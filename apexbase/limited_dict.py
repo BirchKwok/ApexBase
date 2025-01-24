@@ -8,7 +8,8 @@ class LimitedDict:
     def __init__(self, max_size):
         if not isinstance(max_size, int):
             raise ValueError('max_size must be an integer')
-
+        if max_size == 0:
+            raise ValueError('max_size cannot be 0')
         if max_size == -1:
             self.max_size = np.inf
         elif max_size < 0:
@@ -20,9 +21,6 @@ class LimitedDict:
         self.lock = RLock()
 
     def __setitem__(self, key, value):
-        if self.max_size == 0:
-            return
-
         with self.lock:
             if key in self.cache:
                 del self.cache[key]
@@ -32,15 +30,12 @@ class LimitedDict:
                 self.cache.popitem(last=False)
 
     def __getitem__(self, key):
-        if self.max_size == 0:
-            return
-
-        if key in self.cache:
-            value = self.cache[key]
-        else:
+        with self.lock:
+            if key in self.cache:
+                value = self.cache.pop(key)
+                self.cache[key] = value  # Move to end (most recently used)
+                return value
             raise KeyError('Key not found')
-
-        return value
 
     @property
     def is_reached_max_size(self):

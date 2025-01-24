@@ -105,7 +105,7 @@ def test_large_scale_performance(tmp_path):
     # 2.3 JSON字段查询
     query_start = time.time()
     results = client.query(
-        'profile LIKE \'%"city":"北京"%\' AND profile LIKE \'%"experience":1%\'',
+        'json_extract(profile, "$.city") = "北京" AND json_extract(profile, "$.experience") = 1',
         return_ids_only=True
     )
     query_time = time.time() - query_start
@@ -114,9 +114,9 @@ def test_large_scale_performance(tmp_path):
     # 2.4 复杂JSON查询
     query_start = time.time()
     results = client.query(
-        'profile LIKE \'%"city":"北京"%\' AND ' +
-        'profile LIKE \'%"experience":6%\' AND ' +
-        'profile LIKE \'%"skills":%\'',
+        'json_extract(profile, "$.city") = "北京" AND ' +
+        'json_extract(profile, "$.experience") = 6 AND ' +
+        'json_extract(profile, "$.skills") IS NOT NULL',
         return_ids_only=True
     )
     query_time = time.time() - query_start

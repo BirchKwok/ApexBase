@@ -1,6 +1,7 @@
 from typing import List, Union, Dict, Any
 import json
 import re
+from .sql_parser import SQLParser, SQLGenerator
 
 
 class Query:
@@ -25,13 +26,19 @@ class Query:
                 The storage object.
         """
         self.storage = storage
+        self.parser = SQLParser()
+        self.generator = SQLGenerator()
         # SQL语法组件
         self.sql_components = {
-            'operators': {'=', '>', '<', '>=', '<=', '!=', 'LIKE', 'IN', 'IS', 'NOT', 'NULL'},
-            'logical': {'AND', 'OR'},
+            'operators': {'=', '>', '<', '>=', '<=', '!=', 'LIKE', 'IN', 'IS', 'NOT', 'NULL', 'BETWEEN', 'AND', 'OR'},
+            'logical': {'AND', 'OR', 'NOT'},
             'order': {'ORDER', 'BY', 'ASC', 'DESC'},
             'special': {'1=1'},  # 特殊条件
-            'functions': {'CAST', 'AS', 'INTEGER', 'REAL', 'TEXT', 'JSON_EXTRACT'}  # 函数和类型
+            'functions': {
+                'CAST', 'AS', 'INTEGER', 'REAL', 'TEXT', 'JSON_EXTRACT', 'JSON_TYPE', 'JSON_VALID',
+                'JSON_ARRAY', 'JSON_OBJECT', 'JSON_QUOTE', 'JSON_GROUP_ARRAY', 'JSON_GROUP_OBJECT',
+                'JSON_ARRAY_LENGTH', 'JSON_REMOVE', 'JSON_REPLACE', 'JSON_SET', 'JSON_INSERT'
+            }  # 函数和类型
         }
 
     def _quote_identifier(self, identifier: str) -> str:
@@ -47,35 +54,30 @@ class Query:
         """
         return f'"{identifier}"'
 
-    def _parse_query(self, query: str) -> dict:
+    def _parse_query(self, query_filter: str) -> Dict[str, str]:
         """
-        解析查询语句，将其分解为组件。
+        解析查询字符串,提取 WHERE 和 ORDER BY 子句。
 
-        Parameters:
-            query: str
-                查询语句
+        Args:
+            query_filter: 查询字符串
 
         Returns:
-            dict: 包含解析后的查询组件
+            Dict[str, str]: 包含 'where' 和 'order' 键的字典
         """
-        if not query:
-            return {'where': None, 'order': None}
+        if not query_filter:
+            return {'where': '1=1', 'order': ''}
 
-        # 处理特殊查询
-        if query.upper() == '1=1':
-            return {'where': '1=1', 'order': None}
+        # 分离 ORDER BY 子句
+        parts = query_filter.split(' ORDER BY ', 1)
+        where_clause = parts[0].strip()
+        order_clause = f'ORDER BY {parts[1].strip()}' if len(parts) > 1 else ''
 
-        # 分离ORDER BY子句
-        order_match = re.search(r'\bORDER\s+BY\s+(.+)$', query, re.IGNORECASE)
-        where_clause = query
-        order_clause = None
-
-        if order_match:
-            where_clause = query[:order_match.start()].strip()
-            order_clause = order_match.group()
+        # 如果 WHERE 子句为空,使用 1=1
+        if not where_clause:
+            where_clause = '1=1'
 
         return {
-            'where': where_clause if where_clause and where_clause != '1=1' else '1=1',
+            'where': where_clause,
             'order': order_clause
         }
 
@@ -116,95 +118,138 @@ class Query:
 
         Returns:
             bool: 是否有效
+
+        Raises:
+            ValueError: 当查询语法无效时抛出
         """
         if not where_clause or where_clause == '1=1':
             return True
 
-        # 预处理：将表达式转换为标准形式
-        # 1. 保护字符串字面量
-        def preserve_string(match):
-            return f"STRING_LITERAL_{len(self._string_literals)}"
-        
-        self._string_literals = []
-        cleaned = where_clause
-        cleaned = re.sub(r"'([^']*)'", lambda m: (self._string_literals.append(m.group(1)), preserve_string(m))[1], cleaned)
-        
-        # 2. 保护函数调用
-        def preserve_function(match):
-            func_name = match.group(1).upper()
-            args = match.group(2)
-            return f"{func_name}_CALL_{len(self._function_calls)}"
-        
-        self._function_calls = []
-        cleaned = re.sub(r'(json_extract|cast)\s*\(([^)]+)\)', lambda m: (self._function_calls.append(m.group(0)), preserve_function(m))[1], cleaned, flags=re.IGNORECASE)
-        
-        # 3. 将其余部分转为大写
-        cleaned = cleaned.upper()
-        
-        # 4. 标准化空白字符
-        cleaned = re.sub(r'\s+', ' ', cleaned)
-        
-        # 5. 分割成 tokens
-        tokens = cleaned.split()
-        
-        # 6. 验证每个 token
-        i = 0
-        while i < len(tokens):
-            token = tokens[i]
+        try:
+            # 预处理：将表达式转换为标准形式
+            # 1. 保护字符串字面量（包括单引号和双引号）
+            def preserve_string(match):
+                return f"STRING_LITERAL_{len(self._string_literals)}"
             
-            # 检查是否是字符串字面量
-            if token.startswith('STRING_LITERAL_'):
-                i += 1
-                continue
+            self._string_literals = []
+            cleaned = where_clause
+            # 处理双引号字符串
+            cleaned = re.sub(r'"([^"]*)"', lambda m: (self._string_literals.append(m.group(1)), preserve_string(m))[1], cleaned)
+            # 处理单引号字符串
+            cleaned = re.sub(r"'([^']*)'", lambda m: (self._string_literals.append(m.group(1)), preserve_string(m))[1], cleaned)
             
-            # 检查是否是函数调用
-            if token.startswith(('JSON_EXTRACT_CALL_', 'CAST_CALL_')):
-                i += 1
-                continue
+            # 2. 保护函数调用
+            def preserve_function(match):
+                func_name = match.group(1).upper()
+                args = match.group(2)
+                return f"{func_name}_CALL_{len(self._function_calls)}"
             
-            # 检查是否是操作符
-            if token in self.sql_components['operators']:
-                i += 1
-                continue
+            self._function_calls = []
+            cleaned = re.sub(r'(json_extract|cast)\s*\(([^)]+)\)', lambda m: (self._function_calls.append(m.group(0)), preserve_function(m))[1], cleaned, flags=re.IGNORECASE)
             
-            # 检查是否是逻辑操作符
-            if token in self.sql_components['logical']:
-                i += 1
-                continue
+            # 3. 将其余部分转为大写（保护中文字符）
+            def uppercase_non_chinese(match):
+                text = match.group(0)
+                return text if any('\u4e00' <= c <= '\u9fff' for c in text) else text.upper()
             
-            # 检查是否是数字
-            if token.isdigit() or token == 'NULL':
-                i += 1
-                continue
+            cleaned = re.sub(r'\S+', uppercase_non_chinese, cleaned)
             
-            # 检查是否是标识符
-            if re.match(r'^[A-Z_][A-Z0-9_]*$', token):
-                i += 1
-                continue
+            # 4. 标准化空白字符
+            cleaned = re.sub(r'\s+', ' ', cleaned)
             
-            # 如果都不匹配，说明是无效的 token
-            return False
-        
-        # 7. 验证函数调用
-        for func_call in self._function_calls:
-            if 'json_extract' in func_call.lower():
-                match = re.match(r'json_extract\s*\(([^,]+),\s*\'([^\']+)\'\)', func_call, re.IGNORECASE)
-                if not match:
-                    return False
-                field = match.group(1).strip()
-                path = match.group(2)
-                if not self._validate_json_path(path):
-                    return False
-            elif 'cast' in func_call.lower():
-                match = re.match(r'cast\s*\(([^)]+)\)\s+as\s+(integer|real|text)', func_call, re.IGNORECASE)
-                if not match:
-                    return False
-                expr = match.group(1).strip()
-                type_ = match.group(2).upper()
-                if not expr or type_ not in {'INTEGER', 'REAL', 'TEXT'}:
-                    return False
-        
-        return True
+            # 5. 分割成 tokens
+            tokens = cleaned.split()
+            if not tokens:
+                raise ValueError("Invalid query syntax: empty WHERE clause")
+            
+            # 6. 验证每个 token
+            i = 0
+            while i < len(tokens):
+                token = tokens[i]
+                
+                # 检查是否是字符串字面量
+                if token.startswith('STRING_LITERAL_'):
+                    i += 1
+                    continue
+                
+                # 检查是否是函数调用
+                if token.startswith(('JSON_EXTRACT_CALL_', 'CAST_CALL_')):
+                    i += 1
+                    if i < len(tokens):
+                        if tokens[i] in {'=', '>', '<', '>=', '<=', '!='}:
+                            i += 1
+                            if i < len(tokens):
+                                i += 1  # 跳过值
+                            else:
+                                raise ValueError(f"Invalid query syntax: missing value after operator in {where_clause}")
+                        elif tokens[i] == 'IS':
+                            i += 1
+                            if i < len(tokens) and tokens[i] == 'NOT':
+                                i += 1
+                            if i < len(tokens) and tokens[i] == 'NULL':
+                                i += 1
+                            else:
+                                raise ValueError(f"Invalid query syntax: expected NULL after IS [NOT] in {where_clause}")
+                        else:
+                            raise ValueError(f"Invalid query syntax: invalid operator after function call in {where_clause}")
+                    else:
+                        raise ValueError(f"Invalid query syntax: unexpected end after function call in {where_clause}")
+                    continue
+                
+                # 检查是否是逻辑操作符
+                if token in {'AND', 'OR'}:
+                    i += 1
+                    continue
+                
+                # 检查是否是字段名
+                if re.match(r'^[A-Z_][A-Z0-9_]*$', token):
+                    i += 1
+                    if i < len(tokens) and tokens[i] in {'=', '>', '<', '>=', '<=', '!=', 'LIKE', 'IN', 'IS'}:
+                        i += 1
+                        if tokens[i-1] == 'IS':
+                            if i < len(tokens) and tokens[i] == 'NOT':
+                                i += 1
+                            if i < len(tokens) and tokens[i] == 'NULL':
+                                i += 1
+                            else:
+                                raise ValueError(f"Invalid query syntax: expected NULL after IS [NOT] in {where_clause}")
+                        elif i < len(tokens):
+                            # 检查值是否是数字或字符串字面量
+                            if re.match(r'^-?\d+(\.\d+)?$', tokens[i]) or tokens[i].startswith('STRING_LITERAL_'):
+                                i += 1
+                            else:
+                                raise ValueError(f"Invalid query syntax: invalid value {tokens[i]} in {where_clause}")
+                        else:
+                            raise ValueError(f"Invalid query syntax: missing value after operator in {where_clause}")
+                    else:
+                        raise ValueError(f"Invalid query syntax: invalid operator after field name in {where_clause}")
+                    continue
+                
+                # 检查是否是数字字面量
+                if re.match(r'^-?\d+(\.\d+)?$', token):
+                    i += 1
+                    continue
+                
+                raise ValueError(f"Invalid query syntax: unexpected token {token} in {where_clause}")
+            
+            # 7. 验证函数调用
+            for func_call in self._function_calls:
+                if 'json_extract' in func_call.lower():
+                    # 修改正则表达式以适应我们的字符串替换
+                    match = re.match(r'json_extract\s*\(([^,]+),\s*(?:STRING_LITERAL_\d+|[\'"][^\'\"]+[\'\"])\)', func_call, re.IGNORECASE)
+                    if not match:
+                        raise ValueError(f"Invalid query syntax: invalid json_extract syntax in {func_call}")
+                elif 'cast' in func_call.lower():
+                    match = re.match(r'cast\s*\(([^,]+)\s+as\s+(integer|real|text)\)', func_call, re.IGNORECASE)
+                    if not match:
+                        raise ValueError(f"Invalid query syntax: invalid CAST syntax in {func_call}")
+            
+            return True
+            
+        except Exception as e:
+            if isinstance(e, ValueError):
+                raise
+            raise ValueError(f"Invalid query syntax: {str(e)}")
 
     def query(self, query_filter: str = None, return_ids_only: bool = True, limit: int = None, offset: int = None) -> Union[List[int], List[Dict[str, Any]]]:
         """
@@ -218,8 +263,6 @@ class Query:
                 - "age > 18 AND city = 'New York'"
                 - "json_extract(data, '$.address.city') = 'Beijing'"
                 - "1=1"  # 返回所有记录
-                - "1=1 ORDER BY age DESC"  # 按年龄降序排序
-                If None, returns all records.
             return_ids_only: bool
                 If True, only return IDs. If False, return complete records.
             limit: int
@@ -229,8 +272,15 @@ class Query:
 
         Returns:
             Union[List[int], List[Dict[str, Any]]]: List of IDs or complete records.
+
+        Raises:
+            ValueError: 当查询语法无效时抛出
         """
         try:
+            # 验证查询语法
+            if query_filter and not query_filter.strip():
+                raise ValueError("Invalid query syntax: empty query")
+
             # 构建基本查询
             if return_ids_only:
                 base_query = "SELECT _id FROM records"
@@ -243,60 +293,53 @@ class Query:
                 base_query = f"SELECT {fields_str} FROM records"
 
             # 处理查询条件
+            parameters = []
             if query_filter:
                 # 解析查询
                 parsed = self._parse_query(query_filter)
-                
-                # 验证WHERE子句
-                if not self._validate_where(parsed['where']):
-                    raise ValueError(f"Invalid query syntax: {query_filter}")
-                
-                # 验证ORDER BY子句
-                if parsed['order'] and not self._validate_order_by(parsed['order']):
+
+                # 验证 WHERE 子句
+                if parsed['where'] != '1=1' and not self._validate_where(parsed['where']):
                     raise ValueError(f"Invalid query syntax: {query_filter}")
 
-                # 提取并验证 JSON 路径
-                json_paths = re.findall(r'json_extract\s*\(([^,]+),\s*\'([^\']+)\'\)', parsed['where'])
-                for field, path in json_paths:
-                    field = field.strip()
-                    if not self._validate_json_path(path):
-                        raise ValueError(f"Invalid JSON path: {path}")
-                    # 创建临时索引以优化查询
-                    self._create_temp_indexes(field, path)
-
-                # 验证字段是否存在
+                # 使用AST解析器解析WHERE子句
                 if parsed['where'] != '1=1':
-                    # 提取查询中的字段名（排除json_extract函数）
-                    where_no_json = re.sub(r'json_extract\s*\([^)]+\)', '', parsed['where'])
-                    field_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\s*[=<>!]'
-                    fields_in_query = re.findall(field_pattern, where_no_json)
-                    
-                    # 获取所有可用字段
-                    available_fields = set(self.list_fields())
-                    
-                    # 检查每个字段是否存在
-                    for field in fields_in_query:
-                        if field not in available_fields:
-                            return [] if return_ids_only else []
+                    try:
+                        self.generator.reset()  # 重置生成器状态
+                        ast = self.parser.parse(parsed['where'])
+                        where_clause = self.generator.generate(ast)
+                        parameters = self.generator.get_parameters()
+                        print(f"Debug - SQL Query: {base_query} WHERE {where_clause}")
+                        print(f"Debug - Parameters: {parameters}")
+                    except Exception as e:
+                        raise ValueError(f"Invalid query syntax: {str(e)}")
 
-                # 添加WHERE子句
-                if parsed['where']:
-                    base_query += f" WHERE {parsed['where']}"
+                    # 添加WHERE子句
+                    base_query += f" WHERE {where_clause}"
 
                 # 添加ORDER BY子句
                 if parsed['order']:
+                    if not self._validate_order_by(parsed['order']):
+                        raise ValueError("Invalid ORDER BY clause")
                     base_query += f" {parsed['order']}"
 
             # 添加分页
             if limit is not None:
+                if not isinstance(limit, int) or limit < 0:
+                    raise ValueError("Invalid LIMIT value")
                 base_query += f" LIMIT {limit}"
                 if offset is not None:
+                    if not isinstance(offset, int) or offset < 0:
+                        raise ValueError("Invalid OFFSET value")
                     base_query += f" OFFSET {offset}"
 
             # 执行查询
             cursor = self.storage.conn.cursor()
             try:
-                results = cursor.execute(base_query).fetchall()
+                if parameters:
+                    results = cursor.execute(base_query, parameters).fetchall()
+                else:
+                    results = cursor.execute(base_query).fetchall()
 
                 if return_ids_only:
                     return [row[0] for row in results]
@@ -323,6 +366,8 @@ class Query:
                     return [] if return_ids_only else []
                 raise ValueError(f"Invalid query syntax: {query_filter}")
         except Exception as e:
+            if isinstance(e, ValueError):
+                raise
             raise ValueError(f"Query failed: {str(e)}")
 
     def list_fields(self) -> List[str]:

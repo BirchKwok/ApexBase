@@ -89,7 +89,8 @@ class Storage:
                 CREATE TABLE fields_meta (
                     field_name TEXT PRIMARY KEY,
                     field_type TEXT NOT NULL,
-                    is_searchable INTEGER DEFAULT 0
+                    is_searchable INTEGER DEFAULT 0,
+                    is_indexed INTEGER DEFAULT 0
                 )
             """)
             
@@ -116,6 +117,10 @@ class Storage:
             cursor.execute("DELETE FROM sqlite_sequence WHERE name = 'records'")
             
             cursor.execute("COMMIT")
+            
+            # 创建自动索引
+            self._create_auto_indexes()
+            
         except Exception as e:
             cursor.execute("ROLLBACK")
             raise e
@@ -418,7 +423,7 @@ class Storage:
                                 field_updates.append(f"{quoted_field_name} = ?")
                                 # 如果是复杂类型，序列化为JSON
                                 if isinstance(value, (list, dict)):
-                                    import json
+                                    # import json
                                     params.append(json.dumps(value))
                                 else:
                                     params.append(value)
@@ -701,7 +706,7 @@ class Storage:
                         field_updates.append(f"{quoted_field_name} = ?")
                         # 如果是复杂类型，序列化为JSON
                         if isinstance(value, (list, dict)):
-                            import json
+                            # import json
                             params.append(json.dumps(value))
                         else:
                             params.append(value)
@@ -775,7 +780,7 @@ class Storage:
                             quoted_field_name = self._quote_identifier(field_name)
                             field_updates.append(f"{quoted_field_name} = ?")
                             if isinstance(value, (list, dict)):
-                                import json
+                                # import json
                                 params.append(json.dumps(value))
                             else:
                                 params.append(value)
@@ -957,3 +962,103 @@ class Storage:
         """
         if hasattr(self, 'conn'):
             self.conn.close()
+
+    def _create_auto_indexes(self):
+        """
+        根据查询模式自动创建索引
+        """
+        try:
+            cursor = self.conn.cursor()
+            
+            # 获取所有数值类型字段
+            numeric_fields = cursor.execute("""
+                SELECT field_name 
+                FROM fields_meta 
+                WHERE field_type IN ('INTEGER', 'REAL')
+            """).fetchall()
+            
+            # 为数值类型字段创建索引（这些字段经常用于范围查询）
+            for (field_name,) in numeric_fields:
+                index_name = f"idx_{field_name}"
+                quoted_field_name = self._quote_identifier(field_name)
+                cursor.execute(f"""
+                    CREATE INDEX IF NOT EXISTS {index_name}
+                    ON records({quoted_field_name})
+                """)
+            
+            # 获取所有TEXT类型字段
+            text_fields = cursor.execute("""
+                SELECT field_name 
+                FROM fields_meta 
+                WHERE field_type = 'TEXT'
+            """).fetchall()
+            
+            # 为TEXT类型字段创建LIKE查询优化索引
+            for (field_name,) in text_fields:
+                index_name = f"idx_{field_name}_like"
+                quoted_field_name = self._quote_identifier(field_name)
+                cursor.execute(f"""
+                    CREATE INDEX IF NOT EXISTS {index_name}
+                    ON records({quoted_field_name} COLLATE NOCASE)
+                """)
+            
+            # 分析新创建的索引
+            cursor.execute("ANALYZE")
+            
+        except Exception as e:
+            print(f"Warning: Failed to create automatic indexes: {str(e)}")
+
+    def analyze_query_performance(self, query: str) -> dict:
+        """
+        分析查询性能
+        
+        Parameters:
+            query: str
+                要分析的查询语句
+                
+        Returns:
+            dict: 包含查询计划和性能指标的字典
+        """
+        try:
+            cursor = self.conn.cursor()
+            
+            # 启用查询计划分析
+            cursor.execute("EXPLAIN QUERY PLAN " + query)
+            query_plan = cursor.fetchall()
+            
+            # 收集性能指标
+            metrics = {
+                'tables_used': set(),
+                'indexes_used': set(),
+                'scan_type': [],
+                'estimated_rows': 0
+            }
+            
+            for step in query_plan:
+                detail = step[3]  # 查询计划详情
+                
+                # 分析使用的表
+                if 'TABLE' in detail:
+                    table = detail.split('TABLE')[1].split()[0]
+                    metrics['tables_used'].add(table)
+                
+                # 分析使用的索引
+                if 'USING INDEX' in detail:
+                    index = detail.split('USING INDEX')[1].split()[0]
+                    metrics['indexes_used'].add(index)
+                
+                # 分析扫描类型
+                if 'SCAN' in detail:
+                    scan_type = detail.split('SCAN')[0].strip()
+                    metrics['scan_type'].append(scan_type)
+                
+                # 估算处理的行数
+                if 'rows=' in detail:
+                    rows = int(detail.split('rows=')[1].split()[0])
+                    metrics['estimated_rows'] = max(metrics['estimated_rows'], rows)
+            
+            return metrics
+            
+        except Exception as e:
+            print(f"Warning: Failed to analyze query performance: {str(e)}")
+            return {}
