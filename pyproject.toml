@@ -12,12 +12,12 @@ description = "A lightning-fast, feature-rich embedded database designed for mod
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "orjson",
-    "pandas",
-    "pyarrow",
-    "polars",
-    "numpy",
-    "psutil"
+    "orjson>=3.9.0",
+    "pandas>=2.0.0",
+    "pyarrow>=17.0.0",
+    "polars>=0.20.0",
+    "numpy>=1.24.0",
+    "psutil>=5.9.0"
 ]
 
 [tool.setuptools]
