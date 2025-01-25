@@ -7,8 +7,6 @@ import psutil
 import os
 from apexbase import ApexClient
 import numpy as np
-from typing import List, Dict
-import json
 
 
 def generate_random_string(length: int) -> str:
@@ -115,21 +113,42 @@ def test_large_scale_performance(tmp_path):
     query_start = time.time()
     results = client.query(
         'json_extract(profile, "$.city") = "北京" AND ' +
-        'json_extract(profile, "$.experience") = 6 AND ' +
+        'json_extract(profile, "$.experience") BETWEEN 6 AND 10 AND ' +
         'json_extract(profile, "$.skills") IS NOT NULL',
         return_ids_only=True
     )
     query_time = time.time() - query_start
     print(f"复杂JSON查询耗时: {query_time:.2f}秒, 结果数量: {len(results)}")
     
+    # 2.5 测试大小写不敏感性
+    query_start = time.time()
+    results1 = client.query(
+        'JSON_EXTRACT(profile, "$.city") = "北京" AND ' +
+        'JSON_EXTRACT(profile, "$.experience") BETWEEN 6 AND 10 AND ' +
+        'JSON_EXTRACT(profile, "$.skills") IS NOT NULL',
+        return_ids_only=True
+    )
+    results2 = client.query(
+        'json_extract(profile, "$.city") = "北京" and ' +
+        'json_extract(profile, "$.experience") between 6 and 10 and ' +
+        'json_extract(profile, "$.skills") is not null',
+        return_ids_only=True
+    )
+    query_time = time.time() - query_start
+    print(f"大小写不敏感性测试:")
+    print(f"大写查询结果数量: {len(results1)}")
+    print(f"小写查询结果数量: {len(results2)}")
+    assert len(results1) == len(results2), "大小写不敏感性测试失败：不同大小写的查询返回不同的结果数量"
+    assert set(results1) == set(results2), "大小写不敏感性测试失败：不同大小写的查询返回不同的结果集"
+    
     # 3. 测试全文搜索性能
     print("\n3. 全文搜索性能测试")
     
     # # 3.1 创建索引
-    # index_start = time.time()
-    # client.rebuild_search_index()
-    # index_time = time.time() - index_start
-    # print(f"重建全文索引耗时: {index_time:.2f}秒")
+    index_start = time.time()
+    client.rebuild_search_index()
+    index_time = time.time() - index_start
+    print(f"重建全文索引耗时: {index_time:.2f}秒")
     
     # 3.2 执行搜索
     search_start = time.time()

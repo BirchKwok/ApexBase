@@ -122,7 +122,7 @@ class Query:
         Raises:
             ValueError: 当查询语法无效时抛出
         """
-        if not where_clause or where_clause == '1=1':
+        if not where_clause or where_clause.upper() == '1=1':
             return True
 
         try:
@@ -182,11 +182,25 @@ class Query:
                                 i += 1  # 跳过值
                             else:
                                 raise ValueError(f"Invalid query syntax: missing value after operator in {where_clause}")
-                        elif tokens[i] == 'IS':
+                        elif tokens[i].upper() == 'BETWEEN':
                             i += 1
-                            if i < len(tokens) and tokens[i] == 'NOT':
+                            if i < len(tokens):
+                                i += 1  # 跳过第一个值
+                                if i < len(tokens) and tokens[i].upper() == 'AND':
+                                    i += 1
+                                    if i < len(tokens):
+                                        i += 1  # 跳过第二个值
+                                    else:
+                                        raise ValueError(f"Invalid query syntax: missing second value after BETWEEN in {where_clause}")
+                                else:
+                                    raise ValueError(f"Invalid query syntax: expected AND after BETWEEN value in {where_clause}")
+                            else:
+                                raise ValueError(f"Invalid query syntax: missing value after BETWEEN in {where_clause}")
+                        elif tokens[i].upper() == 'IS':
+                            i += 1
+                            if i < len(tokens) and tokens[i].upper() == 'NOT':
                                 i += 1
-                            if i < len(tokens) and tokens[i] == 'NULL':
+                            if i < len(tokens) and tokens[i].upper() == 'NULL':
                                 i += 1
                             else:
                                 raise ValueError(f"Invalid query syntax: expected NULL after IS [NOT] in {where_clause}")
@@ -197,19 +211,19 @@ class Query:
                     continue
                 
                 # 检查是否是逻辑操作符
-                if token in {'AND', 'OR'}:
+                if token.upper() in {'AND', 'OR'}:
                     i += 1
                     continue
                 
                 # 检查是否是字段名
                 if re.match(r'^[A-Z_][A-Z0-9_]*$', token):
                     i += 1
-                    if i < len(tokens) and tokens[i] in {'=', '>', '<', '>=', '<=', '!=', 'LIKE', 'IN', 'IS'}:
+                    if i < len(tokens) and (tokens[i] in {'=', '>', '<', '>=', '<=', '!='} or tokens[i].upper() in {'LIKE', 'IN', 'IS'}):
                         i += 1
-                        if tokens[i-1] == 'IS':
-                            if i < len(tokens) and tokens[i] == 'NOT':
+                        if tokens[i-1].upper() == 'IS':
+                            if i < len(tokens) and tokens[i].upper() == 'NOT':
                                 i += 1
-                            if i < len(tokens) and tokens[i] == 'NULL':
+                            if i < len(tokens) and tokens[i].upper() == 'NULL':
                                 i += 1
                             else:
                                 raise ValueError(f"Invalid query syntax: expected NULL after IS [NOT] in {where_clause}")

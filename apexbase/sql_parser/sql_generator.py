@@ -27,6 +27,16 @@ class SQLGenerator:
 
     def visit_binaryop(self, node):
         left = self.generate(node.left)
+        if node.operator == 'BETWEEN':
+            if not isinstance(node.right, tuple) or len(node.right) != 2:
+                raise ValueError("BETWEEN operator requires two values")
+            start_val = self.add_parameter(node.right[0].value)
+            end_val = self.add_parameter(node.right[1].value)
+            return f"{left} BETWEEN {start_val} AND {end_val}"
+        elif node.operator == 'IS NOT NULL':
+            return f"{left} IS NOT NULL"
+        elif node.operator == 'IS NULL':
+            return f"{left} IS NULL"
         right = self.generate(node.right)
         if isinstance(node.right, Literal):
             right = self.add_parameter(node.right.value)

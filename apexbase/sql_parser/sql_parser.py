@@ -58,11 +58,16 @@ class JsonPath(Node):
 
 class BinaryOp(Node):
     """二元操作符节点"""
-    def __init__(self, left: Node, operator: str, right: Node, location: Optional[tuple] = None):
+    def __init__(self, left: Node, right: Union[Node, tuple], operator: str, location: Optional[tuple] = None):
         super().__init__(NodeType.BINARY_OP, location)
         self.left = left
-        self.operator = operator
         self.right = right
+        self.operator = operator
+        
+        # 验证BETWEEN操作符的参数
+        if operator == 'BETWEEN':
+            if not isinstance(right, tuple) or len(right) != 2:
+                raise ValueError("BETWEEN operator requires exactly two values")
 
 class FunctionCall(Node):
     """函数调用节点"""
@@ -163,6 +168,7 @@ class Token:
 class SQLLexer:
     """SQL 词法分析器"""
     def __init__(self):
+        # 所有操作符和关键字都使用大写形式存储
         self.operators = {'=', '>', '<', '>=', '<=', '!=', 'LIKE', 'IN', 'IS NULL', 'IS NOT NULL', 'BETWEEN'}
         self.logical = {'AND', 'OR', 'NOT'}
         self.keywords = {
@@ -289,6 +295,7 @@ class SQLLexer:
             identifier += self.text[self.pos]
             self.advance()
         
+        # 转换为大写进行比较，但保留原始大小写
         upper_identifier = identifier.upper()
         if upper_identifier in self.functions:
             return Token(TokenType.FUNCTION, upper_identifier, (start_pos, self.pos))
@@ -415,26 +422,52 @@ class SQLParser:
         raise ValueError(f"Expected {token_type}, got {self.current_token}")
 
     def expr(self):
-        """解析逻辑表达式"""
-        node = self.term()
+        """解析表达式"""
+        node = self.comparison()
 
         while self.current_token and self.current_token.type in {TokenType.AND, TokenType.OR}:
             token = self.current_token
             self.advance()
-            node = LogicalOp(node, token.value, self.term())
+            node = LogicalOp(node, token.value, self.comparison())
+
+        return node
+
+    def comparison(self):
+        """解析比较表达式"""
+        node = self.term()
+
+        while self.current_token and self.current_token.type in {TokenType.OPERATOR, TokenType.BETWEEN, TokenType.IS}:
+            token = self.current_token
+            if token.type == TokenType.BETWEEN:
+                self.advance()
+                start_value = self.term()
+                if not self.current_token or self.current_token.type != TokenType.AND:
+                    raise ValueError("Expected AND after BETWEEN start value")
+                self.advance()  # 跳过 AND
+                end_value = self.term()
+                node = BinaryOp(node, (start_value, end_value), 'BETWEEN')
+            elif token.type == TokenType.IS:
+                self.advance()
+                if self.current_token and self.current_token.type == TokenType.NOT:
+                    self.advance()
+                    if not self.current_token or self.current_token.type != TokenType.NULL:
+                        raise ValueError("Expected NULL after IS NOT")
+                    self.advance()
+                    node = BinaryOp(node, None, 'IS NOT NULL')
+                else:
+                    if not self.current_token or self.current_token.type != TokenType.NULL:
+                        raise ValueError("Expected NULL after IS")
+                    self.advance()
+                    node = BinaryOp(node, None, 'IS NULL')
+            else:
+                self.advance()
+                node = BinaryOp(node, self.term(), token.value)
 
         return node
 
     def term(self):
-        """解析比较表达式"""
-        node = self.factor()
-
-        while self.current_token and self.current_token.type == TokenType.OPERATOR:
-            token = self.current_token
-            self.advance()
-            node = BinaryOp(node, token.value, self.factor())
-
-        return node
+        """解析项"""
+        return self.factor()
 
     def factor(self):
         """解析因子"""
@@ -467,7 +500,7 @@ class SQLParser:
                 else:
                     right = self.factor()
                 
-                return BinaryOp(node, operator, right)
+                return BinaryOp(node, right, operator)
             
             return node
         
@@ -554,4 +587,5 @@ class SQLGenerator:
                 args = [self.generate(arg) for arg in node.args]
                 return f"{node.name}({', '.join(args)})"
         else:
+            raise ValueError(f"Unsupported node type: {type(node)}") 
             raise ValueError(f"Unsupported node type: {type(node)}") 
