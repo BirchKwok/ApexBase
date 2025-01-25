@@ -88,10 +88,11 @@ class Storage:
             table_name: str
                 The table name to switch to
         """
-        if not self._table_exists(table_name):
-            raise ValueError(f"Table '{table_name}' does not exist")
-        self.current_table = table_name
-        self._invalidate_cache()
+        with self._lock:
+            if not self._table_exists(table_name):
+                raise ValueError(f"Table '{table_name}' does not exist")
+            self.current_table = table_name
+            self._invalidate_cache()
 
     def create_table(self, table_name: str):
         """
@@ -101,54 +102,55 @@ class Storage:
             table_name: str
                 The table name to create
         """
-        if self._table_exists(table_name):
-            return
+        with self._lock:
+            if self._table_exists(table_name):
+                return
 
-        cursor = self.conn.cursor()
-        cursor.execute("BEGIN IMMEDIATE")
-        try:
-            cursor.execute(f"""
-                CREATE TABLE {self._quote_identifier(table_name)} (
-                    _id INTEGER PRIMARY KEY AUTOINCREMENT
+            cursor = self.conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute(f"""
+                    CREATE TABLE {self._quote_identifier(table_name)} (
+                        _id INTEGER PRIMARY KEY AUTOINCREMENT
+                    )
+                """)
+                
+                cursor.execute(f"""
+                    CREATE TABLE {self._quote_identifier(table_name + '_fields_meta')} (
+                        field_name TEXT PRIMARY KEY,
+                        field_type TEXT NOT NULL,
+                        is_searchable INTEGER DEFAULT 0,
+                        is_indexed INTEGER DEFAULT 0
+                    )
+                """)
+                
+                cursor.execute(f"""
+                    CREATE VIRTUAL TABLE {self._quote_identifier(table_name + '_fts')} USING fts5(
+                        content,
+                        field_name,
+                        record_id UNINDEXED,
+                        tokenize='porter unicode61'
+                    )
+                """)
+                
+                cursor.execute(f"""
+                    CREATE TRIGGER {self._quote_identifier(table_name + '_fts_delete')} 
+                    AFTER DELETE ON {self._quote_identifier(table_name)} BEGIN
+                        DELETE FROM {self._quote_identifier(table_name + '_fts')} 
+                        WHERE record_id = old._id;
+                    END
+                """)
+                
+                cursor.execute(
+                    "INSERT INTO tables_meta (table_name) VALUES (?)",
+                    [table_name]
                 )
-            """)
-            
-            cursor.execute(f"""
-                CREATE TABLE {self._quote_identifier(table_name + '_fields_meta')} (
-                    field_name TEXT PRIMARY KEY,
-                    field_type TEXT NOT NULL,
-                    is_searchable INTEGER DEFAULT 0,
-                    is_indexed INTEGER DEFAULT 0
-                )
-            """)
-            
-            cursor.execute(f"""
-                CREATE VIRTUAL TABLE {self._quote_identifier(table_name + '_fts')} USING fts5(
-                    content,
-                    field_name,
-                    record_id UNINDEXED,
-                    tokenize='porter unicode61'
-                )
-            """)
-            
-            cursor.execute(f"""
-                CREATE TRIGGER {self._quote_identifier(table_name + '_fts_delete')} 
-                AFTER DELETE ON {self._quote_identifier(table_name)} BEGIN
-                    DELETE FROM {self._quote_identifier(table_name + '_fts')} 
-                    WHERE record_id = old._id;
-                END
-            """)
-            
-            cursor.execute(
-                "INSERT INTO tables_meta (table_name) VALUES (?)",
-                [table_name]
-            )
-            
-            cursor.execute("COMMIT")
-            
-        except Exception as e:
-            cursor.execute("ROLLBACK")
-            raise e
+                
+                cursor.execute("COMMIT")
+                
+            except Exception as e:
+                cursor.execute("ROLLBACK")
+                raise e
 
     def drop_table(self, table_name: str):
         """

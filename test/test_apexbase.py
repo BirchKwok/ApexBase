@@ -20,22 +20,26 @@ def test_initialization(temp_dir):
     """Test initialization parameters"""
     client = ApexClient()
     assert Path("apexbase.db").exists()
+    client.close()  # Close the connection before removing the file
     os.remove("apexbase.db")  # Clean up
     
     # Test specified directory
     client = ApexClient(temp_dir)
     db_path = Path(temp_dir) / "apexbase.db"
     assert db_path.exists()
+    client.close()  # Close the connection
     
     # Test drop_if_exists
     client = ApexClient(temp_dir, drop_if_exists=True)  # Should delete and recreate database
     assert db_path.exists()
+    client.close()  # Close the connection
     
     # Test directory auto-creation
     nested_dir = os.path.join(temp_dir, "nested", "path")
     client = ApexClient(nested_dir)
     assert Path(nested_dir).exists()
     assert (Path(nested_dir) / "apexbase.db").exists()
+    client.close()  # Close the connection
 
 def test_basic_operations(temp_dir):
     """Test basic operations: store, query, retrieve"""
