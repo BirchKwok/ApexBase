@@ -1,7 +1,112 @@
-from typing import List, Union, Dict, Any
-import json
+from typing import List, Optional, Tuple
 import re
+import sqlite3
+from collections import OrderedDict
+
+from .limited_dict import LimitedDict
 from .sql_parser import SQLParser, SQLGenerator
+import pandas as pd
+import pyarrow as pa
+
+
+class LRUCache(OrderedDict):
+    """LRU缓存实现"""
+    def __init__(self, maxsize=1000):
+        super().__init__()
+        self.maxsize = maxsize
+
+    def get(self, key, default=None):
+        try:
+            value = self[key]
+            self.move_to_end(key)
+            return value
+        except KeyError:
+            return default
+
+    def put(self, key, value):
+        if key in self:
+            self.move_to_end(key)
+        self[key] = value
+        if len(self) > self.maxsize:
+            self.popitem(last=False)
+
+
+class ResultView:
+    """查询结果视图，支持延迟执行和LRU缓存"""
+    _global_cache = LRUCache(maxsize=1000)  # 全局LRU缓存
+
+    def __init__(self, storage, query_sql: str, params: tuple = None):
+        self.storage = storage
+        self.query_sql = query_sql
+        self.params = params if params is not None else ()
+        self._executed = False  # 标记是否已执行查询
+        self._cache_key = f"{query_sql}:{params}"  # 缓存键
+
+    def _execute_query(self):
+        """执行查询并缓存结果"""
+        if not self._executed:
+            # 尝试从缓存获取结果
+            cached_result = self._global_cache.get(self._cache_key)
+            if cached_result is not None:
+                self._ids, self._results = cached_result
+            else:
+                # 执行查询并缓存结果
+                try:
+                    cursor = self.storage.conn.cursor()
+                    self._ids = [row[0] for row in cursor.execute(self.query_sql, self.params)]
+                    self._results = None  # 延迟加载记录
+                    self._global_cache.put(self._cache_key, (self._ids, self._results))
+                except sqlite3.OperationalError as e:
+                    raise ValueError(f"Invalid query syntax: {str(e)}")
+            self._executed = True
+
+    @property
+    def ids(self) -> List[int]:
+        """获取结果的ID列表，使用缓存"""
+        if not self._executed:
+            self._execute_query()
+        return self._ids
+
+    def to_dict(self) -> List[dict]:
+        """将结果转换为字典列表，使用缓存"""
+        if not self._executed:
+            self._execute_query()
+        
+        # 检查缓存中是否有完整结果
+        cached_result = self._global_cache.get(self._cache_key)
+        if cached_result and cached_result[1] is not None:
+            return cached_result[1]
+        
+        # 获取完整记录并更新缓存
+        self._results = self.storage.retrieve_many(self._ids)
+        self._global_cache.put(self._cache_key, (self._ids, self._results))
+        return self._results
+
+    def __len__(self):
+        """返回结果数量，触发查询执行"""
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        """通过索引访问结果，使用缓存"""
+        return self.to_dict()[idx]
+
+    def __iter__(self):
+        """迭代结果，使用缓存"""
+        return iter(self.to_dict())
+
+    def to_pandas(self) -> "pd.DataFrame":
+        """将结果转换为Pandas DataFrame，使用缓存，并将_id设置为无名称索引"""
+        data = self.to_dict()
+        df = pd.DataFrame(data)
+        if '_id' in df.columns:
+            df.set_index('_id', inplace=True)
+            df.index.name = None
+        return df
+
+    def to_arrow(self) -> "pa.Table":
+        """将结果转换为PyArrow Table，使用缓存，并将_id设置为索引"""
+        df = self.to_pandas()  # 已经设置了_id为索引
+        return pa.Table.from_pandas(df)
 
 
 class Query:
@@ -28,18 +133,7 @@ class Query:
         self.storage = storage
         self.parser = SQLParser()
         self.generator = SQLGenerator()
-        # SQL语法组件
-        self.sql_components = {
-            'operators': {'=', '>', '<', '>=', '<=', '!=', 'LIKE', 'IN', 'IS', 'NOT', 'NULL', 'BETWEEN', 'AND', 'OR'},
-            'logical': {'AND', 'OR', 'NOT'},
-            'order': {'ORDER', 'BY', 'ASC', 'DESC'},
-            'special': {'1=1'},  # 特殊条件
-            'functions': {
-                'CAST', 'AS', 'INTEGER', 'REAL', 'TEXT', 'JSON_EXTRACT', 'JSON_TYPE', 'JSON_VALID',
-                'JSON_ARRAY', 'JSON_OBJECT', 'JSON_QUOTE', 'JSON_GROUP_ARRAY', 'JSON_GROUP_OBJECT',
-                'JSON_ARRAY_LENGTH', 'JSON_REMOVE', 'JSON_REPLACE', 'JSON_SET', 'JSON_INSERT'
-            }  # 函数和类型
-        }
+        self._query_cache = LimitedDict(1000)  # 缓存查询结果
 
     def _quote_identifier(self, identifier: str) -> str:
         """
@@ -54,351 +148,134 @@ class Query:
         """
         return f'"{identifier}"'
 
-    def _parse_query(self, query_filter: str) -> Dict[str, str]:
-        """
-        解析查询字符串,提取 WHERE 和 ORDER BY 子句。
-
-        Args:
-            query_filter: 查询字符串
-
-        Returns:
-            Dict[str, str]: 包含 'where' 和 'order' 键的字典
-        """
-        if not query_filter:
-            return {'where': '1=1', 'order': ''}
-
-        # 分离 ORDER BY 子句
-        parts = query_filter.split(' ORDER BY ', 1)
-        where_clause = parts[0].strip()
-        order_clause = f'ORDER BY {parts[1].strip()}' if len(parts) > 1 else ''
-
-        # 如果 WHERE 子句为空,使用 1=1
-        if not where_clause:
-            where_clause = '1=1'
-
-        return {
-            'where': where_clause,
-            'order': order_clause
-        }
-
-    def _validate_order_by(self, order_clause: str) -> bool:
-        """
-        验证ORDER BY子句。
-
-        Parameters:
-            order_clause: str
-                ORDER BY子句
-
-        Returns:
-            bool: 是否有效
-        """
-        if not order_clause:
-            return True
-
-        parts = order_clause.upper().split()
-        if len(parts) < 3:
-            return False
-
-        if parts[0] != 'ORDER' or parts[1] != 'BY':
-            return False
-
-        # 验证排序方向（如果指定）
-        if len(parts) > 3 and parts[-1] not in {'ASC', 'DESC'}:
-            return False
-
-        return True
-
-    def _validate_where(self, where_clause: str) -> bool:
-        """
-        验证WHERE子句。
-
-        Parameters:
-            where_clause: str
-                WHERE子句
-
-        Returns:
-            bool: 是否有效
-
-        Raises:
-            ValueError: 当查询语法无效时抛出
-        """
-        if not where_clause or where_clause.upper() == '1=1':
-            return True
-
+    def _build_query_sql(self, query_filter: str = None) -> Tuple[str, tuple]:
+        """构建查询SQL语句"""
+        table_name = self.storage._get_table_name(None)
+        quoted_table = self.storage._quote_identifier(table_name)
+        
+        if not query_filter or query_filter.strip() == "1=1":
+            sql = f"SELECT _id FROM {quoted_table}"
+            return sql, ()
+        
         try:
-            # 预处理：将表达式转换为标准形式
-            # 1. 保护字符串字面量（包括单引号和双引号）
-            def preserve_string(match):
-                return f"STRING_LITERAL_{len(self._string_literals)}"
+            # 使用 SQLParser 解析查询
+            ast = self.parser.parse(query_filter)
             
-            self._string_literals = []
-            cleaned = where_clause
-            # 处理双引号字符串
-            cleaned = re.sub(r'"([^"]*)"', lambda m: (self._string_literals.append(m.group(1)), preserve_string(m))[1], cleaned)
-            # 处理单引号字符串
-            cleaned = re.sub(r"'([^']*)'", lambda m: (self._string_literals.append(m.group(1)), preserve_string(m))[1], cleaned)
+            # 使用 SQLGenerator 生成 SQL 和参数
+            self.generator.reset()
+            where_clause = self.generator.generate(ast)
+            params = self.generator.get_parameters()
             
-            # 2. 保护函数调用
-            def preserve_function(match):
-                func_name = match.group(1).upper()
-                args = match.group(2)
-                return f"{func_name}_CALL_{len(self._function_calls)}"
-            
-            self._function_calls = []
-            cleaned = re.sub(r'(json_extract|cast)\s*\(([^)]+)\)', lambda m: (self._function_calls.append(m.group(0)), preserve_function(m))[1], cleaned, flags=re.IGNORECASE)
-            
-            # 3. 将其余部分转为大写（保护中文字符）
-            def uppercase_non_chinese(match):
-                text = match.group(0)
-                return text if any('\u4e00' <= c <= '\u9fff' for c in text) else text.upper()
-            
-            cleaned = re.sub(r'\S+', uppercase_non_chinese, cleaned)
-            
-            # 4. 标准化空白字符
-            cleaned = re.sub(r'\s+', ' ', cleaned)
-            
-            # 5. 分割成 tokens
-            tokens = cleaned.split()
-            if not tokens:
-                raise ValueError("Invalid query syntax: empty WHERE clause")
-            
-            # 6. 验证每个 token
-            i = 0
-            while i < len(tokens):
-                token = tokens[i]
-                
-                # 检查是否是字符串字面量
-                if token.startswith('STRING_LITERAL_'):
-                    i += 1
-                    continue
-                
-                # 检查是否是函数调用
-                if token.startswith(('JSON_EXTRACT_CALL_', 'CAST_CALL_')):
-                    i += 1
-                    if i < len(tokens):
-                        if tokens[i] in {'=', '>', '<', '>=', '<=', '!='}:
-                            i += 1
-                            if i < len(tokens):
-                                i += 1  # 跳过值
-                            else:
-                                raise ValueError(f"Invalid query syntax: missing value after operator in {where_clause}")
-                        elif tokens[i].upper() == 'BETWEEN':
-                            i += 1
-                            if i < len(tokens):
-                                i += 1  # 跳过第一个值
-                                if i < len(tokens) and tokens[i].upper() == 'AND':
-                                    i += 1
-                                    if i < len(tokens):
-                                        i += 1  # 跳过第二个值
-                                    else:
-                                        raise ValueError(f"Invalid query syntax: missing second value after BETWEEN in {where_clause}")
-                                else:
-                                    raise ValueError(f"Invalid query syntax: expected AND after BETWEEN value in {where_clause}")
-                            else:
-                                raise ValueError(f"Invalid query syntax: missing value after BETWEEN in {where_clause}")
-                        elif tokens[i].upper() == 'IS':
-                            i += 1
-                            if i < len(tokens) and tokens[i].upper() == 'NOT':
-                                i += 1
-                            if i < len(tokens) and tokens[i].upper() == 'NULL':
-                                i += 1
-                            else:
-                                raise ValueError(f"Invalid query syntax: expected NULL after IS [NOT] in {where_clause}")
-                        else:
-                            raise ValueError(f"Invalid query syntax: invalid operator after function call in {where_clause}")
-                    else:
-                        raise ValueError(f"Invalid query syntax: unexpected end after function call in {where_clause}")
-                    continue
-                
-                # 检查是否是逻辑操作符
-                if token.upper() in {'AND', 'OR'}:
-                    i += 1
-                    continue
-                
-                # 检查是否是字段名
-                if re.match(r'^[A-Z_][A-Z0-9_]*$', token):
-                    i += 1
-                    if i < len(tokens) and (tokens[i] in {'=', '>', '<', '>=', '<=', '!='} or tokens[i].upper() in {'LIKE', 'IN', 'IS'}):
-                        i += 1
-                        if tokens[i-1].upper() == 'IS':
-                            if i < len(tokens) and tokens[i].upper() == 'NOT':
-                                i += 1
-                            if i < len(tokens) and tokens[i].upper() == 'NULL':
-                                i += 1
-                            else:
-                                raise ValueError(f"Invalid query syntax: expected NULL after IS [NOT] in {where_clause}")
-                        elif i < len(tokens):
-                            # 检查值是否是数字或字符串字面量
-                            if re.match(r'^-?\d+(\.\d+)?$', tokens[i]) or tokens[i].startswith('STRING_LITERAL_'):
-                                i += 1
-                            else:
-                                raise ValueError(f"Invalid query syntax: invalid value {tokens[i]} in {where_clause}")
-                        else:
-                            raise ValueError(f"Invalid query syntax: missing value after operator in {where_clause}")
-                    else:
-                        raise ValueError(f"Invalid query syntax: invalid operator after field name in {where_clause}")
-                    continue
-                
-                # 检查是否是数字字面量
-                if re.match(r'^-?\d+(\.\d+)?$', token):
-                    i += 1
-                    continue
-                
-                raise ValueError(f"Invalid query syntax: unexpected token {token} in {where_clause}")
-            
-            # 7. 验证函数调用
-            for func_call in self._function_calls:
-                if 'json_extract' in func_call.lower():
-                    # 修改正则表达式以适应我们的字符串替换
-                    match = re.match(r'json_extract\s*\(([^,]+),\s*(?:STRING_LITERAL_\d+|[\'"][^\'\"]+[\'\"])\)', func_call, re.IGNORECASE)
-                    if not match:
-                        raise ValueError(f"Invalid query syntax: invalid json_extract syntax in {func_call}")
-                elif 'cast' in func_call.lower():
-                    match = re.match(r'cast\s*\(([^,]+)\s+as\s+(integer|real|text)\)', func_call, re.IGNORECASE)
-                    if not match:
-                        raise ValueError(f"Invalid query syntax: invalid CAST syntax in {func_call}")
-            
-            return True
+            sql = f"SELECT _id FROM {quoted_table} WHERE {where_clause}"
+            return sql, tuple(params)
             
         except Exception as e:
-            if isinstance(e, ValueError):
-                raise
             raise ValueError(f"Invalid query syntax: {str(e)}")
 
-    def query(self, query_filter: str = None, return_ids_only: bool = True, limit: int = None, offset: int = None) -> Union[List[int], List[Dict[str, Any]]]:
+    def query(self, query_filter: str = None) -> ResultView:
         """
-        Query records using SQL-like filter syntax.
+        使用SQL语法查询记录。
 
         Parameters:
             query_filter: str
-                SQL-like filter condition. Examples:
-                - "age > 18"
-                - "name LIKE '%John%'"
-                - "age > 18 AND city = 'New York'"
-                - "json_extract(data, '$.address.city') = 'Beijing'"
-                - "1=1"  # 返回所有记录
-            return_ids_only: bool
-                If True, only return IDs. If False, return complete records.
-            limit: int
-                Maximum number of records to return.
-            offset: int
-                Number of records to skip.
+                SQL过滤条件。例如：
+                - age > 30
+                - name LIKE 'John%'
+                - age > 30 AND city = 'New York'
+                - field IN (1, 2, 3)
+                不支持 ORDER BY, GROUP BY, HAVING 等语句
 
         Returns:
-            Union[List[int], List[Dict[str, Any]]]: List of IDs or complete records.
-
-        Raises:
-            ValueError: 当查询语法无效时抛出
+            ResultView: 查询结果视图
         """
+        if not isinstance(query_filter, str) or not query_filter.strip():
+            raise ValueError("Invalid query syntax")
+            
         try:
-            # 验证查询语法
-            if query_filter and not query_filter.strip():
-                raise ValueError("Invalid query syntax: empty query")
+            sql, params = self._build_query_sql(query_filter)
+            return ResultView(self.storage, sql, params)
+        except (ValueError, sqlite3.OperationalError) as e:
+            raise ValueError(f"Invalid query syntax: {str(e)}")
 
-            # 构建基本查询
-            if return_ids_only:
-                base_query = "SELECT _id FROM records"
-            else:
-                # 获取所有字段名（除了_id）
-                fields = self.list_fields()
-                if not fields:
-                    return []
-                fields_str = ', '.join(f'"{field}"' for field in fields)
-                base_query = f"SELECT {fields_str} FROM records"
+    def search_text(self, text: str, fields: List[str] = None, table_name: str = None) -> ResultView:
+        """
+        全文搜索。
 
-            # 处理查询条件
-            parameters = []
-            if query_filter:
-                # 解析查询
-                parsed = self._parse_query(query_filter)
+        Parameters:
+            text: str
+                搜索文本
+            fields: List[str]
+                要搜索的字段列表，如果为None则搜索所有可搜索字段
+            table_name: str
+                表名，如果为None则使用当前表
 
-                # 验证 WHERE 子句
-                if parsed['where'] != '1=1' and not self._validate_where(parsed['where']):
-                    raise ValueError(f"Invalid query syntax: {query_filter}")
+        Returns:
+            ResultView: 搜索结果视图
+        """
+        table_name = self.storage._get_table_name(table_name)
+        quoted_fts = self.storage._quote_identifier(table_name + '_fts')
+        
+        # 获取可搜索字段
+        if fields:
+            field_list = [f"'{field}'" for field in fields]
+            field_filter = f"AND field_name IN ({','.join(field_list)})"
+        else:
+            field_filter = ""
+        
+        # 构建FTS查询
+        sql = f"""
+            SELECT DISTINCT record_id as _id
+            FROM {quoted_fts}
+            WHERE content MATCH ?
+            {field_filter}
+        """
+        
+        return ResultView(self.storage, sql, (text,))
 
-                # 使用AST解析器解析WHERE子句
-                if parsed['where'] != '1=1':
-                    try:
-                        self.generator.reset()  # 重置生成器状态
-                        ast = self.parser.parse(parsed['where'])
-                        where_clause = self.generator.generate(ast)
-                        parameters = self.generator.get_parameters()
-                        print(f"Debug - SQL Query: {base_query} WHERE {where_clause}")
-                        print(f"Debug - Parameters: {parameters}")
-                    except Exception as e:
-                        raise ValueError(f"Invalid query syntax: {str(e)}")
+    def retrieve(self, id_: int) -> Optional[dict]:
+        """
+        检索单条记录。
 
-                    # 添加WHERE子句
-                    base_query += f" WHERE {where_clause}"
+        Parameters:
+            id_: int
+                记录ID
 
-                # 添加ORDER BY子句
-                if parsed['order']:
-                    if not self._validate_order_by(parsed['order']):
-                        raise ValueError("Invalid ORDER BY clause")
-                    base_query += f" {parsed['order']}"
+        Returns:
+            Optional[dict]: 记录数据，如果不存在则返回None
+        """
+        return self.storage.retrieve(id_)
 
-            # 添加分页
-            if limit is not None:
-                if not isinstance(limit, int) or limit < 0:
-                    raise ValueError("Invalid LIMIT value")
-                base_query += f" LIMIT {limit}"
-                if offset is not None:
-                    if not isinstance(offset, int) or offset < 0:
-                        raise ValueError("Invalid OFFSET value")
-                    base_query += f" OFFSET {offset}"
+    def retrieve_many(self, ids: List[int]) -> List[dict]:
+        """
+        批量检索记录。
 
-            # 执行查询
-            cursor = self.storage.conn.cursor()
-            try:
-                if parameters:
-                    results = cursor.execute(base_query, parameters).fetchall()
-                else:
-                    results = cursor.execute(base_query).fetchall()
+        Parameters:
+            ids: List[int]
+                记录ID列表
 
-                if return_ids_only:
-                    return [row[0] for row in results]
-                else:
-                    # 构建结果字典
-                    records = []
-                    fields = self.list_fields()
-                    for row in results:
-                        record = {}
-                        for i, value in enumerate(row):
-                            if value is not None:
-                                if isinstance(value, str):
-                                    try:
-                                        parsed_value = json.loads(value)
-                                        record[fields[i]] = parsed_value
-                                    except json.JSONDecodeError:
-                                        record[fields[i]] = value
-                                else:
-                                    record[fields[i]] = value
-                        records.append(record)
-                    return records
-            except Exception as e:
-                if "no such column" in str(e):
-                    return [] if return_ids_only else []
-                raise ValueError(f"Invalid query syntax: {query_filter}")
-        except Exception as e:
-            if isinstance(e, ValueError):
-                raise
-            raise ValueError(f"Query failed: {str(e)}")
+        Returns:
+            List[dict]: 记录数据列表
+        """
+        return self.storage.retrieve_many(ids)
 
     def list_fields(self) -> List[str]:
         """
-        获取所有可用字段列表。
+        获取当前表的所有可用字段列表。
 
         Returns:
             List[str]: 字段名列表
         """
         try:
             cursor = self.storage.conn.cursor()
-            results = cursor.execute("SELECT field_name FROM fields_meta").fetchall()
+            table_name = self.storage.current_table
+            results = cursor.execute(
+                f"SELECT field_name FROM {self.storage._quote_identifier(table_name + '_fields_meta')}"
+            ).fetchall()
             return [row[0] for row in results]
         except Exception as e:
             raise ValueError(f"Failed to list fields: {str(e)}")
 
-    def get_field_type(self, field_name: str) -> str:
+    def get_field_type(self, field_name: str) -> Optional[str]:
         """
         获取字段类型。
 
@@ -407,12 +284,13 @@ class Query:
                 字段名称
 
         Returns:
-            str: 字段类型
+            Optional[str]: 字段类型，如果字段不存在则返回None
         """
         try:
+            table_name = self.storage.current_table
             cursor = self.storage.conn.cursor()
             result = cursor.execute(
-                "SELECT field_type FROM fields_meta WHERE field_name = ?",
+                f"SELECT field_type FROM {self.storage._quote_identifier(table_name + '_fields_meta')} WHERE field_name = ?",
                 [field_name]
             ).fetchone()
             return result[0] if result else None
@@ -428,20 +306,23 @@ class Query:
                 字段名称
         """
         try:
+            table_name = self.storage.current_table
             cursor = self.storage.conn.cursor()
+            
             # 检查字段是否存在
             field_exists = cursor.execute(
-                "SELECT 1 FROM fields_meta WHERE field_name = ?",
+                f"SELECT 1 FROM {self.storage._quote_identifier(table_name + '_fields_meta')} WHERE field_name = ?",
                 [field_name]
             ).fetchone()
             
             if field_exists:
                 # 创建索引，使用引号包裹字段名
-                index_name = f"idx_{field_name}"
+                index_name = f"idx_{table_name}_{field_name}"
                 quoted_field_name = self._quote_identifier(field_name)
+                quoted_table = self.storage._quote_identifier(table_name)
                 cursor.execute(f"""
                     CREATE INDEX IF NOT EXISTS {index_name}
-                    ON records({quoted_field_name})
+                    ON {quoted_table}({quoted_field_name})
                 """)
                 cursor.execute("ANALYZE")
             else:
@@ -449,128 +330,29 @@ class Query:
         except Exception as e:
             raise ValueError(f"Failed to create index: {str(e)}")
 
-    def retrieve(self, id_: int) -> Dict[str, Any]:
-        """
-        Retrieve a single record by ID.
-
-        Parameters:
-            id_: int
-                The ID of the record to retrieve.
-
-        Returns:
-            Dict[str, Any]: The record if found, None otherwise.
-        """
-        try:
-            # 获取所有字段名（除了_id）
-            fields = self.list_fields()
-            if not fields:
-                return None
-            fields_str = ', '.join(f'"{field}"' for field in fields)
-            
-            result = self.storage.conn.execute(
-                f"SELECT {fields_str} FROM records WHERE _id = ?",
-                [id_]
-            ).fetchone()
-            
-            if result:
-                # 构建结果字典，不包含内部ID
-                record = {}
-                for i, value in enumerate(result):
-                    if value is not None:
-                        # 尝试解析JSON字符串
-                        if isinstance(value, str):
-                            try:
-                                parsed_value = json.loads(value)
-                                record[fields[i]] = parsed_value
-                            except json.JSONDecodeError:
-                                record[fields[i]] = value
-                        else:
-                            record[fields[i]] = value
-                return record
-            return None
-        except Exception as e:
-            raise ValueError(f"Failed to retrieve record: {str(e)}")
-
-    def retrieve_many(self, ids: List[int]) -> List[Dict[str, Any]]:
-        """
-        Retrieve multiple records by their IDs.
-
-        Parameters:
-            ids: List[int]
-                List of record IDs to retrieve.
-
-        Returns:
-            List[Dict[str, Any]]: List of retrieved records.
-        """
-        if not ids:
-            return []
-
-        try:
-            cursor = self.storage.conn.cursor()
-            
-            # 获取所有字段名（除了_id）
-            fields = self.list_fields()
-            if not fields:
-                return []
-            fields_str = ', '.join(f'"{field}"' for field in fields)
-
-            # 使用参数化查询
-            placeholders = ','.join('?' * len(ids))
-            query = f"""
-                SELECT _id, {fields_str}
-                FROM records
-                WHERE _id IN ({placeholders})
-                ORDER BY _id
-            """
-            
-            results = cursor.execute(query, ids).fetchall()
-
-            # 构建ID到记录的映射
-            id_to_record = {}
-            for row in results:
-                record_id = row[0]  # 第一列是_id
-                if any(row[1:]):  # 检查是否有任何非空字段
-                    record = {}
-                    for i, value in enumerate(row[1:], 0):  # 跳过_id列
-                        if value is not None:
-                            # 尝试解析JSON字符串
-                            if isinstance(value, str):
-                                try:
-                                    parsed_value = json.loads(value)
-                                    record[fields[i]] = parsed_value
-                                except json.JSONDecodeError:
-                                    record[fields[i]] = value
-                            else:
-                                record[fields[i]] = value
-                    id_to_record[record_id] = record
-
-            # 按照输入ID的顺序返回记录
-            return [id_to_record.get(id_) for id_ in ids]
-
-        except Exception as e:
-            raise ValueError(f"Failed to retrieve records: {str(e)}")
-
     def _create_temp_indexes(self, field: str, json_path: str):
         """
-        为 JSON 路径创建临时索引。
+        为JSON路径创建临时索引。
 
         Parameters:
             field: str
                 字段名
             json_path: str
-                JSON 路径
+                JSON路径
         """
         try:
+            table_name = self.storage.current_table
             cursor = self.storage.conn.cursor()
             
             # 生成安全的索引名
             safe_path = json_path.replace('$', '').replace('.', '_').replace('[', '_').replace(']', '_')
-            index_name = f"idx_json_{field}_{safe_path.strip('_')}"
+            index_name = f"idx_json_{table_name}_{field}_{safe_path.strip('_')}"
+            quoted_table = self.storage._quote_identifier(table_name)
             
             # 创建索引
             cursor.execute(f"""
                 CREATE INDEX IF NOT EXISTS {index_name}
-                ON records(json_extract({field}, ?))
+                ON {quoted_table}(json_extract({field}, ?))
             """, (json_path,))
             
             # 分析新创建的索引
@@ -615,3 +397,4 @@ class Query:
                     return False
 
         return True
+    

@@ -53,3 +53,5 @@ Cargo.lock
 *.wal
 *.tmp
 *.cursorrules
+
+*.ipynb
