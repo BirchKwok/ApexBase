@@ -2,11 +2,8 @@ name: Build and Release
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  release:
-    types: [created]
+    tags:
+      - 'v*'
 
 jobs:
   test:
@@ -35,8 +32,6 @@ jobs:
   build-and-publish:
     needs: test
     runs-on: ubuntu-latest
-    if: github.event_name == 'release' && github.event.action == 'created'
-
     steps:
     - uses: actions/checkout@v3
     - name: Set up Python
