@@ -133,6 +133,7 @@ client.rebuild_search_index()
   - pandas
   - pyarrow
   - polars
+  - numpy
 
 ## License
 
