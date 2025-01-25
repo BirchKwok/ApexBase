@@ -306,12 +306,25 @@ class ApexClient:
 
     def count_rows(self, table_name: str = None):
         """
-        Returns the number of rows in the current table or a specified table.
+        Returns the number of rows in a specified table or the current table.
+
+        Parameters:
+            table_name: str
+                The table name, or None to use the current table
+
+        Returns:
+            int: The number of rows in the table
         """
-        if table_name is None:
-            table_name = self.current_table
-            
         return self.storage.count_rows(table_name)
 
-    def __del__(self):
+    def close(self):
+        """
+        Close the database connection.
+        """
         self.storage.close()
+
+    def __del__(self):
+        """
+        Destructor to ensure the database connection is closed.
+        """
+        self.close()
