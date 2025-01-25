@@ -391,3 +391,12 @@ class Query:
 
         return True
     
+    def retrieve_all(self) -> ResultView:
+        """
+        Retrieve all records.
+
+        Returns:
+            ResultView: The result view
+        """
+        return self.query("1=1")
+    

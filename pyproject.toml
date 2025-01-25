@@ -4,18 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "apexbase"
-version = "0.1.0"
+version = "0.0.1"
 authors = [
     { name = "Birch Kwok", email = "birchkwok@gmail.com" }
 ]
-description = "A simple and efficient database for small and medium-sized projects"
+description = "A lightning-fast, feature-rich embedded database designed for modern Python applications."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "orjson",
     "pandas",
     "pyarrow",
-    "polars"
+    "polars",
+    "numpy"
 ]
 
 [tool.setuptools]

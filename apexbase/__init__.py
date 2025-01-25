@@ -1,9 +1,11 @@
 from typing import List, Dict, Union, Optional
-import os
 from pathlib import Path
 
 from .storage import Storage
 from .query import Query, ResultView
+
+
+version = "0.0.1"
 
 
 class ApexClient:
@@ -155,24 +157,9 @@ class ApexClient:
             List[dict]: The list of record data
         """
         return self.query_handler.retrieve_many(ids)
-
-    def concat(self, other: 'ApexClient') -> 'ApexClient':
-        """
-        Concatenate two caches.
-
-        Parameters:
-            other: ApexClient
-                Another cache to concatenate.
-
-        Returns:
-            ApexClient: The concatenated cache.
-        """
-        if not isinstance(other, ApexClient):
-            raise ValueError("The other cache must be an instance of ApexClient.")
-        records = list(other.storage.retrieve_all())
-        if records:
-            self.store(records)
-        return self
+    
+    def retrieve_all(self) -> ResultView:
+        return self.query_handler.retrieve_all()
 
     def list_fields(self):
         """
