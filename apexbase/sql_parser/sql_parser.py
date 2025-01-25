@@ -4,7 +4,7 @@ import re
 from enum import Enum, auto
 
 class NodeType(Enum):
-    """节点类型枚举"""
+    """Node type enumeration"""
     LITERAL = auto()
     IDENTIFIER = auto()
     BINARY_OP = auto()
@@ -23,13 +23,13 @@ class NodeType(Enum):
     SUBQUERY = auto()
 
 class Node:
-    """AST节点基类"""
+    """AST node base class"""
     def __init__(self, node_type: NodeType, location: Optional[tuple] = None):
         self.type = node_type
         self.location = location  # (start_pos, end_pos)
 
 class Literal(Node):
-    """字面量节点"""
+    """Literal node"""
     def __init__(self, value: Any, location: Optional[tuple] = None):
         super().__init__(NodeType.LITERAL, location)
         self.value = value
@@ -43,34 +43,34 @@ class Literal(Node):
             self.value_type = 'string'
 
 class Identifier(Node):
-    """标识符节点"""
+    """Identifier node"""
     def __init__(self, name: str, quoted: bool = False, location: Optional[tuple] = None):
         super().__init__(NodeType.IDENTIFIER, location)
         self.name = name
         self.quoted = quoted
 
 class JsonPath(Node):
-    """JSON路径节点"""
+    """JSON path node"""
     def __init__(self, field: str, path: str, location: Optional[tuple] = None):
         super().__init__(NodeType.JSON_PATH, location)
         self.field = field
         self.path = path
 
 class BinaryOp(Node):
-    """二元操作符节点"""
+    """Binary operator node"""
     def __init__(self, left: Node, right: Union[Node, tuple], operator: str, location: Optional[tuple] = None):
         super().__init__(NodeType.BINARY_OP, location)
         self.left = left
         self.right = right
         self.operator = operator
         
-        # 验证BETWEEN操作符的参数
+        # Validate BETWEEN operator parameters
         if operator == 'BETWEEN':
             if not isinstance(right, tuple) or len(right) != 2:
                 raise ValueError("BETWEEN operator requires exactly two values")
 
 class FunctionCall(Node):
-    """函数调用节点"""
+    """Function call node"""
     def __init__(self, name: str, args: List[Node], distinct: bool = False, location: Optional[tuple] = None):
         super().__init__(NodeType.FUNCTION_CALL, location)
         self.name = name
@@ -78,7 +78,7 @@ class FunctionCall(Node):
         self.distinct = distinct
 
 class LogicalOp(Node):
-    """逻辑操作符节点"""
+    """Logical operator node"""
     def __init__(self, left: Node, operator: str, right: Optional[Node] = None, location: Optional[tuple] = None):
         super().__init__(NodeType.LOGICAL_OP, location)
         self.left = left
@@ -86,13 +86,13 @@ class LogicalOp(Node):
         self.right = right
 
 class OrderBy(Node):
-    """排序节点"""
+    """Order by node"""
     def __init__(self, expressions: List[tuple[Node, str]], location: Optional[tuple] = None):
         super().__init__(NodeType.ORDER_BY, location)
         self.expressions = expressions
 
 class Between(Node):
-    """BETWEEN节点"""
+    """Between node"""
     def __init__(self, expr: Node, start: Node, end: Node, location: Optional[tuple] = None):
         super().__init__(NodeType.BETWEEN, location)
         self.expr = expr
@@ -100,28 +100,28 @@ class Between(Node):
         self.end = end
 
 class InList(Node):
-    """IN列表节点"""
+    """In list node"""
     def __init__(self, expr: Node, values: List[Node], location: Optional[tuple] = None):
         super().__init__(NodeType.IN_LIST, location)
         self.expr = expr
         self.values = values
 
 class IsNull(Node):
-    """IS NULL节点"""
+    """IS NULL node"""
     def __init__(self, expr: Node, is_not: bool = False, location: Optional[tuple] = None):
         super().__init__(NodeType.IS_NULL, location)
         self.expr = expr
         self.is_not = is_not
 
 class CaseWhen(Node):
-    """CASE WHEN节点"""
+    """CASE WHEN node"""
     def __init__(self, conditions: List[tuple[Node, Node]], else_result: Optional[Node] = None, location: Optional[tuple] = None):
         super().__init__(NodeType.CASE_WHEN, location)
         self.conditions = conditions
         self.else_result = else_result
 
 class TokenType(Enum):
-    """Token 类型枚举"""
+    """Token type enumeration"""
     IDENTIFIER = 'IDENTIFIER'
     NUMBER = 'NUMBER'
     STRING = 'STRING'
@@ -154,7 +154,7 @@ class TokenType(Enum):
 
 @dataclass
 class Token:
-    """词法单元"""
+    """Lexical unit"""
     type: str
     value: Any
     position: Optional[int] = None
@@ -166,9 +166,9 @@ class Token:
         return self.__str__()
 
 class SQLLexer:
-    """SQL 词法分析器"""
+    """SQL lexer"""
     def __init__(self):
-        # 所有操作符和关键字都使用大写形式存储
+        # All operators and keywords are stored in uppercase
         self.operators = {'=', '>', '<', '>=', '<=', '!=', 'LIKE', 'IN', 'IS NULL', 'IS NOT NULL', 'BETWEEN'}
         self.logical = {'AND', 'OR', 'NOT'}
         self.keywords = {
@@ -186,20 +186,20 @@ class SQLLexer:
         self.column = 1
 
     def reset(self, text: str):
-        """重置词法分析器状态"""
+        """Reset lexer state"""
         self.text = text.strip()
         self.pos = 0
         self.line = 1
         self.column = 1
 
     def peek(self) -> str:
-        """查看下一个字符但不移动位置"""
+        """Peek at the next character without moving position"""
         if self.pos < len(self.text):
             return self.text[self.pos]
         return ''
 
     def advance(self):
-        """移动到下一个字符"""
+        """Move to the next character"""
         if self.text[self.pos] == '\n':
             self.line += 1
             self.column = 1
@@ -208,35 +208,35 @@ class SQLLexer:
         self.pos += 1
 
     def skip_whitespace(self):
-        """跳过空白字符"""
+        """Skip whitespace characters"""
         while self.pos < len(self.text) and self.text[self.pos].isspace():
             self.advance()
 
     def read_number(self) -> Token:
-        """读取数字"""
+        """Read number"""
         start_pos = self.pos
         num = ''
         
-        # 处理负号
+        # Handle negative sign
         if self.peek() == '-':
             num = '-'
             self.advance()
         
-        # 读取整数部分
+        # Read integer part
         while self.pos < len(self.text) and self.text[self.pos].isdigit():
             num += self.text[self.pos]
             self.advance()
         
-        # 处理小数点
+        # Handle decimal point
         if self.pos < len(self.text) and self.text[self.pos] == '.':
             num += '.'
             self.advance()
-            # 读取小数部分
+            # Read fractional part
             while self.pos < len(self.text) and self.text[self.pos].isdigit():
                 num += self.text[self.pos]
                 self.advance()
         
-        # 处理科学计数法
+        # Handle scientific notation
         if self.pos < len(self.text) and self.text[self.pos].lower() == 'e':
             num += self.text[self.pos]
             self.advance()
@@ -250,52 +250,52 @@ class SQLLexer:
         return Token(TokenType.NUMBER, float(num) if '.' in num or 'e' in num.lower() else int(num), (start_pos, self.pos))
 
     def read_string(self) -> Token:
-        """读取字符串字面量"""
+        """Read string literal"""
         start_pos = self.pos
         quote = self.text[self.pos]
-        self.advance()  # 跳过开始引号
+        self.advance()  # Skip start quote
         string = ''
 
         while self.pos < len(self.text):
             if self.text[self.pos] == quote and (self.pos + 1 >= len(self.text) or self.text[self.pos + 1] != quote):
-                # 字符串结束
-                self.advance()  # 跳过结束引号
+                # String ends
+                self.advance()  # Skip end quote
                 return Token(TokenType.STRING, string, (start_pos, self.pos))
             elif self.text[self.pos] == quote and self.pos + 1 < len(self.text) and self.text[self.pos + 1] == quote:
-                # 处理转义的引号
+                # Handle escaped quotes
                 string += quote
-                self.advance()  # 跳过第一个引号
-                self.advance()  # 跳过第二个引号
+                self.advance()  # Skip first quote
+                self.advance()  # Skip second quote
             else:
                 string += self.text[self.pos]
                 self.advance()
 
-        # 如果到达文本末尾但没有找到结束引号
+        # If end of text is reached without finding a closing quote
         raise ValueError(f"Unterminated string at position {start_pos}")
 
     def read_identifier(self) -> Token:
-        """读取标识符或关键字"""
+        """Read identifier or keyword"""
         start_pos = self.pos
         identifier = ''
         
-        # 处理引号包裹的标识符
+        # Handle quoted identifiers
         if self.text[self.pos] in ('"', '`'):
             quote = self.text[self.pos]
-            self.advance()  # 跳过开始引号
+            self.advance()  # Skip start quote
             while self.pos < len(self.text) and self.text[self.pos] != quote:
                 identifier += self.text[self.pos]
                 self.advance()
             if self.pos >= len(self.text):
                 raise ValueError(f"Unterminated quoted identifier at position {start_pos}")
-            self.advance()  # 跳过结束引号
+            self.advance()  # Skip end quote
             return Token(TokenType.IDENTIFIER, identifier, (start_pos, self.pos))
         
-        # 处理普通标识符
+        # Handle normal identifiers
         while self.pos < len(self.text) and (self.text[self.pos].isalnum() or self.text[self.pos] == '_'):
             identifier += self.text[self.pos]
             self.advance()
         
-        # 转换为大写进行比较，但保留原始大小写
+        # Convert to uppercase for comparison, but preserve original case
         upper_identifier = identifier.upper()
         if upper_identifier in self.functions:
             return Token(TokenType.FUNCTION, upper_identifier, (start_pos, self.pos))
@@ -308,7 +308,7 @@ class SQLLexer:
             return Token(TokenType.IDENTIFIER, identifier, (start_pos, self.pos))
 
     def read_operator(self) -> Token:
-        """读取操作符"""
+        """Read operator"""
         start_pos = self.pos
         if self.text[self.pos:self.pos + 2] in {'>=', '<=', '!=', '<>'}:
             op = self.text[self.pos:self.pos + 2]
@@ -321,39 +321,39 @@ class SQLLexer:
             return Token(TokenType.OPERATOR, op, (start_pos, self.pos))
 
     def tokenize(self, text: str) -> List[Token]:
-        """将输入文本转换为token列表"""
+        """Convert input text to token list"""
         self.reset(text)
         tokens = []
         
         while self.pos < len(self.text):
             char = self.text[self.pos]
             
-            # 跳过空白字符
+            # Skip whitespace characters
             if char.isspace():
                 self.skip_whitespace()
                 continue
             
-            # 处理数字
+            # Handle numbers
             if char.isdigit() or (char == '-' and self.pos + 1 < len(self.text) and self.text[self.pos + 1].isdigit()):
                 tokens.append(self.read_number())
                 continue
             
-            # 处理字符串
+            # Handle strings
             if char in ('"', "'", '`'):
                 tokens.append(self.read_string())
                 continue
             
-            # 处理标识符和关键字
+            # Handle identifiers and keywords
             if char.isalpha() or char == '_' or char in ('"', '`'):
                 tokens.append(self.read_identifier())
                 continue
             
-            # 处理操作符
+            # Handle operators
             if char in {'=', '>', '<', '!'}:
                 tokens.append(self.read_operator())
                 continue
             
-            # 处理括号和其他符号
+            # Handle parentheses and other symbols
             if char == '(':
                 tokens.append(Token(TokenType.LPAREN, char, (self.pos, self.pos + 1)))
                 self.advance()
@@ -384,13 +384,13 @@ class SQLLexer:
         return tokens
 
 class SQLParser:
-    """SQL 解析器"""
+    """SQL parser"""
     def __init__(self):
         self.tokens = []
         self.token_index = -1
 
     def parse(self, text):
-        """解析 SQL 查询文本"""
+        """Parse SQL query text"""
         lexer = SQLLexer()
         self.tokens = lexer.tokenize(text)
         self.token_index = 0
@@ -406,11 +406,11 @@ class SQLParser:
 
     def eat(self, token_type):
         """
-        检查当前token是否为预期类型，如果是则消耗它
+        Check if the current token is the expected type, and if so, consume it
         
         Parameters:
             token_type: Union[str, TokenType]
-                预期的token类型
+                Expected token type
         """
         if isinstance(token_type, str):
             token_type = getattr(TokenType, token_type)
@@ -422,7 +422,7 @@ class SQLParser:
         raise ValueError(f"Expected {token_type}, got {self.current_token}")
 
     def expr(self):
-        """解析表达式"""
+        """Parse expression"""
         node = self.comparison()
 
         while self.current_token and self.current_token.type in {TokenType.AND, TokenType.OR}:
@@ -433,7 +433,7 @@ class SQLParser:
         return node
 
     def comparison(self):
-        """解析比较表达式"""
+        """Parse comparison expression"""
         node = self.term()
 
         while self.current_token and self.current_token.type in {TokenType.OPERATOR, TokenType.BETWEEN, TokenType.IS}:
@@ -443,7 +443,7 @@ class SQLParser:
                 start_value = self.term()
                 if not self.current_token or self.current_token.type != TokenType.AND:
                     raise ValueError("Expected AND after BETWEEN start value")
-                self.advance()  # 跳过 AND
+                self.advance()  # Skip AND
                 end_value = self.term()
                 node = BinaryOp(node, (start_value, end_value), 'BETWEEN')
             elif token.type == TokenType.IS:
@@ -466,11 +466,11 @@ class SQLParser:
         return node
 
     def term(self):
-        """解析项"""
+        """Parse term"""
         return self.factor()
 
     def factor(self):
-        """解析因子"""
+        """Parse factor"""
         token = self.current_token
         
         if not token:
@@ -480,12 +480,12 @@ class SQLParser:
             node = Identifier(token.value)
             self.advance()
             
-            # 检查是否有比较运算符
+            # Check for comparison operator
             if self.current_token and self.current_token.type == TokenType.OPERATOR:
                 operator = self.current_token.value
                 self.advance()
                 
-                # 获取右侧值
+                # Get right value
                 if not self.current_token:
                     raise ValueError("Expected value after operator")
                 
@@ -526,7 +526,7 @@ class SQLParser:
         raise ValueError(f"Unexpected token: {token}")
 
     def function_call(self):
-        """解析函数调用"""
+        """Parse function call"""
         token = self.current_token
         self.advance()
         self.eat(TokenType.LPAREN)
@@ -542,20 +542,20 @@ class SQLParser:
         return FunctionCall(token.value, args)
 
 class SQLGenerator:
-    """SQL 生成器"""
+    """SQL generator"""
     def __init__(self):
         self.parameters = []
 
     def reset(self):
-        """重置生成器状态"""
+        """Reset generator state"""
         self.parameters = []
 
     def get_parameters(self):
-        """获取参数列表"""
+        """Get parameter list"""
         return self.parameters
 
     def generate(self, node):
-        """生成 SQL 表达式"""
+        """Generate SQL expression"""
         if isinstance(node, BinaryOp):
             left = self.generate(node.left)
             right = self.generate(node.right)
@@ -574,10 +574,10 @@ class SQLGenerator:
                 if len(node.args) != 2:
                     raise ValueError("json_extract function requires exactly 2 arguments")
                 
-                # 第一个参数是字段名
+                # First argument is field name
                 field = self.generate(node.args[0])
                 
-                # 第二个参数是JSON路径
+                # Second argument is JSON path
                 if not isinstance(node.args[1], Literal) or not isinstance(node.args[1].value, str):
                     raise ValueError("Second argument of json_extract must be a string literal")
                 
@@ -587,5 +587,4 @@ class SQLGenerator:
                 args = [self.generate(arg) for arg in node.args]
                 return f"{node.name}({', '.join(args)})"
         else:
-            raise ValueError(f"Unsupported node type: {type(node)}") 
             raise ValueError(f"Unsupported node type: {type(node)}") 

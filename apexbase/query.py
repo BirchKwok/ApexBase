@@ -3,14 +3,13 @@ import re
 import sqlite3
 from collections import OrderedDict
 
-from .limited_dict import LimitedDict
 from .sql_parser import SQLParser, SQLGenerator
 import pandas as pd
 import pyarrow as pa
 
 
 class LRUCache(OrderedDict):
-    """LRU缓存实现"""
+    """LRU cache implementation"""
     def __init__(self, maxsize=1000):
         super().__init__()
         self.maxsize = maxsize
@@ -32,29 +31,28 @@ class LRUCache(OrderedDict):
 
 
 class ResultView:
-    """查询结果视图，支持延迟执行和LRU缓存"""
-    _global_cache = LRUCache(maxsize=1000)  # 全局LRU缓存
+    """Query result view, supports lazy execution and LRU cache"""
+    _global_cache = LRUCache(maxsize=1000)
 
     def __init__(self, storage, query_sql: str, params: tuple = None):
         self.storage = storage
         self.query_sql = query_sql
         self.params = params if params is not None else ()
-        self._executed = False  # 标记是否已执行查询
-        self._cache_key = f"{query_sql}:{params}"  # 缓存键
+        self._executed = False
+        self._cache_key = f"{query_sql}:{params}"
 
     def _execute_query(self):
-        """执行查询并缓存结果"""
+        """Execute the query and cache the result"""
         if not self._executed:
-            # 尝试从缓存获取结果
+            # Try to get the result from the cache
             cached_result = self._global_cache.get(self._cache_key)
             if cached_result is not None:
                 self._ids, self._results = cached_result
             else:
-                # 执行查询并缓存结果
                 try:
                     cursor = self.storage.conn.cursor()
                     self._ids = [row[0] for row in cursor.execute(self.query_sql, self.params)]
-                    self._results = None  # 延迟加载记录
+                    self._results = None
                     self._global_cache.put(self._cache_key, (self._ids, self._results))
                 except sqlite3.OperationalError as e:
                     raise ValueError(f"Invalid query syntax: {str(e)}")
@@ -62,40 +60,40 @@ class ResultView:
 
     @property
     def ids(self) -> List[int]:
-        """获取结果的ID列表，使用缓存"""
+        """Get the list of IDs for the result, using cache"""
         if not self._executed:
             self._execute_query()
         return self._ids
 
     def to_dict(self) -> List[dict]:
-        """将结果转换为字典列表，使用缓存"""
+        """Convert the result to a list of dictionaries, using cache"""
         if not self._executed:
             self._execute_query()
         
-        # 检查缓存中是否有完整结果
+        # Check if the full result is in the cache
         cached_result = self._global_cache.get(self._cache_key)
         if cached_result and cached_result[1] is not None:
             return cached_result[1]
         
-        # 获取完整记录并更新缓存
+        # Get the full records and update the cache
         self._results = self.storage.retrieve_many(self._ids)
         self._global_cache.put(self._cache_key, (self._ids, self._results))
         return self._results
 
     def __len__(self):
-        """返回结果数量，触发查询执行"""
+        """Return the number of results, triggering query execution"""
         return len(self.ids)
 
     def __getitem__(self, idx):
-        """通过索引访问结果，使用缓存"""
+        """Access the result by index, using cache"""
         return self.to_dict()[idx]
 
     def __iter__(self):
-        """迭代结果，使用缓存"""
+        """Iterate over the result, using cache"""
         return iter(self.to_dict())
 
     def to_pandas(self) -> "pd.DataFrame":
-        """将结果转换为Pandas DataFrame，使用缓存，并将_id设置为无名称索引"""
+        """Convert the result to a Pandas DataFrame, using cache, and set _id as an unnamed index"""
         data = self.to_dict()
         df = pd.DataFrame(data)
         if '_id' in df.columns:
@@ -104,8 +102,8 @@ class ResultView:
         return df
 
     def to_arrow(self) -> "pa.Table":
-        """将结果转换为PyArrow Table，使用缓存，并将_id设置为索引"""
-        df = self.to_pandas()  # 已经设置了_id为索引
+        """Convert the result to a PyArrow Table, using cache, and set _id as an index"""
+        df = self.to_pandas()  # _id is already set as an index
         return pa.Table.from_pandas(df)
 
 
@@ -133,23 +131,22 @@ class Query:
         self.storage = storage
         self.parser = SQLParser()
         self.generator = SQLGenerator()
-        self._query_cache = LimitedDict(1000)  # 缓存查询结果
 
     def _quote_identifier(self, identifier: str) -> str:
         """
-        正确转义 SQLite 标识符。
+        Correctly escape SQLite identifiers.
 
         Parameters:
             identifier: str
-                需要转义的标识符
+                The identifier to escape
 
         Returns:
-            str: 转义后的标识符
+            str: The escaped identifier
         """
         return f'"{identifier}"'
 
     def _build_query_sql(self, query_filter: str = None) -> Tuple[str, tuple]:
-        """构建查询SQL语句"""
+        """Build the query SQL statement"""
         table_name = self.storage._get_table_name(None)
         quoted_table = self.storage._quote_identifier(table_name)
         
@@ -158,10 +155,8 @@ class Query:
             return sql, ()
         
         try:
-            # 使用 SQLParser 解析查询
             ast = self.parser.parse(query_filter)
             
-            # 使用 SQLGenerator 生成 SQL 和参数
             self.generator.reset()
             where_clause = self.generator.generate(ast)
             params = self.generator.get_parameters()
@@ -174,19 +169,18 @@ class Query:
 
     def query(self, query_filter: str = None) -> ResultView:
         """
-        使用SQL语法查询记录。
+        Query records using SQL syntax.
 
         Parameters:
             query_filter: str
-                SQL过滤条件。例如：
+                SQL filter conditions. For example:
                 - age > 30
                 - name LIKE 'John%'
                 - age > 30 AND city = 'New York'
                 - field IN (1, 2, 3)
-                不支持 ORDER BY, GROUP BY, HAVING 等语句
 
         Returns:
-            ResultView: 查询结果视图
+            ResultView: The query result view
         """
         if not isinstance(query_filter, str) or not query_filter.strip():
             raise ValueError("Invalid query syntax")
@@ -199,30 +193,30 @@ class Query:
 
     def search_text(self, text: str, fields: List[str] = None, table_name: str = None) -> ResultView:
         """
-        全文搜索。
+        Full-text search.
 
         Parameters:
             text: str
-                搜索文本
+                The search text
             fields: List[str]
-                要搜索的字段列表，如果为None则搜索所有可搜索字段
+                The list of fields to search, if None, search all searchable fields
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, if None, use the current table
 
         Returns:
-            ResultView: 搜索结果视图
+            ResultView: The search result view
         """
         table_name = self.storage._get_table_name(table_name)
         quoted_fts = self.storage._quote_identifier(table_name + '_fts')
         
-        # 获取可搜索字段
+        # Get searchable fields
         if fields:
             field_list = [f"'{field}'" for field in fields]
             field_filter = f"AND field_name IN ({','.join(field_list)})"
         else:
             field_filter = ""
         
-        # 构建FTS查询
+        # Build FTS query
         sql = f"""
             SELECT DISTINCT record_id as _id
             FROM {quoted_fts}
@@ -234,36 +228,36 @@ class Query:
 
     def retrieve(self, id_: int) -> Optional[dict]:
         """
-        检索单条记录。
+        Retrieve a single record.
 
         Parameters:
             id_: int
-                记录ID
+                The record ID
 
         Returns:
-            Optional[dict]: 记录数据，如果不存在则返回None
+            Optional[dict]: The record data, or None if it doesn't exist
         """
         return self.storage.retrieve(id_)
 
     def retrieve_many(self, ids: List[int]) -> List[dict]:
         """
-        批量检索记录。
+        Retrieve multiple records.
 
         Parameters:
             ids: List[int]
-                记录ID列表
+                The list of record IDs
 
         Returns:
-            List[dict]: 记录数据列表
+            List[dict]: The list of record data
         """
         return self.storage.retrieve_many(ids)
 
     def list_fields(self) -> List[str]:
         """
-        获取当前表的所有可用字段列表。
+        Get the list of all available fields for the current table.
 
         Returns:
-            List[str]: 字段名列表
+            List[str]: The list of field names
         """
         try:
             cursor = self.storage.conn.cursor()
@@ -277,14 +271,14 @@ class Query:
 
     def get_field_type(self, field_name: str) -> Optional[str]:
         """
-        获取字段类型。
+        Get the field type.
 
         Parameters:
             field_name: str
-                字段名称
+                The field name
 
         Returns:
-            Optional[str]: 字段类型，如果字段不存在则返回None
+            Optional[str]: The field type, or None if the field doesn't exist
         """
         try:
             table_name = self.storage.current_table
@@ -299,24 +293,23 @@ class Query:
 
     def create_field_index(self, field_name: str):
         """
-        为指定字段创建索引。
+        Create an index for a specified field.
 
         Parameters:
             field_name: str
-                字段名称
+                The field name
         """
         try:
             table_name = self.storage.current_table
             cursor = self.storage.conn.cursor()
             
-            # 检查字段是否存在
+            # Check if the field exists
             field_exists = cursor.execute(
                 f"SELECT 1 FROM {self.storage._quote_identifier(table_name + '_fields_meta')} WHERE field_name = ?",
                 [field_name]
             ).fetchone()
             
             if field_exists:
-                # 创建索引，使用引号包裹字段名
                 index_name = f"idx_{table_name}_{field_name}"
                 quoted_field_name = self._quote_identifier(field_name)
                 quoted_table = self.storage._quote_identifier(table_name)
@@ -332,66 +325,66 @@ class Query:
 
     def _create_temp_indexes(self, field: str, json_path: str):
         """
-        为JSON路径创建临时索引。
+        Create temporary indexes for JSON paths.
 
         Parameters:
             field: str
-                字段名
+                The field name
             json_path: str
-                JSON路径
+                The JSON path
         """
         try:
             table_name = self.storage.current_table
             cursor = self.storage.conn.cursor()
             
-            # 生成安全的索引名
+            # Generate a safe index name
             safe_path = json_path.replace('$', '').replace('.', '_').replace('[', '_').replace(']', '_')
             index_name = f"idx_json_{table_name}_{field}_{safe_path.strip('_')}"
             quoted_table = self.storage._quote_identifier(table_name)
             
-            # 创建索引
+            # Create index
             cursor.execute(f"""
                 CREATE INDEX IF NOT EXISTS {index_name}
                 ON {quoted_table}(json_extract({field}, ?))
             """, (json_path,))
             
-            # 分析新创建的索引
+            # Analyze the newly created index
             cursor.execute("ANALYZE")
         except Exception as e:
-            # 如果创建索引失败，记录错误但继续执行
+            # If index creation fails, record the error but continue execution
             print(f"Warning: Failed to create JSON index: {str(e)}")
 
     def _validate_json_path(self, json_path: str) -> bool:
         """
-        验证 JSON 路径语法。
+        Validate the JSON path syntax.
 
         Parameters:
             json_path: str
-                JSON 路径表达式，例如 '$.name' 或 '$.address.city'
+                The JSON path expression, e.g. '$.name' or '$.address.city'
 
         Returns:
-            bool: 路径语法是否有效
+            bool: Whether the path syntax is valid
         """
         if not json_path:
             return False
 
-        # 基本语法检查
+        # Basic syntax check
         if not json_path.startswith('$'):
             return False
 
-        # 检查路径组件
+        # Check path components
         parts = json_path[2:].split('.')
         for part in parts:
             if not part:
                 return False
-            # 检查数组访问语法
+            # Check array access syntax
             if '[' in part:
                 if not part.endswith(']'):
                     return False
                 array_part = part.split('[')[1][:-1]
                 if not array_part.isdigit():
                     return False
-            # 检查普通字段名
+            # Check normal field names
             else:
                 if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', part):
                     return False

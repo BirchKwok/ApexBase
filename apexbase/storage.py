@@ -10,19 +10,17 @@ import time
 
 class Storage:
     """
-    使用SQLite作为后端存储的多表存储类。
+    A multi-table storage class using SQLite as the backend.
     """
-    def __init__(self, filepath=None, cache_size: int = 1000, batch_size: int = 1000):
+    def __init__(self, filepath=None, batch_size: int = 1000):
         """
-        初始化Storage类。
+        Initializes the Storage class.
 
         Parameters:
             filepath: str
-                存储文件路径
-            cache_size: int
-                查询结果缓存的最大数量
+                The file path for storage
             batch_size: int
-                批量操作的大小
+                The size of batch operations
         """
         if filepath is None:
             raise ValueError("You must provide a file path.")
@@ -30,49 +28,35 @@ class Storage:
         self.filepath = Path(filepath)
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
 
-        # 配置参数
         self.batch_size = batch_size
-        self._query_cache = LimitedDict(cache_size)
-        self._field_cache = LimitedDict(100)  # 缓存字段信息
-        self._lock = threading.Lock()  # 添加锁用于并发控制
-        self.current_table = "default"  # 默认表名
-        self.auto_update_fts = False  # 是否自动更新FTS索引
+        self._field_cache = LimitedDict(100)
+        self._lock = threading.Lock()
+        self.current_table = "default"
+        self.auto_update_fts = False
 
-        # SQLite连接
         self.conn = sqlite3.connect(str(self.filepath), 
-                                  isolation_level=None,  # 自动提交模式，手动控制事务
-                                  check_same_thread=False)  # 允许跨线程访问
+                                  isolation_level=None,
+                                  check_same_thread=False)
         
-        # 优化SQLite配置
         cursor = self.conn.cursor()
-        # 使用WAL模式提高写入性能
         cursor.execute("PRAGMA journal_mode=WAL")
-        # 设置较大的WAL文件大小限制（64MB）
         cursor.execute("PRAGMA wal_autocheckpoint=1000")
-        # 降低同步级别提高性能
         cursor.execute("PRAGMA synchronous=NORMAL")
-        # 设置较大的页缓存（约256MB）
         cursor.execute("PRAGMA cache_size=-262144")
-        # 临时表和临时文件使用内存
         cursor.execute("PRAGMA temp_store=MEMORY")
-        # 启用内存映射，提高读取性能
-        cursor.execute("PRAGMA mmap_size=1099511627776")  # 1TB
-        # 设置较大的页大小，提高读写效率
-        cursor.execute("PRAGMA page_size=32768")  # 32KB
-        # 启用严格的外键约束
+        cursor.execute("PRAGMA mmap_size=1099511627776")
+        cursor.execute("PRAGMA page_size=32768")
         cursor.execute("PRAGMA foreign_keys=ON")
-        # 读写锁定超时设置（5分钟）
         cursor.execute("PRAGMA busy_timeout=300000")
         
         self._initialize_database()
 
     def _initialize_database(self):
         """
-        初始化SQLite数据库，创建必要的系统表。
+        Initializes the SQLite database, creating necessary system tables.
         """
         cursor = self.conn.cursor()
         
-        # 创建表管理表
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tables_meta (
                 table_name TEXT PRIMARY KEY,
@@ -80,30 +64,29 @@ class Storage:
             )
         """)
         
-        # 创建默认表
         if not self._table_exists("default"):
             self.create_table("default")
 
     def _get_table_name(self, table_name: str = None) -> str:
         """
-        获取实际的表名。
+        Gets the actual table name.
 
         Parameters:
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, or None to use the current table
 
         Returns:
-            str: 实际的表名
+            str: The actual table name
         """
         return table_name if table_name is not None else self.current_table
 
     def use_table(self, table_name: str):
         """
-        切换当前表。
+        Switches the current table.
 
         Parameters:
             table_name: str
-                要切换到的表名
+                The table name to switch to
         """
         if not self._table_exists(table_name):
             raise ValueError(f"Table '{table_name}' does not exist")
@@ -112,11 +95,11 @@ class Storage:
 
     def create_table(self, table_name: str):
         """
-        创建新表。
+        Creates a new table.
 
         Parameters:
             table_name: str
-                要创建的表名
+                The table name to create
         """
         if self._table_exists(table_name):
             return
@@ -124,14 +107,12 @@ class Storage:
         cursor = self.conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         try:
-            # 创建记录表
             cursor.execute(f"""
                 CREATE TABLE {self._quote_identifier(table_name)} (
                     _id INTEGER PRIMARY KEY AUTOINCREMENT
                 )
             """)
             
-            # 创建字段元数据表
             cursor.execute(f"""
                 CREATE TABLE {self._quote_identifier(table_name + '_fields_meta')} (
                     field_name TEXT PRIMARY KEY,
@@ -141,7 +122,6 @@ class Storage:
                 )
             """)
             
-            # 创建FTS5虚拟表
             cursor.execute(f"""
                 CREATE VIRTUAL TABLE {self._quote_identifier(table_name + '_fts')} USING fts5(
                     content,
@@ -151,7 +131,6 @@ class Storage:
                 )
             """)
             
-            # 创建触发器以保持FTS索引同步
             cursor.execute(f"""
                 CREATE TRIGGER {self._quote_identifier(table_name + '_fts_delete')} 
                 AFTER DELETE ON {self._quote_identifier(table_name)} BEGIN
@@ -160,7 +139,6 @@ class Storage:
                 END
             """)
             
-            # 记录表信息
             cursor.execute(
                 "INSERT INTO tables_meta (table_name) VALUES (?)",
                 [table_name]
@@ -174,11 +152,11 @@ class Storage:
 
     def drop_table(self, table_name: str):
         """
-        删除表。
+        Drops a table.
 
         Parameters:
             table_name: str
-                要删除的表名
+                The table name to drop
         """
         if not self._table_exists(table_name):
             return
@@ -190,18 +168,15 @@ class Storage:
         try:
             cursor.execute("BEGIN IMMEDIATE")
             
-            # 删除相关的所有表和触发器
             cursor.execute(f"DROP TABLE IF EXISTS {self._quote_identifier(table_name)}")
             cursor.execute(f"DROP TABLE IF EXISTS {self._quote_identifier(table_name + '_fields_meta')}")
             cursor.execute(f"DROP TABLE IF EXISTS {self._quote_identifier(table_name + '_fts')}")
             cursor.execute(f"DROP TRIGGER IF EXISTS {self._quote_identifier(table_name + '_fts_delete')}")
             
-            # 从表管理表中删除记录
             cursor.execute("DELETE FROM tables_meta WHERE table_name = ?", [table_name])
             
             cursor.execute("COMMIT")
             
-            # 如果删除的是当前表，切换到默认表
             if self.current_table == table_name:
                 self.use_table("default")
             
@@ -213,24 +188,24 @@ class Storage:
 
     def list_tables(self) -> List[str]:
         """
-        列出所有表。
+        Lists all tables.
 
         Returns:
-            List[str]: 表名列表
+            List[str]: The list of table names
         """
         cursor = self.conn.cursor()
         return [row[0] for row in cursor.execute("SELECT table_name FROM tables_meta ORDER BY table_name")]
 
     def _table_exists(self, table_name: str) -> bool:
         """
-        检查表是否存在。
+        Checks if a table exists.
 
         Parameters:
             table_name: str
-                要检查的表名
+                The table name to check
 
         Returns:
-            bool: 表是否存在
+            bool: Whether the table exists
         """
         cursor = self.conn.cursor()
         return cursor.execute(
@@ -240,44 +215,41 @@ class Storage:
 
     def _quote_identifier(self, identifier: str) -> str:
         """
-        正确转义 SQLite 标识符。
+        Correctly escapes SQLite identifiers.
 
         Parameters:
             identifier: str
-                需要转义的标识符
+                The identifier to escape
 
         Returns:
-            str: 转义后的标识符
+            str: The escaped identifier
         """
         return f'"{identifier}"'
 
     def _ensure_field_exists(self, field_name: str, field_type: str, is_searchable: bool = True, table_name: str = None):
         """
-        确保字段存在，如不存在则创建。
+        Ensures a field exists, creating it if it doesn't.
 
         Parameters:
             field_name: str
-                字段名称
+                The field name
             field_type: str
-                字段类型 (TEXT, INTEGER, REAL, etc.)
+                The field type (TEXT, INTEGER, REAL, etc.)
             is_searchable: bool
-                是否为可搜索字段
+                Whether the field is searchable
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, or None to use the current table
         """
         table_name = self._get_table_name(table_name)
         try:
-            # 检查字段是否已存在
             result = self.conn.execute(
                 f"SELECT field_type FROM {self._quote_identifier(table_name + '_fields_meta')} WHERE field_name = ?",
                 [field_name]
             ).fetchone()
             
             if not result:
-                # 添加字段到表，使用引号包裹字段名
                 quoted_field_name = self._quote_identifier(field_name)
                 self.conn.execute(f"ALTER TABLE {self._quote_identifier(table_name)} ADD COLUMN {quoted_field_name} {field_type}")
-                # 记录字段元数据
                 self.conn.execute(
                     f"INSERT INTO {self._quote_identifier(table_name + '_fields_meta')} (field_name, field_type, is_searchable) VALUES (?, ?, ?)",
                     [field_name, field_type, 1 if is_searchable else 0]
@@ -287,61 +259,57 @@ class Storage:
 
     def _infer_field_type(self, value: Any) -> str:
         """
-        根据值推断字段类型。
+        Infers the field type based on the value.
 
         Parameters:
             value: Any
-                字段值
+                The field value
 
         Returns:
-            str: SQLite字段类型
+            str: The SQLite field type
         """
         if isinstance(value, bool):
-            return "INTEGER"  # SQLite没有布尔类型，使用INTEGER
+            return "INTEGER"
         elif isinstance(value, int):
             return "INTEGER"
         elif isinstance(value, float):
             return "REAL"
         elif isinstance(value, (list, dict)):
-            return "TEXT"  # 复杂类型序列化为JSON字符串
+            return "TEXT"
         else:
             return "TEXT"
 
     def _update_fts_index(self, record_id: int, data: dict, table_name: str = None):
         """
-        更新FTS索引。
+        Updates the FTS index.
 
         Parameters:
             record_id: int
-                记录ID
+                The record ID
             data: dict
-                记录数据
+                The record data
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, or None to use the current table
         """
         table_name = self._get_table_name(table_name)
         cursor = self.conn.cursor()
         
-        # 获取可搜索字段
         searchable_fields = cursor.execute(
             f"SELECT field_name FROM {self._quote_identifier(table_name + '_fields_meta')} WHERE is_searchable = 1"
         ).fetchall()
         
-        # 删除旧的索引内容
         cursor.execute(f"DELETE FROM {self._quote_identifier(table_name + '_fts')} WHERE record_id = ?", [record_id])
         
-        # 为每个可搜索字段添加索引
+        # Add index for each searchable field
         for (field_name,) in searchable_fields:
             if field_name in data:
                 value = data[field_name]
                 if value is not None:
-                    # 如果是复杂类型，转换为字符串
                     if isinstance(value, (list, dict)):
                         content = json.dumps(value, ensure_ascii=False)
                     else:
                         content = str(value)
                     
-                    # 转义特殊字符
                     content = content.replace(".", " ").replace("@", " ")
                     
                     cursor.execute(
@@ -351,26 +319,26 @@ class Storage:
 
     def set_auto_update_fts(self, enabled: bool):
         """
-        设置是否自动更新FTS索引。
+        Sets whether to automatically update the FTS index.
 
         Parameters:
             enabled: bool
-                是否启用自动更新
+                Whether to enable automatic updates
         """
         self.auto_update_fts = enabled
 
     def store(self, data: dict, table_name: str = None) -> int:
         """
-        在存储中存储一条记录。
+        Stores a record in the storage.
 
         Parameters:
             data: dict
-                要存储的记录
+                The record to store
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, or None to use the current table
 
         Returns:
-            int: 记录的ID
+            int: The record ID
         """
         if not isinstance(data, dict):
             raise ValueError("Only dict-type data is allowed.")
@@ -381,17 +349,15 @@ class Storage:
         
         while retry_count < max_retries:
             try:
-                with self._lock:  # 使用锁确保并发安全
+                with self._lock:
                     cursor = self.conn.cursor()
                     cursor.execute("BEGIN IMMEDIATE")
                     
-                    # 为每个字段创建列
                     for field_name, value in data.items():
-                        if field_name != '_id':  # 跳过ID字段
+                        if field_name != '_id':
                             field_type = self._infer_field_type(value)
                             self._ensure_field_exists(field_name, field_type, table_name=table_name)
                     
-                    # 构建插入语句
                     fields = [field for field in data.keys() if field != '_id']
                     placeholders = ['?' for _ in fields]
                     values = [
@@ -408,7 +374,6 @@ class Storage:
                     cursor.execute(sql, values)
                     record_id = cursor.lastrowid
                     
-                    # 如果启用了自动更新FTS索引，则更新
                     if self.auto_update_fts:
                         self._update_fts_index(record_id, data, table_name)
                     
@@ -420,7 +385,7 @@ class Storage:
                 cursor.execute("ROLLBACK")
                 if "database is locked" in str(e) and retry_count < max_retries - 1:
                     retry_count += 1
-                    time.sleep(0.1 * (2 ** retry_count))  # 指数退避
+                    time.sleep(0.1 * (2 ** retry_count))
                     continue
                 raise e
             except Exception as e:
@@ -429,16 +394,16 @@ class Storage:
 
     def batch_store(self, data_list: List[dict], table_name: str = None) -> List[int]:
         """
-        批量存储记录。
+        Batch stores records.
 
         Parameters:
             data_list: List[dict]
-                要存储的记录列表
+                The list of records to store
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, or None to use the current table
 
         Returns:
-            List[int]: 记录ID列表
+            List[int]: The list of record IDs
         """
         if not data_list:
             return []
@@ -452,21 +417,18 @@ class Storage:
                 cursor = self.conn.cursor()
                 cursor.execute("BEGIN TRANSACTION")
                 
-                # 确保所有字段都存在
                 all_fields = set()
                 for data in data_list:
                     all_fields.update(data.keys())
                 all_fields.discard('_id')
                 
                 for field_name in all_fields:
-                    # 使用第一个包含该字段的记录来推断类型
                     for data in data_list:
                         if field_name in data:
                             field_type = self._infer_field_type(data[field_name])
                             self._ensure_field_exists(field_name, field_type, table_name=table_name)
                             break
                 
-                # 批量插入记录
                 for data in data_list:
                     current_batch.append(data)
                     
@@ -475,7 +437,6 @@ class Storage:
                         record_ids.extend(batch_ids)
                         current_batch = []
                 
-                # 处理剩余的记录
                 if current_batch:
                     batch_ids = self._execute_batch_store(current_batch, table_name)
                     record_ids.extend(batch_ids)
@@ -490,16 +451,16 @@ class Storage:
 
     def _execute_batch_store(self, batch: List[dict], table_name: str) -> List[int]:
         """
-        执行批量存储操作。
+        Executes the batch store operation.
 
         Parameters:
             batch: List[dict]
-                要存储的记录批次
+                The batch of records to store
             table_name: str
-                表名
+                The table name
 
         Returns:
-            List[int]: 记录ID列表
+            List[int]: The list of record IDs
         """
         cursor = self.conn.cursor()
         record_ids = []
@@ -522,7 +483,6 @@ class Storage:
             record_id = cursor.lastrowid
             record_ids.append(record_id)
             
-            # 如果启用了自动更新FTS索引，则更新
             if self.auto_update_fts:
                 self._update_fts_index(record_id, data, table_name)
         
@@ -530,16 +490,16 @@ class Storage:
 
     def _parse_record(self, row: tuple, table_name: str = None) -> Dict[str, Any]:
         """
-        解析记录。
+        Parses a record.
 
         Parameters:
             row: tuple
-                数据库行
+                The database row
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, or None to use the current table
 
         Returns:
-            Dict[str, Any]: 解析后的记录
+            Dict[str, Any]: The parsed record
         """
         table_name = self._get_table_name(table_name)
         fields = self.list_fields(table_name=table_name)
@@ -551,26 +511,24 @@ class Storage:
                 if value is not None:
                     if field_type == 'TEXT':
                         try:
-                            # 尝试解析JSON
                             record[field_name] = json.loads(value)
                         except (json.JSONDecodeError, TypeError):
                             record[field_name] = value
                     else:
                         record[field_name] = value
         
-        record['_id'] = row[0]  # ID总是第一个字段
+        record['_id'] = row[0]
         return record
 
     def create_json_index(self, field_path: str):
         """
-        为指定的JSON字段路径创建索引。
+        Creates an index for a specified JSON field path.
 
         Parameters:
             field_path: str
-                JSON字段路径，例如 "$.name" 或 "$.address.city"
+                The JSON field path, e.g., "$.name" or "$.address.city"
         """
         try:
-            # 生成安全的索引名
             safe_name = field_path.replace('$', '').replace('.', '_').replace('[', '_').replace(']', '_')
             index_name = f"idx_json_{safe_name.strip('_')}"
             
@@ -579,7 +537,6 @@ class Storage:
                 ON records(json_extract(data, ?))
             """, (field_path,))
             
-            # 分析新创建的索引
             self.conn.execute("ANALYZE")
         except Exception as e:
             raise ValueError(f"Failed to create JSON index: {str(e)}")
@@ -622,16 +579,16 @@ class Storage:
 
     def list_fields(self, table_name: str = None, use_cache: bool = True) -> Dict[str, str]:
         """
-        列出表中的字段。
+        Lists the fields in a table.
 
         Parameters:
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, or None to use the current table
             use_cache: bool
-                是否使用缓存
+                Whether to use cache
 
         Returns:
-            Dict[str, str]: 字段名到字段类型的映射
+            Dict[str, str]: The mapping of field names to field types
         """
         table_name = self._get_table_name(table_name)
         cache_key = f"fields_{table_name}"
@@ -658,11 +615,11 @@ class Storage:
 
     def optimize(self, table_name: str = None):
         """
-        优化数据库性能。
+        Optimizes database performance.
 
         Parameters:
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, or None to use the current table
         """
         table_name = self._get_table_name(table_name)
         cursor = self.conn.cursor()
@@ -670,10 +627,8 @@ class Storage:
         try:
             cursor.execute("BEGIN TRANSACTION")
             
-            # 重建表以回收空间
             cursor.execute(f"VACUUM")
             
-            # 更新统计信息
             cursor.execute(f"ANALYZE {self._quote_identifier(table_name)}")
             cursor.execute(f"ANALYZE {self._quote_identifier(table_name + '_fields_meta')}")
             cursor.execute(f"ANALYZE {self._quote_identifier(table_name + '_fts')}")
@@ -685,24 +640,23 @@ class Storage:
             raise ValueError(f"Failed to optimize database: {str(e)}")
 
     def _get_cache_key(self, operation: str, **kwargs) -> str:
-        """生成缓存键"""
+        """Generate a cache key"""
         return f"{operation}:{orjson.dumps(kwargs).decode('utf-8')}"
 
     def _invalidate_cache(self):
-        """清除所有缓存"""
-        self._query_cache.clear()
+        """Clear all caches"""
         self._field_cache.clear()
 
     def delete(self, id_: int) -> bool:
         """
-        删除指定ID的记录。
+        Deletes a record with the specified ID.
 
         Parameters:
             id_: int
-                要删除的记录ID
+                The ID of the record to delete
 
         Returns:
-            bool: 删除是否成功
+            bool: Whether the deletion was successful
         """
         try:
             table_name = self.current_table
@@ -711,7 +665,6 @@ class Storage:
             cursor = self.conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
             try:
-                # 检查记录是否存在
                 exists = cursor.execute(
                     f"SELECT 1 FROM {quoted_table} WHERE _id = ?",
                     [id_]
@@ -720,7 +673,6 @@ class Storage:
                     cursor.execute("ROLLBACK")
                     return False
                 
-                # 删除记录
                 cursor.execute(f"DELETE FROM {quoted_table} WHERE _id = ?", [id_])
                 cursor.execute("COMMIT")
                 self._invalidate_cache()
@@ -731,19 +683,19 @@ class Storage:
         except Exception as e:
             raise ValueError(f"Failed to delete record: {str(e)}")
 
-    def batch_delete(self, ids: List[int]) -> List[int]:
+    def batch_delete(self, ids: List[int]) -> bool:
         """
-        批量删除记录。
+        Batch deletes records.  
 
         Parameters:
             ids: List[int]
-                要删除的记录ID列表
+                The list of record IDs to delete
 
         Returns:
-            List[int]: 成功删除的记录ID列表
+            List[int]: The list of record IDs that were successfully deleted
         """
         if not ids:
-            return []
+            return True
 
         try:
             table_name = self.current_table
@@ -754,21 +706,16 @@ class Storage:
             cursor.execute("BEGIN IMMEDIATE")
             
             try:
-                # 禁用触发器
                 cursor.execute("DROP TRIGGER IF EXISTS " + self._quote_identifier(table_name + '_fts_delete'))
                 
-                # 分批处理删除，每批1000条
                 batch_size = 1000
                 for i in range(0, len(ids), batch_size):
                     batch_ids = ids[i:i + batch_size]
                     placeholders = ','.join('?' * len(batch_ids))
                     
-                    # 直接删除FTS索引记录
                     cursor.execute(f"DELETE FROM {quoted_fts} WHERE record_id IN ({placeholders})", batch_ids)
-                    # 删除主表记录
                     cursor.execute(f"DELETE FROM {quoted_table} WHERE _id IN ({placeholders})", batch_ids)
                 
-                # 重新创建触发器
                 cursor.execute(f"""
                     CREATE TRIGGER {self._quote_identifier(table_name + '_fts_delete')} 
                     AFTER DELETE ON {quoted_table} BEGIN
@@ -779,27 +726,26 @@ class Storage:
                 
                 cursor.execute("COMMIT")
                 self._invalidate_cache()
-                return ids
+                return True
                 
             except Exception as e:
                 cursor.execute("ROLLBACK")
                 raise e
-                
         except Exception as e:
             raise ValueError(f"Batch deletion failed: {str(e)}")
 
     def replace(self, id_: int, data: dict) -> bool:
         """
-        替换指定ID的记录。
+        Replaces a record with the specified ID.
 
         Parameters:
             id_: int
-                要替换的记录ID
+                The ID of the record to replace
             data: dict
-                新的记录数据
+                The new record data
 
         Returns:
-            bool: 替换是否成功
+            bool: Whether the replacement was successful
         """
         if not isinstance(data, dict):
             raise ValueError("Only dict-type data is allowed.")
@@ -810,7 +756,6 @@ class Storage:
             
             cursor = self.conn.cursor()
             
-            # 检查记录是否存在
             exists = cursor.execute(
                 f"SELECT 1 FROM {quoted_table} WHERE _id = ?",
                 [id_]
@@ -820,13 +765,11 @@ class Storage:
 
             cursor.execute("BEGIN IMMEDIATE")
             try:
-                # 确保所有字段存在
                 for field_name, value in data.items():
                     if field_name != '_id':
                         field_type = self._infer_field_type(value)
                         self._ensure_field_exists(field_name, field_type, table_name=table_name)
-
-                # 处理每个字段
+        
                 field_updates = []
                 params = []
                 
@@ -834,19 +777,19 @@ class Storage:
                     if field_name != '_id':
                         quoted_field_name = self._quote_identifier(field_name)
                         field_updates.append(f"{quoted_field_name} = ?")
-                        # 如果是复杂类型，序列化为JSON
+                        # If it is a complex type, serialize to JSON
                         if isinstance(value, (list, dict)):
                             params.append(json.dumps(value))
                         else:
                             params.append(value)
 
-                # 如果有字段需要更新
+                # If there are fields to update
                 if field_updates:
                     update_sql = f"UPDATE {quoted_table} SET {', '.join(field_updates)} WHERE _id = ?"
                     params.append(id_)
                     cursor.execute(update_sql, params)
 
-                # 更新FTS索引
+                # Update the FTS index
                 self._update_fts_index(id_, data, table_name)
 
                 cursor.execute("COMMIT")
@@ -860,14 +803,14 @@ class Storage:
 
     def batch_replace(self, data_dict: Dict[int, dict]) -> List[int]:
         """
-        批量替换记录。
+        Batch replaces records.
 
         Parameters:
             data_dict: Dict[int, dict]
-                要替换的记录字典，key为记录ID，value为新的记录数据
+                The dictionary of records to replace, with keys as record IDs and values as new record data
 
         Returns:
-            List[int]: 成功替换的记录ID列表
+            List[int]: The list of record IDs that were successfully replaced
         """
         if not data_dict:
             return []
@@ -879,18 +822,18 @@ class Storage:
             cursor = self.conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
             try:
-                # 首先收集所有唯一字段并确保它们存在
+                # First collect all unique fields and ensure they exist
                 all_fields = set()
                 for data in data_dict.values():
                     for field_name, value in data.items():
                         if field_name != '_id':
                             all_fields.add((field_name, self._infer_field_type(value)))
 
-                # 批量创建所有需要的字段
+                # Batch create all required fields
                 for field_name, field_type in all_fields:
                     self._ensure_field_exists(field_name, field_type, table_name=table_name)
 
-                # 检查所有ID是否存在
+                # Check if all IDs exist
                 ids = list(data_dict.keys())
                 placeholders = ','.join('?' * len(ids))
                 existing_ids = cursor.execute(
@@ -899,7 +842,7 @@ class Storage:
                 ).fetchall()
                 existing_ids = {row[0] for row in existing_ids}
 
-                # 只更新存在的记录
+                # Only update existing records
                 success_ids = []
                 for id_, data in data_dict.items():
                     if id_ not in existing_ids:
@@ -933,28 +876,28 @@ class Storage:
 
     def search_text(self, query: str, fields: List[str] = None, table_name: str = None) -> List[int]:
         """
-        全文搜索。
+        Full-text search.
 
         Parameters:
             query: str
-                搜索查询
+                The search query
             fields: List[str]
-                要搜索的字段列表，如果为None则搜索所有可搜索字段
+                The list of fields to search, or None to search all searchable fields
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, or None to use the current table
 
         Returns:
-            List[int]: 匹配记录的ID列表
+            List[int]: The list of record IDs that matched
         """
         table_name = self._get_table_name(table_name)
         cursor = self.conn.cursor()
         
         try:
-            # 转义特殊字符
+            # Escape special characters
             escaped_query = query.replace(".", " ").replace("@", " ")
             
             if fields:
-                # 验证字段是否可搜索
+                # Validate fields are searchable
                 searchable_fields = cursor.execute(
                     f"SELECT field_name FROM {self._quote_identifier(table_name + '_fields_meta')} WHERE is_searchable = 1"
                 ).fetchall()
@@ -964,7 +907,7 @@ class Storage:
                 if invalid_fields:
                     raise ValueError(f"Fields {invalid_fields} are not searchable")
                 
-                # 构建查询
+                # Build the query
                 field_conditions = " OR ".join(f"field_name = ?" for _ in fields)
                 sql = f"""
                     SELECT DISTINCT record_id 
@@ -990,15 +933,15 @@ class Storage:
 
     def set_searchable(self, field_name: str, is_searchable: bool = True, table_name: str = None):
         """
-        设置字段是否可搜索。
+        Set whether a field is searchable.
 
         Parameters:
             field_name: str
-                字段名称
+                The field name
             is_searchable: bool
-                是否可搜索
+                Whether the field is searchable
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, or None to use the current table
         """
         table_name = self._get_table_name(table_name)
         cursor = self.conn.cursor()
@@ -1006,7 +949,7 @@ class Storage:
         try:
             cursor.execute("BEGIN TRANSACTION")
             
-            # 更新字段元数据
+            # Update field metadata
             cursor.execute(
                 f"UPDATE {self._quote_identifier(table_name + '_fields_meta')} SET is_searchable = ? WHERE field_name = ?",
                 [1 if is_searchable else 0, field_name]
@@ -1015,7 +958,7 @@ class Storage:
             if cursor.rowcount == 0:
                 raise ValueError(f"Field {field_name} does not exist")
             
-            # 如果设置为可搜索，添加现有数据到FTS索引
+            # If set to searchable, add existing data to the FTS index
             if is_searchable:
                 cursor.execute(f"DELETE FROM {self._quote_identifier(table_name + '_fts')} WHERE field_name = ?", [field_name])
                 
@@ -1034,7 +977,7 @@ class Storage:
                         [content, field_name, record_id]
                     )
             else:
-                # 如果设置为不可搜索，从FTS索引中删除
+                # If set to not searchable, delete from the FTS index
                 cursor.execute(
                     f"DELETE FROM {self._quote_identifier(table_name + '_fts')} WHERE field_name = ?",
                     [field_name]
@@ -1049,11 +992,11 @@ class Storage:
 
     def rebuild_fts_index(self, table_name: str = None):
         """
-        重建全文搜索索引。
+        Rebuilds the full-text search index.
 
         Parameters:
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, or None to use the current table
         """
         table_name = self._get_table_name(table_name)
         cursor = self.conn.cursor()
@@ -1061,15 +1004,15 @@ class Storage:
         try:
             cursor.execute("BEGIN TRANSACTION")
             
-            # 清空FTS索引
+            # Clear the FTS index
             cursor.execute(f"DELETE FROM {self._quote_identifier(table_name + '_fts')}")
             
-            # 获取可搜索字段
+            # Get searchable fields
             searchable_fields = cursor.execute(
                 f"SELECT field_name FROM {self._quote_identifier(table_name + '_fields_meta')} WHERE is_searchable = 1"
             ).fetchall()
             
-            # 重建索引
+            # Rebuild the index
             for field_name, in searchable_fields:
                 cursor.execute(
                     f"SELECT _id, {self._quote_identifier(field_name)} FROM {self._quote_identifier(table_name)} WHERE {self._quote_identifier(field_name)} IS NOT NULL"
@@ -1102,19 +1045,19 @@ class Storage:
 
     def _create_auto_indexes(self):
         """
-        根据查询模式自动创建索引
+        Automatically create indexes based on query patterns
         """
         try:
             cursor = self.conn.cursor()
             
-            # 获取所有数值类型字段
+            # Get all numeric fields
             numeric_fields = cursor.execute("""
                 SELECT field_name 
                 FROM fields_meta 
                 WHERE field_type IN ('INTEGER', 'REAL')
             """).fetchall()
             
-            # 为数值类型字段创建索引（这些字段经常用于范围查询）
+            # Create indexes for numeric fields (often used for range queries)
             for (field_name,) in numeric_fields:
                 index_name = f"idx_{field_name}"
                 quoted_field_name = self._quote_identifier(field_name)
@@ -1123,14 +1066,14 @@ class Storage:
                     ON records({quoted_field_name})
                 """)
             
-            # 获取所有TEXT类型字段
+            # Get all TEXT fields
             text_fields = cursor.execute("""
                 SELECT field_name 
                 FROM fields_meta 
                 WHERE field_type = 'TEXT'
             """).fetchall()
             
-            # 为TEXT类型字段创建LIKE查询优化索引
+            # Create indexes for TEXT fields (used for LIKE queries)
             for (field_name,) in text_fields:
                 index_name = f"idx_{field_name}_like"
                 quoted_field_name = self._quote_identifier(field_name)
@@ -1139,7 +1082,7 @@ class Storage:
                     ON records({quoted_field_name} COLLATE NOCASE)
                 """)
             
-            # 分析新创建的索引
+            # Analyze new indexes
             cursor.execute("ANALYZE")
             
         except Exception as e:
@@ -1147,23 +1090,23 @@ class Storage:
 
     def analyze_query_performance(self, query: str) -> dict:
         """
-        分析查询性能
+        Analyze query performance
         
         Parameters:
             query: str
-                要分析的查询语句
+                The query to analyze
                 
         Returns:
-            dict: 包含查询计划和性能指标的字典
+            dict: A dictionary containing the query plan and performance metrics
         """
         try:
             cursor = self.conn.cursor()
             
-            # 启用查询计划分析
+            # Enable query plan analysis
             cursor.execute("EXPLAIN QUERY PLAN " + query)
             query_plan = cursor.fetchall()
             
-            # 收集性能指标
+            # Collect performance metrics
             metrics = {
                 'tables_used': set(),
                 'indexes_used': set(),
@@ -1172,24 +1115,20 @@ class Storage:
             }
             
             for step in query_plan:
-                detail = step[3]  # 查询计划详情
+                detail = step[3]  # Query plan details
                 
-                # 分析使用的表
                 if 'TABLE' in detail:
                     table = detail.split('TABLE')[1].split()[0]
                     metrics['tables_used'].add(table)
                 
-                # 分析使用的索引
                 if 'USING INDEX' in detail:
                     index = detail.split('USING INDEX')[1].split()[0]
                     metrics['indexes_used'].add(index)
                 
-                # 分析扫描类型
                 if 'SCAN' in detail:
                     scan_type = detail.split('SCAN')[0].strip()
                     metrics['scan_type'].append(scan_type)
                 
-                # 估算处理的行数
                 if 'rows=' in detail:
                     rows = int(detail.split('rows=')[1].split()[0])
                     metrics['estimated_rows'] = max(metrics['estimated_rows'], rows)
@@ -1202,17 +1141,17 @@ class Storage:
 
     def count_rows(self, table_name: str = None) -> int:
         """
-        返回指定表的行数。
+        Returns the number of rows in a specified table or the current table.
 
         Parameters:
             table_name: str
-                表名，如果为None则使用当前表
+                The table name, or None to use the current table
 
         Returns:
-            int: 表中的记录数
+            int: The number of rows in the table
 
         Raises:
-            ValueError: 当表不存在时抛出
+            ValueError: When the table does not exist
         """
         table_name = self._get_table_name(table_name)
         
@@ -1230,40 +1169,40 @@ class Storage:
 
     def retrieve(self, id_: int) -> Optional[dict]:
         """
-        检索单条记录。
+        Retrieve a single record.
 
         Parameters:
             id_: int
-                记录ID
+                The record ID
 
         Returns:
-            Optional[dict]: 记录数据，如果不存在则返回None
+            Optional[dict]: The record data, or None if it does not exist
         """
         table_name = self.current_table
         quoted_table = self._quote_identifier(table_name)
         cursor = self.conn.cursor()
         
         try:
-            # 获取所有字段
+            # Get all fields
             fields = self.list_fields()
             if not fields:
                 return None
             
-            # 构建查询
+            # Build the query
             field_selects = [f"{self._quote_identifier(field)}" for field in fields]
             sql = f"SELECT _id, {', '.join(field_selects)} FROM {quoted_table} WHERE _id = ?"
             
-            # 执行查询
+            # Execute the query
             result = cursor.execute(sql, [id_]).fetchone()
             if not result:
                 return None
             
-            # 构建记录字典
+            # Build the record dictionary
             record = {"_id": result[0]}
             for i, field in enumerate(fields, 1):
                 value = result[i]
                 if value is not None:
-                    # 尝试解析JSON字符串
+                    # Try to parse JSON strings
                     try:
                         record[field] = json.loads(value)
                     except (json.JSONDecodeError, TypeError):
@@ -1278,14 +1217,14 @@ class Storage:
 
     def retrieve_many(self, ids: List[int]) -> List[dict]:
         """
-        批量检索记录。
+        Retrieve multiple records.
 
         Parameters:
             ids: List[int]
-                记录ID列表
+                The list of record IDs
 
         Returns:
-            List[dict]: 记录数据列表
+            List[dict]: The list of record data
         """
         if not ids:
             return []
@@ -1295,27 +1234,27 @@ class Storage:
         cursor = self.conn.cursor()
         
         try:
-            # 获取所有字段
+            # Get all fields
             fields = self.list_fields()
             if not fields:
                 return []
             
-            # 构建查询
+            # Build the query
             field_selects = [f"{self._quote_identifier(field)}" for field in fields]
             placeholders = ','.join('?' * len(ids))
             sql = f"SELECT _id, {', '.join(field_selects)} FROM {quoted_table} WHERE _id IN ({placeholders})"
             
-            # 执行查询
+            # Execute the query
             results = cursor.execute(sql, ids).fetchall()
             
-            # 构建记录列表
+            # Build the record list
             records = []
             for result in results:
                 record = {"_id": result[0]}
                 for i, field in enumerate(fields, 1):
                     value = result[i]
                     if value is not None:
-                        # 尝试解析JSON字符串
+                        # Try to parse JSON strings
                         try:
                             record[field] = json.loads(value)
                         except (json.JSONDecodeError, TypeError):

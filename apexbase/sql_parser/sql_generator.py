@@ -1,7 +1,7 @@
 from .sql_parser import *
 
 class SQLGenerator:
-    """SQL 生成器"""
+    """SQL generator"""
 
     def __init__(self):
         self.parameters = []

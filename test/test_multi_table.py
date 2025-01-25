@@ -6,19 +6,19 @@ from apexbase import ApexClient
 
 @pytest.fixture
 def temp_dir():
-    """创建临时目录"""
+    """Create a temporary directory"""
     temp_path = tempfile.mkdtemp()
     yield temp_path
     shutil.rmtree(temp_path)
 
 def test_table_management(temp_dir):
-    """测试表管理功能：创建、列出、切换、删除表"""
+    """Test table management: create, list, switch, delete tables"""
     client = ApexClient(temp_dir)
     
-    # 测试默认表
+    # Test default table
     assert "default" in client.list_tables()
     
-    # 测试创建新表
+    # Test create new tables
     client.create_table("users")
     client.create_table("orders")
     tables = client.list_tables()
@@ -26,29 +26,29 @@ def test_table_management(temp_dir):
     assert "orders" in tables
     assert len(tables) == 3  # default, users, orders
     
-    # 测试切换表
+    # Test switch table
     client.use_table("users")
     assert client.current_table == "users"
     
-    # 测试删除表
+    # Test delete table
     client.drop_table("orders")
     tables = client.list_tables()
     assert "orders" not in tables
     assert len(tables) == 2
     
-    # 测试不能删除默认表
+    # Test cannot delete default table
     with pytest.raises(ValueError):
         client.drop_table("default")
 
 def test_multi_table_operations(temp_dir):
-    """测试多表操作：在不同表中存储和查询数据"""
+    """Test multi-table operations: store and query data in different tables"""
     client = ApexClient(temp_dir)
     
-    # 创建测试表
+    # Create test tables
     client.create_table("users")
     client.create_table("orders")
     
-    # 在users表中存储数据
+    # Store data in users table
     client.use_table("users")
     user_records = [
         {"name": "John", "age": 30, "email": "john@example.com"},
@@ -58,7 +58,7 @@ def test_multi_table_operations(temp_dir):
     assert user_ids is not None
     assert len(user_ids) == 2
     
-    # 在orders表中存储数据
+    # Store data in orders table
     client.use_table("orders")
     order_records = [
         {"user_id": user_ids[0], "product": "Laptop", "price": 1000},
@@ -69,7 +69,7 @@ def test_multi_table_operations(temp_dir):
     assert order_ids is not None
     assert len(order_ids) == 3
     
-    # 验证每个表的数据
+    # Verify data in each table
     client.use_table("users")
     users = client.query("1=1")
     assert len(users) == 2
@@ -80,20 +80,20 @@ def test_multi_table_operations(temp_dir):
     assert len(orders) == 3
     assert all(o["product"] in ["Laptop", "Mouse", "Keyboard"] for o in orders)
     
-    # 测试跨表查询（通过代码层面关联）
+    # Test cross-table query (associated through code level)
     john_orders = client.query(f"user_id = {user_ids[0]}")
     assert len(john_orders) == 2
     assert all(o["user_id"] == user_ids[0] for o in john_orders)
 
 def test_table_isolation(temp_dir):
-    """测试表隔离：确保不同表的数据和结构是独立的"""
+    """Test table isolation: ensure data and structure in different tables are independent"""
     client = ApexClient(temp_dir)
     
-    # 创建两个具有不同结构的表
+    # Create two tables with different structures
     client.create_table("employees")
     client.create_table("departments")
     
-    # 在employees表中存储数据
+    # Store data in employees table
     client.use_table("employees")
     employee = {
         "name": "John",
@@ -103,7 +103,7 @@ def test_table_isolation(temp_dir):
     emp_id = client.store(employee)
     assert emp_id is not None
     
-    # 在departments表中存储不同结构的数据
+    # Store different structure data in departments table
     client.use_table("departments")
     department = {
         "name": "IT",
@@ -113,7 +113,7 @@ def test_table_isolation(temp_dir):
     dept_id = client.store(department)
     assert dept_id is not None
     
-    # 验证字段隔离
+    # Verify field isolation
     client.use_table("employees")
     employee_fields = client.list_fields()
     assert "salary" in employee_fields
@@ -127,14 +127,14 @@ def test_table_isolation(temp_dir):
     assert "skills" not in department_fields
 
 def test_multi_table_search(temp_dir):
-    """测试多表搜索：测试每个表的搜索功能是独立的"""
+    """Test multi-table search: test each table's search function is independent"""
     client = ApexClient(temp_dir)
     
-    # 创建并配置测试表
+    # Create and configure test tables
     client.create_table("articles")
     client.create_table("comments")
     
-    # 在articles表中存储数据
+    # Store data in articles table
     client.use_table("articles")
     articles = [
         {"title": "Python Tutorial", "content": "Learn Python programming"},
@@ -146,7 +146,7 @@ def test_multi_table_search(temp_dir):
     client.set_searchable("title", True)
     client.set_searchable("content", True)
     
-    # 在comments表中存储数据
+    # Store data in comments table
     client.use_table("comments")
     comments = [
         {"text": "Great Python tutorial!", "rating": 5},
@@ -157,17 +157,17 @@ def test_multi_table_search(temp_dir):
     assert len(comment_ids) == 2
     client.set_searchable("text", True)
     
-    # 测试articles表的搜索
+    # Test articles table's search
     client.use_table("articles")
     python_articles = client.search_text("python")
     assert len(python_articles) == 1
     
-    # 测试comments表的搜索
+    # Test comments table's search
     client.use_table("comments")
     python_comments = client.search_text("python")
     assert len(python_comments) == 1
     
-    # 验证搜索结果的独立性
+    # Verify search result independence
     client.use_table("articles")
     sql_articles = client.search_text("sql")
     assert len(sql_articles) == 1
@@ -177,7 +177,7 @@ def test_multi_table_search(temp_dir):
     assert len(sql_comments) == 1
 
 def test_multi_table_concurrent_access(temp_dir):
-    """测试多表并发访问"""
+    """Test multi-table concurrent access"""
     import threading
     import random
     
@@ -190,7 +190,7 @@ def test_multi_table_concurrent_access(temp_dir):
     
     def worker():
         for _ in range(records_per_thread):
-            # 随机选择表
+            # Randomly select table
             table = random.choice(["table1", "table2"])
             client.use_table(table)
             record = {
@@ -207,7 +207,7 @@ def test_multi_table_concurrent_access(temp_dir):
     for t in threads:
         t.join()
     
-    # 验证每个表的记录
+    # Verify records in each table
     client.use_table("table1")
     table1_records = client.query("1=1")
     table1_count = len(table1_records)
@@ -216,10 +216,10 @@ def test_multi_table_concurrent_access(temp_dir):
     table2_records = client.query("1=1")
     table2_count = len(table2_records)
     
-    # 验证总记录数
+    # Verify total record count
     assert table1_count + table2_count == num_threads * records_per_thread
     
-    # 验证每个表的记录正确性
+    # Verify records in each table
     for table, records in [("table1", table1_records), ("table2", table2_records)]:
         client.use_table(table)
         for record in records:
@@ -227,26 +227,26 @@ def test_multi_table_concurrent_access(temp_dir):
             assert 1 <= record["value"] <= 1000
 
 def test_table_error_handling(temp_dir):
-    """测试表操作的错误处理"""
+    """Test table operation error handling"""
     client = ApexClient(temp_dir)
     
-    # 测试创建重复表
+    # Test create duplicate table
     client.create_table("test")
-    client.create_table("test")  # 不应该抛出错误，而是静默返回
+    client.create_table("test")  # Should not raise error, but return silently
     
-    # 测试使用不存在的表
+    # Test use nonexistent table
     with pytest.raises(ValueError):
         client.use_table("nonexistent")
     
-    # 测试删除不存在的表
-    client.drop_table("nonexistent")  # 不应该抛出错误，而是静默返回
+    # Test delete nonexistent table
+    client.drop_table("nonexistent")  # Should not raise error, but return silently
     
-    # 测试删除默认表
+    # Test delete default table
     with pytest.raises(ValueError):
         client.drop_table("default")
     
-    # 测试在不存在的表中操作
+    # Test operation in nonexistent table
     client.use_table("test")
     client.drop_table("test")
-    # 删除当前表后，应该自动切换到默认表
+    # After deleting current table, it should automatically switch to default table
     assert client.current_table == "default" 

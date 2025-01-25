@@ -7,157 +7,152 @@ from .query import Query, ResultView
 
 
 class ApexClient:
-    def __init__(self, dirpath=None, cache_size: int = 1000, batch_size: int = 1000, drop_if_exists: bool = False):
+    def __init__(self, dirpath=None, batch_size: int = 1000, drop_if_exists: bool = False):
         """
-        创建 ApexClient 实例。
+        Initializes a new instance of the ApexClient class.
 
         Parameters:
             dirpath: str
-                数据存储目录的路径。如果为None，则使用当前目录。
-            cache_size: int
-                查询结果缓存的最大数量。
+                The directory path for storing data. If None, the current directory is used.
             batch_size: int
-                批量操作的大小。
+                The size of batch operations.
             drop_if_exists: bool
-                如果为True，则在数据库文件已存在时删除它。
+                If True, the database file will be deleted if it already exists.
         """
         if dirpath is None:
             dirpath = "."
         
-        # 确保目录存在
         self.dirpath = Path(dirpath)
         self.dirpath.mkdir(parents=True, exist_ok=True)
         
-        # 构建数据库文件路径
         self.db_path = self.dirpath / "apexbase.db"
         
-        # 如果设置了drop_if_exists且文件存在，则删除文件
         if drop_if_exists and self.db_path.exists():
             self.db_path.unlink()
         
-        self.storage = Storage(str(self.db_path), cache_size=cache_size, batch_size=batch_size)
+        self.storage = Storage(str(self.db_path), batch_size=batch_size)
         self.query_handler = Query(self.storage)
-        self.current_table = "default"  # 默认表名
+        self.current_table = "default"  # Default table name
 
     def use_table(self, table_name: str):
         """
-        切换当前操作的表。
+        Switches the current table for operations.
 
         Parameters:
             table_name: str
-                要切换到的表名
+                The name of the table to switch to.
         """
         self.current_table = table_name
         self.storage.use_table(table_name)
 
     def create_table(self, table_name: str):
         """
-        创建新表。
+        Creates a new table.
 
         Parameters:
             table_name: str
-                要创建的表名
+                The name of the table to create.
         """
         self.storage.create_table(table_name)
 
     def drop_table(self, table_name: str):
         """
-        删除表。
+        Drops a table.
 
         Parameters:
             table_name: str
-                要删除的表名
+                The name of the table to drop.
         """
         self.storage.drop_table(table_name)
-        # 如果删除的是当前表，切换到默认表
+        # If the table being dropped is the current table, switch to the default table
         if self.current_table == table_name:
             self.current_table = "default"
 
     def list_tables(self) -> List[str]:
         """
-        列出所有表。
+        Lists all tables.
 
         Returns:
-            List[str]: 表名列表
+            List[str]: A list of table names
         """
         return self.storage.list_tables()
 
     def store(self, data: Union[dict, List[dict]]) -> Union[int, List[int]]:
         """
-        存储一条或多条记录。
+        Stores one or more records.
 
         Parameters:
             data: Union[dict, List[dict]]
-                要存储的记录或记录列表
+                The records to store, either as a single dictionary or a list of dictionaries.
 
         Returns:
-            Union[int, List[int]]: 记录ID或ID列表
+            Union[int, List[int]]: The record ID or ID list
         """
         if isinstance(data, dict):
-            # 单条记录
+            # Single record
             return self.storage.store(data)
         elif isinstance(data, list):
-            # 多条记录
+            # Multiple records
             return self.storage.batch_store(data)
         else:
             raise ValueError("Data must be a dict or a list of dicts")
 
     def query(self, query_filter: str = None) -> ResultView:
         """
-        使用SQL语法查询记录。
+        Queries records using SQL syntax.
 
         Parameters:
             query_filter: str
-                SQL过滤条件。例如：
+                SQL filter conditions. For example:
                 - age > 30
                 - name LIKE 'John%'
                 - age > 30 AND city = 'New York'
                 - field IN (1, 2, 3)
-                不支持 ORDER BY, GROUP BY, HAVING 等语句
+                - ORDER BY, GROUP BY, HAVING are not supported
 
         Returns:
-            ResultView: 查询结果视图，支持延迟执行
+            ResultView: A view of query results, supporting deferred execution
         """
         return self.query_handler.query(query_filter)
 
     def search_text(self, text: str, fields: List[str] = None) -> ResultView:
         """
-        全文搜索。
+        Full-text search.
 
         Parameters:
             text: str
-                搜索文本
+                The text to search
             fields: List[str]
-                要搜索的字段列表，如果为None则搜索所有可搜索字段
+                The fields to search, if None, all searchable fields are searched
 
         Returns:
-            ResultView: 搜索结果视图，支持延迟执行
+            ResultView: A view of search results, supporting deferred execution
         """
         return self.query_handler.search_text(text, fields)
 
     def retrieve(self, id_: int) -> Optional[dict]:
         """
-        检索单条记录。
+        Retrieves a single record.
 
         Parameters:
             id_: int
-                记录ID
+                The record ID
 
         Returns:
-            Optional[dict]: 记录数据，如果不存在则返回None
+            Optional[dict]: The record data, or None if it doesn't exist
         """
         return self.query_handler.retrieve(id_)
 
     def retrieve_many(self, ids: List[int]) -> List[dict]:
         """
-        批量检索记录。
+        Retrieves multiple records.
 
         Parameters:
             ids: List[int]
-                记录ID列表
+                The list of record IDs
 
         Returns:
-            List[dict]: 记录数据列表
+            List[dict]: The list of record data
         """
         return self.query_handler.retrieve_many(ids)
 
@@ -188,70 +183,62 @@ class ApexClient:
         """
         return list(self.storage.list_fields().keys())
 
-    def delete(self, id_: int) -> bool:
+    def delete(self, ids: Union[int, List[int]]) -> bool:
         """
-        删除一条记录。
+        Deletes a single record.
 
         Parameters:
-            id_: int
-                要删除的记录ID
+            ids: Union[int, List[int]]
+                The record ID or list of record IDs to delete
 
         Returns:
-            bool: 删除是否成功
+            bool: Whether the deletion was successful
         """
-        return self.storage.delete(id_)
-
-    def batch_delete(self, ids: List[int]) -> List[int]:
-        """
-        批量删除记录。
-
-        Parameters:
-            ids: List[int]
-                要删除的记录ID列表
-
-        Returns:
-            List[int]: 成功删除的记录ID列表
-        """
-        return self.storage.batch_delete(ids)
+        if isinstance(ids, int):
+            return self.storage.delete(ids)
+        elif isinstance(ids, list):
+            return self.storage.batch_delete(ids)
+        else:
+            raise ValueError("ids must be an int or a list of ints")
 
     def replace(self, id_: int, data: dict) -> bool:
         """
-        替换一条记录。
+        Replaces a single record.
 
         Parameters:
             id_: int
-                要替换的记录ID
+                The record ID to replace
             data: dict
-                新的记录数据
+                The new record data
 
         Returns:
-            bool: 替换是否成功
+            bool: Whether the replacement was successful
         """
         return self.storage.replace(id_, data)
 
     def batch_replace(self, data_dict: Dict[int, dict]) -> List[int]:
         """
-        批量替换记录。
+        Replaces multiple records.
 
         Parameters:
             data_dict: Dict[int, dict]
-                要替换的记录字典，key为记录ID，value为新的记录数据
+                The dictionary of records to replace, with keys as record IDs and values as new record data
 
         Returns:
-            List[int]: 成功替换的记录ID列表
+            List[int]: The list of successfully replaced record IDs
         """
         return self.storage.batch_replace(data_dict)
 
     def from_pandas(self, df) -> 'ApexClient':
         """
-        从Pandas DataFrame导入数据。
+        Imports data from a Pandas DataFrame.
 
         Parameters:
             df: pandas.DataFrame
-                输入的DataFrame
+                The input DataFrame
 
         Returns:
-            ApexClient: self，用于链式调用
+            ApexClient: self, for chaining
         """
         records = df.to_dict('records')
         self.store(records)
@@ -259,14 +246,14 @@ class ApexClient:
 
     def from_pyarrow(self, table) -> 'ApexClient':
         """
-        从PyArrow Table导入数据。
+        Imports data from a PyArrow Table.
 
         Parameters:
             table: pyarrow.Table
-                输入的PyArrow Table
+                The input PyArrow Table
 
         Returns:
-            ApexClient: self，用于链式调用
+            ApexClient: self
         """
         records = table.to_pylist()
         self.store(records)
@@ -274,14 +261,14 @@ class ApexClient:
 
     def from_polars(self, df) -> 'ApexClient':
         """
-        从Polars DataFrame导入数据。
+        Imports data from a Polars DataFrame.
 
         Parameters:
             df: polars.DataFrame
-                输入的Polars DataFrame
+                The input Polars DataFrame
 
         Returns:
-            ApexClient: self，用于链式调用
+            ApexClient: self
         """
         records = df.to_dicts()
         self.store(records)
@@ -289,51 +276,52 @@ class ApexClient:
 
     def set_searchable(self, field_name: str, is_searchable: bool = True):
         """
-        设置字段是否可搜索。
+        Sets whether a field is searchable.
 
         Parameters:
             field_name: str
-                字段名称
+                The field name
             is_searchable: bool
-                是否可搜索
+                Whether the field is searchable
         """
         self.storage.set_searchable(field_name, is_searchable)
 
     def rebuild_search_index(self):
         """
-        重建全文搜索索引。
+        Rebuilds the full-text search index.
         """
         self.storage.rebuild_fts_index()
 
     def optimize(self):
         """
-        优化数据库性能。
+        Optimizes the database performance.
         """
         self.storage.optimize()
 
     def set_auto_update_fts(self, enabled: bool):
         """
-        设置是否自动更新全文搜索索引。
-        默认为False，以提高批量写入性能。
-        如果禁用自动更新，需要手动调用rebuild_fts_index来更新索引。
+        Sets whether to automatically update the full-text search index.
+        Defaults to False, to improve batch write performance.
+        If auto-update is disabled, you need to manually call rebuild_fts_index to update the index.
 
         Parameters:
             enabled: bool
-                是否启用自动更新
+                Whether to enable auto-update
         """
         self.storage.set_auto_update_fts(enabled)
 
     def rebuild_fts_index(self):
         """
-        重建当前表的全文搜索索引。
-        在批量写入后调用此方法来更新索引。
+        Rebuilds the full-text search index for the current table.
+        Call this method after batch writes to update the index.
         """
         self.storage.rebuild_fts_index()
 
     def count_rows(self, table_name: str = None):
         """
-        返回当前表或指定表的行数。
+        Returns the number of rows in the current table or a specified table.
         """
         if table_name is None:
             table_name = self.current_table
+            
         return self.storage.count_rows(table_name)
