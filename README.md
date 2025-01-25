@@ -134,6 +134,7 @@ client.rebuild_search_index()
   - pyarrow
   - polars
   - numpy
+  - psutil
 
 ## License
 

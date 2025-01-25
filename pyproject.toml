@@ -16,7 +16,8 @@ dependencies = [
     "pandas",
     "pyarrow",
     "polars",
-    "numpy"
+    "numpy",
+    "psutil"
 ]
 
 [tool.setuptools]
