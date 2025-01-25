@@ -312,3 +312,6 @@ class ApexClient:
             table_name = self.current_table
             
         return self.storage.count_rows(table_name)
+
+    def __del__(self):
+        self.storage.close()

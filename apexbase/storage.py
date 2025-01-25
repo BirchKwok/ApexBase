@@ -1267,3 +1267,9 @@ class Storage:
             
         except Exception as e:
             raise ValueError(f"Failed to retrieve records: {str(e)}")
+
+    def close(self):
+        """
+        Close the database connection.
+        """
+        self.conn.close()
