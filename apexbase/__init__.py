@@ -5,7 +5,7 @@ from .storage import Storage
 from .query import Query, ResultView
 
 
-version = "0.0.1"
+version = "0.0.2"
 
 
 class ApexClient:
