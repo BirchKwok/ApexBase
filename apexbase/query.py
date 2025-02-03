@@ -1,11 +1,16 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 import re
-import sqlite3
 from collections import OrderedDict
+import json
 
 from .sql_parser import SQLParser, SQLGenerator
 import pandas as pd
 import pyarrow as pa
+
+
+class QueryError(Exception):
+    """Exception raised for query errors."""
+    pass
 
 
 class LRUCache(OrderedDict):
@@ -34,29 +39,101 @@ class ResultView:
     """Query result view, supports lazy execution and LRU cache"""
     _global_cache = LRUCache(maxsize=1000)
 
-    def __init__(self, storage, query_sql: str, params: tuple = None):
+    def __init__(self, storage, query_sql: str, table_name: str = None, fields: str = None):
         self.storage = storage
         self.query_sql = query_sql
-        self.params = params if params is not None else ()
-        self._executed = False
-        self._cache_key = f"{query_sql}:{params}"
+        self.fields = fields
+        self.table_name = table_name
 
+        self.parser = SQLParser()
+        self.generator = SQLGenerator()
+        
+        self._executed = False
+        self._cache_key = f"{query_sql}:{table_name if table_name else ''}"
+
+    def _build_query_sql(self, query_filter: str = None) -> Tuple[str, tuple]:
+        """构建查询SQL语句
+        
+        Args:
+            query_filter: 查询条件
+            
+        Returns:
+            SQL语句和参数元组
+        """
+        table_name = self.storage._get_table_name(self.table_name)
+        quoted_table = self.storage._quote_identifier(table_name)
+        # 获取所有字段
+        fields = self.storage.list_fields(table_name)
+        field_list = ','.join(self.storage._quote_identifier(f) for f in fields)
+        
+        if not query_filter or query_filter.strip() == "1=1":
+            sql = f"SELECT {field_list} FROM {quoted_table}"
+            return sql, ()
+        
+        try:
+            # 处理LIKE查询
+            if 'LIKE' in query_filter.upper():
+                # 使用正则表达式匹配字段名和模式
+                match = re.match(r'\s*(\w+)\s+LIKE\s+[\'"](.+?)[\'"]\s*', query_filter, re.IGNORECASE)
+                if match:
+                    field, pattern = match.groups()
+                    sql = f"""
+                        SELECT {field_list} 
+                        FROM {quoted_table}
+                        WHERE {self.storage._quote_identifier(field)} LIKE ?
+                    """
+                    return sql, (pattern,)
+                else:
+                    raise ValueError(f"Invalid LIKE syntax in: {query_filter}")
+            
+            # 处理其他查询
+            ast = self.parser.parse(query_filter)
+            self.generator.reset()
+            where_clause = self.generator.generate(ast)
+            params = self.generator.get_parameters()
+            
+            sql = f"SELECT {field_list} FROM {quoted_table} WHERE {where_clause}"
+            return sql, tuple(params)
+            
+        except Exception as e:
+            raise ValueError(f"Invalid query syntax: {str(e)}")
+        
     def _execute_query(self):
-        """Execute the query and cache the result"""
-        if not self._executed:
-            # Try to get the result from the cache
-            cached_result = self._global_cache.get(self._cache_key)
-            if cached_result is not None:
-                self._ids, self._results = cached_result
-            else:
-                try:
-                    cursor = self.storage.conn.cursor()
-                    self._ids = [row[0] for row in cursor.execute(self.query_sql, self.params)]
-                    self._results = None
-                    self._global_cache.put(self._cache_key, (self._ids, self._results))
-                except sqlite3.OperationalError as e:
-                    raise ValueError(f"Invalid query syntax: {str(e)}")
+        """执行查询并缓存结果"""
+        try:
+            query_sql, params = self._build_query_sql(self.query_sql)
+            result = self.storage.query(query_sql, params)
+            
+            # 获取字段名
+            fields = self.storage.list_fields()
+            if not fields:
+                self._ids = []
+                self._results = []
+                return
+                
+            self._ids = []
+            self._results = []
+            for row in result:
+                data = {}
+                for i, field in enumerate(fields):
+                    value = row[i]
+                    if value is not None:
+                        try:
+                            # 尝试解析JSON
+                            data[field] = json.loads(value)
+                        except (json.JSONDecodeError, TypeError):
+                            data[field] = value
+                    else:
+                        data[field] = None
+                
+                if '_id' in data:
+                    self._ids.append(data['_id'])
+                self._results.append(data)
+                    
+            self._global_cache.put(self._cache_key, (self._ids, self._results))
             self._executed = True
+        except Exception as e:
+            raise QueryError(f"Query execution failed: {str(e)}")
 
     @property
     def ids(self) -> List[int]:
@@ -65,20 +142,12 @@ class ResultView:
             self._execute_query()
         return self._ids
 
-    def to_dict(self) -> List[dict]:
+    def to_dict(self) -> List[Dict]:
         """Convert the result to a list of dictionaries, using cache"""
         if not self._executed:
             self._execute_query()
-        
-        # Check if the full result is in the cache
-        cached_result = self._global_cache.get(self._cache_key)
-        if cached_result and cached_result[1] is not None:
-            return cached_result[1]
-        
-        # Get the full records and update the cache
-        self._results = self.storage.retrieve_many(self._ids)
-        self._global_cache.put(self._cache_key, (self._ids, self._results))
-        return self._results
+            
+        return self._results if self._results else []
 
     def __len__(self):
         """Return the number of results, triggering query execution"""
@@ -129,8 +198,6 @@ class Query:
                 The storage object.
         """
         self.storage = storage
-        self.parser = SQLParser()
-        self.generator = SQLGenerator()
 
     def _quote_identifier(self, identifier: str) -> str:
         """
@@ -145,29 +212,7 @@ class Query:
         """
         return f'"{identifier}"'
 
-    def _build_query_sql(self, query_filter: str = None) -> Tuple[str, tuple]:
-        """Build the query SQL statement"""
-        table_name = self.storage._get_table_name(None)
-        quoted_table = self.storage._quote_identifier(table_name)
-        
-        if not query_filter or query_filter.strip() == "1=1":
-            sql = f"SELECT _id FROM {quoted_table}"
-            return sql, ()
-        
-        try:
-            ast = self.parser.parse(query_filter)
-            
-            self.generator.reset()
-            where_clause = self.generator.generate(ast)
-            params = self.generator.get_parameters()
-            
-            sql = f"SELECT _id FROM {quoted_table} WHERE {where_clause}"
-            return sql, tuple(params)
-            
-        except Exception as e:
-            raise ValueError(f"Invalid query syntax: {str(e)}")
-
-    def query(self, query_filter: str = None) -> ResultView:
+    def query(self, query_filter: str = None, table_name: str = None) -> ResultView:
         """
         Query records using SQL syntax.
 
@@ -184,47 +229,8 @@ class Query:
         """
         if not isinstance(query_filter, str) or not query_filter.strip():
             raise ValueError("Invalid query syntax")
-            
-        try:
-            sql, params = self._build_query_sql(query_filter)
-            return ResultView(self.storage, sql, params)
-        except (ValueError, sqlite3.OperationalError) as e:
-            raise ValueError(f"Invalid query syntax: {str(e)}")
-
-    def search_text(self, text: str, fields: List[str] = None, table_name: str = None) -> ResultView:
-        """
-        Full-text search.
-
-        Parameters:
-            text: str
-                The search text
-            fields: List[str]
-                The list of fields to search, if None, search all searchable fields
-            table_name: str
-                The table name, if None, use the current table
-
-        Returns:
-            ResultView: The search result view
-        """
-        table_name = self.storage._get_table_name(table_name)
-        quoted_fts = self.storage._quote_identifier(table_name + '_fts')
         
-        # Get searchable fields
-        if fields:
-            field_list = [f"'{field}'" for field in fields]
-            field_filter = f"AND field_name IN ({','.join(field_list)})"
-        else:
-            field_filter = ""
-        
-        # Build FTS query
-        sql = f"""
-            SELECT DISTINCT record_id as _id
-            FROM {quoted_fts}
-            WHERE content MATCH ?
-            {field_filter}
-        """
-        
-        return ResultView(self.storage, sql, (text,))
+        return ResultView(self.storage, query_filter, table_name)
 
     def retrieve(self, id_: int) -> Optional[dict]:
         """
@@ -333,26 +339,22 @@ class Query:
             json_path: str
                 The JSON path
         """
-        try:
-            table_name = self.storage.current_table
-            cursor = self.storage.conn.cursor()
-            
-            # Generate a safe index name
-            safe_path = json_path.replace('$', '').replace('.', '_').replace('[', '_').replace(']', '_')
-            index_name = f"idx_json_{table_name}_{field}_{safe_path.strip('_')}"
-            quoted_table = self.storage._quote_identifier(table_name)
-            
-            # Create index
-            cursor.execute(f"""
-                CREATE INDEX IF NOT EXISTS {index_name}
-                ON {quoted_table}(json_extract({field}, ?))
-            """, (json_path,))
-            
-            # Analyze the newly created index
-            cursor.execute("ANALYZE")
-        except Exception as e:
-            # If index creation fails, record the error but continue execution
-            print(f"Warning: Failed to create JSON index: {str(e)}")
+        table_name = self.storage.current_table
+        cursor = self.storage.conn.cursor()
+        
+        # Generate a safe index name
+        safe_path = json_path.replace('$', '').replace('.', '_').replace('[', '_').replace(']', '_')
+        index_name = f"idx_json_{table_name}_{field}_{safe_path.strip('_')}"
+        quoted_table = self.storage._quote_identifier(table_name)
+        
+        # Create index
+        cursor.execute(f"""
+            CREATE INDEX IF NOT EXISTS {index_name}
+            ON {quoted_table}(json_extract({field}, ?))
+        """, (json_path,))
+        
+        # Analyze the newly created index
+        cursor.execute("ANALYZE")
 
     def _validate_json_path(self, json_path: str) -> bool:
         """

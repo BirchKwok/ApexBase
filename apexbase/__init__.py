@@ -1,7 +1,7 @@
-from typing import List, Dict, Union, Optional
+from typing import List, Dict, Union, Optional, Literal
 from pathlib import Path
 
-from .storage import Storage
+from .storage import create_storage
 from .query import Query, ResultView
 
 
@@ -9,7 +9,13 @@ version = "0.0.2"
 
 
 class ApexClient:
-    def __init__(self, dirpath=None, batch_size: int = 1000, drop_if_exists: bool = False):
+    def __init__(
+        self, 
+        dirpath=None, 
+        batch_size: int = 1000, 
+        drop_if_exists: bool = False,
+        backend: Literal["sqlite", "duckdb"] = "sqlite"
+    ):
         """
         Initializes a new instance of the ApexClient class.
 
@@ -20,6 +26,8 @@ class ApexClient:
                 The size of batch operations.
             drop_if_exists: bool
                 If True, the database file will be deleted if it already exists.
+            backend: str
+                The storage backend to use ("sqlite" or "duckdb"). Defaults to "sqlite".
         """
         if dirpath is None:
             dirpath = "."
@@ -27,12 +35,12 @@ class ApexClient:
         self.dirpath = Path(dirpath)
         self.dirpath.mkdir(parents=True, exist_ok=True)
         
-        self.db_path = self.dirpath / "apexbase.db"
+        self.db_path = self.dirpath / f"apexbase_{backend}.db"
         
         if drop_if_exists and self.db_path.exists():
             self.db_path.unlink()
         
-        self.storage = Storage(str(self.db_path), batch_size=batch_size)
+        self.storage = create_storage(backend, str(self.db_path), batch_size=batch_size)
         self.query_handler = Query(self.storage)
         self.current_table = "default"  # Default table name
 
@@ -116,21 +124,6 @@ class ApexClient:
             ResultView: A view of query results, supporting deferred execution
         """
         return self.query_handler.query(query_filter)
-
-    def search_text(self, text: str, fields: List[str] = None) -> ResultView:
-        """
-        Full-text search.
-
-        Parameters:
-            text: str
-                The text to search
-            fields: List[str]
-                The fields to search, if None, all searchable fields are searched
-
-        Returns:
-            ResultView: A view of search results, supporting deferred execution
-        """
-        return self.query_handler.search_text(text, fields)
 
     def retrieve(self, id_: int) -> Optional[dict]:
         """
@@ -261,48 +254,11 @@ class ApexClient:
         self.store(records)
         return self
 
-    def set_searchable(self, field_name: str, is_searchable: bool = True):
-        """
-        Sets whether a field is searchable.
-
-        Parameters:
-            field_name: str
-                The field name
-            is_searchable: bool
-                Whether the field is searchable
-        """
-        self.storage.set_searchable(field_name, is_searchable)
-
-    def rebuild_search_index(self):
-        """
-        Rebuilds the full-text search index.
-        """
-        self.storage.rebuild_fts_index()
-
     def optimize(self):
         """
         Optimizes the database performance.
         """
         self.storage.optimize()
-
-    def set_auto_update_fts(self, enabled: bool):
-        """
-        Sets whether to automatically update the full-text search index.
-        Defaults to False, to improve batch write performance.
-        If auto-update is disabled, you need to manually call rebuild_fts_index to update the index.
-
-        Parameters:
-            enabled: bool
-                Whether to enable auto-update
-        """
-        self.storage.set_auto_update_fts(enabled)
-
-    def rebuild_fts_index(self):
-        """
-        Rebuilds the full-text search index for the current table.
-        Call this method after batch writes to update the index.
-        """
-        self.storage.rebuild_fts_index()
 
     def count_rows(self, table_name: str = None):
         """

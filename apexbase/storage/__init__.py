@@ -1,0 +1,26 @@
+
+
+from typing import Literal
+
+
+
+def create_storage(backend: Literal["sqlite", "duckdb"], filepath: str = None, batch_size: int = 1000):
+    """
+    Factory function to create a storage backend instance.
+    
+    Parameters:
+        backend: str
+            The storage backend to use ("sqlite" or "duckdb")
+        filepath: str
+            The file path for storage
+        batch_size: int
+            The size of batch operations
+    """
+    if backend == "sqlite":
+        from .sqlite_storage import SQLiteStorage
+        return SQLiteStorage(filepath, batch_size)
+    elif backend == "duckdb":
+        from .duckdb_storage import DuckDBStorage
+        return DuckDBStorage(filepath, batch_size)
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
