@@ -1,10 +1,8 @@
 import sqlite3
 import orjson
 from typing import Dict, List, Any, Optional
-from pathlib import Path
 import json
 import threading
-import time
 import os
 
 from .base import BaseStorage
@@ -86,6 +84,7 @@ class SQLiteStorage(BaseStorage):
                 table_name TEXT,
                 field_name TEXT,
                 field_type TEXT,
+                ordinal_position INTEGER,
                 PRIMARY KEY (table_name, field_name),
                 FOREIGN KEY (table_name) REFERENCES tables_meta(table_name)
             )
@@ -93,6 +92,12 @@ class SQLiteStorage(BaseStorage):
             
             # 初始化元数据
             cursor.execute('INSERT OR IGNORE INTO tables_meta (table_name) VALUES (?)', ('default',))
+            
+            # 初始化default表的_id字段
+            cursor.execute('''
+            INSERT OR IGNORE INTO fields_meta (table_name, field_name, field_type, ordinal_position) 
+            VALUES (?, ?, ?, ?)
+            ''', ('default', '_id', 'INTEGER', 1))
             
             conn.commit()
 
@@ -277,7 +282,15 @@ class SQLiteStorage(BaseStorage):
             ):
                 existing_fields.add(row[0])
             
-            # 添加新字段
+            # 获取当前最大的ordinal_position
+            result = cursor.execute("""
+                SELECT COALESCE(MAX(ordinal_position), 0) + 1
+                FROM fields_meta
+                WHERE table_name = ?
+            """, [table_name]).fetchone()
+            next_position = result[0] if result else 2  # _id是1，所以从2开始
+            
+            # 按照数据中的字段顺序添加新字段
             for field_name, value in data.items():
                 if field_name != '_id' and field_name not in existing_fields:
                     field_type = self._infer_field_type(value)
@@ -289,10 +302,14 @@ class SQLiteStorage(BaseStorage):
                     )
                     
                     # 更新元数据
-                    cursor.execute(
-                        "INSERT INTO fields_meta (table_name, field_name, field_type) VALUES (?, ?, ?)",
-                        [table_name, field_name, field_type]
-                    )
+                    cursor.execute("""
+                        INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT (table_name, field_name) DO UPDATE SET 
+                            field_type = EXCLUDED.field_type,
+                            ordinal_position = EXCLUDED.ordinal_position
+                    """, [table_name, field_name, field_type, next_position])
+                    next_position += 1
             
             cursor.execute("COMMIT")
             
@@ -363,27 +380,64 @@ class SQLiteStorage(BaseStorage):
         
         table_name = self._get_table_name(table_name)
         
-        # 确保所有字段存在
-        all_fields = set()
+        # 预处理：获取所有字段和类型，保持字段顺序
+        all_fields = {'_id': 'INTEGER'}  # 确保包含_id字段
+        field_order = []  # 保持字段添加顺序
         for data in data_list:
-            all_fields.update(data.keys())
-        
-        # 创建一个包含所有字段的示例数据
-        example_data = {field: None for field in all_fields}
-        self._ensure_fields_exist(example_data, table_name)
+            for key, value in data.items():
+                if key not in all_fields and key != '_id':  # 跳过_id字段
+                    all_fields[key] = self._infer_field_type(value)
+                    if key not in field_order:
+                        field_order.append(key)
         
         with self._get_connection() as conn:
             cursor = conn.cursor()
             try:
-                # 获取所有字段
-                fields = []
+                cursor.execute("BEGIN TRANSACTION")
+                
+                # 1. 一次性创建所有需要的列
+                if not self._table_exists(table_name):
+                    self.create_table(table_name)
+                
+                # 获取现有字段
+                existing_fields = set()
                 for row in cursor.execute(
-                    "SELECT field_name FROM fields_meta WHERE table_name = ? AND field_name != '_id'",
+                    "SELECT field_name FROM fields_meta WHERE table_name = ?",
                     [table_name]
                 ):
-                    fields.append(row[0])
+                    existing_fields.add(row[0])
+                
+                # 获取当前最大的ordinal_position
+                result = cursor.execute("""
+                    SELECT COALESCE(MAX(ordinal_position), 0) + 1
+                    FROM fields_meta
+                    WHERE table_name = ?
+                """, [table_name]).fetchone()
+                next_position = result[0] if result else 2  # _id是1，所以从2开始
+                
+                # 按照field_order添加新字段
+                for field_name in field_order:
+                    if field_name not in existing_fields:
+                        field_type = all_fields[field_name]
+                        quoted_field = self._quote_identifier(field_name)
+                        
+                        # 添加字段到表
+                        cursor.execute(
+                            f"ALTER TABLE {self._quote_identifier(table_name)} ADD COLUMN {quoted_field} {field_type}"
+                        )
+                        
+                        # 更新元数据
+                        cursor.execute("""
+                            INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
+                            VALUES (?, ?, ?, ?)
+                            ON CONFLICT (table_name, field_name) DO UPDATE SET 
+                                field_type = EXCLUDED.field_type,
+                                ordinal_position = EXCLUDED.ordinal_position
+                        """, [table_name, field_name, field_type, next_position])
+                        next_position += 1
                 
                 # 准备批量插入
+                fields = ['_id'] + field_order
                 placeholders = ','.join(['?' for _ in fields])
                 sql = f"""
                     INSERT INTO {self._quote_identifier(table_name)}
@@ -393,9 +447,13 @@ class SQLiteStorage(BaseStorage):
                 
                 # 准备数据
                 values = []
-                for data in data_list:
-                    row = []
-                    for field in fields:
+                first_id = cursor.execute(
+                    f"SELECT COALESCE(MAX(_id), 0) + 1 FROM {self._quote_identifier(table_name)}"
+                ).fetchone()[0]
+                
+                for i, data in enumerate(data_list):
+                    row = [first_id + i]  # _id
+                    for field in field_order:
                         value = data.get(field)
                         if isinstance(value, (list, dict)):
                             row.append(json.dumps(value))
@@ -406,104 +464,12 @@ class SQLiteStorage(BaseStorage):
                 # 执行批量插入
                 cursor.executemany(sql, values)
                 
-                # 获取插入的ID范围
-                first_id = cursor.lastrowid - len(data_list) + 1
-                
-                conn.commit()
+                cursor.execute("COMMIT")
                 return list(range(first_id, first_id + len(data_list)))
                 
             except Exception as e:
-                conn.rollback()
+                cursor.execute("ROLLBACK")
                 raise e
-
-    def _parse_record(self, row: tuple, table_name: str = None) -> Dict[str, Any]:
-        """
-        Parses a record.
-
-        Parameters:
-            row: tuple
-                The database row
-            table_name: str
-                The table name, or None to use the current table
-
-        Returns:
-            Dict[str, Any]: The parsed record
-        """
-        table_name = self._get_table_name(table_name)
-        fields = self.list_fields(table_name=table_name)
-        record = {}
-        
-        for i, (field_name, field_type) in enumerate(fields.items(), start=1):
-            if i < len(row):
-                value = row[i]
-                if value is not None:
-                    if field_type == 'TEXT':
-                        try:
-                            record[field_name] = json.loads(value)
-                        except (json.JSONDecodeError, TypeError):
-                            record[field_name] = value
-                    else:
-                        record[field_name] = value
-        
-        record['_id'] = row[0]
-        return record
-
-    def create_json_index(self, field_path: str):
-        """
-        Creates an index for a specified JSON field path.
-
-        Parameters:
-            field_path: str
-                The JSON field path, e.g., "$.name" or "$.address.city"
-        """
-        try:
-            safe_name = field_path.replace('$', '').replace('.', '_').replace('[', '_').replace(']', '_')
-            index_name = f"idx_json_{safe_name.strip('_')}"
-            
-            self._get_connection().execute(f"""
-                CREATE INDEX IF NOT EXISTS {index_name}
-                ON records(json_extract(data, ?))
-            """, (field_path,))
-            
-            self._get_connection().execute("ANALYZE")
-        except Exception as e:
-            raise ValueError(f"Failed to create JSON index: {str(e)}")
-
-    def field_exists(self, field: str, use_cache: bool = True) -> bool:
-        """
-        Check if a field exists with caching.
-
-        Parameters:
-            field: str
-                The field to check.
-            use_cache: bool
-                Whether to use cache.
-
-        Returns:
-            bool: True if the field exists, False otherwise.
-        """
-        field = field.strip(':')
-        
-        if use_cache:
-            cache_key = self._get_cache_key("field_exists", field=field)
-            cached_result = self._field_cache.get(cache_key)
-            if cached_result is not None:
-                return cached_result
-
-        try:
-            result = self._get_connection().execute(f"""
-                SELECT COUNT(*) 
-                FROM records 
-                WHERE json_extract(data, '$.{field}') IS NOT NULL 
-                LIMIT 1
-            """).fetchone()
-            exists = result[0] > 0
-            
-            if use_cache:
-                self._field_cache[cache_key] = exists
-            return exists
-        except Exception:
-            return False
 
     def list_fields(self, table_name: str = None) -> List[str]:
         """获取表的所有字段
@@ -517,15 +483,15 @@ class SQLiteStorage(BaseStorage):
         table_name = self._get_table_name(table_name)
         cursor = self._get_connection().cursor()
         
-        # 获取所有字段，包括_id
-        fields = ['_id']  # 确保_id总是第一个字段
-        for row in cursor.execute(
-            "SELECT field_name FROM fields_meta WHERE table_name = ? ORDER BY field_name",
-            [table_name]
-        ):
-            fields.append(row[0])
-            
-        return fields
+        # 按ordinal_position排序获取所有字段
+        result = cursor.execute("""
+            SELECT field_name 
+            FROM fields_meta 
+            WHERE table_name = ? 
+            ORDER BY ordinal_position
+        """, [table_name]).fetchall()
+        
+        return [row[0] for row in result]
 
     def optimize(self, table_name: str = None):
         """
@@ -772,174 +738,11 @@ class SQLiteStorage(BaseStorage):
         except Exception as e:
             raise ValueError(f"Batch replacement failed: {str(e)}")
 
-    def set_searchable(self, field_name: str, is_searchable: bool = True, table_name: str = 'default'):
-        """设置字段是否可搜索
-        
-        Args:
-            field_name: 字段名
-            is_searchable: 是否可搜索
-            table_name: 表名
-        """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # 更新字段元数据
-            cursor.execute(
-                'UPDATE fields_meta SET is_searchable = ? WHERE table_name = ? AND field_name = ?',
-                (1 if is_searchable else 0, table_name, field_name)
-            )
-            
-            # 如果字段不存在,则插入
-            if cursor.rowcount == 0:
-                cursor.execute(
-                    'INSERT INTO fields_meta (table_name, field_name, field_type) VALUES (?, ?, ?)',
-                    (table_name, field_name, 'TEXT')
-                )
-            
-            conn.commit()
-
-    def rebuild_fts_index(self, table_name: str = None):
-        """
-        Rebuilds the full-text search index.
-
-        Parameters:
-            table_name: str
-                The table name, or None to use the current table
-        """
-        table_name = self._get_table_name(table_name)
-        cursor = self._get_connection().cursor()
-        
-        try:
-            cursor.execute("BEGIN TRANSACTION")
-            
-            # Clear the FTS index
-            cursor.execute(f"DELETE FROM {self._quote_identifier(table_name + '_fts')}")
-            
-            # Get searchable fields
-            searchable_fields = cursor.execute(
-                f"SELECT field_name FROM {self._quote_identifier(table_name + '_fields_meta')} WHERE is_searchable = 1"
-            ).fetchall()
-            
-            # Rebuild the index
-            for field_name, in searchable_fields:
-                cursor.execute(
-                    f"SELECT _id, {self._quote_identifier(field_name)} FROM {self._quote_identifier(table_name)} WHERE {self._quote_identifier(field_name)} IS NOT NULL"
-                )
-                
-                for record_id, value in cursor.fetchall():
-                    if value is not None:
-                        if isinstance(value, (list, dict)):
-                            content = json.dumps(value, ensure_ascii=False)
-                        else:
-                            content = str(value)
-                        
-                        cursor.execute(
-                            f"INSERT INTO {self._quote_identifier(table_name + '_fts')} (content, field_name, record_id) VALUES (?, ?, ?)",
-                            [content, field_name, record_id]
-                        )
-            
-            cursor.execute("COMMIT")
-            
-        except Exception as e:
-            cursor.execute("ROLLBACK")
-            raise ValueError(f"Failed to rebuild FTS index: {str(e)}")
-
     def close(self):
         """关闭数据库连接"""
         if hasattr(self, '_conn'):
             self._conn.close()
             del self._conn
-
-    def _create_auto_indexes(self):
-        """
-        Automatically create indexes based on query patterns
-        """
-        cursor = self._get_connection().cursor()
-        
-        # Get all numeric fields
-        numeric_fields = cursor.execute("""
-            SELECT field_name 
-            FROM fields_meta 
-            WHERE field_type IN ('INTEGER', 'REAL')
-        """).fetchall()
-        
-        # Create indexes for numeric fields (often used for range queries)
-        for (field_name,) in numeric_fields:
-            index_name = f"idx_{field_name}"
-            quoted_field_name = self._quote_identifier(field_name)
-            cursor.execute(f"""
-                CREATE INDEX IF NOT EXISTS {index_name}
-                ON records({quoted_field_name})
-            """)
-        
-        # Get all TEXT fields
-        text_fields = cursor.execute("""
-            SELECT field_name 
-            FROM fields_meta 
-            WHERE field_type = 'TEXT'
-        """).fetchall()
-        
-        # Create indexes for TEXT fields (used for LIKE queries)
-        for (field_name,) in text_fields:
-            index_name = f"idx_{field_name}_like"
-            quoted_field_name = self._quote_identifier(field_name)
-            cursor.execute(f"""
-                CREATE INDEX IF NOT EXISTS {index_name}
-                ON records({quoted_field_name} COLLATE NOCASE)
-            """)
-        
-        # Analyze new indexes
-        cursor.execute("ANALYZE")
-
-    def analyze_query_performance(self, query: str) -> dict:
-        """
-        Analyze query performance
-        
-        Parameters:
-            query: str
-                The query to analyze
-                
-        Returns:
-            dict: A dictionary containing the query plan and performance metrics
-        """
-        try:
-            cursor = self._get_connection().cursor()
-            
-            # Enable query plan analysis
-            cursor.execute("EXPLAIN QUERY PLAN " + query)
-            query_plan = cursor.fetchall()
-            
-            # Collect performance metrics
-            metrics = {
-                'tables_used': set(),
-                'indexes_used': set(),
-                'scan_type': [],
-                'estimated_rows': 0
-            }
-            
-            for step in query_plan:
-                detail = step[3]  # Query plan details
-                
-                if 'TABLE' in detail:
-                    table = detail.split('TABLE')[1].split()[0]
-                    metrics['tables_used'].add(table)
-                
-                if 'USING INDEX' in detail:
-                    index = detail.split('USING INDEX')[1].split()[0]
-                    metrics['indexes_used'].add(index)
-                
-                if 'SCAN' in detail:
-                    scan_type = detail.split('SCAN')[0].strip()
-                    metrics['scan_type'].append(scan_type)
-                
-                if 'rows=' in detail:
-                    rows = int(detail.split('rows=')[1].split()[0])
-                    metrics['estimated_rows'] = max(metrics['estimated_rows'], rows)
-            
-            return metrics
-            
-        except Exception as e:
-            return {}
 
     def count_rows(self, table_name: str = None) -> int:
         """

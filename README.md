@@ -12,7 +12,6 @@
 
 🔍 **Powerful Query Capabilities**
 - SQL-like query syntax
-- Full-text search with case-insensitive support
 - Complex queries with multiple conditions
 - JSON field support
 
@@ -68,10 +67,6 @@ results = client.query("age > 25")
 for record in results:
     print(record)
 
-# Full-text search
-client.set_searchable("name", True)
-results = client.search_text("John")
-
 # Import from Pandas
 import pandas as pd
 df = pd.DataFrame({"name": ["Alice", "Bob"], "age": [28, 32]})
@@ -114,15 +109,9 @@ results = client.query("name LIKE 'J%'")
 ### Performance Optimization
 
 ```python
-# Disable automatic FTS updates for batch operations
-client.set_auto_update_fts(False)
-
 # Store large batch of records
 records = [{"id": i, "value": i * 2} for i in range(10000)]
 ids = client.store(records)
-
-# Manually rebuild search index
-client.rebuild_search_index()
 ```
 
 ## Requirements
