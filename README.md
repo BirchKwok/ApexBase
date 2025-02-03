@@ -5,10 +5,11 @@
 ## Features
 
 ✨ **High Performance**
-- Built on SQLite with optimized configurations
+- Built on SQLite/DuckDB with optimized configurations
 - Efficient batch operations support
 - Automatic performance optimization
 - Concurrent access support
+- Columnar storage support with DuckDB backend
 
 🔍 **Powerful Query Capabilities**
 - SQL-like query syntax
@@ -45,11 +46,18 @@ pip install apexbase
 
 ## Quick Start
 
+```bash
+pip install apexbase
+```
+
 ```python
 from apexbase import ApexClient
 
-# Initialize the database
+# Initialize the database with SQLite backend (default)
 client = ApexClient("my_database")
+
+# Or use DuckDB backend for columnar storage and analytics
+client = ApexClient("my_database", backend="duckdb")
 
 # Store single record
 record = {"name": "John", "age": 30, "tags": ["python", "rust"]}
@@ -71,6 +79,23 @@ for record in results:
 import pandas as pd
 df = pd.DataFrame({"name": ["Alice", "Bob"], "age": [28, 32]})
 client.from_pandas(df)
+```
+
+### Storage Backend Selection
+
+```python
+# Use SQLite backend (default) - optimized for OLTP workloads
+client = ApexClient("my_database", backend="sqlite")
+
+# Use DuckDB backend - optimized for OLAP and analytics workloads
+client = ApexClient("my_database", backend="duckdb")
+
+# DuckDB backend advantages:
+# - Columnar storage for better analytics performance
+# - Efficient compression
+# - Vectorized query execution
+# - Better performance for analytical queries
+# - Native support for complex aggregations
 ```
 
 ## Advanced Usage
@@ -124,6 +149,7 @@ ids = client.store(records)
   - polars
   - numpy
   - psutil
+  - duckdb (optional, for columnar storage backend)
 
 ## License
 
