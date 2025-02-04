@@ -1,9 +1,9 @@
 from typing import List, Optional, Tuple, Dict
 import re
 from collections import OrderedDict
-import json
-import orjson
 
+import polars as pl
+import orjson
 import pandas as pd
 import pyarrow as pa
 
@@ -106,7 +106,6 @@ class ResultView:
                 else:
                     raise ValueError(f"Invalid LIKE syntax in: {where}")
             
-            # 直接使用数据库后端处理查询条件
             sql = f"SELECT {field_list} FROM {quoted_table} WHERE {where}"
             return sql, ()
             
@@ -159,17 +158,7 @@ class ResultView:
 
     def to_dict(self) -> List[Dict]:
         """Convert the result to a list of dictionaries, using cache"""
-        if not self._executed:
-            self._execute_query()
-            
-        if not self._processed_results:
-            # 优化：使用列表推导和 zip
-            self._processed_results = [
-                dict(zip(self._field_names, row))
-                for row in self._raw_results
-            ]
-            
-        return self._processed_results
+        return self.to_pandas().to_dict(orient='records')
 
     def __len__(self):
         """Return the number of results, triggering query execution"""
@@ -177,48 +166,25 @@ class ResultView:
 
     def __getitem__(self, idx):
         """Access the result by index, using cache"""
-        return self.to_dict()[idx]
+        return self.to_pandas().iloc[idx]
 
     def __iter__(self):
         """Iterate over the result, using cache"""
-        return iter(self.to_dict())
+        return iter(self.to_pandas())
 
     def to_pandas(self) -> "pd.DataFrame":
         """Convert the result to a Pandas DataFrame"""
-        # 直接从存储中获取数据
         query_sql, params = self._build_query_sql(self.query_sql)
-        
-        # 使用原生转换
-        if hasattr(self.storage, 'to_pandas'):
-            try:
-                df = self.storage.to_pandas(query_sql, params)
-                if '_id' in df.columns:
-                    df.set_index('_id', inplace=True)
-                    df.index.name = None
-                return df
-            except:
-                pass  # 如果失败，回退到普通转换
-        
-        # 回退到普通转换
-        if not self._executed:
-            self._execute_query()
-            
-        # 优化：直接构建 DataFrame
-        data = []
-        for row in self._raw_results:
-            item = dict(zip(self._field_names, row))
-            data.append(item)
-            
-        df = pd.DataFrame(data)
-        if '_id' in df.columns:
-            df.set_index('_id', inplace=True)
-            df.index.name = None
-        return df
+        return self.storage.to_pandas(query_sql, params)
 
     def to_arrow(self) -> "pa.Table":
         """Convert the result to a PyArrow Table, using cache, and set _id as an index"""
         df = self.to_pandas()  # _id is already set as an index
         return pa.Table.from_pandas(df)
+    
+    def to_polars(self) -> "pl.DataFrame":
+        """Convert the result to a Polars DataFrame"""
+        return pl.from_pandas(self.to_pandas())
 
     @property
     def ids(self) -> List[int]:

@@ -896,16 +896,19 @@ class SQLiteStorage(BaseStorage):
         """
         cursor = self._get_connection().cursor()
         
+        # 全局查询优化参数
+        cursor.execute('PRAGMA temp_store=MEMORY')
+        cursor.execute('PRAGMA cache_size=2000000')
+        cursor.execute('PRAGMA mmap_size=30000000000')
+        cursor.execute('PRAGMA read_uncommitted=1')
+        cursor.execute('PRAGMA synchronous=OFF')
+        cursor.execute('PRAGMA journal_mode=MEMORY')
+        cursor.execute('PRAGMA page_size=4096')
+        
         # 优化查询
         if 'LIKE' in sql.upper():
             # 添加索引提示
             sql = f"/* USING INDEX */ {sql}"
-            
-            # 设置临时查询优化参数
-            cursor.execute('PRAGMA temp_store=MEMORY')
-            cursor.execute('PRAGMA cache_size=2000000')
-            cursor.execute('PRAGMA mmap_size=30000000000')
-            cursor.execute('PRAGMA read_uncommitted=1')
             
             # 优化 LIKE 查询
             if 'LIKE' in sql and '%' in sql:
@@ -924,8 +927,16 @@ class SQLiteStorage(BaseStorage):
                         ) WHERE rev_{field} GLOB '{pattern[::-1]}*'
                     """
         
-        # 执行查询并一次性获取所有结果
-        return cursor.execute(sql, params).fetchall()
+        # 使用迭代器模式执行查询
+        cursor.execute(sql, params)
+        chunk_size = 1000  # 每次获取的记录数
+        results = []
+        while True:
+            chunk = cursor.fetchmany(chunk_size)
+            if not chunk:
+                break
+            results.extend(chunk)
+        return results
 
     def _create_indexes(self, table_name: str):
         """为表创建必要的索引"""
@@ -987,43 +998,36 @@ class SQLiteStorage(BaseStorage):
             raise e
 
     def to_pandas(self, sql: str, params: tuple = None) -> "pd.DataFrame":
-        """将查询结果直接转换为 DataFrame
+        """将查询结果转换为 Pandas DataFrame
         
         Args:
-            sql: SQL 语句
+            sql: SQL语句
             params: 查询参数
             
         Returns:
-            DataFrame 对象
+            pd.DataFrame: 查询结果
         """
         cursor = self._get_connection().cursor()
+        cursor.execute(sql, params)
+        columns = [description[0] for description in cursor.description]
         
-        # 优化查询参数
-        cursor.execute('PRAGMA temp_store=MEMORY')
-        cursor.execute('PRAGMA cache_size=2000000')
-        cursor.execute('PRAGMA mmap_size=30000000000')
-        cursor.execute('PRAGMA read_uncommitted=1')
+        chunk_size = 10000
+        chunks = []
+        while True:
+            chunk = cursor.fetchmany(chunk_size)
+            if not chunk:
+                break
+            chunks.append(pd.DataFrame(chunk, columns=columns))
         
-        # 获取字段名
-        fields = self.list_fields()
-        field_list = ','.join(
-            f'CAST({self._quote_identifier(f)} AS TEXT) AS {self._quote_identifier(f)}'
-            for f in fields
-        )
+        if not chunks:
+            return pd.DataFrame(columns=columns)
+        elif len(chunks) == 1:
+            return chunks[0]
         
-        # 构建优化的查询
-        optimized_sql = f"""
-            WITH result AS (
-                {sql}
-            )
-            SELECT {field_list}
-            FROM result
-        """
+        df = pd.concat(chunks, ignore_index=True)
         
-        # 执行查询并直接构建 DataFrame
-        result = cursor.execute(optimized_sql, params).fetchall()
-        return pd.DataFrame.from_records(
-            result,
-            columns=fields,
-            coerce_float=True
-        )
+        if '_id' in df.columns:
+            df.set_index('_id', inplace=True)
+            df.index.name = None
+            
+        return df
