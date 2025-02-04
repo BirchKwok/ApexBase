@@ -38,6 +38,10 @@ class DuckDBStorage(BaseStorage):
         """初始化数据库，创建必要的系统表"""
         cursor = self.conn.cursor()
         
+        # 设置优化参数
+        cursor.execute("PRAGMA memory_limit='4GB'")
+        cursor.execute("PRAGMA threads=4")
+        
         # 创建元数据表
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tables_meta (
@@ -53,6 +57,7 @@ class DuckDBStorage(BaseStorage):
                 table_name VARCHAR,
                 field_name VARCHAR,
                 field_type VARCHAR,
+                is_indexed BOOLEAN DEFAULT FALSE,
                 ordinal_position INTEGER,
                 PRIMARY KEY (table_name, field_name)
             )
@@ -269,9 +274,20 @@ class DuckDBStorage(BaseStorage):
         
         # 转换为DataFrame
         if isinstance(data, dict):
-            df = pd.DataFrame([data])
+            # 预处理 JSON 字段
+            processed_data = {}
+            for k, v in data.items():
+                if isinstance(v, (dict, list)):
+                    processed_data[k] = json.dumps(v)
+                else:
+                    processed_data[k] = v
+            df = pd.DataFrame([processed_data])
         else:
             df = data.copy()
+            # 预处理 DataFrame 中的 JSON 字段
+            for col in df.columns:
+                if df[col].apply(lambda x: isinstance(x, (dict, list))).any():
+                    df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x)
         
         # 如果是多行数据，使用batch_store
         if len(df) > 1:
@@ -307,6 +323,9 @@ class DuckDBStorage(BaseStorage):
                 """
                 cursor.execute(insert_sql)
                 cursor.unregister('df_view')
+                
+                # 创建索引
+                self._create_indexes(table_name)
                 
                 cursor.execute("COMMIT")
                 return next_id
@@ -625,7 +644,7 @@ class DuckDBStorage(BaseStorage):
                 raise e
 
     def query(self, sql: str, params: tuple = None) -> List[tuple]:
-        """执行自定义SQL查询
+        """执行自定义SQL查询，支持并行执行
         
         Args:
             sql: SQL语句
@@ -635,6 +654,14 @@ class DuckDBStorage(BaseStorage):
             查询结果
         """
         cursor = self.conn.cursor()
+        
+        # 添加并行查询支持
+        cursor.execute("PRAGMA threads=4")
+        
+        # 如果是 LIKE 查询，添加索引提示
+        if 'LIKE' in sql.upper():
+            sql = f"/* use_index */ {sql}"
+        
         return cursor.execute(sql, params).fetchall()
 
     def close(self):
@@ -664,14 +691,13 @@ class DuckDBStorage(BaseStorage):
         elif isinstance(value, float):
             return "DOUBLE"
         elif isinstance(value, (list, dict)):
-            return "JSON"  # DuckDB支持JSON类型
+            return "JSON"
         elif isinstance(value, str):
-            # 如果字符串长度超过一定值，使用TEXT类型
             if len(value) > 255:
                 return "TEXT"
             return "VARCHAR"
         else:
-            return "VARCHAR"  # 其他类型默认使用VARCHAR
+            return "VARCHAR"
 
     def _ensure_fields_exist(self, data: dict, table_name: str = None):
         """确保所有字段都存在
@@ -739,3 +765,61 @@ class DuckDBStorage(BaseStorage):
         """, [table_name]).fetchall()
         
         return [row[0] for row in result]
+
+    def _create_indexes(self, table_name: str):
+        """为表创建必要的索引"""
+        cursor = self.conn.cursor()
+        
+        # 获取需要创建索引的字段
+        fields = cursor.execute("""
+            SELECT field_name, field_type 
+            FROM fields_meta 
+            WHERE table_name = ? AND is_indexed = FALSE
+        """, [table_name]).fetchall()
+        
+        for field_name, field_type in fields:
+            # 为 VARCHAR 类型的字段创建索引
+            if field_type == 'VARCHAR':
+                index_name = f"idx_{table_name}_{field_name}"
+                cursor.execute(f"""
+                    CREATE INDEX IF NOT EXISTS {index_name}
+                    ON {self._quote_identifier(table_name)} ({self._quote_identifier(field_name)})
+                """)
+                
+                # 更新索引状态
+                cursor.execute("""
+                    UPDATE fields_meta 
+                    SET is_indexed = TRUE 
+                    WHERE table_name = ? AND field_name = ?
+                """, [table_name, field_name])
+
+    def to_pandas(self, sql: str, params: tuple = None) -> "pd.DataFrame":
+        """将查询结果直接转换为 DataFrame
+        
+        Args:
+            sql: SQL 语句
+            params: 查询参数
+            
+        Returns:
+            DataFrame 对象
+        """
+        cursor = self.conn.cursor()
+        
+        # 获取字段名
+        fields = self.list_fields()
+        field_list = ','.join(
+            f'CAST({self._quote_identifier(f)} AS TEXT) AS {self._quote_identifier(f)}'
+            for f in fields
+        )
+        
+        # 构建优化的查询
+        optimized_sql = f"""
+            WITH result AS (
+                {sql}
+            )
+            SELECT {field_list}
+            FROM result
+        """
+        
+        # 使用 DuckDB 的原生 DataFrame 转换
+        return cursor.execute(optimized_sql, params).df()

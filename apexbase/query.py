@@ -2,8 +2,8 @@ from typing import List, Optional, Tuple, Dict
 import re
 from collections import OrderedDict
 import json
+import orjson
 
-from .sql_parser import SQLParser, SQLGenerator
 import pandas as pd
 import pyarrow as pa
 
@@ -35,6 +35,25 @@ class LRUCache(OrderedDict):
             self.popitem(last=False)
 
 
+class LazyJSONField:
+    """延迟解析的 JSON 字段"""
+    def __init__(self, value):
+        self._value = value
+        self._parsed = None
+
+    def __str__(self):
+        return self._value
+
+    def get(self):
+        """获取解析后的值"""
+        if self._parsed is None:
+            try:
+                self._parsed = orjson.loads(self._value)
+            except:
+                self._parsed = self._value
+        return self._parsed
+
+
 class ResultView:
     """Query result view, supports lazy execution and LRU cache"""
     _global_cache = LRUCache(maxsize=1000)
@@ -44,18 +63,19 @@ class ResultView:
         self.query_sql = query_sql
         self.fields = fields
         self.table_name = table_name
-
-        self.parser = SQLParser()
-        self.generator = SQLGenerator()
         
         self._executed = False
         self._cache_key = f"{query_sql}:{table_name if table_name else ''}"
+        self._raw_results = None
+        self._processed_results = None
+        self._json_fields = None
+        self._field_names = None
 
-    def _build_query_sql(self, query_filter: str = None) -> Tuple[str, tuple]:
+    def _build_query_sql(self, where: str = None) -> Tuple[str, tuple]:
         """构建查询SQL语句
         
         Args:
-            query_filter: 查询条件
+            where: 查询条件
             
         Returns:
             SQL语句和参数元组
@@ -66,15 +86,15 @@ class ResultView:
         fields = self.storage.list_fields(table_name)
         field_list = ','.join(self.storage._quote_identifier(f) for f in fields)
         
-        if not query_filter or query_filter.strip() == "1=1":
+        if not where or where.strip() == "1=1":
             sql = f"SELECT {field_list} FROM {quoted_table}"
             return sql, ()
         
         try:
             # 处理LIKE查询
-            if 'LIKE' in query_filter.upper():
+            if 'LIKE' in where.upper():
                 # 使用正则表达式匹配字段名和模式
-                match = re.match(r'\s*(\w+)\s+LIKE\s+[\'"](.+?)[\'"]\s*', query_filter, re.IGNORECASE)
+                match = re.match(r'\s*(\w+)\s+LIKE\s+[\'"](.+?)[\'"]\s*', where, re.IGNORECASE)
                 if match:
                     field, pattern = match.groups()
                     sql = f"""
@@ -84,16 +104,11 @@ class ResultView:
                     """
                     return sql, (pattern,)
                 else:
-                    raise ValueError(f"Invalid LIKE syntax in: {query_filter}")
+                    raise ValueError(f"Invalid LIKE syntax in: {where}")
             
-            # 处理其他查询
-            ast = self.parser.parse(query_filter)
-            self.generator.reset()
-            where_clause = self.generator.generate(ast)
-            params = self.generator.get_parameters()
-            
-            sql = f"SELECT {field_list} FROM {quoted_table} WHERE {where_clause}"
-            return sql, tuple(params)
+            # 直接使用数据库后端处理查询条件
+            sql = f"SELECT {field_list} FROM {quoted_table} WHERE {where}"
+            return sql, ()
             
         except Exception as e:
             raise ValueError(f"Invalid query syntax: {str(e)}")
@@ -102,52 +117,59 @@ class ResultView:
         """执行查询并缓存结果"""
         try:
             query_sql, params = self._build_query_sql(self.query_sql)
-            result = self.storage.query(query_sql, params)
             
             # 获取字段名
-            fields = self.storage.list_fields()
-            if not fields:
+            self._field_names = self.storage.list_fields()
+            if not self._field_names:
                 self._ids = []
-                self._results = []
+                self._raw_results = []
                 return
-                
+            
+            # 执行查询
+            result = self.storage.query(query_sql, params)
+            
+            # 处理结果
+            self._raw_results = result
             self._ids = []
-            self._results = []
-            for row in result:
-                data = {}
-                for i, field in enumerate(fields):
-                    value = row[i]
-                    if value is not None:
-                        try:
-                            # 尝试解析JSON
-                            data[field] = json.loads(value)
-                        except (json.JSONDecodeError, TypeError):
-                            data[field] = value
-                    else:
-                        data[field] = None
-                
-                if '_id' in data:
-                    self._ids.append(data['_id'])
-                self._results.append(data)
-                    
-            self._global_cache.put(self._cache_key, (self._ids, self._results))
+            id_index = self._field_names.index('_id')
+            self._ids = [row[id_index] for row in result]
+            
+            self._global_cache.put(self._cache_key, (self._ids, self._raw_results))
             self._executed = True
+            
         except Exception as e:
             raise QueryError(f"Query execution failed: {str(e)}")
 
-    @property
-    def ids(self) -> List[int]:
-        """Get the list of IDs for the result, using cache"""
-        if not self._executed:
-            self._execute_query()
-        return self._ids
+    def _process_row(self, row):
+        """处理单行数据"""
+        if not self._field_names:
+            return {}
+            
+        data = {}
+        for i, field in enumerate(self._field_names):
+            value = row[i]
+            if value is not None:
+                if field in self._json_fields and isinstance(value, str):
+                    data[field] = LazyJSONField(value)
+                else:
+                    data[field] = value
+            else:
+                data[field] = None
+        return data
 
     def to_dict(self) -> List[Dict]:
         """Convert the result to a list of dictionaries, using cache"""
         if not self._executed:
             self._execute_query()
             
-        return self._results if self._results else []
+        if not self._processed_results:
+            # 优化：使用列表推导和 zip
+            self._processed_results = [
+                dict(zip(self._field_names, row))
+                for row in self._raw_results
+            ]
+            
+        return self._processed_results
 
     def __len__(self):
         """Return the number of results, triggering query execution"""
@@ -162,8 +184,31 @@ class ResultView:
         return iter(self.to_dict())
 
     def to_pandas(self) -> "pd.DataFrame":
-        """Convert the result to a Pandas DataFrame, using cache, and set _id as an unnamed index"""
-        data = self.to_dict()
+        """Convert the result to a Pandas DataFrame"""
+        # 直接从存储中获取数据
+        query_sql, params = self._build_query_sql(self.query_sql)
+        
+        # 使用原生转换
+        if hasattr(self.storage, 'to_pandas'):
+            try:
+                df = self.storage.to_pandas(query_sql, params)
+                if '_id' in df.columns:
+                    df.set_index('_id', inplace=True)
+                    df.index.name = None
+                return df
+            except:
+                pass  # 如果失败，回退到普通转换
+        
+        # 回退到普通转换
+        if not self._executed:
+            self._execute_query()
+            
+        # 优化：直接构建 DataFrame
+        data = []
+        for row in self._raw_results:
+            item = dict(zip(self._field_names, row))
+            data.append(item)
+            
         df = pd.DataFrame(data)
         if '_id' in df.columns:
             df.set_index('_id', inplace=True)
@@ -174,6 +219,13 @@ class ResultView:
         """Convert the result to a PyArrow Table, using cache, and set _id as an index"""
         df = self.to_pandas()  # _id is already set as an index
         return pa.Table.from_pandas(df)
+
+    @property
+    def ids(self) -> List[int]:
+        """Get the list of IDs for the result, using cache"""
+        if not self._executed:
+            self._execute_query()
+        return self._ids
 
 
 class Query:
@@ -212,12 +264,12 @@ class Query:
         """
         return f'"{identifier}"'
 
-    def query(self, query_filter: str = None, table_name: str = None) -> ResultView:
+    def query(self, where: str = None, table_name: str = None) -> ResultView:
         """
         Query records using SQL syntax.
 
         Parameters:
-            query_filter: str
+            where: str
                 SQL filter conditions. For example:
                 - age > 30
                 - name LIKE 'John%'
@@ -227,10 +279,10 @@ class Query:
         Returns:
             ResultView: The query result view
         """
-        if not isinstance(query_filter, str) or not query_filter.strip():
+        if not isinstance(where, str) or not where.strip():
             raise ValueError("Invalid query syntax")
         
-        return ResultView(self.storage, query_filter, table_name)
+        return ResultView(self.storage, where, table_name)
 
     def retrieve(self, id_: int) -> Optional[dict]:
         """

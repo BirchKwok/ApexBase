@@ -1,3 +1,4 @@
+import shutil
 from typing import List, Dict, Union, Optional, Literal
 from pathlib import Path
 
@@ -33,12 +34,12 @@ class ApexClient:
             dirpath = "."
         
         self.dirpath = Path(dirpath)
+        if drop_if_exists and self.dirpath.exists():
+            shutil.rmtree(self.dirpath)
+            
         self.dirpath.mkdir(parents=True, exist_ok=True)
         
         self.db_path = self.dirpath / f"apexbase_{backend}.db"
-        
-        if drop_if_exists and self.db_path.exists():
-            self.db_path.unlink()
         
         self.storage = create_storage(backend, str(self.db_path), batch_size=batch_size)
         self.query_handler = Query(self.storage)
@@ -107,12 +108,12 @@ class ApexClient:
         else:
             raise ValueError("Data must be a dict or a list of dicts")
 
-    def query(self, query_filter: str = None) -> ResultView:
+    def query(self, where: str = None) -> ResultView:
         """
         Queries records using SQL syntax.
 
         Parameters:
-            query_filter: str
+            where: str
                 SQL filter conditions. For example:
                 - age > 30
                 - name LIKE 'John%'
@@ -123,7 +124,7 @@ class ApexClient:
         Returns:
             ResultView: A view of query results, supporting deferred execution
         """
-        return self.query_handler.query(query_filter)
+        return self.query_handler.query(where)
 
     def retrieve(self, id_: int) -> Optional[dict]:
         """

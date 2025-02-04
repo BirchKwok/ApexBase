@@ -4,6 +4,8 @@ from typing import Dict, List, Any, Optional
 import json
 import threading
 import os
+import re
+import pandas as pd
 
 from .base import BaseStorage
 from ..limited_dict import LimitedDict
@@ -35,20 +37,8 @@ class SQLiteStorage(BaseStorage):
     def _get_connection(self):
         """获取数据库连接"""
         if not hasattr(self, '_conn'):
-            self._conn = sqlite3.connect(self.db_path)
+            self._conn = sqlite3.connect(self.db_path, isolation_level=None)  # 自动提交模式
             self._conn.row_factory = sqlite3.Row
-            
-            # 设置数据库参数
-            cursor = self._conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA wal_autocheckpoint=1000")
-            cursor.execute("PRAGMA synchronous=NORMAL")
-            cursor.execute("PRAGMA cache_size=-262144")
-            cursor.execute("PRAGMA temp_store=MEMORY")
-            cursor.execute("PRAGMA mmap_size=1099511627776")
-            cursor.execute("PRAGMA page_size=32768")
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute("PRAGMA busy_timeout=300000")
             
         return self._conn
 
@@ -60,9 +50,20 @@ class SQLiteStorage(BaseStorage):
             # 设置数据库参数
             cursor.execute('PRAGMA journal_mode=WAL')
             cursor.execute('PRAGMA synchronous=NORMAL')
-            cursor.execute('PRAGMA cache_size=10000')
+            cursor.execute('PRAGMA cache_size=2000000')  # 进一步增加缓存
             cursor.execute('PRAGMA temp_store=MEMORY')
             cursor.execute('PRAGMA mmap_size=30000000000')
+            cursor.execute('PRAGMA page_size=32768')
+            cursor.execute('PRAGMA busy_timeout=5000')
+            cursor.execute('PRAGMA locking_mode=EXCLUSIVE')
+            cursor.execute('PRAGMA foreign_keys=OFF')
+            cursor.execute('PRAGMA read_uncommitted=1')
+            cursor.execute('PRAGMA recursive_triggers=0')
+            cursor.execute('PRAGMA auto_vacuum=INCREMENTAL')
+            cursor.execute('PRAGMA secure_delete=OFF')
+            
+            # 创建反向字符串函数
+            conn.create_function("reverse", 1, lambda s: s[::-1] if s else None)
             
             # 创建主表 - 只包含_id字段，其他字段动态添加
             cursor.execute('''
@@ -75,7 +76,8 @@ class SQLiteStorage(BaseStorage):
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS tables_meta (
                 table_name TEXT PRIMARY KEY,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                schema TEXT  -- 存储表的字段定义
             )
             ''')
             
@@ -84,9 +86,10 @@ class SQLiteStorage(BaseStorage):
                 table_name TEXT,
                 field_name TEXT,
                 field_type TEXT,
+                is_json BOOLEAN DEFAULT FALSE,
+                is_indexed BOOLEAN DEFAULT FALSE,
                 ordinal_position INTEGER,
-                PRIMARY KEY (table_name, field_name),
-                FOREIGN KEY (table_name) REFERENCES tables_meta(table_name)
+                PRIMARY KEY (table_name, field_name)
             )
             ''')
             
@@ -294,6 +297,7 @@ class SQLiteStorage(BaseStorage):
             for field_name, value in data.items():
                 if field_name != '_id' and field_name not in existing_fields:
                     field_type = self._infer_field_type(value)
+                    is_json = isinstance(value, str) and (value.startswith('{') or value.startswith('['))
                     quoted_field = self._quote_identifier(field_name)
                     
                     # 添加字段到表
@@ -303,12 +307,13 @@ class SQLiteStorage(BaseStorage):
                     
                     # 更新元数据
                     cursor.execute("""
-                        INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
-                        VALUES (?, ?, ?, ?)
+                        INSERT INTO fields_meta (table_name, field_name, field_type, is_json, ordinal_position)
+                        VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT (table_name, field_name) DO UPDATE SET 
                             field_type = EXCLUDED.field_type,
+                            is_json = EXCLUDED.is_json,
                             ordinal_position = EXCLUDED.ordinal_position
-                    """, [table_name, field_name, field_type, next_position])
+                    """, [table_name, field_name, field_type, is_json, next_position])
                     next_position += 1
             
             cursor.execute("COMMIT")
@@ -329,8 +334,16 @@ class SQLiteStorage(BaseStorage):
         """
         table_name = self._get_table_name(table_name)
         
+        # 预处理数据
+        processed_data = {}
+        for k, v in data.items():
+            if isinstance(v, (dict, list)):
+                processed_data[k] = orjson.dumps(v).decode('utf-8')
+            else:
+                processed_data[k] = v
+        
         # 确保所有字段存在
-        self._ensure_fields_exist(data, table_name)
+        self._ensure_fields_exist(processed_data, table_name)
         
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -340,14 +353,11 @@ class SQLiteStorage(BaseStorage):
                 values = []
                 params = []
                 
-                for field_name, value in data.items():
+                for field_name, value in processed_data.items():
                     if field_name != '_id':
                         fields.append(self._quote_identifier(field_name))
                         values.append('?')
-                        if isinstance(value, (list, dict)):
-                            params.append(json.dumps(value))
-                        else:
-                            params.append(value)
+                        params.append(value)
                 
                 # 构建并执行插入语句
                 sql = f"""
@@ -874,7 +884,7 @@ class SQLiteStorage(BaseStorage):
         except Exception as e:
             raise ValueError(f"Failed to retrieve records: {str(e)}")
 
-    def query(self, sql: str, params: tuple) -> List[tuple]:
+    def query(self, sql: str, params: tuple = None) -> List[tuple]:
         """执行自定义SQL查询
         
         Args:
@@ -885,4 +895,135 @@ class SQLiteStorage(BaseStorage):
             查询结果
         """
         cursor = self._get_connection().cursor()
+        
+        # 优化查询
+        if 'LIKE' in sql.upper():
+            # 添加索引提示
+            sql = f"/* USING INDEX */ {sql}"
+            
+            # 设置临时查询优化参数
+            cursor.execute('PRAGMA temp_store=MEMORY')
+            cursor.execute('PRAGMA cache_size=2000000')
+            cursor.execute('PRAGMA mmap_size=30000000000')
+            cursor.execute('PRAGMA read_uncommitted=1')
+            
+            # 优化 LIKE 查询
+            if 'LIKE' in sql and '%' in sql:
+                # 如果是前缀匹配，使用索引
+                if sql.count('%') == 1 and sql.endswith("%'"):
+                    sql = sql.replace('LIKE', 'GLOB')
+                    sql = sql.replace('%', '*')
+                # 如果是后缀匹配，反转字符串并使用前缀匹配
+                elif sql.count('%') == 1 and sql.startswith("'%"):
+                    field = re.search(r'(\w+)\s+LIKE', sql).group(1)
+                    pattern = sql.split("'%")[1].rstrip("'")
+                    sql = f"""
+                        SELECT * FROM (
+                            SELECT *, reverse({field}) as rev_{field}
+                            FROM ({sql.split('WHERE')[0]})
+                        ) WHERE rev_{field} GLOB '{pattern[::-1]}*'
+                    """
+        
+        # 执行查询并一次性获取所有结果
         return cursor.execute(sql, params).fetchall()
+
+    def _create_indexes(self, table_name: str):
+        """为表创建必要的索引"""
+        cursor = self._get_connection().cursor()
+        
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            
+            # 获取需要创建索引的字段
+            fields = cursor.execute("""
+                SELECT field_name, field_type 
+                FROM fields_meta 
+                WHERE table_name = ? AND is_indexed = FALSE
+            """, [table_name]).fetchall()
+            
+            for field_name, field_type in fields:
+                # 为 TEXT/VARCHAR 类型的字段创建索引
+                if field_type in ('TEXT', 'VARCHAR'):
+                    index_name = f"idx_{table_name}_{field_name}"
+                    # 使用部分索引和前缀索引优化 LIKE 查询
+                    cursor.execute(f"""
+                        CREATE INDEX IF NOT EXISTS {index_name}
+                        ON {self._quote_identifier(table_name)} ({self._quote_identifier(field_name)})
+                        WHERE {self._quote_identifier(field_name)} IS NOT NULL
+                    """)
+                    
+                    # 创建前缀索引
+                    cursor.execute(f"""
+                        CREATE INDEX IF NOT EXISTS {index_name}_prefix
+                        ON {self._quote_identifier(table_name)} (
+                            substr({self._quote_identifier(field_name)}, 1, 10)
+                        )
+                        WHERE {self._quote_identifier(field_name)} IS NOT NULL
+                    """)
+                    
+                    # 创建反向索引，用于优化后缀匹配
+                    cursor.execute(f"""
+                        CREATE INDEX IF NOT EXISTS {index_name}_reverse
+                        ON {self._quote_identifier(table_name)} (
+                            reverse({self._quote_identifier(field_name)})
+                        )
+                        WHERE {self._quote_identifier(field_name)} IS NOT NULL
+                    """)
+                    
+                    # 更新索引状态
+                    cursor.execute("""
+                        UPDATE fields_meta 
+                        SET is_indexed = TRUE 
+                        WHERE table_name = ? AND field_name = ?
+                    """, [table_name, field_name])
+                    
+            # 分析表以优化查询计划
+            cursor.execute(f"ANALYZE {self._quote_identifier(table_name)}")
+            
+            cursor.execute("COMMIT")
+            
+        except Exception as e:
+            cursor.execute("ROLLBACK")
+            raise e
+
+    def to_pandas(self, sql: str, params: tuple = None) -> "pd.DataFrame":
+        """将查询结果直接转换为 DataFrame
+        
+        Args:
+            sql: SQL 语句
+            params: 查询参数
+            
+        Returns:
+            DataFrame 对象
+        """
+        cursor = self._get_connection().cursor()
+        
+        # 优化查询参数
+        cursor.execute('PRAGMA temp_store=MEMORY')
+        cursor.execute('PRAGMA cache_size=2000000')
+        cursor.execute('PRAGMA mmap_size=30000000000')
+        cursor.execute('PRAGMA read_uncommitted=1')
+        
+        # 获取字段名
+        fields = self.list_fields()
+        field_list = ','.join(
+            f'CAST({self._quote_identifier(f)} AS TEXT) AS {self._quote_identifier(f)}'
+            for f in fields
+        )
+        
+        # 构建优化的查询
+        optimized_sql = f"""
+            WITH result AS (
+                {sql}
+            )
+            SELECT {field_list}
+            FROM result
+        """
+        
+        # 执行查询并直接构建 DataFrame
+        result = cursor.execute(optimized_sql, params).fetchall()
+        return pd.DataFrame.from_records(
+            result,
+            columns=fields,
+            coerce_float=True
+        )
