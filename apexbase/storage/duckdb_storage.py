@@ -94,8 +94,9 @@ class DuckDBStorage(BaseStorage):
             try:
                 # 创建主表（使用最小schema）
                 cursor.execute(f"""
-                    CREATE TABLE {self._quote_identifier(table_name)} (
-                        _id BIGINT PRIMARY KEY
+                    CREATE TABLE IF NOT EXISTS {self._quote_identifier(table_name)} (
+                        _id BIGINT,
+                        PRIMARY KEY (_id)
                     )
                 """)
                 
@@ -149,7 +150,8 @@ class DuckDBStorage(BaseStorage):
     def list_tables(self) -> List[str]:
         """Lists all tables."""
         cursor = self.conn.cursor()
-        return [row[0] for row in cursor.execute("SELECT table_name FROM tables_meta ORDER BY table_name")]
+        result = cursor.execute("SELECT table_name FROM tables_meta ORDER BY table_name")
+        return [row[0] for row in result.fetchall()]
 
     def _table_exists(self, table_name: str) -> bool:
         """Checks if a table exists."""
@@ -549,21 +551,41 @@ class DuckDBStorage(BaseStorage):
         
         return data_list
 
-    def delete(self, id_: int) -> bool:
-        """Deletes a single record by ID."""
+    def delete(self, id_: Union[int, List[int]]) -> bool:
+        """删除记录
+        
+        Args:
+            id_: 单个ID或ID列表
+            
+        Returns:
+            bool: 删除是否成功
+        """
+        if isinstance(id_, list):
+            return self.batch_delete(id_)
+            
         table_name = self._get_table_name()
         
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute("BEGIN TRANSACTION")
             try:
-                result = cursor.execute(f"""
+                # 检查记录是否存在
+                exists = cursor.execute(
+                    f"SELECT 1 FROM {self._quote_identifier(table_name)} WHERE _id = ?",
+                    [id_]
+                ).fetchone()
+                if not exists:
+                    cursor.execute("ROLLBACK")
+                    return False
+                
+                # 执行删除
+                cursor.execute(f"""
                     DELETE FROM {self._quote_identifier(table_name)}
                     WHERE _id = ?
                 """, [id_])
                 
                 cursor.execute("COMMIT")
-                return result.rowcount > 0
+                return True
                 
             except Exception as e:
                 cursor.execute("ROLLBACK")
@@ -580,39 +602,122 @@ class DuckDBStorage(BaseStorage):
             cursor = self.conn.cursor()
             cursor.execute("BEGIN TRANSACTION")
             try:
+                # 检查记录是否存在
                 placeholders = ','.join(['?' for _ in ids])
-                result = cursor.execute(f"""
+                exists = cursor.execute(f"""
+                    SELECT COUNT(*) 
+                    FROM {self._quote_identifier(table_name)} 
+                    WHERE _id IN ({placeholders})
+                """, ids).fetchone()[0]
+                
+                if exists == 0:
+                    cursor.execute("ROLLBACK")
+                    return False
+                
+                # 执行删除
+                cursor.execute(f"""
                     DELETE FROM {self._quote_identifier(table_name)}
                     WHERE _id IN ({placeholders})
                 """, ids)
                 
                 cursor.execute("COMMIT")
-                return result.rowcount > 0
+                return True
                 
             except Exception as e:
                 cursor.execute("ROLLBACK")
                 raise e
 
     def replace(self, id_: int, data: dict) -> bool:
-        """Replaces a single record by ID."""
+        """替换单条记录
+    
+        Args:
+            id_: 记录ID
+            data: 新的记录数据
+            
+        Returns:
+            bool: 替换是否成功
+        """
         table_name = self._get_table_name()
         
         with self._lock:
             cursor = self.conn.cursor()
-            cursor.execute("BEGIN TRANSACTION")
-            try:
-                result = cursor.execute(f"""
+            
+            # 检查记录是否存在
+            exists = cursor.execute(
+                f"SELECT 1 FROM {self._quote_identifier(table_name)} WHERE _id = ?",
+                [id_]
+            ).fetchone()
+            
+            if not exists:
+                return False
+
+            # 确保所有字段存在
+            update_data = {k: v for k, v in data.items() if k != '_id'}  # 显式排除_id字段
+            self._ensure_fields_exist(update_data, table_name, cursor)
+            
+            # 准备更新数据
+            set_clauses = []
+            params = []
+            
+            for field, value in update_data.items():
+                quoted_field = self._quote_identifier(field)
+                if isinstance(value, (dict, list)):
+                    set_clauses.append(f"{quoted_field} = ?")
+                    params.append(json.dumps(value))
+                else:
+                    set_clauses.append(f"{quoted_field} = ?")
+                    params.append(value)
+
+            if set_clauses:
+                params.append(id_)  # 添加WHERE条件的参数
+                update_sql = f"""
                     UPDATE {self._quote_identifier(table_name)}
-                    SET data = ?
+                    SET {', '.join(set_clauses)}
                     WHERE _id = ?
-                """, [orjson.dumps(data).decode('utf-8'), id_])
-                
-                cursor.execute("COMMIT")
-                return result.rowcount > 0
-                
-            except Exception as e:
-                cursor.execute("ROLLBACK")
-                raise e
+                """
+                try:
+                    cursor.execute(update_sql, params)
+                except Exception as e:
+                    # 如果 UPDATE 失败，尝试 DELETE + INSERT
+                    cursor.execute(f"""
+                        DELETE FROM {self._quote_identifier(table_name)}
+                        WHERE _id = ?
+                    """, [id_])
+                    
+                    # 准备所有字段
+                    all_fields = self._get_table_columns(table_name)
+                    current_data = cursor.execute(f"""
+                        SELECT * FROM {self._quote_identifier(table_name)}
+                        WHERE _id = ?
+                    """, [id_]).fetchone()
+                    
+                    # 构建完整的字段值列表
+                    columns = []
+                    values = []
+                    for field in all_fields:
+                        columns.append(self._quote_identifier(field))
+                        if field == '_id':
+                            values.append(id_)
+                        elif field in update_data:
+                            value = update_data[field]
+                            if isinstance(value, (dict, list)):
+                                values.append(json.dumps(value))
+                            else:
+                                values.append(value)
+                        else:
+                            idx = all_fields.index(field)
+                            values.append(current_data[idx] if current_data else None)
+                    
+                    # 插入新记录
+                    placeholders = ['?' for _ in columns]
+                    insert_sql = f"""
+                        INSERT INTO {self._quote_identifier(table_name)}
+                        ({', '.join(columns)})
+                        VALUES ({', '.join(placeholders)})
+                    """
+                    cursor.execute(insert_sql, values)
+            
+            return True
 
     def batch_replace(self, data_dict: Dict[int, dict]) -> List[int]:
         """Replaces multiple records by IDs."""
@@ -624,24 +729,88 @@ class DuckDBStorage(BaseStorage):
         
         with self._lock:
             cursor = self.conn.cursor()
-            cursor.execute("BEGIN TRANSACTION")
-            try:
-                for id_, data in data_dict.items():
-                    result = cursor.execute(f"""
+            
+            # 检查记录是否存在
+            ids = list(data_dict.keys())
+            placeholders = ','.join(['?' for _ in ids])
+            existing_ids = cursor.execute(f"""
+                SELECT _id FROM {self._quote_identifier(table_name)}
+                WHERE _id IN ({placeholders})
+            """, ids).fetchall()
+            existing_ids = {row[0] for row in existing_ids}
+            
+            # 只更新存在的记录
+            for id_ in existing_ids:
+                data = data_dict[id_]
+                # 确保所有字段存在
+                update_data = {k: v for k, v in data.items() if k != '_id'}
+                self._ensure_fields_exist(update_data, table_name, cursor)
+                
+                # 准备更新数据
+                set_clauses = []
+                params = []
+                
+                for field, value in update_data.items():
+                    quoted_field = self._quote_identifier(field)
+                    if isinstance(value, (dict, list)):
+                        set_clauses.append(f"{quoted_field} = ?")
+                        params.append(json.dumps(value))
+                    else:
+                        set_clauses.append(f"{quoted_field} = ?")
+                        params.append(value)
+
+                if set_clauses:
+                    params.append(id_)  # 添加WHERE条件的参数
+                    update_sql = f"""
                         UPDATE {self._quote_identifier(table_name)}
-                        SET data = ?
+                        SET {', '.join(set_clauses)}
                         WHERE _id = ?
-                    """, [orjson.dumps(data).decode('utf-8'), id_])
+                    """
+                    try:
+                        cursor.execute(update_sql, params)
+                    except Exception as e:
+                        # 如果 UPDATE 失败，尝试 DELETE + INSERT
+                        cursor.execute(f"""
+                            DELETE FROM {self._quote_identifier(table_name)}
+                            WHERE _id = ?
+                        """, [id_])
+                        
+                        # 准备所有字段
+                        all_fields = self._get_table_columns(table_name)
+                        current_data = cursor.execute(f"""
+                            SELECT * FROM {self._quote_identifier(table_name)}
+                            WHERE _id = ?
+                        """, [id_]).fetchone()
+                        
+                        # 构建完整的字段值列表
+                        columns = []
+                        values = []
+                        for field in all_fields:
+                            columns.append(self._quote_identifier(field))
+                            if field == '_id':
+                                values.append(id_)
+                            elif field in update_data:
+                                value = update_data[field]
+                                if isinstance(value, (dict, list)):
+                                    values.append(json.dumps(value))
+                                else:
+                                    values.append(value)
+                            else:
+                                idx = all_fields.index(field)
+                                values.append(current_data[idx] if current_data else None)
+                        
+                        # 插入新记录
+                        placeholders = ['?' for _ in columns]
+                        insert_sql = f"""
+                            INSERT INTO {self._quote_identifier(table_name)}
+                            ({', '.join(columns)})
+                            VALUES ({', '.join(placeholders)})
+                        """
+                        cursor.execute(insert_sql, values)
                     
-                    if result.rowcount > 0:
-                        success_ids.append(id_)
-                
-                cursor.execute("COMMIT")
-                return success_ids
-                
-            except Exception as e:
-                cursor.execute("ROLLBACK")
-                raise e
+                    success_ids.append(id_)
+            
+            return success_ids
 
     def query(self, sql: str, params: tuple = None) -> List[tuple]:
         """执行自定义SQL查询，支持并行执行
@@ -698,51 +867,6 @@ class DuckDBStorage(BaseStorage):
             return "VARCHAR"
         else:
             return "VARCHAR"
-
-    def _ensure_fields_exist(self, data: dict, table_name: str = None):
-        """确保所有字段都存在
-        
-        Args:
-            data: 数据字典
-            table_name: 表名
-        """
-        table_name = self._get_table_name(table_name)
-        cursor = self.conn.cursor()
-        
-        try:
-            cursor.execute("BEGIN TRANSACTION")
-            
-            # 获取现有字段
-            existing_fields = set()
-            result = cursor.execute(
-                "SELECT field_name FROM fields_meta WHERE table_name = ?",
-                [table_name]
-            ).fetchall()
-            for row in result:
-                existing_fields.add(row[0])
-            
-            # 添加新字段
-            for field_name, value in data.items():
-                if field_name != '_id' and field_name not in existing_fields:
-                    field_type = self._infer_field_type(value)
-                    quoted_field = self._quote_identifier(field_name)
-                    
-                    # 添加字段到表
-                    cursor.execute(
-                        f"ALTER TABLE {self._quote_identifier(table_name)} ADD COLUMN IF NOT EXISTS {quoted_field} {field_type}"
-                    )
-                    
-                    # 更新元数据
-                    cursor.execute(
-                        "INSERT INTO fields_meta (table_name, field_name, field_type) VALUES (?, ?, ?)",
-                        [table_name, field_name, field_type]
-                    )
-            
-            cursor.execute("COMMIT")
-            
-        except Exception as e:
-            cursor.execute("ROLLBACK")
-            raise e
 
     def list_fields(self, table_name: str = None) -> List[str]:
         """获取表的所有字段
@@ -823,3 +947,72 @@ class DuckDBStorage(BaseStorage):
         
         # 使用 DuckDB 的原生 DataFrame 转换
         return cursor.execute(optimized_sql, params).df()
+
+    def _create_temp_table(self, table_name: str, suffix: str = None) -> str:
+        """创建临时表并返回表名"""
+        temp_name = f"temp_{table_name}"
+        if suffix:
+            temp_name = f"{temp_name}_{suffix}"
+        temp_name = self._quote_identifier(temp_name)
+        return temp_name
+
+    def count_rows(self, table_name: str = None) -> int:
+        """获取表中的记录数
+        
+        Args:
+            table_name: 表名
+            
+        Returns:
+            记录数
+        """
+        table_name = self._get_table_name(table_name)
+        cursor = self.conn.cursor()
+        result = cursor.execute(f"SELECT COUNT(*) FROM {self._quote_identifier(table_name)}").fetchone()
+        return result[0] if result else 0
+
+    def optimize(self):
+        """优化数据库性能"""
+        table_name = self._get_table_name()
+        cursor = self.conn.cursor()
+        
+        try:
+            # DuckDB的优化操作
+            cursor.execute("PRAGMA memory_limit='4GB'")
+            cursor.execute("PRAGMA threads=4")
+            cursor.execute("PRAGMA force_compression='none'")
+            cursor.execute("PRAGMA checkpoint_threshold='1GB'")
+            
+            # 分析表以优化查询计划
+            cursor.execute(f"ANALYZE {self._quote_identifier(table_name)}")
+            
+        except Exception as e:
+            raise ValueError(f"Failed to optimize database: {str(e)}")
+
+    def _ensure_fields_exist(self, data: dict, table_name: str, cursor):
+        """确保所有字段都存在（移除事务管理）"""
+        # 获取现有字段元数据
+        existing_fields = cursor.execute(
+            "SELECT field_name FROM fields_meta WHERE table_name = ?",
+            [table_name]
+        ).fetchall()
+        existing_fields = {row[0] for row in existing_fields}
+        
+        # 添加新字段到表和元数据
+        for field in data.keys():
+            if field == '_id':
+                continue
+            if field not in existing_fields:
+                field_type = self._infer_field_type(data[field])
+                # 添加字段到表
+                cursor.execute(
+                    f"ALTER TABLE {self._quote_identifier(table_name)} "
+                    f"ADD COLUMN {self._quote_identifier(field)} {field_type}"
+                )
+                # 更新元数据表
+                cursor.execute(
+                    "INSERT INTO fields_meta (table_name, field_name, field_type) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT (table_name, field_name) DO UPDATE SET "
+                    "field_type = EXCLUDED.field_type",
+                    [table_name, field, field_type]
+                )

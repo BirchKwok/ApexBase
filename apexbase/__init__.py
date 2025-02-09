@@ -162,7 +162,7 @@ class ApexClient:
         Returns:
             List[str]: List of fields.
         """
-        return list(self.storage.list_fields().keys())
+        return self.storage.list_fields()
 
     def delete(self, ids: Union[int, List[int]]) -> bool:
         """

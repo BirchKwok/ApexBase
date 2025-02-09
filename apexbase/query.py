@@ -175,7 +175,11 @@ class ResultView:
     def to_pandas(self) -> "pd.DataFrame":
         """Convert the result to a Pandas DataFrame"""
         query_sql, params = self._build_query_sql(self.query_sql)
-        return self.storage.to_pandas(query_sql, params)
+        df =  self.storage.to_pandas(query_sql, params)
+        if '_id' in df.columns:
+            df.set_index('_id', inplace=True)
+            df.index.name = None
+        return df
 
     def to_arrow(self) -> "pa.Table":
         """Convert the result to a PyArrow Table, using cache, and set _id as an index"""
@@ -192,7 +196,17 @@ class ResultView:
         if not self._executed:
             self._execute_query()
         return self._ids
-
+    
+    @property
+    def shape(self) -> Tuple[int, int]:
+        """Get the shape of the result"""
+        return self.to_pandas().shape
+    
+    @property
+    def columns(self) -> List[str]:
+        """Get the list of columns for the result"""
+        return self.to_pandas().columns
+    
 
 class Query:
     """

@@ -275,8 +275,6 @@ class SQLiteStorage(BaseStorage):
         cursor = self._get_connection().cursor()
         
         try:
-            cursor.execute("BEGIN TRANSACTION")
-            
             # 获取现有字段
             existing_fields = set()
             for row in cursor.execute(
@@ -316,10 +314,7 @@ class SQLiteStorage(BaseStorage):
                     """, [table_name, field_name, field_type, is_json, next_position])
                     next_position += 1
             
-            cursor.execute("COMMIT")
-            
         except Exception as e:
-            cursor.execute("ROLLBACK")
             raise e
 
     def store(self, data: dict, table_name: str = None) -> int:
@@ -515,13 +510,12 @@ class SQLiteStorage(BaseStorage):
         cursor = self._get_connection().cursor()
         
         try:
+            # VACUUM 不能在事务中执行
+            cursor.execute("VACUUM")
+            
+            # 其他优化操作放在事务中
             cursor.execute("BEGIN TRANSACTION")
-            
-            cursor.execute(f"VACUUM")
-            
             cursor.execute(f"ANALYZE {self._quote_identifier(table_name)}")
-            cursor.execute(f"ANALYZE {self._quote_identifier(table_name + '_fields_meta')}")
-            
             cursor.execute("COMMIT")
             
         except Exception as e:
@@ -642,11 +636,9 @@ class SQLiteStorage(BaseStorage):
 
             cursor.execute("BEGIN IMMEDIATE")
             try:
-                for field_name, value in data.items():
-                    if field_name != '_id':
-                        field_type = self._infer_field_type(value)
-                        self._ensure_field_exists(field_name, field_type, table_name=table_name)
-        
+                # 确保所有字段存在
+                self._ensure_fields_exist(data, table_name)
+                
                 field_updates = []
                 params = []
                 
@@ -692,20 +684,13 @@ class SQLiteStorage(BaseStorage):
         try:
             table_name = self.current_table
             quoted_table = self._quote_identifier(table_name)
-            
+
             cursor = self._get_connection().cursor()
             cursor.execute("BEGIN IMMEDIATE")
             try:
-                # First collect all unique fields and ensure they exist
-                all_fields = set()
+                # 确保所有字段存在
                 for data in data_dict.values():
-                    for field_name, value in data.items():
-                        if field_name != '_id':
-                            all_fields.add((field_name, self._infer_field_type(value)))
-
-                # Batch create all required fields
-                for field_name, field_type in all_fields:
-                    self._ensure_field_exists(field_name, field_type, table_name=table_name)
+                    self._ensure_fields_exist(data, table_name)
 
                 # Check if all IDs exist
                 ids = list(data_dict.keys())
@@ -1025,9 +1010,5 @@ class SQLiteStorage(BaseStorage):
             return chunks[0]
         
         df = pd.concat(chunks, ignore_index=True)
-        
-        if '_id' in df.columns:
-            df.set_index('_id', inplace=True)
-            df.index.name = None
             
         return df
