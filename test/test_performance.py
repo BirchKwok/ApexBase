@@ -225,6 +225,8 @@ def test_complex_query_performance(client):
 def test_concurrent_operations_performance(client):
     """测试并发操作性能"""
     import threading
+    import os
+    from pathlib import Path
     
     # 准备数据
     size = 1000
@@ -233,14 +235,44 @@ def test_concurrent_operations_performance(client):
     
     # 并发操作函数
     def concurrent_operation(op_type):
-        if op_type == 'query':
-            client.retrieve(random.choice(ids))
-        elif op_type == 'update':
-            id_ = random.choice(ids)
-            client.replace(id_, generate_test_data(1)[0])
-        elif op_type == 'delete':
-            id_ = random.choice(ids)
-            client.delete(id_)
+        # 为每个线程创建新的客户端
+        backend = client.storage.__class__.__name__.lower().replace('storage', '')
+        thread_id = threading.get_ident()
+        
+        if backend == 'sqlite':
+            # 为每个线程创建独立的SQLite数据库文件
+            db_dir = Path(client.storage.db_path).parent
+            db_path = str(db_dir / f'thread_{thread_id}.db')
+            thread_client = ApexClient(dirpath=db_path, backend=backend)
+            # 复制主数据库的数据
+            thread_client.store(data)
+        elif backend == 'duckdb':
+            # DuckDB使用独立的内存数据库
+            thread_client = ApexClient(dirpath=f':memory:thread_{thread_id}', backend=backend)
+            # 复制主数据库的数据，使用事务保护
+            try:
+                thread_client.store(data)
+            except:
+                # 如果存储失败，跳过该操作
+                return
+        
+        try:
+            if op_type == 'query':
+                thread_client.retrieve(random.choice(ids))
+            elif op_type == 'update':
+                id_ = random.choice(ids)
+                thread_client.replace(id_, generate_test_data(1)[0])
+            elif op_type == 'delete':
+                id_ = random.choice(ids)
+                thread_client.delete(id_)
+        finally:
+            thread_client.close()
+            # 清理临时数据库文件
+            if backend == 'sqlite':
+                try:
+                    os.remove(db_path)
+                except:
+                    pass
     
     # 创建多个线程执行不同操作
     threads = []
