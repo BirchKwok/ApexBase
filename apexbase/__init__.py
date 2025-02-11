@@ -35,19 +35,19 @@ class ApexClient:
         if dirpath is None:
             dirpath = "."
         
-        self.dirpath = Path(dirpath)
-        if drop_if_exists and self.dirpath.exists():
-            shutil.rmtree(self.dirpath)
+        self._dirpath = Path(dirpath)
+        if drop_if_exists and self._dirpath.exists():
+            shutil.rmtree(self._dirpath)
             
-        self.dirpath.mkdir(parents=True, exist_ok=True)
+        self._dirpath.mkdir(parents=True, exist_ok=True)
         
-        self.db_path = self.dirpath / f"apexbase_{backend}.db"
+        self._db_path = self._dirpath / f"apexbase_{backend}.db"
         
-        self.storage = create_storage(backend, str(self.db_path), 
+        self._storage = create_storage(backend, str(self._db_path), 
                                       batch_size=batch_size, 
                                       enable_cache=enable_cache, cache_size=cache_size)
-        self.query_handler = Query(self.storage)
-        self.current_table = "default"  # Default table name
+        self._query_handler = Query(self._storage)
+        self._current_table = "default"  # Default table name
 
     def use_table(self, table_name: str):
         """
@@ -57,8 +57,15 @@ class ApexClient:
             table_name: str
                 The name of the table to switch to.
         """
-        self.current_table = table_name
-        self.storage.use_table(table_name)
+        self._current_table = table_name
+        self._storage.use_table(table_name)
+
+    @property
+    def current_table(self):
+        """
+        Returns the current table name.
+        """
+        return self._current_table
 
     def create_table(self, table_name: str):
         """
@@ -68,7 +75,7 @@ class ApexClient:
             table_name: str
                 The name of the table to create.
         """
-        self.storage.create_table(table_name)
+        self._storage.create_table(table_name)
 
     def drop_table(self, table_name: str):
         """
@@ -78,10 +85,10 @@ class ApexClient:
             table_name: str
                 The name of the table to drop.
         """
-        self.storage.drop_table(table_name)
+        self._storage.drop_table(table_name)
         # If the table being dropped is the current table, switch to the default table
-        if self.current_table == table_name:
-            self.current_table = "default"
+        if self._current_table == table_name:
+            self._current_table = "default"
 
     def list_tables(self) -> List[str]:
         """
@@ -90,7 +97,7 @@ class ApexClient:
         Returns:
             List[str]: A list of table names
         """
-        return self.storage.list_tables()
+        return self._storage.list_tables()
 
     def store(self, data: Union[dict, List[dict]]) -> Union[int, List[int]]:
         """
@@ -105,10 +112,10 @@ class ApexClient:
         """
         if isinstance(data, dict):
             # Single record
-            return self.storage.store(data)
+            return self._storage.store(data)
         elif isinstance(data, list):
             # Multiple records
-            return self.storage.batch_store(data)
+            return self._storage.batch_store(data)
         else:
             raise ValueError("Data must be a dict or a list of dicts")
 
@@ -128,7 +135,7 @@ class ApexClient:
         Returns:
             ResultView: A view of query results, supporting deferred execution
         """
-        return self.query_handler.query(where)
+        return self._query_handler.query(where)
 
     def retrieve(self, id_: int) -> Optional[dict]:
         """
@@ -141,7 +148,7 @@ class ApexClient:
         Returns:
             Optional[dict]: The record data, or None if it doesn't exist
         """
-        return self.query_handler.retrieve(id_)
+        return self._query_handler.retrieve(id_)
 
     def retrieve_many(self, ids: List[int]) -> List[dict]:
         """
@@ -154,10 +161,10 @@ class ApexClient:
         Returns:
             List[dict]: The list of record data
         """
-        return self.query_handler.retrieve_many(ids)
+        return self._query_handler.retrieve_many(ids)
     
     def retrieve_all(self) -> ResultView:
-        return self.query_handler.retrieve_all()
+        return self._query_handler.retrieve_all()
 
     def list_fields(self):
         """
@@ -166,7 +173,7 @@ class ApexClient:
         Returns:
             List[str]: List of fields.
         """
-        return self.storage.list_fields()
+        return self._storage.list_fields()
 
     def delete(self, ids: Union[int, List[int]]) -> bool:
         """
@@ -180,9 +187,9 @@ class ApexClient:
             bool: Whether the deletion was successful
         """
         if isinstance(ids, int):
-            return self.storage.delete(ids)
+            return self._storage.delete(ids)
         elif isinstance(ids, list):
-            return self.storage.batch_delete(ids)
+            return self._storage.batch_delete(ids)
         else:
             raise ValueError("ids must be an int or a list of ints")
 
@@ -199,7 +206,7 @@ class ApexClient:
         Returns:
             bool: Whether the replacement was successful
         """
-        return self.storage.replace(id_, data)
+        return self._storage.replace(id_, data)
 
     def batch_replace(self, data_dict: Dict[int, dict]) -> List[int]:
         """
@@ -212,7 +219,7 @@ class ApexClient:
         Returns:
             List[int]: The list of successfully replaced record IDs
         """
-        return self.storage.batch_replace(data_dict)
+        return self._storage.batch_replace(data_dict)
 
     def from_pandas(self, df) -> 'ApexClient':
         """
@@ -263,7 +270,7 @@ class ApexClient:
         """
         Optimizes the database performance.
         """
-        self.storage.optimize()
+        self._storage.optimize()
 
     def count_rows(self, table_name: str = None):
         """
@@ -276,22 +283,73 @@ class ApexClient:
         Returns:
             int: The number of rows in the table
         """
-        return self.storage.count_rows(table_name)
+        return self._storage.count_rows(table_name)
 
     def close(self):
         """
         Close the database connection.
         """
-        self.storage.close()
+        self._storage.close()
 
     def flush_cache(self):
         """
         Flush the cache.
         """
-        self.storage.flush_cache()
+        self._storage.flush_cache()
 
     def __del__(self):
         """
         Destructor to ensure the database connection is closed.
         """
         self.close()
+
+    def drop_column(self, column_name: str):
+        """
+        删除指定的列。
+
+        Parameters:
+            column_name: str
+                要删除的列名
+        """
+        if column_name == '_id':
+            raise ValueError("Cannot drop _id column")
+        self._storage.drop_column(column_name)
+
+    def add_column(self, column_name: str, column_type: str):
+        """
+        添加新列。
+
+        Parameters:
+            column_name: str
+                新列的名称
+            column_type: str
+                新列的数据类型
+        """
+        self._storage.add_column(column_name, column_type)
+
+    def rename_column(self, old_column_name: str, new_column_name: str):
+        """
+        重命名列。
+
+        Parameters:
+            old_column_name: str
+                原列名
+            new_column_name: str
+                新列名
+        """
+        if old_column_name == '_id':
+            raise ValueError("Cannot rename _id column")
+        self._storage.rename_column(old_column_name, new_column_name)
+
+    def get_column_dtype(self, column_name: str) -> str:
+        """
+        获取列的数据类型。
+
+        Parameters:
+            column_name: str
+                列名
+
+        Returns:
+            str: 列的数据类型
+        """
+        return self._storage.get_column_dtype(column_name)

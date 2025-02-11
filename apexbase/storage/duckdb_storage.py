@@ -173,10 +173,17 @@ class DuckDBStorage(BaseStorage):
         self._cache = []
 
         self.conn = duckdb.connect(str(self.filepath))
+        
+        # 使用 DuckDBSchema 管理所有表的 schema
+        self._schema_manager = DuckDBSchema({
+            'columns': {
+                '_id': 'BIGINT'
+            },
+            'tables': {}  # table_name -> {'columns': {'column_name': 'column_type'}}
+        })
+        
         self._initialize_database()
-
         self.id_manager = IDManager(self)
-
         self._last_modified_time = None
 
     def _initialize_database(self):
@@ -269,6 +276,9 @@ class DuckDBStorage(BaseStorage):
                     """, [table_name, field_name, field_type, position])
                 
                 cursor.execute("COMMIT")
+                
+                # 更新 schema
+                self._update_table_schema(table_name, schema)
                 
             except Exception as e:
                 cursor.execute("ROLLBACK")
@@ -1225,30 +1235,279 @@ class DuckDBStorage(BaseStorage):
             raise ValueError(f"Failed to optimize database: {str(e)}")
 
     def _ensure_fields_exist(self, data: dict, table_name: str, cursor):
-        """Ensure all fields exist (remove transaction management)"""
-        # Get existing field metadata
-        existing_fields = cursor.execute(
-            "SELECT field_name FROM fields_meta WHERE table_name = ?",
-            [table_name]
-        ).fetchall()
-        existing_fields = {row[0] for row in existing_fields}
+        """确保所有字段都存在
         
-        # Add new fields to the table and metadata
-        for field in data.keys():
-            if field == '_id':
-                continue
-            if field not in existing_fields:
-                field_type = self._infer_field_type(data[field])
-                # Add fields to the table
+        Args:
+            data: 数据字典
+            table_name: 表名
+            cursor: 数据库游标
+        """
+        # 获取当前 schema
+        current_schema = self._get_table_schema(table_name)
+        
+        # 检查并添加新字段
+        new_fields = []
+        for field_name, value in data.items():
+            if field_name != '_id' and not current_schema.has_column(field_name):
+                field_type = self._infer_field_type(value)
+                new_fields.append((field_name, field_type))
+                current_schema.add_column(field_name, field_type)
+        
+        if new_fields:
+            # 获取当前最大的 ordinal_position
+            result = cursor.execute("""
+                SELECT COALESCE(MAX(ordinal_position), 0) + 1
+                FROM fields_meta
+                WHERE table_name = ?
+            """, [table_name]).fetchone()
+            next_position = result[0] if result else 2  # _id是1，所以从2开始
+            
+            # 添加新字段
+            for field_name, field_type in new_fields:
+                quoted_field = self._quote_identifier(field_name)
+                
+                # 添加字段到表
                 cursor.execute(
                     f"ALTER TABLE {self._quote_identifier(table_name)} "
-                    f"ADD COLUMN {self._quote_identifier(field)} {field_type}"
+                    f"ADD COLUMN {quoted_field} {field_type}"
                 )
-                # Update the metadata table
-                cursor.execute(
-                    "INSERT INTO fields_meta (table_name, field_name, field_type) "
-                    "VALUES (?, ?, ?) "
-                    "ON CONFLICT (table_name, field_name) DO UPDATE SET "
-                    "field_type = EXCLUDED.field_type",
-                    [table_name, field, field_type]
-                )
+                
+                # 更新元数据
+                cursor.execute("""
+                    INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT (table_name, field_name) DO UPDATE SET 
+                        field_type = EXCLUDED.field_type,
+                        ordinal_position = EXCLUDED.ordinal_position
+                """, [table_name, field_name, field_type, next_position])
+                next_position += 1
+            
+            # 更新 schema
+            self._update_table_schema(table_name, current_schema)
+
+    def drop_column(self, column_name: str):
+        """删除指定的列
+        
+        Args:
+            column_name: 要删除的列名
+        """
+        if column_name == '_id':
+            raise ValueError("Cannot drop _id column")
+            
+        table_name = self.current_table
+        cursor = self.conn.cursor()
+        
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            
+            # 检查列是否存在
+            if not self._column_exists(table_name, column_name):
+                raise ValueError(f"Column {column_name} does not exist")
+            
+            # DuckDB支持直接删除列
+            cursor.execute(f"""
+                ALTER TABLE {self._quote_identifier(table_name)}
+                DROP COLUMN {self._quote_identifier(column_name)}
+            """)
+            
+            # 更新元数据
+            cursor.execute("""
+                DELETE FROM fields_meta 
+                WHERE table_name = ? AND field_name = ?
+            """, [table_name, column_name])
+            
+            cursor.execute("COMMIT")
+            
+        except Exception as e:
+            cursor.execute("ROLLBACK")
+            raise e
+
+    def add_column(self, column_name: str, column_type: str):
+        """添加新列
+        
+        Args:
+            column_name: 新列的名称
+            column_type: 新列的数据类型
+        """
+        if column_name == '_id':
+            raise ValueError("Cannot add _id column")
+            
+        table_name = self.current_table
+        cursor = self.conn.cursor()
+        
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            
+            # 检查列是否已存在
+            if self._column_exists(table_name, column_name):
+                raise ValueError(f"Column {column_name} already exists")
+            
+            # 添加新列
+            cursor.execute(f"""
+                ALTER TABLE {self._quote_identifier(table_name)}
+                ADD COLUMN {self._quote_identifier(column_name)} {column_type}
+            """)
+            
+            # 更新元数据
+            next_position = cursor.execute("""
+                SELECT COALESCE(MAX(ordinal_position), 0) + 1
+                FROM fields_meta
+                WHERE table_name = ?
+            """, [table_name]).fetchone()[0]
+            
+            cursor.execute("""
+                INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
+                VALUES (?, ?, ?, ?)
+            """, [table_name, column_name, column_type, next_position])
+            
+            cursor.execute("COMMIT")
+            
+        except Exception as e:
+            cursor.execute("ROLLBACK")
+            raise e
+
+    def rename_column(self, old_column_name: str, new_column_name: str):
+        """重命名列
+        
+        Args:
+            old_column_name: 原列名
+            new_column_name: 新列名
+        """
+        if old_column_name == '_id':
+            raise ValueError("Cannot rename _id column")
+            
+        table_name = self.current_table
+        cursor = self.conn.cursor()
+        
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            
+            # 检查原列是否存在
+            if not self._column_exists(table_name, old_column_name):
+                raise ValueError(f"Column {old_column_name} does not exist")
+                
+            # 检查新列名是否已存在
+            if self._column_exists(table_name, new_column_name):
+                raise ValueError(f"Column {new_column_name} already exists")
+            
+            # DuckDB支持直接重命名列
+            cursor.execute(f"""
+                ALTER TABLE {self._quote_identifier(table_name)}
+                RENAME COLUMN {self._quote_identifier(old_column_name)} 
+                TO {self._quote_identifier(new_column_name)}
+            """)
+            
+            # 更新元数据
+            cursor.execute("""
+                UPDATE fields_meta 
+                SET field_name = ?
+                WHERE table_name = ? AND field_name = ?
+            """, [new_column_name, table_name, old_column_name])
+            
+            cursor.execute("COMMIT")
+            
+        except Exception as e:
+            cursor.execute("ROLLBACK")
+            raise e
+
+    def get_column_dtype(self, column_name: str) -> str:
+        """获取列的数据类型
+        
+        Args:
+            column_name: 列名
+            
+        Returns:
+            列的数据类型
+        """
+        table_name = self.current_table
+        cursor = self.conn.cursor()
+        
+        result = cursor.execute("""
+            SELECT field_type 
+            FROM fields_meta 
+            WHERE table_name = ? AND field_name = ?
+        """, [table_name, column_name]).fetchone()
+        
+        if result is None:
+            raise ValueError(f"Column {column_name} does not exist")
+            
+        return result[0]
+
+    def _column_exists(self, table_name: str, column_name: str) -> bool:
+        """检查列是否存在
+        
+        Args:
+            table_name: 表名
+            column_name: 列名
+            
+        Returns:
+            列是否存在
+        """
+        cursor = self.conn.cursor()
+        result = cursor.execute("""
+            SELECT 1 
+            FROM fields_meta 
+            WHERE table_name = ? AND field_name = ?
+        """, [table_name, column_name]).fetchone()
+        return result is not None
+
+    def _get_table_schema(self, table_name: str) -> DuckDBSchema:
+        """获取表的 schema
+        
+        Args:
+            table_name: 表名
+            
+        Returns:
+            表的 schema
+        """
+        if not self._schema_manager.has_column('tables'):
+            self._schema_manager.add_column('tables', 'OBJECT')
+            
+        tables = self._schema_manager.to_dict().get('tables', {})
+        if table_name not in tables:
+            # 如果表不存在，创建默认 schema
+            if not self._table_exists(table_name):
+                tables[table_name] = {'columns': {'_id': 'BIGINT'}}
+            else:
+                # 从数据库中读取字段信息
+                cursor = self.conn.cursor()
+                fields = {'_id': 'BIGINT'}
+                for row in cursor.execute("""
+                    SELECT field_name, field_type 
+                    FROM fields_meta 
+                    WHERE table_name = ?
+                    ORDER BY ordinal_position
+                """, [table_name]):
+                    fields[row[0]] = row[1]
+                tables[table_name] = {'columns': fields}
+            
+            # 更新 schema_manager
+            self._schema_manager.modify_column('tables', 'OBJECT')
+        
+        return DuckDBSchema(tables[table_name])
+        
+    def _update_table_schema(self, table_name: str, schema: DuckDBSchema):
+        """更新表的 schema
+        
+        Args:
+            table_name: 表名
+            schema: 新的 schema
+        """
+        if not self._schema_manager.has_column('tables'):
+            self._schema_manager.add_column('tables', 'OBJECT')
+            
+        tables = self._schema_manager.to_dict().get('tables', {})
+        tables[table_name] = schema.to_dict()
+        self._schema_manager.modify_column('tables', 'OBJECT')
+        
+    def _remove_table_schema(self, table_name: str):
+        """删除表的 schema
+        
+        Args:
+            table_name: 表名
+        """
+        if self._schema_manager.has_column('tables'):
+            tables = self._schema_manager.to_dict().get('tables', {})
+            if table_name in tables:
+                del tables[table_name]
+                self._schema_manager.modify_column('tables', 'OBJECT')

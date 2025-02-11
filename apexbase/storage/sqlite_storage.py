@@ -171,6 +171,14 @@ class SQLiteStorage(BaseStorage):
         self.id_manager = IDManager(self)
         
         self._last_modified_time = None
+        
+        # 使用 SQLiteSchema 管理所有表的 schema
+        self._schema_manager = SQLiteSchema({
+            'columns': {
+                '_id': 'INTEGER'
+            },
+            'tables': {}  # table_name -> {'columns': {'column_name': 'column_type'}}
+        })
 
         # Create the database directory
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
@@ -278,6 +286,67 @@ class SQLiteStorage(BaseStorage):
                 raise ValueError(f"Table '{table_name}' does not exist")
             self.current_table = table_name
 
+    def _get_table_schema(self, table_name: str) -> SQLiteSchema:
+        """获取表的 schema
+        
+        Args:
+            table_name: 表名
+            
+        Returns:
+            表的 schema
+        """
+        if not self._schema_manager.has_column('tables'):
+            self._schema_manager.add_column('tables', 'OBJECT')
+            
+        tables = self._schema_manager.to_dict().get('tables', {})
+        if table_name not in tables:
+            # 如果表不存在，创建默认 schema
+            if not self._table_exists(table_name):
+                tables[table_name] = {'columns': {'_id': 'INTEGER'}}
+            else:
+                # 从数据库中读取字段信息
+                cursor = self._get_connection().cursor()
+                fields = {'_id': 'INTEGER'}
+                for row in cursor.execute("""
+                    SELECT field_name, field_type 
+                    FROM fields_meta 
+                    WHERE table_name = ?
+                    ORDER BY ordinal_position
+                """, [table_name]):
+                    fields[row[0]] = row[1]
+                tables[table_name] = {'columns': fields}
+            
+            # 更新 schema_manager
+            self._schema_manager.modify_column('tables', 'OBJECT')
+        
+        return SQLiteSchema(tables[table_name])
+        
+    def _update_table_schema(self, table_name: str, schema: SQLiteSchema):
+        """更新表的 schema
+        
+        Args:
+            table_name: 表名
+            schema: 新的 schema
+        """
+        if not self._schema_manager.has_column('tables'):
+            self._schema_manager.add_column('tables', 'OBJECT')
+            
+        tables = self._schema_manager.to_dict().get('tables', {})
+        tables[table_name] = schema.to_dict()
+        self._schema_manager.modify_column('tables', 'OBJECT')
+        
+    def _remove_table_schema(self, table_name: str):
+        """删除表的 schema
+        
+        Args:
+            table_name: 表名
+        """
+        if self._schema_manager.has_column('tables'):
+            tables = self._schema_manager.to_dict().get('tables', {})
+            if table_name in tables:
+                del tables[table_name]
+                self._schema_manager.modify_column('tables', 'OBJECT')
+
     def create_schema(self, table_name: str, schema: SQLiteSchema):
         """Create the schema of the table
         
@@ -307,12 +376,6 @@ class SQLiteStorage(BaseStorage):
             """
             cursor.execute(create_sql)
             
-            # Update metadata
-            cursor.execute(
-                "INSERT INTO tables_meta (table_name, schema) VALUES (?, ?)",
-                [table_name, orjson.dumps(schema.to_dict()).decode('utf-8')]
-            )
-            
             # Initialize fields_meta table
             for position, (field_name, field_type) in enumerate(schema.to_dict()['columns'].items(), 1):
                 cursor.execute("""
@@ -324,6 +387,9 @@ class SQLiteStorage(BaseStorage):
                 """, [table_name, field_name, field_type, position])
             
             cursor.execute("COMMIT")
+            
+            # 更新 schema
+            self._update_table_schema(table_name, schema)
             
         except Exception as e:
             cursor.execute("ROLLBACK")
@@ -357,11 +423,12 @@ class SQLiteStorage(BaseStorage):
             cursor.execute("BEGIN IMMEDIATE")
             
             cursor.execute(f"DROP TABLE IF EXISTS {self._quote_identifier(table_name)}")
-            cursor.execute(f"DROP TABLE IF EXISTS {self._quote_identifier(table_name + '_fields_meta')}")
-            
-            cursor.execute("DELETE FROM tables_meta WHERE table_name = ?", [table_name])
+            cursor.execute("DELETE FROM fields_meta WHERE table_name = ?", [table_name])
             
             cursor.execute("COMMIT")
+            
+            # 删除 schema
+            self._remove_table_schema(table_name)
             
             if self.current_table == table_name:
                 self.use_table("default")
@@ -454,60 +521,55 @@ class SQLiteStorage(BaseStorage):
                 self.create_schema(table_name, schema)
                 return
             
-            # Get existing fields
-            existing_fields = set()
-            for row in cursor.execute(
-                "SELECT field_name FROM fields_meta WHERE table_name = ?",
-                [table_name]
-            ):
-                existing_fields.add(row[0])
+            # Get current schema
+            current_schema = self._get_table_schema(table_name)
             
-            # Get the current schema
-            result = cursor.execute(
-                "SELECT schema FROM tables_meta WHERE table_name = ?",
-                [table_name]
-            ).fetchone()
-            current_schema = SQLiteSchema(json.loads(result[0]))
-            
-            # Get the current maximum ordinal_position
-            result = cursor.execute("""
-                SELECT COALESCE(MAX(ordinal_position), 0) + 1
-                FROM fields_meta
-                WHERE table_name = ?
-            """, [table_name]).fetchone()
-            next_position = result[0] if result else 2  # _id是1，所以从2开始
-            
-            # Add new fields in the order of the fields in the data
+            # Check and add new fields
+            new_fields = []
             for field_name, value in data.items():
-                if field_name != '_id' and field_name not in existing_fields:
+                if field_name != '_id' and not current_schema.has_column(field_name):
                     field_type = self._infer_field_type(value)
-                    is_json = isinstance(value, str) and (value.startswith('{') or value.startswith('['))
-                    quoted_field = self._quote_identifier(field_name)
-                    
-                    # Add the field to the table
-                    cursor.execute(
-                        f"ALTER TABLE {self._quote_identifier(table_name)} ADD COLUMN {quoted_field} {field_type}"
-                    )
-                    
-                    # Update the schema
+                    new_fields.append((field_name, field_type))
                     current_schema.add_column(field_name, field_type)
-                    
-                    # Update the metadata
-                    cursor.execute("""
-                        INSERT INTO fields_meta (table_name, field_name, field_type, is_json, ordinal_position)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT (table_name, field_name) DO UPDATE SET 
-                            field_type = EXCLUDED.field_type,
-                            is_json = EXCLUDED.is_json,
-                            ordinal_position = EXCLUDED.ordinal_position
-                    """, [table_name, field_name, field_type, is_json, next_position])
-                    next_position += 1
             
-            # Update the schema in tables_meta
-            cursor.execute(
-                "UPDATE tables_meta SET schema = ? WHERE table_name = ?",
-                [orjson.dumps(current_schema.to_dict()).decode('utf-8'), table_name]
-            )
+            if new_fields:
+                # Get the current maximum ordinal_position
+                result = cursor.execute("""
+                    SELECT COALESCE(MAX(ordinal_position), 0) + 1
+                    FROM fields_meta
+                    WHERE table_name = ?
+                """, [table_name]).fetchone()
+                next_position = result[0] if result else 2  # _id是1，所以从2开始
+                
+                # Add new fields in a single transaction
+                cursor.execute("BEGIN TRANSACTION")
+                try:
+                    for field_name, field_type in new_fields:
+                        quoted_field = self._quote_identifier(field_name)
+                        
+                        # Add the field to the table
+                        cursor.execute(
+                            f"ALTER TABLE {self._quote_identifier(table_name)} ADD COLUMN {quoted_field} {field_type}"
+                        )
+                        
+                        # Update metadata
+                        cursor.execute("""
+                            INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
+                            VALUES (?, ?, ?, ?)
+                            ON CONFLICT (table_name, field_name) DO UPDATE SET 
+                                field_type = EXCLUDED.field_type,
+                                ordinal_position = EXCLUDED.ordinal_position
+                        """, [table_name, field_name, field_type, next_position])
+                        next_position += 1
+                    
+                    cursor.execute("COMMIT")
+                    
+                    # 更新 schema
+                    self._update_table_schema(table_name, current_schema)
+                    
+                except Exception as e:
+                    cursor.execute("ROLLBACK")
+                    raise e
             
         except Exception as e:
             raise e
@@ -532,16 +594,24 @@ class SQLiteStorage(BaseStorage):
             else:
                 processed_data[k] = v
         
-        # Ensure all fields exist
-        self._ensure_fields_exist(processed_data, table_name)
+        # 只在第一次存储时检查字段
+        if self.id_manager.get_next_id(table_name) == 1:
+            self._ensure_fields_exist(processed_data, table_name)
         
-        if self.enable_cache and self.id_manager.get_next_id(table_name) != 1:
+        if self.enable_cache:
             with self._lock:
                 self._cache.append(processed_data)
-
                 self.id_manager.auto_increment(table_name)
+                
+                # 当缓存达到一定大小时，分批处理
                 if len(self._cache) >= self.cache_size:
-                    self.flush_cache()
+                    # 分批处理缓存数据
+                    batch_size = 1000
+                    for i in range(0, len(self._cache), batch_size):
+                        batch = self._cache[i:i + batch_size]
+                        self.batch_store(batch, table_name)
+                    self._cache = []
+                    
             return self.id_manager.current_id(table_name)
         
         with self._get_connection() as conn:
@@ -575,7 +645,7 @@ class SQLiteStorage(BaseStorage):
             finally:
                 self.id_manager.reset_last_id(table_name)
                 self._last_modified_time = time.time()
-            
+
     def flush_cache(self):
         """Flush the cache"""
         if self._cache:
@@ -598,6 +668,10 @@ class SQLiteStorage(BaseStorage):
         
         table_name = self._get_table_name(table_name)
         
+        # 先检查并创建表（如果需要）
+        if not self._table_exists(table_name):
+            self.create_table(table_name)
+        
         # Preprocess: Get all fields and types, keep field order
         all_fields = {'_id': 'INTEGER'}  # Ensure _id field is included
         field_order = []  # Keep field addition order
@@ -608,90 +682,101 @@ class SQLiteStorage(BaseStorage):
                     if key not in field_order:
                         field_order.append(key)
         
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            try:
-                cursor.execute("BEGIN TRANSACTION")
+        # 使用更小的批次大小来处理数据
+        batch_size = min(1000, len(data_list))
+        all_ids = []
+        
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
                 
-                # 1. Create all required columns at once
-                if not self._table_exists(table_name):
-                    self.create_table(table_name)
-                
-                # Get existing fields
-                existing_fields = set()
-                for row in cursor.execute(
-                    "SELECT field_name FROM fields_meta WHERE table_name = ?",
-                    [table_name]
-                ):
-                    existing_fields.add(row[0])
-                
-                # Get the current maximum ordinal_position
-                result = cursor.execute("""
-                    SELECT COALESCE(MAX(ordinal_position), 0) + 1
-                    FROM fields_meta
-                    WHERE table_name = ?
-                """, [table_name]).fetchone()
-                next_position = result[0] if result else 2  # _id是1，所以从2开始
-                
-                # Add new fields in the order of field_order
-                for field_name in field_order:
-                    if field_name not in existing_fields:
-                        field_type = all_fields[field_name]
-                        quoted_field = self._quote_identifier(field_name)
-                        
-                        # Add field to table
-                        cursor.execute(
-                            f"ALTER TABLE {self._quote_identifier(table_name)} ADD COLUMN {quoted_field} {field_type}"
-                        )
-                        
-                        # Update metadata
-                        cursor.execute("""
-                            INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
-                            VALUES (?, ?, ?, ?)
-                            ON CONFLICT (table_name, field_name) DO UPDATE SET 
-                                field_type = EXCLUDED.field_type,
-                                ordinal_position = EXCLUDED.ordinal_position
-                        """, [table_name, field_name, field_type, next_position])
-                        next_position += 1
-                
-                # Prepare batch insertion
-                fields = ['_id'] + field_order
-                placeholders = ','.join(['?' for _ in fields])
-                sql = f"""
-                    INSERT INTO {self._quote_identifier(table_name)}
-                    ({','.join(self._quote_identifier(f) for f in fields)})
-                    VALUES ({placeholders})
-                """
-                
-                # Prepare data
-                values = []
+                # 首先获取起始ID
                 first_id = cursor.execute(
                     f"SELECT COALESCE(MAX(_id), 0) + 1 FROM {self._quote_identifier(table_name)}"
                 ).fetchone()[0]
+                current_id = first_id
                 
-                for i, data in enumerate(data_list):
-                    row = [first_id + i]  # _id
-                    for field in field_order:
-                        value = data.get(field)
-                        if isinstance(value, (list, dict)):
-                            row.append(json.dumps(value))
-                        else:
-                            row.append(value)
-                    values.append(tuple(row))
+                # 分批处理数据
+                for i in range(0, len(data_list), batch_size):
+                    batch = data_list[i:i + batch_size]
+                    
+                    try:
+                        cursor.execute("BEGIN TRANSACTION")
+                        
+                        # Get existing fields
+                        existing_fields = set()
+                        for row in cursor.execute(
+                            "SELECT field_name FROM fields_meta WHERE table_name = ?",
+                            [table_name]
+                        ):
+                            existing_fields.add(row[0])
+                        
+                        # Get the current maximum ordinal_position
+                        result = cursor.execute("""
+                            SELECT COALESCE(MAX(ordinal_position), 0) + 1
+                            FROM fields_meta
+                            WHERE table_name = ?
+                        """, [table_name]).fetchone()
+                        next_position = result[0] if result else 2  # _id是1，所以从2开始
+                        
+                        # Add new fields in the order of field_order
+                        for field_name in field_order:
+                            if field_name not in existing_fields:
+                                field_type = all_fields[field_name]
+                                quoted_field = self._quote_identifier(field_name)
+                                
+                                # Add field to table
+                                cursor.execute(
+                                    f"ALTER TABLE {self._quote_identifier(table_name)} ADD COLUMN {quoted_field} {field_type}"
+                                )
+                                
+                                # Update metadata
+                                cursor.execute("""
+                                    INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
+                                    VALUES (?, ?, ?, ?)
+                                    ON CONFLICT (table_name, field_name) DO UPDATE SET 
+                                        field_type = EXCLUDED.field_type,
+                                        ordinal_position = EXCLUDED.ordinal_position
+                                """, [table_name, field_name, field_type, next_position])
+                                next_position += 1
+                        
+                        # Prepare batch insertion
+                        fields = ['_id'] + field_order
+                        placeholders = ','.join(['?' for _ in fields])
+                        sql = f"""
+                            INSERT INTO {self._quote_identifier(table_name)}
+                            ({','.join(self._quote_identifier(f) for f in fields)})
+                            VALUES ({placeholders})
+                        """
+                        
+                        # Prepare data
+                        values = []
+                        for data in batch:
+                            row = [current_id]  # _id
+                            current_id += 1
+                            for field in field_order:
+                                value = data.get(field)
+                                if isinstance(value, (list, dict)):
+                                    row.append(json.dumps(value))
+                                else:
+                                    row.append(value)
+                            values.append(tuple(row))
+                        
+                        # Execute batch insertion
+                        cursor.executemany(sql, values)
+                        
+                        cursor.execute("COMMIT")
+                        all_ids.extend(range(current_id - len(batch), current_id))
+                        
+                    except Exception as e:
+                        cursor.execute("ROLLBACK")
+                        raise e
                 
-                # Execute batch insertion
-                cursor.executemany(sql, values)
+                return all_ids
                 
-                cursor.execute("COMMIT")
-                return list(range(first_id, first_id + len(data_list)))
-                
-            except Exception as e:
-                cursor.execute("ROLLBACK")
-                raise e
-            
-            finally:
-                self.id_manager.reset_last_id(table_name)
-                self._last_modified_time = time.time()
+        finally:
+            self.id_manager.reset_last_id(table_name)
+            self._last_modified_time = time.time()
 
     def list_fields(self, table_name: str = None) -> List[str]:
         """Get all fields of the table
@@ -703,17 +788,7 @@ class SQLiteStorage(BaseStorage):
             Field list
         """
         table_name = self._get_table_name(table_name)
-        cursor = self._get_connection().cursor()
-        
-        # Get all fields sorted by ordinal_position
-        result = cursor.execute("""
-            SELECT field_name 
-            FROM fields_meta 
-            WHERE table_name = ? 
-            ORDER BY ordinal_position
-        """, [table_name]).fetchall()
-        
-        return [row[0] for row in result]
+        return self._get_table_schema(table_name).get_columns()
 
     def optimize(self, table_name: str = None):
         """
@@ -1255,3 +1330,260 @@ class SQLiteStorage(BaseStorage):
         df = pd.concat(chunks, ignore_index=True)
             
         return df
+
+    def drop_column(self, column_name: str):
+        """删除指定的列
+        
+        Args:
+            column_name: 要删除的列名
+        """
+        if column_name == '_id':
+            raise ValueError("Cannot drop _id column")
+            
+        table_name = self.current_table
+        cursor = self._get_connection().cursor()
+        
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            
+            # 获取当前表的所有列
+            columns = self._get_table_columns(table_name)
+            if column_name not in columns:
+                raise ValueError(f"Column {column_name} does not exist")
+                
+            # 创建新表（不包含要删除的列）
+            remaining_columns = [col for col in columns if col != column_name]
+            columns_def = []
+            for col in remaining_columns:
+                col_type = cursor.execute("""
+                    SELECT field_type FROM fields_meta 
+                    WHERE table_name = ? AND field_name = ?
+                """, [table_name, col]).fetchone()[0]
+                if col == '_id':
+                    columns_def.append(f"{self._quote_identifier(col)} {col_type} PRIMARY KEY")
+                else:
+                    columns_def.append(f"{self._quote_identifier(col)} {col_type}")
+            
+            temp_table = f"temp_{table_name}"
+            cursor.execute(f"""
+                CREATE TABLE {self._quote_identifier(temp_table)} (
+                    {', '.join(columns_def)}
+                )
+            """)
+            
+            # 复制数据到新表
+            cursor.execute(f"""
+                INSERT INTO {self._quote_identifier(temp_table)} 
+                SELECT {', '.join(self._quote_identifier(col) for col in remaining_columns)}
+                FROM {self._quote_identifier(table_name)}
+            """)
+            
+            # 删除旧表并重命名新表
+            cursor.execute(f"DROP TABLE {self._quote_identifier(table_name)}")
+            cursor.execute(f"""
+                ALTER TABLE {self._quote_identifier(temp_table)} 
+                RENAME TO {self._quote_identifier(table_name)}
+            """)
+            
+            # 更新元数据
+            cursor.execute("""
+                DELETE FROM fields_meta 
+                WHERE table_name = ? AND field_name = ?
+            """, [table_name, column_name])
+            
+            cursor.execute("COMMIT")
+            
+        except Exception as e:
+            cursor.execute("ROLLBACK")
+            raise e
+
+    def add_column(self, column_name: str, column_type: str):
+        """添加新列
+        
+        Args:
+            column_name: 新列的名称
+            column_type: 新列的数据类型
+        """
+        if column_name == '_id':
+            raise ValueError("Cannot add _id column")
+            
+        table_name = self.current_table
+        cursor = self._get_connection().cursor()
+        
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            
+            # 检查列是否已存在
+            if self._column_exists(table_name, column_name):
+                raise ValueError(f"Column {column_name} already exists")
+            
+            # 添加新列
+            cursor.execute(f"""
+                ALTER TABLE {self._quote_identifier(table_name)}
+                ADD COLUMN {self._quote_identifier(column_name)} {column_type}
+            """)
+            
+            # 更新元数据
+            next_position = cursor.execute("""
+                SELECT COALESCE(MAX(ordinal_position), 0) + 1
+                FROM fields_meta
+                WHERE table_name = ?
+            """, [table_name]).fetchone()[0]
+            
+            cursor.execute("""
+                INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
+                VALUES (?, ?, ?, ?)
+            """, [table_name, column_name, column_type, next_position])
+            
+            cursor.execute("COMMIT")
+            
+        except Exception as e:
+            cursor.execute("ROLLBACK")
+            raise e
+
+    def rename_column(self, old_column_name: str, new_column_name: str):
+        """重命名列
+        
+        Args:
+            old_column_name: 原列名
+            new_column_name: 新列名
+        """
+        if old_column_name == '_id':
+            raise ValueError("Cannot rename _id column")
+            
+        table_name = self.current_table
+        cursor = self._get_connection().cursor()
+        
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            
+            # 检查原列是否存在
+            if not self._column_exists(table_name, old_column_name):
+                raise ValueError(f"Column {old_column_name} does not exist")
+                
+            # 检查新列名是否已存在
+            if self._column_exists(table_name, new_column_name):
+                raise ValueError(f"Column {new_column_name} already exists")
+            
+            # 获取列类型
+            col_type = cursor.execute("""
+                SELECT field_type FROM fields_meta 
+                WHERE table_name = ? AND field_name = ?
+            """, [table_name, old_column_name]).fetchone()[0]
+            
+            # 创建新表
+            columns = self._get_table_columns(table_name)
+            columns_def = []
+            for col in columns:
+                if col == old_column_name:
+                    if col == '_id':
+                        columns_def.append(f"{self._quote_identifier(new_column_name)} {col_type} PRIMARY KEY")
+                    else:
+                        columns_def.append(f"{self._quote_identifier(new_column_name)} {col_type}")
+                else:
+                    col_type = cursor.execute("""
+                        SELECT field_type FROM fields_meta 
+                        WHERE table_name = ? AND field_name = ?
+                    """, [table_name, col]).fetchone()[0]
+                    if col == '_id':
+                        columns_def.append(f"{self._quote_identifier(col)} {col_type} PRIMARY KEY")
+                    else:
+                        columns_def.append(f"{self._quote_identifier(col)} {col_type}")
+            
+            temp_table = f"temp_{table_name}"
+            cursor.execute(f"""
+                CREATE TABLE {self._quote_identifier(temp_table)} (
+                    {', '.join(columns_def)}
+                )
+            """)
+            
+            # 复制数据到新表
+            select_columns = [
+                f"{self._quote_identifier(col)} AS {self._quote_identifier(new_column_name)}" 
+                if col == old_column_name else self._quote_identifier(col)
+                for col in columns
+            ]
+            cursor.execute(f"""
+                INSERT INTO {self._quote_identifier(temp_table)}
+                SELECT {', '.join(select_columns)}
+                FROM {self._quote_identifier(table_name)}
+            """)
+            
+            # 删除旧表并重命名新表
+            cursor.execute(f"DROP TABLE {self._quote_identifier(table_name)}")
+            cursor.execute(f"""
+                ALTER TABLE {self._quote_identifier(temp_table)}
+                RENAME TO {self._quote_identifier(table_name)}
+            """)
+            
+            # 更新元数据
+            cursor.execute("""
+                UPDATE fields_meta 
+                SET field_name = ?
+                WHERE table_name = ? AND field_name = ?
+            """, [new_column_name, table_name, old_column_name])
+            
+            cursor.execute("COMMIT")
+            
+        except Exception as e:
+            cursor.execute("ROLLBACK")
+            raise e
+
+    def get_column_dtype(self, column_name: str) -> str:
+        """获取列的数据类型
+        
+        Args:
+            column_name: 列名
+            
+        Returns:
+            列的数据类型
+        """
+        table_name = self.current_table
+        cursor = self._get_connection().cursor()
+        
+        result = cursor.execute("""
+            SELECT field_type 
+            FROM fields_meta 
+            WHERE table_name = ? AND field_name = ?
+        """, [table_name, column_name]).fetchone()
+        
+        if result is None:
+            raise ValueError(f"Column {column_name} does not exist")
+            
+        return result[0]
+
+    def _column_exists(self, table_name: str, column_name: str) -> bool:
+        """检查列是否存在
+        
+        Args:
+            table_name: 表名
+            column_name: 列名
+            
+        Returns:
+            列是否存在
+        """
+        cursor = self._get_connection().cursor()
+        result = cursor.execute("""
+            SELECT 1 
+            FROM fields_meta 
+            WHERE table_name = ? AND field_name = ?
+        """, [table_name, column_name]).fetchone()
+        return result is not None
+
+    def _get_table_columns(self, table_name: str) -> List[str]:
+        """获取表的所有列名
+        
+        Args:
+            table_name: 表名
+            
+        Returns:
+            列名列表
+        """
+        cursor = self._get_connection().cursor()
+        result = cursor.execute("""
+            SELECT field_name 
+            FROM fields_meta 
+            WHERE table_name = ?
+            ORDER BY ordinal_position
+        """, [table_name]).fetchall()
+        return [row[0] for row in result]

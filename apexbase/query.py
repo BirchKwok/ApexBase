@@ -40,6 +40,19 @@ class ResultView:
     _global_cache = LRUCache(maxsize=1000)
 
     def __init__(self, storage, query_sql: str, table_name: str = None, fields: str = None):
+        """
+        Initialize the ResultView class.
+
+        Parameters:
+            storage: Storage
+                The storage object.
+            query_sql: str
+                The query SQL statement.
+            table_name: str
+                The table name.
+            fields: str
+                The fields to select.
+        """
         self.storage = storage
         self.query_sql = query_sql
         self.fields = fields
