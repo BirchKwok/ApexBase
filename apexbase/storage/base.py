@@ -71,80 +71,80 @@ class BaseSchema(ABC):
     
     @abstractmethod
     def to_dict(self) -> dict:
-        """转换为字典格式"""
+        """Convert to dictionary format"""
         pass
     
     @abstractmethod
     def drop_column(self, column_name: str):
-        """删除列
+        """Drop a column
         
         Args:
-            column_name: 列名
+            column_name: The name of the column to drop
         """
         pass
     
     @abstractmethod
     def add_column(self, column_name: str, column_type: str):
-        """添加列
+        """Add a column
         
         Args:
-            column_name: 列名
-            column_type: 列类型
+            column_name: The name of the column to add
+            column_type: The type of the column to add
         """
         pass
 
     @abstractmethod
     def rename_column(self, old_column_name: str, new_column_name: str):
-        """重命名列
+        """Rename a column
         
         Args:
-            old_column_name: 旧列名
-            new_column_name: 新列名
+            old_column_name: The old name of the column
+            new_column_name: The new name of the column
         """
         pass
 
     @abstractmethod
     def modify_column(self, column_name: str, column_type: str):
-        """修改列类型
+        """Modify the type of a column
         
         Args:
-            column_name: 列名
-            column_type: 列类型
+            column_name: The name of the column to modify
+            column_type: The type of the column to modify
         """
         pass
 
     @abstractmethod
     def get_column_type(self, column_name: str) -> str:
-        """获取列类型
+        """Get the type of a column
         
         Args:
-            column_name: 列名
+            column_name: The name of the column
         """
         pass
 
     @abstractmethod
     def has_column(self, column_name: str) -> bool:
-        """检查列是否存在
+        """Check if a column exists
         
         Args:
-            column_name: 列名
+            column_name: The name of the column
         """
         pass
 
     @abstractmethod
     def get_columns(self) -> List[str]:
-        """获取所有列名
+        """Get all column names
         
         Returns:
-            列名列表
+            The list of column names
         """
         pass
 
     @abstractmethod
     def update_from_data(self, data: dict):
-        """从数据更新schema
+        """Update the schema from data
         
         Args:
-            data: 数据字典
+            data: The data dictionary
         """
         pass

@@ -36,7 +36,7 @@ class LRUCache(OrderedDict):
 
 
 class LazyJSONField:
-    """延迟解析的 JSON 字段"""
+    """Lazy parsed JSON field"""
     def __init__(self, value):
         self._value = value
         self._parsed = None
@@ -45,7 +45,7 @@ class LazyJSONField:
         return self._value
 
     def get(self):
-        """获取解析后的值"""
+        """Get the parsed value"""
         if self._parsed is None:
             try:
                 self._parsed = orjson.loads(self._value)
@@ -72,17 +72,17 @@ class ResultView:
         self._field_names = None
 
     def _build_query_sql(self, where: str = None) -> Tuple[str, tuple]:
-        """构建查询SQL语句
+        """Build the query SQL statement
         
         Args:
-            where: 查询条件
+            where: Query condition
             
         Returns:
-            SQL语句和参数元组
+            SQL statement and parameter tuple
         """
         table_name = self.storage._get_table_name(self.table_name)
         quoted_table = self.storage._quote_identifier(table_name)
-        # 获取所有字段
+        # Get all fields
         fields = self.storage.list_fields(table_name)
         field_list = ','.join(self.storage._quote_identifier(f) for f in fields)
         
@@ -91,9 +91,9 @@ class ResultView:
             return sql, ()
         
         try:
-            # 处理LIKE查询
+            # Process LIKE query
             if 'LIKE' in where.upper():
-                # 使用正则表达式匹配字段名和模式
+                # Use regex to match field name and pattern
                 match = re.match(r'\s*(\w+)\s+LIKE\s+[\'"](.+?)[\'"]\s*', where, re.IGNORECASE)
                 if match:
                     field, pattern = match.groups()
@@ -113,21 +113,21 @@ class ResultView:
             raise ValueError(f"Invalid query syntax: {str(e)}")
         
     def _execute_query(self):
-        """执行查询并缓存结果"""
+        """Execute the query and cache the results"""
         try:
             query_sql, params = self._build_query_sql(self.query_sql)
             
-            # 获取字段名
+            # Get field names
             self._field_names = self.storage.list_fields()
             if not self._field_names:
                 self._ids = []
                 self._raw_results = []
                 return
             
-            # 执行查询
+            # Execute the query
             result = self.storage.query(query_sql, params)
             
-            # 处理结果
+            # Process the results
             self._raw_results = result
             self._ids = []
             id_index = self._field_names.index('_id')
@@ -140,7 +140,7 @@ class ResultView:
             raise QueryError(f"Query execution failed: {str(e)}")
 
     def _process_row(self, row):
-        """处理单行数据"""
+        """Process a single row of data"""
         if not self._field_names:
             return {}
             

@@ -16,16 +16,16 @@ class SQLiteSchema(BaseSchema):
     """SQLite schema."""
 
     def __init__(self, schema: dict = None):
-        """初始化Schema
+        """Initialize the schema
         
         Args:
-            schema: 可选的schema字典，格式为 {'columns': {'column_name': 'column_type'}}
+            schema: Optional schema dictionary, format: {'columns': {'column_name': 'column_type'}}
         """
         self.schema = schema or {'columns': {'_id': 'INTEGER'}}
         self._validate_schema()
 
     def _validate_schema(self):
-        """验证schema格式"""
+        """Validate the schema format"""
         if not isinstance(self.schema, dict):
             raise ValueError("Schema must be a dictionary")
         if 'columns' not in self.schema:
@@ -36,14 +36,14 @@ class SQLiteSchema(BaseSchema):
             self.schema['columns']['_id'] = 'INTEGER'
 
     def to_dict(self):
-        """转换为字典格式"""
+        """Convert to dictionary format"""
         return self.schema
     
     def drop_column(self, column_name: str):
-        """删除列
+        """Drop a column
         
         Args:
-            column_name: 列名
+            column_name: Column name
         """
         if column_name == '_id':
             raise ValueError("Cannot drop _id column")
@@ -51,22 +51,22 @@ class SQLiteSchema(BaseSchema):
             del self.schema['columns'][column_name]
 
     def add_column(self, column_name: str, column_type: str):
-        """添加列
+        """Add a column
         
         Args:
-            column_name: 列名
-            column_type: 列类型
+            column_name: Column name
+            column_type: Column type
         """
         if column_name in self.schema['columns']:
             raise ValueError(f"Column {column_name} already exists")
         self.schema['columns'][column_name] = column_type
 
     def rename_column(self, old_column_name: str, new_column_name: str):
-        """重命名列
+        """Rename a column
         
         Args:
-            old_column_name: 旧列名
-            new_column_name: 新列名
+            old_column_name: Old column name
+            new_column_name: New column name
         """
         if old_column_name == '_id':
             raise ValueError("Cannot rename _id column")
@@ -77,11 +77,11 @@ class SQLiteSchema(BaseSchema):
         self.schema['columns'][new_column_name] = self.schema['columns'].pop(old_column_name)
 
     def modify_column(self, column_name: str, column_type: str):
-        """修改列类型
+        """Modify the column type
         
         Args:
-            column_name: 列名
-            column_type: 列类型
+            column_name: Column name
+            column_type: Column type
         """
         if column_name == '_id':
             raise ValueError("Cannot modify _id column type")
@@ -90,36 +90,36 @@ class SQLiteSchema(BaseSchema):
         self.schema['columns'][column_name] = column_type
 
     def get_column_type(self, column_name: str) -> str:
-        """获取列类型
+        """Get the column type
         
         Args:
-            column_name: 列名
+            column_name: Column name
         """
         if column_name not in self.schema['columns']:
             raise ValueError(f"Column {column_name} does not exist")
         return self.schema['columns'][column_name]
 
     def has_column(self, column_name: str) -> bool:
-        """检查列是否存在
+        """Check if the column exists
         
         Args:
-            column_name: 列名
+            column_name: Column name
         """
         return column_name in self.schema['columns']
 
     def get_columns(self) -> List[str]:
-        """获取所有列名
+        """Get all column names
         
         Returns:
-            列名列表
+            Column name list
         """
         return list(self.schema['columns'].keys())
 
     def update_from_data(self, data: dict):
-        """从数据更新schema
+        """Update the schema from data
         
         Args:
-            data: 数据字典
+            data: Data dictionary
         """
         for column_name, value in data.items():
             if column_name != '_id' and column_name not in self.schema['columns']:
@@ -127,13 +127,13 @@ class SQLiteSchema(BaseSchema):
                 self.add_column(column_name, column_type)
 
     def _infer_column_type(self, value) -> str:
-        """推断列类型
+        """Infer the column type
         
         Args:
-            value: 值
+            value: Value
             
         Returns:
-            列类型
+            Column type
         """
         if isinstance(value, bool):
             return "INTEGER"  # SQLite没有布尔类型
@@ -144,20 +144,20 @@ class SQLiteSchema(BaseSchema):
         elif isinstance(value, (str, dict, list)):
             return "TEXT"
         elif pd.isna(value):
-            return "TEXT"  # 对于空值，默认使用TEXT
+            return "TEXT"  # For empty values, default to TEXT
         else:
-            return "TEXT"  # 对于未知类型，默认使用TEXT
+            return "TEXT"  # For unknown types, default to TEXT
 
 
 class SQLiteStorage(BaseStorage):
     """SQLite implementation of the storage backend."""
     
     def __init__(self, db_path: str, batch_size: int = 1000, enable_cache: bool = True, cache_size: int = 10000):
-        """初始化SQLite存储
+        """Initialize the SQLite storage
         
         Args:
-            db_path: 数据库文件路径
-            batch_size: 批处理大小
+            db_path: Database file path
+            batch_size: Batch size
         """
         self.db_path = db_path
         self.batch_size = batch_size
@@ -169,29 +169,29 @@ class SQLiteStorage(BaseStorage):
         self._cache = []
         self.id_manager = IDManager(self)
         
-        # 创建数据库目录
+        # Create the database directory
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         
-        # 初始化数据库
+        # Initialize the database
         self._initialize_database()
 
     def _get_connection(self):
-        """获取数据库连接"""
+        """Get the database connection"""
         if not hasattr(self, '_conn'):
-            self._conn = sqlite3.connect(self.db_path, isolation_level=None)  # 自动提交模式
+            self._conn = sqlite3.connect(self.db_path, isolation_level=None)
             self._conn.row_factory = sqlite3.Row
             
         return self._conn
 
     def _initialize_database(self):
-        """初始化数据库,创建必要的表"""
+        """Initialize the database, create necessary tables"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             
-            # 设置数据库参数
+            # Set database parameters
             cursor.execute('PRAGMA journal_mode=WAL')
             cursor.execute('PRAGMA synchronous=NORMAL')
-            cursor.execute('PRAGMA cache_size=2000000')  # 进一步增加缓存
+            cursor.execute('PRAGMA cache_size=2000000')  # Further increase cache
             cursor.execute('PRAGMA temp_store=MEMORY')
             cursor.execute('PRAGMA mmap_size=30000000000')
             cursor.execute('PRAGMA page_size=32768')
@@ -203,22 +203,22 @@ class SQLiteStorage(BaseStorage):
             cursor.execute('PRAGMA auto_vacuum=INCREMENTAL')
             cursor.execute('PRAGMA secure_delete=OFF')
             
-            # 创建反向字符串函数
+            # Create reverse string function
             conn.create_function("reverse", 1, lambda s: s[::-1] if s else None)
             
-            # 创建主表 - 只包含_id字段，其他字段动态添加
+            # Create the main table - only contains the _id field, other fields are dynamically added
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS "default" (
                 _id INTEGER PRIMARY KEY
             )
             ''')
             
-            # 创建元数据表
+            # Create the metadata table
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS tables_meta (
                 table_name TEXT PRIMARY KEY,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                schema TEXT  -- 存储表的字段定义
+                schema TEXT  -- Store the field definition of the table
             )
             ''')
             
@@ -234,14 +234,14 @@ class SQLiteStorage(BaseStorage):
             )
             ''')
             
-            # 初始化元数据
+            # Initialize metadata
             default_schema = SQLiteSchema().to_dict()
             cursor.execute(
                 'INSERT OR IGNORE INTO tables_meta (table_name, schema) VALUES (?, ?)',
                 ('default', json.dumps(default_schema))
             )
             
-            # 初始化default表的_id字段
+            # Initialize the _id field of the default table
             cursor.execute('''
             INSERT OR IGNORE INTO fields_meta (table_name, field_name, field_type, ordinal_position) 
             VALUES (?, ?, ?, ?)
@@ -276,11 +276,11 @@ class SQLiteStorage(BaseStorage):
             self.current_table = table_name
 
     def create_schema(self, table_name: str, schema: SQLiteSchema):
-        """创建表的schema
+        """Create the schema of the table
         
         Args:
-            table_name: 表名
-            schema: schema对象
+            table_name: Table name
+            schema: Schema object
         """
         if self._table_exists(table_name):
             raise ValueError(f"Table '{table_name}' already exists")
@@ -289,7 +289,7 @@ class SQLiteStorage(BaseStorage):
         try:
             cursor.execute("BEGIN TRANSACTION")
             
-            # 创建表
+            # Create the table
             columns = []
             for col_name, col_type in schema.to_dict()['columns'].items():
                 if col_name == '_id':
@@ -304,13 +304,13 @@ class SQLiteStorage(BaseStorage):
             """
             cursor.execute(create_sql)
             
-            # 更新元数据
+            # Update metadata
             cursor.execute(
                 "INSERT INTO tables_meta (table_name, schema) VALUES (?, ?)",
                 [table_name, orjson.dumps(schema.to_dict()).decode('utf-8')]
             )
             
-            # 初始化fields_meta表
+            # Initialize fields_meta table
             for position, (field_name, field_type) in enumerate(schema.to_dict()['columns'].items(), 1):
                 cursor.execute("""
                     INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
@@ -327,12 +327,12 @@ class SQLiteStorage(BaseStorage):
             raise e
 
     def create_table(self, table_name: str):
-        """创建新表，使用默认schema
+        """Create a new table, using the default schema
         
         Args:
-            table_name: 表名
+            table_name: Table name
         """
-        schema = SQLiteSchema()  # 使用默认schema
+        schema = SQLiteSchema()  # Use the default schema
         self.create_schema(table_name, schema)
 
     def drop_table(self, table_name: str):
@@ -408,37 +408,37 @@ class SQLiteStorage(BaseStorage):
         return f'"{identifier}"'
 
     def _infer_field_type(self, value: Any) -> str:
-        """推断字段类型
+        """Infer the field type
         
         Args:
-            value: 字段值
+            value: Field value
             
         Returns:
-            字段类型
+            Field type
         """
         if isinstance(value, bool):
-            return "INTEGER"  # SQLite没有布尔类型，使用INTEGER
+            return "INTEGER"  # SQLite does not have a boolean type, use INTEGER
         elif isinstance(value, int):
             return "INTEGER"
         elif isinstance(value, float):
             return "REAL"
         elif isinstance(value, (list, dict)):
-            return "TEXT"  # 复杂类型序列化为JSON存储
+            return "TEXT"  # Complex types are serialized to JSON storage
         else:
             return "TEXT"
 
     def _ensure_fields_exist(self, data: dict, table_name: str = None):
-        """确保所有字段都存在
+        """Ensure all fields exist
         
         Args:
-            data: 数据字典
-            table_name: 表名
+            data: Data dictionary
+            table_name: Table name
         """
         table_name = self._get_table_name(table_name)
         cursor = self._get_connection().cursor()
         
         try:
-            # 如果表不存在，创建表
+            # If the table does not exist, create the table
             if not self._table_exists(table_name):
                 schema = SQLiteSchema()
                 for field_name, value in data.items():
@@ -448,7 +448,7 @@ class SQLiteStorage(BaseStorage):
                 self.create_schema(table_name, schema)
                 return
             
-            # 获取现有字段
+            # Get existing fields
             existing_fields = set()
             for row in cursor.execute(
                 "SELECT field_name FROM fields_meta WHERE table_name = ?",
@@ -456,14 +456,14 @@ class SQLiteStorage(BaseStorage):
             ):
                 existing_fields.add(row[0])
             
-            # 获取当前schema
+            # Get the current schema
             result = cursor.execute(
                 "SELECT schema FROM tables_meta WHERE table_name = ?",
                 [table_name]
             ).fetchone()
             current_schema = SQLiteSchema(json.loads(result[0]))
             
-            # 获取当前最大的ordinal_position
+            # Get the current maximum ordinal_position
             result = cursor.execute("""
                 SELECT COALESCE(MAX(ordinal_position), 0) + 1
                 FROM fields_meta
@@ -471,22 +471,22 @@ class SQLiteStorage(BaseStorage):
             """, [table_name]).fetchone()
             next_position = result[0] if result else 2  # _id是1，所以从2开始
             
-            # 按照数据中的字段顺序添加新字段
+            # Add new fields in the order of the fields in the data
             for field_name, value in data.items():
                 if field_name != '_id' and field_name not in existing_fields:
                     field_type = self._infer_field_type(value)
                     is_json = isinstance(value, str) and (value.startswith('{') or value.startswith('['))
                     quoted_field = self._quote_identifier(field_name)
                     
-                    # 添加字段到表
+                    # Add the field to the table
                     cursor.execute(
                         f"ALTER TABLE {self._quote_identifier(table_name)} ADD COLUMN {quoted_field} {field_type}"
                     )
                     
-                    # 更新schema
+                    # Update the schema
                     current_schema.add_column(field_name, field_type)
                     
-                    # 更新元数据
+                    # Update the metadata
                     cursor.execute("""
                         INSERT INTO fields_meta (table_name, field_name, field_type, is_json, ordinal_position)
                         VALUES (?, ?, ?, ?, ?)
@@ -497,7 +497,7 @@ class SQLiteStorage(BaseStorage):
                     """, [table_name, field_name, field_type, is_json, next_position])
                     next_position += 1
             
-            # 更新tables_meta中的schema
+            # Update the schema in tables_meta
             cursor.execute(
                 "UPDATE tables_meta SET schema = ? WHERE table_name = ?",
                 [orjson.dumps(current_schema.to_dict()).decode('utf-8'), table_name]
@@ -507,18 +507,18 @@ class SQLiteStorage(BaseStorage):
             raise e
 
     def store(self, data: dict, table_name: str = None) -> int:
-        """存储单条记录
+        """Store a single record
         
         Args:
-            data: 要存储的数据
-            table_name: 表名
+            data: Data to store
+            table_name: Table name
             
         Returns:
-            存储的记录ID
+            The ID of the stored record
         """
         table_name = self._get_table_name(table_name)
         
-        # 预处理数据
+        # Preprocess data
         processed_data = {}
         for k, v in data.items():
             if isinstance(v, (dict, list)):
@@ -526,7 +526,7 @@ class SQLiteStorage(BaseStorage):
             else:
                 processed_data[k] = v
         
-        # 确保所有字段存在
+        # Ensure all fields exist
         self._ensure_fields_exist(processed_data, table_name)
         
         if self.enable_cache and self.id_manager.get_next_id(table_name) != 1:
@@ -541,7 +541,6 @@ class SQLiteStorage(BaseStorage):
         with self._get_connection() as conn:
             cursor = conn.cursor()
             try:
-                # 准备插入语句
                 fields = []
                 values = []
                 params = []
@@ -552,7 +551,6 @@ class SQLiteStorage(BaseStorage):
                         values.append('?')
                         params.append(value)
                 
-                # 构建并执行插入语句
                 sql = f"""
                     INSERT INTO {self._quote_identifier(table_name)} 
                     ({', '.join(fields)}) 
@@ -572,33 +570,33 @@ class SQLiteStorage(BaseStorage):
                 self.id_manager.reset_last_id(table_name)
             
     def flush_cache(self):
-        """刷新缓存"""
+        """Flush the cache"""
         if self._cache:
             with self._lock:
                 self.batch_store(self._cache)
                 self._cache = []
 
     def batch_store(self, data_list: List[dict], table_name: str = None) -> List[int]:
-        """批量存储记录
+        """Batch store records
         
         Args:
-            data_list: 要存储的记录列表
-            table_name: 表名
+            data_list: List of records to store
+            table_name: Table name
             
         Returns:
-            存储的记录ID列表
+            List of record IDs
         """
         if not data_list:
             return []
         
         table_name = self._get_table_name(table_name)
         
-        # 预处理：获取所有字段和类型，保持字段顺序
-        all_fields = {'_id': 'INTEGER'}  # 确保包含_id字段
-        field_order = []  # 保持字段添加顺序
+        # Preprocess: Get all fields and types, keep field order
+        all_fields = {'_id': 'INTEGER'}  # Ensure _id field is included
+        field_order = []  # Keep field addition order
         for data in data_list:
             for key, value in data.items():
-                if key not in all_fields and key != '_id':  # 跳过_id字段
+                if key not in all_fields and key != '_id':  # Skip _id field
                     all_fields[key] = self._infer_field_type(value)
                     if key not in field_order:
                         field_order.append(key)
@@ -608,11 +606,11 @@ class SQLiteStorage(BaseStorage):
             try:
                 cursor.execute("BEGIN TRANSACTION")
                 
-                # 1. 一次性创建所有需要的列
+                # 1. Create all required columns at once
                 if not self._table_exists(table_name):
                     self.create_table(table_name)
                 
-                # 获取现有字段
+                # Get existing fields
                 existing_fields = set()
                 for row in cursor.execute(
                     "SELECT field_name FROM fields_meta WHERE table_name = ?",
@@ -620,7 +618,7 @@ class SQLiteStorage(BaseStorage):
                 ):
                     existing_fields.add(row[0])
                 
-                # 获取当前最大的ordinal_position
+                # Get the current maximum ordinal_position
                 result = cursor.execute("""
                     SELECT COALESCE(MAX(ordinal_position), 0) + 1
                     FROM fields_meta
@@ -628,18 +626,18 @@ class SQLiteStorage(BaseStorage):
                 """, [table_name]).fetchone()
                 next_position = result[0] if result else 2  # _id是1，所以从2开始
                 
-                # 按照field_order添加新字段
+                # Add new fields in the order of field_order
                 for field_name in field_order:
                     if field_name not in existing_fields:
                         field_type = all_fields[field_name]
                         quoted_field = self._quote_identifier(field_name)
                         
-                        # 添加字段到表
+                        # Add field to table
                         cursor.execute(
                             f"ALTER TABLE {self._quote_identifier(table_name)} ADD COLUMN {quoted_field} {field_type}"
                         )
                         
-                        # 更新元数据
+                        # Update metadata
                         cursor.execute("""
                             INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
                             VALUES (?, ?, ?, ?)
@@ -649,7 +647,7 @@ class SQLiteStorage(BaseStorage):
                         """, [table_name, field_name, field_type, next_position])
                         next_position += 1
                 
-                # 准备批量插入
+                # Prepare batch insertion
                 fields = ['_id'] + field_order
                 placeholders = ','.join(['?' for _ in fields])
                 sql = f"""
@@ -658,7 +656,7 @@ class SQLiteStorage(BaseStorage):
                     VALUES ({placeholders})
                 """
                 
-                # 准备数据
+                # Prepare data
                 values = []
                 first_id = cursor.execute(
                     f"SELECT COALESCE(MAX(_id), 0) + 1 FROM {self._quote_identifier(table_name)}"
@@ -674,7 +672,7 @@ class SQLiteStorage(BaseStorage):
                             row.append(value)
                     values.append(tuple(row))
                 
-                # 执行批量插入
+                # Execute batch insertion
                 cursor.executemany(sql, values)
                 
                 cursor.execute("COMMIT")
@@ -688,18 +686,18 @@ class SQLiteStorage(BaseStorage):
                 self.id_manager.reset_last_id(table_name)
 
     def list_fields(self, table_name: str = None) -> List[str]:
-        """获取表的所有字段
+        """Get all fields of the table
         
         Args:
-            table_name: 表名
+            table_name: Table name
             
         Returns:
-            字段列表
+            Field list
         """
         table_name = self._get_table_name(table_name)
         cursor = self._get_connection().cursor()
         
-        # 按ordinal_position排序获取所有字段
+        # Get all fields sorted by ordinal_position
         result = cursor.execute("""
             SELECT field_name 
             FROM fields_meta 
@@ -721,10 +719,10 @@ class SQLiteStorage(BaseStorage):
         cursor = self._get_connection().cursor()
         
         try:
-            # VACUUM 不能在事务中执行
+            # VACUUM cannot be executed in a transaction
             cursor.execute("VACUUM")
             
-            # 其他优化操作放在事务中
+            # Other optimization operations are placed in a transaction
             cursor.execute("BEGIN TRANSACTION")
             cursor.execute(f"ANALYZE {self._quote_identifier(table_name)}")
             cursor.execute("COMMIT")
@@ -848,7 +846,7 @@ class SQLiteStorage(BaseStorage):
 
             cursor.execute("BEGIN IMMEDIATE")
             try:
-                # 确保所有字段存在
+                # Ensure all fields exist
                 self._ensure_fields_exist(data, table_name)
                 
                 field_updates = []
@@ -900,7 +898,7 @@ class SQLiteStorage(BaseStorage):
             cursor = self._get_connection().cursor()
             cursor.execute("BEGIN IMMEDIATE")
             try:
-                # 确保所有字段存在
+                # Ensure all fields exist
                 for data in data_dict.values():
                     self._ensure_fields_exist(data, table_name)
 
@@ -946,7 +944,7 @@ class SQLiteStorage(BaseStorage):
             raise ValueError(f"Batch replacement failed: {str(e)}")
 
     def _get_next_id(self, table_name: str) -> int:
-        """获取下一个ID"""
+        """Get the next ID"""
         cursor = self._get_connection().cursor()
         result = cursor.execute(f"""
             SELECT COALESCE(MAX(_id), 0) + 1 
@@ -955,7 +953,7 @@ class SQLiteStorage(BaseStorage):
         return result[0] if result else 1
     
     def close(self):
-        """关闭数据库连接"""
+        """Close the database connection"""
         if self.enable_cache:
             self.flush_cache()
 
@@ -997,24 +995,24 @@ class SQLiteStorage(BaseStorage):
             raise ValueError(f"Failed to count rows: {str(e)}")
 
     def retrieve(self, id_: int) -> Optional[dict]:
-        """获取单条记录
+        """Get a single record
         
         Args:
-            id_: 记录ID
+            id_: Record ID
             
         Returns:
-            记录数据字典
+            Record data dictionary
         """
         table_name = self._get_table_name()
         cursor = self._get_connection().cursor()
         
         try:
-            # 获取所有字段
+            # Get all fields
             fields = self.list_fields(table_name)
             if not fields:
                 return None
             
-            # 构建查询
+            # Build query
             field_list = ','.join(self._quote_identifier(f) for f in fields)
             sql = f"""
                 SELECT {field_list}
@@ -1026,13 +1024,13 @@ class SQLiteStorage(BaseStorage):
             if not result:
                 return None
             
-            # 构建返回数据
+            # Build return data
             data = {}
             for i, field in enumerate(fields):
                 value = result[i]
                 if value is not None:
                     try:
-                        # 尝试解析JSON
+                        # Try to parse JSON
                         data[field] = json.loads(value)
                     except (json.JSONDecodeError, TypeError):
                         data[field] = value
@@ -1045,13 +1043,13 @@ class SQLiteStorage(BaseStorage):
             raise ValueError(f"Failed to retrieve record: {str(e)}")
 
     def retrieve_many(self, ids: List[int]) -> List[dict]:
-        """获取多条记录
+        """Get multiple records
         
         Args:
-            ids: 记录ID列表
+            ids: Record ID list
             
         Returns:
-            记录数据字典列表
+            Record data dictionary list
         """
         if not ids:
             return []
@@ -1060,12 +1058,12 @@ class SQLiteStorage(BaseStorage):
         cursor = self._get_connection().cursor()
         
         try:
-            # 获取所有字段
+            # Get all fields
             fields = self.list_fields(table_name)
             if not fields:
                 return []
             
-            # 构建查询
+            # Build query
             field_list = ','.join(self._quote_identifier(f) for f in fields)
             placeholders = ','.join('?' for _ in ids)
             sql = f"""
@@ -1077,7 +1075,7 @@ class SQLiteStorage(BaseStorage):
             
             results = cursor.execute(sql, ids).fetchall()
             
-            # 构建返回数据
+            # Build return data
             records = []
             for row in results:
                 data = {}
@@ -1085,7 +1083,7 @@ class SQLiteStorage(BaseStorage):
                     value = row[i]
                     if value is not None:
                         try:
-                            # 尝试解析JSON
+                            # Try to parse JSON
                             data[field] = json.loads(value)
                         except (json.JSONDecodeError, TypeError):
                             data[field] = value
@@ -1099,18 +1097,18 @@ class SQLiteStorage(BaseStorage):
             raise ValueError(f"Failed to retrieve records: {str(e)}")
 
     def query(self, sql: str, params: tuple = None) -> List[tuple]:
-        """执行自定义SQL查询
+        """Execute a custom SQL query
         
         Args:
-            sql: SQL语句
-            params: 查询参数
+            sql: SQL statement
+            params: Query parameters
             
         Returns:
-            查询结果
+            Query results
         """
         cursor = self._get_connection().cursor()
         
-        # 全局查询优化参数
+        # Global query optimization parameters
         cursor.execute('PRAGMA temp_store=MEMORY')
         cursor.execute('PRAGMA cache_size=2000000')
         cursor.execute('PRAGMA mmap_size=30000000000')
@@ -1119,18 +1117,18 @@ class SQLiteStorage(BaseStorage):
         cursor.execute('PRAGMA journal_mode=MEMORY')
         cursor.execute('PRAGMA page_size=4096')
         
-        # 优化查询
+        # Optimize query
         if 'LIKE' in sql.upper():
-            # 添加索引提示
+            # Add index hint
             sql = f"/* USING INDEX */ {sql}"
             
-            # 优化 LIKE 查询
+            # Optimize LIKE query
             if 'LIKE' in sql and '%' in sql:
-                # 如果是前缀匹配，使用索引
+                # If it is a prefix match, use the index
                 if sql.count('%') == 1 and sql.endswith("%'"):
                     sql = sql.replace('LIKE', 'GLOB')
                     sql = sql.replace('%', '*')
-                # 如果是后缀匹配，反转字符串并使用前缀匹配
+                # If it is a suffix match, reverse the string and use prefix matching
                 elif sql.count('%') == 1 and sql.startswith("'%"):
                     field = re.search(r'(\w+)\s+LIKE', sql).group(1)
                     pattern = sql.split("'%")[1].rstrip("'")
@@ -1141,9 +1139,9 @@ class SQLiteStorage(BaseStorage):
                         ) WHERE rev_{field} GLOB '{pattern[::-1]}*'
                     """
         
-        # 使用迭代器模式执行查询
+        # Use iterator mode to execute the query
         cursor.execute(sql, params)
-        chunk_size = 1000  # 每次获取的记录数
+        chunk_size = 1000  # Number of records to fetch at a time
         results = []
         while True:
             chunk = cursor.fetchmany(chunk_size)
@@ -1153,13 +1151,13 @@ class SQLiteStorage(BaseStorage):
         return results
 
     def _create_indexes(self, table_name: str):
-        """为表创建必要的索引"""
+        """Create necessary indexes for the table"""
         cursor = self._get_connection().cursor()
         
         try:
             cursor.execute("BEGIN IMMEDIATE")
             
-            # 获取需要创建索引的字段
+            # Get fields that need to be indexed
             fields = cursor.execute("""
                 SELECT field_name, field_type 
                 FROM fields_meta 
@@ -1167,17 +1165,17 @@ class SQLiteStorage(BaseStorage):
             """, [table_name]).fetchall()
             
             for field_name, field_type in fields:
-                # 为 TEXT/VARCHAR 类型的字段创建索引
+                # Create index for TEXT/VARCHAR fields
                 if field_type in ('TEXT', 'VARCHAR'):
                     index_name = f"idx_{table_name}_{field_name}"
-                    # 使用部分索引和前缀索引优化 LIKE 查询
+                    # Use partial index and prefix index to optimize LIKE queries
                     cursor.execute(f"""
                         CREATE INDEX IF NOT EXISTS {index_name}
                         ON {self._quote_identifier(table_name)} ({self._quote_identifier(field_name)})
                         WHERE {self._quote_identifier(field_name)} IS NOT NULL
                     """)
                     
-                    # 创建前缀索引
+                    # Create prefix index
                     cursor.execute(f"""
                         CREATE INDEX IF NOT EXISTS {index_name}_prefix
                         ON {self._quote_identifier(table_name)} (
@@ -1186,7 +1184,7 @@ class SQLiteStorage(BaseStorage):
                         WHERE {self._quote_identifier(field_name)} IS NOT NULL
                     """)
                     
-                    # 创建反向索引，用于优化后缀匹配
+                    # Create reverse index, for suffix matching optimization
                     cursor.execute(f"""
                         CREATE INDEX IF NOT EXISTS {index_name}_reverse
                         ON {self._quote_identifier(table_name)} (
@@ -1195,14 +1193,14 @@ class SQLiteStorage(BaseStorage):
                         WHERE {self._quote_identifier(field_name)} IS NOT NULL
                     """)
                     
-                    # 更新索引状态
+                    # Update index status
                     cursor.execute("""
                         UPDATE fields_meta 
                         SET is_indexed = TRUE 
                         WHERE table_name = ? AND field_name = ?
                     """, [table_name, field_name])
                     
-            # 分析表以优化查询计划
+            # Analyze table to optimize query plan
             cursor.execute(f"ANALYZE {self._quote_identifier(table_name)}")
             
             cursor.execute("COMMIT")
@@ -1212,14 +1210,14 @@ class SQLiteStorage(BaseStorage):
             raise e
 
     def to_pandas(self, sql: str, params: tuple = None) -> "pd.DataFrame":
-        """将查询结果转换为 Pandas DataFrame
+        """Convert query results to Pandas DataFrame
         
         Args:
-            sql: SQL语句
-            params: 查询参数
+            sql: SQL statement
+            params: Query parameters
             
         Returns:
-            pd.DataFrame: 查询结果
+            pd.DataFrame: Query results
         """
         cursor = self._get_connection().cursor()
         cursor.execute(sql, params)
@@ -1241,42 +1239,3 @@ class SQLiteStorage(BaseStorage):
         df = pd.concat(chunks, ignore_index=True)
             
         return df
-    
-    def drop_column(self, table_name: str, column_name: str):
-        """删除列
-        
-        Args:
-            table_name: 表名
-            column_name: 列名
-        """
-        pass
-
-    def add_column(self, table_name: str, column_name: str, column_type: str):
-        """添加列
-        
-        Args:
-            table_name: 表名
-            column_name: 列名
-            column_type: 列类型
-        """
-        pass
-
-    def rename_column(self, table_name: str, old_column_name: str, new_column_name: str):
-        """重命名列
-        
-        Args:
-            table_name: 表名
-            old_column_name: 旧列名
-            new_column_name: 新列名
-        """
-        pass
-
-    def modify_column(self, table_name: str, column_name: str, column_type: str):
-        """修改列类型
-        
-        Args:
-            table_name: 表名
-            column_name: 列名
-            column_type: 列类型
-        """
-        pass
