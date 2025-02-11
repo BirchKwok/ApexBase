@@ -1,4 +1,5 @@
 import sqlite3
+import time
 import orjson
 from typing import Dict, List, Any, Optional
 import json
@@ -169,6 +170,8 @@ class SQLiteStorage(BaseStorage):
         self._cache = []
         self.id_manager = IDManager(self)
         
+        self._last_modified_time = None
+
         # Create the database directory
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         
@@ -366,6 +369,9 @@ class SQLiteStorage(BaseStorage):
         except Exception as e:
             cursor.execute("ROLLBACK")
             raise e
+        
+        finally:
+            self._last_modified_time = time.time()
 
     def list_tables(self) -> List[str]:
         """
@@ -568,6 +574,7 @@ class SQLiteStorage(BaseStorage):
             
             finally:
                 self.id_manager.reset_last_id(table_name)
+                self._last_modified_time = time.time()
             
     def flush_cache(self):
         """Flush the cache"""
@@ -684,6 +691,7 @@ class SQLiteStorage(BaseStorage):
             
             finally:
                 self.id_manager.reset_last_id(table_name)
+                self._last_modified_time = time.time()
 
     def list_fields(self, table_name: str = None) -> List[str]:
         """Get all fields of the table
@@ -772,6 +780,7 @@ class SQLiteStorage(BaseStorage):
         
         finally:
             self.id_manager.reset_last_id(table_name)
+            self._last_modified_time = time.time()
 
     def batch_delete(self, ids: List[int]) -> bool:
         """
@@ -814,6 +823,7 @@ class SQLiteStorage(BaseStorage):
         
         finally:
             self.id_manager.reset_last_id(table_name)
+            self._last_modified_time = time.time()
 
     def replace(self, id_: int, data: dict) -> bool:
         """
@@ -876,6 +886,9 @@ class SQLiteStorage(BaseStorage):
                 raise e
         except Exception as e:
             raise ValueError(f"Failed to replace record: {str(e)}")
+
+        finally:
+            self._last_modified_time = time.time()
 
     def batch_replace(self, data_dict: Dict[int, dict]) -> List[int]:
         """
@@ -942,6 +955,9 @@ class SQLiteStorage(BaseStorage):
                 raise e
         except Exception as e:
             raise ValueError(f"Batch replacement failed: {str(e)}")
+
+        finally:
+            self._last_modified_time = time.time()  
 
     def _get_next_id(self, table_name: str) -> int:
         """Get the next ID"""

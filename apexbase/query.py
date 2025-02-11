@@ -1,16 +1,11 @@
+import sys
 from typing import List, Optional, Tuple, Dict
-import re
 from collections import OrderedDict
+import re
 
 import polars as pl
-import orjson
 import pandas as pd
 import pyarrow as pa
-
-
-class QueryError(Exception):
-    """Exception raised for query errors."""
-    pass
 
 
 class LRUCache(OrderedDict):
@@ -28,6 +23,11 @@ class LRUCache(OrderedDict):
             return default
 
     def put(self, key, value):
+        # Only keep values that are less than 500MB
+        size = sys.getsizeof(value)
+        if size > 500 * 1024 * 1024:
+            return
+        
         if key in self:
             self.move_to_end(key)
         self[key] = value
@@ -35,27 +35,8 @@ class LRUCache(OrderedDict):
             self.popitem(last=False)
 
 
-class LazyJSONField:
-    """Lazy parsed JSON field"""
-    def __init__(self, value):
-        self._value = value
-        self._parsed = None
-
-    def __str__(self):
-        return self._value
-
-    def get(self):
-        """Get the parsed value"""
-        if self._parsed is None:
-            try:
-                self._parsed = orjson.loads(self._value)
-            except:
-                self._parsed = self._value
-        return self._parsed
-
-
 class ResultView:
-    """Query result view, supports lazy execution and LRU cache"""
+    """Query result view"""
     _global_cache = LRUCache(maxsize=1000)
 
     def __init__(self, storage, query_sql: str, table_name: str = None, fields: str = None):
@@ -63,13 +44,6 @@ class ResultView:
         self.query_sql = query_sql
         self.fields = fields
         self.table_name = table_name
-        
-        self._executed = False
-        self._cache_key = f"{query_sql}:{table_name if table_name else ''}"
-        self._raw_results = None
-        self._processed_results = None
-        self._json_fields = None
-        self._field_names = None
 
     def _build_query_sql(self, where: str = None) -> Tuple[str, tuple]:
         """Build the query SQL statement
@@ -111,50 +85,6 @@ class ResultView:
             
         except Exception as e:
             raise ValueError(f"Invalid query syntax: {str(e)}")
-        
-    def _execute_query(self):
-        """Execute the query and cache the results"""
-        try:
-            query_sql, params = self._build_query_sql(self.query_sql)
-            
-            # Get field names
-            self._field_names = self.storage.list_fields()
-            if not self._field_names:
-                self._ids = []
-                self._raw_results = []
-                return
-            
-            # Execute the query
-            result = self.storage.query(query_sql, params)
-            
-            # Process the results
-            self._raw_results = result
-            self._ids = []
-            id_index = self._field_names.index('_id')
-            self._ids = [row[id_index] for row in result]
-            
-            self._global_cache.put(self._cache_key, (self._ids, self._raw_results))
-            self._executed = True
-            
-        except Exception as e:
-            raise QueryError(f"Query execution failed: {str(e)}")
-
-    def _process_row(self, row):
-        """Process a single row of data"""
-        if not self._field_names:
-            return {}
-            
-        data = {}
-        for i, field in enumerate(self._field_names):
-            value = row[i]
-            if value is not None:
-                if field in self._json_fields and isinstance(value, str):
-                    data[field] = LazyJSONField(value)
-                else:
-                    data[field] = value
-            else:
-                data[field] = None
-        return data
 
     def to_dict(self) -> List[Dict]:
         """Convert the result to a list of dictionaries, using cache"""
@@ -175,10 +105,16 @@ class ResultView:
     def to_pandas(self) -> "pd.DataFrame":
         """Convert the result to a Pandas DataFrame"""
         query_sql, params = self._build_query_sql(self.query_sql)
+        _cache_key = f"{query_sql}:{params}:{self.storage._last_modified_time}"
+        if _cache_key in self._global_cache:
+                return self._global_cache.get(_cache_key)
+        
         df =  self.storage.to_pandas(query_sql, params)
         if '_id' in df.columns:
             df.set_index('_id', inplace=True)
-            df.index.name = None
+            df.index.name = None        
+        
+        self._global_cache.put(_cache_key, df)
         return df
 
     def to_arrow(self) -> "pa.Table":
@@ -193,9 +129,7 @@ class ResultView:
     @property
     def ids(self) -> List[int]:
         """Get the list of IDs for the result, using cache"""
-        if not self._executed:
-            self._execute_query()
-        return self._ids
+        return self.to_pandas().index.tolist()
     
     @property
     def shape(self) -> Tuple[int, int]:
@@ -206,6 +140,10 @@ class ResultView:
     def columns(self) -> List[str]:
         """Get the list of columns for the result"""
         return self.to_pandas().columns
+    
+    def _clear_cache(self):
+        """Clear the cache"""
+        self._global_cache.clear()
     
 
 class Query:

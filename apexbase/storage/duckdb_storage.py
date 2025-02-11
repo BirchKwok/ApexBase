@@ -1,3 +1,4 @@
+import time
 import duckdb
 import orjson
 from typing import Dict, List, Optional, Union
@@ -176,6 +177,8 @@ class DuckDBStorage(BaseStorage):
 
         self.id_manager = IDManager(self)
 
+        self._last_modified_time = None
+
     def _initialize_database(self):
         """Initialize the database, create necessary system tables"""
         cursor = self.conn.cursor()
@@ -303,6 +306,9 @@ class DuckDBStorage(BaseStorage):
         except Exception as e:
             cursor.execute("ROLLBACK")
             raise e
+        
+        finally:
+            self._last_modified_time = time.time()
 
     def list_tables(self) -> List[str]:
         """Lists all tables."""
@@ -523,6 +529,7 @@ class DuckDBStorage(BaseStorage):
             
             finally:
                 self.id_manager.reset_last_id(table_name)
+                self._last_modified_time = time.time()
     
     def _get_next_id(self, table_name: str) -> int:
         """Get the next ID"""
@@ -666,6 +673,7 @@ class DuckDBStorage(BaseStorage):
             
             finally:
                 self.id_manager.reset_last_id(table_name)
+                self._last_modified_time = time.time()
 
     def _get_table_columns(self, table_name: str) -> List[str]:
         """Get the column names of the table."""
@@ -796,6 +804,7 @@ class DuckDBStorage(BaseStorage):
             
             finally:
                 self.id_manager.reset_last_id(table_name)
+                self._last_modified_time = time.time()
 
     def batch_delete(self, ids: List[int]) -> bool:
         """Batch delete records
@@ -843,6 +852,7 @@ class DuckDBStorage(BaseStorage):
             
             finally:
                 self.id_manager.reset_last_id(table_name)
+                self._last_modified_time = time.time()
 
     def replace(self, id_: int, data: dict) -> bool:
         """Replace a single record
@@ -933,6 +943,8 @@ class DuckDBStorage(BaseStorage):
                         VALUES ({', '.join(placeholders)})
                     """
                     cursor.execute(insert_sql, values)
+
+            self._last_modified_time = time.time()
             
             return True
 
@@ -1026,7 +1038,8 @@ class DuckDBStorage(BaseStorage):
                         cursor.execute(insert_sql, values)
                     
                     success_ids.append(id_)
-            
+
+            self._last_modified_time = time.time()
             return success_ids
 
     def query(self, sql: str, params: tuple = None) -> List[tuple]:
