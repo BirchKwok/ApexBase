@@ -4,16 +4,155 @@ from typing import Dict, List, Optional, Union
 from pathlib import Path
 
 import pandas as pd
-from ..limited_dict import LimitedDict
-from .base import BaseStorage
+
+from apexbase.storage.id_manager import IDManager
+from .base import BaseStorage, BaseSchema
 import threading
 import json
+
+
+class DuckDBSchema(BaseSchema):
+    """DuckDB schema."""
+
+    def __init__(self, schema: dict = None):
+        """初始化Schema
+        
+        Args:
+            schema: 可选的schema字典，格式为 {'columns': {'column_name': 'column_type'}}
+        """
+        self.schema = schema or {'columns': {'_id': 'BIGINT'}}
+        self._validate_schema()
+
+    def _validate_schema(self):
+        """验证schema格式"""
+        if not isinstance(self.schema, dict):
+            raise ValueError("Schema must be a dictionary")
+        if 'columns' not in self.schema:
+            raise ValueError("Schema must have a 'columns' key")
+        if not isinstance(self.schema['columns'], dict):
+            raise ValueError("Schema columns must be a dictionary")
+        if '_id' not in self.schema['columns']:
+            self.schema['columns']['_id'] = 'BIGINT'
+
+    def to_dict(self):
+        """转换为字典格式"""
+        return self.schema
+    
+    def drop_column(self, column_name: str):
+        """删除列
+        
+        Args:
+            column_name: 列名
+        """
+        if column_name == '_id':
+            raise ValueError("Cannot drop _id column")
+        if column_name in self.schema['columns']:
+            del self.schema['columns'][column_name]
+
+    def add_column(self, column_name: str, column_type: str):
+        """添加列
+        
+        Args:
+            column_name: 列名
+            column_type: 列类型
+        """
+        if column_name in self.schema['columns']:
+            raise ValueError(f"Column {column_name} already exists")
+        self.schema['columns'][column_name] = column_type
+
+    def rename_column(self, old_column_name: str, new_column_name: str):
+        """重命名列
+        
+        Args:
+            old_column_name: 旧列名
+            new_column_name: 新列名
+        """
+        if old_column_name == '_id':
+            raise ValueError("Cannot rename _id column")
+        if old_column_name not in self.schema['columns']:
+            raise ValueError(f"Column {old_column_name} does not exist")
+        if new_column_name in self.schema['columns']:
+            raise ValueError(f"Column {new_column_name} already exists")
+        self.schema['columns'][new_column_name] = self.schema['columns'].pop(old_column_name)
+
+    def modify_column(self, column_name: str, column_type: str):
+        """修改列类型
+        
+        Args:
+            column_name: 列名
+            column_type: 列类型
+        """
+        if column_name == '_id':
+            raise ValueError("Cannot modify _id column type")
+        if column_name not in self.schema['columns']:
+            raise ValueError(f"Column {column_name} does not exist")
+        self.schema['columns'][column_name] = column_type
+
+    def get_column_type(self, column_name: str) -> str:
+        """获取列类型
+        
+        Args:
+            column_name: 列名
+        """
+        if column_name not in self.schema['columns']:
+            raise ValueError(f"Column {column_name} does not exist")
+        return self.schema['columns'][column_name]
+
+    def has_column(self, column_name: str) -> bool:
+        """检查列是否存在
+        
+        Args:
+            column_name: 列名
+        """
+        return column_name in self.schema['columns']
+
+    def get_columns(self) -> List[str]:
+        """获取所有列名
+        
+        Returns:
+            列名列表
+        """
+        return list(self.schema['columns'].keys())
+
+    def update_from_data(self, data: dict):
+        """从数据更新schema
+        
+        Args:
+            data: 数据字典
+        """
+        for column_name, value in data.items():
+            if column_name != '_id' and column_name not in self.schema['columns']:
+                column_type = self._infer_column_type(value)
+                self.add_column(column_name, column_type)
+
+    def _infer_column_type(self, value) -> str:
+        """推断列类型
+        
+        Args:
+            value: 值
+            
+        Returns:
+            列类型
+        """
+        if isinstance(value, bool):
+            return "BOOLEAN"
+        elif isinstance(value, int):
+            return "BIGINT"
+        elif isinstance(value, float):
+            return "DOUBLE"
+        elif isinstance(value, (str, dict, list)):
+            return "VARCHAR"
+        elif pd.isna(value):
+            return "VARCHAR"  # 对于空值，默认使用VARCHAR
+        else:
+            return "VARCHAR"  # 对于未知类型，默认使用VARCHAR
 
 
 class DuckDBStorage(BaseStorage):
     """DuckDB implementation of the storage backend with columnar storage."""
     
-    def __init__(self, filepath=None, batch_size: int = 1000):
+    def __init__(self, filepath=None, batch_size: int = 1000, 
+                 enable_cache: bool = True, cache_size: int = 10000):
         """初始化DuckDB存储
         
         Args:
@@ -27,12 +166,16 @@ class DuckDBStorage(BaseStorage):
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
 
         self.batch_size = batch_size
-        self._field_cache = LimitedDict(100)
         self._lock = threading.Lock()
         self.current_table = "default"
+        self.enable_cache = enable_cache
+        self.cache_size = cache_size
+        self._cache = []
 
         self.conn = duckdb.connect(str(self.filepath))
         self._initialize_database()
+
+        self.id_manager = IDManager(self)
 
     def _initialize_database(self):
         """初始化数据库，创建必要的系统表"""
@@ -77,7 +220,57 @@ class DuckDBStorage(BaseStorage):
             if not self._table_exists(table_name):
                 raise ValueError(f"Table '{table_name}' does not exist")
             self.current_table = table_name
-            self._invalidate_cache()
+
+    def create_schema(self, table_name: str, schema: DuckDBSchema):
+        """创建表的schema
+        
+        Args:
+            table_name: 表名
+            schema: schema对象
+        """
+        with self._lock:
+            if self._table_exists(table_name):
+                raise ValueError(f"Table '{table_name}' already exists")
+
+            cursor = self.conn.cursor()
+            cursor.execute("BEGIN TRANSACTION")
+            try:
+                # 创建表
+                columns = []
+                for col_name, col_type in schema.to_dict()['columns'].items():
+                    if col_name == '_id':
+                        columns.append(f"{self._quote_identifier(col_name)} {col_type} PRIMARY KEY")
+                    else:
+                        columns.append(f"{self._quote_identifier(col_name)} {col_type}")
+                
+                create_sql = f"""
+                    CREATE TABLE {self._quote_identifier(table_name)} (
+                        {', '.join(columns)}
+                    )
+                """
+                cursor.execute(create_sql)
+                
+                # 更新元数据
+                cursor.execute(
+                    "INSERT INTO tables_meta (table_name, schema) VALUES (?, ?)",
+                    [table_name, orjson.dumps(schema.to_dict()).decode('utf-8')]
+                )
+                
+                # 初始化fields_meta表
+                for position, (field_name, field_type) in enumerate(schema.to_dict()['columns'].items(), 1):
+                    cursor.execute("""
+                        INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT (table_name, field_name) DO UPDATE SET 
+                            field_type = EXCLUDED.field_type,
+                            ordinal_position = EXCLUDED.ordinal_position
+                    """, [table_name, field_name, field_type, position])
+                
+                cursor.execute("COMMIT")
+                
+            except Exception as e:
+                cursor.execute("ROLLBACK")
+                raise e
 
     def create_table(self, table_name: str):
         """创建新表，使用默认schema
@@ -85,41 +278,8 @@ class DuckDBStorage(BaseStorage):
         Args:
             table_name: 表名
         """
-        with self._lock:
-            if self._table_exists(table_name):
-                return
-
-            cursor = self.conn.cursor()
-            cursor.execute("BEGIN TRANSACTION")
-            try:
-                # 创建主表（使用最小schema）
-                cursor.execute(f"""
-                    CREATE TABLE IF NOT EXISTS {self._quote_identifier(table_name)} (
-                        _id BIGINT,
-                        PRIMARY KEY (_id)
-                    )
-                """)
-                
-                # 更新元数据
-                cursor.execute(
-                    "INSERT INTO tables_meta (table_name, schema) VALUES (?, ?)",
-                    [table_name, orjson.dumps({'columns': {'_id': 'BIGINT'}}).decode('utf-8')]
-                )
-                
-                # 初始化fields_meta表
-                cursor.execute("""
-                    INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT (table_name, field_name) DO UPDATE SET 
-                        field_type = EXCLUDED.field_type,
-                        ordinal_position = EXCLUDED.ordinal_position
-                """, [table_name, '_id', 'BIGINT', 1])
-                
-                cursor.execute("COMMIT")
-                
-            except Exception as e:
-                cursor.execute("ROLLBACK")
-                raise e
+        schema = DuckDBSchema()  # 使用默认schema
+        self.create_schema(table_name, schema)
 
     def drop_table(self, table_name: str):
         """Drops a table."""
@@ -140,8 +300,6 @@ class DuckDBStorage(BaseStorage):
             
             if self.current_table == table_name:
                 self.use_table("default")
-            
-            self._invalidate_cache()
             
         except Exception as e:
             cursor.execute("ROLLBACK")
@@ -195,30 +353,50 @@ class DuckDBStorage(BaseStorage):
             
         # 如果表不存在，创建表
         if not self._table_exists(table_name):
-            self.create_table(table_name)
+            schema = DuckDBSchema()
+            for col in df.columns:
+                if col != '_id':
+                    schema.add_column(col, self._get_duckdb_type(df[col].dtype))
+            self.create_schema(table_name, schema)
+            return
         
         # 获取现有列
         existing_columns = set(self._get_table_columns(table_name))
         # 保持原始顺序的新列列表
-        new_columns = [col for col in df.columns if col != '_id' and col not in existing_columns]
+        columns = df.columns
+
+        new_columns = [col for col in columns if col != '_id' and col not in existing_columns]
         
+        if not new_columns:
+            return
+            
         # 添加新列
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute("BEGIN TRANSACTION")
             try:
+                # 获取当前schema
+                result = cursor.execute(
+                    "SELECT schema FROM tables_meta WHERE table_name = ?",
+                    [table_name]
+                ).fetchone()
+                current_schema = DuckDBSchema(orjson.loads(result[0]))
+                
                 next_position = cursor.execute("""
                     SELECT COALESCE(MAX(ordinal_position), 0) + 1
                     FROM fields_meta
                     WHERE table_name = ?
                 """, [table_name]).fetchone()[0]
                 
-                for col in new_columns:  # 使用保持顺序的列表
+                for col in new_columns:
                     sql_type = self._get_duckdb_type(df[col].dtype)
                     cursor.execute(f"""
                         ALTER TABLE {self._quote_identifier(table_name)}
                         ADD COLUMN {self._quote_identifier(col)} {sql_type}
                     """)
+                    
+                    # 更新schema
+                    current_schema.add_column(col, sql_type)
                     
                     # 添加字段到fields_meta表
                     cursor.execute("""
@@ -230,17 +408,10 @@ class DuckDBStorage(BaseStorage):
                     """, [table_name, col, sql_type, next_position])
                     next_position += 1
                 
-                # 更新schema信息
-                schema = {
-                    'columns': {
-                        col: str(df[col].dtype) if col in df.columns else 'BIGINT'
-                        for col in self._get_table_columns(table_name)
-                    }
-                }
-                
+                # 更新tables_meta中的schema
                 cursor.execute(
                     "UPDATE tables_meta SET schema = ? WHERE table_name = ?",
-                    [orjson.dumps(schema).decode('utf-8'), table_name]
+                    [orjson.dumps(current_schema.to_dict()).decode('utf-8'), table_name]
                 )
                 
                 cursor.execute("COMMIT")
@@ -274,7 +445,6 @@ class DuckDBStorage(BaseStorage):
         """
         table_name = self._get_table_name(table_name)
         
-        # 转换为DataFrame
         if isinstance(data, dict):
             # 预处理 JSON 字段
             processed_data = {}
@@ -283,8 +453,8 @@ class DuckDBStorage(BaseStorage):
                     processed_data[k] = json.dumps(v)
                 else:
                     processed_data[k] = v
-            df = pd.DataFrame([processed_data])
-        else:
+            df = [processed_data]
+        elif isinstance(data, pd.DataFrame):
             df = data.copy()
             # 预处理 DataFrame 中的 JSON 字段
             for col in df.columns:
@@ -294,10 +464,26 @@ class DuckDBStorage(BaseStorage):
         # 如果是多行数据，使用batch_store
         if len(df) > 1:
             return self.batch_store(df, table_name)
+        elif self.enable_cache and self.id_manager.get_next_id(table_name) != 1:
+            with self._lock:
+                if not isinstance(df, pd.DataFrame):
+                    self._cache.append(df[0])
+                else:
+                    self._cache.append(df.to_dict(orient='records')[0])
+
+                self.id_manager.auto_increment(table_name)
+            if len(self._cache) >= self.cache_size:
+                self.flush_cache()
+            
+            with self._lock:
+                return self.id_manager.current_id(table_name)
         
         # 确保表存在并更新schema
-        self._create_table_if_not_exists(table_name, df)
+        self._create_table_if_not_exists(table_name, df[0])
         
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame(df)
+            
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute("BEGIN TRANSACTION")
@@ -335,6 +521,24 @@ class DuckDBStorage(BaseStorage):
             except Exception as e:
                 cursor.execute("ROLLBACK")
                 raise e
+            
+            finally:
+                self.id_manager.reset_last_id(table_name)
+    
+    def _get_next_id(self, table_name: str) -> int:
+        """获取下一个ID"""
+        cursor = self.conn.cursor()
+        result = cursor.execute(f"""
+            SELECT COALESCE(MAX(_id), 0) + 1 
+            FROM {self._quote_identifier(table_name)}
+        """).fetchone()
+        return result[0] if result else 1
+    
+    def flush_cache(self):
+        """刷新缓存"""
+        if self._cache is not None and len(self._cache) > 0:
+            self.batch_store(self._cache)
+            self._cache = []
 
     def batch_store(self, data_list: List[dict], table_name: str = None) -> List[int]:
         """批量存储记录
@@ -460,6 +664,9 @@ class DuckDBStorage(BaseStorage):
             except Exception as e:
                 cursor.execute("ROLLBACK")
                 raise e
+            
+            finally:
+                self.id_manager.reset_last_id(table_name)
 
     def _get_table_columns(self, table_name: str) -> List[str]:
         """获取表的列名。"""
@@ -551,18 +758,15 @@ class DuckDBStorage(BaseStorage):
         
         return data_list
 
-    def delete(self, id_: Union[int, List[int]]) -> bool:
+    def delete(self, id_: int) -> bool:
         """删除记录
         
         Args:
-            id_: 单个ID或ID列表
+            id_: 记录ID
             
         Returns:
             bool: 删除是否成功
         """
-        if isinstance(id_, list):
-            return self.batch_delete(id_)
-            
         table_name = self._get_table_name()
         
         with self._lock:
@@ -590,9 +794,19 @@ class DuckDBStorage(BaseStorage):
             except Exception as e:
                 cursor.execute("ROLLBACK")
                 raise e
+            
+            finally:
+                self.id_manager.reset_last_id(table_name)
 
     def batch_delete(self, ids: List[int]) -> bool:
-        """Deletes multiple records by IDs."""
+        """批量删除记录
+        
+        Args:
+            ids: 记录ID列表
+            
+        Returns:
+            bool: 删除是否成功
+        """
         if not ids:
             return True
             
@@ -610,7 +824,8 @@ class DuckDBStorage(BaseStorage):
                     WHERE _id IN ({placeholders})
                 """, ids).fetchone()[0]
                 
-                if exists == 0:
+                print(f"DuckDB: Checking existence for IDs {ids}, found {exists} records")
+                if exists != len(ids):
                     cursor.execute("ROLLBACK")
                     return False
                 
@@ -626,6 +841,9 @@ class DuckDBStorage(BaseStorage):
             except Exception as e:
                 cursor.execute("ROLLBACK")
                 raise e
+            
+            finally:
+                self.id_manager.reset_last_id(table_name)
 
     def replace(self, id_: int, data: dict) -> bool:
         """替换单条记录
@@ -835,12 +1053,11 @@ class DuckDBStorage(BaseStorage):
 
     def close(self):
         """Closes the database connection."""
+        if self.enable_cache:
+            self.flush_cache()
+
         if hasattr(self, 'conn'):
             self.conn.close()
-
-    def _invalidate_cache(self):
-        """Invalidates the field cache."""
-        self._field_cache.clear()
 
     def _infer_field_type(self, value) -> str:
         """推断字段类型
@@ -967,8 +1184,15 @@ class DuckDBStorage(BaseStorage):
         """
         table_name = self._get_table_name(table_name)
         cursor = self.conn.cursor()
-        result = cursor.execute(f"SELECT COUNT(*) FROM {self._quote_identifier(table_name)}").fetchone()
-        return result[0] if result else 0
+        
+        # 如果有缓存中的数据，需要包含在计数中
+        cache_count = len(self._cache) if self.enable_cache else 0
+        
+        result = cursor.execute(f"""
+            SELECT COUNT(*) 
+            FROM {self._quote_identifier(table_name)}
+        """).fetchone()
+        return result[0] + cache_count if result else cache_count
 
     def optimize(self):
         """优化数据库性能"""
@@ -1016,3 +1240,42 @@ class DuckDBStorage(BaseStorage):
                     "field_type = EXCLUDED.field_type",
                     [table_name, field, field_type]
                 )
+
+    def drop_column(self, table_name: str, column_name: str):
+        """删除列
+        
+        Args:
+            table_name: 表名
+            column_name: 列名
+        """
+        pass
+
+    def add_column(self, table_name: str, column_name: str, column_type: str):
+        """添加列
+        
+        Args:
+            table_name: 表名
+            column_name: 列名
+            column_type: 列类型
+        """
+        pass
+
+    def rename_column(self, table_name: str, old_column_name: str, new_column_name: str):
+        """重命名列
+        
+        Args:
+            table_name: 表名
+            old_column_name: 旧列名
+            new_column_name: 新列名
+        """
+        pass
+
+    def modify_column(self, table_name: str, column_name: str, column_type: str):
+        """修改列类型
+        
+        Args:
+            table_name: 表名
+            column_name: 列名
+            column_type: 列类型
+        """
+        pass

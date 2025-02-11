@@ -1,5 +1,3 @@
-
-
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 
@@ -65,4 +63,88 @@ class BaseStorage(ABC):
     
     @abstractmethod
     def close(self):
+        pass
+
+
+class BaseSchema(ABC):
+    """Abstract base class for schema."""
+    
+    @abstractmethod
+    def to_dict(self) -> dict:
+        """转换为字典格式"""
+        pass
+    
+    @abstractmethod
+    def drop_column(self, column_name: str):
+        """删除列
+        
+        Args:
+            column_name: 列名
+        """
+        pass
+    
+    @abstractmethod
+    def add_column(self, column_name: str, column_type: str):
+        """添加列
+        
+        Args:
+            column_name: 列名
+            column_type: 列类型
+        """
+        pass
+
+    @abstractmethod
+    def rename_column(self, old_column_name: str, new_column_name: str):
+        """重命名列
+        
+        Args:
+            old_column_name: 旧列名
+            new_column_name: 新列名
+        """
+        pass
+
+    @abstractmethod
+    def modify_column(self, column_name: str, column_type: str):
+        """修改列类型
+        
+        Args:
+            column_name: 列名
+            column_type: 列类型
+        """
+        pass
+
+    @abstractmethod
+    def get_column_type(self, column_name: str) -> str:
+        """获取列类型
+        
+        Args:
+            column_name: 列名
+        """
+        pass
+
+    @abstractmethod
+    def has_column(self, column_name: str) -> bool:
+        """检查列是否存在
+        
+        Args:
+            column_name: 列名
+        """
+        pass
+
+    @abstractmethod
+    def get_columns(self) -> List[str]:
+        """获取所有列名
+        
+        Returns:
+            列名列表
+        """
+        pass
+
+    @abstractmethod
+    def update_from_data(self, data: dict):
+        """从数据更新schema
+        
+        Args:
+            data: 数据字典
+        """
         pass

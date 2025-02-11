@@ -1,10 +1,8 @@
-
-
 from typing import Literal
 
 
-
-def create_storage(backend: Literal["sqlite", "duckdb"], filepath: str = None, batch_size: int = 1000):
+def create_storage(backend: Literal["sqlite", "duckdb"], filepath: str = None,
+                    batch_size: int = 1000, enable_cache: bool = True, cache_size: int = 10000):
     """
     Factory function to create a storage backend instance.
     
@@ -18,9 +16,10 @@ def create_storage(backend: Literal["sqlite", "duckdb"], filepath: str = None, b
     """
     if backend == "sqlite":
         from .sqlite_storage import SQLiteStorage
-        return SQLiteStorage(filepath, batch_size)
+        return SQLiteStorage(filepath, batch_size, enable_cache, cache_size)
     elif backend == "duckdb":
         from .duckdb_storage import DuckDBStorage
-        return DuckDBStorage(filepath, batch_size)
+        return DuckDBStorage(filepath, batch_size, enable_cache, cache_size)
     else:
         raise ValueError(f"Unknown backend: {backend}")
+    

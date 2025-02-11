@@ -15,6 +15,8 @@ class ApexClient:
         dirpath=None, 
         batch_size: int = 1000, 
         drop_if_exists: bool = False,
+        enable_cache: bool = True,
+        cache_size: int = 10000,
         backend: Literal["sqlite", "duckdb"] = "sqlite"
     ):
         """
@@ -41,7 +43,9 @@ class ApexClient:
         
         self.db_path = self.dirpath / f"apexbase_{backend}.db"
         
-        self.storage = create_storage(backend, str(self.db_path), batch_size=batch_size)
+        self.storage = create_storage(backend, str(self.db_path), 
+                                      batch_size=batch_size, 
+                                      enable_cache=enable_cache, cache_size=cache_size)
         self.query_handler = Query(self.storage)
         self.current_table = "default"  # Default table name
 
@@ -279,6 +283,12 @@ class ApexClient:
         Close the database connection.
         """
         self.storage.close()
+
+    def flush_cache(self):
+        """
+        Flush the cache.
+        """
+        self.storage.flush_cache()
 
     def __del__(self):
         """
