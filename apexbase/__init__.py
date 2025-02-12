@@ -69,13 +69,14 @@ class ApexClient:
 
     def create_table(self, table_name: str):
         """
-        Creates a new table.
+        Creates a new table and switches to it.
 
         Parameters:
             table_name: str
                 The name of the table to create.
         """
         self._storage.create_table(table_name)
+        self.use_table(table_name)  # 创建表后立即切换到该表
 
     def drop_table(self, table_name: str):
         """
@@ -285,17 +286,19 @@ class ApexClient:
         """
         return self._storage.count_rows(table_name)
 
-    def close(self):
-        """
-        Close the database connection.
-        """
-        self._storage.close()
-
     def flush_cache(self):
         """
-        Flush the cache.
+        Flushes the storage cache.
         """
         self._storage.flush_cache()
+
+    def close(self):
+        """
+        Closes the database connection and flushes any remaining cache.
+        """
+        if hasattr(self, '_storage'):
+            self.flush_cache()
+            self._storage.close()
 
     def __del__(self):
         """

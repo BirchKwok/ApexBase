@@ -403,6 +403,13 @@ class SQLiteStorage(BaseStorage):
         """
         schema = SQLiteSchema()  # Use the default schema
         self.create_schema(table_name, schema)
+        
+        # 更新元数据
+        cursor = self._get_connection().cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO tables_meta (table_name, schema) VALUES (?, ?)",
+            [table_name, json.dumps(schema.to_dict())]
+        )
 
     def drop_table(self, table_name: str):
         """
@@ -424,6 +431,7 @@ class SQLiteStorage(BaseStorage):
             
             cursor.execute(f"DROP TABLE IF EXISTS {self._quote_identifier(table_name)}")
             cursor.execute("DELETE FROM fields_meta WHERE table_name = ?", [table_name])
+            cursor.execute("DELETE FROM tables_meta WHERE table_name = ?", [table_name])
             
             cursor.execute("COMMIT")
             

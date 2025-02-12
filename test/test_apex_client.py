@@ -27,7 +27,7 @@ def test_basic_operations(client):
     # 测试存储单条记录
     data = {"name": "John", "age": 30}
     id_ = client.store(data)
-    client.storage.flush_cache()  # 刷新缓存
+    client.flush_cache()  # 刷新缓存
     
     # 测试检索记录
     retrieved = client.retrieve(id_)
@@ -40,7 +40,7 @@ def test_basic_operations(client):
         {"name": "Bob", "age": 35}
     ]
     ids = client.store(batch_data)
-    client.storage.flush_cache()  # 刷新缓存
+    client.flush_cache()  # 刷新缓存
     
     # 测试批量检索
     results = client.retrieve_many(ids)
@@ -56,7 +56,7 @@ def test_query_operations(client):
         {"name": "Bob", "age": 35, "city": "New York"}
     ]
     client.store(test_data)
-    client.storage.flush_cache()  # 刷新缓存
+    client.flush_cache()  # 刷新缓存
     
     # 测试简单查询
     results = client.query("age > 28")
@@ -87,7 +87,7 @@ def test_table_operations(client):
     
     # 测试在新表中存储数据
     client.store({"name": "John"})
-    client.storage.flush_cache()  # 刷新缓存
+    client.flush_cache()  # 刷新缓存
     
     # 测试删除表
     client.drop_table("users")
@@ -97,7 +97,7 @@ def test_table_operations(client):
 def test_update_operations(client):
     # 插入初始数据
     id_ = client.store({"name": "John", "age": 30})
-    client.storage.flush_cache()  # 刷新缓存
+    client.flush_cache()  # 刷新缓存
     
     # 测试替换单条记录
     success = client.replace(id_, {"name": "John Doe", "age": 31})
@@ -118,9 +118,9 @@ def test_update_operations(client):
 def test_delete_operations(client):
     # 插入测试数据
     id1 = client.store({"name": "John"})
-    client.storage.flush_cache()  # 刷新缓存
+    client.flush_cache()  # 刷新缓存
     id2 = client.store({"name": "Alice"})
-    client.storage.flush_cache()  # 刷新缓存
+    client.flush_cache()  # 刷新缓存
     
     # 测试删除单条记录
     success = client.delete(id1)
@@ -158,9 +158,9 @@ def test_dataframe_imports(client):
 def test_utility_operations(client):
     # 插入一些测试数据
     client.store({"name": "John", "age": 30})
-    client.storage.flush_cache()  # 刷新缓存
+    client.flush_cache()  # 刷新缓存
     client.store({"name": "Alice", "age": 25})
-    client.storage.flush_cache()  # 刷新缓存
+    client.flush_cache()  # 刷新缓存
     
     # 测试字段列表
     fields = client.list_fields()

@@ -1266,11 +1266,19 @@ class DuckDBStorage(BaseStorage):
             for field_name, field_type in new_fields:
                 quoted_field = self._quote_identifier(field_name)
                 
-                # 添加字段到表
-                cursor.execute(
-                    f"ALTER TABLE {self._quote_identifier(table_name)} "
-                    f"ADD COLUMN {quoted_field} {field_type}"
-                )
+                # 检查列是否已存在
+                try:
+                    cursor.execute(f"""
+                        SELECT {quoted_field} 
+                        FROM {self._quote_identifier(table_name)} 
+                        LIMIT 0
+                    """)
+                except:
+                    # 列不存在，添加它
+                    cursor.execute(f"""
+                        ALTER TABLE {self._quote_identifier(table_name)}
+                        ADD COLUMN {quoted_field} {field_type}
+                    """)
                 
                 # 更新元数据
                 cursor.execute("""
