@@ -449,19 +449,19 @@ class DuckDBStorage(BaseStorage):
             return 'VARCHAR'
 
     def store(self, data: Union[dict, pd.DataFrame], table_name: str = None) -> Union[int, List[int]]:
-        """Store data
+        """存储数据
         
         Args:
-            data: The data to store, can be a dictionary or DataFrame
-            table_name: The name of the table
+            data: 要存储的数据，可以是字典或DataFrame
+            table_name: 表名
             
         Returns:
-            The record ID or ID list
+            记录ID或ID列表
         """
         table_name = self._get_table_name(table_name)
         
         if isinstance(data, dict):
-            # Preprocess JSON fields
+            # 预处理数据
             processed_data = {}
             for k, v in data.items():
                 if isinstance(v, (dict, list)):
@@ -471,12 +471,12 @@ class DuckDBStorage(BaseStorage):
             df = [processed_data]
         elif isinstance(data, pd.DataFrame):
             df = data.copy()
-            # Preprocess JSON fields in the DataFrame
+            # 预处理DataFrame中的JSON字段
             for col in df.columns:
                 if df[col].apply(lambda x: isinstance(x, (dict, list))).any():
                     df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x)
         
-        # If the data is multiple rows, use batch_store
+        # 如果数据是多行，使用batch_store
         if len(df) > 1:
             return self.batch_store(df, table_name)
         elif self.enable_cache and self.id_manager.get_next_id(table_name) != 1:
@@ -493,7 +493,7 @@ class DuckDBStorage(BaseStorage):
             with self._lock:
                 return self.id_manager.current_id(table_name)
         
-        # Ensure the table exists and update the schema
+        # 确保表存在并更新schema
         self._create_table_if_not_exists(table_name, df[0])
         
         if not isinstance(df, pd.DataFrame):
@@ -503,22 +503,22 @@ class DuckDBStorage(BaseStorage):
             cursor = self.conn.cursor()
             cursor.execute("BEGIN TRANSACTION")
             try:
-                # Get the next ID
+                # 获取下一个ID
                 result = cursor.execute(f"""
                     SELECT COALESCE(MAX(_id), 0) + 1 
                     FROM {self._quote_identifier(table_name)}
                 """).fetchone()
                 next_id = result[0] if result else 1
                 
-                # Add ID column
+                # 添加ID列
                 if '_id' in df.columns:
                     df = df.drop('_id', axis=1)
                 df.insert(0, '_id', next_id)
                 
-                # Get the column names
+                # 获取列名
                 columns = [f'"{str(col)}"' for col in df.columns]
                 
-                # Insert data
+                # 插入数据
                 cursor.register('df_view', df)
                 insert_sql = f"""
                     INSERT INTO {self._quote_identifier(table_name)} ({', '.join(columns)})
@@ -527,7 +527,7 @@ class DuckDBStorage(BaseStorage):
                 cursor.execute(insert_sql)
                 cursor.unregister('df_view')
                 
-                # Create indexes
+                # 创建索引
                 self._create_indexes(table_name)
                 
                 cursor.execute("COMMIT")
@@ -717,16 +717,15 @@ class DuckDBStorage(BaseStorage):
         if result:
             data = {}
             for i, col in enumerate(columns):
-                value = result[i]
-                if value is not None:
-                    if col != '_id' and isinstance(value, str):
-                        try:
-                            # Try to parse the JSON string
-                            data[col] = json.loads(value)
-                        except json.JSONDecodeError:
-                            data[col] = value
-                    else:
-                        data[col] = value
+                # 始终包含字段，即使值为 None
+                if col != '_id' and isinstance(result[i], str):
+                    try:
+                        # Try to parse the JSON string
+                        data[col] = json.loads(result[i])
+                    except json.JSONDecodeError:
+                        data[col] = result[i]
+                else:
+                    data[col] = result[i]
             return data
         return None
 
@@ -761,16 +760,15 @@ class DuckDBStorage(BaseStorage):
         for row in results:
             data = {}
             for i, col in enumerate(columns):
-                value = row[i]
-                if value is not None:
-                    if col != '_id' and isinstance(value, str):
-                        try:
-                            # Try to parse the JSON string
-                            data[col] = json.loads(value)
-                        except json.JSONDecodeError:
-                            data[col] = value
-                    else:
-                        data[col] = value
+                # 始终包含字段，即使值为 None
+                if col != '_id' and isinstance(row[i], str):
+                    try:
+                        # Try to parse the JSON string
+                        data[col] = json.loads(row[i])
+                    except json.JSONDecodeError:
+                        data[col] = row[i]
+                else:
+                    data[col] = row[i]
             data_list.append(data)
         
         return data_list
@@ -1242,56 +1240,77 @@ class DuckDBStorage(BaseStorage):
             table_name: 表名
             cursor: 数据库游标
         """
-        # 获取当前 schema
-        current_schema = self._get_table_schema(table_name)
-        
-        # 检查并添加新字段
-        new_fields = []
-        for field_name, value in data.items():
-            if field_name != '_id' and not current_schema.has_column(field_name):
-                field_type = self._infer_field_type(value)
-                new_fields.append((field_name, field_type))
-                current_schema.add_column(field_name, field_type)
-        
-        if new_fields:
-            # 获取当前最大的 ordinal_position
-            result = cursor.execute("""
-                SELECT COALESCE(MAX(ordinal_position), 0) + 1
-                FROM fields_meta
-                WHERE table_name = ?
-            """, [table_name]).fetchone()
-            next_position = result[0] if result else 2  # _id是1，所以从2开始
+        try:
+            cursor.execute("BEGIN TRANSACTION")
             
-            # 添加新字段
-            for field_name, field_type in new_fields:
-                quoted_field = self._quote_identifier(field_name)
-                
-                # 检查列是否已存在
-                try:
-                    cursor.execute(f"""
-                        SELECT {quoted_field} 
-                        FROM {self._quote_identifier(table_name)} 
-                        LIMIT 0
-                    """)
-                except:
-                    # 列不存在，添加它
-                    cursor.execute(f"""
-                        ALTER TABLE {self._quote_identifier(table_name)}
-                        ADD COLUMN {quoted_field} {field_type}
-                    """)
-                
-                # 更新元数据
-                cursor.execute("""
-                    INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT (table_name, field_name) DO UPDATE SET 
-                        field_type = EXCLUDED.field_type,
-                        ordinal_position = EXCLUDED.ordinal_position
-                """, [table_name, field_name, field_type, next_position])
-                next_position += 1
+            # 如果表不存在，创建表
+            if not self._table_exists(table_name):
+                schema = DuckDBSchema()
+                for field_name, value in data.items():
+                    if field_name != '_id':
+                        field_type = self._infer_field_type(value)
+                        schema.add_column(field_name, field_type)
+                self.create_schema(table_name, schema)
+                cursor.execute("COMMIT")
+                return
             
-            # 更新 schema
-            self._update_table_schema(table_name, current_schema)
+            # 获取当前 schema
+            current_schema = self._get_table_schema(table_name)
+            
+            # 检查并添加新字段
+            new_fields = []
+            for field_name, value in data.items():
+                if field_name != '_id' and not current_schema.has_column(field_name):
+                    field_type = self._infer_field_type(value)
+                    new_fields.append((field_name, field_type))
+                    current_schema.add_column(field_name, field_type)
+            
+            if new_fields:
+                # 获取当前最大的 ordinal_position
+                result = cursor.execute("""
+                    SELECT COALESCE(MAX(ordinal_position), 0) + 1
+                    FROM fields_meta
+                    WHERE table_name = ?
+                """, [table_name]).fetchone()
+                next_position = result[0] if result else 2
+                
+                # 添加新字段
+                for field_name, field_type in new_fields:
+                    # 检查列是否已存在
+                    if not self._column_exists(table_name, field_name):
+                        quoted_field = self._quote_identifier(field_name)
+                        
+                        # 添加列到表
+                        cursor.execute(f"""
+                            ALTER TABLE {self._quote_identifier(table_name)}
+                            ADD COLUMN IF NOT EXISTS {quoted_field} {field_type}
+                            DEFAULT NULL
+                        """)
+                        
+                        # 更新元数据
+                        cursor.execute("""
+                            INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
+                            VALUES (?, ?, ?, ?)
+                            ON CONFLICT (table_name, field_name) DO UPDATE SET 
+                                field_type = EXCLUDED.field_type,
+                                ordinal_position = EXCLUDED.ordinal_position
+                        """, [table_name, field_name, field_type, next_position])
+                        next_position += 1
+                
+                # 更新 tables_meta
+                cursor.execute(
+                    "UPDATE tables_meta SET schema = ? WHERE table_name = ?",
+                    [orjson.dumps(current_schema.to_dict()).decode('utf-8'), table_name]
+                )
+                
+                # 更新 schema
+                self._update_table_schema(table_name, current_schema)
+            
+            cursor.execute("COMMIT")
+            
+        except Exception as e:
+            cursor.execute("ROLLBACK")
+            raise e
 
     def drop_column(self, column_name: str):
         """删除指定的列
@@ -1348,7 +1367,8 @@ class DuckDBStorage(BaseStorage):
             
             # 检查列是否已存在
             if self._column_exists(table_name, column_name):
-                raise ValueError(f"Column {column_name} already exists")
+                cursor.execute("ROLLBACK")
+                return  # 如果列已存在，直接返回
             
             # 添加新列
             cursor.execute(f"""
@@ -1367,6 +1387,17 @@ class DuckDBStorage(BaseStorage):
                 INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
                 VALUES (?, ?, ?, ?)
             """, [table_name, column_name, column_type, next_position])
+            
+            # 获取并更新 schema
+            current_schema = self._get_table_schema(table_name)
+            current_schema.add_column(column_name, column_type)
+            self._update_table_schema(table_name, current_schema)
+            
+            # 更新 tables_meta
+            cursor.execute(
+                "UPDATE tables_meta SET schema = ? WHERE table_name = ?",
+                [orjson.dumps(current_schema.to_dict()).decode('utf-8'), table_name]
+            )
             
             cursor.execute("COMMIT")
             

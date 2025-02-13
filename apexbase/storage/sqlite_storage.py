@@ -386,6 +386,12 @@ class SQLiteStorage(BaseStorage):
                         ordinal_position = EXCLUDED.ordinal_position
                 """, [table_name, field_name, field_type, position])
             
+            # Update tables_meta
+            cursor.execute(
+                "INSERT OR REPLACE INTO tables_meta (table_name, schema) VALUES (?, ?)",
+                [table_name, json.dumps(schema.to_dict())]
+            )
+            
             cursor.execute("COMMIT")
             
             # 更新 schema
@@ -508,18 +514,22 @@ class SQLiteStorage(BaseStorage):
         else:
             return "TEXT"
 
-    def _ensure_fields_exist(self, data: dict, table_name: str = None):
-        """Ensure all fields exist
+    def _ensure_fields_exist(self, data: dict, table_name: str = None, in_transaction: bool = False):
+        """确保所有字段都存在
         
         Args:
-            data: Data dictionary
-            table_name: Table name
+            data: 数据字典
+            table_name: 表名
+            in_transaction: 是否在事务中
         """
         table_name = self._get_table_name(table_name)
         cursor = self._get_connection().cursor()
         
         try:
-            # If the table does not exist, create the table
+            if not in_transaction:
+                cursor.execute("BEGIN TRANSACTION")
+            
+            # 如果表不存在，创建表
             if not self._table_exists(table_name):
                 schema = SQLiteSchema()
                 for field_name, value in data.items():
@@ -527,12 +537,14 @@ class SQLiteStorage(BaseStorage):
                         field_type = self._infer_field_type(value)
                         schema.add_column(field_name, field_type)
                 self.create_schema(table_name, schema)
+                if not in_transaction:
+                    cursor.execute("COMMIT")
                 return
             
-            # Get current schema
+            # 获取当前 schema
             current_schema = self._get_table_schema(table_name)
             
-            # Check and add new fields
+            # 检查并添加新字段
             new_fields = []
             for field_name, value in data.items():
                 if field_name != '_id' and not current_schema.has_column(field_name):
@@ -541,26 +553,27 @@ class SQLiteStorage(BaseStorage):
                     current_schema.add_column(field_name, field_type)
             
             if new_fields:
-                # Get the current maximum ordinal_position
+                # 获取当前最大的 ordinal_position
                 result = cursor.execute("""
                     SELECT COALESCE(MAX(ordinal_position), 0) + 1
                     FROM fields_meta
                     WHERE table_name = ?
                 """, [table_name]).fetchone()
-                next_position = result[0] if result else 2  # _id是1，所以从2开始
+                next_position = result[0] if result else 2
                 
-                # Add new fields in a single transaction
-                cursor.execute("BEGIN TRANSACTION")
-                try:
-                    for field_name, field_type in new_fields:
+                # 添加新字段
+                for field_name, field_type in new_fields:
+                    # 检查列是否已存在
+                    if not self._column_exists(table_name, field_name):
                         quoted_field = self._quote_identifier(field_name)
                         
-                        # Add the field to the table
-                        cursor.execute(
-                            f"ALTER TABLE {self._quote_identifier(table_name)} ADD COLUMN {quoted_field} {field_type}"
-                        )
+                        # 添加列到表
+                        cursor.execute(f"""
+                            ALTER TABLE {self._quote_identifier(table_name)}
+                            ADD COLUMN {quoted_field} {field_type}
+                        """)
                         
-                        # Update metadata
+                        # 更新元数据
                         cursor.execute("""
                             INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
                             VALUES (?, ?, ?, ?)
@@ -569,17 +582,22 @@ class SQLiteStorage(BaseStorage):
                                 ordinal_position = EXCLUDED.ordinal_position
                         """, [table_name, field_name, field_type, next_position])
                         next_position += 1
-                    
-                    cursor.execute("COMMIT")
-                    
-                    # 更新 schema
-                    self._update_table_schema(table_name, current_schema)
-                    
-                except Exception as e:
-                    cursor.execute("ROLLBACK")
-                    raise e
+                
+                # 更新 tables_meta
+                cursor.execute(
+                    "UPDATE tables_meta SET schema = ? WHERE table_name = ?",
+                    [json.dumps(current_schema.to_dict()), table_name]
+                )
+                
+                # 更新 schema
+                self._update_table_schema(table_name, current_schema)
+            
+            if not in_transaction:
+                cursor.execute("COMMIT")
             
         except Exception as e:
+            if not in_transaction:
+                cursor.execute("ROLLBACK")
             raise e
 
     def store(self, data: dict, table_name: str = None) -> int:
@@ -909,17 +927,14 @@ class SQLiteStorage(BaseStorage):
             self._last_modified_time = time.time()
 
     def replace(self, id_: int, data: dict) -> bool:
-        """
-        Replaces a record with the specified ID.
-
-        Parameters:
-            id_: int
-                The ID of the record to replace
-            data: dict
-                The new record data
-
+        """替换记录
+        
+        Args:
+            id_: 记录ID
+            data: 新记录数据
+            
         Returns:
-            bool: Whether the replacement was successful
+            是否替换成功
         """
         if not isinstance(data, dict):
             raise ValueError("Only dict-type data is allowed.")
@@ -939,8 +954,8 @@ class SQLiteStorage(BaseStorage):
 
             cursor.execute("BEGIN IMMEDIATE")
             try:
-                # Ensure all fields exist
-                self._ensure_fields_exist(data, table_name)
+                # 确保所有字段都存在
+                self._ensure_fields_exist(data, table_name, in_transaction=True)
                 
                 field_updates = []
                 params = []
@@ -949,29 +964,25 @@ class SQLiteStorage(BaseStorage):
                     if field_name != '_id':
                         quoted_field_name = self._quote_identifier(field_name)
                         field_updates.append(f"{quoted_field_name} = ?")
-                        # If it is a complex type, serialize to JSON
                         if isinstance(value, (list, dict)):
                             params.append(json.dumps(value))
                         else:
                             params.append(value)
 
-                # If there are fields to update
                 if field_updates:
                     update_sql = f"UPDATE {quoted_table} SET {', '.join(field_updates)} WHERE _id = ?"
                     params.append(id_)
                     cursor.execute(update_sql, params)
 
                 cursor.execute("COMMIT")
-
                 return True
+                
             except Exception as e:
                 cursor.execute("ROLLBACK")
                 raise e
+                
         except Exception as e:
             raise ValueError(f"Failed to replace record: {str(e)}")
-
-        finally:
-            self._last_modified_time = time.time()
 
     def batch_replace(self, data_dict: Dict[int, dict]) -> List[int]:
         """
@@ -996,7 +1007,7 @@ class SQLiteStorage(BaseStorage):
             try:
                 # Ensure all fields exist
                 for data in data_dict.values():
-                    self._ensure_fields_exist(data, table_name)
+                    self._ensure_fields_exist(data, table_name, in_transaction=True)
 
                 # Check if all IDs exist
                 ids = list(data_dict.keys())
@@ -1423,7 +1434,14 @@ class SQLiteStorage(BaseStorage):
             
             # 检查列是否已存在
             if self._column_exists(table_name, column_name):
-                raise ValueError(f"Column {column_name} already exists")
+                cursor.execute("ROLLBACK")
+                return  # 如果列已存在，直接返回
+            
+            # 获取当前 schema
+            current_schema = self._get_table_schema(table_name)
+            if current_schema.has_column(column_name):
+                cursor.execute("ROLLBACK")
+                return  # 如果列已存在，直接返回
             
             # 添加新列
             cursor.execute(f"""
@@ -1442,6 +1460,16 @@ class SQLiteStorage(BaseStorage):
                 INSERT INTO fields_meta (table_name, field_name, field_type, ordinal_position)
                 VALUES (?, ?, ?, ?)
             """, [table_name, column_name, column_type, next_position])
+            
+            # 更新 schema
+            current_schema.add_column(column_name, column_type)
+            self._update_table_schema(table_name, current_schema)
+            
+            # 更新 tables_meta
+            cursor.execute(
+                "UPDATE tables_meta SET schema = ? WHERE table_name = ?",
+                [json.dumps(current_schema.to_dict()), table_name]
+            )
             
             cursor.execute("COMMIT")
             
