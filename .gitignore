@@ -55,3 +55,4 @@ Cargo.lock
 *.cursorrules
 
 *.ipynb
+*.apex
