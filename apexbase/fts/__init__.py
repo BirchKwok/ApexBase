@@ -1,10 +1,11 @@
 import re
 import mmap
+import shutil
 import msgpack
 from collections import defaultdict
 from typing import List, Union, Dict, Tuple
 from pathlib import Path
-import multiprocessing as mp
+
 from concurrent.futures import ProcessPoolExecutor
 
 from pyroaring import BitMap
@@ -65,31 +66,50 @@ class FullTextSearch:
                  max_chinese_length: int = 4, 
                  num_workers: int = 4,
                  shard_size: int = 100_000,  # 每个分片包含的文档数
-                 min_term_length: int = 2):   # 最小词长度
+                 min_term_length: int = 2,   # 最小词长度
+                 auto_save: bool = True,     # 是否自动保存
+                 batch_size: int = 1000,     # 批量处理大小
+                 drop_if_exists: bool = False,
+                 buffer_size: int = 10000):  # 内存缓冲区大小
         """
         初始化全文搜索器。
 
         Args:
             index_dir: 索引文件存储目录，如果为None则使用内存索引
             max_chinese_length: 中文子串的最大长度，默认为4个字符
-            num_workers: 并行构建索引的工作进程数，默认为CPU核心数
+            num_workers: 并行构建索引的工作进程数，默认为4
             shard_size: 每个分片包含的文档数，默认10万
             min_term_length: 最小词长度，小于此长度的词不会被索引
+            auto_save: 是否自动保存到磁盘，默认为True
+            batch_size: 批量处理大小，达到此数量时才更新词组索引和保存，默认1000
+            drop_if_exists: 如果索引文件存在，是否删除，默认为False
+            buffer_size: 内存缓冲区大小，达到此大小时才写入磁盘，默认10000
         """
         self.chinese_pattern = re.compile(r'[\u4e00-\u9fff]+')
         self.index_dir = Path(index_dir) if index_dir else None
+        
+        if drop_if_exists and self.index_dir and self.index_dir.exists():
+            shutil.rmtree(self.index_dir)
+                
         self.max_chinese_length = max_chinese_length
-        self.num_workers = num_workers or mp.cpu_count()
+        self.num_workers = num_workers
         self.shard_size = shard_size
         self.min_term_length = min_term_length
+        self.auto_save = auto_save
+        self.batch_size = batch_size
+        self.buffer_size = buffer_size
         
         # 使用 LRU 缓存管理内存中的索引
         self.cache = LRUCache(maxsize=10000)
         self.modified_keys = set()
         
-        # 内存索引
+        # 内存索引和缓冲区
         self.index = defaultdict(BitMap)
         self.word_index = defaultdict(BitMap)
+        self.index_buffer = defaultdict(set)  # 文档缓冲区
+        
+        # 批量处理计数器
+        self._batch_count = 0
         
         if self.index_dir:
             self.index_dir.mkdir(parents=True, exist_ok=True)
@@ -245,34 +265,48 @@ class FullTextSearch:
         chinese_pattern = re.compile(r'[\u4e00-\u9fff]+')
         result = defaultdict(set)
         
+        # 预编译正则表达式和常用变量
+        word_splitter = re.compile(r'\s+')
+        chinese_cache = {}  # 缓存中文处理结果
+        
         for i, doc in enumerate(docs):
             doc_id = start_id + i
+            
+            # 分别处理每个字段
             for field_value in doc.values():
                 field_str = str(field_value).lower()
                 
-                # 添加完整字段到索引（如果长度足够）
+                # 处理完整字段
                 if len(field_str) >= min_term_length:
                     result[field_str].add(doc_id)
                 
                 # 处理中文部分
-                if chinese_pattern.search(field_str):
-                    segments = chinese_pattern.findall(field_str)
-                    for seg in segments:
+                for match in chinese_pattern.finditer(field_str):
+                    seg = match.group()
+                    # 使用缓存避免重复计算
+                    if seg not in chinese_cache:
                         n = len(seg)
-                        for length in range(min_term_length, min(n + 1, max_chinese_length + 1)):
-                            for j in range(n - length + 1):
-                                substr = seg[j:j + length]
-                                result[substr].add(doc_id)
+                        substrings = {seg[j:j + length] 
+                                    for length in range(min_term_length, min(n + 1, max_chinese_length + 1))
+                                    for j in range(n - length + 1)}
+                        chinese_cache[seg] = substrings
+                    
+                    # 从缓存中获取子串
+                    for substr in chinese_cache[seg]:
+                        result[substr].add(doc_id)
                 
                 # 处理词组
                 if ' ' in field_str:
-                    words = field_str.split()
-                    # 只为单词建立索引
+                    # 对整个词组建立索引
+                    result[field_str].add(doc_id)
+                    # 对单词建立索引
+                    words = word_splitter.split(field_str)
                     for word in words:
-                        if not chinese_pattern.search(word) and len(word) >= min_term_length:
+                        if len(word) >= min_term_length and not chinese_pattern.search(word):
                             result[word].add(doc_id)
         
-        return {k: list(v) for k, v in result.items()}
+        # 使用列表推导式优化返回值创建
+        return {k: list(v) for k, v in result.items() if v}
 
     def add_document(self, doc_id: Union[int, List[int]], fields: Union[Dict[str, Union[str, int, float]], List[Dict[str, Union[str, int, float]]]]):
         """
@@ -294,36 +328,151 @@ class FullTextSearch:
         if len(doc_ids) != len(docs):
             raise ValueError("文档ID列表和文档列表长度必须相同")
         
-        # 批量处理文档
-        chunk_size = max(1, len(docs) // (self.num_workers * 2))
-        chunks = []
-        
-        for i in range(0, len(docs), chunk_size):
-            chunk_docs = docs[i:i + chunk_size]
-            chunk_start_id = doc_ids[i]
-            chunk = (chunk_start_id, chunk_docs, self.max_chinese_length, self.min_term_length)
-            chunks.append(chunk)
-        
-        # 并行处理文档
-        if len(chunks) > 1:
+        # 优化chunk大小计算
+        total_docs = len(docs)
+        if total_docs < 1000:
+            # 小批量数据直接处理
+            results = [self._process_chunk((doc_ids[0], docs, self.max_chinese_length, self.min_term_length))]
+        else:
+            # 大批量数据并行处理
+            chunk_size = max(1000, total_docs // self.num_workers)
+            chunks = []
+            
+            for i in range(0, total_docs, chunk_size):
+                chunk_docs = docs[i:i + chunk_size]
+                chunk_start_id = doc_ids[i]
+                chunk = (chunk_start_id, chunk_docs, self.max_chinese_length, self.min_term_length)
+                chunks.append(chunk)
+            
+            # 使用进程池并行处理
             with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
                 results = list(executor.map(self._process_chunk, chunks))
-        else:
-            results = [self._process_chunk(chunks[0])]
         
-        # 合并结果
+        # 使用缓冲区合并结果
         for result in results:
             for key, doc_ids in result.items():
-                if len(key) >= self.min_term_length:  # 只索引符合最小长度要求的词
-                    self.index[key] |= BitMap(doc_ids)
-                    self.modified_keys.add(key)
+                if len(key) >= self.min_term_length:
+                    self.index_buffer[key].update(doc_ids)
         
-        # 更新词组索引
-        self._build_word_index()
+        # 更新批处理计数
+        self._batch_count += len(docs)
         
-        # 如果使用磁盘存储，保存更新
-        if self.index_dir:
-            self._save_index(incremental=True)
+        # 当缓冲区达到阈值时，合并到主索引
+        if len(self.index_buffer) >= self.buffer_size:
+            self._merge_buffer()
+        
+        # 当达到批处理大小时，更新词组索引并保存
+        if self._batch_count >= self.batch_size:
+            self._merge_buffer()  # 确保所有数据都已合并
+            self._build_word_index()
+            if self.auto_save and self.index_dir:
+                self._save_index(incremental=True)
+            self._batch_count = 0
+
+    def _merge_buffer(self):
+        """合并缓冲区到主索引"""
+        for key, doc_ids in self.index_buffer.items():
+            if doc_ids:  # 只处理非空集合
+                self.index[key] |= BitMap(doc_ids)
+                self.modified_keys.add(key)
+        self.index_buffer.clear()
+
+    def flush(self):
+        """
+        强制将当前的更改保存到磁盘，并更新词组索引。
+        在批量添加完成后调用此方法以确保所有更改都已保存。
+        """
+        if self.index_buffer:
+            self._merge_buffer()
+        if self._batch_count > 0:
+            self._build_word_index()
+            if self.index_dir:
+                self._save_index(incremental=True)
+            self._batch_count = 0
+
+    def _build_word_index(self):
+        """构建词组反向索引"""
+        # 使用临时字典收集所有词的文档ID
+        temp_word_index = defaultdict(set)
+        word_splitter = re.compile(r'\s+')
+        
+        for field_str, doc_ids in self.index.items():
+            if ' ' in field_str:
+                # 只处理包含空格的字段
+                words = word_splitter.split(field_str.lower())
+                doc_ids_list = list(doc_ids)
+                for word in words:
+                    if not self.chinese_pattern.search(word) and len(word) >= self.min_term_length:
+                        temp_word_index[word].update(doc_ids_list)
+        
+        # 批量更新词组索引
+        self.word_index.clear()
+        for word, doc_ids in temp_word_index.items():
+            if doc_ids:  # 只添加非空集合
+                self.word_index[word] = BitMap(doc_ids)
+
+    def search(self, query: str) -> List[int]:
+        """搜索实现"""
+        query_key = query.lower()  # 统一转换为小写
+
+        # 使用缓存获取结果
+        cached_result = self.cache.get(query_key)
+        if cached_result is not None:
+            return sorted(cached_result)
+
+        result = BitMap()
+        
+        # 先尝试精确匹配
+        if query_key in self.index:
+            result |= self.index[query_key]
+            self.cache.put(query_key, result)
+            return sorted(result)
+        
+        # 检查是否为中文查询
+        if self.chinese_pattern.search(query_key):
+            # 中文查询：尝试子串匹配
+            for length in range(len(query_key), self.min_term_length - 1, -1):
+                for i in range(len(query_key) - length + 1):
+                    substr = query_key[i:i + length]
+                    if substr in self.index:
+                        result |= self.index[substr]
+                        if result:  # 如果找到匹配，就返回
+                            self.cache.put(query_key, result)
+                            return sorted(result)
+        else:
+            # 非中文查询：词组匹配
+            if ' ' in query_key:
+                words = query_key.split()
+                word_results = []
+                
+                # 收集每个单词的匹配结果
+                for word in words:
+                    if len(word) >= self.min_term_length:
+                        word_result = BitMap()
+                        if word in self.index:
+                            word_result |= self.index[word]
+                        if not word_result:  # 如果有任何一个词没有匹配，直接返回空结果
+                            self.cache.put(query_key, BitMap())
+                            return []
+                        word_results.append(word_result)
+                
+                # 使用交集获取包含所有单词的文档
+                if word_results:
+                    result = word_results[0]
+                    for other_result in word_results[1:]:
+                        result &= other_result
+
+        # 缓存结果
+        self.cache.put(query_key, result)
+        return sorted(result)
+
+    def _bitmap_to_bytes(self, bitmap: BitMap) -> bytes:
+        """将 BitMap 转换为字节串"""
+        return bitmap.serialize()
+    
+    def _bytes_to_bitmap(self, data: bytes) -> BitMap:
+        """将字节串转换回 BitMap"""
+        return BitMap.deserialize(data)
 
     def remove_document(self, doc_id: int):
         """从索引中删除文档"""
@@ -363,67 +512,6 @@ class FullTextSearch:
         # 清除缓存
         self.cache = LRUCache(maxsize=self.cache.maxsize)
 
-    def _bitmap_to_bytes(self, bitmap: BitMap) -> bytes:
-        """将 BitMap 转换为字节串"""
-        return bitmap.serialize()
-    
-    def _bytes_to_bitmap(self, data: bytes) -> BitMap:
-        """将字节串转换回 BitMap"""
-        return BitMap.deserialize(data)
-
-    def _build_word_index(self):
-        """构建词组反向索引"""
-        self.word_index.clear()
-        for field_str, doc_ids in self.index.items():
-            if ' ' in field_str:
-                words = field_str.lower().split()
-                for word in words:
-                    if not self.chinese_pattern.search(word) and len(word) >= self.min_term_length:
-                        self.word_index[word] |= doc_ids
-
-    def search(self, query: str) -> List[int]:
-        """搜索实现"""
-        query_key = query.lower()  # 统一转换为小写
-
-        # 使用缓存获取结果
-        cached_result = self.cache.get(query_key)
-        if cached_result is not None:
-            return sorted(cached_result)
-
-        result = BitMap()
-        
-        # 检查是否为中文查询
-        if self.chinese_pattern.search(query):
-            # 中文查询
-            if query_key in self.index:
-                result |= self.index[query_key]
-        else:
-            # 非中文查询
-            if query_key in self.index:
-                result |= self.index[query_key]
-            elif ' ' in query_key:
-                # 词组查询
-                words = query_key.split()
-                # 检查每个单词是否存在于索引中
-                word_results = []
-                for word in words:
-                    if len(word) >= self.min_term_length:  # 只处理符合最小长度要求的词
-                        word_result = BitMap()
-                        if word in self.word_index:
-                            word_result |= self.word_index[word]
-                        word_results.append(word_result)
-                
-                # 使用交集获取包含所有单词的文档
-                if word_results:
-                    result = word_results[0]
-                    for other_result in word_results[1:]:
-                        result &= other_result
-
-        # 缓存结果
-        self.cache.put(query_key, result)
-        return sorted(result)
-
-
 if __name__ == '__main__':
     # 示例数据：文档列表，每个文档是一个字典
     data = [
@@ -437,55 +525,79 @@ if __name__ == '__main__':
         {"title": "hello world 你好", "content": "示例文本"},
     ]
     
-    # 使用磁盘索引
+    # 使用磁盘索引，并设置合适的参数
     index_dir = "fts_index"
-    fts = FullTextSearch(index_dir=index_dir)
+    fts = FullTextSearch(
+        index_dir=index_dir,
+        batch_size=1000,
+        buffer_size=5000,
+        drop_if_exists=True  # 清除已存在的索引
+    )
     
     # 批量添加文档
     doc_ids = list(range(len(data)))
     fts.add_document(doc_ids, data)
+    fts.flush()
     
     # 基本搜索测试
     print("\n=== 基本搜索测试 ===")
-    query1 = "Hello World"
-    result1 = fts.search(query1)
-    print(f"查询【{query1}】的行索引: {result1}")
     
-    query2 = "hello world"
-    result2 = fts.search(query2)
-    print(f"查询【{query2}】的行索引: {result2}")
+    # 测试精确匹配
+    print("\n精确匹配测试:")
+    queries = ["Hello World", "hello world", "全文搜索", "mixed"]
+    for query in queries:
+        result = fts.search(query)
+        print(f"查询【{query}】的文档: {result}")
+        if result:
+            print("匹配的文档内容:")
+            for doc_id in result:
+                print(f"  - {data[doc_id]}")
     
-    query3 = "全文"
-    result3 = fts.search(query3)
-    print(f"查询【{query3}】的行索引: {result3}")
+    # 测试中文查询
+    print("\n中文查询测试:")
+    queries = ["全文", "搜索", "测试"]
+    for query in queries:
+        result = fts.search(query)
+        print(f"查询【{query}】的文档: {result}")
+        if result:
+            print("匹配的文档内容:")
+            for doc_id in result:
+                print(f"  - {data[doc_id]}")
     
-    query4 = "mixed"
-    result4 = fts.search(query4)
-    print(f"查询【{query4}】的行索引: {result4}")
+    # 测试词组查询
+    print("\n词组查询测试:")
+    queries = ["hello world", "全文 搜索", "python 搜索"]
+    for query in queries:
+        result = fts.search(query)
+        print(f"查询【{query}】的文档: {result}")
+        if result:
+            print("匹配的文档内容:")
+            for doc_id in result:
+                print(f"  - {data[doc_id]}")
     
     # 增量更新测试
     print("\n=== 增量更新测试 ===")
-    # 添加新文档
     new_doc = {"title": "新增文档", "content": "测试全文搜索", "tags": "hello world test"}
     fts.add_document(len(data), new_doc)
+    fts.flush()
     
-    print("添加新文档后:")
-    result5 = fts.search("新增")
-    print(f"查询【新增】的行索引: {result5}")
-    result6 = fts.search("hello world")
-    print(f"查询【hello world】的行索引: {result6}")
+    print("\n添加新文档后:")
+    queries = ["新增", "测试", "hello world"]
+    for query in queries:
+        result = fts.search(query)
+        print(f"查询【{query}】的文档: {result}")
     
     # 删除文档
     fts.remove_document(len(data))
     print("\n删除新文档后:")
-    result7 = fts.search("新增")
-    print(f"查询【新增】的行索引: {result7}")
-    result8 = fts.search("hello world")
-    print(f"查询【hello world】的行索引: {result8}")
+    for query in queries:
+        result = fts.search(query)
+        print(f"查询【{query}】的文档: {result}")
     
     # 从磁盘加载索引
     print("\n=== 重新加载索引测试 ===")
     fts_reload = FullTextSearch(index_dir=index_dir)
-    result9 = fts_reload.search("hello world")
-    print(f"重新加载后查询【hello world】的行索引: {result9}")
+    for query in ["hello world", "全文", "搜索"]:
+        result = fts_reload.search(query)
+        print(f"查询【{query}】的文档: {result}")
     

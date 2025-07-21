@@ -5,16 +5,17 @@
 ## Features
 
 ✨ **High Performance**
-- Built on SQLite/DuckDB with optimized configurations
+- Built on DuckDB with optimized columnar storage
 - Efficient batch operations support
 - Automatic performance optimization
-- Concurrent access support
-- Columnar storage support with DuckDB backend
+- Concurrent query execution
+- Optimized for OLAP workloads
 
 🔍 **Powerful Query Capabilities**
 - SQL-like query syntax
 - Complex queries with multiple conditions
 - JSON field support
+- Vectorized query execution
 
 📊 **Data Framework Integration**
 - Seamless integration with Pandas
@@ -53,11 +54,8 @@ pip install apexbase
 ```python
 from apexbase import ApexClient
 
-# Initialize the database with SQLite backend (default)
+# Initialize the database
 client = ApexClient("my_database")
-
-# Or use DuckDB backend for columnar storage and analytics
-client = ApexClient("my_database", backend="duckdb")
 
 # Store single record
 record = {"name": "John", "age": 30, "tags": ["python", "rust"]}
@@ -81,22 +79,17 @@ df = pd.DataFrame({"name": ["Alice", "Bob"], "age": [28, 32]})
 client.from_pandas(df)
 ```
 
-### Storage Backend Selection
+### DuckDB Advantages
 
-```python
-# Use SQLite backend (default) - optimized for OLTP workloads
-client = ApexClient("my_database", backend="sqlite")
+ApexBase is built on DuckDB, providing significant advantages:
 
-# Use DuckDB backend - optimized for OLAP and analytics workloads
-client = ApexClient("my_database", backend="duckdb")
-
-# DuckDB backend advantages:
-# - Columnar storage for better analytics performance
-# - Efficient compression
-# - Vectorized query execution
-# - Better performance for analytical queries
-# - Native support for complex aggregations
-```
+- **Columnar storage** for better analytics performance
+- **Efficient compression** for reduced storage footprint
+- **Vectorized query execution** for faster results
+- **Parallel query processing** for multi-core utilization
+- **Native support for complex aggregations**
+- **Optimized for both OLAP and OLTP workloads**
+- **Efficient memory management** for large datasets
 
 ## Advanced Usage
 
@@ -137,6 +130,9 @@ results = client.query("name LIKE 'J%'")
 # Store large batch of records
 records = [{"id": i, "value": i * 2} for i in range(10000)]
 ids = client.store(records)
+
+# Optimize the database for analytics performance
+client.optimize()
 ```
 
 ## Requirements
@@ -149,7 +145,7 @@ ids = client.store(records)
   - polars
   - numpy
   - psutil
-  - duckdb (optional, for columnar storage backend)
+  - duckdb
 
 ## License
 

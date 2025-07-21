@@ -1,5 +1,5 @@
 import shutil
-from typing import List, Dict, Union, Optional, Literal
+from typing import List, Dict, Union, Optional
 from pathlib import Path
 
 from .storage import create_storage
@@ -16,8 +16,7 @@ class ApexClient:
         batch_size: int = 1000, 
         drop_if_exists: bool = False,
         enable_cache: bool = True,
-        cache_size: int = 10000,
-        backend: Literal["sqlite", "duckdb"] = "sqlite"
+        cache_size: int = 10000
     ):
         """
         Initializes a new instance of the ApexClient class.
@@ -29,8 +28,10 @@ class ApexClient:
                 The size of batch operations.
             drop_if_exists: bool
                 If True, the database file will be deleted if it already exists.
-            backend: str
-                The storage backend to use ("sqlite" or "duckdb"). Defaults to "sqlite".
+            enable_cache: bool
+                Whether to enable caching for better write performance.
+            cache_size: int
+                The size of the cache for batch operations.
         """
         if dirpath is None:
             dirpath = "."
@@ -41,9 +42,9 @@ class ApexClient:
             
         self._dirpath.mkdir(parents=True, exist_ok=True)
         
-        self._db_path = self._dirpath / f"apexbase_{backend}.db"
+        self._db_path = self._dirpath / "apexbase.db"
         
-        self._storage = create_storage(backend, str(self._db_path), 
+        self._storage = create_storage(str(self._db_path), 
                                       batch_size=batch_size, 
                                       enable_cache=enable_cache, cache_size=cache_size)
         self._query_handler = Query(self._storage)
