@@ -210,28 +210,30 @@ class DuckDBStorage(BaseStorage):
         
     def _load_extensions(self):
         """加载和初始化扩展"""
+        extensions = [
+            ("httpfs", False),  # (扩展名, 是否必需)
+            ("json", False),
+            ("parquet", False),
+            ("arrow", False)
+        ]
+        
+        for ext_name, required in extensions:
+            try:
+                self.conn.execute(f"INSTALL {ext_name}")
+                self.conn.execute(f"LOAD {ext_name}")
+                print(f"成功加载扩展: {ext_name}")
+            except Exception as e:
+                if required:
+                    raise RuntimeError(f"无法加载必需的扩展 {ext_name}: {e}")
+                else:
+                    print(f"Warning: 无法加载可选扩展 {ext_name}: {e}")
+                    
+        # 无论扩展是否加载成功，都设置这些优化参数
         try:
-            # 加载 httpfs 扩展以支持远程文件访问
-            self.conn.execute("INSTALL httpfs")
-            self.conn.execute("LOAD httpfs")
-            
-            # 加载 json 扩展以优化JSON处理
-            self.conn.execute("INSTALL json")
-            self.conn.execute("LOAD json")
-            
-            # 加载 parquet 扩展以支持 Parquet 格式
-            self.conn.execute("INSTALL parquet")
-            self.conn.execute("LOAD parquet")
-            
-            # 加载 arrow 扩展以支持 Arrow 格式
-            self.conn.execute("INSTALL arrow")
-            self.conn.execute("LOAD arrow")
-            
-            # 加载并行扫描扩展
             self.conn.execute("PRAGMA enable_object_cache=true")
             self.conn.execute("PRAGMA threads=8")
         except Exception as e:
-            print(f"Warning: Failed to load some extensions: {e}")
+            print(f"Warning: 无法设置优化参数: {e}")
 
     def _initialize_database(self):
         """Initialize the database, create necessary system tables"""
