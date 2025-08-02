@@ -102,9 +102,12 @@ def test_batch_store_performance(client):
         
         _, duration = store_batch()
         print(f"\n批量存储 {size} 条记录耗时: {duration:.4f}秒")
-        records_per_second = size / duration
-        print(f"每秒存储记录数: {records_per_second:.1f}")
-        assert duration < size / 10  # 确保批量存储速度至少为10条/秒
+        if duration > 0:
+            records_per_second = size / duration
+            print(f"每秒存储记录数: {records_per_second:.1f}")
+        else:
+            print(f"存储速度极快，无法精确测量")
+        assert duration < size / 10 or duration == 0  # 确保批量存储速度至少为10条/秒，或者执行极快
 
 def test_single_query_performance(client):
     """测试单条记录查询性能"""
