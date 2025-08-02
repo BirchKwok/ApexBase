@@ -1,5 +1,3 @@
-from typing import Literal
-
 
 def create_storage(
     filepath: str = None,
