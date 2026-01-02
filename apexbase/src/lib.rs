@@ -11,6 +11,7 @@ pub mod data;
 pub mod cache;
 pub mod python;
 pub mod fts;
+pub mod io_engine;
 
 // Re-export main types
 pub use storage::ApexFile;

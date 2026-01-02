@@ -61,3 +61,7 @@ Cargo.lock
 .cursor/
 .windsurf/
 .vscode/
+
+AGENTS.md
+
+.claude/

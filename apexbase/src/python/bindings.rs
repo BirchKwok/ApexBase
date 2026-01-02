@@ -437,6 +437,36 @@ fn value_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
     }
 }
 
+/// Convert Arrow array value at index to Python object
+fn arrow_value_to_py(py: Python<'_>, array: &arrow::array::ArrayRef, idx: usize) -> PyResult<PyObject> {
+    use arrow::array::{Array, Int64Array, Float64Array, StringArray, BooleanArray};
+    use arrow::datatypes::DataType;
+    
+    if array.is_null(idx) {
+        return Ok(py.None());
+    }
+    
+    match array.data_type() {
+        DataType::Int64 => {
+            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            Ok(arr.value(idx).to_object(py))
+        }
+        DataType::Float64 => {
+            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            Ok(arr.value(idx).to_object(py))
+        }
+        DataType::Utf8 => {
+            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            Ok(arr.value(idx).to_object(py))
+        }
+        DataType::Boolean => {
+            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            Ok(arr.value(idx).to_object(py))
+        }
+        _ => Ok(py.None()),
+    }
+}
+
 fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     match value {
         serde_json::Value::Null => Ok(py.None()),
@@ -682,10 +712,11 @@ impl ApexStorage {
         self.tables.read().keys().cloned().collect()
     }
 
-    // ========== CRUD Operations ==========
+    // ========== CRUD Operations (via IoEngine) ==========
 
-    /// Store a single record
+    /// Store a single record - IoEngine::Single strategy
     fn store(&self, py: Python<'_>, data: &Bound<'_, PyDict>) -> PyResult<i64> {
+        // IoEngine strategy: Single (direct insert for single row)
         let fields = dict_to_fields(data)?;
         let table_name = self.current_table.read().clone();
         
@@ -701,9 +732,10 @@ impl ApexStorage {
         Ok(id as i64)
     }
 
-    /// Store a single record without returning ID - faster
+    /// Store a single record without returning ID - IoEngine::Single strategy (no return)
     #[pyo3(name = "_store_single_no_return")]
     fn store_single_no_return(&self, py: Python<'_>, data: &Bound<'_, PyDict>) -> PyResult<()> {
+        // IoEngine strategy: Single (direct insert, no ID return for speed)
         let fields = dict_to_fields(data)?;
         let table_name = self.current_table.read().clone();
         
@@ -1965,8 +1997,9 @@ impl ApexStorage {
         Ok((start_id, batch_size))
     }
 
-    /// Retrieve a single record
+    /// Retrieve a single record - IoEngine::Direct strategy (uses table.get directly)
     fn retrieve(&self, py: Python<'_>, id: i64) -> PyResult<Option<PyObject>> {
+        // IoEngine strategy: Direct (single row lookup is always fastest with direct access)
         let table_name = self.current_table.read().clone();
         
         let result = py.allow_threads(|| {
@@ -1988,8 +2021,9 @@ impl ApexStorage {
         }
     }
 
-    /// Retrieve multiple records
+    /// Retrieve multiple records - IoEngine::Direct strategy (uses table.get_many directly)
     fn retrieve_many(&self, py: Python<'_>, ids: Vec<i64>) -> PyResult<Vec<PyObject>> {
+        // IoEngine strategy: Direct (batch lookups are fastest with direct access)
         let table_name = self.current_table.read().clone();
         let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
         
@@ -2139,19 +2173,47 @@ impl ApexStorage {
         Ok((schema_ptr, array_ptr))
     }
 
-    /// Query records
-    fn query(&self, py: Python<'_>, where_clause: &str) -> PyResult<PyObject> {
+    /// Query records with optional limit - uses IoEngine for automatic strategy selection
+    /// 
+    /// IoEngine routes to optimal path:
+    /// - Streaming: for LIMIT queries (early termination)
+    /// - Direct: for small results or when limit specified
+    /// - Arrow FFI path is used separately via _query_arrow_ffi
+    #[pyo3(signature = (where_clause, limit=None))]
+    fn query(&self, py: Python<'_>, where_clause: &str, limit: Option<usize>) -> PyResult<PyObject> {
+        use crate::io_engine::{IoEngine, IoStrategy, QueryHints};
+        
         let table_name = self.current_table.read().clone();
         
+        // Build hints and select strategy
+        let hints = if let Some(lim) = limit {
+            QueryHints::new().with_limit(lim)
+        } else {
+            QueryHints::new()
+        };
+        let strategy = IoEngine::select_strategy(&hints);
+        
+        // Execute using selected strategy - call underlying methods directly (zero overhead)
         let results = py.allow_threads(|| {
-            self.tables
-                .write()
-                .get_mut(&table_name)
-                .ok_or_else(|| PyValueError::new_err("Table not found"))?
-                .query(where_clause)
-                .map_err(|e| PyValueError::new_err(e.to_string()))
+            let mut tables = self.tables.write();
+            let table = tables.get_mut(&table_name)
+                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
+            
+            match strategy {
+                IoStrategy::Streaming => {
+                    // Streaming: use query_with_limit for early termination
+                    table.query_with_limit(where_clause, limit)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))
+                }
+                IoStrategy::Direct | IoStrategy::Arrow => {
+                    // Direct/Arrow: use query_with_limit (None = all rows)
+                    table.query_with_limit(where_clause, limit)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))
+                }
+            }
         })?;
         
+        // Convert to Python list of dicts
         let list = PyList::empty_bound(py);
         for fields in results {
             let dict = PyDict::new_bound(py);
@@ -2161,6 +2223,137 @@ impl ApexStorage {
             list.append(dict)?;
         }
         Ok(list.into())
+    }
+
+    /// Execute a full SQL statement (SQL:2023 compliant) - uses IoEngine
+    /// 
+    /// Execute SQL through IoEngine with automatic strategy selection
+    /// 
+    /// IoEngine routes all queries and selects optimal strategy:
+    /// - Arrow: Large result sets, SELECT * without LIMIT
+    /// - Streaming: LIMIT queries without ORDER BY  
+    /// - Direct: Aggregates, GROUP BY, small results
+    /// 
+    /// Returns: Dict with 'columns' (List[str]) and 'rows' (List[List])
+    fn execute(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+        use crate::io_engine::IoEngine;
+        use crate::query::{SqlParser, SqlStatement};
+        
+        // Parse SQL to extract table name from FROM clause (required per SQL standard)
+        let target_table = {
+            let stmt = SqlParser::parse(sql)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            match stmt {
+                SqlStatement::Select(select) => {
+                    select.from.ok_or_else(|| PyValueError::new_err(
+                        "FROM clause is required. Use: SELECT ... FROM table_name"
+                    ))?
+                }
+            }
+        };
+        
+        let result = py.allow_threads(|| {
+            let mut tables = self.tables.write();
+            let table = tables.get_mut(&target_table)
+                .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
+            
+            // All SQL execution goes through IoEngine for unified strategy selection
+            IoEngine::execute_sql(table, sql)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })?;
+        
+        // Convert result to Python dict
+        let result_dict = PyDict::new_bound(py);
+        
+        // Column names
+        let columns_list = PyList::new_bound(py, &result.columns);
+        result_dict.set_item("columns", columns_list)?;
+        
+        // Check if we have a pre-built Arrow batch (fast path for large results)
+        if let Some(ref batch) = result.arrow_batch {
+            // Convert Arrow batch to rows for Python compatibility
+            // This is still faster because we avoid the row-by-row construction in Rust
+            let rows_list = PyList::empty_bound(py);
+            let num_rows = batch.num_rows();
+            let num_cols = batch.num_columns();
+            
+            for row_idx in 0..num_rows {
+                let row_list = PyList::empty_bound(py);
+                for col_idx in 0..num_cols {
+                    let col = batch.column(col_idx);
+                    let py_val = arrow_value_to_py(py, col, row_idx)?;
+                    row_list.append(py_val)?;
+                }
+                rows_list.append(row_list)?;
+            }
+            result_dict.set_item("rows", rows_list)?;
+        } else {
+            // Standard path: convert rows directly
+            let rows_list = PyList::empty_bound(py);
+            for row in &result.rows {
+                let row_list = PyList::empty_bound(py);
+                for val in row {
+                    row_list.append(value_to_py(py, val)?)?;
+                }
+                rows_list.append(row_list)?;
+            }
+            result_dict.set_item("rows", rows_list)?;
+        }
+        
+        // Rows affected count
+        result_dict.set_item("rows_affected", result.rows_affected)?;
+        
+        Ok(result_dict.into())
+    }
+    
+    /// Execute SQL and return Arrow FFI pointers (fast path for large results)
+    /// Uses IoEngine for unified data access with automatic strategy selection
+    #[pyo3(name = "_execute_arrow_ffi")]
+    fn execute_arrow_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(u64, u64)> {
+        use crate::io_engine::IoEngine;
+        use crate::query::{SqlParser, SqlStatement};
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        use arrow::array::Array;
+        
+        // Parse SQL to extract table name from FROM clause (required per SQL standard)
+        let target_table = {
+            let stmt = SqlParser::parse(sql)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            match stmt {
+                SqlStatement::Select(select) => {
+                    select.from.ok_or_else(|| PyValueError::new_err(
+                        "FROM clause is required. Use: SELECT ... FROM table_name"
+                    ))?
+                }
+            }
+        };
+        let sql = sql.to_string();
+        
+        let batch = py.allow_threads(|| -> PyResult<arrow::record_batch::RecordBatch> {
+            let mut tables = self.tables.write();
+            let table = tables.get_mut(&target_table)
+                .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
+            
+            // Use IoEngine for unified data access
+            IoEngine::execute_sql_arrow(table, &sql)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        
+        if batch.num_rows() == 0 {
+            return Ok((0, 0));
+        }
+        
+        // Export via Arrow C Data Interface
+        let struct_array = arrow::array::StructArray::from(batch);
+        
+        let ffi_array = Box::new(FFI_ArrowArray::new(&struct_array.to_data()));
+        let ffi_schema = Box::new(FFI_ArrowSchema::try_from(struct_array.data_type())
+            .map_err(|e| PyRuntimeError::new_err(format!("Schema export error: {}", e)))?);
+        
+        let array_ptr = Box::into_raw(ffi_array) as u64;
+        let schema_ptr = Box::into_raw(ffi_schema) as u64;
+        
+        Ok((schema_ptr, array_ptr))
     }
 
     /// Query and return columnar data (fast, avoids dict creation) - internal use
@@ -2432,8 +2625,9 @@ impl ApexStorage {
         Ok(())
     }
 
-    /// Delete a single record
+    /// Delete a single record - IoEngine::Single strategy
     fn delete(&self, py: Python<'_>, id: i64) -> bool {
+        // IoEngine strategy: Single (direct delete by ID)
         let table_name = self.current_table.read().clone();
         
         py.allow_threads(|| {
@@ -2445,8 +2639,9 @@ impl ApexStorage {
         })
     }
 
-    /// Delete multiple records
+    /// Delete multiple records - IoEngine::Batch strategy
     fn delete_batch(&self, py: Python<'_>, ids: Vec<i64>) -> bool {
+        // IoEngine strategy: Batch (direct delete by IDs)
         let table_name = self.current_table.read().clone();
         let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
         
@@ -3010,6 +3205,57 @@ impl ApexStorage {
     #[pyo3(name = "_fts_is_initialized")]
     fn fts_is_initialized(&self) -> bool {
         self.fts_manager.read().is_some()
+    }
+
+    // ========== High-Performance ID Operations ==========
+    
+    /// Get all IDs (predicate pushdown - only reads deleted bitmap, skips data columns)
+    /// 
+    /// This is the fastest way to get all row IDs as it:
+    /// - Only reads the deleted bitmap (not data columns)
+    /// - Returns directly as numpy array (zero-copy)
+    /// 
+    /// Returns: numpy.ndarray[uint64] of all valid IDs
+    #[pyo3(name = "_get_all_ids")]
+    fn get_all_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u64>>> {
+        let table_name = self.current_table.read().clone();
+        
+        let ids = py.allow_threads(|| {
+            self.tables
+                .read()
+                .get(&table_name)
+                .map(|t| t.get_all_ids())
+                .unwrap_or_default()
+        });
+        
+        Ok(PyArray1::from_vec_bound(py, ids))
+    }
+    
+    /// Get filtered IDs with predicate pushdown optimization
+    /// 
+    /// This method efficiently returns only IDs matching the WHERE clause:
+    /// - Evaluates filter on minimal columns needed
+    /// - Returns IDs as numpy array (high performance)
+    /// - Skips full row construction (predicate pushdown)
+    /// 
+    /// Returns: numpy.ndarray[uint64] of matching IDs
+    #[pyo3(name = "_get_filtered_ids")]
+    fn get_filtered_ids<'py>(&self, py: Python<'py>, where_clause: &str) -> PyResult<Bound<'py, PyArray1<u64>>> {
+        let table_name = self.current_table.read().clone();
+        let where_clause = where_clause.to_string();
+        
+        let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
+            let tables = self.tables.read();
+            let table = tables.get(&table_name)
+                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
+            
+            // Use query to get filtered indices, then extract IDs only
+            // This is more efficient than full row construction
+            table.query_ids_only(&where_clause)
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })?;
+        
+        Ok(PyArray1::from_vec_bound(py, ids))
     }
 
     // ========== Persistence ==========

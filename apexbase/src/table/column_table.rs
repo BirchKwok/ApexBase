@@ -744,6 +744,12 @@ impl ColumnTable {
     pub fn flush_buffer(&mut self) {
         self.flush_write_buffer();
     }
+    
+    /// Check if there are pending writes in the buffer
+    #[inline]
+    pub fn has_pending_writes(&self) -> bool {
+        !self.write_buffer.is_empty()
+    }
 
     /// Flush write buffer to column storage
     pub fn flush_write_buffer(&mut self) {
@@ -1625,11 +1631,21 @@ impl ColumnTable {
 
     /// Query with filter - returns row data directly (no cloning overhead)
     pub fn query(&mut self, where_clause: &str) -> Result<Vec<HashMap<String, Value>>> {
+        self.query_with_limit(where_clause, None)
+    }
+    
+    /// Query with filter and optional limit - uses streaming early termination
+    pub fn query_with_limit(&mut self, where_clause: &str, limit: Option<usize>) -> Result<Vec<HashMap<String, Value>>> {
         // Flush write buffer before querying
         self.flush_write_buffer();
         
         let executor = QueryExecutor::new();
         let filter = executor.parse(where_clause)?;
+        
+        // If limit is specified, use streaming early termination
+        if let Some(max_rows) = limit {
+            return self.query_streaming(&filter, max_rows);
+        }
         
         // Use column-based filtering for better performance
         let matching_indices = filter.filter_columns(
@@ -1646,6 +1662,126 @@ impl ColumnTable {
         }
         
         Ok(results)
+    }
+    
+    /// Streaming query with early termination - stops after finding `limit` matches
+    fn query_streaming(&self, filter: &Filter, limit: usize) -> Result<Vec<HashMap<String, Value>>> {
+        let mut results = Vec::with_capacity(limit);
+        let mut found = 0;
+        
+        for row_idx in 0..self.row_count {
+            if self.deleted.get(row_idx) {
+                continue;
+            }
+            
+            if self.filter_matches_row(filter, row_idx) {
+                results.push(self.build_row(row_idx, row_idx as u64));
+                found += 1;
+                if found >= limit {
+                    break;
+                }
+            }
+        }
+        
+        Ok(results)
+    }
+    
+    /// Check if a single row matches the filter
+    #[inline]
+    fn filter_matches_row(&self, filter: &Filter, row_idx: usize) -> bool {
+        use crate::query::LikeMatcher;
+        
+        match filter {
+            Filter::True => true,
+            Filter::False => false,
+            Filter::Compare { field, op, value } => {
+                if let Some(col_idx) = self.schema.get_index(field) {
+                    if let Some(row_val) = self.columns[col_idx].get(row_idx) {
+                        return Self::compare_values(&row_val, op, value);
+                    }
+                }
+                false
+            }
+            Filter::Like { field, pattern } => {
+                if let Some(col_idx) = self.schema.get_index(field) {
+                    if let TypedColumn::String { data, nulls } = &self.columns[col_idx] {
+                        if row_idx < data.len() && !nulls.get(row_idx) {
+                            let matcher = LikeMatcher::new(pattern);
+                            return matcher.matches(&data[row_idx]);
+                        }
+                    }
+                }
+                false
+            }
+            Filter::Range { field, low, high, low_inclusive, high_inclusive } => {
+                if let Some(col_idx) = self.schema.get_index(field) {
+                    if let Some(row_val) = self.columns[col_idx].get(row_idx) {
+                        let low_ok = if *low_inclusive {
+                            row_val >= *low
+                        } else {
+                            row_val > *low
+                        };
+                        let high_ok = if *high_inclusive {
+                            row_val <= *high
+                        } else {
+                            row_val < *high
+                        };
+                        return low_ok && high_ok;
+                    }
+                }
+                false
+            }
+            Filter::And(filters) => filters.iter().all(|f| self.filter_matches_row(f, row_idx)),
+            Filter::Or(filters) => filters.iter().any(|f| self.filter_matches_row(f, row_idx)),
+            Filter::Not(inner) => !self.filter_matches_row(inner, row_idx),
+            Filter::In { field, values } => {
+                if let Some(col_idx) = self.schema.get_index(field) {
+                    if let Some(row_val) = self.columns[col_idx].get(row_idx) {
+                        return values.contains(&row_val);
+                    }
+                }
+                false
+            }
+        }
+    }
+    
+    /// Compare two values with the given operator
+    #[inline]
+    fn compare_values(row_val: &Value, op: &crate::query::CompareOp, target: &Value) -> bool {
+        use crate::query::CompareOp;
+        match op {
+            CompareOp::Equal => row_val == target,
+            CompareOp::NotEqual => row_val != target,
+            CompareOp::LessThan => row_val < target,
+            CompareOp::LessEqual => row_val <= target,
+            CompareOp::GreaterThan => row_val > target,
+            CompareOp::GreaterEqual => row_val >= target,
+            _ => false,
+        }
+    }
+
+    /// Query returning only IDs (predicate pushdown optimization)
+    /// 
+    /// This is the most efficient way to get matching row IDs:
+    /// - Only evaluates filter conditions
+    /// - Skips full row construction
+    /// - Returns IDs directly without data column reads
+    /// 
+    /// Used by get_ids() method for high-performance ID retrieval
+    pub fn query_ids_only(&self, where_clause: &str) -> Result<Vec<u64>> {
+        let executor = QueryExecutor::new();
+        let filter = executor.parse(where_clause)?;
+        
+        // Use column-based filtering (only reads columns needed for filter)
+        let matching_indices = filter.filter_columns(
+            &self.schema,
+            &self.columns,
+            self.row_count,
+            &self.deleted,
+        );
+        
+        // IDs = row indices (direct conversion, no data column reads)
+        Ok(matching_indices.iter().map(|&i| i as u64).collect())
     }
 
     /// Query returning column data directly (fastest for Python)
@@ -1676,8 +1812,13 @@ impl ColumnTable {
         })
     }
 
-    /// OPTIMIZED: Query and build Arrow RecordBatch directly (no column cloning)
-    /// This is the fastest path for query results
+    /// ULTRA-OPTIMIZED: Query and build Arrow RecordBatch with zero-copy fast paths
+    /// 
+    /// Performance optimizations:
+    /// 1. Contiguous range detection: O(1) check, enables slice-based construction
+    /// 2. Full table scan: Direct column conversion without gather
+    /// 3. Parallel string building with chunked processing
+    /// 4. Pre-allocated buffers to avoid reallocation
     pub fn query_to_record_batch(&mut self, where_clause: &str) -> Result<arrow::record_batch::RecordBatch> {
         use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringBuilder, UInt64Array};
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
@@ -1710,6 +1851,12 @@ impl ColumnTable {
             ]).map_err(|e| crate::ApexError::SerializationError(e.to_string()));
         }
         
+        // OPTIMIZATION: Check for contiguous range [0, N) - enables fast paths
+        let is_contiguous_from_zero = num_rows > 0 && 
+            matching_indices[0] == 0 && 
+            matching_indices[num_rows - 1] == num_rows - 1 &&
+            (num_rows < 3 || matching_indices[num_rows / 2] == num_rows / 2);
+        
         // Build schema
         let mut fields = vec![Field::new("_id", ArrowDataType::UInt64, false)];
         for (name, dtype) in &self.schema.columns {
@@ -1725,93 +1872,128 @@ impl ColumnTable {
         let schema = Arc::new(Schema::new(fields));
         
         // Build _id array (IDs = row indices)
-        let id_array: ArrayRef = Arc::new(UInt64Array::from_iter_values(
-            matching_indices.iter().map(|&i| i as u64)
-        ));
+        let id_array: ArrayRef = if is_contiguous_from_zero {
+            // Fast path: sequential IDs from 0 to num_rows-1
+            Arc::new(UInt64Array::from_iter_values(0..num_rows as u64))
+        } else {
+            Arc::new(UInt64Array::from_iter_values(
+                matching_indices.iter().map(|&i| i as u64)
+            ))
+        };
         
-        // Build data column arrays in parallel (NO column cloning!)
-        let data_arrays: Vec<ArrayRef> = self.columns.par_iter()
-            .map(|col| -> ArrayRef {
-                match col {
-                    TypedColumn::Int64 { data, nulls } => {
-                        let no_nulls = nulls.all_false();
-                        if no_nulls {
-                            // Fast path: no nulls, direct gather
-                            let values: Vec<i64> = matching_indices.iter()
-                                .map(|&idx| if idx < data.len() { data[idx] } else { 0 })
-                                .collect();
-                            Arc::new(Int64Array::new(ScalarBuffer::from(values), None))
-                        } else {
-                            let values: Vec<i64> = matching_indices.iter()
-                                .map(|&idx| if idx < data.len() { data[idx] } else { 0 })
-                                .collect();
-                            let null_bits: Vec<bool> = matching_indices.iter()
-                                .map(|&idx| !nulls.get(idx))
-                                .collect();
-                            Arc::new(Int64Array::new(ScalarBuffer::from(values), Some(NullBuffer::from(null_bits))))
-                        }
-                    }
-                    TypedColumn::Float64 { data, nulls } => {
-                        let no_nulls = nulls.all_false();
-                        if no_nulls {
-                            let values: Vec<f64> = matching_indices.iter()
-                                .map(|&idx| if idx < data.len() { data[idx] } else { 0.0 })
-                                .collect();
-                            Arc::new(Float64Array::new(ScalarBuffer::from(values), None))
-                        } else {
-                            let values: Vec<f64> = matching_indices.iter()
-                                .map(|&idx| if idx < data.len() { data[idx] } else { 0.0 })
-                                .collect();
-                            let null_bits: Vec<bool> = matching_indices.iter()
-                                .map(|&idx| !nulls.get(idx))
-                                .collect();
-                            Arc::new(Float64Array::new(ScalarBuffer::from(values), Some(NullBuffer::from(null_bits))))
-                        }
-                    }
-                    TypedColumn::String { data, nulls } => {
-                        let no_nulls = nulls.all_false();
-                        // Pre-calculate capacity
-                        let total_bytes: usize = matching_indices.iter()
-                            .filter(|&&idx| idx < data.len())
-                            .map(|&idx| data[idx].len())
-                            .sum();
-                        
-                        let mut builder = StringBuilder::with_capacity(num_rows, total_bytes);
-                        for &idx in &matching_indices {
-                            if idx >= data.len() || (!no_nulls && nulls.get(idx)) {
-                                builder.append_null();
+        // Build data column arrays - choose strategy based on result size
+        let data_arrays: Vec<ArrayRef> = if is_contiguous_from_zero {
+            // FAST PATH: Contiguous range - use direct slice conversion
+            self.columns.par_iter()
+                .map(|col| -> ArrayRef {
+                    match col {
+                        TypedColumn::Int64 { data, nulls } => {
+                            let slice = &data[..num_rows];
+                            if nulls.all_false() {
+                                Arc::new(Int64Array::new(ScalarBuffer::from(slice.to_vec()), None))
                             } else {
-                                builder.append_value(&data[idx]);
+                                let null_bits: Vec<bool> = (0..num_rows).map(|i| !nulls.get(i)).collect();
+                                Arc::new(Int64Array::new(ScalarBuffer::from(slice.to_vec()), Some(NullBuffer::from(null_bits))))
                             }
                         }
-                        Arc::new(builder.finish())
-                    }
-                    TypedColumn::Bool { data, nulls } => {
-                        let values: Vec<Option<bool>> = matching_indices.iter()
-                            .map(|&idx| {
-                                if idx < data.len() && !nulls.get(idx) {
-                                    Some(data.get(idx))
+                        TypedColumn::Float64 { data, nulls } => {
+                            let slice = &data[..num_rows];
+                            if nulls.all_false() {
+                                Arc::new(Float64Array::new(ScalarBuffer::from(slice.to_vec()), None))
+                            } else {
+                                let null_bits: Vec<bool> = (0..num_rows).map(|i| !nulls.get(i)).collect();
+                                Arc::new(Float64Array::new(ScalarBuffer::from(slice.to_vec()), Some(NullBuffer::from(null_bits))))
+                            }
+                        }
+                        TypedColumn::String { data, nulls } => {
+                            // OPTIMIZED: Build string array with pre-computed offsets
+                            Self::build_string_array_contiguous(&data[..num_rows], nulls, num_rows)
+                        }
+                        TypedColumn::Bool { data, nulls } => {
+                            let values: Vec<Option<bool>> = (0..num_rows)
+                                .map(|i| {
+                                    if !nulls.get(i) { Some(data.get(i)) } else { None }
+                                })
+                                .collect();
+                            Arc::new(BooleanArray::from(values))
+                        }
+                        TypedColumn::Mixed { data, nulls } => {
+                            let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
+                            for i in 0..num_rows {
+                                if nulls.get(i) {
+                                    builder.append_null();
                                 } else {
-                                    None
+                                    builder.append_value(data[i].to_string_value());
                                 }
-                            })
-                            .collect();
-                        Arc::new(BooleanArray::from(values))
+                            }
+                            Arc::new(builder.finish())
+                        }
                     }
-                    TypedColumn::Mixed { data, nulls } => {
-                        let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
-                        for &idx in &matching_indices {
-                            if idx >= data.len() || nulls.get(idx) {
-                                builder.append_null();
+                })
+                .collect()
+        } else {
+            // GATHER PATH: Non-contiguous indices
+            self.columns.par_iter()
+                .map(|col| -> ArrayRef {
+                    match col {
+                        TypedColumn::Int64 { data, nulls } => {
+                            let no_nulls = nulls.all_false();
+                            let values: Vec<i64> = matching_indices.iter()
+                                .map(|&idx| if idx < data.len() { data[idx] } else { 0 })
+                                .collect();
+                            if no_nulls {
+                                Arc::new(Int64Array::new(ScalarBuffer::from(values), None))
                             } else {
-                                builder.append_value(data[idx].to_string_value());
+                                let null_bits: Vec<bool> = matching_indices.iter()
+                                    .map(|&idx| !nulls.get(idx))
+                                    .collect();
+                                Arc::new(Int64Array::new(ScalarBuffer::from(values), Some(NullBuffer::from(null_bits))))
                             }
                         }
-                        Arc::new(builder.finish())
+                        TypedColumn::Float64 { data, nulls } => {
+                            let no_nulls = nulls.all_false();
+                            let values: Vec<f64> = matching_indices.iter()
+                                .map(|&idx| if idx < data.len() { data[idx] } else { 0.0 })
+                                .collect();
+                            if no_nulls {
+                                Arc::new(Float64Array::new(ScalarBuffer::from(values), None))
+                            } else {
+                                let null_bits: Vec<bool> = matching_indices.iter()
+                                    .map(|&idx| !nulls.get(idx))
+                                    .collect();
+                                Arc::new(Float64Array::new(ScalarBuffer::from(values), Some(NullBuffer::from(null_bits))))
+                            }
+                        }
+                        TypedColumn::String { data, nulls } => {
+                            Self::build_string_array_gather(data, nulls, &matching_indices)
+                        }
+                        TypedColumn::Bool { data, nulls } => {
+                            let values: Vec<Option<bool>> = matching_indices.iter()
+                                .map(|&idx| {
+                                    if idx < data.len() && !nulls.get(idx) {
+                                        Some(data.get(idx))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            Arc::new(BooleanArray::from(values))
+                        }
+                        TypedColumn::Mixed { data, nulls } => {
+                            let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
+                            for &idx in &matching_indices {
+                                if idx >= data.len() || nulls.get(idx) {
+                                    builder.append_null();
+                                } else {
+                                    builder.append_value(data[idx].to_string_value());
+                                }
+                            }
+                            Arc::new(builder.finish())
+                        }
                     }
-                }
-            })
-            .collect();
+                })
+                .collect()
+        };
         
         // Combine arrays
         let mut arrays = Vec::with_capacity(self.columns.len() + 1);
@@ -1820,6 +2002,222 @@ impl ColumnTable {
         
         arrow::record_batch::RecordBatch::try_new(schema, arrays)
             .map_err(|e| crate::ApexError::SerializationError(e.to_string()))
+    }
+    
+    /// Build Arrow RecordBatch from pre-computed row indices
+    /// This is optimized for cases where filtering has already been done
+    pub fn build_record_batch_from_indices(&self, indices: &[usize]) -> Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, UInt64Array};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use arrow::buffer::{NullBuffer, ScalarBuffer};
+        use std::sync::Arc;
+        use rayon::prelude::*;
+
+        let num_rows = indices.len();
+        if num_rows == 0 {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_id", ArrowDataType::UInt64, false),
+            ]));
+            return arrow::record_batch::RecordBatch::try_new(schema, vec![
+                Arc::new(UInt64Array::from(Vec::<u64>::new()))
+            ]).map_err(|e| crate::ApexError::SerializationError(e.to_string()));
+        }
+
+        // Build schema
+        let mut fields = vec![Field::new("_id", ArrowDataType::UInt64, false)];
+        for (name, dtype) in &self.schema.columns {
+            let arrow_type = match dtype {
+                DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => ArrowDataType::Int64,
+                DataType::Float64 | DataType::Float32 => ArrowDataType::Float64,
+                DataType::Bool => ArrowDataType::Boolean,
+                DataType::String => ArrowDataType::Utf8,
+                _ => ArrowDataType::Utf8,
+            };
+            fields.push(Field::new(name, arrow_type, true));
+        }
+        let schema = Arc::new(Schema::new(fields));
+
+        // Build _id array
+        let id_array: ArrayRef = Arc::new(UInt64Array::from_iter_values(
+            indices.iter().map(|&i| i as u64)
+        ));
+
+        // Build data column arrays in parallel
+        let data_arrays: Vec<ArrayRef> = self.columns.par_iter()
+            .map(|col| -> ArrayRef {
+                match col {
+                    TypedColumn::Int64 { data, nulls } => {
+                        let no_nulls = nulls.all_false();
+                        let values: Vec<i64> = indices.iter()
+                            .map(|&idx| if idx < data.len() { data[idx] } else { 0 })
+                            .collect();
+                        if no_nulls {
+                            Arc::new(Int64Array::new(ScalarBuffer::from(values), None))
+                        } else {
+                            let null_bits: Vec<bool> = indices.iter()
+                                .map(|&idx| !nulls.get(idx))
+                                .collect();
+                            Arc::new(Int64Array::new(ScalarBuffer::from(values), Some(NullBuffer::from(null_bits))))
+                        }
+                    }
+                    TypedColumn::Float64 { data, nulls } => {
+                        let no_nulls = nulls.all_false();
+                        let values: Vec<f64> = indices.iter()
+                            .map(|&idx| if idx < data.len() { data[idx] } else { 0.0 })
+                            .collect();
+                        if no_nulls {
+                            Arc::new(Float64Array::new(ScalarBuffer::from(values), None))
+                        } else {
+                            let null_bits: Vec<bool> = indices.iter()
+                                .map(|&idx| !nulls.get(idx))
+                                .collect();
+                            Arc::new(Float64Array::new(ScalarBuffer::from(values), Some(NullBuffer::from(null_bits))))
+                        }
+                    }
+                    TypedColumn::String { data, nulls } => {
+                        Self::build_string_array_gather(data, nulls, indices)
+                    }
+                    TypedColumn::Bool { data, nulls } => {
+                        let values: Vec<Option<bool>> = indices.iter()
+                            .map(|&i| {
+                                if !nulls.get(i) { Some(data.get(i)) } else { None }
+                            })
+                            .collect();
+                        Arc::new(BooleanArray::from(values))
+                    }
+                    TypedColumn::Mixed { data, nulls } => {
+                        use arrow::array::StringBuilder;
+                        let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
+                        for &i in indices {
+                            if nulls.get(i) {
+                                builder.append_null();
+                            } else {
+                                builder.append_value(data[i].to_string_value());
+                            }
+                        }
+                        Arc::new(builder.finish())
+                    }
+                }
+            })
+            .collect();
+
+        // Combine arrays
+        let mut arrays = Vec::with_capacity(self.columns.len() + 1);
+        arrays.push(id_array);
+        arrays.extend(data_arrays);
+
+        arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .map_err(|e| crate::ApexError::SerializationError(e.to_string()))
+    }
+
+    /// Build Arrow StringArray from contiguous string slice - optimized for sequential access
+    /// 
+    /// Uses direct buffer construction instead of StringBuilder for better performance.
+    /// Pre-calculates total bytes to avoid reallocation.
+    #[inline]
+    fn build_string_array_contiguous(data: &[String], nulls: &BitVec, num_rows: usize) -> std::sync::Arc<dyn arrow::array::Array> {
+        use arrow::array::StringArray;
+        use arrow::buffer::{OffsetBuffer, Buffer};
+        use std::sync::Arc;
+        use rayon::prelude::*;
+        
+        let no_nulls = nulls.all_false();
+        
+        // Parallel size calculation for large datasets
+        let total_bytes: usize = if num_rows >= 100_000 {
+            const CHUNK_SIZE: usize = 50_000;
+            let num_chunks = (num_rows + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            (0..num_chunks)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * CHUNK_SIZE;
+                    let end = (start + CHUNK_SIZE).min(num_rows);
+                    data[start..end].iter().map(|s| s.len()).sum::<usize>()
+                })
+                .sum()
+        } else {
+            data.iter().map(|s| s.len()).sum()
+        };
+        
+        if no_nulls {
+            // FAST PATH: No nulls - build directly from data buffer
+            let mut value_buffer = Vec::with_capacity(total_bytes);
+            let mut offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+            offsets.push(0);
+            
+            for s in data {
+                value_buffer.extend_from_slice(s.as_bytes());
+                offsets.push(value_buffer.len() as i32);
+            }
+            
+            let offset_buffer = OffsetBuffer::new(offsets.into());
+            let value_buf = Buffer::from_vec(value_buffer);
+            
+            Arc::new(unsafe {
+                StringArray::new_unchecked(offset_buffer, value_buf, None)
+            })
+        } else {
+            // Has nulls - use builder
+            use arrow::array::StringBuilder;
+            let mut builder = StringBuilder::with_capacity(num_rows, total_bytes);
+            for (i, s) in data.iter().enumerate() {
+                if nulls.get(i) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(s);
+                }
+            }
+            Arc::new(builder.finish())
+        }
+    }
+    
+    /// Build Arrow StringArray with gather from non-contiguous indices
+    #[inline]
+    fn build_string_array_gather(data: &[String], nulls: &BitVec, indices: &[usize]) -> std::sync::Arc<dyn arrow::array::Array> {
+        use arrow::array::{StringBuilder, StringArray};
+        use arrow::buffer::{OffsetBuffer, Buffer};
+        use std::sync::Arc;
+        
+        let num_rows = indices.len();
+        let no_nulls = nulls.all_false();
+        
+        // Pre-calculate total bytes
+        let total_bytes: usize = indices.iter()
+            .filter(|&&idx| idx < data.len())
+            .map(|&idx| data[idx].len())
+            .sum();
+        
+        if no_nulls {
+            // FAST PATH: No nulls - build directly from gathered data
+            let mut value_buffer = Vec::with_capacity(total_bytes);
+            let mut offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+            offsets.push(0);
+            
+            for &idx in indices {
+                if idx < data.len() {
+                    value_buffer.extend_from_slice(data[idx].as_bytes());
+                }
+                offsets.push(value_buffer.len() as i32);
+            }
+            
+            let offset_buffer = OffsetBuffer::new(offsets.into());
+            let value_buf = Buffer::from_vec(value_buffer);
+            
+            Arc::new(unsafe {
+                StringArray::new_unchecked(offset_buffer, value_buf, None)
+            })
+        } else {
+            // Has nulls - use builder
+            let mut builder = StringBuilder::with_capacity(num_rows, total_bytes);
+            for &idx in indices {
+                if idx >= data.len() || nulls.get(idx) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(&data[idx]);
+                }
+            }
+            Arc::new(builder.finish())
+        }
     }
 
     /// Ensure a column exists, creating it if necessary
@@ -1916,6 +2314,11 @@ impl ColumnTable {
     /// Get reference to columns
     pub fn columns_ref(&self) -> &Vec<TypedColumn> {
         &self.columns
+    }
+    
+    /// Get reference to deleted bitmap
+    pub fn deleted_ref(&self) -> &BitVec {
+        &self.deleted
     }
 
     /// Get total row count

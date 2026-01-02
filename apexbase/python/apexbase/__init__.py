@@ -94,6 +94,240 @@ _registry = _InstanceRegistry()
 atexit.register(_registry.close_all)
 
 
+class SqlResultArrow:
+    """SQL 执行结果 - Arrow-backed 高性能实现"""
+    
+    def __init__(self, batch):
+        """从 Arrow RecordBatch 初始化"""
+        self._batch = batch
+        # 隐藏 _id 列
+        self.columns = [c for c in batch.schema.names if c != '_id']
+        self.rows_affected = batch.num_rows
+        self._rows = None  # 懒加载
+    
+    @property
+    def rows(self):
+        """懒加载 rows（仅在需要时转换，隐藏 _id）"""
+        if self._rows is None:
+            self._rows = [
+                [v for k, v in row.items() if k != '_id']
+                for row in self._batch.to_pylist()
+            ]
+        return self._rows
+    
+    def __len__(self) -> int:
+        return self._batch.num_rows
+    
+    def __iter__(self):
+        for row in self._batch.to_pylist():
+            yield {k: v for k, v in row.items() if k != '_id'}
+    
+    def to_dicts(self) -> list:
+        """转换为字典列表（隐藏 _id）"""
+        return [{k: v for k, v in row.items() if k != '_id'} for row in self._batch.to_pylist()]
+    
+    def to_pandas(self):
+        """直接从 Arrow 转换为 pandas（零拷贝，隐藏 _id）"""
+        df = self._batch.to_pandas()
+        if '_id' in df.columns:
+            df = df.drop(columns=['_id'])
+        return df
+    
+    def to_polars(self):
+        """直接从 Arrow 转换为 polars（隐藏 _id）"""
+        try:
+            import polars as pl
+            df = pl.from_arrow(self._batch)
+            if '_id' in df.columns:
+                df = df.drop('_id')
+            return df
+        except ImportError:
+            raise ImportError("polars is required for to_polars()")
+    
+    def get_ids(self, return_list: bool = False):
+        """
+        获取结果的 ID 列表（高性能零拷贝实现）
+        
+        Parameters:
+            return_list: bool, default False
+                如果为 True，返回 Python list
+                如果为 False，返回 numpy.ndarray（默认，零拷贝，最快）
+        
+        Returns:
+            numpy.ndarray 或 list: ID 数组
+        """
+        if '_id' in self._batch.schema.names:
+            # 零拷贝路径：直接从 Arrow 转 numpy，不经过 Python 对象
+            id_array = self._batch.column('_id').to_numpy()
+            if return_list:
+                return id_array.tolist()
+            return id_array
+        else:
+            # 回退：生成序列 ID
+            ids = np.arange(self._batch.num_rows, dtype=np.uint64)
+            if return_list:
+                return ids.tolist()
+            return ids
+    
+    def scalar(self):
+        if self._batch.num_rows > 0 and self._batch.num_columns > 0:
+            col = self._batch.column(0)
+            # 跳过 _id 列
+            if self._batch.schema.names[0] == '_id' and self._batch.num_columns > 1:
+                col = self._batch.column(1)
+            return col[0].as_py()
+        return None
+    
+    def first(self) -> Optional[dict]:
+        if self._batch.num_rows > 0:
+            row = self._batch.to_pylist()[0]
+            return {k: v for k, v in row.items() if k != '_id'}
+        return None
+    
+    def __repr__(self) -> str:
+        return f"SqlResultArrow(columns={self.columns}, rows={self._batch.num_rows})"
+
+
+class SqlResult:
+    """SQL 执行结果 - SQL:2023 标准兼容"""
+    
+    def __init__(self, columns: list, rows: list, rows_affected: int = 0, arrow_batch=None):
+        """
+        初始化 SQL 结果
+        
+        Parameters:
+            columns: 列名列表
+            rows: 数据行列表，每行是一个值列表
+            rows_affected: 受影响的行数
+            arrow_batch: 可选的 Arrow RecordBatch (用于大结果集的快速路径)
+        """
+        # 隐藏 _id 列
+        self._all_columns = columns
+        self.columns = [c for c in columns if c != '_id']
+        self._id_col_idx = columns.index('_id') if '_id' in columns else None
+        self.rows = rows
+        self.rows_affected = rows_affected
+        self._arrow_batch = arrow_batch  # 快速路径: Arrow 数据
+    
+    def __len__(self) -> int:
+        """返回结果行数"""
+        if self._arrow_batch is not None:
+            return self._arrow_batch.num_rows
+        return len(self.rows)
+    
+    def __iter__(self):
+        """迭代结果行，每行作为字典返回（隐藏 _id）"""
+        if self._arrow_batch is not None:
+            # Arrow 快速路径
+            for row in self._arrow_batch.to_pylist():
+                yield {k: v for k, v in row.items() if k != '_id'}
+        else:
+            for row in self.rows:
+                yield {k: v for k, v in zip(self._all_columns, row) if k != '_id'}
+    
+    def to_dicts(self) -> list:
+        """转换为字典列表（隐藏 _id）"""
+        if self._arrow_batch is not None:
+            return [{k: v for k, v in row.items() if k != '_id'} for row in self._arrow_batch.to_pylist()]
+        return [{k: v for k, v in zip(self._all_columns, row) if k != '_id'} for row in self.rows]
+    
+    def to_pandas(self):
+        """转换为 pandas DataFrame (Arrow 零拷贝快速路径，隐藏 _id)"""
+        try:
+            import pandas as pd
+            if self._arrow_batch is not None:
+                # 零拷贝快速路径: 使用 ArrowDtype (pandas 2.0+)
+                try:
+                    df = self._arrow_batch.to_pandas(types_mapper=pd.ArrowDtype)
+                except (TypeError, AttributeError):
+                    # 回退: pandas < 2.0
+                    df = self._arrow_batch.to_pandas()
+            else:
+                df = pd.DataFrame(self.rows, columns=self._all_columns)
+            # 隐藏 _id
+            if '_id' in df.columns:
+                df = df.drop(columns=['_id'])
+            return df
+        except ImportError:
+            raise ImportError("pandas is required for to_pandas()")
+    
+    def to_polars(self):
+        """转换为 polars DataFrame（隐藏 _id）"""
+        try:
+            import polars as pl
+            if self._arrow_batch is not None:
+                # 快速路径: 直接从 Arrow 转换
+                df = pl.from_arrow(self._arrow_batch)
+            else:
+                df = pl.DataFrame(dict(zip(self._all_columns, zip(*self.rows)))) if self.rows else pl.DataFrame()
+            # 隐藏 _id
+            if '_id' in df.columns:
+                df = df.drop('_id')
+            return df
+        except ImportError:
+            raise ImportError("polars is required for to_polars()")
+    
+    def get_ids(self, return_list: bool = False):
+        """
+        获取结果的 ID 列表（高性能零拷贝实现）
+        
+        Parameters:
+            return_list: bool, default False
+                如果为 True，返回 Python list
+                如果为 False，返回 numpy.ndarray（默认，零拷贝，最快）
+        
+        Returns:
+            numpy.ndarray 或 list: ID 数组
+        """
+        if self._arrow_batch is not None and '_id' in self._arrow_batch.schema.names:
+            # 零拷贝路径：直接从 Arrow 转 numpy，不经过 Python 对象
+            id_array = self._arrow_batch.column('_id').to_numpy()
+            if return_list:
+                return id_array.tolist()
+            return id_array
+        elif self._id_col_idx is not None:
+            # 从 rows 中提取（较慢路径）
+            ids = np.array([row[self._id_col_idx] for row in self.rows], dtype=np.uint64)
+            if return_list:
+                return ids.tolist()
+            return ids
+        else:
+            # 回退：生成序列 ID
+            ids = np.arange(len(self), dtype=np.uint64)
+            if return_list:
+                return ids.tolist()
+            return ids
+    
+    def scalar(self):
+        """获取单一标量值（用于聚合查询如 COUNT(*)）"""
+        if self._arrow_batch is not None and self._arrow_batch.num_rows > 0:
+            # 跳过 _id 列
+            col_idx = 0
+            if self._arrow_batch.schema.names[0] == '_id' and self._arrow_batch.num_columns > 1:
+                col_idx = 1
+            return self._arrow_batch.column(col_idx)[0].as_py()
+        if self.rows and self.rows[0]:
+            # 跳过 _id 列
+            idx = 0
+            if self._id_col_idx == 0 and len(self.rows[0]) > 1:
+                idx = 1
+            return self.rows[0][idx]
+        return None
+    
+    def first(self) -> Optional[dict]:
+        """获取第一行作为字典（隐藏 _id）"""
+        if self._arrow_batch is not None and self._arrow_batch.num_rows > 0:
+            return {col: self._arrow_batch.column(i)[0].as_py() 
+                    for i, col in enumerate(self._arrow_batch.schema.names) if col != '_id'}
+        if self.rows:
+            return {k: v for k, v in zip(self._all_columns, self.rows[0]) if k != '_id'}
+        return None
+    
+    def __repr__(self) -> str:
+        row_count = len(self)
+        return f"SqlResult(columns={self.columns}, rows={row_count}, rows_affected={self.rows_affected})"
+
+
 class ResultView:
     """查询结果视图 - Arrow-first 高性能实现"""
     
@@ -124,13 +358,14 @@ class ResultView:
         return cls(data=data)
     
     def _ensure_data(self):
-        """确保 _data 可用（懒加载从 Arrow 转换）"""
+        """确保 _data 可用（懒加载从 Arrow 转换，隐藏 _id）"""
         if self._data is None and self._arrow_table is not None:
-            self._data = self._arrow_table.to_pylist()
+            self._data = [{k: v for k, v in row.items() if k != '_id'} 
+                          for row in self._arrow_table.to_pylist()]
         return self._data if self._data is not None else []
     
     def to_dict(self) -> List[dict]:
-        """返回字典列表"""
+        """返回字典列表（隐藏 _id）"""
         return self._ensure_data()
     
     def to_pandas(self, zero_copy: bool = True):
@@ -177,20 +412,26 @@ class ResultView:
         return df
     
     def to_polars(self):
-        """返回 Polars DataFrame（直接从 Arrow，最快）"""
+        """返回 Polars DataFrame（直接从 Arrow，最快，隐藏 _id）"""
         if not POLARS_AVAILABLE:
             raise ImportError("polars not available. Install with: pip install polars")
         
         if self._arrow_table is not None:
-            return pl.from_arrow(self._arrow_table)
+            df = pl.from_arrow(self._arrow_table)
+            if '_id' in df.columns:
+                df = df.drop('_id')
+            return df
         return pl.DataFrame(self._ensure_data())
     
     def to_arrow(self):
-        """返回 PyArrow Table（零拷贝，最快）"""
+        """返回 PyArrow Table（零拷贝，最快，隐藏 _id）"""
         if not ARROW_AVAILABLE:
             raise ImportError("pyarrow not available. Install with: pip install pyarrow")
         
         if self._arrow_table is not None:
+            # 移除 _id 列
+            if '_id' in self._arrow_table.column_names:
+                return self._arrow_table.drop(['_id'])
             return self._arrow_table
         return pa.Table.from_pylist(self._ensure_data())
     
@@ -218,9 +459,33 @@ class ResultView:
     
     @property
     def ids(self):
+        """[已弃用] 请使用 get_ids() 方法"""
+        return self.get_ids(return_list=True)
+    
+    def get_ids(self, return_list: bool = False):
+        """
+        获取结果的 ID 列表（高性能零拷贝实现）
+        
+        Parameters:
+            return_list: bool, default False
+                如果为 True，返回 Python list
+                如果为 False，返回 numpy.ndarray（默认，零拷贝，最快）
+        
+        Returns:
+            numpy.ndarray 或 list: ID 数组
+        """
         if self._arrow_table is not None and '_id' in self._arrow_table.column_names:
-            return self._arrow_table.column('_id').to_pylist()
-        return [r.get('_id') for r in self._ensure_data() if '_id' in r]
+            # 零拷贝路径：直接从 Arrow 转 numpy，不经过 Python 对象
+            id_array = self._arrow_table.column('_id').to_numpy()
+            if return_list:
+                return id_array.tolist()
+            return id_array
+        else:
+            # 回退：生成序列 ID
+            ids = np.arange(self._num_rows, dtype=np.uint64)
+            if return_list:
+                return ids.tolist()
+            return ids
     
     def __len__(self):
         return self._num_rows
@@ -794,12 +1059,13 @@ class ApexClient:
         
         self._store_columnar_fast(columns)
 
-    def query(self, where: str = None) -> ResultView:
+    def query(self, where: str = None, limit: int = None) -> ResultView:
         """
         使用 SQL 语法查询记录
         
         Parameters:
             where: SQL WHERE 子句，如 "age > 25 AND city = 'NYC'"
+            limit: 可选，限制返回的最大行数（启用流式早停优化）
         
         Returns:
             ResultView: 查询结果视图，支持 to_dict(), to_pandas(), to_polars(), to_arrow()
@@ -807,6 +1073,11 @@ class ApexClient:
         self._check_connection()
         
         where_clause = where if where and where.strip() != "1=1" else "1=1"
+        
+        # 如果指定了 limit，使用流式早停优化（最快路径）
+        if limit is not None:
+            results = self._storage.query(where_clause, limit)
+            return ResultView.from_dicts(results)
         
         if not ARROW_AVAILABLE:
             results = self._storage.query(where_clause)
@@ -844,6 +1115,64 @@ class ApexClient:
         # 最终回退到传统方式
         results = self._storage.query(where_clause)
         return ResultView.from_dicts(results)
+
+    def execute(self, sql: str) -> 'SqlResult':
+        """
+        执行完整的 SQL 语句 (SQL:2023 标准)
+        
+        支持的 SQL 语法:
+        - SELECT columns FROM table WHERE conditions
+        - ORDER BY column [ASC|DESC] [NULLS FIRST|LAST]
+        - LIMIT n OFFSET m
+        - DISTINCT
+        - 聚合函数: COUNT, SUM, AVG, MIN, MAX
+        - GROUP BY / HAVING
+        - 运算符: LIKE, IN, BETWEEN, IS NULL, AND, OR, NOT
+        - 比较运算符: =, !=, <>, <, <=, >, >=
+        
+        示例:
+            # 基本查询
+            result = client.execute("SELECT * FROM data WHERE age > 18")
+            
+            # 带排序和限制
+            result = client.execute("SELECT name, age FROM data ORDER BY age DESC LIMIT 10")
+            
+            # 聚合查询
+            result = client.execute("SELECT COUNT(*), AVG(age) FROM data WHERE status = 'active'")
+            
+            # LIKE 模式匹配
+            result = client.execute("SELECT * FROM data WHERE name LIKE 'John%'")
+            
+            # GROUP BY 分组
+            result = client.execute("SELECT city, COUNT(*) FROM data GROUP BY city")
+        
+        Parameters:
+            sql: 完整的 SQL SELECT 语句
+        
+        Returns:
+            SqlResult: 包含 columns (列名列表) 和 rows (数据行列表) 的结果对象
+        """
+        self._check_connection()
+        
+        # 尝试使用 Arrow FFI 快速路径 (用于大结果集)
+        if ARROW_AVAILABLE:
+            try:
+                import pyarrow as pa
+                schema_ptr, array_ptr = self._storage._execute_arrow_ffi(sql)
+                
+                if schema_ptr != 0 and array_ptr != 0:
+                    # 使用 Arrow C Data Interface 零拷贝导入
+                    struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
+                    if isinstance(struct_array, pa.StructArray):
+                        batch = pa.RecordBatch.from_struct_array(struct_array)
+                        columns = batch.schema.names
+                        return SqlResult(columns, [], batch.num_rows, arrow_batch=batch)
+            except Exception:
+                pass  # 回退到标准路径
+        
+        # 标准路径: SqlExecutor 处理
+        result = self._storage.execute(sql)
+        return SqlResult(result['columns'], result['rows'], result.get('rows_affected', 0))
 
     def retrieve(self, id_: int) -> Optional[dict]:
         """
