@@ -226,6 +226,7 @@ impl Filter {
     }
 
     /// Filter a single Compare condition directly on column data
+    /// OPTIMIZED: Uses parallel processing for large datasets
     #[inline]
     fn filter_compare_column(
         &self,
@@ -237,57 +238,137 @@ impl Filter {
         op: &CompareOp,
         value: &Value,
     ) -> Vec<usize> {
+        use rayon::prelude::*;
+        
         let col_idx = match schema.get_index(field) {
             Some(idx) => idx,
             None => return Vec::new(),
         };
 
         let column = &columns[col_idx];
-        let mut result = Vec::with_capacity(row_count / 4); // Estimate 25% match
+        let no_deletes = deleted.all_false();
+        
+        // Use parallel processing for large datasets (> 100K rows)
+        let use_parallel = row_count >= 100_000;
 
         match (column, value) {
             // Fast path: Int64 column with Int64 value
             (TypedColumn::Int64 { data, nulls }, Value::Int64(target)) => {
-                for (i, &val) in data.iter().enumerate() {
-                    if i < row_count && !deleted.get(i) && !nulls.get(i) {
+                let no_nulls = nulls.all_false();
+                let target = *target;
+                let data_len = data.len().min(row_count);
+                
+                if use_parallel {
+                    // Parallel filtering using rayon
+                    (0..data_len).into_par_iter()
+                        .filter(|&i| {
+                            let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                            if skip { return false; }
+                            let val = data[i];
+                            match op {
+                                CompareOp::Equal => val == target,
+                                CompareOp::NotEqual => val != target,
+                                CompareOp::LessThan => val < target,
+                                CompareOp::LessEqual => val <= target,
+                                CompareOp::GreaterThan => val > target,
+                                CompareOp::GreaterEqual => val >= target,
+                                _ => false,
+                            }
+                        })
+                        .collect()
+                } else {
+                    // Sequential for smaller datasets
+                    let mut result = Vec::with_capacity(row_count / 4);
+                    for i in 0..data_len {
+                        let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                        if skip { continue; }
+                        let val = data[i];
                         let matches = match op {
-                            CompareOp::Equal => val == *target,
-                            CompareOp::NotEqual => val != *target,
-                            CompareOp::LessThan => val < *target,
-                            CompareOp::LessEqual => val <= *target,
-                            CompareOp::GreaterThan => val > *target,
-                            CompareOp::GreaterEqual => val >= *target,
+                            CompareOp::Equal => val == target,
+                            CompareOp::NotEqual => val != target,
+                            CompareOp::LessThan => val < target,
+                            CompareOp::LessEqual => val <= target,
+                            CompareOp::GreaterThan => val > target,
+                            CompareOp::GreaterEqual => val >= target,
                             _ => false,
                         };
-                        if matches {
-                            result.push(i);
-                        }
+                        if matches { result.push(i); }
                     }
+                    result
                 }
             }
             // Fast path: Float64 column with Float64 value
             (TypedColumn::Float64 { data, nulls }, Value::Float64(target)) => {
-                for (i, &val) in data.iter().enumerate() {
-                    if i < row_count && !deleted.get(i) && !nulls.get(i) {
+                let no_nulls = nulls.all_false();
+                let target = *target;
+                let data_len = data.len().min(row_count);
+                
+                if use_parallel {
+                    (0..data_len).into_par_iter()
+                        .filter(|&i| {
+                            let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                            if skip { return false; }
+                            let val = data[i];
+                            match op {
+                                CompareOp::Equal => (val - target).abs() < f64::EPSILON,
+                                CompareOp::NotEqual => (val - target).abs() >= f64::EPSILON,
+                                CompareOp::LessThan => val < target,
+                                CompareOp::LessEqual => val <= target,
+                                CompareOp::GreaterThan => val > target,
+                                CompareOp::GreaterEqual => val >= target,
+                                _ => false,
+                            }
+                        })
+                        .collect()
+                } else {
+                    let mut result = Vec::with_capacity(row_count / 4);
+                    for i in 0..data_len {
+                        let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                        if skip { continue; }
+                        let val = data[i];
                         let matches = match op {
                             CompareOp::Equal => (val - target).abs() < f64::EPSILON,
                             CompareOp::NotEqual => (val - target).abs() >= f64::EPSILON,
-                            CompareOp::LessThan => val < *target,
-                            CompareOp::LessEqual => val <= *target,
-                            CompareOp::GreaterThan => val > *target,
-                            CompareOp::GreaterEqual => val >= *target,
+                            CompareOp::LessThan => val < target,
+                            CompareOp::LessEqual => val <= target,
+                            CompareOp::GreaterThan => val > target,
+                            CompareOp::GreaterEqual => val >= target,
                             _ => false,
                         };
-                        if matches {
-                            result.push(i);
-                        }
+                        if matches { result.push(i); }
                     }
+                    result
                 }
             }
             // Fast path: String column with String value
             (TypedColumn::String { data, nulls }, Value::String(target)) => {
-                for (i, val) in data.iter().enumerate() {
-                    if i < row_count && !deleted.get(i) && !nulls.get(i) {
+                let no_nulls = nulls.all_false();
+                let data_len = data.len().min(row_count);
+                
+                if use_parallel {
+                    (0..data_len).into_par_iter()
+                        .filter(|&i| {
+                            let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                            if skip { return false; }
+                            let val = &data[i];
+                            match op {
+                                CompareOp::Equal => val == target,
+                                CompareOp::NotEqual => val != target,
+                                CompareOp::LessThan => val < target,
+                                CompareOp::LessEqual => val <= target,
+                                CompareOp::GreaterThan => val > target,
+                                CompareOp::GreaterEqual => val >= target,
+                                CompareOp::Like => Self::like_match(val, target),
+                                _ => false,
+                            }
+                        })
+                        .collect()
+                } else {
+                    let mut result = Vec::with_capacity(row_count / 4);
+                    for i in 0..data_len {
+                        let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                        if skip { continue; }
+                        let val = &data[i];
                         let matches = match op {
                             CompareOp::Equal => val == target,
                             CompareOp::NotEqual => val != target,
@@ -298,14 +379,14 @@ impl Filter {
                             CompareOp::Like => Self::like_match(val, target),
                             _ => false,
                         };
-                        if matches {
-                            result.push(i);
-                        }
+                        if matches { result.push(i); }
                     }
+                    result
                 }
             }
             // Fallback: use generic Value comparison
             _ => {
+                let mut result = Vec::with_capacity(row_count / 4);
                 for i in 0..row_count {
                     if !deleted.get(i) {
                         if let Some(row_value) = column.get(i) {
@@ -315,10 +396,9 @@ impl Filter {
                         }
                     }
                 }
+                result
             }
         }
-
-        result
     }
 
     /// Filter LIKE condition on column data

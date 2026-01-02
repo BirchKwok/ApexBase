@@ -88,6 +88,18 @@ impl BitVec {
         self.data.iter().map(|w| w.count_ones() as usize).sum()
     }
 
+    /// Check if all bits are false (no nulls) - O(words) not O(bits)
+    #[inline]
+    pub fn all_false(&self) -> bool {
+        self.data.iter().all(|&w| w == 0)
+    }
+
+    /// Get raw u64 data for direct Arrow buffer conversion
+    #[inline]
+    pub fn raw_data(&self) -> &[u64] {
+        &self.data
+    }
+
     /// Extend with n false values - fast batch operation
     #[inline]
     pub fn extend_false(&mut self, count: usize) {
@@ -1514,6 +1526,60 @@ impl ColumnTable {
         )
     }
 
+    /// Get multiple rows by IDs and return as Arrow RecordBatch - ZERO-COPY FFI PATH
+    /// This method returns a RecordBatch directly for Arrow C Data Interface export
+    /// Used by _retrieve_many_arrow_ffi for maximum performance
+    pub fn get_many_record_batch(&mut self, ids: &[u64]) -> std::result::Result<arrow::array::RecordBatch, String> {
+        use arrow::array::RecordBatch;
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use std::sync::Arc;
+
+        if ids.is_empty() {
+            // Return empty batch
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_id", ArrowDataType::UInt64, false),
+            ]));
+            return RecordBatch::try_new(schema, vec![
+                Arc::new(arrow::array::UInt64Array::from(Vec::<u64>::new()))
+            ]).map_err(|e| e.to_string());
+        }
+
+        // Flush pending writes to ensure data consistency
+        self.flush_write_buffer();
+
+        // Filter valid row indices (not deleted, within bounds)
+        let row_indices: Vec<usize> = ids.iter()
+            .map(|&id| id as usize)
+            .filter(|&idx| idx < self.row_count && !self.deleted.get(idx))
+            .collect();
+
+        if row_indices.is_empty() {
+            // Return empty batch
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_id", ArrowDataType::UInt64, false),
+            ]));
+            return RecordBatch::try_new(schema, vec![
+                Arc::new(arrow::array::UInt64Array::from(Vec::<u64>::new()))
+            ]).map_err(|e| e.to_string());
+        }
+
+        // Get column names
+        let column_names: Vec<String> = self.schema.columns.iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        // Generate ID array (row index = ID)
+        let id_array: Vec<u64> = (0..self.row_count as u64).collect();
+
+        // Call the optimized RecordBatch builder
+        crate::data::build_record_batch_direct(
+            &id_array,
+            &self.columns,
+            &column_names,
+            &row_indices,
+        )
+    }
+
     /// Delete a row - O(1) soft delete
     /// ID = row index (0-based)
     pub fn delete(&mut self, id: u64) -> bool {
@@ -1608,6 +1674,152 @@ impl ColumnTable {
             schema: self.schema.clone(),
             row_indices: matching_indices,
         })
+    }
+
+    /// OPTIMIZED: Query and build Arrow RecordBatch directly (no column cloning)
+    /// This is the fastest path for query results
+    pub fn query_to_record_batch(&mut self, where_clause: &str) -> Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringBuilder, UInt64Array};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use arrow::buffer::{NullBuffer, ScalarBuffer};
+        use std::sync::Arc;
+        use rayon::prelude::*;
+
+        // Flush write buffer before querying
+        self.flush_write_buffer();
+        
+        let executor = QueryExecutor::new();
+        let filter = executor.parse(where_clause)?;
+        
+        // Get matching row indices (parallel filtering)
+        let matching_indices = filter.filter_columns(
+            &self.schema,
+            &self.columns,
+            self.row_count,
+            &self.deleted,
+        );
+        
+        let num_rows = matching_indices.len();
+        if num_rows == 0 {
+            // Return empty batch
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_id", ArrowDataType::UInt64, false),
+            ]));
+            return arrow::record_batch::RecordBatch::try_new(schema, vec![
+                Arc::new(UInt64Array::from(Vec::<u64>::new()))
+            ]).map_err(|e| crate::ApexError::SerializationError(e.to_string()));
+        }
+        
+        // Build schema
+        let mut fields = vec![Field::new("_id", ArrowDataType::UInt64, false)];
+        for (name, dtype) in &self.schema.columns {
+            let arrow_type = match dtype {
+                DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => ArrowDataType::Int64,
+                DataType::Float64 | DataType::Float32 => ArrowDataType::Float64,
+                DataType::Bool => ArrowDataType::Boolean,
+                DataType::String => ArrowDataType::Utf8,
+                _ => ArrowDataType::Utf8,
+            };
+            fields.push(Field::new(name, arrow_type, true));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        
+        // Build _id array (IDs = row indices)
+        let id_array: ArrayRef = Arc::new(UInt64Array::from_iter_values(
+            matching_indices.iter().map(|&i| i as u64)
+        ));
+        
+        // Build data column arrays in parallel (NO column cloning!)
+        let data_arrays: Vec<ArrayRef> = self.columns.par_iter()
+            .map(|col| -> ArrayRef {
+                match col {
+                    TypedColumn::Int64 { data, nulls } => {
+                        let no_nulls = nulls.all_false();
+                        if no_nulls {
+                            // Fast path: no nulls, direct gather
+                            let values: Vec<i64> = matching_indices.iter()
+                                .map(|&idx| if idx < data.len() { data[idx] } else { 0 })
+                                .collect();
+                            Arc::new(Int64Array::new(ScalarBuffer::from(values), None))
+                        } else {
+                            let values: Vec<i64> = matching_indices.iter()
+                                .map(|&idx| if idx < data.len() { data[idx] } else { 0 })
+                                .collect();
+                            let null_bits: Vec<bool> = matching_indices.iter()
+                                .map(|&idx| !nulls.get(idx))
+                                .collect();
+                            Arc::new(Int64Array::new(ScalarBuffer::from(values), Some(NullBuffer::from(null_bits))))
+                        }
+                    }
+                    TypedColumn::Float64 { data, nulls } => {
+                        let no_nulls = nulls.all_false();
+                        if no_nulls {
+                            let values: Vec<f64> = matching_indices.iter()
+                                .map(|&idx| if idx < data.len() { data[idx] } else { 0.0 })
+                                .collect();
+                            Arc::new(Float64Array::new(ScalarBuffer::from(values), None))
+                        } else {
+                            let values: Vec<f64> = matching_indices.iter()
+                                .map(|&idx| if idx < data.len() { data[idx] } else { 0.0 })
+                                .collect();
+                            let null_bits: Vec<bool> = matching_indices.iter()
+                                .map(|&idx| !nulls.get(idx))
+                                .collect();
+                            Arc::new(Float64Array::new(ScalarBuffer::from(values), Some(NullBuffer::from(null_bits))))
+                        }
+                    }
+                    TypedColumn::String { data, nulls } => {
+                        let no_nulls = nulls.all_false();
+                        // Pre-calculate capacity
+                        let total_bytes: usize = matching_indices.iter()
+                            .filter(|&&idx| idx < data.len())
+                            .map(|&idx| data[idx].len())
+                            .sum();
+                        
+                        let mut builder = StringBuilder::with_capacity(num_rows, total_bytes);
+                        for &idx in &matching_indices {
+                            if idx >= data.len() || (!no_nulls && nulls.get(idx)) {
+                                builder.append_null();
+                            } else {
+                                builder.append_value(&data[idx]);
+                            }
+                        }
+                        Arc::new(builder.finish())
+                    }
+                    TypedColumn::Bool { data, nulls } => {
+                        let values: Vec<Option<bool>> = matching_indices.iter()
+                            .map(|&idx| {
+                                if idx < data.len() && !nulls.get(idx) {
+                                    Some(data.get(idx))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        Arc::new(BooleanArray::from(values))
+                    }
+                    TypedColumn::Mixed { data, nulls } => {
+                        let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
+                        for &idx in &matching_indices {
+                            if idx >= data.len() || nulls.get(idx) {
+                                builder.append_null();
+                            } else {
+                                builder.append_value(data[idx].to_string_value());
+                            }
+                        }
+                        Arc::new(builder.finish())
+                    }
+                }
+            })
+            .collect();
+        
+        // Combine arrays
+        let mut arrays = Vec::with_capacity(self.columns.len() + 1);
+        arrays.push(id_array);
+        arrays.extend(data_arrays);
+        
+        arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .map_err(|e| crate::ApexError::SerializationError(e.to_string()))
     }
 
     /// Ensure a column exists, creating it if necessary

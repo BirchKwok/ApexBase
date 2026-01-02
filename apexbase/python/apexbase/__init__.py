@@ -808,49 +808,158 @@ class ApexClient:
         
         where_clause = where if where and where.strip() != "1=1" else "1=1"
         
-        # Arrow-first: 直接使用 query_arrow（最快路径）
-        if ARROW_AVAILABLE:
-            try:
-                arrow_bytes = self._storage._query_arrow(where_clause)
-                return ResultView.from_arrow_bytes(arrow_bytes)
-            except Exception:
-                pass  # 回退到传统方式
+        if not ARROW_AVAILABLE:
+            results = self._storage.query(where_clause)
+            return ResultView.from_dicts(results)
         
-        # 回退：使用传统 dict 方式
+        # 优先使用 FFI 零拷贝方式 (最快)
+        try:
+            import pyarrow as pa
+            
+            schema_ptr, array_ptr = self._storage._query_arrow_ffi(where_clause)
+            
+            if schema_ptr == 0 and array_ptr == 0:
+                return ResultView.from_arrow_bytes(b'')
+            
+            try:
+                struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
+                
+                if isinstance(struct_array, pa.StructArray):
+                    batch = pa.RecordBatch.from_struct_array(struct_array)
+                    table = pa.Table.from_batches([batch])
+                    return ResultView(table)
+            finally:
+                self._storage._free_arrow_ffi(schema_ptr, array_ptr)
+                
+        except Exception:
+            pass  # FFI 失败，回退到 IPC 方式
+        
+        # 回退到 Arrow IPC 方式
+        try:
+            arrow_bytes = self._storage._query_arrow(where_clause)
+            return ResultView.from_arrow_bytes(arrow_bytes)
+        except Exception:
+            pass
+        
+        # 最终回退到传统方式
         results = self._storage.query(where_clause)
         return ResultView.from_dicts(results)
 
     def retrieve(self, id_: int) -> Optional[dict]:
-        """获取单个记录"""
+        """
+        获取单个记录 - 使用 Arrow C Data Interface 零拷贝传输
+        
+        性能优化 (按优先级):
+        1. FFI 零拷贝 - 最快，无序列化开销
+        2. Arrow IPC - 次快，有序列化开销
+        3. 传统回退 - 最慢
+        
+        Parameters:
+            id_: 记录 ID
+        
+        Returns:
+            Optional[dict]: 记录字典，如果不存在则返回 None
+        """
         self._check_connection()
+        
+        if not ARROW_AVAILABLE:
+            return self._storage.retrieve(id_)
+        
+        # 优先使用 FFI 零拷贝方式 (最快)
+        try:
+            import pyarrow as pa
+            
+            schema_ptr, array_ptr = self._storage._retrieve_many_arrow_ffi([id_])
+            
+            if schema_ptr == 0 and array_ptr == 0:
+                return None
+            
+            try:
+                struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
+                
+                if isinstance(struct_array, pa.StructArray):
+                    batch = pa.RecordBatch.from_struct_array(struct_array)
+                    table = pa.Table.from_batches([batch])
+                    results = table.to_pylist()
+                    return results[0] if results else None
+            finally:
+                self._storage._free_arrow_ffi(schema_ptr, array_ptr)
+                
+        except Exception:
+            pass  # FFI 失败，回退到 IPC 方式
+        
+        # 回退到 Arrow IPC 方式
+        try:
+            arrow_bytes = self._storage._retrieve_many_arrow([id_])
+            if arrow_bytes:
+                reader = pa.ipc.open_stream(arrow_bytes)
+                table = reader.read_all()
+                results = table.to_pylist()
+                return results[0] if results else None
+        except Exception:
+            pass
+        
+        # 最终回退到传统方式
         return self._storage.retrieve(id_)
 
-    def retrieve_many(self, ids: List[int]) -> List[dict]:
+    def retrieve_many(self, ids: List[int]) -> 'ResultView':
         """
-        获取多个记录
+        获取多个记录 - 使用 Arrow C Data Interface 零拷贝传输
+        
+        性能优化 (按优先级):
+        1. FFI 零拷贝 - 最快，无序列化开销
+        2. Arrow IPC - 次快，有序列化开销
+        3. 传统回退 - 最慢
         
         Parameters:
             ids: 要检索的记录 ID 列表
         
         Returns:
-            List[dict]: 记录列表
+            ResultView: 记录视图，支持多种输出格式：
+                - .to_arrow() -> pyarrow.Table （零拷贝，最快）
+                - .to_pandas() -> pandas.DataFrame
+                - .to_polars() -> polars.DataFrame
+                - .to_dict() -> List[dict]
         """
         self._check_connection()
         if not ids:
-            return []
+            return ResultView.from_dicts([])
         
-        # 优先使用 Arrow 传输（如果可用且数据量较大）
-        if ARROW_AVAILABLE and len(ids) > 50:
+        if not ARROW_AVAILABLE:
+            return ResultView.from_dicts(self._storage.retrieve_many(ids))
+        
+        # 优先使用 FFI 零拷贝方式 (最快)
+        try:
+            import pyarrow as pa
+            
+            schema_ptr, array_ptr = self._storage._retrieve_many_arrow_ffi(ids)
+            
+            if schema_ptr == 0 and array_ptr == 0:
+                return ResultView.from_dicts([])
+            
             try:
-                arrow_bytes = self._storage._retrieve_many_arrow(ids)
-                if arrow_bytes:
-                    reader = pa.ipc.open_stream(arrow_bytes)
-                    table = reader.read_all()
-                    return table.to_pylist()
-            except Exception:
-                pass  # 回退到传统方式
+                struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
+                
+                if isinstance(struct_array, pa.StructArray):
+                    batch = pa.RecordBatch.from_struct_array(struct_array)
+                    table = pa.Table.from_batches([batch])
+                    return ResultView(table)
+            finally:
+                self._storage._free_arrow_ffi(schema_ptr, array_ptr)
+                
+        except Exception:
+            pass  # FFI 失败，回退到 IPC 方式
         
-        return self._storage.retrieve_many(ids)
+        # 回退到 Arrow IPC 方式
+        try:
+            arrow_bytes = self._storage._retrieve_many_arrow(ids)
+            if arrow_bytes:
+                return ResultView.from_arrow_bytes(arrow_bytes)
+        except Exception:
+            pass
+        
+        # 最终回退到传统方式
+        return ResultView.from_dicts(self._storage.retrieve_many(ids))
 
     def retrieve_all(self) -> ResultView:
         """
@@ -1154,13 +1263,41 @@ class ApexClient:
             if need_switch:
                 self.use_table(table_name)
             
-            # 全部在 Rust 层完成：搜索 + 分页 + 检索 + Arrow 序列化
-            arrow_bytes = self._storage._fts_search_and_retrieve(query, limit, offset)
-            
-            if arrow_bytes and len(arrow_bytes) > 0 and ARROW_AVAILABLE:
-                return ResultView.from_arrow_bytes(arrow_bytes)
-            else:
+            if not ARROW_AVAILABLE:
                 return ResultView.from_dicts([])
+            
+            # 优先使用 FFI 零拷贝方式 (最快)
+            try:
+                import pyarrow as pa
+                
+                schema_ptr, array_ptr = self._storage._fts_search_and_retrieve_ffi(query, limit, offset)
+                
+                if schema_ptr == 0 and array_ptr == 0:
+                    return ResultView.from_dicts([])
+                
+                try:
+                    struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
+                    
+                    if isinstance(struct_array, pa.StructArray):
+                        batch = pa.RecordBatch.from_struct_array(struct_array)
+                        table = pa.Table.from_batches([batch])
+                        return ResultView(table)
+                finally:
+                    self._storage._free_arrow_ffi(schema_ptr, array_ptr)
+                    
+            except Exception:
+                pass  # FFI 失败，回退到 IPC 方式
+            
+            # 回退到 Arrow IPC 方式
+            try:
+                arrow_bytes = self._storage._fts_search_and_retrieve(query, limit, offset)
+                
+                if arrow_bytes and len(arrow_bytes) > 0:
+                    return ResultView.from_arrow_bytes(arrow_bytes)
+            except Exception:
+                pass
+            
+            return ResultView.from_dicts([])
                 
         finally:
             if need_switch and original_table is not None:

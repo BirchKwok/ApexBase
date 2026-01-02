@@ -2090,6 +2090,55 @@ impl ApexStorage {
         Ok(pyo3::types::PyBytes::new_bound(py, &bytes))
     }
 
+    /// ZERO-COPY retrieve multiple records via Arrow C Data Interface
+    /// 
+    /// This is the absolute fastest path for retrieve_many - NO serialization overhead:
+    /// - Exports Arrow arrays via FFI pointers
+    /// - Python receives raw memory pointers
+    /// - PyArrow imports directly without copy
+    /// 
+    /// Returns: (schema_ptr, array_ptr) tuple for PyArrow import
+    #[pyo3(name = "_retrieve_many_arrow_ffi")]
+    fn retrieve_many_arrow_ffi(&self, py: Python<'_>, ids: Vec<i64>) -> PyResult<(u64, u64)> {
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        use arrow::array::Array;
+        
+        let table_name = self.current_table.read().clone();
+        let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
+        
+        if ids_u64.is_empty() {
+            return Ok((0, 0));
+        }
+        
+        // Build the RecordBatch in Rust
+        let batch = py.allow_threads(|| -> PyResult<arrow::array::RecordBatch> {
+            let mut tables = self.tables.write();
+            let table = tables.get_mut(&table_name)
+                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
+            
+            // Flush pending writes
+            table.flush_write_buffer();
+            
+            // Use optimized direct path to build RecordBatch
+            table.get_many_record_batch(&ids_u64)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        
+        // Export via Arrow C Data Interface
+        let struct_array = arrow::array::StructArray::from(batch);
+        
+        // Allocate FFI structs on heap (they must outlive this function)
+        let ffi_array = Box::new(FFI_ArrowArray::new(&struct_array.to_data()));
+        let ffi_schema = Box::new(FFI_ArrowSchema::try_from(struct_array.data_type())
+            .map_err(|e| PyRuntimeError::new_err(format!("Schema export error: {}", e)))?);
+        
+        // Return raw pointers as u64 for Python to use
+        let array_ptr = Box::into_raw(ffi_array) as u64;
+        let schema_ptr = Box::into_raw(ffi_schema) as u64;
+        
+        Ok((schema_ptr, array_ptr))
+    }
+
     /// Query records
     fn query(&self, py: Python<'_>, where_clause: &str) -> PyResult<PyObject> {
         let table_name = self.current_table.read().clone();
@@ -2229,6 +2278,44 @@ impl ApexStorage {
         Ok(pyo3::types::PyBytes::new_bound(py, &bytes))
     }
 
+    /// OPTIMIZED: Query via Arrow FFI (zero-copy, no column cloning)
+    /// This is the fastest path for filtered queries
+    #[pyo3(name = "_query_arrow_ffi")]
+    fn query_arrow_ffi(&self, py: Python<'_>, where_clause: &str) -> PyResult<(u64, u64)> {
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        use arrow::array::Array;
+        use std::sync::Arc;
+        
+        let table_name = self.current_table.read().clone();
+        let where_clause = where_clause.to_string();
+        
+        // Build RecordBatch directly (no column cloning!)
+        let batch = py.allow_threads(|| -> PyResult<arrow::record_batch::RecordBatch> {
+            let mut tables = self.tables.write();
+            let table = tables.get_mut(&table_name)
+                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
+            
+            table.query_to_record_batch(&where_clause)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        
+        if batch.num_rows() == 0 {
+            return Ok((0, 0));
+        }
+        
+        // Export via Arrow C Data Interface
+        let struct_array = arrow::array::StructArray::from(batch);
+        
+        let ffi_array = Box::new(FFI_ArrowArray::new(&struct_array.to_data()));
+        let ffi_schema = Box::new(FFI_ArrowSchema::try_from(struct_array.data_type())
+            .map_err(|e| PyRuntimeError::new_err(format!("Schema export error: {}", e)))?);
+        
+        let array_ptr = Box::into_raw(ffi_array) as u64;
+        let schema_ptr = Box::into_raw(ffi_schema) as u64;
+        
+        Ok((schema_ptr, array_ptr))
+    }
+
     /// Retrieve all records as Arrow IPC - internal use
     #[pyo3(name = "_retrieve_all_arrow")]
     fn retrieve_all_arrow<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
@@ -2266,18 +2353,20 @@ impl ApexStorage {
     /// - Exports Arrow arrays via FFI pointers
     /// - Python receives raw memory pointers
     /// - PyArrow imports directly without copy
+    /// - OPTIMIZED: No row_indices allocation (saves 80MB for 10M rows)
     /// 
     /// Returns: (schema_ptr, array_ptr) tuple for PyArrow import
     #[pyo3(name = "_retrieve_all_arrow_ffi")]
     fn retrieve_all_arrow_ffi(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
         use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-        use arrow::array::{RecordBatch, Array};
+        use arrow::array::Array;
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
+        use arrow::record_batch::RecordBatch;
         
         let table_name = self.current_table.read().clone();
         
-        // Build the RecordBatch in Rust
+        // Build the RecordBatch in Rust - ULTRA OPTIMIZED path
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
             let mut tables = self.tables.write();
             let table = tables.get_mut(&table_name)
@@ -2297,21 +2386,18 @@ impl ApexStorage {
                 ]).map_err(|e| PyRuntimeError::new_err(e.to_string()));
             }
             
-            // Build arrays directly (reuse existing logic)
-            let row_count_usize = row_count as usize;
-            let row_indices: Vec<usize> = (0..row_count_usize).collect();
+            // Get column info
             let column_names: Vec<String> = table.schema_ref().columns.iter()
                 .map(|(name, _)| name.clone())
                 .collect();
-            let id_array: Vec<u64> = (0..row_count).collect();
-            
-            // Use the optimized conversion
             let columns = table.columns_ref();
-            crate::data::build_record_batch_direct(
-                &id_array,
+            let total_rows = row_count as usize;
+            
+            // Use the ULTRA-OPTIMIZED path - no row_indices allocation
+            crate::data::build_record_batch_all(
                 columns,
                 &column_names,
-                &row_indices,
+                total_rows,
             ).map_err(|e| PyRuntimeError::new_err(e))
         })?;
         
@@ -2661,6 +2747,87 @@ impl ApexStorage {
         })?;
         
         Ok(pyo3::types::PyBytes::new_bound(py, &bytes))
+    }
+    
+    /// ZERO-COPY FTS search and retrieve via Arrow C Data Interface
+    /// 
+    /// This is the fastest path for FTS search + retrieve:
+    /// - Search in Rust (no Python boundary)
+    /// - Retrieve in Rust (no Python boundary)
+    /// - Export via FFI (no serialization)
+    /// 
+    /// Returns: (schema_ptr, array_ptr) tuple for PyArrow import
+    #[pyo3(name = "_fts_search_and_retrieve_ffi")]
+    #[pyo3(signature = (query, limit = None, offset = 0))]
+    fn fts_search_and_retrieve_ffi(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> PyResult<(u64, u64)> {
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        use arrow::array::Array;
+        
+        let manager_guard = self.fts_manager.read();
+        let manager = manager_guard.as_ref()
+            .ok_or_else(|| PyValueError::new_err("FTS not initialized. Call _init_fts first."))?;
+        
+        let table_name = self.current_table.read().clone();
+        let query_owned = query.to_string();
+        
+        // Search, paginate, and retrieve - ALL IN RUST
+        let batch = py.allow_threads(|| -> PyResult<arrow::array::RecordBatch> {
+            let engine = manager.get_engine(&table_name)
+                .map_err(|e| PyRuntimeError::new_err(format!("FTS error: {}", e)))?;
+            
+            // Get document IDs with pagination
+            let ids: Vec<u64> = if let Some(lim) = limit {
+                engine.search_page(&query_owned, offset, lim)
+                    .map_err(|e| PyRuntimeError::new_err(format!("FTS search error: {}", e)))?
+            } else if offset > 0 {
+                let all_ids = engine.search_ids(&query_owned)
+                    .map_err(|e| PyRuntimeError::new_err(format!("FTS search error: {}", e)))?;
+                all_ids.into_iter().skip(offset).collect()
+            } else {
+                engine.search_ids(&query_owned)
+                    .map_err(|e| PyRuntimeError::new_err(format!("FTS search error: {}", e)))?
+            };
+            
+            if ids.is_empty() {
+                // Return empty batch
+                use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+                use std::sync::Arc;
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("_id", ArrowDataType::UInt64, false),
+                ]));
+                return arrow::array::RecordBatch::try_new(schema, vec![
+                    Arc::new(arrow::array::UInt64Array::from(Vec::<u64>::new()))
+                ]).map_err(|e| PyRuntimeError::new_err(e.to_string()));
+            }
+            
+            // Retrieve records as RecordBatch
+            let mut tables = self.tables.write();
+            let table = tables.get_mut(&table_name)
+                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
+            
+            table.get_many_record_batch(&ids)
+                .map_err(|e| PyRuntimeError::new_err(e))
+        })?;
+        
+        // Export via Arrow C Data Interface
+        let struct_array = arrow::array::StructArray::from(batch);
+        
+        // Allocate FFI structs on heap
+        let ffi_array = Box::new(FFI_ArrowArray::new(&struct_array.to_data()));
+        let ffi_schema = Box::new(FFI_ArrowSchema::try_from(struct_array.data_type())
+            .map_err(|e| PyRuntimeError::new_err(format!("Schema export error: {}", e)))?);
+        
+        // Return raw pointers as u64 for Python to use
+        let array_ptr = Box::into_raw(ffi_array) as u64;
+        let schema_ptr = Box::into_raw(ffi_schema) as u64;
+        
+        Ok((schema_ptr, array_ptr))
     }
     
     /// Fuzzy search with typo tolerance
