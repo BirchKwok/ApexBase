@@ -1,7 +1,7 @@
 """
-ApexBase - 基于 Rust 核心的高性能嵌入式数据库
+ApexBase - High-performance embedded database based on Rust core
 
-使用自定义单文件存储格式（.apex），提供高效的数据存储和查询功能。
+Uses custom single-file storage format (.apex) to provide efficient data storage and query functionality.
 """
 
 import shutil
@@ -11,14 +11,14 @@ from typing import List, Dict, Union, Optional, Literal
 from pathlib import Path
 import numpy as np
 
-# 导入 Rust 核心
+# Import Rust core
 from apexbase._core import ApexStorage as RustStorage, __version__ as _core_version
 
-# FTS 现在直接在 Rust 层实现，无需 Python nanofts 包
-# 但保留兼容性标志
-FTS_AVAILABLE = True  # 总是可用，因为已经集成到 Rust 核心
+# FTS is now directly implemented in Rust layer, no need for Python nanofts package
+# But keep compatibility flag
+FTS_AVAILABLE = True  # Always available since integrated into Rust core
 
-# 可选的数据框架支持
+# Optional data framework support
 try:
     import pyarrow as pa
     import pandas as pd
@@ -39,7 +39,7 @@ __version__ = "0.2.0"
 
 
 class _InstanceRegistry:
-    """全局实例注册表"""
+    """Global instance registry"""
     
     def __init__(self):
         self._instances = {}
@@ -95,19 +95,19 @@ atexit.register(_registry.close_all)
 
 
 class SqlResultArrow:
-    """SQL 执行结果 - Arrow-backed 高性能实现"""
+    """SQL execution result - Arrow-backed high-performance implementation"""
     
     def __init__(self, batch):
-        """从 Arrow RecordBatch 初始化"""
+        """Initialize from Arrow RecordBatch"""
         self._batch = batch
-        # 隐藏 _id 列
+        # Hide _id column
         self.columns = [c for c in batch.schema.names if c != '_id']
         self.rows_affected = batch.num_rows
-        self._rows = None  # 懒加载
+        self._rows = None  # Lazy loading
     
     @property
     def rows(self):
-        """懒加载 rows（仅在需要时转换，隐藏 _id）"""
+        """Lazy load rows (convert only when needed, hide _id)"""
         if self._rows is None:
             self._rows = [
                 [v for k, v in row.items() if k != '_id']
@@ -123,18 +123,18 @@ class SqlResultArrow:
             yield {k: v for k, v in row.items() if k != '_id'}
     
     def to_dicts(self) -> list:
-        """转换为字典列表（隐藏 _id）"""
+        """Convert to dictionary list (hide _id)"""
         return [{k: v for k, v in row.items() if k != '_id'} for row in self._batch.to_pylist()]
     
     def to_pandas(self):
-        """直接从 Arrow 转换为 pandas（零拷贝，隐藏 _id）"""
+        """Convert directly from Arrow to pandas (zero-copy, hide _id)"""
         df = self._batch.to_pandas()
         if '_id' in df.columns:
             df = df.drop(columns=['_id'])
         return df
     
     def to_polars(self):
-        """直接从 Arrow 转换为 polars（隐藏 _id）"""
+        """Convert directly from Arrow to polars (hide _id)"""
         try:
             import polars as pl
             df = pl.from_arrow(self._batch)
@@ -146,24 +146,24 @@ class SqlResultArrow:
     
     def get_ids(self, return_list: bool = False):
         """
-        获取结果的 ID 列表（高性能零拷贝实现）
+        Get ID list of results (high-performance zero-copy implementation)
         
         Parameters:
             return_list: bool, default False
-                如果为 True，返回 Python list
-                如果为 False，返回 numpy.ndarray（默认，零拷贝，最快）
+                If True, return Python list
+                If False, return numpy.ndarray (default, zero-copy, fastest)
         
         Returns:
-            numpy.ndarray 或 list: ID 数组
+            numpy.ndarray or list: ID array
         """
         if '_id' in self._batch.schema.names:
-            # 零拷贝路径：直接从 Arrow 转 numpy，不经过 Python 对象
+            # Zero-copy path: directly convert from Arrow to numpy, bypassing Python objects
             id_array = self._batch.column('_id').to_numpy()
             if return_list:
                 return id_array.tolist()
             return id_array
         else:
-            # 回退：生成序列 ID
+            # Fallback: generate sequential IDs
             ids = np.arange(self._batch.num_rows, dtype=np.uint64)
             if return_list:
                 return ids.tolist()
@@ -172,7 +172,7 @@ class SqlResultArrow:
     def scalar(self):
         if self._batch.num_rows > 0 and self._batch.num_columns > 0:
             col = self._batch.column(0)
-            # 跳过 _id 列
+            # Skip _id column
             if self._batch.schema.names[0] == '_id' and self._batch.num_columns > 1:
                 col = self._batch.column(1)
             return col[0].as_py()
@@ -189,36 +189,36 @@ class SqlResultArrow:
 
 
 class SqlResult:
-    """SQL 执行结果 - SQL:2023 标准兼容"""
+    """SQL execution result - SQL:2023 standard compatible"""
     
     def __init__(self, columns: list, rows: list, rows_affected: int = 0, arrow_batch=None):
         """
-        初始化 SQL 结果
+        Initialize SQL result
         
         Parameters:
-            columns: 列名列表
-            rows: 数据行列表，每行是一个值列表
-            rows_affected: 受影响的行数
-            arrow_batch: 可选的 Arrow RecordBatch (用于大结果集的快速路径)
+            columns: List of column names
+            rows: List of data rows, each row is a list of values
+            rows_affected: Number of affected rows
+            arrow_batch: Optional Arrow RecordBatch (for fast path with large result sets)
         """
-        # 隐藏 _id 列
+        # Hide _id column
         self._all_columns = columns
         self.columns = [c for c in columns if c != '_id']
         self._id_col_idx = columns.index('_id') if '_id' in columns else None
         self.rows = rows
         self.rows_affected = rows_affected
-        self._arrow_batch = arrow_batch  # 快速路径: Arrow 数据
+        self._arrow_batch = arrow_batch  # Fast path: Arrow data
     
     def __len__(self) -> int:
-        """返回结果行数"""
+        """Return number of result rows"""
         if self._arrow_batch is not None:
             return self._arrow_batch.num_rows
         return len(self.rows)
     
     def __iter__(self):
-        """迭代结果行，每行作为字典返回（隐藏 _id）"""
+        """Iterate result rows, each row returned as dictionary (hide _id)"""
         if self._arrow_batch is not None:
-            # Arrow 快速路径
+            # Arrow fast path
             for row in self._arrow_batch.to_pylist():
                 yield {k: v for k, v in row.items() if k != '_id'}
         else:
@@ -226,25 +226,25 @@ class SqlResult:
                 yield {k: v for k, v in zip(self._all_columns, row) if k != '_id'}
     
     def to_dicts(self) -> list:
-        """转换为字典列表（隐藏 _id）"""
+        """Convert to dictionary list (hide _id)"""
         if self._arrow_batch is not None:
             return [{k: v for k, v in row.items() if k != '_id'} for row in self._arrow_batch.to_pylist()]
         return [{k: v for k, v in zip(self._all_columns, row) if k != '_id'} for row in self.rows]
     
     def to_pandas(self):
-        """转换为 pandas DataFrame (Arrow 零拷贝快速路径，隐藏 _id)"""
+        """Convert to pandas DataFrame (Arrow zero-copy fast path, hide _id)"""
         try:
             import pandas as pd
             if self._arrow_batch is not None:
-                # 零拷贝快速路径: 使用 ArrowDtype (pandas 2.0+)
+                # Zero-copy fast path: use ArrowDtype (pandas 2.0+)
                 try:
                     df = self._arrow_batch.to_pandas(types_mapper=pd.ArrowDtype)
                 except (TypeError, AttributeError):
-                    # 回退: pandas < 2.0
+                    # Fallback: pandas < 2.0
                     df = self._arrow_batch.to_pandas()
             else:
                 df = pd.DataFrame(self.rows, columns=self._all_columns)
-            # 隐藏 _id
+            # Hide _id
             if '_id' in df.columns:
                 df = df.drop(columns=['_id'])
             return df
@@ -252,15 +252,15 @@ class SqlResult:
             raise ImportError("pandas is required for to_pandas()")
     
     def to_polars(self):
-        """转换为 polars DataFrame（隐藏 _id）"""
+        """Convert to polars DataFrame (hide _id)"""
         try:
             import polars as pl
             if self._arrow_batch is not None:
-                # 快速路径: 直接从 Arrow 转换
+                # Fast path: directly convert from Arrow
                 df = pl.from_arrow(self._arrow_batch)
             else:
                 df = pl.DataFrame(dict(zip(self._all_columns, zip(*self.rows)))) if self.rows else pl.DataFrame()
-            # 隐藏 _id
+            # Hide _id
             if '_id' in df.columns:
                 df = df.drop('_id')
             return df
@@ -269,45 +269,45 @@ class SqlResult:
     
     def get_ids(self, return_list: bool = False):
         """
-        获取结果的 ID 列表（高性能零拷贝实现）
+        Get ID list of results (high-performance zero-copy implementation)
         
         Parameters:
             return_list: bool, default False
-                如果为 True，返回 Python list
-                如果为 False，返回 numpy.ndarray（默认，零拷贝，最快）
+                If True, return Python list
+                If False, return numpy.ndarray (default, zero-copy, fastest)
         
         Returns:
-            numpy.ndarray 或 list: ID 数组
+            numpy.ndarray or list: ID array
         """
         if self._arrow_batch is not None and '_id' in self._arrow_batch.schema.names:
-            # 零拷贝路径：直接从 Arrow 转 numpy，不经过 Python 对象
+            # Zero-copy path: directly convert from Arrow to numpy, bypassing Python objects
             id_array = self._arrow_batch.column('_id').to_numpy()
             if return_list:
                 return id_array.tolist()
             return id_array
         elif self._id_col_idx is not None:
-            # 从 rows 中提取（较慢路径）
+            # Extract from rows (slower path)
             ids = np.array([row[self._id_col_idx] for row in self.rows], dtype=np.uint64)
             if return_list:
                 return ids.tolist()
             return ids
         else:
-            # 回退：生成序列 ID
+            # Fallback: generate sequential IDs
             ids = np.arange(len(self), dtype=np.uint64)
             if return_list:
                 return ids.tolist()
             return ids
     
     def scalar(self):
-        """获取单一标量值（用于聚合查询如 COUNT(*)）"""
+        """Get single scalar value (for aggregate queries like COUNT(*))"""
         if self._arrow_batch is not None and self._arrow_batch.num_rows > 0:
-            # 跳过 _id 列
+            # Skip _id column
             col_idx = 0
             if self._arrow_batch.schema.names[0] == '_id' and self._arrow_batch.num_columns > 1:
                 col_idx = 1
             return self._arrow_batch.column(col_idx)[0].as_py()
         if self.rows and self.rows[0]:
-            # 跳过 _id 列
+            # Skip _id column
             idx = 0
             if self._id_col_idx == 0 and len(self.rows[0]) > 1:
                 idx = 1
@@ -315,7 +315,7 @@ class SqlResult:
         return None
     
     def first(self) -> Optional[dict]:
-        """获取第一行作为字典（隐藏 _id）"""
+        """Get first row as dictionary (hide _id)"""
         if self._arrow_batch is not None and self._arrow_batch.num_rows > 0:
             return {col: self._arrow_batch.column(i)[0].as_py() 
                     for i, col in enumerate(self._arrow_batch.schema.names) if col != '_id'}
@@ -329,23 +329,23 @@ class SqlResult:
 
 
 class ResultView:
-    """查询结果视图 - Arrow-first 高性能实现"""
+    """Query result view - Arrow-first high-performance implementation"""
     
     def __init__(self, arrow_table=None, data=None):
         """
-        初始化 ResultView（Arrow-first 模式）
+        Initialize ResultView (Arrow-first mode)
         
         Args:
-            arrow_table: PyArrow Table（主要数据源，最快）
-            data: List[dict] 数据（可选，用于回退）
+            arrow_table: PyArrow Table (primary data source, fastest)
+            data: List[dict] data (optional, for fallback)
         """
         self._arrow_table = arrow_table
-        self._data = data  # 懒加载，从 Arrow 转换
+        self._data = data  # Lazy loading, convert from Arrow
         self._num_rows = arrow_table.num_rows if arrow_table is not None else (len(data) if data else 0)
     
     @classmethod
     def from_arrow_bytes(cls, arrow_bytes: bytes) -> 'ResultView':
-        """从 Arrow IPC bytes 创建（最快路径）"""
+        """Create from Arrow IPC bytes (fastest path)"""
         if not arrow_bytes or not ARROW_AVAILABLE:
             return cls(data=[])
         reader = pa.ipc.open_stream(arrow_bytes)
@@ -354,49 +354,56 @@ class ResultView:
     
     @classmethod
     def from_dicts(cls, data: List[dict]) -> 'ResultView':
-        """从字典列表创建（回退路径）"""
+        """Create from dictionary list (fallback path)"""
         return cls(data=data)
     
     def _ensure_data(self):
-        """确保 _data 可用（懒加载从 Arrow 转换，隐藏 _id）"""
+        """Ensure _data is available (lazy load from Arrow conversion, hide _id)"""
         if self._data is None and self._arrow_table is not None:
             self._data = [{k: v for k, v in row.items() if k != '_id'} 
                           for row in self._arrow_table.to_pylist()]
         return self._data if self._data is not None else []
     
     def to_dict(self) -> List[dict]:
-        """返回字典列表（隐藏 _id）"""
+        """Convert results to a list of dictionaries.
+        
+        Returns:
+            List[dict]: List of records as dictionaries, excluding the internal '_id' field.
+        """
         return self._ensure_data()
     
     def to_pandas(self, zero_copy: bool = True):
-        """
-        返回 Pandas DataFrame
+        """Convert results to a pandas DataFrame.
         
-        Parameters:
-            zero_copy: bool, default True
-                如果为 True，使用 ArrowDtype 实现零拷贝转换（pandas 2.0+）
-                如果为 False，使用传统转换方式（复制数据到 NumPy）
+        Args:
+            zero_copy: If True, use ArrowDtype for zero-copy conversion (pandas 2.0+).
+                If False, use traditional conversion copying data to NumPy.
+                Defaults to True.
         
         Returns:
-            pandas.DataFrame
+            pandas.DataFrame: DataFrame containing the query results.
+        
+        Raises:
+            ImportError: If pandas is not available.
         
         Note:
-            零拷贝模式下，DataFrame 列使用 Arrow 原生类型（如 string[pyarrow]）
-            这在大多数场景下性能更好，但某些 NumPy 操作可能需要先转换类型
+            In zero-copy mode, DataFrame columns use Arrow native types (like string[pyarrow]).
+            This performs better in most scenarios, but some NumPy operations may need
+            type conversion first.
         """
         if not ARROW_AVAILABLE:
             raise ImportError("pandas not available. Install with: pip install pandas")
         
         if self._arrow_table is not None:
             if zero_copy:
-                # 零拷贝模式：使用 ArrowDtype（pandas 2.0+）
+                # Zero-copy mode: use ArrowDtype (pandas 2.0+)
                 try:
                     df = self._arrow_table.to_pandas(types_mapper=pd.ArrowDtype)
                 except (TypeError, AttributeError):
-                    # 回退：pandas < 2.0 不支持 ArrowDtype
+                    # Fallback: pandas < 2.0 doesn't support ArrowDtype
                     df = self._arrow_table.to_pandas()
             else:
-                # 传统模式：复制数据到 NumPy 类型
+                # Traditional mode: copy data to NumPy types
                 df = self._arrow_table.to_pandas()
             
             if '_id' in df.columns:
@@ -404,7 +411,7 @@ class ResultView:
                 df.index.name = None
             return df
         
-        # 回退
+        # Fallback
         df = pd.DataFrame(self._ensure_data())
         if '_id' in df.columns:
             df.set_index('_id', inplace=True)
@@ -412,7 +419,14 @@ class ResultView:
         return df
     
     def to_polars(self):
-        """返回 Polars DataFrame（直接从 Arrow，最快，隐藏 _id）"""
+        """Convert results to a polars DataFrame.
+        
+        Returns:
+            polars.DataFrame: DataFrame containing the query results.
+            
+        Raises:
+            ImportError: If polars is not available.
+        """
         if not POLARS_AVAILABLE:
             raise ImportError("polars not available. Install with: pip install polars")
         
@@ -424,12 +438,19 @@ class ResultView:
         return pl.DataFrame(self._ensure_data())
     
     def to_arrow(self):
-        """返回 PyArrow Table（零拷贝，最快，隐藏 _id）"""
+        """Convert results to a PyArrow Table.
+        
+        Returns:
+            pyarrow.Table: Arrow Table containing the query results.
+            
+        Raises:
+            ImportError: If pyarrow is not available.
+        """
         if not ARROW_AVAILABLE:
             raise ImportError("pyarrow not available. Install with: pip install pyarrow")
         
         if self._arrow_table is not None:
-            # 移除 _id 列
+            # Remove _id column
             if '_id' in self._arrow_table.column_names:
                 return self._arrow_table.drop(['_id'])
             return self._arrow_table
@@ -459,20 +480,19 @@ class ResultView:
     
     @property
     def ids(self):
-        """[已弃用] 请使用 get_ids() 方法"""
+        """[Deprecated] Please use get_ids() method"""
         return self.get_ids(return_list=True)
     
     def get_ids(self, return_list: bool = False):
-        """
-        获取结果的 ID 列表（高性能零拷贝实现）
+        """Get the internal IDs of the result records.
         
-        Parameters:
-            return_list: bool, default False
-                如果为 True，返回 Python list
-                如果为 False，返回 numpy.ndarray（默认，零拷贝，最快）
+        Args:
+            return_list: If True, return as Python list.
+                If False, return as numpy.ndarray (default, zero-copy, fastest).
+                Defaults to False.
         
         Returns:
-            numpy.ndarray 或 list: ID 数组
+            numpy.ndarray or list: Array of record IDs.
         """
         if self._arrow_table is not None and '_id' in self._arrow_table.column_names:
             # 零拷贝路径：直接从 Arrow 转 numpy，不经过 Python 对象
@@ -506,14 +526,14 @@ DurabilityLevel = Literal['fast', 'safe', 'max']
 
 class ApexClient:
     """
-    ApexBase 客户端 - 基于 Rust 核心的高性能嵌入式数据库
+    ApexBase client - High-performance embedded database based on Rust core
     
-    特点:
-    - 自定义单文件存储格式 (.apex)
-    - 高性能批量写入
-    - 支持全文搜索 (NanoFTS)
-    - 与 Pandas、Polars、PyArrow 集成
-    - 可配置的持久化强度 (durability)
+    Features:
+    - Custom single-file storage format (.apex)
+    - High-performance batch writes
+    - Full-text search support (NanoFTS)
+    - Integration with Pandas, Polars, PyArrow
+    - Configurable durability levels
     """
     
     def __init__(
@@ -528,45 +548,45 @@ class ApexClient:
         _auto_manage: bool = True
     ):
         """
-        初始化 ApexClient
+        Initialize ApexClient
         
         Parameters:
             dirpath: str
-                数据存储目录路径，如果为 None，使用当前目录
+                Data storage directory path, if None, use current directory
             batch_size: int
-                批量操作的大小
+                Size of batch operations
             drop_if_exists: bool
-                如果为 True，删除已存在的数据库文件
+                If True, delete existing database files
             enable_cache: bool
-                是否启用写入缓存
+                Whether to enable write cache
             cache_size: int
-                缓存大小
+                Cache size
             prefer_arrow_format: bool
-                是否优先使用 Arrow 格式
+                Whether to prefer Arrow format
             durability: Literal['fast', 'safe', 'max']
-                持久化强度级别：
-                - 'fast': 最高性能，数据先写入内存缓冲区，flush() 时才持久化
-                          适合批量导入、可重建数据、对性能要求极高的场景
-                - 'safe': 平衡模式，每次 flush() 确保数据完全落盘 (fsync)
-                          适合大多数生产环境
-                - 'max': 最强 ACID 保证，每次写入都立即 fsync
-                         适合金融、订单等关键数据场景
+                Durability level:
+                - 'fast': Highest performance, data first written to memory buffer, persisted when flush()
+                          Suitable for batch import, reconstructible data, extremely performance-sensitive scenarios
+                - 'safe': Balanced mode, ensures data fully written to disk on each flush() (fsync)
+                          Suitable for most production environments
+                - 'max': Strongest ACID guarantee, immediate fsync on each write
+                         Suitable for financial, orders, and other critical data scenarios
         
         Note:
-            FTS（全文搜索）功能需要在连接后通过 init_fts() 方法单独初始化。
-            这样可以更灵活地配置每个表的 FTS 设置。
+            FTS (full-text search) functionality needs to be initialized separately through init_fts() method after connection.
+            This allows more flexible configuration of FTS settings for each table.
             
-            ApexClient 支持上下文管理器，推荐使用 with 语句自动管理资源：
+            ApexClient supports context manager, recommended to use with statement for automatic resource management:
             
-            >>> # 基本用法
+            >>> # Basic usage
             >>> with ApexClient("./my_db") as client:
             ...     client.store({"name": "Alice", "age": 25})
-            ...     # 自动提交和关闭连接
+            ...     # Auto commit and close connection
             ... 
-            >>> # 链式调用
+            >>> # Chain calls
             >>> with ApexClient("./my_db").init_fts(index_fields=['name']) as client:
             ...     client.store({"name": "Bob"})
-            ...     # 自动关闭 FTS 索引和数据库连接
+            ...     # Auto close FTS index and database connection
         """
         if dirpath is None:
             dirpath = "."
@@ -574,29 +594,29 @@ class ApexClient:
         self._dirpath = Path(dirpath)
         self._dirpath.mkdir(parents=True, exist_ok=True)
         
-        # 使用 .apex 文件格式
+        # Use .apex file format
         self._db_path = self._dirpath / "apexbase.apex"
         self._auto_manage = _auto_manage
         self._is_closed = False
         
-        # 注册到全局注册表
+        # Register to global registry
         if self._auto_manage:
             _registry.register(self, str(self._db_path))
         
-        # 处理 drop_if_exists
+        # Handle drop_if_exists
         if drop_if_exists and self._db_path.exists():
             self._db_path.unlink()
-            # 同时清理 FTS 索引
+            # Also clean up FTS indexes
             fts_dir = self._dirpath / "fts_indexes"
             if fts_dir.exists():
                 shutil.rmtree(fts_dir)
         
-        # 验证 durability 参数
+        # Validate durability parameter
         if durability not in ('fast', 'safe', 'max'):
             raise ValueError(f"durability must be 'fast', 'safe', or 'max', got '{durability}'")
         self._durability = durability
         
-        # 初始化 Rust 存储引擎，传入 durability 配置
+        # Initialize Rust storage engine, pass durability configuration
         self._storage = RustStorage(str(self._db_path), durability=durability)
         
         self._current_table = "default"
@@ -604,24 +624,24 @@ class ApexClient:
         self._enable_cache = enable_cache
         self._cache_size = cache_size
         
-        # FTS 配置 - 每个表独立管理
+        # FTS configuration - each table managed independently
         # key: table_name, value: {'enabled': bool, 'index_fields': List[str], 'config': Dict}
         self._fts_tables: Dict[str, Dict] = {}
         
         self._prefer_arrow_format = prefer_arrow_format and ARROW_AVAILABLE
 
     def _is_fts_enabled(self, table_name: str = None) -> bool:
-        """检查指定表是否启用了 FTS"""
+        """Check if FTS is enabled for specified table"""
         table = table_name or self._current_table
         return table in self._fts_tables and self._fts_tables[table].get('enabled', False)
     
     def _get_fts_config(self, table_name: str = None) -> Optional[Dict]:
-        """获取指定表的 FTS 配置"""
+        """Get FTS configuration for specified table"""
         table = table_name or self._current_table
         return self._fts_tables.get(table)
     
     def _ensure_fts_initialized(self, table_name: str = None) -> bool:
-        """确保指定表的 FTS 已初始化"""
+        """Ensure FTS is initialized for specified table"""
         table = table_name or self._current_table
         
         if not self._is_fts_enabled(table):
@@ -646,38 +666,38 @@ class ApexClient:
         cache_size: int = 10000
     ) -> 'ApexClient':
         """
-        初始化全文搜索 (FTS) 功能
+        Initialize full-text search (FTS) functionality
         
-        此方法必须在 ApexClient 正确连接后调用。可以为不同的表配置不同的 FTS 设置。
+        This method must be called after ApexClient is properly connected. Different FTS settings can be configured for different tables.
         
         Parameters:
             table_name: str, optional
-                要启用 FTS 的表名。如果为 None，使用当前表。
+                Table name to enable FTS for. If None, use current table.
             index_fields: List[str], optional
-                要索引的字段列表。如果为 None，索引所有字符串字段。
+                List of fields to index. If None, index all string fields.
             lazy_load: bool, default False
-                是否启用懒加载模式。懒加载模式下，索引在首次查询时才会完全加载到内存。
+                Whether to enable lazy loading mode. In lazy loading mode, indexes are fully loaded to memory only on first query.
             cache_size: int, default 10000
-                FTS 缓存大小。
+                FTS cache size.
         
         Returns:
-            ApexClient: 返回 self，支持链式调用。
+            ApexClient: Returns self, supports chain calls.
         
         Raises:
-            RuntimeError: 如果 ApexClient 未正确连接。
+            RuntimeError: If ApexClient is not properly connected.
         
         Example:
-            >>> # 基本用法 - 为当前表启用 FTS
+            >>> # Basic usage - enable FTS for current table
             >>> client = ApexClient("./my_db")
             >>> client.init_fts(index_fields=['title', 'content'])
             
-            >>> # 为特定表启用 FTS
+            >>> # Enable FTS for specific table
             >>> client.init_fts(table_name='articles', index_fields=['title', 'body'])
             
-            >>> # 链式调用
+            >>> # Chain calls
             >>> client = ApexClient("./my_db").init_fts(index_fields=['name', 'description'])
             
-            >>> # 高级配置
+            >>> # Advanced configuration
             >>> client.init_fts(
             ...     table_name='documents',
             ...     index_fields=['content'],
@@ -689,7 +709,7 @@ class ApexClient:
         
         table = table_name or self._current_table
         
-        # 如果需要切换表
+        # If need to switch table
         need_switch = table != self._current_table
         original_table = self._current_table if need_switch else None
         
@@ -697,7 +717,7 @@ class ApexClient:
             if need_switch:
                 self.use_table(table)
             
-            # 保存 FTS 配置
+            # Save FTS configuration
             self._fts_tables[table] = {
                 'enabled': True,
                 'index_fields': index_fields,
@@ -707,7 +727,7 @@ class ApexClient:
                 }
             }
             
-            # 初始化 Rust 原生 FTS
+            # Initialize Rust native FTS
             self._storage._init_fts(
                 index_fields=index_fields,
                 lazy_load=lazy_load,
@@ -721,7 +741,7 @@ class ApexClient:
         return self
 
     def _should_index_field(self, field_name: str, field_value, table_name: str = None) -> bool:
-        """判断字段是否应该被索引"""
+        """Determine if field should be indexed"""
         table = table_name or self._current_table
         
         if not self._is_fts_enabled(table):
@@ -739,7 +759,7 @@ class ApexClient:
         return isinstance(field_value, str)
 
     def _extract_indexable_content(self, data: dict, table_name: str = None) -> dict:
-        """提取可索引的内容"""
+        """Extract indexable content"""
         table = table_name or self._current_table
         
         if not self._is_fts_enabled(table):
@@ -752,38 +772,63 @@ class ApexClient:
         return indexable
 
     def _check_connection(self):
-        """检查连接状态"""
+        """Check connection status"""
         if self._is_closed:
-            raise RuntimeError("ApexClient 连接已关闭，无法执行操作。请创建新的实例。")
+            raise RuntimeError("ApexClient connection has been closed, cannot perform operations. Please create a new instance.")
 
-    # ============ 公共 API ============
+    # ============ Public API ============
 
     def use_table(self, table_name: str):
-        """切换当前表"""
+        """Switch to the specified table.
+        
+        Args:
+            table_name: Name of the table to switch to.
+            
+        Raises:
+            RuntimeError: If the client connection is closed.
+        """
         self._check_connection()
         self._storage.use_table(table_name)
         self._current_table = table_name
-        # FTS 引擎在 Rust 层按需创建，无需在 Python 层管理
+        # FTS engine is created on-demand in Rust layer, no need to manage in Python layer
 
     @property
     def current_table(self) -> str:
-        """获取当前表名"""
+        """Get the name of the current table.
+        
+        Returns:
+            str: Name of the current table.
+        """
         return self._current_table
 
     def create_table(self, table_name: str):
-        """创建新表并切换到该表"""
+        """Create a new table and switch to it.
+        
+        Args:
+            table_name: Name of the table to create.
+            
+        Raises:
+            RuntimeError: If the client connection is closed.
+        """
         self._check_connection()
         self._storage.create_table(table_name)
         self._current_table = table_name
-        # FTS 引擎在 Rust 层按需创建
+        # FTS engine is created on-demand in Rust layer
 
     def drop_table(self, table_name: str):
-        """删除表"""
+        """Delete the specified table.
+        
+        Args:
+            table_name: Name of the table to delete.
+            
+        Raises:
+            RuntimeError: If the client connection is closed.
+        """
         self._check_connection()
         self._storage.drop_table(table_name)
         
-        # FTS 索引文件会在 Rust 层被清理（如果需要）
-        # 也可以手动清理
+        # FTS index files will be cleaned up in Rust layer (if needed)
+        # Can also be manually cleaned up
         if self._is_fts_enabled(table_name):
             fts_index_file = self._dirpath / "fts_indexes" / f"{table_name}.nfts"
             fts_wal_file = self._dirpath / "fts_indexes" / f"{table_name}.nfts.wal"
@@ -791,60 +836,71 @@ class ApexClient:
                 fts_index_file.unlink()
             if fts_wal_file.exists():
                 fts_wal_file.unlink()
-            # 移除 FTS 配置
+            # Remove FTS configuration
             self._fts_tables.pop(table_name, None)
         
         if self._current_table == table_name:
             self._current_table = "default"
 
     def list_tables(self) -> List[str]:
-        """列出所有表"""
+        """List all tables in the database.
+        
+        Returns:
+            List[str]: List of table names.
+            
+        Raises:
+            RuntimeError: If the client connection is closed.
+        """
         self._check_connection()
         return self._storage.list_tables()
 
     def store(self, data) -> None:
-        """
-        存储数据 - 自动选择最优策略，极速写入
+        """Store data using automatically selected optimal strategy for ultra-fast writes.
         
-        支持多种输入格式：
-        - dict: 单条记录
-        - List[dict]: 多条记录 (自动转换为列式高速路径)
-        - Dict[str, list]: 列式数据 (最快路径)
-        - Dict[str, np.ndarray]: numpy 列式数据 (零拷贝，最快)
-        - pandas.DataFrame: 批量存储
-        - polars.DataFrame: 批量存储
-        - pyarrow.Table: 批量存储
+        Supports multiple input formats:
+        - dict: Single record
+        - List[dict]: Multiple records (automatically converted to columnar high-speed path)
+        - Dict[str, list]: Columnar data (fastest path)
+        - Dict[str, np.ndarray]: numpy columnar data (zero-copy, fastest)
+        - pandas.DataFrame: Batch storage
+        - polars.DataFrame: Batch storage
+        - pyarrow.Table: Batch storage
         
-        Parameters:
-            data: 要存储的数据
-        
-        Performance (10,000 rows):
-            - Dict[str, np.ndarray] 纯数值: ~0.1ms (90M rows/s)
-            - Dict[str, list] 混合类型: ~0.7ms (14M rows/s)
+        Args:
+            data: Data to store in any supported format.
+            
+        Raises:
+            RuntimeError: If the client connection is closed.
+            ValueError: If data format is not supported.
+            
+        Note:
+            Performance benchmarks (10,000 rows):
+            - Dict[str, np.ndarray] pure numeric: ~0.1ms (90M rows/s)
+            - Dict[str, list] mixed types: ~0.7ms (14M rows/s)
             - List[dict]: ~4.8ms (2M rows/s)
         
-        Example:
-            >>> # 最快: numpy 列式
+        Examples:
+            Fastest numpy columnar:
             >>> client.store({
             ...     'id': np.arange(10000, dtype=np.int64),
             ...     'score': np.random.random(10000),
             ... })
             
-            >>> # 快: list 列式
+            Fast list columnar:
             >>> client.store({
             ...     'name': ['Alice', 'Bob', 'Charlie'],
             ...     'age': [25, 30, 35],
             ... })
             
-            >>> # 单行
+            Single record:
             >>> client.store({'name': 'Alice', 'age': 25})
         """
         self._check_connection()
         
-        # 1. 检测列式数据 Dict[str, list/ndarray] - 最快路径
+        # 1. Detect columnar data Dict[str, list/ndarray] - fastest path
         if isinstance(data, dict):
             first_value = next(iter(data.values()), None) if data else None
-            # 检测 list, tuple, 或 numpy array
+            # Detect list, tuple, or numpy array
             if first_value is not None and (
                 isinstance(first_value, (list, tuple)) or 
                 hasattr(first_value, '__len__') and hasattr(first_value, 'dtype')
@@ -870,13 +926,13 @@ class ApexClient:
                 self._store_via_arrow_fast(table)
                 return
         
-        # 5. 单条记录 dict
+        # 5. Single record dict
         if isinstance(data, dict):
-            # 获取插入前的行数作为新记录的 ID
+            # Get row count before insertion as ID for new record
             doc_id = self._storage.count_rows()
             self._storage._store_single_no_return(data)
             
-            # 更新 FTS 索引（使用 Rust 原生实现）
+            # Update FTS index (using Rust native implementation)
             if self._is_fts_enabled() and self._ensure_fts_initialized():
                 indexable = self._extract_indexable_content(data)
                 if indexable:
@@ -884,7 +940,7 @@ class ApexClient:
                     self._storage._fts_flush()
             return
             
-        # 6. List[dict] - 自动转换为列式存储
+        # 6. List[dict] - automatically convert to columnar storage
         elif isinstance(data, list):
             if not data:
                 return
@@ -894,28 +950,28 @@ class ApexClient:
             raise ValueError("Data must be dict, list of dicts, Dict[str, list], pandas.DataFrame, polars.DataFrame, or pyarrow.Table")
 
     def _store_list_fast(self, data: List[dict]) -> None:
-        """内部方法：高速 list 存储 - 自动转为列式，无返回值"""
+        """Internal method: high-speed list storage - automatically convert to columnar, no return value"""
         if not data:
             return
         
-        # 获取插入前的行数，用于计算插入后的 ID 范围
+        # Get row count before insertion, to calculate ID range after insertion
         start_id = self._storage.count_rows()
         
-        # 转换为列式格式
+        # Convert to columnar format
         int_cols = {}
         float_cols = {}
         str_cols = {}
         bool_cols = {}
         bin_cols = {}
         
-        # 从第一行确定列类型
+        # Determine column types from first row
         first_row = data[0]
         col_types = {}  # name -> type
         
         for name, value in first_row.items():
             if name == '_id':
                 continue
-            if isinstance(value, bool):  # bool 必须在 int 之前检查
+            if isinstance(value, bool):  # bool must be checked before int
                 col_types[name] = 'bool'
                 bool_cols[name] = []
             elif isinstance(value, int):
@@ -931,10 +987,10 @@ class ApexClient:
                 col_types[name] = 'str'
                 str_cols[name] = []
             else:
-                col_types[name] = 'str'  # 默认转字符串
+                col_types[name] = 'str'  # default to string
                 str_cols[name] = []
         
-        # 收集所有数据
+        # Collect all data
         for row in data:
             for name, col_type in col_types.items():
                 value = row.get(name)
@@ -949,8 +1005,8 @@ class ApexClient:
                 else:  # str
                     str_cols[name].append(str(value) if value is not None else '')
         
-        # 使用不返回 IDs 的高速 API
-        # 如果启用 FTS，传入索引字段名让 Rust 直接构建 FTS 文档 (零边界跨越!)
+        # Use high-speed API that doesn't return IDs
+        # If FTS is enabled, pass index field names to let Rust directly build FTS documents (zero boundary crossing!)
         fts_config = self._fts_tables.get(self._current_table, {})
         fts_fields = fts_config.get('index_fields') if (self._is_fts_enabled() and self._ensure_fts_initialized()) else None
         self._storage._insert_typed_columns_fast(
@@ -1060,21 +1116,36 @@ class ApexClient:
         self._store_columnar_fast(columns)
 
     def query(self, where: str = None, limit: int = None) -> ResultView:
-        """
-        使用 SQL 语法查询记录
+        """Query records using SQL syntax with optional optimization.
         
-        Parameters:
-            where: SQL WHERE 子句，如 "age > 25 AND city = 'NYC'"
-            limit: 可选，限制返回的最大行数（启用流式早停优化）
+        Args:
+            where: SQL WHERE clause for filtering records (e.g., "age > 25 AND city = 'NYC'").
+                If None or "1=1", returns all records.
+            limit: Optional maximum number of records to return.
+                When specified, enables streaming early-stop optimization for faster queries.
         
         Returns:
-            ResultView: 查询结果视图，支持 to_dict(), to_pandas(), to_polars(), to_arrow()
+            ResultView: Query result view supporting multiple output formats:
+                to_dict(), to_pandas(), to_polars(), to_arrow()
+        
+        Raises:
+            RuntimeError: If the client connection is closed.
+        
+        Examples:
+            Basic query:
+            >>> results = client.query("age > 25")
+            
+            Limited query with optimization:
+            >>> results = client.query("city = 'NYC'", limit=100)
+            
+            Convert to pandas:
+            >>> df = client.query("score > 0.5").to_pandas()
         """
         self._check_connection()
         
         where_clause = where if where and where.strip() != "1=1" else "1=1"
         
-        # 如果指定了 limit，使用流式早停优化（最快路径）
+        # If limit is specified, use streaming early-stop optimization (fastest path)
         if limit is not None:
             results = self._storage.query(where_clause, limit)
             return ResultView.from_dicts(results)
@@ -1083,7 +1154,7 @@ class ApexClient:
             results = self._storage.query(where_clause)
             return ResultView.from_dicts(results)
         
-        # 优先使用 FFI 零拷贝方式 (最快)
+        # Prioritize FFI zero-copy method (fastest)
         try:
             import pyarrow as pa
             

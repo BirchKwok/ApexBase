@@ -10,11 +10,11 @@ import os
 import threading
 
 def generate_random_string(length=10):
-    """生成随机字符串"""
+    """Generate random string"""
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
 def generate_test_data(size=1000):
-    """生成测试数据"""
+    """Generate test data"""
     return [
         {
             "name": generate_random_string(),
@@ -33,12 +33,12 @@ def generate_test_data(size=1000):
     ]
 
 def get_process_memory():
-    """获取当前进程的内存使用情况（MB）"""
+    """Get current process memory usage (MB)"""
     process = psutil.Process(os.getpid())
     return process.memory_info().rss / 1024 / 1024
 
 def measure_performance(func):
-    """测量函数执行时间和内存使用的装饰器"""
+    """Decorator to measure function execution time and memory usage"""
     def wrapper(*args, **kwargs):
         start_time = time.time()
         start_memory = get_process_memory()
@@ -56,7 +56,7 @@ def measure_performance(func):
 
 @pytest.fixture
 def client():
-    """创建测试客户端"""
+    """Create test client"""
     test_dir = Path("test_data_perf")
     if test_dir.exists():
         shutil.rmtree(test_dir)

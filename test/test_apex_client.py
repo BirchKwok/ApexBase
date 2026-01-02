@@ -107,7 +107,7 @@ def test_update_operations(client):
     assert updated["name"] == "John Doe"
     assert updated["age"] == 31
     
-    # 创建新的客户端实例来避免缓存问题
+    # Create new client instance to avoid cache issues
     test_dir = Path("test_data_duckdb_fresh")
     if test_dir.exists():
         import shutil
@@ -125,7 +125,7 @@ def test_update_operations(client):
     updated = fresh_client.retrieve(fresh_id)
     assert updated["name"] == "John Smith"
     
-    # 清理
+    # Cleanup
     fresh_client.close()
     if test_dir.exists():
         import shutil
@@ -207,19 +207,19 @@ def test_column_operations(client):
     dtype = client.get_column_dtype("test_email")
     assert dtype.upper() == "VARCHAR"
     
-    # Test renaming a column (DuckDB不支持删除列，所以旧列仍会存在)
+    # Test renaming a column (DuckDB doesn't support dropping columns, so old column will still exist)
     client.rename_column("test_email", "contact_email")
     client.flush_cache()
     fields = client.list_fields()
     assert "contact_email" in fields
-    # DuckDB不支持删除列，原列将保留
+    # DuckDB doesn't support dropping columns, original column will be preserved
     assert "test_email" in fields
     
     # Test deleting a column
     client.drop_column("contact_email")
     client.flush_cache()
     fields = client.list_fields()
-    # DuckDB不会真正删除列，但元数据中应该已删除
+    # DuckDB won't actually delete the column, but it should be removed from metadata
     assert "contact_email" not in fields
     
     # Test that we can't delete or rename the _id column
@@ -333,7 +333,7 @@ def test_edge_cases(client):
     assert "test_path" in fields
     
     special_data = {
-        "test_name": "测试'\"\\特殊字符",
+        "test_name": "Test'\"\\Special characters",
         "test_path": "C:\\Windows\\System32"
     }
     id_ = client.store(special_data)
