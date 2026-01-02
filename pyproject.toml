@@ -1,18 +1,18 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "apexbase"
 version = "0.2.0"
-authors = [
-    { name = "Birch Kwok", email = "birchkwok@gmail.com" }
-]
-description = "A lightning-fast, feature-rich embedded database designed for modern Python applications."
+description = "High-performance embedded database with Rust core and Python API"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
-keywords = ["database", "embedded-database", "duckdb", "columnar-storage", "olap", "analytics", "full-text-search"]
+authors = [
+    { name = "Birch Kwok", email = "birchkwok@gmail.com" }
+]
+keywords = ["database", "embedded-database", "rust", "high-performance"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -23,25 +23,24 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
     "Topic :: Database",
-    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "duckdb>=0.9.0",
-    "orjson>=3.9.0",
-    "pandas>=2.0.0",
-    "pyarrow>=17.0.0",
-    "polars>=0.20.0",
-    "numpy>=1.24.0",
-    "psutil>=5.9.0",
-    "nanofts>=0.1.0"
+    "nanofts>=0.1.0",
 ]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.0.0", "pyarrow>=10.0.0"]
+polars = ["polars>=0.15.0"]
+all = ["pandas>=2.0.0", "pyarrow>=10.0.0", "polars>=0.15.0"]
+dev = ["pytest>=7.0.0", "maturin>=1.4.0"]
 
 [project.urls]
 Homepage = "https://github.com/BirchKwok/ApexBase"
 Repository = "https://github.com/BirchKwok/ApexBase"
-"Bug Tracker" = "https://github.com/BirchKwok/ApexBase/issues"
-Documentation = "https://github.com/BirchKwok/ApexBase#readme"
 
-[tool.setuptools]
-packages = ["apexbase"]
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "apexbase/python"
+module-name = "apexbase._core"

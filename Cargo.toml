@@ -1,0 +1,74 @@
+[package]
+name = "apexbase"
+version = "0.2.0"
+edition = "2021"
+authors = ["Birch Kwok <birchkwok@gmail.com>"]
+description = "High-performance embedded database with Rust core"
+license = "Apache-2.0"
+readme = "README.md"
+
+[lib]
+name = "apexbase"
+path = "apexbase/src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Python bindings with numpy support
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+
+# Memory-mapped I/O
+memmap2 = "0.9"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# Arrow for zero-copy data transfer
+arrow = { version = "54", default-features = false, features = ["ipc", "ffi"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Concurrency
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+rayon = "1.10"
+fork_union = "2.3"  # Low-latency Fork-Join parallelism (faster than rayon)
+
+# String optimization
+compact_str = { version = "0.8", features = ["serde"] }  # SSO for short strings
+string-interner = "0.18"  # String interning for repeated strings
+
+# Checksums
+crc32fast = "1.4"
+
+# Byte order handling
+byteorder = "1.5"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Random number generation (for testing)
+rand = "0.8"
+
+# Regex for query parsing
+regex = "1.10"
+
+# Full-text search engine (native Rust integration)
+nanofts = "0.3.3"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

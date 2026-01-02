@@ -1,371 +1,136 @@
 # ApexBase
 
-🚀 A lightning-fast, feature-rich embedded database designed for modern Python applications.
+**High-performance embedded database with Rust core and Python API**
 
-## Features
+ApexBase 是一个基于 Rust 核心的高性能嵌入式数据库，提供简洁的 Python API。
 
-✨ **High Performance**
-- Built on DuckDB with optimized columnar storage
-- Efficient batch operations support
-- Configurable caching system for better write performance
-- Concurrent query execution
-- Optimized for both OLAP and OLTP workloads
+## ✨ 特性
 
-🔍 **Advanced Query Capabilities**
-- SQL-like query syntax with WHERE clauses
-- Complex queries with multiple conditions and operators
-- LIKE pattern matching support
-- Lazy evaluation with ResultView
-- Vectorized query execution
-- Native JSON field support
+- 🚀 **高性能** - Rust 核心，批量写入速度可达 97万+ ops/s
+- 📦 **单文件存储** - 自定义 `.apex` 文件格式，无需外部依赖
+- 🔍 **全文搜索** - 集成 NanoFTS，支持中文和模糊搜索
+- 🐍 **Python 友好** - 简洁的 API，支持 Pandas/Polars/PyArrow
+- 💾 **紧凑存储** - 相比传统方案节省约 45% 存储空间
 
-🔤 **Full-Text Search (FTS)**
-- Built-in full-text search capabilities
-- Chinese text segmentation support
-- Configurable indexing parameters
-- Parallel index building
-- Disk-based index storage with memory caching
-
-📊 **Data Framework Integration**
-- Seamless integration with Pandas
-- Native support for PyArrow
-- Built-in Polars compatibility
-- Automatic type inference and conversion
-
-🎯 **Advanced Table Management**
-- Multiple table support with easy switching
-- Dynamic schema management
-- Add, drop, and rename columns at runtime
-- Get column data types
-- Table creation and deletion
-
-🛡️ **Data Integrity & Performance**
-- ACID compliance through DuckDB
-- Transaction support
-- Automatic error handling
-- Data consistency guarantees
-- Performance optimization utilities
-
-🔧 **Developer Friendly**
-- Simple and intuitive API
-- Flexible configuration options
-- Comprehensive documentation
-- Extensive test coverage
-- Performance monitoring and testing
-
-## Installation
+## 📦 安装
 
 ```bash
-pip install apexbase
+# 从源码构建
+cd ApexBase
+maturin develop --release
+
+# 安装可选依赖
+pip install pandas pyarrow polars  # 数据框架支持
 ```
 
-## Quick Start
+## 🚀 快速开始
 
 ```python
 from apexbase import ApexClient
 
-# Initialize the database with configuration options
-client = ApexClient(
-    dirpath="my_database",
-    batch_size=1000,
-    enable_cache=True,
-    cache_size=10000,
-    drop_if_exists=False
-)
+# 创建客户端
+client = ApexClient("./data")
 
-# Store single record
-record = {"name": "John", "age": 30, "tags": ["python", "rust"]}
-id_ = client.store(record)
+# 存储数据
+id = client.store({"name": "Alice", "age": 30, "city": "Beijing"})
+ids = client.store([
+    {"name": "Bob", "age": 25},
+    {"name": "Charlie", "age": 35}
+])
 
-# Store multiple records
-records = [
-    {"name": "Jane", "age": 25},
-    {"name": "Bob", "age": 35}
-]
-ids = client.store(records)
+# 查询数据
+results = client.query("age > 28")  # SQL 风格条件查询
+record = client.retrieve(id)         # 按 ID 检索
+all_data = client.retrieve_all()     # 获取所有记录
 
-# Query records with lazy evaluation
-results = client.query("age > 25")
-print(f"Found {results.shape[0]} records")
+# 全文搜索
+doc_ids = client.search_text("Alice")
+records = client.search_and_retrieve("Beijing")
 
-# Convert to different formats
-pandas_df = results.to_pandas()
-polars_df = results.to_polars()
-pyarrow_table = results.to_arrow()
+# 转换为 DataFrame
+df = results.to_pandas()
+pl_df = results.to_polars()
 
-# Iterate over results
-for record in results:
-    print(record)
-
-# Import from data frameworks
-import pandas as pd
-df = pd.DataFrame({"name": ["Alice", "Bob"], "age": [28, 32]})
-client.from_pandas(df)
+# 关闭连接
+client.close()
 ```
 
-### DuckDB Advantages
+## 📊 性能对比
 
-ApexBase is built on DuckDB, providing significant advantages:
+| 操作 | ApexBase (Rust) | 传统方案 | 提升 |
+|------|-----------------|----------|------|
+| 批量写入 (10K) | 17ms | 57ms | **3.3x** |
+| 单条检索 | 0.01ms | 0.4ms | **40x** |
+| 批量检索 (100) | 0.08ms | 1.1ms | **14x** |
+| 存储大小 | 2.1 MB | 3.9 MB | **1.8x 更小** |
 
-- **Columnar storage** for better analytics performance
-- **Efficient compression** for reduced storage footprint
-- **Vectorized query execution** for faster results
-- **Parallel query processing** for multi-core utilization
-- **Native support for complex aggregations**
-- **Optimized for both OLAP and OLTP workloads**
-- **Efficient memory management** for large datasets
+## 📁 项目结构
 
-## Advanced Usage
+```
+ApexBase/
+├── apexbase/                    # 主包目录
+│   ├── src/                     # Rust 源代码
+│   │   ├── storage/             # 存储引擎
+│   │   ├── table/               # 表管理
+│   │   ├── query/               # 查询执行器
+│   │   ├── index/               # B-tree 索引
+│   │   ├── cache/               # LRU 缓存
+│   │   ├── data/                # 数据类型
+│   │   └── python/              # PyO3 绑定
+│   ├── python/                  # Python 包装层
+│   │   └── apexbase/
+│   │       └── __init__.py      # Python API
+│   ├── Cargo.toml
+│   └── pyproject.toml
+├── Cargo.toml                   # 工作区配置
+└── pyproject.toml               # 项目配置
+```
 
-### Table Management
+## 🔧 API 参考
+
+### ApexClient
 
 ```python
-# Create and switch tables
+# 初始化
+client = ApexClient(
+    dirpath="./data",           # 数据目录
+    drop_if_exists=False,       # 是否删除已存在的数据
+    enable_fts=True,            # 启用全文搜索
+    enable_search_cache=True,   # 启用搜索缓存
+)
+
+# 表操作
 client.create_table("users")
-client.create_table("orders") 
 client.use_table("users")
-
-# Check current table
-print(f"Current table: {client.current_table}")
-
-# List all tables
+client.drop_table("users")
 tables = client.list_tables()
-print(f"Available tables: {tables}")
 
-# Store user data
-user = {"name": "John", "email": "john@example.com"}
-user_id = client.store(user)
+# CRUD 操作
+id = client.store({"key": "value"})
+ids = client.store([{...}, {...}])
+record = client.retrieve(id)
+records = client.retrieve_many([1, 2, 3])
+client.replace(id, {"new": "data"})
+client.delete(id)
+client.delete([1, 2, 3])
 
-# Switch to orders table
-client.use_table("orders")
-order = {"user_id": user_id, "product": "Laptop", "price": 999.99}
-client.store(order)
+# 查询
+results = client.query("age > 30")
+results = client.query("name LIKE 'A%'")
+count = client.count_rows()
 
-# Drop table when no longer needed
-client.drop_table("orders")
+# 全文搜索
+ids = client.search_text("keyword")
+ids = client.fuzzy_search_text("keywrd")  # 模糊搜索
+records = client.search_and_retrieve("keyword")
+
+# 数据框架集成
+client.from_pandas(df)
+client.from_polars(df)
+results.to_pandas()
+results.to_polars()
 ```
 
-### Schema Management
+## 📄 License
 
-```python
-# Add new columns dynamically
-client.add_column("phone", "VARCHAR")
-client.add_column("salary", "DOUBLE")
-client.add_column("is_manager", "BOOLEAN")
-
-# Get column information
-fields = client.list_fields()
-print(f"Available fields: {fields}")
-
-# Check column data type
-dtype = client.get_column_dtype("salary")
-print(f"Salary column type: {dtype}")
-
-# Rename columns
-client.rename_column("phone", "phone_number")
-
-# Drop columns (when no longer needed)
-client.drop_column("phone_number")
-```
-
-### Advanced Querying
-
-```python
-# Multiple conditions with ResultView
-results = client.query("age > 25 AND city = 'New York'")
-
-# Get query metadata
-print(f"Query returned {results.shape[0]} rows and {results.shape[1]} columns")
-print(f"Column names: {results.columns}")
-
-# Convert to different formats
-pandas_df = results.to_pandas()
-polars_df = results.to_polars() 
-arrow_table = results.to_arrow()
-
-# Collect all results
-all_data = results.collect()
-
-# Range queries
-results = client.query("score >= 85.0 AND score <= 90.0")
-
-# LIKE pattern matching
-results = client.query("name LIKE 'J%'")
-
-# Complex string queries
-results = client.query("email LIKE '%@gmail.com'")
-
-# Retrieve all records
-all_results = client.retrieve_all()
-```
-
-### Full-Text Search
-
-```python
-from apexbase.fts import FullTextSearch
-
-# Initialize FTS with configuration
-fts = FullTextSearch(
-    index_dir="fts_index",
-    max_chinese_length=4,
-    num_workers=4,
-    shard_size=100000,
-    min_term_length=2,
-    auto_save=True,
-    batch_size=1000
-)
-
-# Add documents for full-text search
-documents = [
-    {"text": "Python is a great programming language"},
-    {"text": "Machine learning with Python and TensorFlow"}, 
-    {"text": "Data science using pandas and numpy"},
-    {"text": "深度学习和自然语言处理技术"},
-]
-
-# Index documents
-for i, doc in enumerate(documents):
-    fts.add_document(i, doc["text"])
-
-# Search for terms
-results = fts.search("Python programming")
-print(f"Found documents: {list(results)}")
-
-# Search Chinese text
-results = fts.search("深度学习")
-print(f"Found Chinese documents: {list(results)}")
-
-# Save index to disk
-fts.save()
-
-# Close FTS
-fts.close()
-```
-
-### Data Framework Integration
-
-```python
-import pandas as pd
-import polars as pl
-import pyarrow as pa
-
-# Import from Pandas
-pdf = pd.DataFrame({
-    "name": ["Alice", "Bob", "Charlie"],
-    "age": [25, 30, 35],
-    "department": ["Engineering", "Sales", "Marketing"]
-})
-client.from_pandas(pdf)
-
-# Import from Polars  
-pldf = pl.DataFrame({
-    "product": ["Laptop", "Phone", "Tablet"],
-    "price": [999.99, 599.99, 399.99],
-    "in_stock": [True, False, True]
-})
-client.from_polars(pldf)
-
-# Import from PyArrow
-table = pa.Table.from_pandas(pdf)
-client.from_pyarrow(table)
-
-# Query and export to different formats
-results = client.query("age > 28")
-export_df = results.to_pandas()
-export_pl = results.to_polars()
-export_arrow = results.to_arrow()
-```
-
-### Performance Optimization & Monitoring
-
-```python
-# Store large batch of records efficiently
-large_batch = [
-    {
-        "id": i, 
-        "value": i * 2,
-        "category": f"cat_{i % 10}",
-        "timestamp": f"2024-01-{(i % 30) + 1:02d}"
-    } 
-    for i in range(100000)
-]
-
-# Batch storage with performance monitoring
-import time
-start_time = time.time()
-ids = client.store(large_batch)
-storage_time = time.time() - start_time
-print(f"Stored {len(ids)} records in {storage_time:.2f} seconds")
-
-# Force cache flush for immediate persistence
-client.flush_cache()
-
-# Optimize database performance
-client.optimize()
-
-# Monitor row counts
-total_rows = client.count_rows()
-print(f"Total rows in current table: {total_rows}")
-
-# Performance tips:
-# 1. Use batch operations for large datasets
-# 2. Enable caching for write-heavy workloads  
-# 3. Adjust batch_size based on your memory constraints
-# 4. Call optimize() after large data loads
-# 5. Use appropriate cache_size for your working set
-```
-
-## Requirements
-
-- Python >= 3.9
-- Core Dependencies:
-  - `duckdb` - High-performance columnar database engine
-  - `orjson` - Fast JSON serialization
-  - `pandas` - Data manipulation and analysis
-  - `pyarrow` - In-memory columnar data format
-  - `polars` - Fast DataFrames library
-  - `numpy` - Numerical computing
-  - `psutil` - System and process utilities
-- Full-Text Search Dependencies:
-  - `pyroaring` - Compressed bitmap data structure
-  - `msgpack` - Efficient binary serialization
-
-## Configuration Options
-
-When initializing `ApexClient`, you can customize various settings:
-
-```python
-client = ApexClient(
-    dirpath="path/to/database",     # Database directory path
-    batch_size=1000,                # Batch processing size
-    drop_if_exists=False,           # Drop existing database
-    enable_cache=True,              # Enable write caching
-    cache_size=10000               # Cache size for write operations
-)
-```
-
-### Configuration Parameters
-
-- **`dirpath`** (str): Directory for database storage. Defaults to current directory.
-- **`batch_size`** (int): Number of records to process in each batch. Default: 1000.
-- **`drop_if_exists`** (bool): Whether to delete existing database. Default: False.
-- **`enable_cache`** (bool): Enable caching for better write performance. Default: True.
-- **`cache_size`** (int): Maximum number of cached records. Default: 10000.
-
-## Performance Benchmarks
-
-ApexBase is optimized for high-performance operations:
-
-- **Single record storage**: < 1ms
-- **Batch operations**: 10,000+ records/second
-- **Query performance**: Leverages DuckDB's vectorized execution
-- **Memory efficiency**: Optimized for large datasets with controlled memory usage
-- **Full-text search**: Efficient indexing and searching with configurable parameters
-
-## License
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+Apache-2.0
