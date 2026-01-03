@@ -495,13 +495,13 @@ class ResultView:
             numpy.ndarray or list: Array of record IDs.
         """
         if self._arrow_table is not None and '_id' in self._arrow_table.column_names:
-            # 零拷贝路径：直接从 Arrow 转 numpy，不经过 Python 对象
+            # Zero-copy path: directly convert from Arrow to numpy, bypassing Python objects
             id_array = self._arrow_table.column('_id').to_numpy()
             if return_list:
                 return id_array.tolist()
             return id_array
         else:
-            # 回退：生成序列 ID
+            # Fallback: generate sequential IDs
             ids = np.arange(self._num_rows, dtype=np.uint64)
             if return_list:
                 return ids.tolist()
@@ -629,6 +629,9 @@ class ApexClient:
         self._fts_tables: Dict[str, Dict] = {}
         
         self._prefer_arrow_format = prefer_arrow_format and ARROW_AVAILABLE
+        
+        # Reference to global registry for testing purposes
+        self._registry = _registry
 
     def _is_fts_enabled(self, table_name: str = None) -> bool:
         """Check if FTS is enabled for specified table"""
@@ -773,7 +776,7 @@ class ApexClient:
 
     def _check_connection(self):
         """Check connection status"""
-        if self._is_closed:
+        if self._is_closed or self._storage is None:
             raise RuntimeError("ApexClient connection has been closed, cannot perform operations. Please create a new instance.")
 
     # ============ Public API ============
@@ -799,6 +802,7 @@ class ApexClient:
         Returns:
             str: Name of the current table.
         """
+        self._check_connection()
         return self._current_table
 
     def create_table(self, table_name: str):
@@ -825,7 +829,11 @@ class ApexClient:
             RuntimeError: If the client connection is closed.
         """
         self._check_connection()
-        self._storage.drop_table(table_name)
+        try:
+            self._storage.drop_table(table_name)
+        except ValueError:
+            # Graceful handling - table doesn't exist, nothing to drop
+            pass
         
         # FTS index files will be cleaned up in Rust layer (if needed)
         # Can also be manually cleaned up
@@ -1014,18 +1022,32 @@ class ApexClient:
         )
 
     def _store_columnar_fast(self, columns: Dict[str, list]) -> None:
-        """内部方法：高速列式存储 - 无返回值"""
+        """Internal method: high-speed columnar storage - no return value"""
         if not columns:
             return
         
-        # 获取插入前的行数，用于计算插入后的 ID 范围
+        # Validate all columns have same length
+        lengths = {}
+        for name, values in columns.items():
+            length = len(values) if hasattr(values, '__len__') else 0
+            lengths[name] = length
+        
+        unique_lengths = set(lengths.values())
+        if len(unique_lengths) > 1:
+            length_details = ", ".join(f"'{k}': {v}" for k, v in lengths.items())
+            raise ValueError(
+                f"All columns must have the same length for columnar storage. "
+                f"Got different lengths: {{{length_details}}}"
+            )
+        
+        # Get row count before insertion, to calculate ID range after insertion
         start_id = self._storage.count_rows()
         
-        # 计算批次大小
+        # Calculate batch size
         first_col = next(iter(columns.values()))
         batch_size = len(first_col) if hasattr(first_col, '__len__') else 0
         
-        # 检查是否全是 numpy 数值类型 - 使用零拷贝高速路径
+        # Check if all are numpy numeric types - use zero-copy high-speed path
         all_numpy_numeric = True
         
         for name, values in columns.items():
@@ -1038,7 +1060,7 @@ class ApexClient:
                 all_numpy_numeric = False
                 break
         
-        # 纯 numpy 数值：使用 UNSAFE 零拷贝路径 - 最高性能
+        # Pure numpy numeric: use UNSAFE zero-copy path - highest performance
         if all_numpy_numeric:
             col_names = []
             int_arrays = []
@@ -1056,10 +1078,10 @@ class ApexClient:
                     bool_lists.append(arr.tolist())
             
             self._storage._insert_numpy_unsafe(col_names, int_arrays, float_arrays, bool_lists)
-            # 纯数值数据通常不需要 FTS 索引
+            # Pure numeric data usually doesn't need FTS indexing
             return
         
-        # 混合类型：走通用路径
+        # Mixed types: use general path
         int_cols = {}
         float_cols = {}
         str_cols = {}
@@ -1070,7 +1092,7 @@ class ApexClient:
             if hasattr(values, '__len__') and len(values) == 0:
                 continue
             
-            # 处理 numpy arrays
+            # Handle numpy arrays
             if hasattr(values, 'dtype'):
                 dtype_str = str(values.dtype)
                 if 'int' in dtype_str:
@@ -1097,7 +1119,7 @@ class ApexClient:
             else:
                 str_cols[name] = [str(v) for v in values]
         
-        # 如果启用 FTS，传入索引字段名让 Rust 直接构建 FTS 文档 (零边界跨越!)
+        # If FTS is enabled, pass index field names to let Rust directly build FTS documents (zero boundary crossing!)
         fts_config = self._fts_tables.get(self._current_table, {})
         fts_fields = fts_config.get('index_fields') if (self._is_fts_enabled() and self._ensure_fts_initialized()) else None
         self._storage._insert_typed_columns_fast(
@@ -1105,9 +1127,9 @@ class ApexClient:
         )
 
     def _store_via_arrow_fast(self, table) -> None:
-        """内部方法：通过 Arrow 存储 - 使用最快路径"""
-        # 注意: 测试表明 Arrow IPC 序列化/反序列化开销较大
-        # 直接转换为 Python 列表 + _insert_typed_columns_fast 更快
+        """Internal method: store via Arrow - use fastest path"""
+        # Note: Testing shows Arrow IPC serialization/deserialization overhead is large
+        # Direct conversion to Python lists + _insert_typed_columns_fast is faster
         columns = {}
         for col_name in table.column_names:
             col = table.column(col_name)
@@ -1174,98 +1196,106 @@ class ApexClient:
                 self._storage._free_arrow_ffi(schema_ptr, array_ptr)
                 
         except Exception:
-            pass  # FFI 失败，回退到 IPC 方式
+            pass  # FFI failed, fallback to IPC method
         
-        # 回退到 Arrow IPC 方式
+        # Fallback to Arrow IPC method
         try:
             arrow_bytes = self._storage._query_arrow(where_clause)
             return ResultView.from_arrow_bytes(arrow_bytes)
         except Exception:
             pass
         
-        # 最终回退到传统方式
+        # Final fallback to traditional method
         results = self._storage.query(where_clause)
         return ResultView.from_dicts(results)
 
     def execute(self, sql: str) -> 'SqlResult':
         """
-        执行完整的 SQL 语句 (SQL:2023 标准)
+        Execute complete SQL statement (SQL:2023 standard)
         
-        支持的 SQL 语法:
+        Supported SQL syntax:
         - SELECT columns FROM table WHERE conditions
         - ORDER BY column [ASC|DESC] [NULLS FIRST|LAST]
         - LIMIT n OFFSET m
         - DISTINCT
-        - 聚合函数: COUNT, SUM, AVG, MIN, MAX
+        - Aggregate functions: COUNT, SUM, AVG, MIN, MAX
         - GROUP BY / HAVING
-        - 运算符: LIKE, IN, BETWEEN, IS NULL, AND, OR, NOT
-        - 比较运算符: =, !=, <>, <, <=, >, >=
+        - Operators: LIKE, IN, BETWEEN, IS NULL, AND, OR, NOT
+        - Comparison operators: =, !=, <>, <, <=, >, >=
         
-        示例:
-            # 基本查询
-            result = client.execute("SELECT * FROM data WHERE age > 18")
+        Examples:
+            Basic query:
+            >>> result = client.execute("SELECT * FROM default WHERE age > 18")
             
-            # 带排序和限制
-            result = client.execute("SELECT name, age FROM data ORDER BY age DESC LIMIT 10")
+            Query with ordering and limit:
+            >>> result = client.execute("SELECT name, age FROM default ORDER BY age DESC LIMIT 10")
             
-            # 聚合查询
-            result = client.execute("SELECT COUNT(*), AVG(age) FROM data WHERE status = 'active'")
+            Aggregate query:
+            >>> result = client.execute("SELECT COUNT(*), AVG(age) FROM default WHERE status = 'active'")
             
-            # LIKE 模式匹配
-            result = client.execute("SELECT * FROM data WHERE name LIKE 'John%'")
+            LIKE pattern matching:
+            >>> result = client.execute("SELECT * FROM default WHERE name LIKE 'John%'")
             
-            # GROUP BY 分组
-            result = client.execute("SELECT city, COUNT(*) FROM data GROUP BY city")
+            GROUP BY grouping:
+            >>> result = client.execute("SELECT city, COUNT(*) FROM default GROUP BY city")
         
-        Parameters:
-            sql: 完整的 SQL SELECT 语句
+        Args:
+            sql: Complete SQL SELECT statement
         
         Returns:
-            SqlResult: 包含 columns (列名列表) 和 rows (数据行列表) 的结果对象
+            SqlResult: Result object containing columns (list of column names) and rows (list of data rows)
         """
         self._check_connection()
         
-        # 尝试使用 Arrow FFI 快速路径 (用于大结果集)
+        # Try to use Arrow FFI fast path (for large result sets)
         if ARROW_AVAILABLE:
             try:
                 import pyarrow as pa
                 schema_ptr, array_ptr = self._storage._execute_arrow_ffi(sql)
                 
                 if schema_ptr != 0 and array_ptr != 0:
-                    # 使用 Arrow C Data Interface 零拷贝导入
+                    # Use Arrow C Data Interface zero-copy import
                     struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
                     if isinstance(struct_array, pa.StructArray):
                         batch = pa.RecordBatch.from_struct_array(struct_array)
                         columns = batch.schema.names
                         return SqlResult(columns, [], batch.num_rows, arrow_batch=batch)
             except Exception:
-                pass  # 回退到标准路径
+                pass  # Fallback to standard path
         
-        # 标准路径: SqlExecutor 处理
+        # Standard path: SqlExecutor handles
         result = self._storage.execute(sql)
         return SqlResult(result['columns'], result['rows'], result.get('rows_affected', 0))
 
     def retrieve(self, id_: int) -> Optional[dict]:
         """
-        获取单个记录 - 使用 Arrow C Data Interface 零拷贝传输
+        Retrieve single record - using traditional method for type fidelity
         
-        性能优化 (按优先级):
-        1. FFI 零拷贝 - 最快，无序列化开销
-        2. Arrow IPC - 次快，有序列化开销
-        3. 传统回退 - 最慢
+        Performance optimization (by priority):
+        1. Traditional method - highest type fidelity (preserves binary data)
+        2. FFI zero-copy - fastest, but may convert some types
+        3. Arrow IPC - second fastest, has serialization overhead
         
-        Parameters:
-            id_: 记录 ID
+        Args:
+            id_: Record ID
         
         Returns:
-            Optional[dict]: 记录字典，如果不存在则返回 None
+            Optional[dict]: Record dictionary, returns None if not found
         """
         self._check_connection()
         
-        if not ARROW_AVAILABLE:
-            return self._storage.retrieve(id_)
+        # Use traditional method first to preserve type fidelity (especially binary data)
+        try:
+            result = self._storage.retrieve(id_)
+            if result is not None:
+                return result
+        except Exception:
+            pass
         
-        # 优先使用 FFI 零拷贝方式 (最快)
+        if not ARROW_AVAILABLE:
+            return None
+        
+        # Fallback to FFI zero-copy method
         try:
             import pyarrow as pa
             
@@ -1286,9 +1316,9 @@ class ApexClient:
                 self._storage._free_arrow_ffi(schema_ptr, array_ptr)
                 
         except Exception:
-            pass  # FFI 失败，回退到 IPC 方式
+            pass  # FFI failed, fallback to IPC method
         
-        # 回退到 Arrow IPC 方式
+        # Fallback to Arrow IPC method
         try:
             arrow_bytes = self._storage._retrieve_many_arrow([id_])
             if arrow_bytes:
@@ -1299,24 +1329,23 @@ class ApexClient:
         except Exception:
             pass
         
-        # 最终回退到传统方式
-        return self._storage.retrieve(id_)
+        return None
 
     def retrieve_many(self, ids: List[int]) -> 'ResultView':
         """
-        获取多个记录 - 使用 Arrow C Data Interface 零拷贝传输
+        Retrieve multiple records - using Arrow C Data Interface zero-copy transfer
         
-        性能优化 (按优先级):
-        1. FFI 零拷贝 - 最快，无序列化开销
-        2. Arrow IPC - 次快，有序列化开销
-        3. 传统回退 - 最慢
+        Performance optimization (by priority):
+        1. FFI zero-copy - fastest, no serialization overhead
+        2. Arrow IPC - second fastest, has serialization overhead
+        3. Traditional fallback - slowest
         
-        Parameters:
-            ids: 要检索的记录 ID 列表
+        Args:
+            ids: List of record IDs to retrieve
         
         Returns:
-            ResultView: 记录视图，支持多种输出格式：
-                - .to_arrow() -> pyarrow.Table （零拷贝，最快）
+            ResultView: Record view supporting multiple output formats:
+                - .to_arrow() -> pyarrow.Table (zero-copy, fastest)
                 - .to_pandas() -> pandas.DataFrame
                 - .to_polars() -> polars.DataFrame
                 - .to_dict() -> List[dict]
@@ -1328,7 +1357,7 @@ class ApexClient:
         if not ARROW_AVAILABLE:
             return ResultView.from_dicts(self._storage.retrieve_many(ids))
         
-        # 优先使用 FFI 零拷贝方式 (最快)
+        # Prioritize FFI zero-copy method (fastest)
         try:
             import pyarrow as pa
             
@@ -1348,9 +1377,9 @@ class ApexClient:
                 self._storage._free_arrow_ffi(schema_ptr, array_ptr)
                 
         except Exception:
-            pass  # FFI 失败，回退到 IPC 方式
+            pass  # FFI failed, fallback to IPC method
         
-        # 回退到 Arrow IPC 方式
+        # Fallback to Arrow IPC method
         try:
             arrow_bytes = self._storage._retrieve_many_arrow(ids)
             if arrow_bytes:
@@ -1358,27 +1387,27 @@ class ApexClient:
         except Exception:
             pass
         
-        # 最终回退到传统方式
+        # Final fallback to traditional method
         return ResultView.from_dicts(self._storage.retrieve_many(ids))
 
     def retrieve_all(self) -> ResultView:
         """
-        获取所有记录 - 使用 Arrow C Data Interface 零拷贝传输
+        Retrieve all records - using Arrow C Data Interface zero-copy transfer
         
-        性能优化 (按优先级):
-        1. FFI 零拷贝 - 最快，无序列化开销
-        2. Arrow IPC - 次快，有序列化开销
-        3. 查询回退 - 最慢
+        Performance optimization (by priority):
+        1. FFI zero-copy - fastest, no serialization overhead
+        2. Arrow IPC - second fastest, has serialization overhead
+        3. Query fallback - slowest
         
         Returns:
-            ResultView: 所有记录的视图
+            ResultView: View of all records
         """
         self._check_connection()
         
         if not ARROW_AVAILABLE:
             return self.query("1=1")
         
-        # 优先使用 FFI 零拷贝方式 (最快)
+        # Prioritize FFI zero-copy method (fastest)
         try:
             import pyarrow as pa
             
@@ -1398,25 +1427,25 @@ class ApexClient:
                 self._storage._free_arrow_ffi(schema_ptr, array_ptr)
                 
         except Exception:
-            pass  # FFI 失败，回退到 IPC 方式
+            pass  # FFI failed, fallback to IPC method
         
-        # 回退到 Arrow IPC 方式
+        # Fallback to Arrow IPC method
         try:
             arrow_bytes = self._storage._retrieve_all_arrow_direct()
             return ResultView.from_arrow_bytes(arrow_bytes)
         except Exception:
             pass
         
-        # 最终回退到查询方式
+        # Final fallback to query method
         return self.query("1=1")
 
     def list_fields(self) -> List[str]:
-        """列出当前表的字段"""
+        """List fields of current table"""
         self._check_connection()
         return self._storage.list_fields()
 
     def delete(self, ids: Union[int, List[int]]) -> bool:
-        """删除记录"""
+        """Delete records"""
         self._check_connection()
         
         if isinstance(ids, int):
@@ -1438,7 +1467,7 @@ class ApexClient:
             raise ValueError("ids must be an int or a list of ints")
 
     def replace(self, id_: int, data: dict) -> bool:
-        """替换记录"""
+        """Replace record"""
         self._check_connection()
         result = self._storage.replace(id_, data)
         
@@ -1453,7 +1482,7 @@ class ApexClient:
         return result
 
     def batch_replace(self, data_dict: Dict[int, dict]) -> List[int]:
-        """批量替换记录"""
+        """Batch replace records"""
         self._check_connection()
         success_ids = []
         
@@ -1464,30 +1493,30 @@ class ApexClient:
         return success_ids
 
     def from_pandas(self, df) -> 'ApexClient':
-        """从 Pandas DataFrame 导入数据"""
+        """Import data from Pandas DataFrame"""
         records = df.to_dict('records')
         self.store(records)
         return self
 
     def from_pyarrow(self, table) -> 'ApexClient':
-        """从 PyArrow Table 导入数据"""
+        """Import data from PyArrow Table"""
         records = table.to_pylist()
         self.store(records)
         return self
 
     def from_polars(self, df) -> 'ApexClient':
-        """从 Polars DataFrame 导入数据"""
+        """Import data from Polars DataFrame"""
         records = df.to_dicts()
         self.store(records)
         return self
 
     def optimize(self):
-        """优化数据库性能"""
+        """Optimize database performance"""
         self._check_connection()
         self._storage.optimize()
 
     def count_rows(self, table_name: str = None) -> int:
-        """获取行数"""
+        """Get row count"""
         self._check_connection()
         if table_name and table_name != self._current_table:
             original = self._current_table
@@ -1499,73 +1528,73 @@ class ApexClient:
 
     def flush(self):
         """
-        将所有数据持久化到磁盘
+        Persist all data to disk
         
-        包括：
-        - 表数据（.apex 文件）
-        - FTS 索引（.nfts 文件）
+        Includes:
+        - Table data (.apex files)
+        - FTS index (.nfts files)
         
-        使用场景：
-        - 批量写入后确保数据安全
-        - 不使用 with 语句时手动持久化
-        - 程序意外退出前保护数据
+        Use cases:
+        - Ensure data safety after batch writes
+        - Manual persistence when not using with statements
+        - Protect data before unexpected program exit
         
         Example:
             client = ApexClient("./my_db")
             client.init_fts(index_fields=['title', 'content'])
             client.store(data)
-            client.flush()  # 数据现在已安全持久化到磁盘
+            client.flush()  # Data is now safely persisted to disk
         """
         self._check_connection()
-        # Flush FTS 索引（所有已启用 FTS 的表）
+        # Flush FTS index (all tables with FTS enabled)
         if self._fts_tables:
             try:
                 self._storage._fts_flush()
             except Exception:
                 pass
-        # Flush 表数据
+        # Flush table data
         self._storage.flush()
     
     def flush_cache(self):
-        """刷新缓存（已弃用，请使用 flush()）"""
+        """Flush cache (deprecated, please use flush())"""
         self.flush()
 
     def drop_column(self, column_name: str):
-        """删除列"""
+        """Drop column"""
         self._check_connection()
         if column_name == '_id':
             raise ValueError("Cannot drop _id column")
         self._storage.drop_column(column_name)
 
     def add_column(self, column_name: str, column_type: str):
-        """添加列"""
+        """Add column"""
         self._check_connection()
         self._storage.add_column(column_name, column_type)
 
     def rename_column(self, old_column_name: str, new_column_name: str):
-        """重命名列"""
+        """Rename column"""
         self._check_connection()
         if old_column_name == '_id':
             raise ValueError("Cannot rename _id column")
         self._storage.rename_column(old_column_name, new_column_name)
 
     def get_column_dtype(self, column_name: str) -> str:
-        """获取列数据类型"""
+        """Get column data type"""
         self._check_connection()
         return self._storage.get_column_dtype(column_name)
 
-    # ============ FTS 方法 ============
+    # ============ FTS Methods ============
 
     def search_text(self, query: str, table_name: str = None) -> Optional[np.ndarray]:
         """
-        执行全文搜索（Rust 原生实现，零 Python 边界开销）
+        Execute full-text search (Rust native implementation, zero Python boundary overhead)
         
-        Parameters:
-            query: 搜索查询字符串
-            table_name: 表名（可选，默认使用当前表）
+        Args:
+            query: Search query string
+            table_name: Table name (optional, defaults to current table)
         
         Returns:
-            np.ndarray: 匹配的文档 ID 数组
+            np.ndarray: Array of matching document IDs
         """
         table = table_name or self._current_table
         
@@ -1575,7 +1604,7 @@ class ApexClient:
         if not self._ensure_fts_initialized(table):
             return None
         
-        # 切换表（如果需要）
+        # Switch table if needed
         if table_name and table_name != self._current_table:
             original = self._current_table
             self.use_table(table_name)
@@ -1587,15 +1616,15 @@ class ApexClient:
 
     def fuzzy_search_text(self, query: str, min_results: int = 1, table_name: str = None) -> Optional[np.ndarray]:
         """
-        执行模糊全文搜索（Rust 原生实现，零 Python 边界开销）
+        Execute fuzzy full-text search (Rust native implementation, zero Python boundary overhead)
         
-        Parameters:
-            query: 搜索查询字符串（支持拼写错误）
-            min_results: 触发模糊搜索的最小结果数
-            table_name: 表名（可选，默认使用当前表）
+        Args:
+            query: Search query string (supports spelling errors)
+            min_results: Minimum result count to trigger fuzzy search
+            table_name: Table name (optional, defaults to current table)
         
         Returns:
-            np.ndarray: 匹配的文档 ID 数组
+            np.ndarray: Array of matching document IDs
         """
         table = table_name or self._current_table
         
@@ -1605,7 +1634,7 @@ class ApexClient:
         if not self._ensure_fts_initialized(table):
             return None
         
-        # 切换表（如果需要）
+        # Switch table if needed
         if table_name and table_name != self._current_table:
             original = self._current_table
             self.use_table(table_name)
@@ -1618,29 +1647,29 @@ class ApexClient:
     def search_and_retrieve(self, query: str, table_name: str = None, 
                            limit: Optional[int] = None, offset: int = 0) -> 'ResultView':
         """
-        执行全文搜索并返回完整记录（Rust 原生实现，零 Python 边界开销）
+        Execute full-text search and return complete records (Rust native implementation, zero Python boundary overhead)
         
-        这是最快的搜索+检索路径，因为：
-        1. 搜索在 Rust 层完成（无 Python 边界开销）
-        2. 检索在 Rust 层完成（无 Python 边界开销）
-        3. 直接返回 Arrow IPC 字节
+        This is the fastest search + retrieve path because:
+        1. Search is completed at Rust layer (no Python boundary overhead)
+        2. Retrieval is completed at Rust layer (no Python boundary overhead)
+        3. Directly returns Arrow IPC bytes
         
-        Parameters:
-            query: 搜索查询字符串
-            table_name: 表名（可选，默认使用当前表）
-            limit: 返回结果数量限制
-            offset: 结果偏移量
+        Args:
+            query: Search query string
+            table_name: Table name (optional, defaults to current table)
+            limit: Result count limit
+            offset: Result offset
         
         Returns:
-            ResultView: 查询结果视图，支持多种输出格式：
-                - .to_arrow() -> pyarrow.Table （零拷贝，最快）
+            ResultView: Query result view supporting multiple output formats:
+                - .to_arrow() -> pyarrow.Table (zero-copy, fastest)
                 - .to_pandas() -> pandas.DataFrame
                 - .to_polars() -> polars.DataFrame
                 - .to_dict() -> List[dict]
         
         Example:
             >>> results = client.search_and_retrieve("Python")
-            >>> arrow_table = results.to_arrow()  # 最快
+            >>> arrow_table = results.to_arrow()  # Fastest
             >>> df = results.to_pandas()
         """
         table = table_name or self._current_table
@@ -1651,11 +1680,11 @@ class ApexClient:
         if not self._ensure_fts_initialized(table):
             return ResultView.from_dicts([])
         
-        # 快速路径：使用默认表名
+        # Fast path: use default table name
         if table_name is None:
             table_name = self._current_table
         
-        # 切换表（如果需要）
+        # Switch table if needed
         need_switch = table_name != self._current_table
         original_table = self._current_table if need_switch else None
         
@@ -1666,7 +1695,7 @@ class ApexClient:
             if not ARROW_AVAILABLE:
                 return ResultView.from_dicts([])
             
-            # 优先使用 FFI 零拷贝方式 (最快)
+            # Prioritize FFI zero-copy method (fastest)
             try:
                 import pyarrow as pa
                 
@@ -1686,9 +1715,9 @@ class ApexClient:
                     self._storage._free_arrow_ffi(schema_ptr, array_ptr)
                     
             except Exception:
-                pass  # FFI 失败，回退到 IPC 方式
+                pass  # FFI failed, fallback to IPC method
             
-            # 回退到 Arrow IPC 方式
+            # Fallback to Arrow IPC method
             try:
                 arrow_bytes = self._storage._fts_search_and_retrieve(query, limit, offset)
                 
@@ -1705,30 +1734,30 @@ class ApexClient:
 
     def search_and_retrieve_top(self, query: str, n: int = 100, table_name: str = None) -> 'ResultView':
         """
-        执行全文搜索并返回前 N 条完整记录（Rust 原生实现）
+        Execute full-text search and return top N complete records (Rust native implementation)
         
-        这是 search_and_retrieve 的简化版本，专门用于获取前 N 条结果。
+        This is a simplified version of search_and_retrieve, specifically for getting the top N results.
         
-        Parameters:
-            query: 搜索查询字符串
-            n: 返回的最大结果数
-            table_name: 表名（可选，默认使用当前表）
+        Args:
+            query: Search query string
+            n: Maximum number of results to return
+            table_name: Table name (optional, defaults to current table)
         
         Returns:
-            ResultView: 查询结果视图
+            ResultView: Query result view
         """
         return self.search_and_retrieve(query, table_name=table_name, limit=n, offset=0)
 
     def set_fts_fuzzy_config(self, threshold: float = 0.7, max_distance: int = 2, 
                              max_candidates: int = 20, table_name: str = None):
         """
-        设置模糊搜索配置
+        Set fuzzy search configuration
         
-        Parameters:
-            threshold: 相似度阈值（0.0-1.0），越高越严格
-            max_distance: 最大编辑距离
-            max_candidates: 最大候选词数量
-            table_name: 表名（可选，默认使用当前表）
+        Args:
+            threshold: Similarity threshold (0.0-1.0), higher values are stricter
+            max_distance: Maximum edit distance
+            max_candidates: Maximum number of candidates
+            table_name: Table name (optional, defaults to current table)
         """
         table = table_name or self._current_table
         
@@ -1738,7 +1767,6 @@ class ApexClient:
         if not self._ensure_fts_initialized(table):
             return
         
-        # 切换表（如果需要）
         if table_name and table_name != self._current_table:
             original = self._current_table
             self.use_table(table_name)
@@ -1749,13 +1777,13 @@ class ApexClient:
 
     def get_fts_stats(self, table_name: str = None) -> Dict:
         """
-        获取 FTS 引擎统计信息
+        Get FTS engine statistics
         
-        Parameters:
-            table_name: 表名（可选，默认使用当前表）
+        Args:
+            table_name: Table name (optional, defaults to current table)
         
         Returns:
-            Dict: FTS 引擎统计信息
+            Dict: FTS engine statistics
         """
         table = table_name or self._current_table
         
@@ -1765,7 +1793,7 @@ class ApexClient:
         if not self._storage._fts_is_initialized():
             return {'fts_enabled': True, 'engine_initialized': False, 'table': table}
         
-        # 切换表（如果需要）
+        # Switch table if needed
         if table_name and table_name != self._current_table:
             original = self._current_table
             self.use_table(table_name)
@@ -1780,17 +1808,17 @@ class ApexClient:
 
     def compact_fts_index(self, table_name: str = None):
         """
-        压缩 FTS 索引，应用删除操作并优化存储
+        Compact FTS index, apply deletions and optimize storage
         
-        Parameters:
-            table_name: 表名（可选，默认使用当前表）
+        Args:
+            table_name: Table name (optional, defaults to current table)
         """
         table = table_name or self._current_table
         
         if not self._is_fts_enabled(table) or not self._storage._fts_is_initialized():
             return
         
-        # 切换表（如果需要）
+        # Switch table if needed
         if table_name and table_name != self._current_table:
             original = self._current_table
             self.use_table(table_name)
@@ -1801,21 +1829,21 @@ class ApexClient:
 
     def warmup_fts_terms(self, terms: List[str], table_name: str = None) -> int:
         """
-        预热 FTS 缓存（懒加载模式下有效）
+        Warm up FTS cache (effective in lazy loading mode)
         
-        Parameters:
-            terms: 要预热的词项列表
-            table_name: 表名（可选，默认使用当前表）
+        Args:
+            terms: List of terms to warm up
+            table_name: Table name (optional, defaults to current table)
         
         Returns:
-            int: 成功加载的词项数量
+            int: Number of successfully loaded terms
         """
         table = table_name or self._current_table
         
         if not self._is_fts_enabled(table) or not self._storage._fts_is_initialized():
             return 0
         
-        # 切换表（如果需要）
+        # Switch table if needed
         if table_name and table_name != self._current_table:
             original = self._current_table
             self.use_table(table_name)
@@ -1825,24 +1853,24 @@ class ApexClient:
         
         return self._storage._fts_warmup_terms(terms)
 
-    # ============ 生命周期管理 ============
+    # ============ Lifecycle Management ============
 
     def _force_close(self):
-        """强制关闭 - 确保数据持久化"""
+        """Force close - ensure data persistence"""
         try:
             if hasattr(self, '_storage') and self._storage is not None:
-                # 先 flush FTS 索引
+                # First flush FTS index
                 if hasattr(self, '_fts_tables') and self._fts_tables:
                     try:
                         self._storage._fts_flush()
                     except Exception:
                         pass
-                # 必须先 flush 确保数据持久化！
+                # Must flush first to ensure data persistence!
                 try:
                     self._storage.flush()
                 except Exception:
                     pass
-                # 然后关闭
+                # Then close
                 self._storage.close()
                 self._storage = None
         except Exception:
@@ -1850,19 +1878,19 @@ class ApexClient:
         self._is_closed = True
 
     def close(self):
-        """关闭数据库连接"""
+        """Close database connection"""
         if self._is_closed:
             return
         
         try:
             if hasattr(self, '_storage') and self._storage is not None:
-                # 先 flush FTS 索引
+                # First flush FTS index
                 if self._fts_tables:
                     try:
                         self._storage._fts_flush()
                     except Exception:
                         pass
-                # 再 flush 数据
+                # Then flush data
                 self._storage.flush()
                 self._storage.close()
                 self._storage = None
@@ -1873,45 +1901,45 @@ class ApexClient:
 
     @classmethod
     def create_clean(cls, dirpath=None, **kwargs):
-        """创建全新实例，强制清理之前的数据"""
+        """Create completely new instance, force cleanup of previous data"""
         kwargs['drop_if_exists'] = True
         return cls(dirpath=dirpath, **kwargs)
 
     def __enter__(self):
         """
-        上下文管理器入口 - 支持with语句
+        Context manager entry - supports with statement
         
         Returns:
-            ApexClient: 返回自身实例，支持链式调用
+            ApexClient: Returns self instance, supports chain calls
             
         Example:
             >>> with ApexClient("./my_db") as client:
             ...     client.store({"name": "Alice"})
-            ...     # 自动调用 close()
+            ...     # Automatically calls close()
         """
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """
-        上下文管理器出口 - 自动清理资源
+        Context manager exit - automatically cleanup resources
         
-        无论是否发生异常，都会确保：
-        - FTS 索引被正确刷新
-        - 数据被持久化到磁盘（通过 flush()）
-        - 数据库连接被关闭
-        - 从全局注册表中注销（如果启用了auto_manage）
+        Regardless of whether an exception occurs, ensures:
+        - FTS index is properly flushed
+        - Data is persisted to disk (via flush())
+        - Database connection is closed
+        - Unregistered from global registry (if auto_manage is enabled)
         
-        注意：ApexBase 不实现传统的事务回滚机制。如果在上下文中
-        发生异常，异常发生前的数据操作通常会被持久化，但具体行为
-        取决于异常发生时数据是否已被刷新到磁盘。
+        Note: ApexBase does not implement traditional transaction rollback mechanisms. If in the context
+        an exception occurs, data operations before the exception are usually persisted, but the specific behavior
+        depends on whether data had been flushed to disk when the exception occurred.
         
         Args:
-            exc_type: 异常类型（如果有）
-            exc_val: 异常值（如果有）
-            exc_tb: 异常跟踪（如果有）
+            exc_type: Exception type (if any)
+            exc_val: Exception value (if any)
+            exc_tb: Exception traceback (if any)
             
         Returns:
-            bool: 返回 False，不抑制异常，让调用者处理
+            bool: Returns False, does not suppress exception, lets caller handle it
         """
         self.close()
         return False
@@ -1924,6 +1952,6 @@ class ApexClient:
         return f"ApexClient(path='{self._dirpath}', table='{self._current_table}')"
 
 
-# 导出
+# Exports
 __all__ = ['ApexClient', 'ResultView', 'DurabilityLevel', '__version__', 'FTS_AVAILABLE', 'ARROW_AVAILABLE', 'POLARS_AVAILABLE']
 

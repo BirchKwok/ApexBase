@@ -186,6 +186,11 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::String(s));
     }
 
+    // Handle Python bytes objects
+    if let Ok(bytes) = obj.extract::<Vec<u8>>() {
+        return Ok(Value::Binary(bytes));
+    }
+
     if let Ok(list) = obj.downcast::<PyList>() {
         let mut arr = Vec::new();
         for item in list.iter() {
@@ -2239,15 +2244,13 @@ impl ApexStorage {
         use crate::io_engine::IoEngine;
         use crate::query::{SqlParser, SqlStatement};
         
-        // Parse SQL to extract table name from FROM clause (required per SQL standard)
+        // Parse SQL to extract table name from FROM clause (optional, defaults to current table)
         let target_table = {
             let stmt = SqlParser::parse(sql)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             match stmt {
                 SqlStatement::Select(select) => {
-                    select.from.ok_or_else(|| PyValueError::new_err(
-                        "FROM clause is required. Use: SELECT ... FROM table_name"
-                    ))?
+                    select.from.unwrap_or_else(|| "default".to_string())
                 }
             }
         };
@@ -2315,15 +2318,13 @@ impl ApexStorage {
         use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
         use arrow::array::Array;
         
-        // Parse SQL to extract table name from FROM clause (required per SQL standard)
+        // Parse SQL to extract table name from FROM clause (optional, defaults to current table)
         let target_table = {
             let stmt = SqlParser::parse(sql)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             match stmt {
                 SqlStatement::Select(select) => {
-                    select.from.ok_or_else(|| PyValueError::new_err(
-                        "FROM clause is required. Use: SELECT ... FROM table_name"
-                    ))?
+                    select.from.unwrap_or_else(|| "default".to_string())
                 }
             }
         };

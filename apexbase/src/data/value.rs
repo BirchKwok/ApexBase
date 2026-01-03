@@ -111,7 +111,7 @@ impl Value {
         }
     }
 
-    /// Convert to string representation
+    /// Convert to string representation (for display purposes)
     pub fn to_string_value(&self) -> String {
         match self {
             Value::Null => "null".to_string(),
@@ -127,7 +127,15 @@ impl Value {
             Value::Float32(v) => v.to_string(),
             Value::Float64(v) => v.to_string(),
             Value::String(s) => s.clone(),
-            Value::Binary(b) => format!("{:?}", b),
+            Value::Binary(b) => {
+                // For binary data, try to represent as UTF-8 string first, fallback to length indicator
+                if let Ok(s) = std::str::from_utf8(b) {
+                    s.to_string()
+                } else {
+                    // For non-UTF8 binary data, indicate it's binary with length
+                    format!("<binary_data_{}bytes>", b.len())
+                }
+            },
             Value::Json(j) => j.to_string(),
             Value::Timestamp(t) => t.to_string(),
             Value::Date(d) => d.to_string(),
