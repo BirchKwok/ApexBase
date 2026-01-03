@@ -18,7 +18,9 @@ use std::sync::Arc;
 /// We handle the conversion transparently.
 pub struct FtsEngine {
     engine: RwLock<Option<UnifiedEngine>>,
+    #[allow(dead_code)]
     index_path: PathBuf,
+    #[allow(dead_code)]
     config: FtsConfig,
 }
 

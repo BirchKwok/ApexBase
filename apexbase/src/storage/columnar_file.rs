@@ -48,7 +48,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -60,10 +60,12 @@ use serde::{Deserialize, Serialize};
 // ============================================================================
 
 const MAGIC_HEADER: &[u8; 8] = b"APEXCOL\0";
+#[allow(dead_code)]
 const MAGIC_FOOTER: &[u8; 8] = b"APEXEND\0";
 const MAGIC_DELTA: &[u8; 4] = b"DELT";
 const FORMAT_VERSION: u32 = 2;  // Bump version for delta support
 const HEADER_SIZE: usize = 128;
+#[allow(dead_code)]
 const FOOTER_SIZE: usize = 32;
 /// Delta compaction threshold (number of delta records before auto-compact)
 const DELTA_COMPACT_THRESHOLD: u64 = 10000;
@@ -108,6 +110,7 @@ pub enum ColumnType {
     Binary = TYPE_BINARY,
 }
 
+#[allow(dead_code)]
 impl ColumnType {
     fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -214,6 +217,7 @@ pub enum ColumnData {
     },
 }
 
+#[allow(dead_code)]
 impl ColumnData {
     pub fn new(dtype: ColumnType) -> Self {
         match dtype {
@@ -446,6 +450,7 @@ struct FileHeader {
     column_count: u32,
     created_at: i64,
     modified_at: i64,
+    #[allow(dead_code)]
     checksum: u32,
     // Delta support fields (v2)
     delta_offset: u64,     // Start of delta zone (0 = no delta)
@@ -1294,7 +1299,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bench.apex");
         
-        let storage = ColumnarStorage::create(&path).unwrap();
+        let _storage = ColumnarStorage::create(&path).unwrap();
         
         let n = 10_000;
         

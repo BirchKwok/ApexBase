@@ -890,33 +890,30 @@ mod tests {
     fn test_simple_select() {
         let sql = "SELECT * FROM users";
         let stmt = SqlParser::parse(sql).unwrap();
-        if let SqlStatement::Select(s) = stmt {
-            assert!(!s.distinct);
-            assert_eq!(s.columns.len(), 1);
-            assert!(matches!(s.columns[0], SelectColumn::All));
-            assert_eq!(s.from, Some("users".to_string()));
-        }
+        let SqlStatement::Select(s) = stmt;
+        assert!(!s.distinct);
+        assert_eq!(s.columns.len(), 1);
+        assert!(matches!(s.columns[0], SelectColumn::All));
+        assert_eq!(s.from, Some("users".to_string()));
     }
 
     #[test]
     fn test_select_with_where() {
         let sql = "SELECT name, age FROM users WHERE age > 18 AND name LIKE 'John%'";
         let stmt = SqlParser::parse(sql).unwrap();
-        if let SqlStatement::Select(s) = stmt {
-            assert_eq!(s.columns.len(), 2);
-            assert!(s.where_clause.is_some());
-        }
+        let SqlStatement::Select(s) = stmt;
+        assert_eq!(s.columns.len(), 2);
+        assert!(s.where_clause.is_some());
     }
 
     #[test]
     fn test_select_with_order_limit() {
         let sql = "SELECT * FROM users ORDER BY age DESC LIMIT 10 OFFSET 5";
         let stmt = SqlParser::parse(sql).unwrap();
-        if let SqlStatement::Select(s) = stmt {
-            assert_eq!(s.order_by.len(), 1);
-            assert!(s.order_by[0].descending);
-            assert_eq!(s.limit, Some(10));
-            assert_eq!(s.offset, Some(5));
-        }
+        let SqlStatement::Select(s) = stmt;
+        assert_eq!(s.order_by.len(), 1);
+        assert!(s.order_by[0].descending);
+        assert_eq!(s.limit, Some(10));
+        assert_eq!(s.offset, Some(5));
     }
 }

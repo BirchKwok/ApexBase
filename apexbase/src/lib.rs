@@ -5,19 +5,18 @@
 
 pub mod storage;
 pub mod table;
-pub mod index;
 pub mod query;
 pub mod data;
-pub mod cache;
 pub mod python;
 pub mod fts;
 pub mod io_engine;
 
 // Re-export main types
-pub use storage::ApexFile;
+pub use storage::{ColumnarStorage, ColumnType, ColumnValue, FileSchema};
 pub use table::{TableCatalog, ColumnTable};
 pub use data::{DataType, Value, Row};
 pub use query::QueryExecutor;
+pub use io_engine::{IoEngine, IoResult, QueryHints, IoStrategy, WriteHints, WriteResult};
 
 use pyo3::prelude::*;
 

@@ -18,135 +18,6 @@ use std::fs;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use numpy::{PyArray1, PyReadonlyArray1};
-// Note: compact_str, string_interner, and rayon are available but not currently used
-// They were tested for string optimization but PyO3 FFI overhead remains the bottleneck
-#[allow(unused_imports)]
-use compact_str::CompactString;
-#[allow(unused_imports)]
-use string_interner::{StringInterner, DefaultBackend, DefaultSymbol};
-#[allow(unused_imports)]
-use rayon::prelude::*;
-
-/// Type alias for string interner (for future optimization)
-#[allow(dead_code)]
-type StrInterner = StringInterner<DefaultBackend>;
-
-/// ULTRA-FAST string extraction with CompactString (SSO) and optional interning
-/// 
-/// Performance optimizations:
-/// 1. CompactString: Strings <= 24 bytes stored inline (no heap allocation)
-/// 2. Pre-computed hash for repeated string detection
-/// 3. Direct memory access without bounds checking
-#[inline]
-fn extract_strings_compact(obj: &Bound<'_, PyAny>) -> PyResult<Vec<CompactString>> {
-    use pyo3::types::PyString;
-    
-    let list = obj.downcast::<PyList>()?;
-    let len = list.len();
-    let mut result = Vec::with_capacity(len);
-    
-    // Fast path: direct iteration with CompactString (SSO for short strings)
-    for item in list.iter() {
-        if let Ok(py_str) = item.downcast::<PyString>() {
-            // CompactString stores strings <= 24 bytes inline (no heap allocation)
-            result.push(CompactString::new(py_str.to_str()?));
-        } else {
-            result.push(CompactString::new(""));
-        }
-    }
-    
-    Ok(result)
-}
-
-/// Extract strings with interning for columns with many repeated values
-/// Returns (interned_symbols, interner) where symbols can be resolved to strings
-#[inline]
-#[allow(dead_code)]
-fn extract_strings_interned(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<DefaultSymbol>, StrInterner)> {
-    use pyo3::types::PyString;
-    
-    let list = obj.downcast::<PyList>()?;
-    let len = list.len();
-    let mut interner: StrInterner = StringInterner::new();
-    let mut symbols = Vec::with_capacity(len);
-    
-    // Intern strings - repeated strings share the same allocation
-    for item in list.iter() {
-        if let Ok(py_str) = item.downcast::<PyString>() {
-            let s = py_str.to_str()?;
-            symbols.push(interner.get_or_intern(s));
-        } else {
-            symbols.push(interner.get_or_intern(""));
-        }
-    }
-    
-    Ok((symbols, interner))
-}
-
-/// Convert CompactString vec to String vec (for storage compatibility)
-#[inline]
-#[allow(dead_code)]
-fn compact_to_string_vec(compact: Vec<CompactString>) -> Vec<String> {
-    compact.into_iter().map(|s| s.into()).collect()
-}
-
-/// ULTRA-FAST: Extract all string columns in parallel after GIL is released
-/// Uses ForkUnion for low-latency parallel processing
-#[inline]
-fn extract_all_strings_parallel(
-    str_cols: &Bound<'_, PyDict>,
-) -> PyResult<(Vec<String>, Vec<Vec<String>>, usize)> {
-    use pyo3::types::PyString;
-    
-    let mut col_names = Vec::with_capacity(str_cols.len());
-    let mut all_strings = Vec::with_capacity(str_cols.len());
-    let mut batch_size = 0usize;
-    
-    // Extract all string columns (requires GIL)
-    for (key, value) in str_cols.iter() {
-        let col_name: String = key.extract()?;
-        let list = value.downcast::<PyList>()?;
-        let len = list.len();
-        if batch_size == 0 { batch_size = len; }
-        
-        let mut strings: Vec<String> = Vec::with_capacity(len);
-        for item in list.iter() {
-            if let Ok(py_str) = item.downcast::<PyString>() {
-                strings.push(py_str.to_str()?.to_owned());
-            } else {
-                strings.push(String::new());
-            }
-        }
-        col_names.push(col_name);
-        all_strings.push(strings);
-    }
-    
-    Ok((col_names, all_strings, batch_size))
-}
-
-/// Fast string list extraction - optimized for bulk string columns
-/// Uses to_str() for direct access with minimal overhead
-#[inline]
-fn extract_string_list_fast(obj: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
-    use pyo3::types::PyString;
-    
-    let list = obj.downcast::<PyList>()?;
-    let len = list.len();
-    let mut result = Vec::with_capacity(len);
-    
-    // OPTIMIZED: Use unsafe_get for faster iteration (skip bounds check)
-    // PyList is guaranteed to have indices 0..len
-    for i in 0..len {
-        let item = unsafe { list.get_item_unchecked(i) };
-        if let Ok(py_str) = item.downcast::<PyString>() {
-            result.push(py_str.to_str()?.to_owned());
-        } else {
-            result.push(String::new());
-        }
-    }
-    
-    Ok(result)
-}
 
 /// Convert Python dict to HashMap<String, Value>
 fn dict_to_fields(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, Value>> {
@@ -561,11 +432,6 @@ impl Durability {
     pub fn sync_on_flush(&self) -> bool {
         matches!(self, Durability::Safe | Durability::Max)
     }
-    
-    /// Whether to fsync on every write
-    pub fn sync_on_write(&self) -> bool {
-        matches!(self, Durability::Max)
-    }
 }
 
 /// High-performance columnar storage engine
@@ -892,7 +758,6 @@ impl ApexStorage {
     /// This is the fastest path for bulk loading from PyArrow/Pandas/Polars.
     fn store_arrow(&self, py: Python<'_>, arrow_bytes: &[u8]) -> PyResult<Vec<i64>> {
         use arrow::ipc::reader::StreamReader;
-        use arrow::array::*;
         
         if arrow_bytes.is_empty() {
             return Ok(Vec::new());
@@ -2478,7 +2343,6 @@ impl ApexStorage {
     fn query_arrow_ffi(&self, py: Python<'_>, where_clause: &str) -> PyResult<(u64, u64)> {
         use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
         use arrow::array::Array;
-        use std::sync::Arc;
         
         let table_name = self.current_table.read().clone();
         let where_clause = where_clause.to_string();
@@ -2719,14 +2583,13 @@ impl ApexStorage {
     }
 
     /// Get column data type
-    fn get_column_dtype(&self, name: &str) -> PyResult<String> {
+    fn get_column_dtype(&self, _name: &str) -> PyResult<String> {
         let table_name = self.current_table.read().clone();
         let tables = self.tables.read();
-        let table = tables.get(&table_name)
+        let _table = tables.get(&table_name)
             .ok_or_else(|| PyValueError::new_err("Table not found"))?;
         
         // Return a generic type since columnar storage is flexible
-        let _ = name;
         Ok("dynamic".to_string())
     }
 

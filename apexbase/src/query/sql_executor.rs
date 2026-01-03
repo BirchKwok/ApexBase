@@ -6,12 +6,11 @@
 use crate::ApexError;
 use crate::data::Value;
 use crate::query::Filter;
-use crate::query::filter::{LikeMatcher, CompareOp};
 use crate::query::sql_parser::{
     SqlStatement, SelectStatement, SelectColumn, SqlExpr, 
     BinaryOperator, UnaryOperator, OrderByClause, AggregateFunc
 };
-use crate::table::column_table::{ColumnTable, ColumnSchema, TypedColumn};
+use crate::table::column_table::{ColumnTable, TypedColumn};
 use crate::io_engine::{IoEngine, StreamingFilterEvaluator};
 use std::collections::HashMap;
 use std::cmp::Ordering;
@@ -118,6 +117,7 @@ impl SqlResult {
 /// SQL Executor
 pub struct SqlExecutor;
 
+#[allow(dead_code)]
 impl SqlExecutor {
     /// Execute a SQL statement against a table
     pub fn execute(sql: &str, table: &mut ColumnTable) -> Result<SqlResult, ApexError> {
@@ -2040,7 +2040,7 @@ impl SqlExecutor {
         }
         
         // Apply HAVING filter
-        if let Some(ref having_expr) = stmt.having {
+        if let Some(ref _having_expr) = stmt.having {
             // TODO: Implement HAVING filter
             // For now, skip HAVING
         }

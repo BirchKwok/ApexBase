@@ -1,9 +1,61 @@
 //! Schema definition for tables
 
-use crate::data::{ColumnDef, DataType};
+use crate::data::{DataType, Value};
 use crate::{ApexError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Column definition
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColumnDef {
+    /// Column ID (unique within a table)
+    pub id: u16,
+    /// Column name
+    pub name: String,
+    /// Data type
+    pub data_type: DataType,
+    /// Whether the column can contain null values
+    pub nullable: bool,
+    /// Whether this column is indexed
+    pub indexed: bool,
+    /// Default value (optional)
+    pub default_value: Option<Value>,
+    /// Ordinal position in the table
+    pub ordinal_position: u16,
+}
+
+impl ColumnDef {
+    /// Create a new column definition
+    pub fn new(id: u16, name: impl Into<String>, data_type: DataType) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            data_type,
+            nullable: true,
+            indexed: false,
+            default_value: None,
+            ordinal_position: id,
+        }
+    }
+
+    /// Set nullable flag
+    pub fn nullable(mut self, nullable: bool) -> Self {
+        self.nullable = nullable;
+        self
+    }
+
+    /// Set indexed flag
+    pub fn indexed(mut self, indexed: bool) -> Self {
+        self.indexed = indexed;
+        self
+    }
+
+    /// Set ordinal position
+    pub fn position(mut self, pos: u16) -> Self {
+        self.ordinal_position = pos;
+        self
+    }
+}
 
 /// Table schema
 #[derive(Debug, Clone, Serialize, Deserialize)]

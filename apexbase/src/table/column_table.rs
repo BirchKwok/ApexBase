@@ -336,11 +336,11 @@ impl TypedColumn {
                 data.push(v.clone());
             }
             // Type mismatch - convert to mixed or store as null
-            (col, value) => {
+            (col, _value) => {
                 col.push_null();
                 // Log warning in debug mode
                 #[cfg(debug_assertions)]
-                eprintln!("Warning: Type mismatch when pushing {:?}", value);
+                eprintln!("Warning: Type mismatch when pushing {:?}", _value);
             }
         }
     }

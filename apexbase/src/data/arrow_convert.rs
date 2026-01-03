@@ -80,7 +80,7 @@ pub fn rows_to_arrow_ipc(rows: &[Row]) -> Result<Vec<u8>, String> {
     }
 
     // Collect all column names and infer types from first row
-    let first_row = &rows[0];
+    let _first_row = &rows[0];
     let mut columns: Vec<(String, ArrowDataType)> = vec![("_id".to_string(), ArrowDataType::UInt64)];
 
     // Collect all unique field names from all rows

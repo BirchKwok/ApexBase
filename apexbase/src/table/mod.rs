@@ -1,13 +1,9 @@
 //! Table management module
+//!
+//! Provides columnar table storage with high-performance operations.
 
 mod catalog;
 mod schema;
-
-// Legacy row-based table (deprecated, kept for reference)
-#[allow(dead_code)]
-pub(crate) mod table;
-
-// Current columnar table implementation
 pub mod column_table;
 
 pub use catalog::{TableCatalog, TableEntry};
