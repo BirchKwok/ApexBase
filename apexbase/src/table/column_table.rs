@@ -1868,10 +1868,10 @@ impl ColumnTable {
     /// 3. Parallel string building with chunked processing
     pub fn query_to_record_batch(&mut self, where_clause: &str) -> Result<arrow::record_batch::RecordBatch> {
         use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringBuilder, UInt64Array};
-        use arrow::array::{DictionaryArray, StringArray, UInt32Array};
+        use arrow::array::{DictionaryArray, StringArray};
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use arrow::buffer::{NullBuffer, ScalarBuffer};
-        use arrow::datatypes::UInt32Type;
+        use arrow::datatypes::Int32Type;
         use rayon::prelude::*;
         use std::sync::Arc;
 
@@ -1898,7 +1898,7 @@ impl ColumnTable {
                 DataType::String => {
                     match self.columns.get(col_idx) {
                         Some(TypedColumn::String(s)) if s.is_dictionary_enabled() => {
-                            ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8))
+                            ArrowDataType::Dictionary(Box::new(ArrowDataType::Int32), Box::new(ArrowDataType::Utf8))
                         }
                         _ => ArrowDataType::Utf8,
                     }
@@ -1919,9 +1919,10 @@ impl ColumnTable {
                     TypedColumn::Float64 { .. } => Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
                     TypedColumn::Bool { .. } => Arc::new(BooleanArray::from(Vec::<Option<bool>>::new())),
                     TypedColumn::String(s) if s.is_dictionary_enabled() => {
-                        let keys = UInt32Array::from(Vec::<u32>::new());
+                        use arrow::array::Int32Array;
+                        let keys = Int32Array::from(Vec::<i32>::new());
                         let values = StringArray::from(Vec::<Option<&str>>::new());
-                        Arc::new(DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values)).unwrap())
+                        Arc::new(DictionaryArray::<arrow::datatypes::Int32Type>::try_new(keys, Arc::new(values)).unwrap())
                     }
                     TypedColumn::String(_) => Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
                     TypedColumn::Mixed { .. } => Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
@@ -2080,12 +2081,22 @@ impl ColumnTable {
 
         // Build schema
         let mut fields = vec![Field::new("_id", ArrowDataType::UInt64, false)];
-        for (name, dtype) in &self.schema.columns {
+        for (col_idx, (name, dtype)) in self.schema.columns.iter().enumerate() {
             let arrow_type = match dtype {
                 DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => ArrowDataType::Int64,
                 DataType::Float64 | DataType::Float32 => ArrowDataType::Float64,
                 DataType::Bool => ArrowDataType::Boolean,
-                DataType::String => ArrowDataType::Utf8,
+                DataType::String => {
+                    match self.columns.get(col_idx) {
+                        Some(TypedColumn::String(s)) if s.is_dictionary_enabled() => {
+                            ArrowDataType::Dictionary(
+                                Box::new(ArrowDataType::Int32),
+                                Box::new(ArrowDataType::Utf8),
+                            )
+                        }
+                        _ => ArrowDataType::Utf8,
+                    }
+                }
                 _ => ArrowDataType::Utf8,
             };
             fields.push(Field::new(name, arrow_type, true));

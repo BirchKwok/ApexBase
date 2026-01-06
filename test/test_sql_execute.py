@@ -73,6 +73,26 @@ class TestBasicSQLExecute:
             assert "_id" not in result.columns  # _id should be hidden
             
             client.close()
+
+    def test_execute_arrow_dictionary_string_schema_match(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            if not (ARROW_AVAILABLE and PYARROW_AVAILABLE and PANDAS_AVAILABLE):
+                pytest.skip("Arrow/PyArrow/Pandas not available")
+
+            client = ApexClient(dirpath=temp_dir)
+
+            repeated = [{"title": "Python编程指南", "content": "same", "number": i % 10} for i in range(6000)]
+            client.store(repeated)
+            client.flush()
+
+            df = client.execute("select * from default where title like 'Python%'").to_pandas()
+            assert len(df) == 6000
+            assert "title" in df.columns
+            assert "content" in df.columns
+            assert "number" in df.columns
+            assert df["title"].iloc[0].startswith("Python")
+
+            client.close()
     
     def test_execute_select_specific_columns(self):
         """Test SELECT with specific columns"""

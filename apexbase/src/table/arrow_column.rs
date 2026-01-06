@@ -15,9 +15,9 @@ use arrow::array::{
     ArrayRef, BooleanBuilder, Float64Builder,
     GenericByteBuilder, Int64Builder,
 };
-use arrow::array::{DictionaryArray, StringArray, UInt32Array};
+use arrow::array::{DictionaryArray, Int32Array, StringArray};
 use arrow::datatypes::GenericStringType;
-use arrow::datatypes::UInt32Type;
+use arrow::datatypes::Int32Type;
 use arrow::buffer::{Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -570,7 +570,7 @@ impl ArrowStringColumn {
         if self.dict_enabled {
             let values = self.build_dictionary_values();
             let keys = self.build_dictionary_keys(&self.dict_keys);
-            if let Ok(dict) = DictionaryArray::<UInt32Type>::try_new(keys, values) {
+            if let Ok(dict) = DictionaryArray::<Int32Type>::try_new(keys, values) {
                 return Arc::new(dict);
             }
 
@@ -612,13 +612,13 @@ impl ArrowStringColumn {
                     keys.push(0);
                     valid.push(false);
                 } else {
-                    keys.push(*self.dict_keys.get(idx).unwrap_or(&0));
+                    keys.push(*self.dict_keys.get(idx).unwrap_or(&0) as i32);
                     valid.push(true);
                 }
             }
 
-            let key_array = UInt32Array::new(ScalarBuffer::from(keys), Some(NullBuffer::from(valid)));
-            if let Ok(dict) = DictionaryArray::<UInt32Type>::try_new(key_array, values) {
+            let key_array = Int32Array::new(ScalarBuffer::from(keys), Some(NullBuffer::from(valid)));
+            if let Ok(dict) = DictionaryArray::<Int32Type>::try_new(key_array, values) {
                 return Arc::new(dict);
             }
 
@@ -672,12 +672,13 @@ impl ArrowStringColumn {
         Self::build_utf8_array_from_buffers(offsets, values, None)
     }
 
-    fn build_dictionary_keys(&self, keys: &[u32]) -> UInt32Array {
+    fn build_dictionary_keys(&self, keys: &[u32]) -> Int32Array {
         let mut valid = Vec::with_capacity(self.len);
         for i in 0..self.len {
             valid.push(!self.nulls.get(i));
         }
-        UInt32Array::new(ScalarBuffer::from(keys.to_vec()), Some(NullBuffer::from(valid)))
+        let keys_i32: Vec<i32> = keys.iter().map(|&k| k as i32).collect();
+        Int32Array::new(ScalarBuffer::from(keys_i32), Some(NullBuffer::from(valid)))
     }
 
     #[inline]
