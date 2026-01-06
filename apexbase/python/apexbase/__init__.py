@@ -10,6 +10,7 @@ import atexit
 from typing import List, Dict, Union, Optional, Literal
 from pathlib import Path
 import numpy as np
+import re
 
 # Import Rust core
 from apexbase._core import ApexStorage as RustStorage, __version__ as _core_version
@@ -109,10 +110,14 @@ class ResultView:
         raise RuntimeError("Non-Arrow query path has been removed. Use Arrow FFI results only.")
     
     def _ensure_data(self):
-        """Ensure _data is available (lazy load from Arrow conversion, hide _id)"""
+        """Ensure _data is available (lazy load from Arrow conversion, optionally hide _id)"""
         if self._data is None and self._arrow_table is not None:
-            self._data = [{k: v for k, v in row.items() if k != '_id'} 
-                          for row in self._arrow_table.to_pylist()]
+            show_id = bool(getattr(self, "_show_internal_id", False))
+            if show_id:
+                self._data = [dict(row) for row in self._arrow_table.to_pylist()]
+            else:
+                self._data = [{k: v for k, v in row.items() if k != '_id'} 
+                              for row in self._arrow_table.to_pylist()]
         return self._data if self._data is not None else []
     
     def to_dict(self) -> List[dict]:
@@ -146,6 +151,7 @@ class ResultView:
             raise ImportError("pandas not available. Install with: pip install pandas")
         
         if self._arrow_table is not None:
+            show_id = bool(getattr(self, "_show_internal_id", False))
             if zero_copy:
                 # Zero-copy mode: use ArrowDtype (pandas 2.0+)
                 try:
@@ -156,8 +162,8 @@ class ResultView:
             else:
                 # Traditional mode: copy data to NumPy types
                 df = self._arrow_table.to_pandas()
-            
-            if '_id' in df.columns:
+
+            if not show_id and '_id' in df.columns:
                 df.set_index('_id', inplace=True)
                 df.index.name = None
             return df
@@ -183,7 +189,8 @@ class ResultView:
         
         if self._arrow_table is not None:
             df = pl.from_arrow(self._arrow_table)
-            if '_id' in df.columns:
+            show_id = bool(getattr(self, "_show_internal_id", False))
+            if not show_id and '_id' in df.columns:
                 df = df.drop('_id')
             return df
         return pl.DataFrame(self._ensure_data())
@@ -201,9 +208,11 @@ class ResultView:
             raise ImportError("pyarrow not available. Install with: pip install pyarrow")
         
         if self._arrow_table is not None:
-            # Remove _id column
-            if '_id' in self._arrow_table.column_names:
-                return self._arrow_table.drop(['_id'])
+            show_id = bool(getattr(self, "_show_internal_id", False))
+            if not show_id:
+                # Remove _id column
+                if '_id' in self._arrow_table.column_names:
+                    return self._arrow_table.drop(['_id'])
             return self._arrow_table
         return pa.Table.from_pylist(self._ensure_data())
     
@@ -220,6 +229,9 @@ class ResultView:
     def columns(self):
         if self._arrow_table is not None:
             cols = self._arrow_table.column_names
+            show_id = bool(getattr(self, "_show_internal_id", False))
+            if show_id:
+                return list(cols)
             return [c for c in cols if c != '_id']
         data = self._ensure_data()
         if not data:
@@ -1001,10 +1013,82 @@ class ApexClient:
             ResultView: SQL execution result view (Arrow-first)
         """
         self._check_connection()
+
+        # Normalize complex _id references for execution:
+        # - qualified forms: table._id / alias._id -> _id
+        # - quoted identifier: "_id" -> _id
+        # This provides compatibility even if the Rust SQL layer doesn't fully support
+        # qualified/quoted identifiers.
+        sql_exec = re.sub(r'(?i)\b([a-z_][\w]*)\s*\.\s*_id\b', '_id', sql)
+        sql_exec = re.sub(r'(?i)\"_id\"', '_id', sql_exec)
+
+        # Default behavior: hide internal _id unless explicitly selected
+        show_internal_id = False
+
+        def _split_select_items(select_list: str):
+            items = []
+            buf = []
+            depth = 0
+            in_single = False
+            in_double = False
+            i = 0
+            while i < len(select_list):
+                ch = select_list[i]
+                if ch == "'" and not in_double:
+                    in_single = not in_single
+                    buf.append(ch)
+                    i += 1
+                    continue
+                if ch == '"' and not in_single:
+                    in_double = not in_double
+                    buf.append(ch)
+                    i += 1
+                    continue
+                if not in_single and not in_double:
+                    if ch == '(':
+                        depth += 1
+                    elif ch == ')':
+                        depth = max(0, depth - 1)
+                    elif ch == ',' and depth == 0:
+                        item = ''.join(buf).strip()
+                        if item:
+                            items.append(item)
+                        buf = []
+                        i += 1
+                        continue
+                buf.append(ch)
+                i += 1
+            tail = ''.join(buf).strip()
+            if tail:
+                items.append(tail)
+            return items
+
+        def _is_plain_star(item: str) -> bool:
+            return bool(re.fullmatch(r"\*", item.strip()))
+
+        def _has_explicit_id_item(item: str) -> bool:
+            s = item.strip()
+            # Skip obvious aggregate/function usage like COUNT(_id)
+            if re.search(r"\b(count|sum|avg|min|max)\s*\(", s, flags=re.IGNORECASE):
+                return False
+            # Match: _id / "_id" / t._id / schema.t._id (Rust parser normalizes to last segment anyway)
+            return bool(re.search(r"(^|[^\w])(_id|\"_id\")([^\w]|$)|\._id([^\w]|$)", s, flags=re.IGNORECASE))
+
+        m = re.search(r"\bselect\b(.*?)\bfrom\b", sql, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            select_list = m.group(1)
+            items = _split_select_items(select_list)
+            has_star = any(_is_plain_star(it) for it in items)
+            has_id = any(_has_explicit_id_item(it) for it in items)
+            # Default: SELECT * hides _id. But any explicit _id item makes it visible.
+            if has_id and (not has_star or True):
+                # Note: even with SELECT *, _id we want _id visible
+                if not (len(items) == 1 and has_star):
+                    show_internal_id = True
         
         # Prefer Arrow FFI fast path
         if ARROW_AVAILABLE:
-            schema_ptr, array_ptr = self._storage._execute_arrow_ffi(sql)
+            schema_ptr, array_ptr = self._storage._execute_arrow_ffi(sql_exec)
             if schema_ptr == 0 and array_ptr == 0:
                 return ResultView(arrow_table=pa.table({}), data=[])
             try:
@@ -1012,7 +1096,9 @@ class ApexClient:
                 if isinstance(struct_array, pa.StructArray):
                     batch = pa.RecordBatch.from_struct_array(struct_array)
                     table = pa.Table.from_batches([batch])
-                    return ResultView(table)
+                    rv = ResultView(table)
+                    rv._show_internal_id = show_internal_id
+                    return rv
                 raise RuntimeError("FFI import did not return StructArray")
             except Exception:
                 pass
@@ -1020,11 +1106,16 @@ class ApexClient:
                 self._storage._free_arrow_ffi(schema_ptr, array_ptr)
 
         # Fallback path (no Arrow): execute via row-based API and wrap as ResultView
-        result = self._storage.execute(sql)
+        result = self._storage.execute(sql_exec)
         columns = result.get('columns', [])
         rows = result.get('rows', [])
-        data = [{k: v for k, v in zip(columns, row) if k != '_id'} for row in rows]
-        return ResultView(arrow_table=None, data=data)
+        if show_internal_id:
+            data = [{k: v for k, v in zip(columns, row)} for row in rows]
+        else:
+            data = [{k: v for k, v in zip(columns, row) if k != '_id'} for row in rows]
+        rv = ResultView(arrow_table=None, data=data)
+        rv._show_internal_id = show_internal_id
+        return rv
 
     def retrieve(self, id_: int) -> Optional[dict]:
         """

@@ -494,38 +494,58 @@ impl SqlExecutor {
     ) -> Result<(Vec<String>, Vec<(String, Option<usize>)>), ApexError> {
         let mut result_names = Vec::new();
         let mut column_indices = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         let schema = table.schema_ref();
+
+        // If the user explicitly selects _id (e.g. SELECT *, _id or SELECT _id, *),
+        // we should not auto-insert _id as part of expanding '*'. This preserves
+        // the user-specified column order.
+        let explicit_id_requested = columns.iter().any(|c| match c {
+            SelectColumn::Column(name) => name == "_id",
+            SelectColumn::ColumnAlias { column, .. } => column == "_id",
+            _ => false,
+        });
         
         for col in columns {
             match col {
                 SelectColumn::All => {
-                    // Add _id first
-                    result_names.push("_id".to_string());
-                    column_indices.push(("_id".to_string(), None));
+                    // Add _id first only when it wasn't explicitly requested elsewhere.
+                    if !explicit_id_requested {
+                        if seen.insert("_id".to_string()) {
+                            result_names.push("_id".to_string());
+                            column_indices.push(("_id".to_string(), None));
+                        }
+                    }
                     
                     // Then all schema columns
                     for (name, _) in &schema.columns {
-                        result_names.push(name.clone());
-                        let idx = schema.get_index(name);
-                        column_indices.push((name.clone(), idx));
+                        if seen.insert(name.clone()) {
+                            result_names.push(name.clone());
+                            let idx = schema.get_index(name);
+                            column_indices.push((name.clone(), idx));
+                        }
                     }
                 }
                 SelectColumn::Column(name) => {
-                    result_names.push(name.clone());
-                    if name == "_id" {
-                        column_indices.push((name.clone(), None));
-                    } else {
-                        let idx = schema.get_index(name);
-                        column_indices.push((name.clone(), idx));
+                    if seen.insert(name.clone()) {
+                        result_names.push(name.clone());
+                        if name == "_id" {
+                            column_indices.push((name.clone(), None));
+                        } else {
+                            let idx = schema.get_index(name);
+                            column_indices.push((name.clone(), idx));
+                        }
                     }
                 }
                 SelectColumn::ColumnAlias { column, alias } => {
-                    result_names.push(alias.clone());
-                    if column == "_id" {
-                        column_indices.push((column.clone(), None));
-                    } else {
-                        let idx = schema.get_index(column);
-                        column_indices.push((column.clone(), idx));
+                    if seen.insert(alias.clone()) {
+                        result_names.push(alias.clone());
+                        if column == "_id" {
+                            column_indices.push((column.clone(), None));
+                        } else {
+                            let idx = schema.get_index(column);
+                            column_indices.push((column.clone(), idx));
+                        }
                     }
                 }
                 SelectColumn::Aggregate { func, column, alias } => {
@@ -543,18 +563,24 @@ impl SqlExecutor {
                             format!("{}(*)", func_name)
                         }
                     });
-                    result_names.push(name.clone());
-                    column_indices.push((name, None));
+                    if seen.insert(name.clone()) {
+                        result_names.push(name.clone());
+                        column_indices.push((name, None));
+                    }
                 }
                 SelectColumn::Expression { alias, .. } => {
                     let name = alias.clone().unwrap_or_else(|| "expr".to_string());
-                    result_names.push(name.clone());
-                    column_indices.push((name, None));
+                    if seen.insert(name.clone()) {
+                        result_names.push(name.clone());
+                        column_indices.push((name, None));
+                    }
                 }
                 SelectColumn::WindowFunction { alias, name, .. } => {
                     let col_name = alias.clone().unwrap_or_else(|| name.clone());
-                    result_names.push(col_name.clone());
-                    column_indices.push((col_name, None));
+                    if seen.insert(col_name.clone()) {
+                        result_names.push(col_name.clone());
+                        column_indices.push((col_name, None));
+                    }
                 }
             }
         }

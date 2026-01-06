@@ -131,8 +131,16 @@ pub enum UnaryOperator {
 
 /// SQL Parser
 pub struct SqlParser {
-    tokens: Vec<Token>,
+    sql_chars: Vec<char>,
+    tokens: Vec<SpannedToken>,
     pos: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SpannedToken {
+    token: Token,
+    start: usize,
+    end: usize,
 }
 
 /// Token types for SQL lexer
@@ -177,13 +185,17 @@ impl SqlParser {
     /// Parse a SQL statement
     pub fn parse(sql: &str) -> Result<SqlStatement, ApexError> {
         let tokens = Self::tokenize(sql)?;
-        let mut parser = SqlParser { tokens, pos: 0 };
+        let mut parser = SqlParser {
+            sql_chars: sql.chars().collect(),
+            tokens,
+            pos: 0,
+        };
         parser.parse_statement()
     }
 
     /// Tokenize SQL string
-    fn tokenize(sql: &str) -> Result<Vec<Token>, ApexError> {
-        let mut tokens = Vec::new();
+    fn tokenize(sql: &str) -> Result<Vec<SpannedToken>, ApexError> {
+        let mut tokens: Vec<SpannedToken> = Vec::new();
         let chars: Vec<char> = sql.chars().collect();
         let len = chars.len();
         let mut i = 0;
@@ -199,68 +211,88 @@ impl SqlParser {
 
             // Single character tokens
             match c {
-                '*' => { tokens.push(Token::Star); i += 1; continue; }
-                ',' => { tokens.push(Token::Comma); i += 1; continue; }
-                '.' => { tokens.push(Token::Dot); i += 1; continue; }
-                '(' => { tokens.push(Token::LParen); i += 1; continue; }
-                ')' => { tokens.push(Token::RParen); i += 1; continue; }
-                '+' => { tokens.push(Token::Plus); i += 1; continue; }
-                '-' => { tokens.push(Token::Minus); i += 1; continue; }
-                '/' => { tokens.push(Token::Slash); i += 1; continue; }
-                '%' => { tokens.push(Token::Percent); i += 1; continue; }
+                '*' => { tokens.push(SpannedToken { token: Token::Star, start: i, end: i + 1 }); i += 1; continue; }
+                ',' => { tokens.push(SpannedToken { token: Token::Comma, start: i, end: i + 1 }); i += 1; continue; }
+                '.' => { tokens.push(SpannedToken { token: Token::Dot, start: i, end: i + 1 }); i += 1; continue; }
+                '(' => { tokens.push(SpannedToken { token: Token::LParen, start: i, end: i + 1 }); i += 1; continue; }
+                ')' => { tokens.push(SpannedToken { token: Token::RParen, start: i, end: i + 1 }); i += 1; continue; }
+                '+' => { tokens.push(SpannedToken { token: Token::Plus, start: i, end: i + 1 }); i += 1; continue; }
+                '-' => { tokens.push(SpannedToken { token: Token::Minus, start: i, end: i + 1 }); i += 1; continue; }
+                '/' => { tokens.push(SpannedToken { token: Token::Slash, start: i, end: i + 1 }); i += 1; continue; }
+                '%' => { tokens.push(SpannedToken { token: Token::Percent, start: i, end: i + 1 }); i += 1; continue; }
                 _ => {}
             }
 
             // Multi-character operators
             if c == '=' {
-                tokens.push(Token::Eq);
+                tokens.push(SpannedToken { token: Token::Eq, start: i, end: i + 1 });
                 i += 1;
                 continue;
             }
+
+            // Double-quoted identifier: "identifier"
+            if c == '"' {
+                let start0 = i;
+                i += 1; // skip opening quote
+                let start = i;
+                while i < len && chars[i] != '"' {
+                    i += 1;
+                }
+                if i >= len {
+                    return Err(ApexError::QueryParseError(format!(
+                        "Syntax error at byte {}: Unterminated double-quoted identifier",
+                        start0
+                    )));
+                }
+                let ident: String = chars[start..i].iter().collect();
+                i += 1; // skip closing quote
+                tokens.push(SpannedToken { token: Token::Identifier(ident), start: start0, end: i });
+                continue;
+            }
+            if c == '\'' {
+                let start0 = i;
+                i += 1; // skip opening quote
+                let start = i;
+                while i < len && chars[i] != '\'' {
+                    i += 1;
+                }
+                if i >= len {
+                    return Err(ApexError::QueryParseError(format!(
+                        "Syntax error at byte {}: Unterminated string literal",
+                        start0
+                    )));
+                }
+                let s: String = chars[start..i].iter().collect();
+                i += 1; // skip closing quote
+                tokens.push(SpannedToken { token: Token::StringLit(s), start: start0, end: i });
+                continue;
+            }
             if c == '!' && i + 1 < len && chars[i + 1] == '=' {
-                tokens.push(Token::NotEq);
+                tokens.push(SpannedToken { token: Token::NotEq, start: i, end: i + 2 });
                 i += 2;
                 continue;
             }
             if c == '<' {
                 if i + 1 < len && chars[i + 1] == '=' {
-                    tokens.push(Token::Le);
+                    tokens.push(SpannedToken { token: Token::Le, start: i, end: i + 2 });
                     i += 2;
                 } else if i + 1 < len && chars[i + 1] == '>' {
-                    tokens.push(Token::NotEq);
+                    tokens.push(SpannedToken { token: Token::NotEq, start: i, end: i + 2 });
                     i += 2;
                 } else {
-                    tokens.push(Token::Lt);
+                    tokens.push(SpannedToken { token: Token::Lt, start: i, end: i + 1 });
                     i += 1;
                 }
                 continue;
             }
             if c == '>' {
                 if i + 1 < len && chars[i + 1] == '=' {
-                    tokens.push(Token::Ge);
+                    tokens.push(SpannedToken { token: Token::Ge, start: i, end: i + 2 });
                     i += 2;
                 } else {
-                    tokens.push(Token::Gt);
+                    tokens.push(SpannedToken { token: Token::Gt, start: i, end: i + 1 });
                     i += 1;
                 }
-                continue;
-            }
-
-            // String literals
-            if c == '\'' || c == '"' {
-                let quote = c;
-                i += 1;
-                let start = i;
-                while i < len && chars[i] != quote {
-                    if chars[i] == '\\' && i + 1 < len {
-                        i += 2; // Skip escaped char
-                    } else {
-                        i += 1;
-                    }
-                }
-                let s: String = chars[start..i].iter().collect();
-                tokens.push(Token::StringLit(s));
-                if i < len { i += 1; } // Skip closing quote
                 continue;
             }
 
@@ -276,20 +308,21 @@ impl SqlParser {
                 let num_str: String = chars[start..i].iter().collect();
                 if has_dot {
                     let f: f64 = num_str.parse().map_err(|_| 
-                        ApexError::QueryParseError(format!("Invalid number: {}", num_str)))?;
-                    tokens.push(Token::FloatLit(f));
+                        ApexError::QueryParseError(format!("Syntax error at byte {}: Invalid number: {}", start, num_str)))?;
+                    tokens.push(SpannedToken { token: Token::FloatLit(f), start, end: i });
                 } else {
                     let n: i64 = num_str.parse().map_err(|_| 
-                        ApexError::QueryParseError(format!("Invalid number: {}", num_str)))?;
-                    tokens.push(Token::IntLit(n));
+                        ApexError::QueryParseError(format!("Syntax error at byte {}: Invalid number: {}", start, num_str)))?;
+                    tokens.push(SpannedToken { token: Token::IntLit(n), start, end: i });
                 }
                 continue;
             }
 
             // Identifiers and keywords
-            if c.is_alphabetic() || c == '_' {
+            if c.is_ascii_alphabetic() || c == '_' {
                 let start = i;
-                while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+                while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                     i += 1;
                 }
                 let word: String = chars[start..i].iter().collect();
@@ -331,23 +364,136 @@ impl SqlParser {
                     "PARTITION" => Token::Partition,
                     _ => Token::Identifier(word),
                 };
-                tokens.push(token);
+                tokens.push(SpannedToken { token, start, end: i });
                 continue;
             }
 
-            return Err(ApexError::QueryParseError(format!("Unexpected character: {}", c)));
+            return Err(ApexError::QueryParseError(format!(
+                "Syntax error at byte {}: Unexpected character: {}",
+                i, c
+            )));
         }
 
-        tokens.push(Token::Eof);
+        tokens.push(SpannedToken { token: Token::Eof, start: len, end: len });
         Ok(tokens)
     }
 
     fn current(&self) -> &Token {
-        &self.tokens[self.pos]
+        &self.tokens[self.pos].token
+    }
+
+    fn current_span(&self) -> (usize, usize) {
+        let t = &self.tokens[self.pos];
+        (t.start, t.end)
+    }
+
+    fn format_near(&self, at: usize) -> String {
+        if self.sql_chars.is_empty() {
+            return String::new();
+        }
+        let start = at.saturating_sub(16);
+        let end = (at + 16).min(self.sql_chars.len());
+        let snippet: String = self.sql_chars[start..end].iter().collect();
+        snippet.replace('\n', " ")
+    }
+
+    fn line_col(&self, at: usize) -> (usize, usize) {
+        // 1-based line/col
+        let mut line = 1usize;
+        let mut col = 1usize;
+        let end = at.min(self.sql_chars.len());
+        for ch in self.sql_chars.iter().take(end) {
+            if *ch == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    fn syntax_error(&self, at: usize, msg: String) -> ApexError {
+        let near = self.format_near(at);
+        let (line, col) = self.line_col(at);
+        ApexError::QueryParseError(format!(
+            "Syntax error at {}:{} (pos {}): {} (near: {})",
+            line, col, at, msg, near
+        ))
+    }
+
+    fn keyword_suggestion(&self) -> Option<String> {
+        match self.current().clone() {
+            Token::Identifier(s) => {
+                let u = s.to_uppercase();
+                // Keep list small and stable; used only for human-friendly hints.
+                const KWS: [&str; 10] = [
+                    "SELECT", "FROM", "WHERE", "LIKE", "LIMIT", "OFFSET", "ORDER", "GROUP", "HAVING", "DISTINCT",
+                ];
+
+                // Fast path for common "plural" / extra trailing char typos: FROMs, WHEREs, LIKEs, LIMITs
+                for kw in KWS {
+                    if u.len() == kw.len() + 1 && u.starts_with(kw) {
+                        return Some(kw.to_string());
+                    }
+                    if u.ends_with('S') && &u[..u.len() - 1] == kw {
+                        return Some(kw.to_string());
+                    }
+                }
+
+                // Fuzzy match: allow small edit distance (e.g., SELECTE -> SELECT)
+                let mut best: Option<(&str, usize)> = None;
+                for kw in KWS {
+                    let dist = Self::edit_distance(&u, kw);
+                    if dist <= 2 {
+                        match best {
+                            None => best = Some((kw, dist)),
+                            Some((_, best_dist)) if dist < best_dist => best = Some((kw, dist)),
+                            _ => {}
+                        }
+                    }
+                }
+                best.map(|(kw, _)| kw.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn edit_distance(a: &str, b: &str) -> usize {
+        // Classic DP Levenshtein distance. Inputs are short keywords; performance is irrelevant.
+        let a: Vec<char> = a.chars().collect();
+        let b: Vec<char> = b.chars().collect();
+        let n = a.len();
+        let m = b.len();
+
+        if n == 0 {
+            return m;
+        }
+        if m == 0 {
+            return n;
+        }
+
+        let mut dp = vec![vec![0usize; m + 1]; n + 1];
+        for i in 0..=n {
+            dp[i][0] = i;
+        }
+        for j in 0..=m {
+            dp[0][j] = j;
+        }
+
+        for i in 1..=n {
+            for j in 1..=m {
+                let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+                dp[i][j] = (dp[i - 1][j] + 1)
+                    .min(dp[i][j - 1] + 1)
+                    .min(dp[i - 1][j - 1] + cost);
+            }
+        }
+        dp[n][m]
     }
 
     fn advance(&mut self) -> &Token {
-        let tok = &self.tokens[self.pos];
+        let tok = &self.tokens[self.pos].token;
         if self.pos < self.tokens.len() - 1 {
             self.pos += 1;
         }
@@ -359,16 +505,39 @@ impl SqlParser {
             self.advance();
             Ok(())
         } else {
-            Err(ApexError::QueryParseError(format!(
-                "Expected {:?}, got {:?}", expected, self.current()
-            )))
+            let (start, _) = self.current_span();
+            Err(self.syntax_error(
+                start,
+                format!("Expected {:?}, got {:?}", expected, self.current()),
+            ))
         }
     }
 
     fn parse_statement(&mut self) -> Result<SqlStatement, ApexError> {
         match self.current() {
-            Token::Select => self.parse_select().map(SqlStatement::Select),
-            _ => Err(ApexError::QueryParseError("Expected SELECT statement".to_string())),
+            Token::Select => {
+                let stmt = self.parse_select().map(SqlStatement::Select)?;
+                // Reject trailing tokens, so typos like FROMs/WHEREs don't get silently ignored.
+                if !matches!(self.current(), Token::Eof) {
+                    let (start, _) = self.current_span();
+                    let mut msg = format!("Unexpected token {:?} after end of statement", self.current());
+                    if let Some(kw) = self.keyword_suggestion() {
+                        msg = format!("{} (did you mean {}?)", msg, kw);
+                    }
+                    return Err(self.syntax_error(start, msg));
+                }
+                Ok(stmt)
+            }
+            _ => {
+                let (start, _) = self.current_span();
+                let mut msg = "Expected SELECT statement".to_string();
+                if let Some(kw) = self.keyword_suggestion() {
+                    if kw == "SELECT" {
+                        msg = format!("{} (did you mean SELECT?)", msg);
+                    }
+                }
+                Err(self.syntax_error(start, msg))
+            }
         }
     }
 
@@ -472,16 +641,40 @@ impl SqlParser {
         })
     }
 
+    /// Parse a column reference, supporting qualified names like t.col.
+    ///
+    /// Currently we normalize to the last identifier segment (e.g. "t._id" => "_id").
+    fn parse_column_ref(&mut self) -> Result<String, ApexError> {
+        let mut name = if let Token::Identifier(n) = self.current().clone() {
+            self.advance();
+            n
+        } else {
+            return Err(ApexError::QueryParseError("Expected column identifier".to_string()));
+        };
+
+        while matches!(self.current(), Token::Dot) {
+            self.advance();
+            if let Token::Identifier(n) = self.current().clone() {
+                self.advance();
+                name = n;
+            } else {
+                return Err(ApexError::QueryParseError("Expected identifier after '.'".to_string()));
+            }
+        }
+
+        Ok(name)
+    }
+
     fn parse_select_columns(&mut self) -> Result<Vec<SelectColumn>, ApexError> {
         let mut columns = Vec::new();
 
         loop {
-            // Check for *
+            // SELECT *
             if matches!(self.current(), Token::Star) {
                 self.advance();
                 columns.push(SelectColumn::All);
             }
-            // Check for aggregate functions
+            // Aggregate functions
             else if matches!(self.current(), Token::Count | Token::Sum | Token::Avg | Token::Min | Token::Max) {
                 let func = match self.current() {
                     Token::Count => AggregateFunc::Count,
@@ -493,20 +686,18 @@ impl SqlParser {
                 };
                 self.advance();
                 self.expect(Token::LParen)?;
-                
+
                 let column = if matches!(self.current(), Token::Star) {
                     self.advance();
-                    None  // COUNT(*)
-                } else if let Token::Identifier(name) = self.current().clone() {
-                    self.advance();
-                    Some(name)
+                    None
+                } else if matches!(self.current(), Token::Identifier(_)) {
+                    Some(self.parse_column_ref()?)
                 } else {
                     None
                 };
-                
+
                 self.expect(Token::RParen)?;
-                
-                // Optional alias
+
                 let alias = if matches!(self.current(), Token::As) {
                     self.advance();
                     if let Token::Identifier(name) = self.current().clone() {
@@ -518,84 +709,80 @@ impl SqlParser {
                 } else {
                     None
                 };
-                
+
                 columns.push(SelectColumn::Aggregate { func, column, alias });
             }
-            // Column name / function
-            else if let Token::Identifier(name) = self.current().clone() {
-                self.advance();
+            // Column or window function name
+            else if matches!(self.current(), Token::Identifier(_)) {
+                let name = self.parse_column_ref()?;
 
-                // Function call in SELECT list
+                // Only window function supported: row_number() OVER (...)
                 if matches!(self.current(), Token::LParen) {
-                    // Only minimal window support for now
                     self.advance();
                     self.expect(Token::RParen)?;
 
-                    if matches!(self.current(), Token::Over) {
-                        self.advance();
-                        self.expect(Token::LParen)?;
-
-                        let mut partition_by = Vec::new();
-                        if matches!(self.current(), Token::Partition) {
-                            self.advance();
-                            self.expect(Token::By)?;
-                            partition_by = self.parse_column_list()?;
-                        }
-
-                        let order_by = if matches!(self.current(), Token::Order) {
-                            self.advance();
-                            self.expect(Token::By)?;
-                            self.parse_order_by()?
-                        } else {
-                            Vec::new()
-                        };
-
-                        self.expect(Token::RParen)?;
-
-                        let alias = if matches!(self.current(), Token::As) {
-                            self.advance();
-                            if let Token::Identifier(alias) = self.current().clone() {
-                                self.advance();
-                                Some(alias)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-
-                        columns.push(SelectColumn::WindowFunction {
-                            name,
-                            partition_by,
-                            order_by,
-                            alias,
-                        });
-                    } else {
-                        // Non-window functions not supported in SELECT list yet
+                    if !matches!(self.current(), Token::Over) {
                         return Err(ApexError::QueryParseError(
                             format!("Unsupported function in SELECT list: {}", name)
                         ));
                     }
+
+                    self.advance();
+                    self.expect(Token::LParen)?;
+
+                    let mut partition_by = Vec::new();
+                    if matches!(self.current(), Token::Partition) {
+                        self.advance();
+                        self.expect(Token::By)?;
+                        partition_by = self.parse_column_list()?;
+                    }
+
+                    let order_by = if matches!(self.current(), Token::Order) {
+                        self.advance();
+                        self.expect(Token::By)?;
+                        self.parse_order_by()?
+                    } else {
+                        Vec::new()
+                    };
+
+                    self.expect(Token::RParen)?;
+
+                    let alias = if matches!(self.current(), Token::As) {
+                        self.advance();
+                        if let Token::Identifier(alias) = self.current().clone() {
+                            self.advance();
+                            Some(alias)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    columns.push(SelectColumn::WindowFunction {
+                        name,
+                        partition_by,
+                        order_by,
+                        alias,
+                    });
                 } else {
-                    // Check for alias
+                    // Regular column with optional alias
                     if matches!(self.current(), Token::As) {
                         self.advance();
                         if let Token::Identifier(alias) = self.current().clone() {
                             self.advance();
                             columns.push(SelectColumn::ColumnAlias { column: name, alias });
                         } else {
-                            columns.push(SelectColumn::Column(name));
+                            return Err(ApexError::QueryParseError("Expected alias after AS".to_string()));
                         }
                     } else {
                         columns.push(SelectColumn::Column(name));
                     }
                 }
-            }
-            else {
+            } else {
                 break;
             }
 
-            // Check for comma
             if matches!(self.current(), Token::Comma) {
                 self.advance();
             } else {
@@ -603,315 +790,308 @@ impl SqlParser {
             }
         }
 
-        if columns.is_empty() {
-            return Err(ApexError::QueryParseError("Expected column list after SELECT".to_string()));
-        }
-
-        Ok(columns)
+    if columns.is_empty() {
+        let (start, _) = self.current_span();
+        return Err(self.syntax_error(start, "Expected column list after SELECT".to_string()));
     }
 
-    fn parse_column_list(&mut self) -> Result<Vec<String>, ApexError> {
-        let mut columns = Vec::new();
+    Ok(columns)
+}
+
+fn parse_column_list(&mut self) -> Result<Vec<String>, ApexError> {
+    let mut columns = Vec::new();
+    
+    loop {
+        if matches!(self.current(), Token::Identifier(_)) {
+            let name = self.parse_column_ref()?;
+            columns.push(name);
+        } else {
+            return Err(ApexError::QueryParseError("Expected column name".to_string()));
+        }
         
-        loop {
-            if let Token::Identifier(name) = self.current().clone() {
-                self.advance();
-                columns.push(name);
-            } else {
-                break;
-            }
+        if matches!(self.current(), Token::Comma) {
+            self.advance();
+        } else {
+            break;
+        }
+    }
+    
+    Ok(columns)
+}
+
+fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
+    let mut clauses = Vec::new();
+
+    loop {
+        if matches!(self.current(), Token::Identifier(_)) {
+            let column = self.parse_column_ref()?;
             
-            if matches!(self.current(), Token::Comma) {
+            let descending = if matches!(self.current(), Token::Desc) {
                 self.advance();
+                true
+            } else if matches!(self.current(), Token::Asc) {
+                self.advance();
+                false
             } else {
-                break;
-            }
-        }
-        
-        Ok(columns)
-    }
-
-    fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
-        let mut clauses = Vec::new();
-
-        loop {
-            if let Token::Identifier(column) = self.current().clone() {
+                // Default ASC
+                if matches!(self.current(), Token::Asc) {
+                    self.advance();
+                }
+                false
+            };
+            
+            // SQL:2023 NULLS FIRST/LAST
+            let nulls_first = if matches!(self.current(), Token::Nulls) {
                 self.advance();
-                
-                let descending = if matches!(self.current(), Token::Desc) {
+                if matches!(self.current(), Token::First) {
                     self.advance();
-                    true
-                } else if matches!(self.current(), Token::Asc) {
+                    Some(true)
+                } else if matches!(self.current(), Token::Last) {
                     self.advance();
-                    false
-                } else {
-                    false
-                };
-                
-                // SQL:2023 NULLS FIRST/LAST
-                let nulls_first = if matches!(self.current(), Token::Nulls) {
-                    self.advance();
-                    if matches!(self.current(), Token::First) {
-                        self.advance();
-                        Some(true)
-                    } else if matches!(self.current(), Token::Last) {
-                        self.advance();
-                        Some(false)
-                    } else {
-                        None
-                    }
+                    Some(false)
                 } else {
                     None
-                };
-                
-                clauses.push(OrderByClause { column, descending, nulls_first });
+                }
             } else {
-                break;
-            }
-
-            if matches!(self.current(), Token::Comma) {
-                self.advance();
-            } else {
-                break;
-            }
+                None
+            };
+            
+            clauses.push(OrderByClause { column, descending, nulls_first });
+        } else {
+            break;
         }
 
-        Ok(clauses)
+        if matches!(self.current(), Token::Comma) {
+            self.advance();
+        } else {
+            break;
+        }
     }
+
+    Ok(clauses)
+}
 
     fn parse_expr(&mut self) -> Result<SqlExpr, ApexError> {
-        self.parse_or_expr()
+        self.parse_or()
     }
 
-    fn parse_or_expr(&mut self) -> Result<SqlExpr, ApexError> {
-        let mut left = self.parse_and_expr()?;
-
+    fn parse_or(&mut self) -> Result<SqlExpr, ApexError> {
+        let mut left = self.parse_and()?;
         while matches!(self.current(), Token::Or) {
             self.advance();
-            let right = self.parse_and_expr()?;
+            let right = self.parse_and()?;
             left = SqlExpr::BinaryOp {
                 left: Box::new(left),
                 op: BinaryOperator::Or,
                 right: Box::new(right),
             };
         }
-
         Ok(left)
     }
 
-    fn parse_and_expr(&mut self) -> Result<SqlExpr, ApexError> {
-        let mut left = self.parse_not_expr()?;
-
+    fn parse_and(&mut self) -> Result<SqlExpr, ApexError> {
+        let mut left = self.parse_not()?;
         while matches!(self.current(), Token::And) {
             self.advance();
-            let right = self.parse_not_expr()?;
+            let right = self.parse_not()?;
             left = SqlExpr::BinaryOp {
                 left: Box::new(left),
                 op: BinaryOperator::And,
                 right: Box::new(right),
             };
         }
+        Ok(left)
+    }
+
+    fn parse_not(&mut self) -> Result<SqlExpr, ApexError> {
+        if matches!(self.current(), Token::Not) {
+            self.advance();
+            let expr = self.parse_not()?;
+            return Ok(SqlExpr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr: Box::new(expr),
+            });
+        }
+        self.parse_comparison()
+    }
+
+    fn parse_comparison(&mut self) -> Result<SqlExpr, ApexError> {
+        let left = self.parse_add_sub()?;
+
+        // Special forms only supported when left is a column
+        let left_col = if let SqlExpr::Column(ref c) = left {
+            Some(c.clone())
+        } else {
+            None
+        };
+
+        if matches!(self.current(), Token::Like) {
+            let column = left_col.ok_or_else(|| ApexError::QueryParseError("LIKE requires column on left side".to_string()))?;
+            self.advance();
+            let pattern = match self.current().clone() {
+                Token::StringLit(s) => {
+                    self.advance();
+                    s
+                }
+                _ => return Err(ApexError::QueryParseError("LIKE pattern must be a string literal".to_string())),
+            };
+            return Ok(SqlExpr::Like { column, pattern, negated: false });
+        }
+
+        if matches!(self.current(), Token::Regexp) {
+            let column = left_col.ok_or_else(|| ApexError::QueryParseError("REGEXP requires column on left side".to_string()))?;
+            self.advance();
+            let pattern = match self.current().clone() {
+                Token::StringLit(s) => {
+                    self.advance();
+                    s
+                }
+                _ => return Err(ApexError::QueryParseError("REGEXP pattern must be a string literal".to_string())),
+            };
+            return Ok(SqlExpr::Regexp { column, pattern, negated: false });
+        }
+
+        if matches!(self.current(), Token::In) {
+            let column = left_col.ok_or_else(|| ApexError::QueryParseError("IN requires column on left side".to_string()))?;
+            self.advance();
+            self.expect(Token::LParen)?;
+            let mut values = Vec::new();
+            loop {
+                match self.current() {
+                    Token::StringLit(_) | Token::IntLit(_) | Token::FloatLit(_) | Token::True | Token::False | Token::Null => {
+                        values.push(self.parse_literal_value()?);
+                    }
+                    _ => break,
+                }
+                if matches!(self.current(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(Token::RParen)?;
+            return Ok(SqlExpr::In { column, values, negated: false });
+        }
+
+        if matches!(self.current(), Token::Between) {
+            let column = left_col.ok_or_else(|| ApexError::QueryParseError("BETWEEN requires column on left side".to_string()))?;
+            self.advance();
+            let low = Box::new(self.parse_add_sub()?);
+            self.expect(Token::And)?;
+            let high = Box::new(self.parse_add_sub()?);
+            return Ok(SqlExpr::Between { column, low, high, negated: false });
+        }
+
+        if matches!(self.current(), Token::Is) {
+            let column = left_col.ok_or_else(|| ApexError::QueryParseError("IS NULL requires column on left side".to_string()))?;
+            self.advance();
+            let negated = if matches!(self.current(), Token::Not) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            self.expect(Token::Null)?;
+            return Ok(SqlExpr::IsNull { column, negated });
+        }
+
+        let op = match self.current() {
+            Token::Eq => Some(BinaryOperator::Eq),
+            Token::NotEq => Some(BinaryOperator::NotEq),
+            Token::Lt => Some(BinaryOperator::Lt),
+            Token::Le => Some(BinaryOperator::Le),
+            Token::Gt => Some(BinaryOperator::Gt),
+            Token::Ge => Some(BinaryOperator::Ge),
+            _ => None,
+        };
+        if let Some(op) = op {
+            self.advance();
+            let right = self.parse_add_sub()?;
+            return Ok(SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            });
+        }
 
         Ok(left)
     }
 
-    fn parse_not_expr(&mut self) -> Result<SqlExpr, ApexError> {
-        if matches!(self.current(), Token::Not) {
-            self.advance();
-            let expr = self.parse_not_expr()?;
-            Ok(SqlExpr::UnaryOp {
-                op: UnaryOperator::Not,
-                expr: Box::new(expr),
-            })
-        } else {
-            self.parse_comparison()
-        }
-    }
-
-    fn parse_comparison(&mut self) -> Result<SqlExpr, ApexError> {
-        let left = self.parse_primary()?;
-
-        // Check for comparison operators
-        match self.current() {
-            Token::Eq => {
-                self.advance();
-                let right = self.parse_primary()?;
-                Ok(SqlExpr::BinaryOp {
-                    left: Box::new(left),
-                    op: BinaryOperator::Eq,
-                    right: Box::new(right),
-                })
-            }
-            Token::NotEq => {
-                self.advance();
-                let right = self.parse_primary()?;
-                Ok(SqlExpr::BinaryOp {
-                    left: Box::new(left),
-                    op: BinaryOperator::NotEq,
-                    right: Box::new(right),
-                })
-            }
-            Token::Lt => {
-                self.advance();
-                let right = self.parse_primary()?;
-                Ok(SqlExpr::BinaryOp {
-                    left: Box::new(left),
-                    op: BinaryOperator::Lt,
-                    right: Box::new(right),
-                })
-            }
-            Token::Le => {
-                self.advance();
-                let right = self.parse_primary()?;
-                Ok(SqlExpr::BinaryOp {
-                    left: Box::new(left),
-                    op: BinaryOperator::Le,
-                    right: Box::new(right),
-                })
-            }
-            Token::Gt => {
-                self.advance();
-                let right = self.parse_primary()?;
-                Ok(SqlExpr::BinaryOp {
-                    left: Box::new(left),
-                    op: BinaryOperator::Gt,
-                    right: Box::new(right),
-                })
-            }
-            Token::Ge => {
-                self.advance();
-                let right = self.parse_primary()?;
-                Ok(SqlExpr::BinaryOp {
-                    left: Box::new(left),
-                    op: BinaryOperator::Ge,
-                    right: Box::new(right),
-                })
-            }
-            Token::Like | Token::Regexp | Token::Not => {
-                // Handle LIKE/REGEXP and NOT LIKE/NOT REGEXP
-                let negated = if matches!(self.current(), Token::Not) {
-                    self.advance();
-                    true
-                } else {
-                    false
-                };
-                
-                if matches!(self.current(), Token::Like) {
-                    self.advance();
-                    let pattern = if let Token::StringLit(s) = self.current().clone() {
-                        self.advance();
-                        s
-                    } else {
-                        return Err(ApexError::QueryParseError("Expected pattern after LIKE".to_string()));
-                    };
-                    
-                    let column = match left {
-                        SqlExpr::Column(name) => name,
-                        _ => return Err(ApexError::QueryParseError("LIKE requires column name".to_string())),
-                    };
-                    
-                    Ok(SqlExpr::Like { column, pattern, negated })
-                } else if matches!(self.current(), Token::Regexp) {
-                    self.advance();
-                    let pattern = if let Token::StringLit(s) = self.current().clone() {
-                        self.advance();
-                        s
-                    } else {
-                        return Err(ApexError::QueryParseError("Expected pattern after REGEXP".to_string()));
-                    };
-
-                    let column = match left {
-                        SqlExpr::Column(name) => name,
-                        _ => return Err(ApexError::QueryParseError("REGEXP requires column name".to_string())),
-                    };
-
-                    Ok(SqlExpr::Regexp { column, pattern, negated })
-                } else if matches!(self.current(), Token::In) {
-                    // NOT IN
-                    self.advance();
-                    let (column, values) = self.parse_in_list(&left)?;
-                    Ok(SqlExpr::In { column, values, negated })
-                } else if matches!(self.current(), Token::Between) {
-                    // NOT BETWEEN
-                    self.advance();
-                    let (column, low, high) = self.parse_between(&left)?;
-                    Ok(SqlExpr::Between { column, low, high, negated })
-                } else {
-                    Ok(left)
-                }
-            }
-            Token::In => {
-                self.advance();
-                let (column, values) = self.parse_in_list(&left)?;
-                Ok(SqlExpr::In { column, values, negated: false })
-            }
-            Token::Between => {
-                self.advance();
-                let (column, low, high) = self.parse_between(&left)?;
-                Ok(SqlExpr::Between { column, low, high, negated: false })
-            }
-            Token::Is => {
-                self.advance();
-                let negated = if matches!(self.current(), Token::Not) {
-                    self.advance();
-                    true
-                } else {
-                    false
-                };
-                self.expect(Token::Null)?;
-                let column = match left {
-                    SqlExpr::Column(name) => name,
-                    _ => return Err(ApexError::QueryParseError("IS NULL requires column name".to_string())),
-                };
-                Ok(SqlExpr::IsNull { column, negated })
-            }
-            _ => Ok(left),
-        }
-    }
-
-    fn parse_in_list(&mut self, left: &SqlExpr) -> Result<(String, Vec<Value>), ApexError> {
-        let column = match left {
-            SqlExpr::Column(name) => name.clone(),
-            _ => return Err(ApexError::QueryParseError("IN requires column name".to_string())),
-        };
-        
-        self.expect(Token::LParen)?;
-        let mut values = Vec::new();
-        
+    fn parse_add_sub(&mut self) -> Result<SqlExpr, ApexError> {
+        let mut left = self.parse_mul_div()?;
         loop {
-            let val = match self.current().clone() {
-                Token::StringLit(s) => { self.advance(); Value::String(s) }
-                Token::IntLit(n) => { self.advance(); Value::Int64(n) }
-                Token::FloatLit(f) => { self.advance(); Value::Float64(f) }
-                Token::True => { self.advance(); Value::Bool(true) }
-                Token::False => { self.advance(); Value::Bool(false) }
-                Token::Null => { self.advance(); Value::Null }
-                _ => break,
+            let op = match self.current() {
+                Token::Plus => Some(BinaryOperator::Add),
+                Token::Minus => Some(BinaryOperator::Sub),
+                _ => None,
             };
-            values.push(val);
-            
-            if matches!(self.current(), Token::Comma) {
+            if let Some(op) = op {
                 self.advance();
+                let right = self.parse_mul_div()?;
+                left = SqlExpr::BinaryOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                };
             } else {
                 break;
             }
         }
-        
-        self.expect(Token::RParen)?;
-        Ok((column, values))
+        Ok(left)
     }
 
-    fn parse_between(&mut self, left: &SqlExpr) -> Result<(String, Box<SqlExpr>, Box<SqlExpr>), ApexError> {
-        let column = match left {
-            SqlExpr::Column(name) => name.clone(),
-            _ => return Err(ApexError::QueryParseError("BETWEEN requires column name".to_string())),
-        };
-        
-        let low = self.parse_primary()?;
-        self.expect(Token::And)?;
-        let high = self.parse_primary()?;
-        
-        Ok((column, Box::new(low), Box::new(high)))
+    fn parse_mul_div(&mut self) -> Result<SqlExpr, ApexError> {
+        let mut left = self.parse_primary()?;
+        loop {
+            let op = match self.current() {
+                Token::Star => Some(BinaryOperator::Mul),
+                Token::Slash => Some(BinaryOperator::Div),
+                Token::Percent => Some(BinaryOperator::Mod),
+                _ => None,
+            };
+            if let Some(op) = op {
+                self.advance();
+                let right = self.parse_primary()?;
+                left = SqlExpr::BinaryOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_literal_value(&mut self) -> Result<Value, ApexError> {
+        match self.current().clone() {
+            Token::StringLit(s) => {
+                self.advance();
+                Ok(Value::String(s))
+            }
+            Token::IntLit(n) => {
+                self.advance();
+                Ok(Value::Int64(n))
+            }
+            Token::FloatLit(f) => {
+                self.advance();
+                Ok(Value::Float64(f))
+            }
+            Token::True => {
+                self.advance();
+                Ok(Value::Bool(true))
+            }
+            Token::False => {
+                self.advance();
+                Ok(Value::Bool(false))
+            }
+            Token::Null => {
+                self.advance();
+                Ok(Value::Null)
+            }
+            _ => Err(ApexError::QueryParseError("Expected literal".to_string())),
+        }
     }
 
     fn parse_primary(&mut self) -> Result<SqlExpr, ApexError> {
@@ -946,8 +1126,8 @@ impl SqlParser {
                 self.advance();
                 Ok(SqlExpr::Literal(Value::Null))
             }
-            Token::Identifier(name) => {
-                self.advance();
+            Token::Identifier(_) => {
+                let name = self.parse_column_ref()?;
                 Ok(SqlExpr::Column(name))
             }
             Token::Minus => {
@@ -958,11 +1138,12 @@ impl SqlParser {
                     expr: Box::new(expr),
                 })
             }
-            _ => Err(ApexError::QueryParseError(format!(
-                "Unexpected token in expression: {:?}", self.current()
-            ))),
+            _ => Err(ApexError::QueryParseError(
+                format!("Unexpected token in expression: {:?}", self.current())
+            )),
         }
     }
+
 }
 
 #[cfg(test)]
@@ -998,5 +1179,79 @@ mod tests {
         assert!(s.order_by[0].descending);
         assert_eq!(s.limit, Some(10));
         assert_eq!(s.offset, Some(5));
+    }
+
+    #[test]
+    fn test_select_qualified_id() {
+        let sql = "SELECT default._id, name FROM default ORDER BY default._id";
+        let stmt = SqlParser::parse(sql).unwrap();
+        let SqlStatement::Select(s) = stmt;
+        assert_eq!(s.columns.len(), 2);
+        match &s.columns[0] {
+            SelectColumn::Column(c) => assert_eq!(c, "_id"),
+            other => panic!("unexpected column: {:?}", other),
+        }
+        match &s.columns[1] {
+            SelectColumn::Column(c) => assert_eq!(c, "name"),
+            other => panic!("unexpected column: {:?}", other),
+        }
+        assert_eq!(s.order_by.len(), 1);
+        assert_eq!(s.order_by[0].column, "_id");
+    }
+
+    #[test]
+    fn test_select_quoted_id() {
+        let sql = "SELECT \"_id\", name FROM default ORDER BY \"_id\"";
+        let stmt = SqlParser::parse(sql).unwrap();
+        let SqlStatement::Select(s) = stmt;
+        assert_eq!(s.columns.len(), 2);
+        match &s.columns[0] {
+            SelectColumn::Column(c) => assert_eq!(c, "_id"),
+            other => panic!("unexpected column: {:?}", other),
+        }
+        assert_eq!(s.order_by.len(), 1);
+        assert_eq!(s.order_by[0].column, "_id");
+    }
+
+    #[test]
+    fn test_syntax_error_missing_select_list() {
+        let err = SqlParser::parse("SELECT FROM t").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Syntax error"));
+        assert!(msg.contains("Expected column list"));
+    }
+
+    #[test]
+    fn test_syntax_error_unterminated_string() {
+        let err = SqlParser::parse("SELECT * FROM t WHERE name = 'abc").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unterminated string literal"));
+        assert!(msg.contains("Syntax error"));
+    }
+
+    #[test]
+    fn test_syntax_error_unexpected_character() {
+        let err = SqlParser::parse("SELECT * FROM t WHERE a = @").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unexpected character"));
+        assert!(msg.contains("Syntax error"));
+    }
+
+    #[test]
+    fn test_syntax_error_misspelled_keywords_like_froms() {
+        let sql = "select * froms default wheres title likes 'Python%' limits 10";
+        let err = SqlParser::parse(sql).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Syntax error"));
+        assert!(msg.contains("did you mean FROM") || msg.contains("did you mean WHERE") || msg.contains("did you mean LIKE") || msg.contains("did you mean LIMIT"));
+    }
+
+    #[test]
+    fn test_syntax_error_misspelled_select_keyword() {
+        let sql = "selecte * from default";
+        let err = SqlParser::parse(sql).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Syntax error"));
+        assert!(msg.contains("did you mean SELECT"));
     }
 }

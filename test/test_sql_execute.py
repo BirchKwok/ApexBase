@@ -74,6 +74,84 @@ class TestBasicSQLExecute:
             
             client.close()
 
+    def test_execute_select_qualified_id_column(self):
+        """Test SELECT with qualified internal id column (e.g., default._id)"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([
+                {"name": "Alice", "age": 25},
+                {"name": "Bob", "age": 30},
+            ])
+
+            result = client.execute("SELECT default._id, name FROM default ORDER BY default._id")
+            assert "_id" in result.columns
+            rows = result.to_dict()
+            assert rows[0]["_id"] == 0
+            assert rows[1]["_id"] == 1
+
+            client.close()
+
+    def test_execute_select_quoted_id_column(self):
+        """Test SELECT with quoted internal id column (\"_id\")"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([
+                {"name": "Alice", "age": 25},
+                {"name": "Bob", "age": 30},
+            ])
+
+            result = client.execute('SELECT "_id", name FROM default ORDER BY "_id"')
+            assert "_id" in result.columns
+            rows = result.to_dict()
+            assert rows[0]["_id"] == 0
+            assert rows[1]["_id"] == 1
+
+            client.close()
+
+    def test_execute_select_star_plus_id_column(self):
+        """Test SELECT *, _id should explicitly expose _id"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([
+                {"name": "Alice", "age": 25},
+                {"name": "Bob", "age": 30},
+            ])
+
+            result = client.execute("SELECT *, _id FROM default ORDER BY _id")
+            assert "_id" in result.columns
+            # _id should appear at the user-specified position (after '*')
+            assert result.columns[-1] == "_id"
+            rows = result.to_dict()
+            assert rows[0]["_id"] == 0
+            assert rows[1]["_id"] == 1
+
+            client.close()
+
+    def test_execute_select_explicit_id_column(self):
+        """Test SELECT explicitly returning internal _id column"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([
+                {"name": "Alice", "age": 25},
+                {"name": "Bob", "age": 30},
+            ])
+
+            result = client.execute("SELECT _id, name FROM default ORDER BY _id")
+
+            assert "_id" in result.columns
+            rows = result.to_dict()
+            assert isinstance(rows, list)
+            assert len(rows) == 2
+            assert "_id" in rows[0]
+            assert rows[0]["_id"] == 0
+            assert rows[1]["_id"] == 1
+
+            client.close()
+
     def test_execute_arrow_dictionary_string_schema_match(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             if not (ARROW_AVAILABLE and PYARROW_AVAILABLE and PANDAS_AVAILABLE):
