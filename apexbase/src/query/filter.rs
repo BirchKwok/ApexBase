@@ -2,6 +2,94 @@
 
 use crate::data::{Row, Value};
 use crate::table::column_table::{TypedColumn, ColumnSchema, BitVec};
+use crate::table::arrow_column::ArrowStringColumn;
+
+#[inline]
+fn indices_to_bitvec(indices: &[usize], len: usize) -> BitVec {
+    let mut bits = BitVec::with_capacity(len);
+    bits.extend_false(len);
+    for &idx in indices {
+        bits.set(idx, true);
+    }
+    bits
+}
+
+#[inline]
+fn bitvec_to_indices(bits: &BitVec) -> Vec<usize> {
+    let mut result = Vec::new();
+    result.reserve(bits.len().min(1024));
+
+    let mut base = 0usize;
+    for &word in bits.raw_data() {
+        let mut w = word;
+        while w != 0 {
+            let tz = w.trailing_zeros() as usize;
+            let idx = base + tz;
+            if idx < bits.len() {
+                result.push(idx);
+            }
+            w &= w - 1;
+        }
+        base += 64;
+        if base >= bits.len() {
+            break;
+        }
+    }
+    result
+}
+
+/// High-performance REGEXP matcher with simple fast paths.
+///
+/// Supported fast paths:
+/// - "abc*" => prefix match
+/// - "*" => match any
+///
+/// Otherwise falls back to regex::Regex compiled once.
+#[derive(Debug, Clone)]
+pub enum RegexpMatcher {
+    Prefix(String),
+    Regex(regex::Regex),
+    Any,
+    Never,
+}
+
+impl RegexpMatcher {
+    #[inline]
+    pub fn new(pattern: &str) -> Self {
+        if pattern.is_empty() {
+            return RegexpMatcher::Never;
+        }
+        if pattern == "*" {
+            return RegexpMatcher::Any;
+        }
+
+        // Fast path: simple prefix glob "abc*" (no other glob or regex meta)
+        if let Some(prefix) = pattern.strip_suffix('*') {
+            if !prefix.is_empty() && !prefix.contains('*') {
+                // Reject common regex metas; keep this fast path strict to avoid semantic surprises
+                let has_meta = prefix.chars().any(|c| matches!(c, '.' | '+' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'));
+                if !has_meta {
+                    return RegexpMatcher::Prefix(prefix.to_string());
+                }
+            }
+        }
+
+        match regex::Regex::new(pattern) {
+            Ok(re) => RegexpMatcher::Regex(re),
+            Err(_) => RegexpMatcher::Never,
+        }
+    }
+
+    #[inline(always)]
+    pub fn matches(&self, s: &str) -> bool {
+        match self {
+            RegexpMatcher::Prefix(p) => s.starts_with(p.as_str()),
+            RegexpMatcher::Regex(re) => re.is_match(s),
+            RegexpMatcher::Any => true,
+            RegexpMatcher::Never => false,
+        }
+    }
+}
 
 /// High-performance LIKE pattern matcher with pre-classified pattern type
 /// 
@@ -153,6 +241,11 @@ pub enum Filter {
         field: String,
         pattern: String,
     },
+    /// REGEXP match
+    Regexp {
+        field: String,
+        pattern: String,
+    },
     /// IN list
     In {
         field: String,
@@ -190,6 +283,14 @@ impl Filter {
             Filter::Like { field, pattern } => {
                 if let Some(Value::String(s)) = row.get(field) {
                     Self::like_match(s, pattern)
+                } else {
+                    false
+                }
+            }
+            Filter::Regexp { field, pattern } => {
+                if let Some(Value::String(s)) = row.get(field) {
+                    let matcher = RegexpMatcher::new(pattern);
+                    matcher.matches(s)
                 } else {
                     false
                 }
@@ -434,42 +535,89 @@ impl Filter {
                     }
                 }
                 
-                // Fallback: sequential with set intersection
+                // Fallback: sequential with BitVec intersection (lower overhead than HashSet)
                 let mut result = filters[0].filter_columns(schema, columns, row_count, deleted);
                 for filter in filters.iter().skip(1) {
                     if result.is_empty() {
                         break;
                     }
                     let matching = filter.filter_columns(schema, columns, row_count, deleted);
-                    let matching_set: std::collections::HashSet<_> = matching.into_iter().collect();
-                    result.retain(|idx| matching_set.contains(idx));
+                    let matching_bits = indices_to_bitvec(&matching, row_count);
+                    result.retain(|&idx| matching_bits.get(idx));
                 }
                 result
             }
             Filter::Or(filters) => {
-                let mut result_set = std::collections::HashSet::new();
+                if filters.is_empty() {
+                    return Vec::new();
+                }
+
+                // BitVec union: 1 bit per row, avoids HashSet and sort
+                let mut bits = BitVec::with_capacity(row_count);
+                bits.extend_false(row_count);
                 for filter in filters {
-                    for idx in filter.filter_columns(schema, columns, row_count, deleted) {
-                        result_set.insert(idx);
+                    let matching = filter.filter_columns(schema, columns, row_count, deleted);
+                    for idx in matching {
+                        bits.set(idx, true);
                     }
                 }
-                let mut result: Vec<usize> = result_set.into_iter().collect();
-                result.sort_unstable();
-                result
+
+                bitvec_to_indices(&bits)
             }
             Filter::Not(filter) => {
                 let matching = filter.filter_columns(schema, columns, row_count, deleted);
-                let matching_set: std::collections::HashSet<_> = matching.into_iter().collect();
+                let matching_bits = indices_to_bitvec(&matching, row_count);
                 (0..row_count)
-                    .filter(|&i| !deleted.get(i) && !matching_set.contains(&i))
+                    .filter(|&i| !deleted.get(i) && !matching_bits.get(i))
                     .collect()
             }
             Filter::Like { field, pattern } => {
                 self.filter_like_column(schema, columns, row_count, deleted, field, pattern)
             }
+            Filter::Regexp { field, pattern } => {
+                self.filter_regexp_column(schema, columns, row_count, deleted, field, pattern)
+            }
             Filter::In { field, values } => {
                 self.filter_in_column(schema, columns, row_count, deleted, field, values)
             }
+        }
+    }
+
+    /// Filter REGEXP directly on column data.
+    #[inline]
+    fn filter_regexp_column(
+        &self,
+        schema: &ColumnSchema,
+        columns: &[TypedColumn],
+        row_count: usize,
+        deleted: &BitVec,
+        field: &str,
+        pattern: &str,
+    ) -> Vec<usize> {
+        let col_idx = match schema.get_index(field) {
+            Some(idx) => idx,
+            None => return Vec::new(),
+        };
+
+        let no_deletes = deleted.all_false();
+        let matcher = RegexpMatcher::new(pattern);
+
+        match &columns[col_idx] {
+            TypedColumn::String(col) => {
+                let mut result = Vec::with_capacity(row_count / 10);
+                for row_idx in 0..row_count {
+                    if !no_deletes && deleted.get(row_idx) {
+                        continue;
+                    }
+                    if let Some(s) = col.get(row_idx) {
+                        if matcher.matches(s) {
+                            result.push(row_idx);
+                        }
+                    }
+                }
+                result
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -589,45 +737,47 @@ impl Filter {
                 }
             }
             // Fast path: String column with String value
-            (TypedColumn::String { data, nulls }, Value::String(target)) => {
-                let no_nulls = nulls.all_false();
-                let data_len = data.len().min(row_count);
+            (TypedColumn::String(col), Value::String(target)) => {
+                let data_len = col.len().min(row_count);
                 
                 if use_parallel {
                     (0..data_len).into_par_iter()
                         .filter(|&i| {
-                            let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                            let skip = (!no_deletes && deleted.get(i)) || col.is_null(i);
                             if skip { return false; }
-                            let val = &data[i];
-                            match op {
-                                CompareOp::Equal => val == target,
-                                CompareOp::NotEqual => val != target,
-                                CompareOp::LessThan => val < target,
-                                CompareOp::LessEqual => val <= target,
-                                CompareOp::GreaterThan => val > target,
-                                CompareOp::GreaterEqual => val >= target,
-                                CompareOp::Like => Self::like_match(val, target),
-                                _ => false,
+                            match col.get(i) {
+                                Some(val) => match op {
+                                    CompareOp::Equal => val == target,
+                                    CompareOp::NotEqual => val != target,
+                                    CompareOp::LessThan => val < target.as_str(),
+                                    CompareOp::LessEqual => val <= target.as_str(),
+                                    CompareOp::GreaterThan => val > target.as_str(),
+                                    CompareOp::GreaterEqual => val >= target.as_str(),
+                                    CompareOp::Like => Self::like_match(val, target),
+                                    _ => false,
+                                },
+                                None => false,
                             }
                         })
                         .collect()
                 } else {
                     let mut result = Vec::with_capacity(row_count / 4);
                     for i in 0..data_len {
-                        let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                        let skip = (!no_deletes && deleted.get(i)) || col.is_null(i);
                         if skip { continue; }
-                        let val = &data[i];
-                        let matches = match op {
-                            CompareOp::Equal => val == target,
-                            CompareOp::NotEqual => val != target,
-                            CompareOp::LessThan => val < target,
-                            CompareOp::LessEqual => val <= target,
-                            CompareOp::GreaterThan => val > target,
-                            CompareOp::GreaterEqual => val >= target,
-                            CompareOp::Like => Self::like_match(val, target),
-                            _ => false,
-                        };
-                        if matches { result.push(i); }
+                        if let Some(val) = col.get(i) {
+                            let matches = match op {
+                                CompareOp::Equal => val == target,
+                                CompareOp::NotEqual => val != target,
+                                CompareOp::LessThan => val < target.as_str(),
+                                CompareOp::LessEqual => val <= target.as_str(),
+                                CompareOp::GreaterThan => val > target.as_str(),
+                                CompareOp::GreaterEqual => val >= target.as_str(),
+                                CompareOp::Like => Self::like_match(val, target),
+                                _ => false,
+                            };
+                            if matches { result.push(i); }
+                        }
                     }
                     result
                 }
@@ -674,10 +824,9 @@ impl Filter {
 
         let column = &columns[col_idx];
         
-        if let TypedColumn::String { data, nulls } = column {
+        if let TypedColumn::String(col) = column {
             let no_deletes = deleted.all_false();
-            let no_nulls = nulls.all_false();
-            let data_len = data.len().min(row_count);
+            let data_len = col.len().min(row_count);
             
             // Classify pattern for optimized matching
             let matcher = LikeMatcher::new(pattern);
@@ -686,9 +835,9 @@ impl Filter {
             if data_len >= 100_000 {
                 return (0..data_len).into_par_iter()
                     .filter(|&i| {
-                        let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                        let skip = (!no_deletes && deleted.get(i)) || col.is_null(i);
                         if skip { return false; }
-                        matcher.matches(&data[i])
+                        col.get(i).map(|s| matcher.matches(s)).unwrap_or(false)
                     })
                     .collect();
             }
@@ -696,10 +845,12 @@ impl Filter {
             // Sequential for smaller datasets
             let mut result = Vec::with_capacity(data_len / 10); // Estimate 10% match
             for i in 0..data_len {
-                let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                let skip = (!no_deletes && deleted.get(i)) || col.is_null(i);
                 if skip { continue; }
-                if matcher.matches(&data[i]) {
-                    result.push(i);
+                if let Some(s) = col.get(i) {
+                    if matcher.matches(s) {
+                        result.push(i);
+                    }
                 }
             }
             result
@@ -863,10 +1014,9 @@ impl Filter {
             match filter {
                 Filter::Like { field, pattern } => {
                     if let Some(col_idx) = schema.get_index(field) {
-                        if let TypedColumn::String { data, nulls } = &columns[col_idx] {
+                        if let TypedColumn::String(col) = &columns[col_idx] {
                             matchers.push(FusedMatcher::Like {
-                                data,
-                                nulls,
+                                col,
                                 matcher: LikeMatcher::new(pattern),
                             });
                         } else {
@@ -922,10 +1072,9 @@ impl Filter {
                     // Handle NOT LIKE patterns
                     if let Filter::Like { field, pattern } = inner.as_ref() {
                         if let Some(col_idx) = schema.get_index(field) {
-                            if let TypedColumn::String { data, nulls } = &columns[col_idx] {
+                            if let TypedColumn::String(col) = &columns[col_idx] {
                                 matchers.push(FusedMatcher::NotLike {
-                                    data,
-                                    nulls,
+                                    col,
                                     matcher: LikeMatcher::new(pattern),
                                 });
                             } else {
@@ -958,8 +1107,8 @@ impl Filter {
 
 /// Fused matcher for parallel AND evaluation
 enum FusedMatcher<'a> {
-    Like { data: &'a [String], nulls: &'a BitVec, matcher: LikeMatcher },
-    NotLike { data: &'a [String], nulls: &'a BitVec, matcher: LikeMatcher },
+    Like { col: &'a ArrowStringColumn, matcher: LikeMatcher },
+    NotLike { col: &'a ArrowStringColumn, matcher: LikeMatcher },
     CompareInt64 { data: &'a [i64], nulls: &'a BitVec, op: CompareOp, target: i64 },
     CompareFloat64 { data: &'a [f64], nulls: &'a BitVec, op: CompareOp, target: f64 },
     RangeInt64 { data: &'a [i64], nulls: &'a BitVec, low: i64, high: i64 },
@@ -969,13 +1118,11 @@ impl<'a> FusedMatcher<'a> {
     #[inline(always)]
     fn matches(&self, i: usize) -> bool {
         match self {
-            FusedMatcher::Like { data, nulls, matcher } => {
-                if i >= data.len() || nulls.get(i) { return false; }
-                matcher.matches(&data[i])
+            FusedMatcher::Like { col, matcher } => {
+                col.get(i).map(|s| matcher.matches(s)).unwrap_or(false)
             }
-            FusedMatcher::NotLike { data, nulls, matcher } => {
-                if i >= data.len() || nulls.get(i) { return false; }
-                !matcher.matches(&data[i])
+            FusedMatcher::NotLike { col, matcher } => {
+                col.get(i).map(|s| !matcher.matches(s)).unwrap_or(false)
             }
             FusedMatcher::CompareInt64 { data, nulls, op, target } => {
                 if i >= data.len() || nulls.get(i) { return false; }

@@ -22,7 +22,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'apexbase', 'python'))
 
 try:
-    from apexbase import ApexClient, SqlResult, SqlResultArrow, ARROW_AVAILABLE, POLARS_AVAILABLE
+    from apexbase import ApexClient, ResultView, ARROW_AVAILABLE, POLARS_AVAILABLE
 except ImportError as e:
     pytest.skip(f"ApexBase not available: {e}", allow_module_level=True)
 
@@ -65,7 +65,7 @@ class TestBasicSQLExecute:
             # Execute basic SELECT
             result = client.execute("SELECT * FROM default")
             
-            assert isinstance(result, SqlResult)
+            assert isinstance(result, ResultView)
             assert len(result) == 3
             assert "name" in result.columns
             assert "age" in result.columns
@@ -123,6 +123,10 @@ class TestBasicSQLExecute:
             
             assert len(result) == 2
             rows = list(result)
+            assert len(rows) == 2
+            assert isinstance(rows[0], dict)
+            assert "name" in rows[0]
+            assert "age" in rows[0]
             names = [row["name"] for row in rows]
             assert "Bob" in names
             assert "Charlie" in names
@@ -414,25 +418,30 @@ class TestSQLGroupBy:
             # Store test data
             test_data = [
                 {"city": "NYC", "population": 1000000},
+                {"city": "NYC", "population": 1100000},
                 {"city": "LA", "population": 800000},
             ]
             client.store(test_data)
-            
-            # Test HAVING - behavior may vary, HAVING may not be supported
-            try:
-                result = client.execute("SELECT city, population FROM default WHERE population > 600000")
-                assert len(result) >= 0
-            except Exception as e:
-                print(f"GROUP BY HAVING: {e}")
+
+            # HAVING should filter on aggregated result
+            result = client.execute(
+                "SELECT city, COUNT(*) AS c FROM default GROUP BY city HAVING c > 1"
+            )
+            rows = result.to_dict()
+            assert isinstance(rows, list)
+            # Only NYC has >1 rows
+            assert len(rows) == 1
+            assert rows[0]["city"] == "NYC"
+            assert rows[0]["c"] == 2
             
             client.close()
 
 
 class TestSqlResultFunctionality:
-    """Test SqlResult functionality and conversions"""
+    """Test ResultView functionality and conversions"""
     
     def test_sql_result_basic_properties(self):
-        """Test SqlResult basic properties"""
+        """Test ResultView basic properties"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
             
@@ -446,7 +455,7 @@ class TestSqlResultFunctionality:
             result = client.execute("SELECT name, age FROM default")
             
             # Test basic properties
-            assert isinstance(result, SqlResult)
+            assert isinstance(result, ResultView)
             assert len(result) >= 0
             # Columns may vary based on implementation
             assert result.columns is not None
@@ -454,7 +463,7 @@ class TestSqlResultFunctionality:
             client.close()
     
     def test_sql_result_iteration(self):
-        """Test SqlResult iteration"""
+        """Test ResultView iteration"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
             
@@ -482,7 +491,7 @@ class TestSqlResultFunctionality:
             client.close()
     
     def test_sql_result_to_dicts(self):
-        """Test SqlResult.to_dicts() method"""
+        """Test ResultView.to_dict() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
             
@@ -494,7 +503,7 @@ class TestSqlResultFunctionality:
             client.store(test_data)
             
             result = client.execute("SELECT name, age FROM default")
-            dict_list = result.to_dicts()
+            dict_list = result.to_dict()
             
             assert isinstance(dict_list, list)
             assert len(dict_list) == 2
@@ -506,7 +515,7 @@ class TestSqlResultFunctionality:
     
     @pytest.mark.skipif(not PANDAS_AVAILABLE, reason="Pandas not available")
     def test_sql_result_to_pandas(self):
-        """Test SqlResult.to_pandas() method"""
+        """Test ResultView.to_pandas() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
             
@@ -531,7 +540,7 @@ class TestSqlResultFunctionality:
     
     @pytest.mark.skipif(not POLARS_DF_AVAILABLE, reason="Polars not available")
     def test_sql_result_to_polars(self):
-        """Test SqlResult.to_polars() method"""
+        """Test ResultView.to_polars() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
             
@@ -554,7 +563,7 @@ class TestSqlResultFunctionality:
             client.close()
     
     def test_sql_result_get_ids(self):
-        """Test SqlResult.get_ids() method"""
+        """Test ResultView.get_ids() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
             
@@ -583,7 +592,7 @@ class TestSqlResultFunctionality:
             client.close()
     
     def test_sql_result_scalar(self):
-        """Test SqlResult.scalar() method"""
+        """Test ResultView.scalar() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
             
@@ -612,7 +621,7 @@ class TestSqlResultFunctionality:
             client.close()
     
     def test_sql_result_first(self):
-        """Test SqlResult.first() method"""
+        """Test ResultView.first() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
             
@@ -640,7 +649,7 @@ class TestSqlResultFunctionality:
             client.close()
     
     def test_sql_result_repr(self):
-        """Test SqlResult.__repr__ method"""
+        """Test ResultView.__repr__ method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
             
@@ -655,7 +664,7 @@ class TestSqlResultFunctionality:
             repr_str = repr(result)
             
             # Basic repr check - format may vary
-            assert "SqlResult" in repr_str
+            assert "ResultView" in repr_str
             
             client.close()
 
@@ -847,9 +856,8 @@ class TestSQLPerformance:
             if ARROW_AVAILABLE and PYARROW_AVAILABLE:
                 # Test that Arrow conversion works
                 try:
-                    # Check if result has Arrow batch internally
-                    if hasattr(result, '_arrow_batch') and result._arrow_batch is not None:
-                        assert isinstance(result._arrow_batch, pa.RecordBatch)
+                    table = result.to_arrow()
+                    assert isinstance(table, pa.Table)
                 except Exception:
                     pass  # Arrow optimization might not be active
             

@@ -3,8 +3,9 @@
 //! This module provides optimized filter evaluation for streaming queries
 //! with early termination support.
 
-use crate::query::{Filter, LikeMatcher, CompareOp};
+use crate::query::{Filter, LikeMatcher, RegexpMatcher, CompareOp};
 use crate::table::column_table::{TypedColumn, ColumnSchema};
+use crate::table::arrow_column::ArrowStringColumn;
 use crate::data::Value;
 
 /// Streaming filter evaluator for early termination
@@ -19,8 +20,9 @@ pub(crate) enum CompiledFilter<'a> {
     False,
     CompareInt64 { data: &'a [i64], op: CompareOp, target: i64 },
     CompareFloat64 { data: &'a [f64], op: CompareOp, target: f64 },
-    CompareString { data: &'a [String], op: CompareOp, target: String },
-    Like { data: &'a [String], matcher: LikeMatcher, negated: bool },
+    CompareString { data: &'a ArrowStringColumn, op: CompareOp, target: String },
+    Like { data: &'a ArrowStringColumn, matcher: LikeMatcher, negated: bool },
+    Regexp { data: &'a ArrowStringColumn, matcher: RegexpMatcher, negated: bool },
     Range { data: &'a [i64], low: i64, high: i64 },
     And(Vec<CompiledFilter<'a>>),
     Or(Vec<CompiledFilter<'a>>),
@@ -56,8 +58,8 @@ impl<'a> StreamingFilterEvaluator<'a> {
                         (TypedColumn::Float64 { data, .. }, Value::Float64(target)) => {
                             CompiledFilter::CompareFloat64 { data, op: op.clone(), target: *target }
                         }
-                        (TypedColumn::String { data, .. }, Value::String(target)) => {
-                            CompiledFilter::CompareString { data, op: op.clone(), target: target.clone() }
+                        (TypedColumn::String(col), Value::String(target)) => {
+                            CompiledFilter::CompareString { data: col, op: op.clone(), target: target.clone() }
                         }
                         _ => CompiledFilter::Generic { filter: filter.clone(), schema, columns }
                     }
@@ -67,9 +69,21 @@ impl<'a> StreamingFilterEvaluator<'a> {
             }
             Filter::Like { field, pattern } => {
                 if let Some(col_idx) = schema.get_index(field) {
-                    if let TypedColumn::String { data, .. } = &columns[col_idx] {
+                    if let TypedColumn::String(col) = &columns[col_idx] {
                         let matcher = LikeMatcher::new(pattern);
-                        CompiledFilter::Like { data, matcher, negated: false }
+                        CompiledFilter::Like { data: col, matcher, negated: false }
+                    } else {
+                        CompiledFilter::False
+                    }
+                } else {
+                    CompiledFilter::False
+                }
+            }
+            Filter::Regexp { field, pattern } => {
+                if let Some(col_idx) = schema.get_index(field) {
+                    if let TypedColumn::String(col) = &columns[col_idx] {
+                        let matcher = RegexpMatcher::new(pattern);
+                        CompiledFilter::Regexp { data: col, matcher, negated: false }
                     } else {
                         CompiledFilter::False
                     }
@@ -146,22 +160,36 @@ impl<'a> StreamingFilterEvaluator<'a> {
                 }
             }
             CompiledFilter::CompareString { data, op, target } => {
-                if row_idx >= data.len() { return false; }
-                let val = &data[row_idx];
-                match op {
-                    CompareOp::Equal => val == target,
-                    CompareOp::NotEqual => val != target,
-                    CompareOp::LessThan => val < target,
-                    CompareOp::LessEqual => val <= target,
-                    CompareOp::GreaterThan => val > target,
-                    CompareOp::GreaterEqual => val >= target,
-                    _ => false,
+                match data.get(row_idx) {
+                    Some(val) => match op {
+                        CompareOp::Equal => val == target,
+                        CompareOp::NotEqual => val != target,
+                        CompareOp::LessThan => val < target.as_str(),
+                        CompareOp::LessEqual => val <= target.as_str(),
+                        CompareOp::GreaterThan => val > target.as_str(),
+                        CompareOp::GreaterEqual => val >= target.as_str(),
+                        _ => false,
+                    },
+                    None => false,
                 }
             }
             CompiledFilter::Like { data, matcher, negated } => {
-                if row_idx >= data.len() { return false; }
-                let matches = matcher.matches(&data[row_idx]);
-                if *negated { !matches } else { matches }
+                match data.get(row_idx) {
+                    Some(val) => {
+                        let matches = matcher.matches(val);
+                        if *negated { !matches } else { matches }
+                    }
+                    None => false,
+                }
+            }
+            CompiledFilter::Regexp { data, matcher, negated } => {
+                match data.get(row_idx) {
+                    Some(val) => {
+                        let matches = matcher.matches(val);
+                        if *negated { !matches } else { matches }
+                    }
+                    None => false,
+                }
             }
             CompiledFilter::Range { data, low, high } => {
                 if row_idx >= data.len() { return false; }

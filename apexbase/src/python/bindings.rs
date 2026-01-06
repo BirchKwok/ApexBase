@@ -8,7 +8,10 @@
 
 use crate::data::Value;
 use crate::table::{ColumnTable, ColumnSchema};
-use crate::fts::{FtsManager, FtsConfig};
+use crate::fts::FtsManager;
+use crate::fts::FtsConfig;
+use crate::io_engine::IoEngine;
+use crate::query::SqlExecutor;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -517,6 +520,201 @@ impl ApexStorage {
         };
 
         Ok(storage)
+    }
+
+    /// Initialize FTS for current table.
+    ///
+    /// This sets up the FTS manager and ensures the engine for the current table exists.
+    #[pyo3(name = "_init_fts")]
+    #[pyo3(signature = (index_fields=None, lazy_load=false, cache_size=10000))]
+    fn init_fts(&self, index_fields: Option<Vec<String>>, lazy_load: bool, cache_size: usize) -> PyResult<()> {
+        let table_name = self.current_table.read().clone();
+
+        // Record index field configuration (used by Python layer to decide what to index)
+        if let Some(fields) = index_fields.clone() {
+            self.fts_index_fields.write().insert(table_name.clone(), fields);
+        }
+
+        // Ensure manager exists
+        if self.fts_manager.read().is_none() {
+            let fts_dir = self.base_dir.join("fts_indexes");
+            let config = FtsConfig {
+                lazy_load,
+                cache_size,
+                ..FtsConfig::default()
+            };
+            let manager = FtsManager::new(&fts_dir, config);
+            *self.fts_manager.write() = Some(manager);
+        }
+
+        // Touch/create engine for current table
+        let manager_guard = self.fts_manager.read();
+        let manager = manager_guard.as_ref().ok_or_else(|| PyRuntimeError::new_err("FTS manager not initialized"))?;
+        manager
+            .get_engine(&table_name)
+            .map_err(|e| PyRuntimeError::new_err(format!("FTS init error: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Add a column to current table
+    fn add_column(&self, column_name: &str, column_type: &str) -> PyResult<()> {
+        let table_name = self.current_table.read().clone();
+        let dtype = match column_type.to_lowercase().as_str() {
+            "int" | "int64" | "i64" | "integer" => crate::data::DataType::Int64,
+            "float" | "float64" | "f64" | "double" => crate::data::DataType::Float64,
+            "bool" | "boolean" => crate::data::DataType::Bool,
+            "str" | "string" | "text" => crate::data::DataType::String,
+            "bytes" | "binary" => crate::data::DataType::Binary,
+            _ => crate::data::DataType::String,
+        };
+
+        let mut tables = self.tables.write();
+        let table = tables
+            .get_mut(&table_name)
+            .ok_or_else(|| PyValueError::new_err("Table not found"))?;
+
+        table.add_column(column_name, dtype);
+        Ok(())
+    }
+
+    fn drop_column(&self, column_name: &str) -> PyResult<()> {
+        let table_name = self.current_table.read().clone();
+
+        let mut tables = self.tables.write();
+        let table = tables
+            .get_mut(&table_name)
+            .ok_or_else(|| PyValueError::new_err("Table not found"))?;
+
+        let ok = table.drop_column(column_name);
+        if !ok {
+            return Err(PyValueError::new_err(format!("Column not found: {}", column_name)));
+        }
+
+        Ok(())
+    }
+
+    /// Delete a single record by id (soft delete)
+    fn delete(&self, id: i64) -> bool {
+        let table_name = self.current_table.read().clone();
+        let mut tables = self.tables.write();
+        if let Some(table) = tables.get_mut(&table_name) {
+            table.delete(id as u64)
+        } else {
+            false
+        }
+    }
+
+    /// Delete multiple records by ids (soft delete)
+    fn delete_batch(&self, ids: Vec<i64>) -> bool {
+        let table_name = self.current_table.read().clone();
+        let ids_u64: Vec<u64> = ids.into_iter().map(|id| id as u64).collect();
+        let mut tables = self.tables.write();
+        if let Some(table) = tables.get_mut(&table_name) {
+            table.delete_batch(&ids_u64)
+        } else {
+            false
+        }
+    }
+
+    /// Replace a record (full replacement) by id
+    fn replace(&self, _py: Python<'_>, id: i64, data: &Bound<'_, PyDict>) -> PyResult<bool> {
+        let table_name = self.current_table.read().clone();
+
+        let mut fields: HashMap<String, Value> = HashMap::new();
+        for (key, value) in data.iter() {
+            let k: String = key.extract()?;
+            let v = py_to_value(&value)?;
+            fields.insert(k, v);
+        }
+
+        let mut tables = self.tables.write();
+        let table = tables
+            .get_mut(&table_name)
+            .ok_or_else(|| PyValueError::new_err("Table not found"))?;
+
+        table.flush_write_buffer();
+        Ok(table.replace(id as u64, &fields))
+    }
+
+    /// Execute a full SQL statement and return rows.
+    /// Returns a dict {columns: List[str], rows: List[List[Any]], rows_affected: int}
+    fn execute(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+        let sql = sql.to_string();
+
+        let (columns, rows, rows_affected) = py.allow_threads(|| -> PyResult<(Vec<String>, Vec<Vec<Value>>, usize)> {
+            // Determine target table from SQL (fallback to current table)
+            let target_table = match crate::query::SqlParser::parse(&sql) {
+                Ok(crate::query::SqlStatement::Select(sel)) => sel.from.unwrap_or_else(|| self.current_table.read().clone()),
+                Err(_) => self.current_table.read().clone(),
+            };
+
+            let mut tables = self.tables.write();
+            let table = tables
+                .get_mut(&target_table)
+                .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
+
+            let result = SqlExecutor::execute(&sql, table)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            Ok((result.columns, result.rows, result.rows_affected))
+        })?;
+
+        let out = PyDict::new_bound(py);
+        out.set_item("columns", columns)?;
+
+        // Convert rows (Vec<Vec<Value>>) -> Python
+        let py_rows = PyList::empty_bound(py);
+        for row in rows {
+            let py_row = PyList::empty_bound(py);
+            for v in row {
+                py_row.append(value_to_py(py, &v)?)?;
+            }
+            py_rows.append(py_row)?;
+        }
+        out.set_item("rows", py_rows)?;
+        out.set_item("rows_affected", rows_affected)?;
+        Ok(out.into())
+    }
+
+    /// Execute SQL and export Arrow via FFI pointers.
+    #[pyo3(name = "_execute_arrow_ffi")]
+    fn execute_arrow_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(u64, u64)> {
+        use arrow::array::Array;
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+
+        let sql = sql.to_string();
+
+        let batch = py.allow_threads(|| -> PyResult<arrow::record_batch::RecordBatch> {
+            // Determine target table from SQL
+            let target_table = match crate::query::SqlParser::parse(&sql) {
+                Ok(crate::query::SqlStatement::Select(sel)) => sel.from.unwrap_or_else(|| self.current_table.read().clone()),
+                Err(_) => self.current_table.read().clone(),
+            };
+
+            let mut tables = self.tables.write();
+            let table = tables
+                .get_mut(&target_table)
+                .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
+
+            IoEngine::execute_sql_arrow(table, &sql)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+
+        if batch.num_rows() == 0 {
+            return Ok((0, 0));
+        }
+
+        let struct_array = arrow::array::StructArray::from(batch);
+
+        let ffi_array = Box::new(FFI_ArrowArray::new(&struct_array.to_data()));
+        let ffi_schema = Box::new(FFI_ArrowSchema::try_from(struct_array.data_type())
+            .map_err(|e| PyRuntimeError::new_err(format!("Schema export error: {}", e)))?);
+
+        let array_ptr = Box::into_raw(ffi_array) as u64;
+        let schema_ptr = Box::into_raw(ffi_schema) as u64;
+
+        Ok((schema_ptr, array_ptr))
     }
 
     // ========== Table Management ==========
@@ -1911,87 +2109,11 @@ impl ApexStorage {
             for (k, v) in fields {
                 dict.set_item(k, value_to_py(py, &v)?)?;
             }
+
             py_results.push(dict.into());
         }
+
         Ok(py_results)
-    }
-
-    /// Retrieve multiple records as Arrow IPC - internal use (OPTIMIZED)
-    /// Uses direct columnar-to-Arrow conversion, skipping HashMap/Row intermediate formats
-    #[pyo3(name = "_retrieve_many_arrow")]
-    fn retrieve_many_arrow<'py>(&self, py: Python<'py>, ids: Vec<i64>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let table_name = self.current_table.read().clone();
-        let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
-        
-        let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
-            let mut tables = self.tables.write();
-            let table = tables.get_mut(&table_name)
-                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
-            
-            // Use the optimized direct Arrow path - no HashMap/Row conversion!
-            table.get_many_arrow(&ids_u64)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-        })?;
-        
-        Ok(pyo3::types::PyBytes::new_bound(py, &bytes))
-    }
-
-    /// ULTRA-FAST: Retrieve multiple records using numpy array input
-    /// Avoids Python list -> Rust Vec conversion overhead by using zero-copy numpy access
-    /// This is ~2-5x faster than _retrieve_many_arrow for large ID arrays
-    #[pyo3(name = "_retrieve_many_arrow_numpy")]
-    fn retrieve_many_arrow_numpy<'py>(
-        &self, 
-        py: Python<'py>, 
-        ids: PyReadonlyArray1<'py, i64>
-    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let table_name = self.current_table.read().clone();
-        
-        // ZERO-COPY: Get slice directly from numpy array
-        let ids_slice = ids.as_slice()?;
-        
-        // Convert to u64 - unfortunately we need to copy here
-        // But this is much faster than Python list iteration
-        let ids_u64: Vec<u64> = ids_slice.iter().map(|&id| id as u64).collect();
-        
-        let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
-            let mut tables = self.tables.write();
-            let table = tables.get_mut(&table_name)
-                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
-            
-            table.get_many_arrow(&ids_u64)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-        })?;
-        
-        Ok(pyo3::types::PyBytes::new_bound(py, &bytes))
-    }
-
-    /// ULTRA-FAST: Retrieve multiple records using numpy u64 array input
-    /// True zero-copy path for u64 numpy arrays - fastest possible
-    #[pyo3(name = "_retrieve_many_arrow_numpy_u64")]
-    fn retrieve_many_arrow_numpy_u64<'py>(
-        &self, 
-        py: Python<'py>, 
-        ids: PyReadonlyArray1<'py, u64>
-    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let table_name = self.current_table.read().clone();
-        
-        // TRUE ZERO-COPY: Get slice directly, pass as reference
-        let ids_slice = ids.as_slice()?;
-        
-        // Clone the slice to owned Vec for thread safety (allow_threads requirement)
-        let ids_owned: Vec<u64> = ids_slice.to_vec();
-        
-        let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
-            let mut tables = self.tables.write();
-            let table = tables.get_mut(&table_name)
-                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
-            
-            table.get_many_arrow(&ids_owned)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-        })?;
-        
-        Ok(pyo3::types::PyBytes::new_bound(py, &bytes))
     }
 
     /// ZERO-COPY retrieve multiple records via Arrow C Data Interface
@@ -2041,771 +2163,6 @@ impl ApexStorage {
         let schema_ptr = Box::into_raw(ffi_schema) as u64;
         
         Ok((schema_ptr, array_ptr))
-    }
-
-    /// Query records with optional limit - uses IoEngine for automatic strategy selection
-    /// 
-    /// IoEngine routes to optimal path:
-    /// - Streaming: for LIMIT queries (early termination)
-    /// - Direct: for small results or when limit specified
-    /// - Arrow FFI path is used separately via _query_arrow_ffi
-    #[pyo3(signature = (where_clause, limit=None))]
-    fn query(&self, py: Python<'_>, where_clause: &str, limit: Option<usize>) -> PyResult<PyObject> {
-        use crate::io_engine::{IoEngine, IoStrategy, QueryHints};
-        
-        let table_name = self.current_table.read().clone();
-        
-        // Build hints and select strategy
-        let hints = if let Some(lim) = limit {
-            QueryHints::new().with_limit(lim)
-        } else {
-            QueryHints::new()
-        };
-        let strategy = IoEngine::select_strategy(&hints);
-        
-        // Execute using selected strategy - call underlying methods directly (zero overhead)
-        let results = py.allow_threads(|| {
-            let mut tables = self.tables.write();
-            let table = tables.get_mut(&table_name)
-                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
-            
-            match strategy {
-                IoStrategy::Streaming => {
-                    // Streaming: use query_with_limit for early termination
-                    table.query_with_limit(where_clause, limit)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))
-                }
-                IoStrategy::Direct | IoStrategy::Arrow => {
-                    // Direct/Arrow: use query_with_limit (None = all rows)
-                    table.query_with_limit(where_clause, limit)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))
-                }
-            }
-        })?;
-        
-        // Convert to Python list of dicts
-        let list = PyList::empty_bound(py);
-        for fields in results {
-            let dict = PyDict::new_bound(py);
-            for (k, v) in fields {
-                dict.set_item(k, value_to_py(py, &v)?)?;
-            }
-            list.append(dict)?;
-        }
-        Ok(list.into())
-    }
-
-    /// Execute a full SQL statement (SQL:2023 compliant) - uses IoEngine
-    /// 
-    /// Execute SQL through IoEngine with automatic strategy selection
-    /// 
-    /// IoEngine routes all queries and selects optimal strategy:
-    /// - Arrow: Large result sets, SELECT * without LIMIT
-    /// - Streaming: LIMIT queries without ORDER BY  
-    /// - Direct: Aggregates, GROUP BY, small results
-    /// 
-    /// Returns: Dict with 'columns' (List[str]) and 'rows' (List[List])
-    fn execute(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
-        use crate::io_engine::IoEngine;
-        use crate::query::{SqlParser, SqlStatement};
-        
-        // Parse SQL to extract table name from FROM clause (optional, defaults to current table)
-        let target_table = {
-            let stmt = SqlParser::parse(sql)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            match stmt {
-                SqlStatement::Select(select) => {
-                    select.from.unwrap_or_else(|| "default".to_string())
-                }
-            }
-        };
-        
-        let result = py.allow_threads(|| {
-            let mut tables = self.tables.write();
-            let table = tables.get_mut(&target_table)
-                .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
-            
-            // All SQL execution goes through IoEngine for unified strategy selection
-            IoEngine::execute_sql(table, sql)
-                .map_err(|e| PyValueError::new_err(e.to_string()))
-        })?;
-        
-        // Convert result to Python dict
-        let result_dict = PyDict::new_bound(py);
-        
-        // Column names
-        let columns_list = PyList::new_bound(py, &result.columns);
-        result_dict.set_item("columns", columns_list)?;
-        
-        // Check if we have a pre-built Arrow batch (fast path for large results)
-        if let Some(ref batch) = result.arrow_batch {
-            // Convert Arrow batch to rows for Python compatibility
-            // This is still faster because we avoid the row-by-row construction in Rust
-            let rows_list = PyList::empty_bound(py);
-            let num_rows = batch.num_rows();
-            let num_cols = batch.num_columns();
-            
-            for row_idx in 0..num_rows {
-                let row_list = PyList::empty_bound(py);
-                for col_idx in 0..num_cols {
-                    let col = batch.column(col_idx);
-                    let py_val = arrow_value_to_py(py, col, row_idx)?;
-                    row_list.append(py_val)?;
-                }
-                rows_list.append(row_list)?;
-            }
-            result_dict.set_item("rows", rows_list)?;
-        } else {
-            // Standard path: convert rows directly
-            let rows_list = PyList::empty_bound(py);
-            for row in &result.rows {
-                let row_list = PyList::empty_bound(py);
-                for val in row {
-                    row_list.append(value_to_py(py, val)?)?;
-                }
-                rows_list.append(row_list)?;
-            }
-            result_dict.set_item("rows", rows_list)?;
-        }
-        
-        // Rows affected count
-        result_dict.set_item("rows_affected", result.rows_affected)?;
-        
-        Ok(result_dict.into())
-    }
-    
-    /// Execute SQL and return Arrow FFI pointers (fast path for large results)
-    /// Uses IoEngine for unified data access with automatic strategy selection
-    #[pyo3(name = "_execute_arrow_ffi")]
-    fn execute_arrow_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(u64, u64)> {
-        use crate::io_engine::IoEngine;
-        use crate::query::{SqlParser, SqlStatement};
-        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-        use arrow::array::Array;
-        
-        // Parse SQL to extract table name from FROM clause (optional, defaults to current table)
-        let target_table = {
-            let stmt = SqlParser::parse(sql)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            match stmt {
-                SqlStatement::Select(select) => {
-                    select.from.unwrap_or_else(|| "default".to_string())
-                }
-            }
-        };
-        let sql = sql.to_string();
-        
-        let batch = py.allow_threads(|| -> PyResult<arrow::record_batch::RecordBatch> {
-            let mut tables = self.tables.write();
-            let table = tables.get_mut(&target_table)
-                .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
-            
-            // Use IoEngine for unified data access
-            IoEngine::execute_sql_arrow(table, &sql)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-        })?;
-        
-        if batch.num_rows() == 0 {
-            return Ok((0, 0));
-        }
-        
-        // Export via Arrow C Data Interface
-        let struct_array = arrow::array::StructArray::from(batch);
-        
-        let ffi_array = Box::new(FFI_ArrowArray::new(&struct_array.to_data()));
-        let ffi_schema = Box::new(FFI_ArrowSchema::try_from(struct_array.data_type())
-            .map_err(|e| PyRuntimeError::new_err(format!("Schema export error: {}", e)))?);
-        
-        let array_ptr = Box::into_raw(ffi_array) as u64;
-        let schema_ptr = Box::into_raw(ffi_schema) as u64;
-        
-        Ok((schema_ptr, array_ptr))
-    }
-
-    /// Query and return columnar data (fast, avoids dict creation) - internal use
-    /// Returns: (column_names: List[str], columns: List[List])
-    #[pyo3(name = "_query_columnar")]
-    fn query_columnar(&self, py: Python<'_>, where_clause: &str) -> PyResult<PyObject> {
-        let table_name = self.current_table.read().clone();
-        
-        let result = py.allow_threads(|| {
-            self.tables
-                .write()
-                .get_mut(&table_name)
-                .ok_or_else(|| PyValueError::new_err("Table not found"))?
-                .query_columnar(where_clause)
-                .map_err(|e| PyValueError::new_err(e.to_string()))
-        })?;
-        
-        // Convert to Python: (column_names, column_data)
-        let mut col_names = vec!["_id".to_string()];
-        col_names.extend(result.schema.column_names());
-        
-        let names_list = PyList::new_bound(py, &col_names);
-        
-        // Build column data lists using row_indices directly (O(n) instead of O(n*m))
-        let mut columns_list = Vec::with_capacity(col_names.len());
-        
-        // First column: IDs (already filtered in result.ids)
-        let ids_list = PyList::new_bound(py, result.ids.iter().map(|&id| id as i64));
-        columns_list.push(ids_list.into_any());
-        
-        // Data columns - iterate over row_indices for efficiency
-        for col in &result.columns {
-            let col_list = match col {
-                crate::table::column_table::TypedColumn::Int64 { data, nulls } => {
-                    let list = PyList::empty_bound(py);
-                    for &idx in &result.row_indices {
-                        if nulls.get(idx) {
-                            list.append(py.None())?;
-                        } else {
-                            list.append(data[idx])?;
-                        }
-                    }
-                    list
-                }
-                crate::table::column_table::TypedColumn::Float64 { data, nulls } => {
-                    let list = PyList::empty_bound(py);
-                    for &idx in &result.row_indices {
-                        if nulls.get(idx) {
-                            list.append(py.None())?;
-                        } else {
-                            list.append(data[idx])?;
-                        }
-                    }
-                    list
-                }
-                crate::table::column_table::TypedColumn::String { data, nulls } => {
-                    let list = PyList::empty_bound(py);
-                    for &idx in &result.row_indices {
-                        if nulls.get(idx) {
-                            list.append(py.None())?;
-                        } else {
-                            list.append(&data[idx])?;
-                        }
-                    }
-                    list
-                }
-                crate::table::column_table::TypedColumn::Bool { data, nulls } => {
-                    let list = PyList::empty_bound(py);
-                    for &idx in &result.row_indices {
-                        if nulls.get(idx) {
-                            list.append(py.None())?;
-                        } else {
-                            list.append(data.get(idx))?;
-                        }
-                    }
-                    list
-                }
-                crate::table::column_table::TypedColumn::Mixed { data, nulls } => {
-                    let list = PyList::empty_bound(py);
-                    for &idx in &result.row_indices {
-                        if nulls.get(idx) {
-                            list.append(py.None())?;
-                        } else {
-                            list.append(value_to_py(py, &data[idx])?)?;
-                        }
-                    }
-                    list
-                }
-            };
-            columns_list.push(col_list.into_any());
-        }
-        
-        let data_list = PyList::new_bound(py, columns_list);
-        let tuple = pyo3::types::PyTuple::new_bound(py, [names_list.into_any(), data_list.into_any()]);
-        Ok(tuple.into())
-    }
-
-    /// Query and return as Arrow IPC (fastest) - internal use
-    #[pyo3(name = "_query_arrow")]
-    fn query_arrow<'py>(&self, py: Python<'py>, where_clause: &str) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let table_name = self.current_table.read().clone();
-        
-        let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
-            let mut tables = self.tables.write();
-            let table = tables.get_mut(&table_name)
-                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
-            
-            let result = table.query_columnar(where_clause)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            
-            result.to_arrow_ipc()
-                .map_err(|e| PyRuntimeError::new_err(e))
-        })?;
-        
-        Ok(pyo3::types::PyBytes::new_bound(py, &bytes))
-    }
-
-    /// OPTIMIZED: Query via Arrow FFI (zero-copy, no column cloning)
-    /// This is the fastest path for filtered queries
-    #[pyo3(name = "_query_arrow_ffi")]
-    fn query_arrow_ffi(&self, py: Python<'_>, where_clause: &str) -> PyResult<(u64, u64)> {
-        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-        use arrow::array::Array;
-        
-        let table_name = self.current_table.read().clone();
-        let where_clause = where_clause.to_string();
-        
-        // Build RecordBatch directly (no column cloning!)
-        let batch = py.allow_threads(|| -> PyResult<arrow::record_batch::RecordBatch> {
-            let mut tables = self.tables.write();
-            let table = tables.get_mut(&table_name)
-                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
-            
-            table.query_to_record_batch(&where_clause)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-        })?;
-        
-        if batch.num_rows() == 0 {
-            return Ok((0, 0));
-        }
-        
-        // Export via Arrow C Data Interface
-        let struct_array = arrow::array::StructArray::from(batch);
-        
-        let ffi_array = Box::new(FFI_ArrowArray::new(&struct_array.to_data()));
-        let ffi_schema = Box::new(FFI_ArrowSchema::try_from(struct_array.data_type())
-            .map_err(|e| PyRuntimeError::new_err(format!("Schema export error: {}", e)))?);
-        
-        let array_ptr = Box::into_raw(ffi_array) as u64;
-        let schema_ptr = Box::into_raw(ffi_schema) as u64;
-        
-        Ok((schema_ptr, array_ptr))
-    }
-
-    /// Retrieve all records as Arrow IPC - internal use
-    #[pyo3(name = "_retrieve_all_arrow")]
-    fn retrieve_all_arrow<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        self.query_arrow(py, "1=1")
-    }
-
-    /// ULTRA-FAST retrieve all records as Arrow IPC - bypasses query parsing
-    /// 
-    /// This is the fastest path for full table reads:
-    /// - No query parsing overhead
-    /// - No column cloning
-    /// - Direct contiguous range optimization
-    /// - Parallel column conversion
-    /// 
-    /// Target: 10M rows in <500ms
-    #[pyo3(name = "_retrieve_all_arrow_direct")]
-    fn retrieve_all_arrow_direct<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let table_name = self.current_table.read().clone();
-        
-        let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
-            let mut tables = self.tables.write();
-            let table = tables.get_mut(&table_name)
-                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
-            
-            table.retrieve_all_arrow_direct()
-                .map_err(|e| PyRuntimeError::new_err(e))
-        })?;
-        
-        Ok(pyo3::types::PyBytes::new_bound(py, &bytes))
-    }
-
-    /// ZERO-COPY retrieve all records via Arrow C Data Interface
-    /// 
-    /// This is the absolute fastest path - NO serialization overhead:
-    /// - Exports Arrow arrays via FFI pointers
-    /// - Python receives raw memory pointers
-    /// - PyArrow imports directly without copy
-    /// - OPTIMIZED: No row_indices allocation (saves 80MB for 10M rows)
-    /// 
-    /// Returns: (schema_ptr, array_ptr) tuple for PyArrow import
-    #[pyo3(name = "_retrieve_all_arrow_ffi")]
-    fn retrieve_all_arrow_ffi(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
-        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-        use arrow::array::Array;
-        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-        use std::sync::Arc;
-        use arrow::record_batch::RecordBatch;
-        
-        let table_name = self.current_table.read().clone();
-        
-        // Build the RecordBatch in Rust - ULTRA OPTIMIZED path
-        let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
-            let mut tables = self.tables.write();
-            let table = tables.get_mut(&table_name)
-                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
-            
-            // Flush pending writes
-            table.flush_write_buffer();
-            
-            let row_count = table.row_count();
-            if row_count == 0 {
-                // Return empty batch
-                let schema = Arc::new(Schema::new(vec![
-                    Field::new("_id", ArrowDataType::UInt64, false),
-                ]));
-                return RecordBatch::try_new(schema, vec![
-                    Arc::new(arrow::array::UInt64Array::from(Vec::<u64>::new()))
-                ]).map_err(|e| PyRuntimeError::new_err(e.to_string()));
-            }
-            
-            // Get column info
-            let column_names: Vec<String> = table.schema_ref().columns.iter()
-                .map(|(name, _)| name.clone())
-                .collect();
-            let columns = table.columns_ref();
-            let total_rows = row_count as usize;
-            
-            // Use the ULTRA-OPTIMIZED path - no row_indices allocation
-            crate::data::build_record_batch_all(
-                columns,
-                &column_names,
-                total_rows,
-            ).map_err(|e| PyRuntimeError::new_err(e))
-        })?;
-        
-        // Export via Arrow C Data Interface
-        let struct_array = arrow::array::StructArray::from(batch);
-        
-        // Allocate FFI structs on heap (they must outlive this function)
-        let ffi_array = Box::new(FFI_ArrowArray::new(&struct_array.to_data()));
-        let ffi_schema = Box::new(FFI_ArrowSchema::try_from(struct_array.data_type())
-            .map_err(|e| PyRuntimeError::new_err(format!("Schema export error: {}", e)))?);
-        
-        // Return raw pointers as u64 for Python to use
-        let array_ptr = Box::into_raw(ffi_array) as u64;
-        let schema_ptr = Box::into_raw(ffi_schema) as u64;
-        
-        Ok((schema_ptr, array_ptr))
-    }
-    
-    /// Free FFI pointers after Python has imported them
-    #[pyo3(name = "_free_arrow_ffi")]
-    fn free_arrow_ffi(&self, schema_ptr: u64, array_ptr: u64) -> PyResult<()> {
-        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-        
-        unsafe {
-            if schema_ptr != 0 {
-                let _ = Box::from_raw(schema_ptr as *mut FFI_ArrowSchema);
-            }
-            if array_ptr != 0 {
-                let _ = Box::from_raw(array_ptr as *mut FFI_ArrowArray);
-            }
-        }
-        Ok(())
-    }
-
-    /// Delete a single record - IoEngine::Single strategy
-    fn delete(&self, py: Python<'_>, id: i64) -> bool {
-        // IoEngine strategy: Single (direct delete by ID)
-        let table_name = self.current_table.read().clone();
-        
-        py.allow_threads(|| {
-            self.tables
-                .write()
-                .get_mut(&table_name)
-                .map(|table| table.delete(id as u64))
-                .unwrap_or(false)
-        })
-    }
-
-    /// Delete multiple records - IoEngine::Batch strategy
-    fn delete_batch(&self, py: Python<'_>, ids: Vec<i64>) -> bool {
-        // IoEngine strategy: Batch (direct delete by IDs)
-        let table_name = self.current_table.read().clone();
-        let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
-        
-        py.allow_threads(|| {
-            self.tables
-                .write()
-                .get_mut(&table_name)
-                .map(|table| table.delete_batch(&ids_u64))
-                .unwrap_or(false)
-        })
-    }
-
-    /// Replace a record (update all fields)
-    fn replace(&self, py: Python<'_>, id: i64, data: &Bound<'_, PyDict>) -> PyResult<bool> {
-        let fields = dict_to_fields(data)?;
-        let table_name = self.current_table.read().clone();
-        
-        Ok(py.allow_threads(|| {
-            self.tables
-                .write()
-                .get_mut(&table_name)
-                .map(|table| table.update(id as u64, &fields))
-                .unwrap_or(false)
-        }))
-    }
-
-    // ========== Schema Operations ==========
-
-    /// Count rows
-    fn count_rows(&self) -> u64 {
-        let table_name = self.current_table.read().clone();
-        self.tables
-            .read()
-            .get(&table_name)
-            .map(|t| t.row_count())
-            .unwrap_or(0)
-    }
-
-    /// List fields
-    fn list_fields(&self) -> Vec<String> {
-        let table_name = self.current_table.read().clone();
-        self.tables
-            .read()
-            .get(&table_name)
-            .map(|t| t.column_names())
-            .unwrap_or_default()
-    }
-
-    /// Add a column (no-op for schema-less storage)
-    fn add_column(&self, _name: &str, _dtype: &str) -> PyResult<()> {
-        // Column storage is schema-flexible, columns are added automatically
-        Ok(())
-    }
-
-    /// Drop a column (not supported)
-    fn drop_column(&self, name: &str) -> PyResult<()> {
-        if name == "_id" {
-            return Err(PyValueError::new_err("Cannot drop _id column"));
-        }
-        // For columnar storage, we don't actually drop columns
-        // Just return success for API compatibility
-        Ok(())
-    }
-
-    /// Rename a column (not directly supported)
-    fn rename_column(&self, old_name: &str, new_name: &str) -> PyResult<()> {
-        if old_name == "_id" {
-            return Err(PyValueError::new_err("Cannot rename _id column"));
-        }
-        // Not directly supported in columnar storage
-        // Return success for API compatibility
-        let _ = new_name;
-        Ok(())
-    }
-
-    /// Get column data type
-    fn get_column_dtype(&self, _name: &str) -> PyResult<String> {
-        let table_name = self.current_table.read().clone();
-        let tables = self.tables.read();
-        let _table = tables.get(&table_name)
-            .ok_or_else(|| PyValueError::new_err("Table not found"))?;
-        
-        // Return a generic type since columnar storage is flexible
-        Ok("dynamic".to_string())
-    }
-
-    // ========== Native FTS Operations (Zero Python-Rust Boundary Crossing) ==========
-    
-    /// Initialize FTS for the current storage
-    /// 
-    /// Args:
-    ///     index_fields: List of field names to index for FTS
-    ///     lazy_load: Enable lazy loading for large indexes
-    ///     cache_size: LRU cache size
-    #[pyo3(name = "_init_fts")]
-    #[pyo3(signature = (index_fields = None, lazy_load = false, cache_size = 10000))]
-    fn init_fts(
-        &self,
-        index_fields: Option<Vec<String>>,
-        lazy_load: bool,
-        cache_size: usize,
-    ) -> PyResult<()> {
-        let fts_dir = self.base_dir.join("fts_indexes");
-        if !fts_dir.exists() {
-            fs::create_dir_all(&fts_dir)
-                .map_err(|e| PyIOError::new_err(format!("Failed to create FTS directory: {}", e)))?;
-        }
-        
-        let config = FtsConfig {
-            lazy_load,
-            cache_size,
-            ..FtsConfig::default()
-        };
-        
-        let manager = FtsManager::new(&fts_dir, config);
-        *self.fts_manager.write() = Some(manager);
-        
-        // Store index fields for current table
-        if let Some(fields) = index_fields {
-            let table_name = self.current_table.read().clone();
-            self.fts_index_fields.write().insert(table_name, fields);
-        }
-        
-        Ok(())
-    }
-    
-    /// Set FTS index fields for a specific table
-    #[pyo3(name = "_set_fts_index_fields")]
-    fn set_fts_index_fields(&self, table_name: &str, fields: Vec<String>) -> PyResult<()> {
-        self.fts_index_fields.write().insert(table_name.to_string(), fields);
-        Ok(())
-    }
-    
-    /// Add a document to the FTS index
-    #[pyo3(name = "_fts_add_document")]
-    fn fts_add_document(&self, py: Python<'_>, doc_id: u64, fields: &Bound<'_, PyDict>) -> PyResult<()> {
-        let manager_guard = self.fts_manager.read();
-        let manager = manager_guard.as_ref()
-            .ok_or_else(|| PyValueError::new_err("FTS not initialized. Call _init_fts first."))?;
-        
-        let table_name = self.current_table.read().clone();
-        
-        // Extract fields from PyDict
-        let mut field_map: HashMap<String, String> = HashMap::new();
-        for (key, value) in fields.iter() {
-            let k: String = key.extract()?;
-            if let Ok(v) = value.extract::<String>() {
-                field_map.insert(k, v);
-            }
-        }
-        
-        // Get engine and add document
-        py.allow_threads(|| {
-            let engine = manager.get_engine(&table_name)
-                .map_err(|e| PyRuntimeError::new_err(format!("FTS error: {}", e)))?;
-            engine.add_document(doc_id, field_map)
-                .map_err(|e| PyRuntimeError::new_err(format!("FTS add error: {}", e)))
-        })
-    }
-    
-    /// Add multiple documents to the FTS index (batch operation)
-    /// 
-    /// Args:
-    ///     docs: List of (doc_id, fields_dict) tuples
-    #[pyo3(name = "_fts_add_documents")]
-    fn fts_add_documents(&self, py: Python<'_>, docs: &Bound<'_, PyList>) -> PyResult<()> {
-        let manager_guard = self.fts_manager.read();
-        let manager = manager_guard.as_ref()
-            .ok_or_else(|| PyValueError::new_err("FTS not initialized. Call _init_fts first."))?;
-        
-        let table_name = self.current_table.read().clone();
-        
-        // Extract documents from PyList
-        let mut doc_vec: Vec<(u64, HashMap<String, String>)> = Vec::with_capacity(docs.len());
-        
-        for item in docs.iter() {
-            let tuple = item.downcast::<pyo3::types::PyTuple>()?;
-            let doc_id: u64 = tuple.get_item(0)?.extract()?;
-            let fields_item = tuple.get_item(1)?;
-            let fields_dict = fields_item.downcast::<PyDict>()?;
-            
-            let mut field_map: HashMap<String, String> = HashMap::new();
-            for (key, value) in fields_dict.iter() {
-                let k: String = key.extract()?;
-                if let Ok(v) = value.extract::<String>() {
-                    field_map.insert(k, v);
-                }
-            }
-            
-            doc_vec.push((doc_id, field_map));
-        }
-        
-        // Get engine and add documents in batch
-        py.allow_threads(|| {
-            let engine = manager.get_engine(&table_name)
-                .map_err(|e| PyRuntimeError::new_err(format!("FTS error: {}", e)))?;
-            engine.add_documents(doc_vec)
-                .map_err(|e| PyRuntimeError::new_err(format!("FTS add error: {}", e)))
-        })
-    }
-    
-    /// Search FTS index and return matching document IDs as numpy array
-    #[pyo3(name = "_fts_search")]
-    fn fts_search<'py>(&self, py: Python<'py>, query: &str) -> PyResult<Bound<'py, PyArray1<u64>>> {
-        let manager_guard = self.fts_manager.read();
-        let manager = manager_guard.as_ref()
-            .ok_or_else(|| PyValueError::new_err("FTS not initialized. Call _init_fts first."))?;
-        
-        let table_name = self.current_table.read().clone();
-        let query_owned = query.to_string();
-        
-        // Search and get IDs
-        let ids = py.allow_threads(|| {
-            let engine = manager.get_engine(&table_name)
-                .map_err(|e| PyRuntimeError::new_err(format!("FTS error: {}", e)))?;
-            engine.search_ids(&query_owned)
-                .map_err(|e| PyRuntimeError::new_err(format!("FTS search error: {}", e)))
-        })?;
-        
-        // Return as numpy array
-        Ok(PyArray1::from_vec_bound(py, ids))
-    }
-    
-    /// Search FTS index and return top N document IDs
-    #[pyo3(name = "_fts_search_top_n")]
-    fn fts_search_top_n<'py>(&self, py: Python<'py>, query: &str, n: usize) -> PyResult<Bound<'py, PyArray1<u64>>> {
-        let manager_guard = self.fts_manager.read();
-        let manager = manager_guard.as_ref()
-            .ok_or_else(|| PyValueError::new_err("FTS not initialized. Call _init_fts first."))?;
-        
-        let table_name = self.current_table.read().clone();
-        let query_owned = query.to_string();
-        
-        // Search and get top N IDs
-        let ids = py.allow_threads(|| {
-            let engine = manager.get_engine(&table_name)
-                .map_err(|e| PyRuntimeError::new_err(format!("FTS error: {}", e)))?;
-            engine.search_top_n(&query_owned, n)
-                .map_err(|e| PyRuntimeError::new_err(format!("FTS search error: {}", e)))
-        })?;
-        
-        Ok(PyArray1::from_vec_bound(py, ids))
-    }
-    
-    /// Search FTS index and return results as Arrow IPC bytes (optimized path)
-    /// 
-    /// This is the fastest path for search + retrieve operations as it:
-    /// 1. Searches in Rust (no Python boundary crossing)
-    /// 2. Retrieves records in Rust (no Python boundary crossing)
-    /// 3. Returns Arrow IPC bytes directly
-    #[pyo3(name = "_fts_search_and_retrieve")]
-    #[pyo3(signature = (query, limit = None, offset = 0))]
-    fn fts_search_and_retrieve<'py>(
-        &self,
-        py: Python<'py>,
-        query: &str,
-        limit: Option<usize>,
-        offset: usize,
-    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let manager_guard = self.fts_manager.read();
-        let manager = manager_guard.as_ref()
-            .ok_or_else(|| PyValueError::new_err("FTS not initialized. Call _init_fts first."))?;
-        
-        let table_name = self.current_table.read().clone();
-        let query_owned = query.to_string();
-        
-        // Search, paginate, and retrieve - ALL IN RUST
-        let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
-            let engine = manager.get_engine(&table_name)
-                .map_err(|e| PyRuntimeError::new_err(format!("FTS error: {}", e)))?;
-            
-            // Get document IDs with pagination using the new API
-            let ids: Vec<u64> = if let Some(lim) = limit {
-                engine.search_page(&query_owned, offset, lim)
-                    .map_err(|e| PyRuntimeError::new_err(format!("FTS search error: {}", e)))?
-            } else if offset > 0 {
-                let all_ids = engine.search_ids(&query_owned)
-                    .map_err(|e| PyRuntimeError::new_err(format!("FTS search error: {}", e)))?;
-                all_ids.into_iter().skip(offset).collect()
-            } else {
-                engine.search_ids(&query_owned)
-                    .map_err(|e| PyRuntimeError::new_err(format!("FTS search error: {}", e)))?
-            };
-            
-            if ids.is_empty() {
-                // Return empty Arrow table
-                return Ok(Vec::new());
-            }
-            
-            // Retrieve records and convert to Arrow
-            let mut tables = self.tables.write();
-            let table = tables.get_mut(&table_name)
-                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
-            
-            table.get_many_arrow(&ids)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-        })?;
-        
-        Ok(pyo3::types::PyBytes::new_bound(py, &bytes))
     }
     
     /// ZERO-COPY FTS search and retrieve via Arrow C Data Interface
@@ -2917,6 +2274,108 @@ impl ApexStorage {
         
         Ok(PyArray1::from_vec_bound(py, ids))
     }
+
+    /// Search (non-fuzzy) returning matching document IDs
+    #[pyo3(name = "_fts_search")]
+    fn fts_search<'py>(&self, py: Python<'py>, query: &str) -> PyResult<Bound<'py, PyArray1<u64>>> {
+        let manager_guard = self.fts_manager.read();
+        let manager = manager_guard.as_ref()
+            .ok_or_else(|| PyValueError::new_err("FTS not initialized. Call _init_fts first."))?;
+
+        let table_name = self.current_table.read().clone();
+        let query_owned = query.to_string();
+
+        let ids = py.allow_threads(|| {
+            let engine = manager.get_engine(&table_name)
+                .map_err(|e| PyRuntimeError::new_err(format!("FTS error: {}", e)))?;
+            let result = engine.search_ids(&query_owned)
+                .map_err(|e| PyRuntimeError::new_err(format!("FTS search error: {}", e)))?;
+            Ok::<Vec<u64>, PyErr>(result)
+        })?;
+
+        Ok(PyArray1::from_vec_bound(py, ids))
+    }
+
+    /// OPTIMIZED: Query via Arrow FFI (zero-copy)
+    /// Returns: (schema_ptr, array_ptr) tuple for PyArrow import
+    #[pyo3(name = "_query_arrow_ffi")]
+    #[pyo3(signature = (where_clause, limit=None))]
+    fn query_arrow_ffi(&self, py: Python<'_>, where_clause: &str, limit: Option<usize>) -> PyResult<(u64, u64)> {
+        use arrow::array::Array;
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        use crate::io_engine::{IoEngine, QueryHints};
+
+        let table_name = self.current_table.read().clone();
+        let where_clause = where_clause.to_string();
+
+        let batch = py.allow_threads(|| -> PyResult<arrow::record_batch::RecordBatch> {
+            let mut tables = self.tables.write();
+            let table = tables.get_mut(&table_name)
+                .ok_or_else(|| PyValueError::new_err("Table not found"))?;
+
+            let mut hints = QueryHints::default();
+            if let Some(lim) = limit {
+                hints = hints.with_limit(lim);
+            }
+
+            let io_result = IoEngine::query(table, &where_clause, hints)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            io_result.to_arrow().map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+
+        if batch.num_rows() == 0 {
+            return Ok((0, 0));
+        }
+
+        let struct_array = arrow::array::StructArray::from(batch);
+
+        let ffi_array = Box::new(FFI_ArrowArray::new(&struct_array.to_data()));
+        let ffi_schema = Box::new(FFI_ArrowSchema::try_from(struct_array.data_type())
+            .map_err(|e| PyRuntimeError::new_err(format!("Schema export error: {}", e)))?);
+
+        let array_ptr = Box::into_raw(ffi_array) as u64;
+        let schema_ptr = Box::into_raw(ffi_schema) as u64;
+
+        Ok((schema_ptr, array_ptr))
+    }
+
+    /// ZERO-COPY retrieve all records via Arrow C Data Interface
+    #[pyo3(name = "_retrieve_all_arrow_ffi")]
+    fn retrieve_all_arrow_ffi(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+        self.query_arrow_ffi(py, "1=1", None)
+    }
+
+    /// Free Arrow FFI pointers allocated by this module
+    #[pyo3(name = "_free_arrow_ffi")]
+    fn free_arrow_ffi(&self, _py: Python<'_>, schema_ptr: u64, array_ptr: u64) -> PyResult<()> {
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        if schema_ptr != 0 {
+            unsafe {
+                drop(Box::from_raw(schema_ptr as *mut FFI_ArrowSchema));
+            }
+        }
+        if array_ptr != 0 {
+            unsafe {
+                drop(Box::from_raw(array_ptr as *mut FFI_ArrowArray));
+            }
+        }
+        Ok(())
+    }
+
+    /// Get current row count
+    fn count_rows(&self) -> i64 {
+        let table_name = self.current_table.read().clone();
+        let mut tables = self.tables.write();
+        if let Some(table) = tables.get_mut(&table_name) {
+            if table.has_pending_writes() {
+                table.flush_write_buffer();
+            }
+            table.row_count() as i64
+        } else {
+            0
+        }
+    }
     
     /// Remove a document from FTS index
     #[pyo3(name = "_fts_remove_document")]
@@ -2974,6 +2433,31 @@ impl ApexStorage {
                 .map_err(|e| PyRuntimeError::new_err(format!("FTS error: {}", e)))?;
             engine.update_document(doc_id, field_map)
                 .map_err(|e| PyRuntimeError::new_err(format!("FTS update error: {}", e)))
+        })
+    }
+
+    /// Add a document into FTS index
+    #[pyo3(name = "_fts_add_document")]
+    fn fts_add_document(&self, py: Python<'_>, doc_id: u64, fields: &Bound<'_, PyDict>) -> PyResult<()> {
+        let manager_guard = self.fts_manager.read();
+        let manager = manager_guard.as_ref()
+            .ok_or_else(|| PyValueError::new_err("FTS not initialized. Call _init_fts first."))?;
+
+        let table_name = self.current_table.read().clone();
+
+        let mut field_map: HashMap<String, String> = HashMap::new();
+        for (key, value) in fields.iter() {
+            let k: String = key.extract()?;
+            if let Ok(v) = value.extract::<String>() {
+                field_map.insert(k, v);
+            }
+        }
+
+        py.allow_threads(|| {
+            let engine = manager.get_engine(&table_name)
+                .map_err(|e| PyRuntimeError::new_err(format!("FTS error: {}", e)))?;
+            engine.add_document(doc_id, field_map)
+                .map_err(|e| PyRuntimeError::new_err(format!("FTS add error: {}", e)))
         })
     }
     
@@ -3262,7 +2746,7 @@ impl ApexStorage {
         for (name, table) in tables.iter() {
             let table_data = TableData {
                 schema: table.schema_ref().clone(),
-                ids: table.get_all_ids(),
+                ids: Vec::new(),
                 columns: table.columns_ref().clone(),
                 next_id: table.get_row_count() as u64,
             };
@@ -3329,12 +2813,17 @@ impl ApexStorage {
             // Load base tables
             let mut tables = HashMap::new();
             let mut max_table_id = 1u32;
-            for (name, table_data) in state.tables.clone() {
+            let StorageState { tables: state_tables, current_table } = state;
+            for (name, table_data) in state_tables {
                 let mut table = ColumnTable::new(max_table_id, &name);
                 table.restore_from(table_data.schema, table_data.ids, table_data.columns, table_data.next_id);
                 tables.insert(name, table);
                 max_table_id += 1;
             }
+            let state = StorageState {
+                tables: HashMap::new(),
+                current_table,
+            };
             
             // Read and apply delta records
             loop {
@@ -3381,14 +2870,20 @@ impl ApexStorage {
             
             let mut tables = HashMap::new();
             let mut max_table_id = 1u32;
-            for (name, table_data) in state.tables.clone() {
-                let mut table = ColumnTable::new(max_table_id, &name);
-                table.restore_from(table_data.schema, table_data.ids, table_data.columns, table_data.next_id);
-                tables.insert(name, table);
-                max_table_id += 1;
+            {
+                let StorageState { tables: state_tables, current_table } = state;
+                for (name, table_data) in state_tables {
+                    let mut table = ColumnTable::new(max_table_id, &name);
+                    table.restore_from(table_data.schema, table_data.ids, table_data.columns, table_data.next_id);
+                    tables.insert(name, table);
+                    max_table_id += 1;
+                }
+                let state = StorageState {
+                    tables: HashMap::new(),
+                    current_table,
+                };
+                (state, tables)
             }
-            
-            (state, tables)
         };
         
         let mut max_table_id = tables.len() as u32 + 1;

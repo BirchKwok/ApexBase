@@ -47,6 +47,13 @@ pub enum SelectColumn {
     Aggregate { func: AggregateFunc, column: Option<String>, alias: Option<String> },
     /// SELECT expression AS alias
     Expression { expr: SqlExpr, alias: Option<String> },
+    /// SELECT row_number() OVER (PARTITION BY ... ORDER BY ...) AS alias
+    WindowFunction {
+        name: String,
+        partition_by: Vec<String>,
+        order_by: Vec<OrderByClause>,
+        alias: Option<String>,
+    },
 }
 
 /// Aggregate functions
@@ -80,6 +87,8 @@ pub enum SqlExpr {
     UnaryOp { op: UnaryOperator, expr: Box<SqlExpr> },
     /// LIKE pattern matching
     Like { column: String, pattern: String, negated: bool },
+    /// REGEXP pattern matching
+    Regexp { column: String, pattern: String, negated: bool },
     /// IN list: column IN (v1, v2, ...)
     In { column: String, values: Vec<Value>, negated: bool },
     /// BETWEEN: column BETWEEN low AND high
@@ -136,6 +145,9 @@ enum Token {
     Group, Having,
     Count, Sum, Avg, Min, Max,
     True, False,
+    Regexp,
+    Over,
+    Partition,
     // Symbols
     Star,           // *
     Comma,          // ,
@@ -314,6 +326,9 @@ impl SqlParser {
                     "MAX" => Token::Max,
                     "TRUE" => Token::True,
                     "FALSE" => Token::False,
+                    "REGEXP" => Token::Regexp,
+                    "OVER" => Token::Over,
+                    "PARTITION" => Token::Partition,
                     _ => Token::Identifier(word),
                 };
                 tokens.push(token);
@@ -506,21 +521,74 @@ impl SqlParser {
                 
                 columns.push(SelectColumn::Aggregate { func, column, alias });
             }
-            // Column name
+            // Column name / function
             else if let Token::Identifier(name) = self.current().clone() {
                 self.advance();
-                
-                // Check for alias
-                if matches!(self.current(), Token::As) {
+
+                // Function call in SELECT list
+                if matches!(self.current(), Token::LParen) {
+                    // Only minimal window support for now
                     self.advance();
-                    if let Token::Identifier(alias) = self.current().clone() {
+                    self.expect(Token::RParen)?;
+
+                    if matches!(self.current(), Token::Over) {
                         self.advance();
-                        columns.push(SelectColumn::ColumnAlias { column: name, alias });
+                        self.expect(Token::LParen)?;
+
+                        let mut partition_by = Vec::new();
+                        if matches!(self.current(), Token::Partition) {
+                            self.advance();
+                            self.expect(Token::By)?;
+                            partition_by = self.parse_column_list()?;
+                        }
+
+                        let order_by = if matches!(self.current(), Token::Order) {
+                            self.advance();
+                            self.expect(Token::By)?;
+                            self.parse_order_by()?
+                        } else {
+                            Vec::new()
+                        };
+
+                        self.expect(Token::RParen)?;
+
+                        let alias = if matches!(self.current(), Token::As) {
+                            self.advance();
+                            if let Token::Identifier(alias) = self.current().clone() {
+                                self.advance();
+                                Some(alias)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        columns.push(SelectColumn::WindowFunction {
+                            name,
+                            partition_by,
+                            order_by,
+                            alias,
+                        });
+                    } else {
+                        // Non-window functions not supported in SELECT list yet
+                        return Err(ApexError::QueryParseError(
+                            format!("Unsupported function in SELECT list: {}", name)
+                        ));
+                    }
+                } else {
+                    // Check for alias
+                    if matches!(self.current(), Token::As) {
+                        self.advance();
+                        if let Token::Identifier(alias) = self.current().clone() {
+                            self.advance();
+                            columns.push(SelectColumn::ColumnAlias { column: name, alias });
+                        } else {
+                            columns.push(SelectColumn::Column(name));
+                        }
                     } else {
                         columns.push(SelectColumn::Column(name));
                     }
-                } else {
-                    columns.push(SelectColumn::Column(name));
                 }
             }
             else {
@@ -719,8 +787,8 @@ impl SqlParser {
                     right: Box::new(right),
                 })
             }
-            Token::Like | Token::Not => {
-                // Handle LIKE and NOT LIKE
+            Token::Like | Token::Regexp | Token::Not => {
+                // Handle LIKE/REGEXP and NOT LIKE/NOT REGEXP
                 let negated = if matches!(self.current(), Token::Not) {
                     self.advance();
                     true
@@ -743,6 +811,21 @@ impl SqlParser {
                     };
                     
                     Ok(SqlExpr::Like { column, pattern, negated })
+                } else if matches!(self.current(), Token::Regexp) {
+                    self.advance();
+                    let pattern = if let Token::StringLit(s) = self.current().clone() {
+                        self.advance();
+                        s
+                    } else {
+                        return Err(ApexError::QueryParseError("Expected pattern after REGEXP".to_string()));
+                    };
+
+                    let column = match left {
+                        SqlExpr::Column(name) => name,
+                        _ => return Err(ApexError::QueryParseError("REGEXP requires column name".to_string())),
+                    };
+
+                    Ok(SqlExpr::Regexp { column, pattern, negated })
                 } else if matches!(self.current(), Token::In) {
                     // NOT IN
                     self.advance();

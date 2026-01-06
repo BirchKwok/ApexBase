@@ -24,7 +24,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'apexbase', 'python'))
 
 try:
-    from apexbase import ApexClient, ResultView, SqlResult, ARROW_AVAILABLE, POLARS_AVAILABLE
+    from apexbase import ApexClient, ResultView, ARROW_AVAILABLE, POLARS_AVAILABLE
 except ImportError as e:
     pytest.skip(f"ApexBase not available: {e}", allow_module_level=True)
 

@@ -19,21 +19,12 @@ from apexbase._core import ApexStorage as RustStorage, __version__ as _core_vers
 FTS_AVAILABLE = True  # Always available since integrated into Rust core
 
 # Optional data framework support
-try:
-    import pyarrow as pa
-    import pandas as pd
-    ARROW_AVAILABLE = True
-except ImportError:
-    ARROW_AVAILABLE = False
-    pa = None
-    pd = None
+import pyarrow as pa
+import pandas as pd
+ARROW_AVAILABLE = True
 
-try:
-    import polars as pl
-    POLARS_AVAILABLE = True
-except ImportError:
-    POLARS_AVAILABLE = False
-    pl = None
+import polars as pl
+POLARS_AVAILABLE = True
 
 __version__ = "0.2.0"
 
@@ -94,240 +85,6 @@ _registry = _InstanceRegistry()
 atexit.register(_registry.close_all)
 
 
-class SqlResultArrow:
-    """SQL execution result - Arrow-backed high-performance implementation"""
-    
-    def __init__(self, batch):
-        """Initialize from Arrow RecordBatch"""
-        self._batch = batch
-        # Hide _id column
-        self.columns = [c for c in batch.schema.names if c != '_id']
-        self.rows_affected = batch.num_rows
-        self._rows = None  # Lazy loading
-    
-    @property
-    def rows(self):
-        """Lazy load rows (convert only when needed, hide _id)"""
-        if self._rows is None:
-            self._rows = [
-                [v for k, v in row.items() if k != '_id']
-                for row in self._batch.to_pylist()
-            ]
-        return self._rows
-    
-    def __len__(self) -> int:
-        return self._batch.num_rows
-    
-    def __iter__(self):
-        for row in self._batch.to_pylist():
-            yield {k: v for k, v in row.items() if k != '_id'}
-    
-    def to_dicts(self) -> list:
-        """Convert to dictionary list (hide _id)"""
-        return [{k: v for k, v in row.items() if k != '_id'} for row in self._batch.to_pylist()]
-    
-    def to_pandas(self):
-        """Convert directly from Arrow to pandas (zero-copy, hide _id)"""
-        df = self._batch.to_pandas()
-        if '_id' in df.columns:
-            df = df.drop(columns=['_id'])
-        return df
-    
-    def to_polars(self):
-        """Convert directly from Arrow to polars (hide _id)"""
-        try:
-            import polars as pl
-            df = pl.from_arrow(self._batch)
-            if '_id' in df.columns:
-                df = df.drop('_id')
-            return df
-        except ImportError:
-            raise ImportError("polars is required for to_polars()")
-    
-    def get_ids(self, return_list: bool = False):
-        """
-        Get ID list of results (high-performance zero-copy implementation)
-        
-        Parameters:
-            return_list: bool, default False
-                If True, return Python list
-                If False, return numpy.ndarray (default, zero-copy, fastest)
-        
-        Returns:
-            numpy.ndarray or list: ID array
-        """
-        if '_id' in self._batch.schema.names:
-            # Zero-copy path: directly convert from Arrow to numpy, bypassing Python objects
-            id_array = self._batch.column('_id').to_numpy()
-            if return_list:
-                return id_array.tolist()
-            return id_array
-        else:
-            # Fallback: generate sequential IDs
-            ids = np.arange(self._batch.num_rows, dtype=np.uint64)
-            if return_list:
-                return ids.tolist()
-            return ids
-    
-    def scalar(self):
-        if self._batch.num_rows > 0 and self._batch.num_columns > 0:
-            col = self._batch.column(0)
-            # Skip _id column
-            if self._batch.schema.names[0] == '_id' and self._batch.num_columns > 1:
-                col = self._batch.column(1)
-            return col[0].as_py()
-        return None
-    
-    def first(self) -> Optional[dict]:
-        if self._batch.num_rows > 0:
-            row = self._batch.to_pylist()[0]
-            return {k: v for k, v in row.items() if k != '_id'}
-        return None
-    
-    def __repr__(self) -> str:
-        return f"SqlResultArrow(columns={self.columns}, rows={self._batch.num_rows})"
-
-
-class SqlResult:
-    """SQL execution result - SQL:2023 standard compatible"""
-    
-    def __init__(self, columns: list, rows: list, rows_affected: int = 0, arrow_batch=None):
-        """
-        Initialize SQL result
-        
-        Parameters:
-            columns: List of column names
-            rows: List of data rows, each row is a list of values
-            rows_affected: Number of affected rows
-            arrow_batch: Optional Arrow RecordBatch (for fast path with large result sets)
-        """
-        # Hide _id column
-        self._all_columns = columns
-        self.columns = [c for c in columns if c != '_id']
-        self._id_col_idx = columns.index('_id') if '_id' in columns else None
-        self.rows = rows
-        self.rows_affected = rows_affected
-        self._arrow_batch = arrow_batch  # Fast path: Arrow data
-    
-    def __len__(self) -> int:
-        """Return number of result rows"""
-        if self._arrow_batch is not None:
-            return self._arrow_batch.num_rows
-        return len(self.rows)
-    
-    def __iter__(self):
-        """Iterate result rows, each row returned as dictionary (hide _id)"""
-        if self._arrow_batch is not None:
-            # Arrow fast path
-            for row in self._arrow_batch.to_pylist():
-                yield {k: v for k, v in row.items() if k != '_id'}
-        else:
-            for row in self.rows:
-                yield {k: v for k, v in zip(self._all_columns, row) if k != '_id'}
-    
-    def to_dicts(self) -> list:
-        """Convert to dictionary list (hide _id)"""
-        if self._arrow_batch is not None:
-            return [{k: v for k, v in row.items() if k != '_id'} for row in self._arrow_batch.to_pylist()]
-        return [{k: v for k, v in zip(self._all_columns, row) if k != '_id'} for row in self.rows]
-    
-    def to_pandas(self):
-        """Convert to pandas DataFrame (Arrow zero-copy fast path, hide _id)"""
-        try:
-            import pandas as pd
-            if self._arrow_batch is not None:
-                # Zero-copy fast path: use ArrowDtype (pandas 2.0+)
-                try:
-                    df = self._arrow_batch.to_pandas(types_mapper=pd.ArrowDtype)
-                except (TypeError, AttributeError):
-                    # Fallback: pandas < 2.0
-                    df = self._arrow_batch.to_pandas()
-            else:
-                df = pd.DataFrame(self.rows, columns=self._all_columns)
-            # Hide _id
-            if '_id' in df.columns:
-                df = df.drop(columns=['_id'])
-            return df
-        except ImportError:
-            raise ImportError("pandas is required for to_pandas()")
-    
-    def to_polars(self):
-        """Convert to polars DataFrame (hide _id)"""
-        try:
-            import polars as pl
-            if self._arrow_batch is not None:
-                # Fast path: directly convert from Arrow
-                df = pl.from_arrow(self._arrow_batch)
-            else:
-                df = pl.DataFrame(dict(zip(self._all_columns, zip(*self.rows)))) if self.rows else pl.DataFrame()
-            # Hide _id
-            if '_id' in df.columns:
-                df = df.drop('_id')
-            return df
-        except ImportError:
-            raise ImportError("polars is required for to_polars()")
-    
-    def get_ids(self, return_list: bool = False):
-        """
-        Get ID list of results (high-performance zero-copy implementation)
-        
-        Parameters:
-            return_list: bool, default False
-                If True, return Python list
-                If False, return numpy.ndarray (default, zero-copy, fastest)
-        
-        Returns:
-            numpy.ndarray or list: ID array
-        """
-        if self._arrow_batch is not None and '_id' in self._arrow_batch.schema.names:
-            # Zero-copy path: directly convert from Arrow to numpy, bypassing Python objects
-            id_array = self._arrow_batch.column('_id').to_numpy()
-            if return_list:
-                return id_array.tolist()
-            return id_array
-        elif self._id_col_idx is not None:
-            # Extract from rows (slower path)
-            ids = np.array([row[self._id_col_idx] for row in self.rows], dtype=np.uint64)
-            if return_list:
-                return ids.tolist()
-            return ids
-        else:
-            # Fallback: generate sequential IDs
-            ids = np.arange(len(self), dtype=np.uint64)
-            if return_list:
-                return ids.tolist()
-            return ids
-    
-    def scalar(self):
-        """Get single scalar value (for aggregate queries like COUNT(*))"""
-        if self._arrow_batch is not None and self._arrow_batch.num_rows > 0:
-            # Skip _id column
-            col_idx = 0
-            if self._arrow_batch.schema.names[0] == '_id' and self._arrow_batch.num_columns > 1:
-                col_idx = 1
-            return self._arrow_batch.column(col_idx)[0].as_py()
-        if self.rows and self.rows[0]:
-            # Skip _id column
-            idx = 0
-            if self._id_col_idx == 0 and len(self.rows[0]) > 1:
-                idx = 1
-            return self.rows[0][idx]
-        return None
-    
-    def first(self) -> Optional[dict]:
-        """Get first row as dictionary (hide _id)"""
-        if self._arrow_batch is not None and self._arrow_batch.num_rows > 0:
-            return {col: self._arrow_batch.column(i)[0].as_py() 
-                    for i, col in enumerate(self._arrow_batch.schema.names) if col != '_id'}
-        if self.rows:
-            return {k: v for k, v in zip(self._all_columns, self.rows[0]) if k != '_id'}
-        return None
-    
-    def __repr__(self) -> str:
-        row_count = len(self)
-        return f"SqlResult(columns={self.columns}, rows={row_count}, rows_affected={self.rows_affected})"
-
-
 class ResultView:
     """Query result view - Arrow-first high-performance implementation"""
     
@@ -345,17 +102,11 @@ class ResultView:
     
     @classmethod
     def from_arrow_bytes(cls, arrow_bytes: bytes) -> 'ResultView':
-        """Create from Arrow IPC bytes (fastest path)"""
-        if not arrow_bytes or not ARROW_AVAILABLE:
-            return cls(data=[])
-        reader = pa.ipc.open_stream(arrow_bytes)
-        table = reader.read_all()
-        return cls(arrow_table=table)
+        raise RuntimeError("Arrow IPC bytes path has been removed. Use Arrow FFI results only.")
     
     @classmethod
     def from_dicts(cls, data: List[dict]) -> 'ResultView':
-        """Create from dictionary list (fallback path)"""
-        return cls(data=data)
+        raise RuntimeError("Non-Arrow query path has been removed. Use Arrow FFI results only.")
     
     def _ensure_data(self):
         """Ensure _data is available (lazy load from Arrow conversion, hide _id)"""
@@ -506,6 +257,31 @@ class ResultView:
             if return_list:
                 return ids.tolist()
             return ids
+
+    def scalar(self):
+        """Get single scalar value (for aggregate queries like COUNT(*))"""
+        if self._arrow_table is not None and self._arrow_table.num_rows > 0:
+            # Skip _id if present
+            col_names = self._arrow_table.column_names
+            col_idx = 0
+            if col_names and col_names[0] == '_id' and len(col_names) > 1:
+                col_idx = 1
+            return self._arrow_table.column(col_idx)[0].as_py()
+
+        data = self._ensure_data()
+        if data:
+            first_row = data[0]
+            if first_row:
+                first_key = next(iter(first_row.keys()))
+                return first_row.get(first_key)
+        return None
+
+    def first(self) -> Optional[dict]:
+        """Get first row as dictionary (hide _id)"""
+        data = self._ensure_data()
+        if data:
+            return data[0]
+        return None
     
     def __len__(self):
         return self._num_rows
@@ -518,6 +294,10 @@ class ResultView:
     
     def __repr__(self):
         return f"ResultView(rows={self._num_rows})"
+
+
+def _empty_result_view() -> ResultView:
+    return ResultView(arrow_table=pa.table({}), data=[])
 
 
 # Durability level type
@@ -627,6 +407,8 @@ class ApexClient:
         # FTS configuration - each table managed independently
         # key: table_name, value: {'enabled': bool, 'index_fields': List[str], 'config': Dict}
         self._fts_tables: Dict[str, Dict] = {}
+
+        self._fts_dirty: bool = False
         
         self._prefer_arrow_format = prefer_arrow_format and ARROW_AVAILABLE
         
@@ -945,7 +727,7 @@ class ApexClient:
                 indexable = self._extract_indexable_content(data)
                 if indexable:
                     self._storage._fts_add_document(doc_id, indexable)
-                    self._storage._fts_flush()
+                    self._fts_dirty = True
             return
             
         # 6. List[dict] - automatically convert to columnar storage
@@ -1167,49 +949,22 @@ class ApexClient:
         
         where_clause = where if where and where.strip() != "1=1" else "1=1"
         
-        # If limit is specified, use streaming early-stop optimization (fastest path)
-        if limit is not None:
-            results = self._storage.query(where_clause, limit)
-            return ResultView.from_dicts(results)
-        
-        if not ARROW_AVAILABLE:
-            results = self._storage.query(where_clause)
-            return ResultView.from_dicts(results)
-        
-        # Prioritize FFI zero-copy method (fastest)
-        try:
-            import pyarrow as pa
-            
-            schema_ptr, array_ptr = self._storage._query_arrow_ffi(where_clause)
-            
-            if schema_ptr == 0 and array_ptr == 0:
-                return ResultView.from_arrow_bytes(b'')
-            
-            try:
-                struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
-                
-                if isinstance(struct_array, pa.StructArray):
-                    batch = pa.RecordBatch.from_struct_array(struct_array)
-                    table = pa.Table.from_batches([batch])
-                    return ResultView(table)
-            finally:
-                self._storage._free_arrow_ffi(schema_ptr, array_ptr)
-                
-        except Exception:
-            pass  # FFI failed, fallback to IPC method
-        
-        # Fallback to Arrow IPC method
-        try:
-            arrow_bytes = self._storage._query_arrow(where_clause)
-            return ResultView.from_arrow_bytes(arrow_bytes)
-        except Exception:
-            pass
-        
-        # Final fallback to traditional method
-        results = self._storage.query(where_clause)
-        return ResultView.from_dicts(results)
+        schema_ptr, array_ptr = self._storage._query_arrow_ffi(where_clause, limit)
 
-    def execute(self, sql: str) -> 'SqlResult':
+        if schema_ptr == 0 and array_ptr == 0:
+            return ResultView(arrow_table=pa.table({}), data=[])
+
+        try:
+            struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
+            if isinstance(struct_array, pa.StructArray):
+                batch = pa.RecordBatch.from_struct_array(struct_array)
+                table = pa.Table.from_batches([batch])
+                return ResultView(table)
+            raise RuntimeError("FFI import did not return StructArray")
+        finally:
+            self._storage._free_arrow_ffi(schema_ptr, array_ptr)
+
+    def execute(self, sql: str) -> ResultView:
         """
         Execute complete SQL statement (SQL:2023 standard)
         
@@ -1243,29 +998,33 @@ class ApexClient:
             sql: Complete SQL SELECT statement
         
         Returns:
-            SqlResult: Result object containing columns (list of column names) and rows (list of data rows)
+            ResultView: SQL execution result view (Arrow-first)
         """
         self._check_connection()
         
-        # Try to use Arrow FFI fast path (for large result sets)
+        # Prefer Arrow FFI fast path
         if ARROW_AVAILABLE:
+            schema_ptr, array_ptr = self._storage._execute_arrow_ffi(sql)
+            if schema_ptr == 0 and array_ptr == 0:
+                return ResultView(arrow_table=pa.table({}), data=[])
             try:
-                import pyarrow as pa
-                schema_ptr, array_ptr = self._storage._execute_arrow_ffi(sql)
-                
-                if schema_ptr != 0 and array_ptr != 0:
-                    # Use Arrow C Data Interface zero-copy import
-                    struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
-                    if isinstance(struct_array, pa.StructArray):
-                        batch = pa.RecordBatch.from_struct_array(struct_array)
-                        columns = batch.schema.names
-                        return SqlResult(columns, [], batch.num_rows, arrow_batch=batch)
+                struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
+                if isinstance(struct_array, pa.StructArray):
+                    batch = pa.RecordBatch.from_struct_array(struct_array)
+                    table = pa.Table.from_batches([batch])
+                    return ResultView(table)
+                raise RuntimeError("FFI import did not return StructArray")
             except Exception:
-                pass  # Fallback to standard path
-        
-        # Standard path: SqlExecutor handles
+                pass
+            finally:
+                self._storage._free_arrow_ffi(schema_ptr, array_ptr)
+
+        # Fallback path (no Arrow): execute via row-based API and wrap as ResultView
         result = self._storage.execute(sql)
-        return SqlResult(result['columns'], result['rows'], result.get('rows_affected', 0))
+        columns = result.get('columns', [])
+        rows = result.get('rows', [])
+        data = [{k: v for k, v in zip(columns, row) if k != '_id'} for row in rows]
+        return ResultView(arrow_table=None, data=data)
 
     def retrieve(self, id_: int) -> Optional[dict]:
         """
@@ -1283,53 +1042,29 @@ class ApexClient:
             Optional[dict]: Record dictionary, returns None if not found
         """
         self._check_connection()
-        
-        # Use traditional method first to preserve type fidelity (especially binary data)
+
+        # Highest type fidelity (preserves binary data)
         try:
             result = self._storage.retrieve(id_)
             if result is not None:
                 return result
         except Exception:
+            # Fallback to Arrow FFI path
             pass
         
-        if not ARROW_AVAILABLE:
+        schema_ptr, array_ptr = self._storage._retrieve_many_arrow_ffi([id_])
+        if schema_ptr == 0 and array_ptr == 0:
             return None
-        
-        # Fallback to FFI zero-copy method
         try:
-            import pyarrow as pa
-            
-            schema_ptr, array_ptr = self._storage._retrieve_many_arrow_ffi([id_])
-            
-            if schema_ptr == 0 and array_ptr == 0:
-                return None
-            
-            try:
-                struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
-                
-                if isinstance(struct_array, pa.StructArray):
-                    batch = pa.RecordBatch.from_struct_array(struct_array)
-                    table = pa.Table.from_batches([batch])
-                    results = table.to_pylist()
-                    return results[0] if results else None
-            finally:
-                self._storage._free_arrow_ffi(schema_ptr, array_ptr)
-                
-        except Exception:
-            pass  # FFI failed, fallback to IPC method
-        
-        # Fallback to Arrow IPC method
-        try:
-            arrow_bytes = self._storage._retrieve_many_arrow([id_])
-            if arrow_bytes:
-                reader = pa.ipc.open_stream(arrow_bytes)
-                table = reader.read_all()
+            struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
+            if isinstance(struct_array, pa.StructArray):
+                batch = pa.RecordBatch.from_struct_array(struct_array)
+                table = pa.Table.from_batches([batch])
                 results = table.to_pylist()
                 return results[0] if results else None
-        except Exception:
-            pass
-        
-        return None
+            raise RuntimeError("FFI import did not return StructArray")
+        finally:
+            self._storage._free_arrow_ffi(schema_ptr, array_ptr)
 
     def retrieve_many(self, ids: List[int]) -> 'ResultView':
         """
@@ -1352,43 +1087,20 @@ class ApexClient:
         """
         self._check_connection()
         if not ids:
-            return ResultView.from_dicts([])
-        
-        if not ARROW_AVAILABLE:
-            return ResultView.from_dicts(self._storage.retrieve_many(ids))
-        
-        # Prioritize FFI zero-copy method (fastest)
+            return _empty_result_view()
+
+        schema_ptr, array_ptr = self._storage._retrieve_many_arrow_ffi(ids)
+        if schema_ptr == 0 and array_ptr == 0:
+            return _empty_result_view()
         try:
-            import pyarrow as pa
-            
-            schema_ptr, array_ptr = self._storage._retrieve_many_arrow_ffi(ids)
-            
-            if schema_ptr == 0 and array_ptr == 0:
-                return ResultView.from_dicts([])
-            
-            try:
-                struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
-                
-                if isinstance(struct_array, pa.StructArray):
-                    batch = pa.RecordBatch.from_struct_array(struct_array)
-                    table = pa.Table.from_batches([batch])
-                    return ResultView(table)
-            finally:
-                self._storage._free_arrow_ffi(schema_ptr, array_ptr)
-                
-        except Exception:
-            pass  # FFI failed, fallback to IPC method
-        
-        # Fallback to Arrow IPC method
-        try:
-            arrow_bytes = self._storage._retrieve_many_arrow(ids)
-            if arrow_bytes:
-                return ResultView.from_arrow_bytes(arrow_bytes)
-        except Exception:
-            pass
-        
-        # Final fallback to traditional method
-        return ResultView.from_dicts(self._storage.retrieve_many(ids))
+            struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
+            if isinstance(struct_array, pa.StructArray):
+                batch = pa.RecordBatch.from_struct_array(struct_array)
+                table = pa.Table.from_batches([batch])
+                return ResultView(table)
+            raise RuntimeError("FFI import did not return StructArray")
+        finally:
+            self._storage._free_arrow_ffi(schema_ptr, array_ptr)
 
     def retrieve_all(self) -> ResultView:
         """
@@ -1404,40 +1116,20 @@ class ApexClient:
         """
         self._check_connection()
         
-        if not ARROW_AVAILABLE:
-            return self.query("1=1")
-        
-        # Prioritize FFI zero-copy method (fastest)
+        schema_ptr, array_ptr = self._storage._retrieve_all_arrow_ffi()
+
+        if schema_ptr == 0 and array_ptr == 0:
+            return ResultView(arrow_table=pa.table({}), data=[])
+
         try:
-            import pyarrow as pa
-            
-            schema_ptr, array_ptr = self._storage._retrieve_all_arrow_ffi()
-            
-            if schema_ptr == 0 and array_ptr == 0:
-                return ResultView.from_arrow_bytes(b'')
-            
-            try:
-                struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
-                
-                if isinstance(struct_array, pa.StructArray):
-                    batch = pa.RecordBatch.from_struct_array(struct_array)
-                    table = pa.Table.from_batches([batch])
-                    return ResultView(table)
-            finally:
-                self._storage._free_arrow_ffi(schema_ptr, array_ptr)
-                
-        except Exception:
-            pass  # FFI failed, fallback to IPC method
-        
-        # Fallback to Arrow IPC method
-        try:
-            arrow_bytes = self._storage._retrieve_all_arrow_direct()
-            return ResultView.from_arrow_bytes(arrow_bytes)
-        except Exception:
-            pass
-        
-        # Final fallback to query method
-        return self.query("1=1")
+            struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
+            if isinstance(struct_array, pa.StructArray):
+                batch = pa.RecordBatch.from_struct_array(struct_array)
+                table = pa.Table.from_batches([batch])
+                return ResultView(table)
+            raise RuntimeError("FFI import did not return StructArray")
+        finally:
+            self._storage._free_arrow_ffi(schema_ptr, array_ptr)
 
     def list_fields(self) -> List[str]:
         """List fields of current table"""
@@ -1453,6 +1145,7 @@ class ApexClient:
             
             if result and self._is_fts_enabled() and self._storage._fts_is_initialized():
                 self._storage._fts_remove_document(ids)
+                self._fts_dirty = True
             
             return result
             
@@ -1461,6 +1154,7 @@ class ApexClient:
             
             if result and self._is_fts_enabled() and self._storage._fts_is_initialized():
                 self._storage._fts_remove_documents(ids)
+                self._fts_dirty = True
             
             return result
         else:
@@ -1475,9 +1169,10 @@ class ApexClient:
             indexable = self._extract_indexable_content(data)
             if indexable:
                 self._storage._fts_update_document(id_, indexable)
-                self._storage._fts_flush()
+                self._fts_dirty = True
             else:
                 self._storage._fts_remove_document(id_)
+                self._fts_dirty = True
         
         return result
 
@@ -1547,11 +1242,13 @@ class ApexClient:
         """
         self._check_connection()
         # Flush FTS index (all tables with FTS enabled)
-        if self._fts_tables:
+        if self._fts_tables and self._fts_dirty:
             try:
                 self._storage._fts_flush()
             except Exception:
                 pass
+            self._fts_dirty = False
+
         # Flush table data
         self._storage.flush()
     
@@ -1678,7 +1375,7 @@ class ApexClient:
             raise ValueError(f"Full-text search is not enabled for table '{table}'. Call init_fts() first.")
         
         if not self._ensure_fts_initialized(table):
-            return ResultView.from_dicts([])
+            return _empty_result_view()
         
         # Fast path: use default table name
         if table_name is None:
@@ -1692,41 +1389,20 @@ class ApexClient:
             if need_switch:
                 self.use_table(table_name)
             
-            if not ARROW_AVAILABLE:
-                return ResultView.from_dicts([])
-            
-            # Prioritize FFI zero-copy method (fastest)
+            schema_ptr, array_ptr = self._storage._fts_search_and_retrieve_ffi(query, limit, offset)
+
+            if schema_ptr == 0 and array_ptr == 0:
+                return _empty_result_view()
+
             try:
-                import pyarrow as pa
-                
-                schema_ptr, array_ptr = self._storage._fts_search_and_retrieve_ffi(query, limit, offset)
-                
-                if schema_ptr == 0 and array_ptr == 0:
-                    return ResultView.from_dicts([])
-                
-                try:
-                    struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
-                    
-                    if isinstance(struct_array, pa.StructArray):
-                        batch = pa.RecordBatch.from_struct_array(struct_array)
-                        table = pa.Table.from_batches([batch])
-                        return ResultView(table)
-                finally:
-                    self._storage._free_arrow_ffi(schema_ptr, array_ptr)
-                    
-            except Exception:
-                pass  # FFI failed, fallback to IPC method
-            
-            # Fallback to Arrow IPC method
-            try:
-                arrow_bytes = self._storage._fts_search_and_retrieve(query, limit, offset)
-                
-                if arrow_bytes and len(arrow_bytes) > 0:
-                    return ResultView.from_arrow_bytes(arrow_bytes)
-            except Exception:
-                pass
-            
-            return ResultView.from_dicts([])
+                struct_array = pa.Array._import_from_c(array_ptr, schema_ptr)
+                if isinstance(struct_array, pa.StructArray):
+                    batch = pa.RecordBatch.from_struct_array(struct_array)
+                    table = pa.Table.from_batches([batch])
+                    return ResultView(table)
+                raise RuntimeError("FFI import did not return StructArray")
+            finally:
+                self._storage._free_arrow_ffi(schema_ptr, array_ptr)
                 
         finally:
             if need_switch and original_table is not None:
@@ -1859,18 +1535,15 @@ class ApexClient:
         """Force close - ensure data persistence"""
         try:
             if hasattr(self, '_storage') and self._storage is not None:
-                # First flush FTS index
-                if hasattr(self, '_fts_tables') and self._fts_tables:
+                # First flush FTS index (only if dirty)
+                if hasattr(self, '_fts_tables') and self._fts_tables and getattr(self, '_fts_dirty', False):
                     try:
                         self._storage._fts_flush()
                     except Exception:
                         pass
-                # Must flush first to ensure data persistence!
-                try:
-                    self._storage.flush()
-                except Exception:
-                    pass
-                # Then close
+                    self._fts_dirty = False
+
+                # Close (Rust close persists)
                 self._storage.close()
                 self._storage = None
         except Exception:
@@ -1884,14 +1557,15 @@ class ApexClient:
         
         try:
             if hasattr(self, '_storage') and self._storage is not None:
-                # First flush FTS index
-                if self._fts_tables:
+                # First flush FTS index (only if dirty)
+                if self._fts_tables and getattr(self, '_fts_dirty', False):
                     try:
                         self._storage._fts_flush()
                     except Exception:
                         pass
-                # Then flush data
-                self._storage.flush()
+                    self._fts_dirty = False
+
+                # Close (Rust close persists)
                 self._storage.close()
                 self._storage = None
         finally:

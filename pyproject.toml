@@ -28,12 +28,12 @@ classifiers = [
 ]
 dependencies = [
     "nanofts>=0.1.0",
+    "pyarrow>=10.0.0",
+    "pandas>=2.0.0",
+    "polars>=0.15.0",
 ]
 
 [project.optional-dependencies]
-pandas = ["pandas>=2.0.0", "pyarrow>=10.0.0"]
-polars = ["polars>=0.15.0"]
-all = ["pandas>=2.0.0", "pyarrow>=10.0.0", "polars>=0.15.0"]
 dev = ["pytest>=7.0.0", "maturin>=1.4.0"]
 
 [project.urls]

@@ -4,7 +4,7 @@
 //! Uses IoEngine for all data read operations.
 
 use crate::ApexError;
-use crate::data::Value;
+use crate::data::{Row, Value};
 use crate::query::Filter;
 use crate::query::sql_parser::{
     SqlStatement, SelectStatement, SelectColumn, SqlExpr, 
@@ -14,6 +14,7 @@ use crate::table::column_table::{ColumnTable, TypedColumn};
 use crate::io_engine::{IoEngine, StreamingFilterEvaluator};
 use std::collections::HashMap;
 use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
 
 // StreamingFilterEvaluator is now provided by IoEngine
 
@@ -58,11 +59,18 @@ impl SqlResult {
         }
         
         if self.rows.is_empty() {
+            use arrow::array::new_null_array;
+
             let fields: Vec<Field> = self.columns.iter()
                 .map(|name| Field::new(name, ArrowDataType::Utf8, true))
                 .collect();
-            let schema = Arc::new(Schema::new(fields));
-            return arrow::record_batch::RecordBatch::try_new(schema, vec![])
+            let schema = Arc::new(Schema::new(fields.clone()));
+            let arrays: Vec<ArrayRef> = fields
+                .iter()
+                .map(|f| new_null_array(f.data_type(), 0))
+                .collect();
+
+            return arrow::record_batch::RecordBatch::try_new(schema, arrays)
                 .map_err(|e| ApexError::SerializationError(e.to_string()));
         }
         
@@ -142,6 +150,7 @@ impl SqlExecutor {
         
         // Pre-compute flags
         let has_aggregates = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Aggregate { .. }));
+        let has_window = stmt.columns.iter().any(|c| matches!(c, SelectColumn::WindowFunction { .. }));
         let no_where = stmt.where_clause.is_none();
         let no_group_by = stmt.group_by.is_empty();
         let has_limit = stmt.limit.is_some();
@@ -210,6 +219,21 @@ impl SqlExecutor {
             let row_count = table.get_row_count();
             (0..row_count).filter(|&i| !deleted.get(i)).collect()
         };
+
+        // Window functions (minimal support): row_number() over(partition by ... order by ...)
+        if has_window {
+            if has_aggregates {
+                return Err(ApexError::QueryParseError("Window functions with aggregates are not supported".to_string()));
+            }
+            if !no_group_by {
+                return Err(ApexError::QueryParseError("Window functions with GROUP BY are not supported".to_string()));
+            }
+            if stmt.distinct {
+                return Err(ApexError::QueryParseError("Window functions with DISTINCT are not supported".to_string()));
+            }
+
+            return Self::execute_window_row_number(&stmt, &matching_indices, table);
+        }
         
         // Step 2: Determine which columns to select
         let (result_columns, column_indices) = Self::resolve_columns(&stmt.columns, table)?;
@@ -527,6 +551,11 @@ impl SqlExecutor {
                     result_names.push(name.clone());
                     column_indices.push((name, None));
                 }
+                SelectColumn::WindowFunction { alias, name, .. } => {
+                    let col_name = alias.clone().unwrap_or_else(|| name.clone());
+                    result_names.push(col_name.clone());
+                    column_indices.push((col_name, None));
+                }
             }
         }
         
@@ -619,6 +648,14 @@ impl SqlExecutor {
                     Ok(filter)
                 }
             }
+            SqlExpr::Regexp { column, pattern, negated } => {
+                let filter = Filter::Regexp { field: column.clone(), pattern: pattern.clone() };
+                if *negated {
+                    Ok(Filter::Not(Box::new(filter)))
+                } else {
+                    Ok(filter)
+                }
+            }
             SqlExpr::In { column, values, negated } => {
                 let filter = Filter::In { field: column.clone(), values: values.clone() };
                 if *negated {
@@ -675,6 +712,166 @@ impl SqlExecutor {
                 format!("Cannot convert expression to filter: {:?}", expr)
             )),
         }
+    }
+
+    /// Minimal window function execution: supports only row_number() OVER (PARTITION BY <col> ORDER BY <col>)
+    /// Applies WHERE first (matching_indices), then computes row_number per partition.
+    fn execute_window_row_number(
+        stmt: &SelectStatement,
+        matching_indices: &[usize],
+        table: &ColumnTable,
+    ) -> Result<SqlResult, ApexError> {
+        #[derive(Clone, Eq)]
+        enum PartKey {
+            Null,
+            Int(i64),
+            Str(String),
+            Other(String),
+        }
+
+        impl PartialEq for PartKey {
+            fn eq(&self, other: &Self) -> bool {
+                match (self, other) {
+                    (PartKey::Null, PartKey::Null) => true,
+                    (PartKey::Int(a), PartKey::Int(b)) => a == b,
+                    (PartKey::Str(a), PartKey::Str(b)) => a == b,
+                    (PartKey::Other(a), PartKey::Other(b)) => a == b,
+                    _ => false,
+                }
+            }
+        }
+
+        impl Hash for PartKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                match self {
+                    PartKey::Null => 0u8.hash(state),
+                    PartKey::Int(v) => {
+                        1u8.hash(state);
+                        v.hash(state);
+                    }
+                    PartKey::Str(s) => {
+                        2u8.hash(state);
+                        s.hash(state);
+                    }
+                    PartKey::Other(s) => {
+                        3u8.hash(state);
+                        s.hash(state);
+                    }
+                }
+            }
+        }
+
+        // Collect window specs (only row_number supported)
+        let mut window_specs = Vec::new();
+        for col in &stmt.columns {
+            if let SelectColumn::WindowFunction { name, partition_by, order_by, alias } = col {
+                if name.to_uppercase() != "ROW_NUMBER" {
+                    return Err(ApexError::QueryParseError(format!("Unsupported window function: {}", name)));
+                }
+                if partition_by.len() != 1 {
+                    return Err(ApexError::QueryParseError("row_number() requires exactly 1 PARTITION BY column".to_string()));
+                }
+                if order_by.len() != 1 {
+                    return Err(ApexError::QueryParseError("row_number() requires exactly 1 ORDER BY column in OVER()".to_string()));
+                }
+                window_specs.push((partition_by[0].clone(), order_by[0].clone(), alias.clone().unwrap_or_else(|| "row_number".to_string())));
+            }
+        }
+        if window_specs.len() != 1 {
+            return Err(ApexError::QueryParseError("Only a single row_number() window function is supported".to_string()));
+        }
+        let (partition_col, order_clause, window_alias) = window_specs.remove(0);
+
+        let schema = table.schema_ref();
+        let columns = table.columns_ref();
+
+        let part_idx = schema.get_index(&partition_col)
+            .ok_or_else(|| ApexError::QueryParseError(format!("Unknown PARTITION BY column: {}", partition_col)))?;
+        let order_idx = if order_clause.column == "_id" {
+            None
+        } else {
+            schema.get_index(&order_clause.column)
+        };
+
+        // Group matching indices by partition key
+        let mut groups: HashMap<PartKey, Vec<usize>> = HashMap::new();
+        for &row_idx in matching_indices {
+            let key = match columns[part_idx].get(row_idx).unwrap_or(Value::Null) {
+                Value::Null => PartKey::Null,
+                Value::Int64(v) => PartKey::Int(v),
+                Value::String(s) => PartKey::Str(s),
+                other => PartKey::Other(other.to_string_value()),
+            };
+            groups.entry(key).or_insert_with(Vec::new).push(row_idx);
+        }
+
+        // Result columns (respect SELECT list ordering)
+        let mut result_columns = Vec::new();
+        for col in &stmt.columns {
+            match col {
+                SelectColumn::Column(name) => result_columns.push(name.clone()),
+                SelectColumn::ColumnAlias { alias, .. } => result_columns.push(alias.clone()),
+                SelectColumn::WindowFunction { alias, .. } => result_columns.push(alias.clone().unwrap_or_else(|| window_alias.clone())),
+                _ => {}
+            }
+        }
+
+        // Build output rows
+        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(matching_indices.len().min(10000));
+
+        for (_, mut idxs) in groups {
+            // Sort within partition by ORDER BY
+            if let Some(oidx) = order_idx {
+                let desc = order_clause.descending;
+                idxs.sort_by(|&a, &b| {
+                    let av = columns[oidx].get(a);
+                    let bv = columns[oidx].get(b);
+                    let cmp = Self::compare_values(av.as_ref(), bv.as_ref(), None);
+                    if desc { cmp.reverse() } else { cmp }
+                });
+            } else {
+                // ORDER BY _id
+                if order_clause.descending {
+                    idxs.sort_by(|a, b| b.cmp(a));
+                } else {
+                    idxs.sort_unstable();
+                }
+            }
+
+            for (pos, row_idx) in idxs.into_iter().enumerate() {
+                let rn = (pos + 1) as i64;
+                let mut row = Vec::with_capacity(result_columns.len());
+                for col in &stmt.columns {
+                    match col {
+                        SelectColumn::Column(name) => {
+                            if name == "_id" {
+                                row.push(Value::Int64(row_idx as i64));
+                            } else if let Some(ci) = schema.get_index(name) {
+                                row.push(columns[ci].get(row_idx).unwrap_or(Value::Null));
+                            } else {
+                                row.push(Value::Null);
+                            }
+                        }
+                        SelectColumn::ColumnAlias { column, .. } => {
+                            if column == "_id" {
+                                row.push(Value::Int64(row_idx as i64));
+                            } else if let Some(ci) = schema.get_index(column) {
+                                row.push(columns[ci].get(row_idx).unwrap_or(Value::Null));
+                            } else {
+                                row.push(Value::Null);
+                            }
+                        }
+                        SelectColumn::WindowFunction { .. } => {
+                            row.push(Value::Int64(rn));
+                        }
+                        _ => {}
+                    }
+                }
+                out_rows.push(row);
+            }
+        }
+
+        Ok(SqlResult::new(result_columns, out_rows))
     }
     
     /// Apply DISTINCT to result rows
@@ -1189,18 +1386,17 @@ impl SqlExecutor {
         let matcher = LikeMatcher::new(like_pattern);
         
         // Get string column data
-        let string_data = match &columns[like_col_idx] {
-            crate::table::column_table::TypedColumn::String { data, nulls } => Some((data, nulls)),
+        let string_col = match &columns[like_col_idx] {
+            crate::table::column_table::TypedColumn::String(col) => Some(col),
             _ => None,
         };
         
-        let (data, nulls) = match string_data {
-            Some(d) => d,
+        let col = match string_col {
+            Some(c) => c,
             None => return Ok(SqlResult::new(result_columns.to_vec(), Vec::new())),
         };
         
-        let no_nulls = nulls.all_false();
-        let data_len = data.len().min(row_count);
+        let data_len = col.len().min(row_count);
         
         let mut rows = Vec::with_capacity(limit.min(100));
         let mut found = 0usize;
@@ -1210,10 +1406,10 @@ impl SqlExecutor {
             // Skip deleted rows
             if !no_deletes && deleted.get(row_idx) { continue; }
             // Skip null values
-            if !no_nulls && nulls.get(row_idx) { continue; }
+            if col.is_null(row_idx) { continue; }
             
             // Check LIKE match
-            let matches = matcher.matches(&data[row_idx]);
+            let matches = col.get(row_idx).map(|s| matcher.matches(s)).unwrap_or(false);
             let passes = if negated { !matches } else { matches };
             
             if passes {
@@ -1967,20 +2163,288 @@ impl SqlExecutor {
     ) -> Result<SqlResult, ApexError> {
         let schema = table.schema_ref();
         let columns = table.columns_ref();
-        
-        // Group rows by GROUP BY columns
-        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-        
-        for &row_idx in matching_indices {
-            let mut key_parts = Vec::new();
-            for group_col in &stmt.group_by {
-                if let Some(col_idx) = schema.get_index(group_col) {
-                    let val = columns[col_idx].get(row_idx).unwrap_or(Value::Null);
-                    key_parts.push(format!("{:?}", val));
+
+        #[derive(Clone, Eq)]
+        enum KeyPart {
+            Null,
+            Int(i64),
+            Float(u64),
+            Bool(bool),
+            StrId(u32),
+            Other(String),
+        }
+
+        impl PartialEq for KeyPart {
+            fn eq(&self, other: &Self) -> bool {
+                match (self, other) {
+                    (KeyPart::Null, KeyPart::Null) => true,
+                    (KeyPart::Int(a), KeyPart::Int(b)) => a == b,
+                    (KeyPart::Float(a), KeyPart::Float(b)) => a == b,
+                    (KeyPart::Bool(a), KeyPart::Bool(b)) => a == b,
+                    (KeyPart::StrId(a), KeyPart::StrId(b)) => a == b,
+                    (KeyPart::Other(a), KeyPart::Other(b)) => a == b,
+                    _ => false,
                 }
             }
-            let key = key_parts.join("|");
-            groups.entry(key).or_insert_with(Vec::new).push(row_idx);
+        }
+
+        impl Hash for KeyPart {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                match self {
+                    KeyPart::Null => 0u8.hash(state),
+                    KeyPart::Int(v) => {
+                        1u8.hash(state);
+                        v.hash(state);
+                    }
+                    KeyPart::Float(bits) => {
+                        2u8.hash(state);
+                        bits.hash(state);
+                    }
+                    KeyPart::Bool(b) => {
+                        3u8.hash(state);
+                        b.hash(state);
+                    }
+                    KeyPart::StrId(id) => {
+                        4u8.hash(state);
+                        id.hash(state);
+                    }
+                    KeyPart::Other(s) => {
+                        5u8.hash(state);
+                        s.hash(state);
+                    }
+                }
+            }
+        }
+
+        #[derive(Clone, Eq)]
+        struct GroupKey {
+            parts: Vec<KeyPart>,
+        }
+
+        impl PartialEq for GroupKey {
+            fn eq(&self, other: &Self) -> bool {
+                self.parts == other.parts
+            }
+        }
+
+        impl Hash for GroupKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.parts.hash(state)
+            }
+        }
+
+        // Local string interner for GROUP BY keys: each distinct string allocated once.
+        let mut string_intern: HashMap<String, u32> = HashMap::new();
+        let mut next_str_id: u32 = 0;
+
+        #[derive(Clone)]
+        struct AggState {
+            func: AggregateFunc,
+            col_idx: Option<usize>,
+            // shared
+            count_star: i64,
+            count_non_null: i64,
+            sum: f64,
+            sum_count: i64,
+            min: Option<Value>,
+            max: Option<Value>,
+        }
+
+        impl AggState {
+            fn new(func: AggregateFunc, col_idx: Option<usize>) -> Self {
+                Self {
+                    func,
+                    col_idx,
+                    count_star: 0,
+                    count_non_null: 0,
+                    sum: 0.0,
+                    sum_count: 0,
+                    min: None,
+                    max: None,
+                }
+            }
+
+            fn update(&mut self, columns: &[TypedColumn], row_idx: usize) {
+                match self.func {
+                    AggregateFunc::Count => {
+                        if self.col_idx.is_none() {
+                            self.count_star += 1;
+                        } else if let Some(ci) = self.col_idx {
+                            if let Some(v) = columns[ci].get(row_idx) {
+                                if !v.is_null() {
+                                    self.count_non_null += 1;
+                                }
+                            }
+                        }
+                    }
+                    AggregateFunc::Sum | AggregateFunc::Avg => {
+                        if let Some(ci) = self.col_idx {
+                            if let Some(v) = columns[ci].get(row_idx) {
+                                if v.is_null() {
+                                    return;
+                                }
+                                if let Some(n) = v.as_f64() {
+                                    self.sum += n;
+                                    self.sum_count += 1;
+                                }
+                            }
+                        }
+                    }
+                    AggregateFunc::Min => {
+                        if let Some(ci) = self.col_idx {
+                            if let Some(v) = columns[ci].get(row_idx) {
+                                if v.is_null() {
+                                    return;
+                                }
+                                self.min = Some(match &self.min {
+                                    None => v,
+                                    Some(curr) => {
+                                        if SqlExecutor::compare_non_null(curr, &v) == Ordering::Greater {
+                                            v
+                                        } else {
+                                            curr.clone()
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    AggregateFunc::Max => {
+                        if let Some(ci) = self.col_idx {
+                            if let Some(v) = columns[ci].get(row_idx) {
+                                if v.is_null() {
+                                    return;
+                                }
+                                self.max = Some(match &self.max {
+                                    None => v,
+                                    Some(curr) => {
+                                        if SqlExecutor::compare_non_null(curr, &v) == Ordering::Less {
+                                            v
+                                        } else {
+                                            curr.clone()
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            fn finalize(&self) -> Value {
+                match self.func {
+                    AggregateFunc::Count => {
+                        if self.col_idx.is_none() {
+                            Value::Int64(self.count_star)
+                        } else {
+                            Value::Int64(self.count_non_null)
+                        }
+                    }
+                    AggregateFunc::Sum => Value::Float64(self.sum),
+                    AggregateFunc::Avg => {
+                        if self.sum_count > 0 {
+                            Value::Float64(self.sum / self.sum_count as f64)
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    AggregateFunc::Min => self.min.clone().unwrap_or(Value::Null),
+                    AggregateFunc::Max => self.max.clone().unwrap_or(Value::Null),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct GroupState {
+            first_row_idx: usize,
+            aggs: Vec<AggState>,
+        }
+
+        // Resolve GROUP BY column indices once
+        let mut group_col_indices = Vec::with_capacity(stmt.group_by.len());
+        for col in &stmt.group_by {
+            let idx = schema
+                .get_index(col)
+                .ok_or_else(|| ApexError::QueryParseError(format!("Unknown GROUP BY column: {}", col)))?;
+            group_col_indices.push(idx);
+        }
+
+        // Collect aggregate specs in SELECT order
+        let mut agg_specs: Vec<(AggregateFunc, Option<usize>)> = Vec::new();
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate { func, column, .. } = col {
+                let col_idx = column.as_ref().and_then(|c| schema.get_index(c));
+                agg_specs.push((func.clone(), col_idx));
+            }
+        }
+
+        // Group rows and compute aggregates in a single pass
+        let mut groups: HashMap<GroupKey, GroupState> = HashMap::new();
+        for &row_idx in matching_indices {
+            let mut parts = Vec::with_capacity(group_col_indices.len());
+            for &col_idx in &group_col_indices {
+                let kp = match &columns[col_idx] {
+                    TypedColumn::String(col) => {
+                        match col.get(row_idx) {
+                            None => KeyPart::Null,
+                            Some(s) => {
+                                if let Some(&id) = string_intern.get(s) {
+                                    KeyPart::StrId(id)
+                                } else {
+                                    let id = next_str_id;
+                                    next_str_id = next_str_id.wrapping_add(1);
+                                    string_intern.insert(s.to_string(), id);
+                                    KeyPart::StrId(id)
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        // Fallback via Value for non-string types
+                        let v = other.get(row_idx).unwrap_or(Value::Null);
+                        match v {
+                            Value::Null => KeyPart::Null,
+                            Value::Bool(b) => KeyPart::Bool(b),
+                            Value::Int64(i) => KeyPart::Int(i),
+                            Value::Int32(i) => KeyPart::Int(i as i64),
+                            Value::Int16(i) => KeyPart::Int(i as i64),
+                            Value::Int8(i) => KeyPart::Int(i as i64),
+                            Value::UInt64(u) => KeyPart::Int(u as i64),
+                            Value::UInt32(u) => KeyPart::Int(u as i64),
+                            Value::UInt16(u) => KeyPart::Int(u as i64),
+                            Value::UInt8(u) => KeyPart::Int(u as i64),
+                            Value::Float64(f) => KeyPart::Float(f.to_bits()),
+                            Value::Float32(f) => KeyPart::Float((f as f64).to_bits()),
+                            Value::String(s) => {
+                                // Should not happen (handled above), but keep safe
+                                if let Some(&id) = string_intern.get(&s) {
+                                    KeyPart::StrId(id)
+                                } else {
+                                    let id = next_str_id;
+                                    next_str_id = next_str_id.wrapping_add(1);
+                                    string_intern.insert(s, id);
+                                    KeyPart::StrId(id)
+                                }
+                            }
+                            other => KeyPart::Other(other.to_string_value()),
+                        }
+                    }
+                };
+                parts.push(kp);
+            }
+
+            let key = GroupKey { parts };
+            let entry = groups.entry(key).or_insert_with(|| GroupState {
+                first_row_idx: row_idx,
+                aggs: agg_specs
+                    .iter()
+                    .map(|(func, col_idx)| AggState::new(func.clone(), *col_idx))
+                    .collect(),
+            });
+
+            for agg in &mut entry.aggs {
+                agg.update(columns, row_idx);
+            }
         }
         
         // Build result columns
@@ -2011,41 +2475,249 @@ impl SqlExecutor {
         }
         
         // Build result rows
-        let mut result_rows = Vec::new();
-        
-        for (_, group_indices) in groups {
-            let mut row = Vec::new();
-            
-            for col in &stmt.columns {
-                match col {
-                    SelectColumn::Column(name) | SelectColumn::ColumnAlias { column: name, .. } => {
-                        // Get value from first row in group
-                        if let Some(&first_idx) = group_indices.first() {
-                            if let Some(col_idx) = schema.get_index(name) {
-                                row.push(columns[col_idx].get(first_idx).unwrap_or(Value::Null));
+        use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        enum ColBuilder {
+            Int64(Int64Builder),
+            Float64(Float64Builder),
+            Bool(BooleanBuilder),
+            Utf8(StringBuilder),
+        }
+
+        impl ColBuilder {
+            fn append_value(&mut self, v: &Value) {
+                match self {
+                    ColBuilder::Int64(b) => {
+                        if let Some(i) = v.as_i64() { b.append_value(i); } else { b.append_null(); }
+                    }
+                    ColBuilder::Float64(b) => {
+                        if let Some(f) = v.as_f64() { b.append_value(f); } else { b.append_null(); }
+                    }
+                    ColBuilder::Bool(b) => {
+                        if let Some(x) = v.as_bool() { b.append_value(x); } else { b.append_null(); }
+                    }
+                    ColBuilder::Utf8(b) => {
+                        if v.is_null() { b.append_null(); } else { b.append_value(v.to_string_value()); }
+                    }
+                }
+            }
+
+            fn finish(self) -> ArrayRef {
+                match self {
+                    ColBuilder::Int64(mut b) => Arc::new(b.finish()),
+                    ColBuilder::Float64(mut b) => Arc::new(b.finish()),
+                    ColBuilder::Bool(mut b) => Arc::new(b.finish()),
+                    ColBuilder::Utf8(mut b) => Arc::new(b.finish()),
+                }
+            }
+        }
+
+        // Pre-build Arrow schema + builders from SELECT list
+        let mut fields: Vec<Field> = Vec::with_capacity(result_columns.len());
+        let mut builders: Vec<ColBuilder> = Vec::with_capacity(result_columns.len());
+
+        for col in &stmt.columns {
+            match col {
+                SelectColumn::Column(name) => {
+                    let out_name = name.clone();
+                    if name == "_id" {
+                        fields.push(Field::new(&out_name, ArrowDataType::Int64, true));
+                        builders.push(ColBuilder::Int64(Int64Builder::new()));
+                    } else if let Some(ci) = schema.get_index(name) {
+                        match &columns[ci] {
+                            TypedColumn::Int64 { .. } => {
+                                fields.push(Field::new(&out_name, ArrowDataType::Int64, true));
+                                builders.push(ColBuilder::Int64(Int64Builder::new()));
+                            }
+                            TypedColumn::Float64 { .. } => {
+                                fields.push(Field::new(&out_name, ArrowDataType::Float64, true));
+                                builders.push(ColBuilder::Float64(Float64Builder::new()));
+                            }
+                            TypedColumn::Bool { .. } => {
+                                fields.push(Field::new(&out_name, ArrowDataType::Boolean, true));
+                                builders.push(ColBuilder::Bool(BooleanBuilder::new()));
+                            }
+                            TypedColumn::String(_) => {
+                                fields.push(Field::new(&out_name, ArrowDataType::Utf8, true));
+                                builders.push(ColBuilder::Utf8(StringBuilder::new()));
+                            }
+                            TypedColumn::Mixed { .. } => {
+                                fields.push(Field::new(&out_name, ArrowDataType::Utf8, true));
+                                builders.push(ColBuilder::Utf8(StringBuilder::new()));
+                            }
+                        }
+                    } else {
+                        fields.push(Field::new(&out_name, ArrowDataType::Utf8, true));
+                        builders.push(ColBuilder::Utf8(StringBuilder::new()));
+                    }
+                }
+                SelectColumn::ColumnAlias { column, alias } => {
+                    let out_name = alias.clone();
+                    if column == "_id" {
+                        fields.push(Field::new(&out_name, ArrowDataType::Int64, true));
+                        builders.push(ColBuilder::Int64(Int64Builder::new()));
+                    } else if let Some(ci) = schema.get_index(column) {
+                        match &columns[ci] {
+                            TypedColumn::Int64 { .. } => {
+                                fields.push(Field::new(&out_name, ArrowDataType::Int64, true));
+                                builders.push(ColBuilder::Int64(Int64Builder::new()));
+                            }
+                            TypedColumn::Float64 { .. } => {
+                                fields.push(Field::new(&out_name, ArrowDataType::Float64, true));
+                                builders.push(ColBuilder::Float64(Float64Builder::new()));
+                            }
+                            TypedColumn::Bool { .. } => {
+                                fields.push(Field::new(&out_name, ArrowDataType::Boolean, true));
+                                builders.push(ColBuilder::Bool(BooleanBuilder::new()));
+                            }
+                            TypedColumn::String(_) => {
+                                fields.push(Field::new(&out_name, ArrowDataType::Utf8, true));
+                                builders.push(ColBuilder::Utf8(StringBuilder::new()));
+                            }
+                            TypedColumn::Mixed { .. } => {
+                                fields.push(Field::new(&out_name, ArrowDataType::Utf8, true));
+                                builders.push(ColBuilder::Utf8(StringBuilder::new()));
+                            }
+                        }
+                    } else {
+                        fields.push(Field::new(&out_name, ArrowDataType::Utf8, true));
+                        builders.push(ColBuilder::Utf8(StringBuilder::new()));
+                    }
+                }
+                SelectColumn::Aggregate { func, column, alias } => {
+                    let out_name = alias.clone().unwrap_or_else(|| {
+                        let func_name = match func {
+                            AggregateFunc::Count => "COUNT",
+                            AggregateFunc::Sum => "SUM",
+                            AggregateFunc::Avg => "AVG",
+                            AggregateFunc::Min => "MIN",
+                            AggregateFunc::Max => "MAX",
+                        };
+                        if let Some(c) = column {
+                            format!("{}({})", func_name, c)
+                        } else {
+                            format!("{}(*)", func_name)
+                        }
+                    });
+
+                    match func {
+                        AggregateFunc::Count => {
+                            fields.push(Field::new(&out_name, ArrowDataType::Int64, true));
+                            builders.push(ColBuilder::Int64(Int64Builder::new()));
+                        }
+                        AggregateFunc::Sum | AggregateFunc::Avg => {
+                            fields.push(Field::new(&out_name, ArrowDataType::Float64, true));
+                            builders.push(ColBuilder::Float64(Float64Builder::new()));
+                        }
+                        AggregateFunc::Min | AggregateFunc::Max => {
+                            // Use source column type when possible, else Utf8 fallback
+                            if let Some(c) = column.as_ref() {
+                                if let Some(ci) = schema.get_index(c) {
+                                    match &columns[ci] {
+                                        TypedColumn::Int64 { .. } => {
+                                            fields.push(Field::new(&out_name, ArrowDataType::Int64, true));
+                                            builders.push(ColBuilder::Int64(Int64Builder::new()));
+                                        }
+                                        TypedColumn::Float64 { .. } => {
+                                            fields.push(Field::new(&out_name, ArrowDataType::Float64, true));
+                                            builders.push(ColBuilder::Float64(Float64Builder::new()));
+                                        }
+                                        TypedColumn::Bool { .. } => {
+                                            fields.push(Field::new(&out_name, ArrowDataType::Boolean, true));
+                                            builders.push(ColBuilder::Bool(BooleanBuilder::new()));
+                                        }
+                                        TypedColumn::String(_) => {
+                                            fields.push(Field::new(&out_name, ArrowDataType::Utf8, true));
+                                            builders.push(ColBuilder::Utf8(StringBuilder::new()));
+                                        }
+                                        TypedColumn::Mixed { .. } => {
+                                            fields.push(Field::new(&out_name, ArrowDataType::Utf8, true));
+                                            builders.push(ColBuilder::Utf8(StringBuilder::new()));
+                                        }
+                                    }
+                                } else {
+                                    fields.push(Field::new(&out_name, ArrowDataType::Utf8, true));
+                                    builders.push(ColBuilder::Utf8(StringBuilder::new()));
+                                }
                             } else {
-                                row.push(Value::Null);
+                                fields.push(Field::new(&out_name, ArrowDataType::Utf8, true));
+                                builders.push(ColBuilder::Utf8(StringBuilder::new()));
                             }
                         }
                     }
-                    SelectColumn::Aggregate { func, column, .. } => {
-                        let value = Self::compute_aggregate(func, column.as_deref(), &group_indices, table)?;
-                        row.push(value);
+                }
+                _ => {}
+            }
+        }
+
+        let having_filter = if let Some(ref having_expr) = stmt.having {
+            Some(Self::expr_to_filter(having_expr)?)
+        } else {
+            None
+        };
+
+        // Build rows (and apply HAVING) and append into Arrow builders
+        for (_key, group_state) in groups {
+            let mut row_values: Vec<Value> = Vec::with_capacity(result_columns.len());
+            let mut agg_i = 0usize;
+
+            for col in &stmt.columns {
+                match col {
+                    SelectColumn::Column(name) => {
+                        let first_idx = group_state.first_row_idx;
+                        if name == "_id" {
+                            row_values.push(Value::Int64(first_idx as i64));
+                        } else if let Some(ci) = schema.get_index(name) {
+                            row_values.push(columns[ci].get(first_idx).unwrap_or(Value::Null));
+                        } else {
+                            row_values.push(Value::Null);
+                        }
+                    }
+                    SelectColumn::ColumnAlias { column, .. } => {
+                        let first_idx = group_state.first_row_idx;
+                        if column == "_id" {
+                            row_values.push(Value::Int64(first_idx as i64));
+                        } else if let Some(ci) = schema.get_index(column) {
+                            row_values.push(columns[ci].get(first_idx).unwrap_or(Value::Null));
+                        } else {
+                            row_values.push(Value::Null);
+                        }
+                    }
+                    SelectColumn::Aggregate { .. } => {
+                        let v = group_state.aggs[agg_i].finalize();
+                        agg_i += 1;
+                        row_values.push(v);
                     }
                     _ => {}
                 }
             }
-            
-            result_rows.push(row);
+
+            if let Some(ref hf) = having_filter {
+                let mut row = Row::new(0);
+                for (i, col_name) in result_columns.iter().enumerate() {
+                    if let Some(v) = row_values.get(i) {
+                        row.set(col_name.clone(), v.clone());
+                    }
+                }
+                if !hf.matches(&row) {
+                    continue;
+                }
+            }
+
+            for (i, v) in row_values.iter().enumerate() {
+                builders[i].append_value(v);
+            }
         }
-        
-        // Apply HAVING filter
-        if let Some(ref _having_expr) = stmt.having {
-            // TODO: Implement HAVING filter
-            // For now, skip HAVING
-        }
-        
-        Ok(SqlResult::new(result_columns, result_rows))
+
+        let arrays: Vec<ArrayRef> = builders.into_iter().map(|b| b.finish()).collect();
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|e| ApexError::SerializationError(e.to_string()))?;
+
+        Ok(SqlResult::with_arrow_batch(result_columns, batch))
     }
     
     /// Build Arrow arrays directly from column data using matching indices
@@ -2128,18 +2800,10 @@ impl SqlExecutor {
                         fields.push(Field::new(col_name, ArrowDataType::Float64, true));
                         arrays.push(Arc::new(Float64Array::from(values)));
                     }
-                    TypedColumn::String { data, nulls } => {
-                        // For strings, use StringBuilder for efficiency
-                        let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 64);
-                        for &i in matching_indices {
-                            if i < data.len() && !nulls.get(i) {
-                                builder.append_value(&data[i]);
-                            } else {
-                                builder.append_null();
-                            }
-                        }
+                    TypedColumn::String(col) => {
+                        // Use ArrowStringColumn's native Arrow conversion
                         fields.push(Field::new(col_name, ArrowDataType::Utf8, true));
-                        arrays.push(Arc::new(builder.finish()));
+                        arrays.push(col.to_arrow_array_indexed(matching_indices));
                     }
                     TypedColumn::Bool { data, nulls } => {
                         let values: Vec<Option<bool>> = matching_indices.iter()

@@ -322,8 +322,8 @@ pub fn typed_columns_to_arrow_ipc(
                     TypedColumn::Float64 { data, nulls } => {
                         build_float64_array_optimized(data, nulls, row_indices, num_rows, contiguous_range)
                     }
-                    TypedColumn::String { data, nulls } => {
-                        build_string_array_optimized(data, nulls, row_indices, num_rows, contiguous_range)
+                    TypedColumn::String(col) => {
+                        col.to_arrow_array_indexed(row_indices)
                     }
                     TypedColumn::Bool { data, nulls } => {
                         build_bool_array_fast(data, nulls, row_indices, num_rows)
@@ -345,8 +345,8 @@ pub fn typed_columns_to_arrow_ipc(
                     TypedColumn::Float64 { data, nulls } => {
                         build_float64_array_optimized(data, nulls, row_indices, num_rows, contiguous_range)
                     }
-                    TypedColumn::String { data, nulls } => {
-                        build_string_array_optimized(data, nulls, row_indices, num_rows, contiguous_range)
+                    TypedColumn::String(col) => {
+                        col.to_arrow_array_indexed(row_indices)
                     }
                     TypedColumn::Bool { data, nulls } => {
                         build_bool_array_fast(data, nulls, row_indices, num_rows)
@@ -370,7 +370,7 @@ pub fn typed_columns_to_arrow_ipc(
 
     // Better buffer size estimation based on actual data
     // For string-heavy data, estimate ~50 bytes per row per string column + overhead
-    let string_col_count = columns.iter().filter(|c| matches!(c, TypedColumn::String { .. })).count();
+    let string_col_count = columns.iter().filter(|c| matches!(c, TypedColumn::String(_))).count();
     let estimated_size = num_rows * (8 + 8 + string_col_count * 50) + 4096;
     let mut buffer = Vec::with_capacity(estimated_size);
     
@@ -920,8 +920,8 @@ fn build_column_array_all(col: &TypedColumn, num_rows: usize) -> ArrayRef {
         TypedColumn::Float64 { data, nulls } => {
             build_float64_array_all(data, nulls, num_rows)
         }
-        TypedColumn::String { data, nulls } => {
-            build_string_array_all(data, nulls, num_rows)
+        TypedColumn::String(col) => {
+            col.to_arrow_array()
         }
         TypedColumn::Bool { data, nulls } => {
             build_bool_array_all(data, nulls, num_rows)
@@ -1136,8 +1136,8 @@ pub fn build_record_batch_direct(
                     TypedColumn::Float64 { data, nulls } => {
                         build_float64_array_optimized(data, nulls, row_indices, num_rows, contiguous_range)
                     }
-                    TypedColumn::String { data, nulls } => {
-                        build_string_array_optimized(data, nulls, row_indices, num_rows, contiguous_range)
+                    TypedColumn::String(col) => {
+                        col.to_arrow_array_indexed(row_indices)
                     }
                     TypedColumn::Bool { data, nulls } => {
                         build_bool_array_fast(data, nulls, row_indices, num_rows)
@@ -1158,8 +1158,8 @@ pub fn build_record_batch_direct(
                     TypedColumn::Float64 { data, nulls } => {
                         build_float64_array_optimized(data, nulls, row_indices, num_rows, contiguous_range)
                     }
-                    TypedColumn::String { data, nulls } => {
-                        build_string_array_optimized(data, nulls, row_indices, num_rows, contiguous_range)
+                    TypedColumn::String(col) => {
+                        col.to_arrow_array_indexed(row_indices)
                     }
                     TypedColumn::Bool { data, nulls } => {
                         build_bool_array_fast(data, nulls, row_indices, num_rows)
