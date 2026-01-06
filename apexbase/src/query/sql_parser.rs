@@ -641,6 +641,137 @@ impl SqlParser {
         })
     }
 
+    fn parse_alias_identifier(&mut self) -> Option<String> {
+        match self.current().clone() {
+            Token::Identifier(s) => {
+                self.advance();
+                Some(s)
+            }
+            // Allow using keyword tokens as aliases (e.g. AS count)
+            Token::Count => {
+                self.advance();
+                Some("count".to_string())
+            }
+            Token::Sum => {
+                self.advance();
+                Some("sum".to_string())
+            }
+            Token::Avg => {
+                self.advance();
+                Some("avg".to_string())
+            }
+            Token::Min => {
+                self.advance();
+                Some("min".to_string())
+            }
+            Token::Max => {
+                self.advance();
+                Some("max".to_string())
+            }
+            Token::Select => {
+                self.advance();
+                Some("select".to_string())
+            }
+            Token::From => {
+                self.advance();
+                Some("from".to_string())
+            }
+            Token::Where => {
+                self.advance();
+                Some("where".to_string())
+            }
+            Token::Order => {
+                self.advance();
+                Some("order".to_string())
+            }
+            Token::Group => {
+                self.advance();
+                Some("group".to_string())
+            }
+            Token::Having => {
+                self.advance();
+                Some("having".to_string())
+            }
+            Token::Limit => {
+                self.advance();
+                Some("limit".to_string())
+            }
+            Token::Offset => {
+                self.advance();
+                Some("offset".to_string())
+            }
+            Token::Distinct => {
+                self.advance();
+                Some("distinct".to_string())
+            }
+            Token::Like => {
+                self.advance();
+                Some("like".to_string())
+            }
+            Token::In => {
+                self.advance();
+                Some("in".to_string())
+            }
+            Token::Between => {
+                self.advance();
+                Some("between".to_string())
+            }
+            Token::Is => {
+                self.advance();
+                Some("is".to_string())
+            }
+            Token::Null => {
+                self.advance();
+                Some("null".to_string())
+            }
+            Token::True => {
+                self.advance();
+                Some("true".to_string())
+            }
+            Token::False => {
+                self.advance();
+                Some("false".to_string())
+            }
+            Token::Regexp => {
+                self.advance();
+                Some("regexp".to_string())
+            }
+            Token::Over => {
+                self.advance();
+                Some("over".to_string())
+            }
+            Token::Partition => {
+                self.advance();
+                Some("partition".to_string())
+            }
+            Token::By => {
+                self.advance();
+                Some("by".to_string())
+            }
+            Token::Asc => {
+                self.advance();
+                Some("asc".to_string())
+            }
+            Token::Desc => {
+                self.advance();
+                Some("desc".to_string())
+            }
+            Token::Nulls => {
+                self.advance();
+                Some("nulls".to_string())
+            }
+            Token::First => {
+                self.advance();
+                Some("first".to_string())
+            }
+            Token::Last => {
+                self.advance();
+                Some("last".to_string())
+            }
+            _ => None,
+        }
+    }
+
     /// Parse a column reference, supporting qualified names like t.col.
     ///
     /// Currently we normalize to the last identifier segment (e.g. "t._id" => "_id").
@@ -700,12 +831,7 @@ impl SqlParser {
 
                 let alias = if matches!(self.current(), Token::As) {
                     self.advance();
-                    if let Token::Identifier(name) = self.current().clone() {
-                        self.advance();
-                        Some(name)
-                    } else {
-                        None
-                    }
+                    self.parse_alias_identifier()
                 } else {
                     None
                 };
@@ -749,12 +875,7 @@ impl SqlParser {
 
                     let alias = if matches!(self.current(), Token::As) {
                         self.advance();
-                        if let Token::Identifier(alias) = self.current().clone() {
-                            self.advance();
-                            Some(alias)
-                        } else {
-                            None
-                        }
+                        self.parse_alias_identifier()
                     } else {
                         None
                     };
@@ -769,8 +890,7 @@ impl SqlParser {
                     // Regular column with optional alias
                     if matches!(self.current(), Token::As) {
                         self.advance();
-                        if let Token::Identifier(alias) = self.current().clone() {
-                            self.advance();
+                        if let Some(alias) = self.parse_alias_identifier() {
                             columns.push(SelectColumn::ColumnAlias { column: name, alias });
                         } else {
                             return Err(ApexError::QueryParseError("Expected alias after AS".to_string()));
@@ -933,6 +1053,11 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                     self.advance();
                     s
                 }
+                Token::Identifier(s) => {
+                    // Support double-quoted patterns like LIKE "foo%" which tokenize as Identifier.
+                    self.advance();
+                    s
+                }
                 _ => return Err(ApexError::QueryParseError("LIKE pattern must be a string literal".to_string())),
             };
             return Ok(SqlExpr::Like { column, pattern, negated: false });
@@ -943,6 +1068,11 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
             self.advance();
             let pattern = match self.current().clone() {
                 Token::StringLit(s) => {
+                    self.advance();
+                    s
+                }
+                Token::Identifier(s) => {
+                    // Support double-quoted patterns like REGEXP "test*" which tokenize as Identifier.
                     self.advance();
                     s
                 }
