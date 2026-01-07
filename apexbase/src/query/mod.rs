@@ -9,6 +9,9 @@ mod sql_executor;
 
 pub use executor::QueryExecutor;
 pub use filter::{Filter, CompareOp, LikeMatcher, RegexpMatcher};
-pub use sql_parser::{SqlParser, SqlStatement, SelectStatement, SelectColumn, SqlExpr, OrderByClause, AggregateFunc};
+pub use sql_parser::{
+    SqlParser, SqlStatement, SelectStatement, SelectColumn, SqlExpr, OrderByClause, AggregateFunc,
+    FromItem, JoinClause, JoinType, UnionStatement,
+};
 pub use sql_executor::{SqlExecutor, SqlResult};
 

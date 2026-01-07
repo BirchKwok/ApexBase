@@ -643,19 +643,129 @@ impl ApexStorage {
         let sql = sql.to_string();
 
         let (columns, rows, rows_affected) = py.allow_threads(|| -> PyResult<(Vec<String>, Vec<Vec<Value>>, usize)> {
-            // Determine target table from SQL (fallback to current table)
-            let target_table = match crate::query::SqlParser::parse(&sql) {
-                Ok(crate::query::SqlStatement::Select(sel)) => sel.from.unwrap_or_else(|| self.current_table.read().clone()),
-                Err(_) => self.current_table.read().clone(),
-            };
+            let default_table = self.current_table.read().clone();
+
+            let parsed = crate::query::SqlParser::parse(&sql);
+            fn stmt_has_join(stmt: &crate::query::SqlStatement) -> bool {
+                match stmt {
+                    crate::query::SqlStatement::Select(sel) => !sel.joins.is_empty(),
+                    crate::query::SqlStatement::Union(u) => stmt_has_join(&u.left) || stmt_has_join(&u.right),
+                }
+            }
+
+            fn first_select_table(stmt: &crate::query::SqlStatement) -> Option<String> {
+                match stmt {
+                    crate::query::SqlStatement::Select(sel) => sel.from.as_ref().map(|f| match f {
+                        crate::query::FromItem::Table { table, .. } => table.clone(),
+                        crate::query::FromItem::Subquery { alias, .. } => alias.clone(),
+                    }),
+                    crate::query::SqlStatement::Union(u) => first_select_table(&u.left),
+                }
+            }
+
+            fn stmt_has_derived_from(stmt: &crate::query::SqlStatement) -> bool {
+                match stmt {
+                    crate::query::SqlStatement::Select(sel) => {
+                        matches!(sel.from, Some(crate::query::FromItem::Subquery { .. }))
+                    }
+                    crate::query::SqlStatement::Union(u) => {
+                        stmt_has_derived_from(&u.left) || stmt_has_derived_from(&u.right)
+                    }
+                }
+            }
+
+            fn expr_has_in_subquery(expr: &crate::query::SqlExpr) -> bool {
+                use crate::query::SqlExpr;
+                match expr {
+                    SqlExpr::InSubquery { .. } => true,
+                    SqlExpr::ExistsSubquery { .. } => false,
+                    SqlExpr::BinaryOp { left, right, .. } => {
+                        expr_has_in_subquery(left) || expr_has_in_subquery(right)
+                    }
+                    SqlExpr::UnaryOp { expr, .. } => expr_has_in_subquery(expr),
+                    SqlExpr::Paren(inner) => expr_has_in_subquery(inner),
+                    SqlExpr::Between { low, high, .. } => {
+                        expr_has_in_subquery(low) || expr_has_in_subquery(high)
+                    }
+                    SqlExpr::Function { args, .. } => args.iter().any(expr_has_in_subquery),
+                    _ => false,
+                }
+            }
+
+            fn expr_has_exists_subquery(expr: &crate::query::SqlExpr) -> bool {
+                use crate::query::SqlExpr;
+                match expr {
+                    SqlExpr::ExistsSubquery { .. } => true,
+                    SqlExpr::ScalarSubquery { .. } => true,
+                    SqlExpr::BinaryOp { left, right, .. } => {
+                        expr_has_exists_subquery(left) || expr_has_exists_subquery(right)
+                    }
+                    SqlExpr::UnaryOp { expr, .. } => expr_has_exists_subquery(expr),
+                    SqlExpr::Paren(inner) => expr_has_exists_subquery(inner),
+                    SqlExpr::Between { low, high, .. } => {
+                        expr_has_exists_subquery(low) || expr_has_exists_subquery(high)
+                    }
+                    SqlExpr::Function { args, .. } => args.iter().any(expr_has_exists_subquery),
+                    _ => false,
+                }
+            }
+
+            fn stmt_has_in_subquery(stmt: &crate::query::SqlStatement) -> bool {
+                match stmt {
+                    crate::query::SqlStatement::Select(sel) => {
+                        sel.where_clause.as_ref().is_some_and(expr_has_in_subquery)
+                            || sel.having.as_ref().is_some_and(expr_has_in_subquery)
+                    }
+                    crate::query::SqlStatement::Union(u) => {
+                        stmt_has_in_subquery(&u.left) || stmt_has_in_subquery(&u.right)
+                    }
+                }
+            }
+
+            fn stmt_has_exists_subquery(stmt: &crate::query::SqlStatement) -> bool {
+                match stmt {
+                    crate::query::SqlStatement::Select(sel) => {
+                        let select_has = sel.columns.iter().any(|c| match c {
+                            crate::query::SelectColumn::Expression { expr, .. } => expr_has_exists_subquery(expr),
+                            _ => false,
+                        });
+                        select_has
+                            || sel.where_clause.as_ref().is_some_and(expr_has_exists_subquery)
+                            || sel.having.as_ref().is_some_and(expr_has_exists_subquery)
+                    }
+                    crate::query::SqlStatement::Union(u) => {
+                        stmt_has_exists_subquery(&u.left) || stmt_has_exists_subquery(&u.right)
+                    }
+                }
+            }
+
+            let is_join = matches!(parsed, Ok(ref s) if stmt_has_join(s));
+            let has_derived = matches!(parsed, Ok(ref s) if stmt_has_derived_from(s));
+            let has_in_subquery = matches!(parsed, Ok(ref s) if stmt_has_in_subquery(s));
+            let has_exists_subquery = matches!(parsed, Ok(ref s) if stmt_has_exists_subquery(s));
+
+            // Robust fallback: scalar subquery in SELECT list looks like "(SELECT".
+            // If present, route through the full SQL executor path.
+            let has_scalar_subquery_text = sql.to_uppercase().contains("(SELECT");
 
             let mut tables = self.tables.write();
-            let table = tables
-                .get_mut(&target_table)
-                .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
 
-            let result = SqlExecutor::execute(&sql, table)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let result = if is_join || has_derived || has_in_subquery || has_exists_subquery || has_scalar_subquery_text {
+                SqlExecutor::execute_with_tables(&sql, &mut tables, &default_table)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            } else {
+                // Determine target table from SQL (fallback to current table)
+                let target_table = match parsed {
+                    Ok(ref stmt) => first_select_table(stmt).unwrap_or_else(|| default_table.clone()),
+                    Err(_) => default_table.clone(),
+                };
+
+                let table = tables
+                    .get_mut(&target_table)
+                    .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
+
+                SqlExecutor::execute(&sql, table).map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            };
 
             Ok((result.columns, result.rows, result.rows_affected))
         })?;
@@ -686,19 +796,125 @@ impl ApexStorage {
         let sql = sql.to_string();
 
         let batch = py.allow_threads(|| -> PyResult<arrow::record_batch::RecordBatch> {
-            // Determine target table from SQL
-            let target_table = match crate::query::SqlParser::parse(&sql) {
-                Ok(crate::query::SqlStatement::Select(sel)) => sel.from.unwrap_or_else(|| self.current_table.read().clone()),
-                Err(_) => self.current_table.read().clone(),
-            };
+            let default_table = self.current_table.read().clone();
+
+            let parsed = crate::query::SqlParser::parse(&sql);
+            fn stmt_has_join(stmt: &crate::query::SqlStatement) -> bool {
+                match stmt {
+                    crate::query::SqlStatement::Select(sel) => !sel.joins.is_empty(),
+                    crate::query::SqlStatement::Union(u) => stmt_has_join(&u.left) || stmt_has_join(&u.right),
+                }
+            }
+
+            fn first_select_table(stmt: &crate::query::SqlStatement) -> Option<String> {
+                match stmt {
+                    crate::query::SqlStatement::Select(sel) => sel.from.as_ref().map(|f| match f {
+                        crate::query::FromItem::Table { table, .. } => table.clone(),
+                        crate::query::FromItem::Subquery { alias, .. } => alias.clone(),
+                    }),
+                    crate::query::SqlStatement::Union(u) => first_select_table(&u.left),
+                }
+            }
+
+            fn stmt_has_derived_from(stmt: &crate::query::SqlStatement) -> bool {
+                match stmt {
+                    crate::query::SqlStatement::Select(sel) => {
+                        matches!(sel.from, Some(crate::query::FromItem::Subquery { .. }))
+                    }
+                    crate::query::SqlStatement::Union(u) => {
+                        stmt_has_derived_from(&u.left) || stmt_has_derived_from(&u.right)
+                    }
+                }
+            }
+
+            fn expr_has_in_subquery(expr: &crate::query::SqlExpr) -> bool {
+                use crate::query::SqlExpr;
+                match expr {
+                    SqlExpr::InSubquery { .. } => true,
+                    SqlExpr::BinaryOp { left, right, .. } => {
+                        expr_has_in_subquery(left) || expr_has_in_subquery(right)
+                    }
+                    SqlExpr::UnaryOp { expr, .. } => expr_has_in_subquery(expr),
+                    SqlExpr::Paren(inner) => expr_has_in_subquery(inner),
+                    SqlExpr::Between { low, high, .. } => {
+                        expr_has_in_subquery(low) || expr_has_in_subquery(high)
+                    }
+                    SqlExpr::Function { args, .. } => args.iter().any(expr_has_in_subquery),
+                    _ => false,
+                }
+            }
+
+            fn expr_has_exists_subquery(expr: &crate::query::SqlExpr) -> bool {
+                use crate::query::SqlExpr;
+                match expr {
+                    SqlExpr::ExistsSubquery { .. } => true,
+                    SqlExpr::BinaryOp { left, right, .. } => {
+                        expr_has_exists_subquery(left) || expr_has_exists_subquery(right)
+                    }
+                    SqlExpr::UnaryOp { expr, .. } => expr_has_exists_subquery(expr),
+                    SqlExpr::Paren(inner) => expr_has_exists_subquery(inner),
+                    SqlExpr::Between { low, high, .. } => {
+                        expr_has_exists_subquery(low) || expr_has_exists_subquery(high)
+                    }
+                    SqlExpr::Function { args, .. } => args.iter().any(expr_has_exists_subquery),
+                    _ => false,
+                }
+            }
+
+            fn stmt_has_in_subquery(stmt: &crate::query::SqlStatement) -> bool {
+                match stmt {
+                    crate::query::SqlStatement::Select(sel) => {
+                        sel.where_clause.as_ref().is_some_and(expr_has_in_subquery)
+                            || sel.having.as_ref().is_some_and(expr_has_in_subquery)
+                    }
+                    crate::query::SqlStatement::Union(u) => {
+                        stmt_has_in_subquery(&u.left) || stmt_has_in_subquery(&u.right)
+                    }
+                }
+            }
+
+            fn stmt_has_exists_subquery(stmt: &crate::query::SqlStatement) -> bool {
+                match stmt {
+                    crate::query::SqlStatement::Select(sel) => {
+                        sel.where_clause.as_ref().is_some_and(expr_has_exists_subquery)
+                            || sel.having.as_ref().is_some_and(expr_has_exists_subquery)
+                    }
+                    crate::query::SqlStatement::Union(u) => {
+                        stmt_has_exists_subquery(&u.left) || stmt_has_exists_subquery(&u.right)
+                    }
+                }
+            }
+
+            let is_join = matches!(parsed, Ok(ref s) if stmt_has_join(s));
+            let has_derived = matches!(parsed, Ok(ref s) if stmt_has_derived_from(s));
+            let has_in_subquery = matches!(parsed, Ok(ref s) if stmt_has_in_subquery(s));
+            let has_exists_subquery = matches!(parsed, Ok(ref s) if stmt_has_exists_subquery(s));
+
+            // Robust fallback: scalar subquery in SELECT list looks like "(SELECT".
+            let has_scalar_subquery_text = sql.to_uppercase().contains("(SELECT");
 
             let mut tables = self.tables.write();
-            let table = tables
-                .get_mut(&target_table)
-                .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
 
-            IoEngine::execute_sql_arrow(table, &sql)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            if is_join || has_derived || has_in_subquery || has_exists_subquery || has_scalar_subquery_text {
+                let result = SqlExecutor::execute_with_tables(&sql, &mut tables, &default_table)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                result
+                    .to_record_batch()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            } else {
+                // Determine target table from SQL
+                let target_table = match parsed {
+                    Ok(ref stmt) => first_select_table(stmt).unwrap_or_else(|| default_table.clone()),
+                    Err(_) => default_table.clone(),
+                };
+
+                let table = tables
+                    .get_mut(&target_table)
+                    .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
+
+                IoEngine::execute_sql_arrow(table, &sql)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            }
         })?;
 
         if batch.num_rows() == 0 {

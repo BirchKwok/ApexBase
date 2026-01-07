@@ -8,7 +8,7 @@ use crate::data::{Row, Value};
 use crate::query::Filter;
 use crate::query::sql_parser::{
     SqlStatement, SelectStatement, SelectColumn, SqlExpr, 
-    BinaryOperator, UnaryOperator, OrderByClause, AggregateFunc
+    BinaryOperator, UnaryOperator, OrderByClause, AggregateFunc, FromItem
 };
 use crate::table::column_table::{ColumnTable, TypedColumn};
 use crate::io_engine::{IoEngine, StreamingFilterEvaluator};
@@ -36,7 +36,7 @@ impl SqlResult {
         let rows_affected = rows.len();
         Self { columns, rows, rows_affected, arrow_batch: None }
     }
-    
+
     pub fn empty() -> Self {
         Self { columns: Vec::new(), rows: Vec::new(), rows_affected: 0, arrow_batch: None }
     }
@@ -125,6 +125,114 @@ impl SqlResult {
 /// SQL Executor
 pub struct SqlExecutor;
 
+// ============ Unified Single-Table Pipeline ============
+//
+// This is a minimal, low-risk step toward a unified execution layer.
+// We only enable it for simple SELECT queries (no JOIN/GROUP BY/aggregates/window/expressions).
+// All other queries keep using the existing highly-optimized legacy paths.
+mod simple_pipeline {
+    use super::*;
+
+    pub(super) fn is_eligible(stmt: &SelectStatement) -> bool {
+        if !stmt.joins.is_empty() {
+            return false;
+        }
+        if !stmt.group_by.is_empty() {
+            return false;
+        }
+        if stmt.having.is_some() {
+            return false;
+        }
+
+        // Aggregates / window functions / expression projection are handled by legacy paths for now.
+        for c in &stmt.columns {
+            match c {
+                SelectColumn::All | SelectColumn::Column(_) | SelectColumn::ColumnAlias { .. } => {}
+                _ => return false,
+            }
+        }
+
+        true
+    }
+
+    pub(super) fn execute(stmt: &SelectStatement, table: &ColumnTable) -> Result<SqlResult, ApexError> {
+        // Step 1: Scan (materialize matching row indices)
+        let matching_indices: Vec<usize> = if let Some(ref where_expr) = stmt.where_clause {
+            SqlExecutor::evaluate_where(where_expr, table)?
+        } else {
+            // All non-deleted rows
+            let row_count = table.get_row_count();
+            let deleted = table.deleted_ref();
+            let mut idxs = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                if !deleted.get(i) {
+                    idxs.push(i);
+                }
+            }
+            idxs
+        };
+
+        // Step 2: Bind projection
+        let (result_columns, column_indices) = SqlExecutor::resolve_columns(&stmt.columns, table)?;
+
+        // Step 3: Sort (optional)
+        let mut indices = matching_indices;
+        if !stmt.order_by.is_empty() {
+            // Use top-k sorter for both cases:
+            // - when LIMIT is present: k = offset + limit
+            // - when LIMIT is absent: k = indices.len() (full sort)
+            let k = if let Some(lim) = stmt.limit {
+                stmt.offset.unwrap_or(0).saturating_add(lim)
+            } else {
+                indices.len()
+            };
+            indices = SqlExecutor::sort_indices_by_columns_topk(&indices, &stmt.order_by, table, k)?;
+        }
+
+        // Step 4: Limit/Offset
+        let off = stmt.offset.unwrap_or(0);
+        let lim = stmt.limit.unwrap_or(usize::MAX);
+        let indices: Vec<usize> = indices.into_iter().skip(off).take(lim).collect();
+
+        // Step 5: Project
+        // Prefer Arrow gather path when possible (same as legacy).
+        if indices.len() > 10_000 {
+            return SqlExecutor::build_arrow_direct(&result_columns, &column_indices, &indices, table);
+        }
+
+        let schema = table.schema_ref();
+        let cols = table.columns_ref();
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
+        for row_idx in indices {
+            let mut row = Vec::with_capacity(column_indices.len());
+            for (col_name, col_idx) in &column_indices {
+                if col_name == "_id" {
+                    row.push(Value::Int64(row_idx as i64));
+                } else if let Some(idx) = col_idx {
+                    row.push(cols[*idx].get(row_idx).unwrap_or(Value::Null));
+                } else {
+                    // Best-effort: re-resolve by name if needed
+                    if let Some(idx) = schema.get_index(col_name) {
+                        row.push(cols[idx].get(row_idx).unwrap_or(Value::Null));
+                    } else {
+                        row.push(Value::Null);
+                    }
+                }
+            }
+            rows.push(row);
+        }
+
+        // DISTINCT for simple pipeline (optional). Legacy has more optimized variants.
+        let rows = if stmt.distinct {
+            SqlExecutor::apply_distinct(rows)
+        } else {
+            rows
+        };
+
+        Ok(SqlResult::new(result_columns, rows))
+    }
+}
+
 #[allow(dead_code)]
 impl SqlExecutor {
     /// Execute a SQL statement against a table
@@ -135,11 +243,2604 @@ impl SqlExecutor {
         
         match stmt {
             SqlStatement::Select(select) => Self::execute_select(select, table),
+            SqlStatement::Union(union) => Self::execute_union(union, table),
         }
+    }
+
+    pub fn execute_with_tables(
+        sql: &str,
+        tables: &mut HashMap<String, ColumnTable>,
+        default_table: &str,
+    ) -> Result<SqlResult, ApexError> {
+        use crate::query::sql_parser::SqlParser;
+
+        let stmt = SqlParser::parse(sql)?;
+        match stmt {
+            SqlStatement::Select(select) => Self::execute_select_with_tables(select, tables, default_table),
+            SqlStatement::Union(union) => Self::execute_union_with_tables(union, tables, default_table),
+        }
+    }
+
+    fn execute_union(union: crate::query::UnionStatement, table: &mut ColumnTable) -> Result<SqlResult, ApexError> {
+        fn exec_one(stmt: crate::query::SqlStatement, table: &mut ColumnTable) -> Result<SqlResult, ApexError> {
+            match stmt {
+                crate::query::SqlStatement::Select(sel) => {
+                    // UNION operand should not carry its own ORDER/LIMIT/OFFSET in our grammar
+                    SqlExecutor::execute_select(sel, table)
+                }
+                crate::query::SqlStatement::Union(u) => SqlExecutor::execute_union(u, table),
+            }
+        }
+
+        let left = exec_one(*union.left, table)?;
+        let right = exec_one(*union.right, table)?;
+        Self::merge_union_results(left, right, union.all, &union.order_by, union.limit, union.offset)
+    }
+
+    fn execute_union_with_tables(
+        union: crate::query::UnionStatement,
+        tables: &mut HashMap<String, ColumnTable>,
+        default_table: &str,
+    ) -> Result<SqlResult, ApexError> {
+        fn exec_one(
+            stmt: crate::query::SqlStatement,
+            tables: &mut HashMap<String, ColumnTable>,
+            default_table: &str,
+        ) -> Result<SqlResult, ApexError> {
+            match stmt {
+                crate::query::SqlStatement::Select(sel) => {
+                    if !sel.joins.is_empty() {
+                        return Err(ApexError::QueryParseError(
+                            "UNION over JOIN queries is not supported yet".to_string(),
+                        ));
+                    }
+                    let target_table = sel
+                        .from
+                        .as_ref()
+                        .map(|f| match f {
+                            FromItem::Table { table, .. } => table.clone(),
+                            FromItem::Subquery { alias, .. } => alias.clone(),
+                        })
+                        .unwrap_or_else(|| default_table.to_string());
+                    let table = tables.get_mut(&target_table).ok_or_else(|| {
+                        ApexError::QueryParseError(format!("Table '{}' not found.", target_table))
+                    })?;
+                    SqlExecutor::execute_select(sel, table)
+                }
+                crate::query::SqlStatement::Union(u) => SqlExecutor::execute_union_with_tables(u, tables, default_table),
+            }
+        }
+
+        let left = exec_one(*union.left, tables, default_table)?;
+        let right = exec_one(*union.right, tables, default_table)?;
+        Self::merge_union_results(left, right, union.all, &union.order_by, union.limit, union.offset)
+    }
+
+    fn merge_union_results(
+        left: SqlResult,
+        right: SqlResult,
+        all: bool,
+        order_by: &[OrderByClause],
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<SqlResult, ApexError> {
+        if left.columns != right.columns {
+            return Err(ApexError::QueryParseError(
+                "UNION requires both sides to have the same columns".to_string(),
+            ));
+        }
+
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(left.rows.len() + right.rows.len());
+        rows.extend(left.rows);
+        rows.extend(right.rows);
+
+        if !all {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            rows.retain(|r| {
+                let k = r.iter().map(|v| v.to_string_value()).collect::<Vec<_>>().join("\u{1f}");
+                seen.insert(k)
+            });
+        }
+
+        if !order_by.is_empty() {
+            // Map ORDER BY column name -> result column index
+            let mut key_idx: Vec<(usize, bool, Option<bool>)> = Vec::new();
+            for ob in order_by {
+                let idx = left
+                    .columns
+                    .iter()
+                    .position(|c| c == &ob.column)
+                    .ok_or_else(|| {
+                        ApexError::QueryParseError(format!(
+                            "ORDER BY column '{}' must appear in UNION select list",
+                            ob.column
+                        ))
+                    })?;
+                key_idx.push((idx, ob.descending, ob.nulls_first));
+            }
+
+            rows.sort_by(|a, b| {
+                for (idx, desc, nulls_first) in &key_idx {
+                    let av = a.get(*idx);
+                    let bv = b.get(*idx);
+                    let cmp = SqlExecutor::compare_values(av, bv, *nulls_first);
+                    let cmp = if *desc { cmp.reverse() } else { cmp };
+                    if cmp != Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                Ordering::Equal
+            });
+        }
+
+        let off = offset.unwrap_or(0);
+        let lim = limit.unwrap_or(usize::MAX);
+        let rows = rows.into_iter().skip(off).take(lim).collect::<Vec<_>>();
+
+        Ok(SqlResult::new(left.columns, rows))
+    }
+
+    fn execute_select_with_tables(
+        stmt: SelectStatement,
+        tables: &mut HashMap<String, ColumnTable>,
+        default_table: &str,
+    ) -> Result<SqlResult, ApexError> {
+        fn strip_prefix(col: &str, alias: &str) -> String {
+            if let Some((a, c)) = col.split_once('.') {
+                if a == alias {
+                    return c.to_string();
+                }
+            }
+            col.to_string()
+        }
+
+        fn rewrite_expr_strip_alias(expr: &SqlExpr, alias: &str) -> SqlExpr {
+            match expr {
+                SqlExpr::Paren(inner) => SqlExpr::Paren(Box::new(rewrite_expr_strip_alias(inner, alias))),
+                SqlExpr::Column(c) => SqlExpr::Column(strip_prefix(c, alias)),
+                SqlExpr::BinaryOp { left, op, right } => SqlExpr::BinaryOp {
+                    left: Box::new(rewrite_expr_strip_alias(left, alias)),
+                    op: op.clone(),
+                    right: Box::new(rewrite_expr_strip_alias(right, alias)),
+                },
+                SqlExpr::UnaryOp { op, expr } => SqlExpr::UnaryOp {
+                    op: op.clone(),
+                    expr: Box::new(rewrite_expr_strip_alias(expr, alias)),
+                },
+                SqlExpr::Like { column, pattern, negated } => SqlExpr::Like {
+                    column: strip_prefix(column, alias),
+                    pattern: pattern.clone(),
+                    negated: *negated,
+                },
+                SqlExpr::Regexp { column, pattern, negated } => SqlExpr::Regexp {
+                    column: strip_prefix(column, alias),
+                    pattern: pattern.clone(),
+                    negated: *negated,
+                },
+                SqlExpr::In { column, values, negated } => SqlExpr::In {
+                    column: strip_prefix(column, alias),
+                    values: values.clone(),
+                    negated: *negated,
+                },
+                SqlExpr::Between { column, low, high, negated } => SqlExpr::Between {
+                    column: strip_prefix(column, alias),
+                    low: Box::new(rewrite_expr_strip_alias(low, alias)),
+                    high: Box::new(rewrite_expr_strip_alias(high, alias)),
+                    negated: *negated,
+                },
+                SqlExpr::IsNull { column, negated } => SqlExpr::IsNull {
+                    column: strip_prefix(column, alias),
+                    negated: *negated,
+                },
+                SqlExpr::Function { name, args } => SqlExpr::Function {
+                    name: name.clone(),
+                    args: args.iter().map(|a| rewrite_expr_strip_alias(a, alias)).collect(),
+                },
+                _ => expr.clone(),
+            }
+        }
+
+        fn materialize_sql_result_to_table(alias: &str, res: SqlResult) -> Result<ColumnTable, ApexError> {
+            use std::collections::HashMap;
+            let mut t = ColumnTable::new(0, alias);
+
+            if res.columns.is_empty() {
+                return Ok(t);
+            }
+
+            // If the result was produced via Arrow fast path, rows may be empty.
+            // Materialize from the Arrow batch when present.
+            if res.rows.is_empty() {
+                if let Some(batch) = res.arrow_batch {
+                    use arrow::array::Array;
+                    use arrow::datatypes::DataType;
+
+                    let mut colmap: HashMap<String, Vec<Value>> = HashMap::new();
+                    for (i, name) in res.columns.iter().enumerate() {
+                        let arr = batch.column(i);
+                        let mut values: Vec<Value> = Vec::with_capacity(arr.len());
+                        match arr.data_type() {
+                            DataType::Int64 => {
+                                let a = arr.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+                                for r in 0..a.len() {
+                                    if a.is_null(r) {
+                                        values.push(Value::Null);
+                                    } else {
+                                        values.push(Value::Int64(a.value(r)));
+                                    }
+                                }
+                            }
+                            DataType::Float64 => {
+                                let a = arr.as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+                                for r in 0..a.len() {
+                                    if a.is_null(r) {
+                                        values.push(Value::Null);
+                                    } else {
+                                        values.push(Value::Float64(a.value(r)));
+                                    }
+                                }
+                            }
+                            DataType::Utf8 => {
+                                let a = arr.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+                                for r in 0..a.len() {
+                                    if a.is_null(r) {
+                                        values.push(Value::Null);
+                                    } else {
+                                        values.push(Value::String(a.value(r).to_string()));
+                                    }
+                                }
+                            }
+                            DataType::Boolean => {
+                                let a = arr.as_any().downcast_ref::<arrow::array::BooleanArray>().unwrap();
+                                for r in 0..a.len() {
+                                    if a.is_null(r) {
+                                        values.push(Value::Null);
+                                    } else {
+                                        values.push(Value::Bool(a.value(r)));
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Fallback: stringify
+                                for r in 0..arr.len() {
+                                    if arr.is_null(r) {
+                                        values.push(Value::Null);
+                                    } else {
+                                        values.push(Value::String(format!("{:?}", arr)));
+                                    }
+                                }
+                            }
+                        }
+                        colmap.insert(name.clone(), values);
+                    }
+
+                    t.insert_columns(colmap)
+                        .map_err(|e| ApexError::QueryParseError(format!("Failed to materialize derived table: {:?}", e)))?;
+                    t.flush_write_buffer();
+                    return Ok(t);
+                }
+            }
+
+            let mut colmap: HashMap<String, Vec<Value>> = HashMap::new();
+            for c in &res.columns {
+                colmap.insert(c.clone(), Vec::with_capacity(res.rows.len()));
+            }
+            for row in res.rows {
+                for (i, c) in res.columns.iter().enumerate() {
+                    let v = row.get(i).cloned().unwrap_or(Value::Null);
+                    colmap.get_mut(c).unwrap().push(v);
+                }
+            }
+            t.insert_columns(colmap)
+                .map_err(|e| ApexError::QueryParseError(format!("Failed to materialize derived table: {:?}", e)))?;
+            t.flush_write_buffer();
+            Ok(t)
+        }
+
+        fn collect_single_column_values(res: SqlResult) -> Result<(Vec<Value>, bool), ApexError> {
+            if res.columns.len() != 1 {
+                return Err(ApexError::QueryParseError(
+                    "IN (subquery) requires subquery to return exactly 1 column".to_string(),
+                ));
+            }
+
+            // rows path
+            if !res.rows.is_empty() {
+                let mut out: Vec<Value> = Vec::with_capacity(res.rows.len());
+                let mut has_null = false;
+                for r in res.rows {
+                    let v = r.get(0).cloned().unwrap_or(Value::Null);
+                    has_null |= v.is_null();
+                    out.push(v);
+                }
+                return Ok((out, has_null));
+            }
+
+            // arrow fast path
+            if let Some(batch) = res.arrow_batch {
+                use arrow::array::Array;
+                use arrow::datatypes::DataType;
+
+                let arr = batch.column(0);
+                let mut out: Vec<Value> = Vec::with_capacity(arr.len());
+                let mut has_null = false;
+                match arr.data_type() {
+                    DataType::Int64 => {
+                        let a = arr.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+                        for i in 0..a.len() {
+                            if a.is_null(i) {
+                                has_null = true;
+                                out.push(Value::Null);
+                            } else {
+                                out.push(Value::Int64(a.value(i)));
+                            }
+                        }
+                    }
+                    DataType::Float64 => {
+                        let a = arr.as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+                        for i in 0..a.len() {
+                            if a.is_null(i) {
+                                has_null = true;
+                                out.push(Value::Null);
+                            } else {
+                                out.push(Value::Float64(a.value(i)));
+                            }
+                        }
+                    }
+                    DataType::Utf8 => {
+                        let a = arr.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+                        for i in 0..a.len() {
+                            if a.is_null(i) {
+                                has_null = true;
+                                out.push(Value::Null);
+                            } else {
+                                out.push(Value::String(a.value(i).to_string()));
+                            }
+                        }
+                    }
+                    DataType::Boolean => {
+                        let a = arr.as_any().downcast_ref::<arrow::array::BooleanArray>().unwrap();
+                        for i in 0..a.len() {
+                            if a.is_null(i) {
+                                has_null = true;
+                                out.push(Value::Null);
+                            } else {
+                                out.push(Value::Bool(a.value(i)));
+                            }
+                        }
+                    }
+                    _ => {
+                        for i in 0..arr.len() {
+                            if arr.is_null(i) {
+                                has_null = true;
+                                out.push(Value::Null);
+                            } else {
+                                out.push(Value::String(format!("{:?}", arr)));
+                            }
+                        }
+                    }
+                }
+                return Ok((out, has_null));
+            }
+
+            Ok((Vec::new(), false))
+        }
+
+        fn rewrite_in_subquery_in_expr(
+            expr: &SqlExpr,
+            tables: &mut HashMap<String, ColumnTable>,
+            default_table: &str,
+        ) -> Result<SqlExpr, ApexError> {
+            fn subquery_has_outer_ref(sub: &SelectStatement) -> bool {
+                // Determine subquery's own qualifier (alias or table name).
+                let (inner_table, inner_alias) = match sub.from.as_ref() {
+                    Some(FromItem::Table { table, alias }) => {
+                        (table.as_str(), alias.as_deref().unwrap_or(table.as_str()))
+                    }
+                    _ => ("", ""),
+                };
+
+                fn expr_has_outer_ref(expr: &SqlExpr, inner_table: &str, inner_alias: &str) -> bool {
+                    match expr {
+                        SqlExpr::Column(c) => {
+                            if let Some((a, _)) = c.split_once('.') {
+                                // Any qualifier not matching the subquery itself is treated as outer ref.
+                                !(a == inner_alias || a == inner_table)
+                            } else {
+                                false
+                            }
+                        }
+                        SqlExpr::BinaryOp { left, right, .. } => {
+                            expr_has_outer_ref(left, inner_table, inner_alias)
+                                || expr_has_outer_ref(right, inner_table, inner_alias)
+                        }
+                        SqlExpr::UnaryOp { expr, .. } => expr_has_outer_ref(expr, inner_table, inner_alias),
+                        SqlExpr::Paren(inner) => expr_has_outer_ref(inner, inner_table, inner_alias),
+                        SqlExpr::Between { low, high, .. } => {
+                            expr_has_outer_ref(low, inner_table, inner_alias)
+                                || expr_has_outer_ref(high, inner_table, inner_alias)
+                        }
+                        SqlExpr::Function { args, .. } => {
+                            args.iter().any(|a| expr_has_outer_ref(a, inner_table, inner_alias))
+                        }
+                        SqlExpr::Case { when_then, else_expr } => {
+                            when_then.iter().any(|(c, v)| {
+                                expr_has_outer_ref(c, inner_table, inner_alias)
+                                    || expr_has_outer_ref(v, inner_table, inner_alias)
+                            }) || else_expr
+                                .as_ref()
+                                .is_some_and(|e| expr_has_outer_ref(e, inner_table, inner_alias))
+                        }
+                        SqlExpr::InSubquery { .. }
+                        | SqlExpr::ExistsSubquery { .. }
+                        | SqlExpr::ScalarSubquery { .. } => false,
+                        SqlExpr::Like { .. }
+                        | SqlExpr::Regexp { .. }
+                        | SqlExpr::In { .. }
+                        | SqlExpr::IsNull { .. }
+                        | SqlExpr::Literal(_) => false,
+                    }
+                }
+
+                if let Some(w) = sub.where_clause.as_ref() {
+                    return expr_has_outer_ref(w, inner_table, inner_alias);
+                }
+                false
+            }
+
+            match expr {
+                SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+                    left: Box::new(rewrite_in_subquery_in_expr(left, tables, default_table)?),
+                    op: op.clone(),
+                    right: Box::new(rewrite_in_subquery_in_expr(right, tables, default_table)?),
+                }),
+                SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
+                    op: op.clone(),
+                    expr: Box::new(rewrite_in_subquery_in_expr(expr, tables, default_table)?),
+                }),
+                SqlExpr::Paren(inner) => Ok(SqlExpr::Paren(Box::new(rewrite_in_subquery_in_expr(
+                    inner,
+                    tables,
+                    default_table,
+                )?))),
+                SqlExpr::Between { column, low, high, negated } => Ok(SqlExpr::Between {
+                    column: column.clone(),
+                    low: Box::new(rewrite_in_subquery_in_expr(low, tables, default_table)?),
+                    high: Box::new(rewrite_in_subquery_in_expr(high, tables, default_table)?),
+                    negated: *negated,
+                }),
+                SqlExpr::Function { name, args } => Ok(SqlExpr::Function {
+                    name: name.clone(),
+                    args: args
+                        .iter()
+                        .map(|a| rewrite_in_subquery_in_expr(a, tables, default_table))
+                        .collect::<Result<Vec<_>, _>>()?,
+                }),
+                SqlExpr::InSubquery { column, stmt, negated } => {
+                    // Correlated subquery: do NOT pre-execute here.
+                    // Keep it for row-wise evaluation in the correlated execution path.
+                    if subquery_has_outer_ref(stmt) {
+                        return Ok(expr.clone());
+                    }
+
+                    if !stmt.joins.is_empty() {
+                        return Err(ApexError::QueryParseError(
+                            "IN (subquery) with JOIN is not supported yet".to_string(),
+                        ));
+                    }
+                    let sub_res = SqlExecutor::execute_select_with_tables((**stmt).clone(), tables, default_table)?;
+                    let (values, has_null) = collect_single_column_values(sub_res)?;
+
+                    // Conservative NULL semantics for NOT IN: if subquery yields any NULL,
+                    // the result is UNKNOWN for all non-matching rows -> filter out.
+                    if *negated && has_null {
+                        return Ok(SqlExpr::Literal(Value::Bool(false)));
+                    }
+
+                    Ok(SqlExpr::In {
+                        column: column.clone(),
+                        values,
+                        negated: *negated,
+                    })
+                }
+                _ => Ok(expr.clone()),
+            }
+        }
+
+        // We will rewrite/normalize the statement in-place.
+        let mut stmt = stmt;
+
+        // Rewrite IN (subquery) in WHERE into IN (list) so we can reuse Filter::In
+        if let Some(ref w) = stmt.where_clause {
+            let rewritten = rewrite_in_subquery_in_expr(w, tables, default_table)?;
+            stmt.where_clause = Some(rewritten);
+        }
+
+        // Derived table in FROM: execute subquery first, materialize, then execute outer query
+        if let Some(FromItem::Subquery { stmt: sub, alias }) = stmt.from.clone() {
+            if !stmt.joins.is_empty() {
+                return Err(ApexError::QueryParseError(
+                    "JOIN with derived table in FROM is not supported yet".to_string(),
+                ));
+            }
+
+            let sub_res = SqlExecutor::execute_select_with_tables(*sub, tables, default_table)?;
+            let tmp = materialize_sql_result_to_table(&alias, sub_res)?;
+            tables.insert(alias.clone(), tmp);
+
+            // Rewrite outer query to refer to the materialized alias table and strip qualifiers
+            stmt.from = Some(FromItem::Table { table: alias.clone(), alias: Some(alias.clone()) });
+            for c in &mut stmt.columns {
+                match c {
+                    SelectColumn::Column(name) => *name = strip_prefix(name, &alias),
+                    SelectColumn::ColumnAlias { column, .. } => *column = strip_prefix(column, &alias),
+                    SelectColumn::Aggregate { column, .. } => {
+                        if let Some(cc) = column.as_mut() {
+                            *cc = strip_prefix(cc, &alias);
+                        }
+                    }
+                    SelectColumn::Expression { expr, .. } => {
+                        *expr = rewrite_expr_strip_alias(expr, &alias);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(w) = stmt.where_clause.as_mut() {
+                *w = rewrite_expr_strip_alias(w, &alias);
+            }
+            stmt.group_by = stmt.group_by.iter().map(|g| strip_prefix(g, &alias)).collect();
+            if let Some(h) = stmt.having.as_mut() {
+                *h = rewrite_expr_strip_alias(h, &alias);
+            }
+            for ob in &mut stmt.order_by {
+                ob.column = strip_prefix(&ob.column, &alias);
+            }
+        }
+
+        // If this is a single-table query with an explicit table alias in FROM (e.g. FROM users u),
+        // normalize outer projection/order-by to unqualified column names (u.name -> name).
+        // This keeps the single-table execution logic and schema lookup consistent.
+        if stmt.joins.is_empty() {
+            if let Some(FromItem::Table { table, alias: Some(a) }) = stmt.from.as_ref() {
+                fn strip_outer_prefix(name: &str, table: &str, alias: &str) -> String {
+                    if let Some((p, c)) = name.split_once('.') {
+                        if p == alias || p == table {
+                            return c.to_string();
+                        }
+                    }
+                    name.to_string()
+                }
+
+                for c in &mut stmt.columns {
+                    match c {
+                        SelectColumn::Column(name) => {
+                            *name = strip_outer_prefix(name, table, a);
+                        }
+                        SelectColumn::ColumnAlias { column, .. } => {
+                            *column = strip_outer_prefix(column, table, a);
+                        }
+                        SelectColumn::Aggregate { column, .. } => {
+                            if let Some(cc) = column.as_mut() {
+                                *cc = strip_outer_prefix(cc, table, a);
+                            }
+                        }
+                        SelectColumn::Expression { .. } => {
+                            // Keep expressions as-is; they may legitimately reference outer alias.
+                        }
+                        _ => {}
+                    }
+                }
+                for ob in &mut stmt.order_by {
+                    ob.column = strip_outer_prefix(&ob.column, table, a);
+                }
+            }
+        }
+
+        if stmt.joins.is_empty() {
+            let target_table = stmt
+                .from
+                .as_ref()
+                .map(|f| match f {
+                    FromItem::Table { table, .. } => table.clone(),
+                    FromItem::Subquery { alias, .. } => alias.clone(),
+                })
+                .unwrap_or_else(|| default_table.to_string());
+
+            fn expr_has_exists_subquery(expr: &SqlExpr) -> bool {
+                match expr {
+                    SqlExpr::ExistsSubquery { .. } => true,
+                    SqlExpr::ScalarSubquery { .. } => true,
+                    SqlExpr::BinaryOp { left, right, .. } => {
+                        expr_has_exists_subquery(left) || expr_has_exists_subquery(right)
+                    }
+                    SqlExpr::UnaryOp { expr, .. } => expr_has_exists_subquery(expr),
+                    SqlExpr::Paren(inner) => expr_has_exists_subquery(inner),
+                    SqlExpr::Between { low, high, .. } => {
+                        expr_has_exists_subquery(low) || expr_has_exists_subquery(high)
+                    }
+                    SqlExpr::Function { args, .. } => args.iter().any(expr_has_exists_subquery),
+                    _ => false,
+                }
+            }
+
+            fn expr_has_in_subquery(expr: &SqlExpr) -> bool {
+                match expr {
+                    SqlExpr::InSubquery { .. } => true,
+                    SqlExpr::BinaryOp { left, right, .. } => {
+                        expr_has_in_subquery(left) || expr_has_in_subquery(right)
+                    }
+                    SqlExpr::UnaryOp { expr, .. } => expr_has_in_subquery(expr),
+                    SqlExpr::Paren(inner) => expr_has_in_subquery(inner),
+                    SqlExpr::Between { low, high, .. } => {
+                        expr_has_in_subquery(low) || expr_has_in_subquery(high)
+                    }
+                    SqlExpr::Function { args, .. } => args.iter().any(expr_has_in_subquery),
+                    SqlExpr::Case { when_then, else_expr } => {
+                        when_then.iter().any(|(c, v)| expr_has_in_subquery(c) || expr_has_in_subquery(v))
+                            || else_expr.as_ref().is_some_and(|e| expr_has_in_subquery(e))
+                    }
+                    _ => false,
+                }
+            }
+
+            // If this is a single-table query but references qualified columns (e.g. u.name)
+            // or has EXISTS subquery, we can't delegate to the single-table executor because it
+            // doesn't understand qualifiers and Filter conversion can't represent EXISTS.
+            let needs_qualified_or_exists = {
+                let has_exists = stmt
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(expr_has_exists_subquery);
+
+                let has_in_subquery = stmt
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(expr_has_in_subquery);
+
+                let has_scalar_in_select = stmt.columns.iter().any(|c| match c {
+                    SelectColumn::Expression { expr, .. } => expr_has_exists_subquery(expr),
+                    _ => false,
+                });
+
+                let outer_alias = stmt.from.as_ref().and_then(|f| match f {
+                    FromItem::Table { alias, .. } => alias.clone(),
+                    _ => None,
+                });
+
+                let has_qualified_select = stmt.columns.iter().any(|c| match c {
+                    SelectColumn::Column(name) => name.contains('.'),
+                    SelectColumn::ColumnAlias { column, .. } => column.contains('.'),
+                    SelectColumn::Aggregate { column, .. } => column.as_ref().is_some_and(|x| x.contains('.')),
+                    SelectColumn::Expression { expr, .. } => matches!(expr, SqlExpr::Column(c) if c.contains('.')),
+                    _ => false,
+                });
+                let has_qualified_order = stmt.order_by.iter().any(|o| o.column.contains('.'));
+
+                has_exists
+                    || has_scalar_in_select
+                    || has_in_subquery
+                    || outer_alias.is_some() && (has_qualified_select || has_qualified_order)
+            };
+
+            // We may need a mutable borrow to flush pending writes, but the EXISTS path also
+            // needs an immutable borrow of the full tables map. Keep the mutable borrow scope
+            // minimal to satisfy Rust's borrow checker.
+            {
+                let t = tables
+                    .get_mut(&target_table)
+                    .ok_or_else(|| ApexError::QueryParseError(format!("Table '{}' not found.", target_table)))?;
+                if t.has_pending_writes() {
+                    t.flush_write_buffer();
+                }
+            }
+
+            if !needs_qualified_or_exists {
+                let table = tables
+                    .get_mut(&target_table)
+                    .ok_or_else(|| ApexError::QueryParseError(format!("Table '{}' not found.", target_table)))?;
+                return Self::execute_select(stmt, table);
+            }
+
+            // ============ Single-table (no JOIN) path with qualifiers / EXISTS support ============
+            let table = tables
+                .get(&target_table)
+                .ok_or_else(|| ApexError::QueryParseError(format!("Table '{}' not found.", target_table)))?;
+
+            let outer_table_name = target_table.clone();
+            let outer_alias = stmt
+                .from
+                .as_ref()
+                .and_then(|f| match f {
+                    FromItem::Table { alias, .. } => alias.clone(),
+                    _ => None,
+                })
+                .unwrap_or_else(|| outer_table_name.clone());
+
+            fn strip_outer(col: &str, outer_alias: &str, outer_table: &str) -> String {
+                if let Some((a, c)) = col.split_once('.') {
+                    // In this execution path we are guaranteed to be running a single-table query.
+                    // Be permissive and strip the qualifier even if it doesn't match exactly,
+                    // so selecting `u.name` works reliably.
+                    if a == outer_alias || a == outer_table {
+                        return c.to_string();
+                    }
+                    return c.to_string();
+                }
+                col.to_string()
+            }
+
+            fn get_col_value_qualified(
+                col_ref: &str,
+                outer_table: &ColumnTable,
+                outer_row: usize,
+                outer_alias: &str,
+                outer_table_name: &str,
+                inner_table: &ColumnTable,
+                inner_row: usize,
+                inner_alias: &str,
+                inner_table_name: &str,
+            ) -> Value {
+                // Handle special _id
+                if col_ref == "_id" {
+                    return Value::Int64(inner_row as i64);
+                }
+                let (a, c) = if let Some((a, c)) = col_ref.split_once('.') {
+                    (a, c)
+                } else {
+                    ("", col_ref)
+                };
+
+                // Qualified
+                if !a.is_empty() {
+                    if a == inner_alias || a == inner_table_name {
+                        if c == "_id" {
+                            return Value::Int64(inner_row as i64);
+                        }
+                        if let Some(ci) = inner_table.schema_ref().get_index(c) {
+                            return inner_table.columns_ref()[ci].get(inner_row).unwrap_or(Value::Null);
+                        }
+                        return Value::Null;
+                    }
+                    if a == outer_alias || a == outer_table_name {
+                        if c == "_id" {
+                            return Value::Int64(outer_row as i64);
+                        }
+                        if let Some(ci) = outer_table.schema_ref().get_index(c) {
+                            return outer_table.columns_ref()[ci].get(outer_row).unwrap_or(Value::Null);
+                        }
+                        return Value::Null;
+                    }
+                    return Value::Null;
+                }
+
+                // Unqualified: prefer inner table if column exists there
+                if c == "_id" {
+                    return Value::Int64(inner_row as i64);
+                }
+                if inner_table.schema_ref().get_index(c).is_some() {
+                    let ci = inner_table.schema_ref().get_index(c).unwrap();
+                    return inner_table.columns_ref()[ci].get(inner_row).unwrap_or(Value::Null);
+                }
+                if outer_table.schema_ref().get_index(c).is_some() {
+                    let ci = outer_table.schema_ref().get_index(c).unwrap();
+                    return outer_table.columns_ref()[ci].get(outer_row).unwrap_or(Value::Null);
+                }
+                Value::Null
+            }
+
+            fn eval_correlated_predicate(
+                expr: &SqlExpr,
+                outer_table: &ColumnTable,
+                outer_row: usize,
+                outer_alias: &str,
+                outer_table_name: &str,
+                inner_table: &ColumnTable,
+                inner_row: usize,
+                inner_alias: &str,
+                inner_table_name: &str,
+            ) -> Result<bool, ApexError> {
+                fn eval_scalar(
+                    expr: &SqlExpr,
+                    outer_table: &ColumnTable,
+                    outer_row: usize,
+                    outer_alias: &str,
+                    outer_table_name: &str,
+                    inner_table: &ColumnTable,
+                    inner_row: usize,
+                    inner_alias: &str,
+                    inner_table_name: &str,
+                ) -> Result<Value, ApexError> {
+                    match expr {
+                        SqlExpr::Paren(inner) => eval_scalar(
+                            inner,
+                            outer_table,
+                            outer_row,
+                            outer_alias,
+                            outer_table_name,
+                            inner_table,
+                            inner_row,
+                            inner_alias,
+                            inner_table_name,
+                        ),
+                        SqlExpr::Literal(v) => Ok(v.clone()),
+                        SqlExpr::Column(c) => Ok(get_col_value_qualified(
+                            c,
+                            outer_table,
+                            outer_row,
+                            outer_alias,
+                            outer_table_name,
+                            inner_table,
+                            inner_row,
+                            inner_alias,
+                            inner_table_name,
+                        )),
+                        SqlExpr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+                            let v = eval_scalar(
+                                expr,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                                inner_table,
+                                inner_row,
+                                inner_alias,
+                                inner_table_name,
+                            )?;
+                            if let Some(i) = v.as_i64() {
+                                Ok(Value::Int64(-i))
+                            } else if let Some(f) = v.as_f64() {
+                                Ok(Value::Float64(-f))
+                            } else {
+                                Ok(Value::Null)
+                            }
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                }
+
+                match expr {
+                    SqlExpr::Paren(inner) => eval_correlated_predicate(
+                        inner,
+                        outer_table,
+                        outer_row,
+                        outer_alias,
+                        outer_table_name,
+                        inner_table,
+                        inner_row,
+                        inner_alias,
+                        inner_table_name,
+                    ),
+                    SqlExpr::Literal(v) => Ok(v.as_bool().unwrap_or(false)),
+                    SqlExpr::UnaryOp { op: UnaryOperator::Not, expr } => Ok(!eval_correlated_predicate(
+                        expr,
+                        outer_table,
+                        outer_row,
+                        outer_alias,
+                        outer_table_name,
+                        inner_table,
+                        inner_row,
+                        inner_alias,
+                        inner_table_name,
+                    )?),
+                    SqlExpr::BinaryOp { left, op, right } => match op {
+                        BinaryOperator::And => Ok(
+                            eval_correlated_predicate(
+                                left,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                                inner_table,
+                                inner_row,
+                                inner_alias,
+                                inner_table_name,
+                            )? && eval_correlated_predicate(
+                                right,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                                inner_table,
+                                inner_row,
+                                inner_alias,
+                                inner_table_name,
+                            )?,
+                        ),
+                        BinaryOperator::Or => Ok(
+                            eval_correlated_predicate(
+                                left,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                                inner_table,
+                                inner_row,
+                                inner_alias,
+                                inner_table_name,
+                            )? || eval_correlated_predicate(
+                                right,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                                inner_table,
+                                inner_row,
+                                inner_alias,
+                                inner_table_name,
+                            )?,
+                        ),
+                        BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Lt
+                        | BinaryOperator::Le
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Ge => {
+                            let lv = eval_scalar(
+                                left,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                                inner_table,
+                                inner_row,
+                                inner_alias,
+                                inner_table_name,
+                            )?;
+                            let rv = eval_scalar(
+                                right,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                                inner_table,
+                                inner_row,
+                                inner_alias,
+                                inner_table_name,
+                            )?;
+                            if lv.is_null() || rv.is_null() {
+                                return Ok(false);
+                            }
+                            let ord = lv.partial_cmp(&rv).unwrap_or(Ordering::Equal);
+                            Ok(match op {
+                                BinaryOperator::Eq => ord == Ordering::Equal,
+                                BinaryOperator::NotEq => ord != Ordering::Equal,
+                                BinaryOperator::Lt => ord == Ordering::Less,
+                                BinaryOperator::Le => ord != Ordering::Greater,
+                                BinaryOperator::Gt => ord == Ordering::Greater,
+                                BinaryOperator::Ge => ord != Ordering::Less,
+                                _ => false,
+                            })
+                        }
+                        _ => Err(ApexError::QueryParseError(
+                            "Unsupported operator in correlated predicate".to_string(),
+                        )),
+                    },
+                    _ => Err(ApexError::QueryParseError(
+                        "Unsupported expression in correlated predicate".to_string(),
+                    )),
+                }
+            }
+
+            fn exists_for_outer_row(
+                sub: &SelectStatement,
+                tables: &HashMap<String, ColumnTable>,
+                default_table: &str,
+                outer_table: &ColumnTable,
+                outer_row: usize,
+                outer_alias: &str,
+                outer_table_name: &str,
+            ) -> Result<bool, ApexError> {
+                if !sub.joins.is_empty() {
+                    return Err(ApexError::QueryParseError(
+                        "EXISTS subquery with JOIN is not supported yet".to_string(),
+                    ));
+                }
+                if !sub.group_by.is_empty() || sub.having.is_some() {
+                    return Err(ApexError::QueryParseError(
+                        "EXISTS subquery with GROUP BY/HAVING is not supported yet".to_string(),
+                    ));
+                }
+
+                let (inner_table_name, inner_alias) = match sub.from.as_ref() {
+                    Some(FromItem::Table { table, alias }) => {
+                        (table.clone(), alias.clone().unwrap_or_else(|| table.clone()))
+                    }
+                    Some(FromItem::Subquery { .. }) => {
+                        return Err(ApexError::QueryParseError(
+                            "EXISTS subquery FROM (subquery) is not supported yet".to_string(),
+                        ))
+                    }
+                    None => (default_table.to_string(), default_table.to_string()),
+                };
+
+                let inner_table = tables
+                    .get(&inner_table_name)
+                    .ok_or_else(|| ApexError::QueryParseError(format!("Table '{}' not found.", inner_table_name)))?;
+
+                let row_count = inner_table.get_row_count();
+                let deleted = inner_table.deleted_ref();
+                for inner_row in 0..row_count {
+                    if deleted.get(inner_row) {
+                        continue;
+                    }
+
+                    let passes = if let Some(ref w) = sub.where_clause {
+                        eval_correlated_predicate(
+                            w,
+                            outer_table,
+                            outer_row,
+                            outer_alias,
+                            outer_table_name,
+                            inner_table,
+                            inner_row,
+                            &inner_alias,
+                            &inner_table_name,
+                        )?
+                    } else {
+                        true
+                    };
+
+                    if passes {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+
+            fn eval_outer_where(
+                expr: &SqlExpr,
+                tables: &HashMap<String, ColumnTable>,
+                default_table: &str,
+                outer_table: &ColumnTable,
+                outer_row: usize,
+                outer_alias: &str,
+                outer_table_name: &str,
+            ) -> Result<bool, ApexError> {
+                fn get_outer_value(
+                    col_ref: &str,
+                    outer_table: &ColumnTable,
+                    outer_row: usize,
+                    outer_alias: &str,
+                    outer_table_name: &str,
+                ) -> Value {
+                    if col_ref == "_id" {
+                        return Value::Int64(outer_row as i64);
+                    }
+                    let (a, c) = if let Some((a, c)) = col_ref.split_once('.') {
+                        (a, c)
+                    } else {
+                        ("", col_ref)
+                    };
+                    let name = if !a.is_empty() {
+                        if a == outer_alias || a == outer_table_name {
+                            c
+                        } else {
+                            // Unknown qualifier
+                            return Value::Null;
+                        }
+                    } else {
+                        c
+                    };
+                    if name == "_id" {
+                        return Value::Int64(outer_row as i64);
+                    }
+                    if let Some(ci) = outer_table.schema_ref().get_index(name) {
+                        outer_table.columns_ref()[ci].get(outer_row).unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                }
+
+                fn eval_outer_scalar(
+                    expr: &SqlExpr,
+                    outer_table: &ColumnTable,
+                    outer_row: usize,
+                    outer_alias: &str,
+                    outer_table_name: &str,
+                ) -> Value {
+                    match expr {
+                        SqlExpr::Paren(inner) => {
+                            eval_outer_scalar(inner, outer_table, outer_row, outer_alias, outer_table_name)
+                        }
+                        SqlExpr::Literal(v) => v.clone(),
+                        SqlExpr::Column(c) => get_outer_value(c, outer_table, outer_row, outer_alias, outer_table_name),
+                        SqlExpr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+                            let v = eval_outer_scalar(expr, outer_table, outer_row, outer_alias, outer_table_name);
+                            if let Some(i) = v.as_i64() {
+                                Value::Int64(-i)
+                            } else if let Some(f) = v.as_f64() {
+                                Value::Float64(-f)
+                            } else {
+                                Value::Null
+                            }
+                        }
+                        _ => Value::Null,
+                    }
+                }
+
+                fn in_subquery_for_outer_row(
+                    column: &str,
+                    sub: &SelectStatement,
+                    negated: bool,
+                    tables: &HashMap<String, ColumnTable>,
+                    default_table: &str,
+                    outer_table: &ColumnTable,
+                    outer_row: usize,
+                    outer_alias: &str,
+                    outer_table_name: &str,
+                ) -> Result<bool, ApexError> {
+                    if !sub.joins.is_empty() {
+                        return Err(ApexError::QueryParseError(
+                            "IN (subquery) with JOIN is not supported yet".to_string(),
+                        ));
+                    }
+
+                    // Determine inner table
+                    let (inner_table_name, inner_alias) = match sub.from.as_ref() {
+                        Some(FromItem::Table { table, alias }) => {
+                            (table.clone(), alias.clone().unwrap_or_else(|| table.clone()))
+                        }
+                        Some(FromItem::Subquery { .. }) => {
+                            return Err(ApexError::QueryParseError(
+                                "IN (subquery) FROM (subquery) is not supported yet".to_string(),
+                            ))
+                        }
+                        None => (default_table.to_string(), default_table.to_string()),
+                    };
+
+                    let inner_table = tables
+                        .get(&inner_table_name)
+                        .ok_or_else(|| {
+                            ApexError::QueryParseError(format!("Table '{}' not found.", inner_table_name))
+                        })?;
+
+                    // Outer value
+                    let outer_v = get_outer_value(column, outer_table, outer_row, outer_alias, outer_table_name);
+                    if outer_v.is_null() {
+                        return Ok(false);
+                    }
+
+                    // Subquery must project a single column for IN
+                    if sub.columns.len() != 1 {
+                        return Err(ApexError::QueryParseError(
+                            "IN (subquery) requires single-column subquery".to_string(),
+                        ));
+                    }
+
+                    let selected_ref: Option<String> = match &sub.columns[0] {
+                        SelectColumn::Column(c) => Some(c.clone()),
+                        SelectColumn::ColumnAlias { column, .. } => Some(column.clone()),
+                        SelectColumn::Expression { .. } => None,
+                        SelectColumn::All => None,
+                        SelectColumn::Aggregate { .. } => None,
+                        SelectColumn::WindowFunction { .. } => None,
+                    };
+                    if selected_ref.is_none() {
+                        return Err(ApexError::QueryParseError(
+                            "IN (subquery) projection must be a column".to_string(),
+                        ));
+                    }
+                    let selected_ref = selected_ref.unwrap();
+
+                    let mut has_null = false;
+                    let mut any_match = false;
+
+                    let row_count = inner_table.get_row_count();
+                    let deleted = inner_table.deleted_ref();
+                    for inner_row in 0..row_count {
+                        if deleted.get(inner_row) {
+                            continue;
+                        }
+
+                        let passes = if let Some(ref w) = sub.where_clause {
+                            eval_correlated_predicate(
+                                w,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                                inner_table,
+                                inner_row,
+                                &inner_alias,
+                                &inner_table_name,
+                            )?
+                        } else {
+                            true
+                        };
+                        if !passes {
+                            continue;
+                        }
+
+                        let v = get_col_value_qualified(
+                            &selected_ref,
+                            outer_table,
+                            outer_row,
+                            outer_alias,
+                            outer_table_name,
+                            inner_table,
+                            inner_row,
+                            &inner_alias,
+                            &inner_table_name,
+                        );
+
+                        if v.is_null() {
+                            has_null = true;
+                            continue;
+                        }
+                        if v == outer_v {
+                            any_match = true;
+                            break;
+                        }
+                    }
+
+                    if negated {
+                        // NOT IN: if subquery contains NULL -> UNKNOWN -> filter out (FALSE)
+                        if has_null {
+                            return Ok(false);
+                        }
+                        Ok(!any_match)
+                    } else {
+                        // IN: if no match but contains NULL -> UNKNOWN -> filter out (FALSE)
+                        if !any_match && has_null {
+                            return Ok(false);
+                        }
+                        Ok(any_match)
+                    }
+                }
+
+                match expr {
+                    SqlExpr::Paren(inner) => eval_outer_where(
+                        inner,
+                        tables,
+                        default_table,
+                        outer_table,
+                        outer_row,
+                        outer_alias,
+                        outer_table_name,
+                    ),
+                    SqlExpr::Literal(v) => Ok(v.as_bool().unwrap_or(false)),
+                    SqlExpr::UnaryOp { op: UnaryOperator::Not, expr } => Ok(!eval_outer_where(
+                        expr,
+                        tables,
+                        default_table,
+                        outer_table,
+                        outer_row,
+                        outer_alias,
+                        outer_table_name,
+                    )?),
+                    SqlExpr::BinaryOp { left, op, right } => match op {
+                        BinaryOperator::And => Ok(
+                            eval_outer_where(
+                                left,
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )? && eval_outer_where(
+                                right,
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )?,
+                        ),
+                        BinaryOperator::Or => Ok(
+                            eval_outer_where(
+                                left,
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )? || eval_outer_where(
+                                right,
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )?,
+                        ),
+                        BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Lt
+                        | BinaryOperator::Le
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Ge => {
+                            let lv = eval_outer_scalar(left, outer_table, outer_row, outer_alias, outer_table_name);
+                            let rv = eval_outer_scalar(right, outer_table, outer_row, outer_alias, outer_table_name);
+                            if lv.is_null() || rv.is_null() {
+                                return Ok(false);
+                            }
+                            let ord = lv.partial_cmp(&rv).unwrap_or(Ordering::Equal);
+                            Ok(match op {
+                                BinaryOperator::Eq => ord == Ordering::Equal,
+                                BinaryOperator::NotEq => ord != Ordering::Equal,
+                                BinaryOperator::Lt => ord == Ordering::Less,
+                                BinaryOperator::Le => ord != Ordering::Greater,
+                                BinaryOperator::Gt => ord == Ordering::Greater,
+                                BinaryOperator::Ge => ord != Ordering::Less,
+                                _ => false,
+                            })
+                        }
+                        _ => Err(ApexError::QueryParseError(
+                            "Unsupported operator in outer WHERE".to_string(),
+                        )),
+                    },
+                    SqlExpr::ExistsSubquery { stmt: sub } => exists_for_outer_row(
+                        sub,
+                        tables,
+                        default_table,
+                        outer_table,
+                        outer_row,
+                        outer_alias,
+                        outer_table_name,
+                    ),
+                    SqlExpr::InSubquery { column, stmt: sub, negated } => in_subquery_for_outer_row(
+                        column,
+                        sub,
+                        *negated,
+                        tables,
+                        default_table,
+                        outer_table,
+                        outer_row,
+                        outer_alias,
+                        outer_table_name,
+                    ),
+                    SqlExpr::ScalarSubquery { .. } => Err(ApexError::QueryParseError(
+                        "Scalar subquery is not supported in WHERE yet".to_string(),
+                    )),
+                    _ => Err(ApexError::QueryParseError(
+                        "Unsupported expression in outer WHERE".to_string(),
+                    )),
+                }
+            }
+
+            fn eval_scalar_subquery_for_outer_row(
+                sub: &SelectStatement,
+                tables: &HashMap<String, ColumnTable>,
+                default_table: &str,
+                outer_table: &ColumnTable,
+                outer_row: usize,
+                outer_alias: &str,
+                outer_table_name: &str,
+            ) -> Result<Value, ApexError> {
+                if !sub.joins.is_empty() {
+                    return Err(ApexError::QueryParseError(
+                        "Scalar subquery with JOIN is not supported yet".to_string(),
+                    ));
+                }
+                if !sub.group_by.is_empty() || sub.having.is_some() {
+                    return Err(ApexError::QueryParseError(
+                        "Scalar subquery with GROUP BY/HAVING is not supported yet".to_string(),
+                    ));
+                }
+                if sub.columns.len() != 1 {
+                    return Err(ApexError::QueryParseError(
+                        "Scalar subquery must return exactly one column".to_string(),
+                    ));
+                }
+
+                let (inner_table_name, inner_alias) = match sub.from.as_ref() {
+                    Some(FromItem::Table { table, alias }) => {
+                        (table.clone(), alias.clone().unwrap_or_else(|| table.clone()))
+                    }
+                    Some(FromItem::Subquery { .. }) => {
+                        return Err(ApexError::QueryParseError(
+                            "Scalar subquery FROM (subquery) is not supported yet".to_string(),
+                        ))
+                    }
+                    None => (default_table.to_string(), default_table.to_string()),
+                };
+
+                let inner_table = tables
+                    .get(&inner_table_name)
+                    .ok_or_else(|| ApexError::QueryParseError(format!("Table '{}' not found.", inner_table_name)))?;
+
+                // Support only simple aggregate scalar: MAX(col), MIN(col), SUM(col), AVG(col), COUNT(*), COUNT(col)
+                let mut agg: Option<(AggregateFunc, Option<String>)> = None;
+                match &sub.columns[0] {
+                    SelectColumn::Aggregate { func, column, distinct, .. } => {
+                        if *distinct {
+                            return Err(ApexError::QueryParseError(
+                                "Scalar subquery DISTINCT aggregate is not supported yet".to_string(),
+                            ));
+                        }
+                        agg = Some((func.clone(), column.clone()));
+                    }
+                    _ => {
+                        return Err(ApexError::QueryParseError(
+                            "Scalar subquery only supports aggregate projection".to_string(),
+                        ))
+                    }
+                }
+                let (func, col) = agg.unwrap();
+
+                // Reuse correlated predicate evaluator for subquery WHERE
+                let row_count = inner_table.get_row_count();
+                let deleted = inner_table.deleted_ref();
+
+                let mut count: i64 = 0;
+                let mut sum: f64 = 0.0;
+                let mut sum_count: i64 = 0;
+                let mut min_v: Option<Value> = None;
+                let mut max_v: Option<Value> = None;
+
+                for inner_row in 0..row_count {
+                    if deleted.get(inner_row) {
+                        continue;
+                    }
+                    let passes = if let Some(ref w) = sub.where_clause {
+                        eval_correlated_predicate(
+                            w,
+                            outer_table,
+                            outer_row,
+                            outer_alias,
+                            outer_table_name,
+                            inner_table,
+                            inner_row,
+                            &inner_alias,
+                            &inner_table_name,
+                        )?
+                    } else {
+                        true
+                    };
+                    if !passes {
+                        continue;
+                    }
+
+                    match func {
+                        AggregateFunc::Count => {
+                            if col.is_none() {
+                                count += 1;
+                            } else if let Some(ref c) = col {
+                                let v = get_col_value_qualified(
+                                    c,
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    &inner_alias,
+                                    &inner_table_name,
+                                );
+                                if !v.is_null() {
+                                    count += 1;
+                                }
+                            }
+                        }
+                        AggregateFunc::Sum | AggregateFunc::Avg => {
+                            if let Some(ref c) = col {
+                                let v = get_col_value_qualified(
+                                    c,
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    &inner_alias,
+                                    &inner_table_name,
+                                );
+                                if let Some(n) = v.as_f64() {
+                                    sum += n;
+                                    sum_count += 1;
+                                }
+                            }
+                        }
+                        AggregateFunc::Min => {
+                            if let Some(ref c) = col {
+                                let v = get_col_value_qualified(
+                                    c,
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    &inner_alias,
+                                    &inner_table_name,
+                                );
+                                if v.is_null() {
+                                    continue;
+                                }
+                                min_v = Some(match &min_v {
+                                    None => v,
+                                    Some(curr) => {
+                                        if SqlExecutor::compare_non_null(curr, &v) == Ordering::Greater {
+                                            v
+                                        } else {
+                                            curr.clone()
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        AggregateFunc::Max => {
+                            if let Some(ref c) = col {
+                                let v = get_col_value_qualified(
+                                    c,
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    &inner_alias,
+                                    &inner_table_name,
+                                );
+                                if v.is_null() {
+                                    continue;
+                                }
+                                max_v = Some(match &max_v {
+                                    None => v,
+                                    Some(curr) => {
+                                        if SqlExecutor::compare_non_null(curr, &v) == Ordering::Less {
+                                            v
+                                        } else {
+                                            curr.clone()
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+
+                Ok(match func {
+                    AggregateFunc::Count => Value::Int64(count),
+                    AggregateFunc::Sum => Value::Float64(sum),
+                    AggregateFunc::Avg => {
+                        if sum_count > 0 {
+                            Value::Float64(sum / sum_count as f64)
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    AggregateFunc::Min => min_v.unwrap_or(Value::Null),
+                    AggregateFunc::Max => max_v.unwrap_or(Value::Null),
+                })
+            }
+
+            fn eval_outer_expr(
+                expr: &SqlExpr,
+                tables: &HashMap<String, ColumnTable>,
+                default_table: &str,
+                outer_table: &ColumnTable,
+                outer_row: usize,
+                outer_alias: &str,
+                outer_table_name: &str,
+            ) -> Result<Value, ApexError> {
+                fn get_outer_value_local(
+                    col_ref: &str,
+                    outer_table: &ColumnTable,
+                    outer_row: usize,
+                    outer_alias: &str,
+                    outer_table_name: &str,
+                ) -> Value {
+                    if col_ref == "_id" {
+                        return Value::Int64(outer_row as i64);
+                    }
+                    let (a, c) = if let Some((a, c)) = col_ref.split_once('.') {
+                        (a, c)
+                    } else {
+                        ("", col_ref)
+                    };
+                    let name = if !a.is_empty() {
+                        if a == outer_alias || a == outer_table_name {
+                            c
+                        } else {
+                            return Value::Null;
+                        }
+                    } else {
+                        c
+                    };
+                    if name == "_id" {
+                        return Value::Int64(outer_row as i64);
+                    }
+                    if let Some(ci) = outer_table.schema_ref().get_index(name) {
+                        outer_table.columns_ref()[ci].get(outer_row).unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                }
+
+                match expr {
+                    SqlExpr::Paren(inner) => {
+                        eval_outer_expr(inner, tables, default_table, outer_table, outer_row, outer_alias, outer_table_name)
+                    }
+                    SqlExpr::Literal(v) => Ok(v.clone()),
+                    SqlExpr::Column(c) => Ok(get_outer_value_local(c, outer_table, outer_row, outer_alias, outer_table_name)),
+                    SqlExpr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+                        let v = eval_outer_expr(expr, tables, default_table, outer_table, outer_row, outer_alias, outer_table_name)?;
+                        if let Some(i) = v.as_i64() {
+                            Ok(Value::Int64(-i))
+                        } else if let Some(f) = v.as_f64() {
+                            Ok(Value::Float64(-f))
+                        } else {
+                            Ok(Value::Null)
+                        }
+                    }
+                    SqlExpr::ScalarSubquery { stmt: sub } => eval_scalar_subquery_for_outer_row(
+                        sub,
+                        tables,
+                        default_table,
+                        outer_table,
+                        outer_row,
+                        outer_alias,
+                        outer_table_name,
+                    ),
+                    _ => Err(ApexError::QueryParseError(
+                        "Unsupported expression in SELECT list".to_string(),
+                    )),
+                }
+            }
+
+            // Evaluate WHERE to matching indices (row-by-row)
+            let row_count = table.get_row_count();
+            let deleted = table.deleted_ref();
+            let mut matching_indices: Vec<usize> = Vec::new();
+            for row_idx in 0..row_count {
+                if deleted.get(row_idx) {
+                    continue;
+                }
+                let passes = if let Some(ref w) = stmt.where_clause {
+                    eval_outer_where(
+                        w,
+                        tables,
+                        default_table,
+                        table,
+                        row_idx,
+                        &outer_alias,
+                        &outer_table_name,
+                    )?
+                } else {
+                    true
+                };
+                if passes {
+                    matching_indices.push(row_idx);
+                }
+            }
+
+            // Project selected columns (strip outer qualifier)
+            let mut result_columns: Vec<String> = Vec::new();
+            let mut projected_cols: Vec<String> = Vec::new();
+            let mut projected_exprs: Vec<Option<SqlExpr>> = Vec::new();
+            for sc in &stmt.columns {
+                match sc {
+                    SelectColumn::Column(c) => {
+                        let name = strip_outer(c, &outer_alias, &outer_table_name);
+                        result_columns.push(name.clone());
+                        projected_cols.push(name);
+                        projected_exprs.push(None);
+                    }
+                    SelectColumn::ColumnAlias { column, alias } => {
+                        let name = strip_outer(column, &outer_alias, &outer_table_name);
+                        result_columns.push(alias.clone());
+                        projected_cols.push(name);
+                        projected_exprs.push(None);
+                    }
+                    SelectColumn::Expression { expr, alias } => {
+                        let out_name = alias.clone().unwrap_or_else(|| "expr".to_string());
+                        result_columns.push(out_name);
+                        projected_cols.push(String::new());
+                        projected_exprs.push(Some(expr.clone()));
+                    }
+                    _ => {
+                        return Err(ApexError::QueryParseError(
+                            "EXISTS single-table path only supports simple column projection and scalar subquery expressions".to_string(),
+                        ))
+                    }
+                }
+            }
+
+            let schema = table.schema_ref();
+            let columns_ref = table.columns_ref();
+            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(matching_indices.len());
+            for &row_idx in &matching_indices {
+                let mut out_row: Vec<Value> = Vec::with_capacity(projected_cols.len());
+                for (i, col) in projected_cols.iter().enumerate() {
+                    if let Some(expr) = projected_exprs.get(i).and_then(|e| e.clone()) {
+                        out_row.push(eval_outer_expr(
+                            &expr,
+                            tables,
+                            default_table,
+                            table,
+                            row_idx,
+                            &outer_alias,
+                            &outer_table_name,
+                        )?);
+                        continue;
+                    }
+
+                    if col == "_id" {
+                        out_row.push(Value::Int64(row_idx as i64));
+                    } else if let Some(ci) = schema.get_index(col) {
+                        out_row.push(columns_ref[ci].get(row_idx).unwrap_or(Value::Null));
+                    } else {
+                        out_row.push(Value::Null);
+                    }
+                }
+                rows.push(out_row);
+            }
+
+            // Apply ORDER BY (strip qualifier)
+            let mut order_by = stmt.order_by.clone();
+            for ob in &mut order_by {
+                ob.column = strip_outer(&ob.column, &outer_alias, &outer_table_name);
+            }
+            if !order_by.is_empty() {
+                rows = Self::apply_order_by(rows, &result_columns, &order_by)?;
+            }
+
+            let off = stmt.offset.unwrap_or(0);
+            let lim = stmt.limit.unwrap_or(usize::MAX);
+            let rows = rows.into_iter().skip(off).take(lim).collect::<Vec<_>>();
+            return Ok(SqlResult::new(result_columns, rows));
+        }
+
+        let from_item = stmt
+            .from
+            .as_ref()
+            .ok_or_else(|| ApexError::QueryParseError("JOIN requires FROM table".to_string()))?;
+
+        let (left_table_name, left_alias) = match from_item {
+            FromItem::Table { table, alias } => {
+                let t = table.clone();
+                let a = alias.clone().unwrap_or_else(|| t.clone());
+                (t, a)
+            }
+            FromItem::Subquery { .. } => {
+                return Err(ApexError::QueryParseError(
+                    "JOIN with derived table is not supported yet".to_string(),
+                ))
+            }
+        };
+
+        {
+            let left_table = tables
+                .get_mut(&left_table_name)
+                .ok_or_else(|| ApexError::QueryParseError(format!("Table '{}' not found.", left_table_name)))?;
+            if left_table.has_pending_writes() {
+                left_table.flush_write_buffer();
+            }
+        }
+
+        // Attempt to push down WHERE to the right side when it only references the right table.
+        fn strip_right_only_where(expr: &SqlExpr, left_alias: &str, right_alias: &str) -> Option<SqlExpr> {
+            match expr {
+                SqlExpr::Paren(inner) => strip_right_only_where(inner, left_alias, right_alias)
+                    .map(|e| SqlExpr::Paren(Box::new(e))),
+                SqlExpr::BinaryOp { left, op, right } => {
+                    // Support AND pushdown
+                    if *op == BinaryOperator::And {
+                        let l = strip_right_only_where(left, left_alias, right_alias)?;
+                        let r = strip_right_only_where(right, left_alias, right_alias)?;
+                        return Some(SqlExpr::BinaryOp { left: Box::new(l), op: op.clone(), right: Box::new(r) });
+                    }
+
+                    // Comparison: right_alias.col OP literal
+                    let col = match left.as_ref() {
+                        SqlExpr::Column(c) => c,
+                        _ => return None,
+                    };
+                    let (a, c) = if let Some((aa, cc)) = col.split_once('.') { (aa, cc) } else { ("", col.as_str()) };
+                    if a.is_empty() {
+                        // Unqualified: ambiguous, don't push down
+                        return None;
+                    }
+                    if a == left_alias {
+                        return None;
+                    }
+                    if a != right_alias {
+                        return None;
+                    }
+
+                    let rv = match right.as_ref() {
+                        SqlExpr::Literal(v) => v.clone(),
+                        _ => return None,
+                    };
+
+                    Some(SqlExpr::BinaryOp {
+                        left: Box::new(SqlExpr::Column(c.to_string())),
+                        op: op.clone(),
+                        right: Box::new(SqlExpr::Literal(rv)),
+                    })
+                }
+                _ => None,
+            }
+        }
+
+        if stmt.joins.len() != 1 {
+            return Err(ApexError::QueryParseError(
+                "Only single JOIN is supported yet".to_string(),
+            ));
+        }
+        let join = &stmt.joins[0];
+
+        let (right_table_name, right_alias) = match &join.right {
+            FromItem::Table { table, alias } => {
+                let t = table.clone();
+                let a = alias.clone().unwrap_or_else(|| t.clone());
+                (t, a)
+            }
+            FromItem::Subquery { .. } => {
+                return Err(ApexError::QueryParseError(
+                    "JOIN with derived table is not supported yet".to_string(),
+                ))
+            }
+        };
+
+        {
+            let right_table = tables
+                .get_mut(&right_table_name)
+                .ok_or_else(|| ApexError::QueryParseError(format!("Table '{}' not found.", right_table_name)))?;
+            if right_table.has_pending_writes() {
+                right_table.flush_write_buffer();
+            }
+        }
+
+        let left_table = tables
+            .get(&left_table_name)
+            .ok_or_else(|| ApexError::QueryParseError(format!("Table '{}' not found.", left_table_name)))?;
+        let right_table = tables
+            .get(&right_table_name)
+            .ok_or_else(|| ApexError::QueryParseError(format!("Table '{}' not found.", right_table_name)))?;
+
+        #[derive(Clone, Copy)]
+        struct JoinRow {
+            left: usize,
+            right: Option<usize>,
+        }
+
+        fn split_qual(col: &str) -> (&str, &str) {
+            if let Some((a, b)) = col.split_once('.') {
+                (a, b)
+            } else {
+                ("", col)
+            }
+        }
+
+        fn get_col_value(table: &ColumnTable, col: &str, row_idx: usize) -> Value {
+            if col == "_id" {
+                return Value::Int64(row_idx as i64);
+            }
+            let schema = table.schema_ref();
+            if let Some(ci) = schema.get_index(col) {
+                table.columns_ref()[ci].get(row_idx).unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            }
+        }
+
+        fn value_for_ref(
+            col_ref: &str,
+            left_table: &ColumnTable,
+            right_table: &ColumnTable,
+            left_alias: &str,
+            right_alias: &str,
+            jr: JoinRow,
+        ) -> Value {
+            let (a, c) = split_qual(col_ref);
+            if a.is_empty() {
+                // Unqualified column: resolve by schema presence.
+                // If only one side contains the column, use that side.
+                // If both contain it, default to left for backward-compat.
+                let l_has = left_table.schema_ref().get_index(c).is_some() || c == "_id";
+                let r_has = right_table.schema_ref().get_index(c).is_some() || c == "_id";
+                if r_has && !l_has {
+                    return jr
+                        .right
+                        .map(|ri| get_col_value(right_table, c, ri))
+                        .unwrap_or(Value::Null);
+                }
+                return get_col_value(left_table, c, jr.left);
+            }
+            if a == left_alias {
+                get_col_value(left_table, c, jr.left)
+            } else if a == right_alias {
+                jr.right
+                    .map(|ri| get_col_value(right_table, c, ri))
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            }
+        }
+
+        fn eval_predicate(
+            expr: &SqlExpr,
+            left_table: &ColumnTable,
+            right_table: &ColumnTable,
+            left_alias: &str,
+            right_alias: &str,
+            jr: JoinRow,
+        ) -> Result<bool, ApexError> {
+            fn eval_scalar(
+                expr: &SqlExpr,
+                left_table: &ColumnTable,
+                right_table: &ColumnTable,
+                left_alias: &str,
+                right_alias: &str,
+                jr: JoinRow,
+            ) -> Result<Value, ApexError> {
+                match expr {
+                    SqlExpr::Paren(inner) => eval_scalar(inner, left_table, right_table, left_alias, right_alias, jr),
+                    SqlExpr::Literal(v) => Ok(v.clone()),
+                    SqlExpr::Column(c) => Ok(value_for_ref(c, left_table, right_table, left_alias, right_alias, jr)),
+                    SqlExpr::UnaryOp { op, expr } => match op {
+                        UnaryOperator::Not => {
+                            let v = eval_predicate(expr, left_table, right_table, left_alias, right_alias, jr)?;
+                            Ok(Value::Bool(!v))
+                        }
+                        UnaryOperator::Minus => {
+                            let v = eval_scalar(expr, left_table, right_table, left_alias, right_alias, jr)?;
+                            if let Some(i) = v.as_i64() {
+                                Ok(Value::Int64(-i))
+                            } else if let Some(f) = v.as_f64() {
+                                Ok(Value::Float64(-f))
+                            } else {
+                                Ok(Value::Null)
+                            }
+                        }
+                    },
+                    SqlExpr::BinaryOp { left, op, right } => match op {
+                        BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul | BinaryOperator::Div | BinaryOperator::Mod => {
+                            let lv = eval_scalar(left, left_table, right_table, left_alias, right_alias, jr)?;
+                            let rv = eval_scalar(right, left_table, right_table, left_alias, right_alias, jr)?;
+                            if let (Some(a), Some(b)) = (lv.as_f64(), rv.as_f64()) {
+                                let out = match op {
+                                    BinaryOperator::Add => a + b,
+                                    BinaryOperator::Sub => a - b,
+                                    BinaryOperator::Mul => a * b,
+                                    BinaryOperator::Div => a / b,
+                                    BinaryOperator::Mod => a % b,
+                                    _ => a,
+                                };
+                                Ok(Value::Float64(out))
+                            } else {
+                                Ok(Value::Null)
+                            }
+                        }
+                        _ => Ok(Value::Null),
+                    },
+                    _ => Ok(Value::Null),
+                }
+            }
+
+            match expr {
+                SqlExpr::Paren(inner) => eval_predicate(inner, left_table, right_table, left_alias, right_alias, jr),
+                SqlExpr::Literal(v) => Ok(v.as_bool().unwrap_or(false)),
+                SqlExpr::UnaryOp { op: UnaryOperator::Not, expr } => {
+                    Ok(!eval_predicate(expr, left_table, right_table, left_alias, right_alias, jr)?)
+                }
+                SqlExpr::BinaryOp { left, op, right } => match op {
+                    BinaryOperator::And => Ok(
+                        eval_predicate(left, left_table, right_table, left_alias, right_alias, jr)?
+                            && eval_predicate(right, left_table, right_table, left_alias, right_alias, jr)?,
+                    ),
+                    BinaryOperator::Or => Ok(
+                        eval_predicate(left, left_table, right_table, left_alias, right_alias, jr)?
+                            || eval_predicate(right, left_table, right_table, left_alias, right_alias, jr)?,
+                    ),
+                    BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::Le
+                    | BinaryOperator::Gt
+                    | BinaryOperator::Ge => {
+                        let lv = eval_scalar(left, left_table, right_table, left_alias, right_alias, jr)?;
+                        let rv = eval_scalar(right, left_table, right_table, left_alias, right_alias, jr)?;
+
+                        if lv.is_null() || rv.is_null() {
+                            return Ok(false);
+                        }
+
+                        let ord = lv.partial_cmp(&rv).unwrap_or(Ordering::Equal);
+                        Ok(match op {
+                            BinaryOperator::Eq => ord == Ordering::Equal,
+                            BinaryOperator::NotEq => ord != Ordering::Equal,
+                            BinaryOperator::Lt => ord == Ordering::Less,
+                            BinaryOperator::Le => ord != Ordering::Greater,
+                            BinaryOperator::Gt => ord == Ordering::Greater,
+                            BinaryOperator::Ge => ord != Ordering::Less,
+                            _ => false,
+                        })
+                    }
+                    _ => Err(ApexError::QueryParseError(
+                        "Unsupported operator in JOIN predicate".to_string(),
+                    )),
+                },
+                _ => Err(ApexError::QueryParseError(
+                    "Unsupported expression in JOIN predicate".to_string(),
+                )),
+            }
+        }
+
+        let (left_key_ref, right_key_ref) = match &join.on {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                let l = match left.as_ref() {
+                    SqlExpr::Column(c) => c.clone(),
+                    _ => {
+                        return Err(ApexError::QueryParseError(
+                            "JOIN ON must be column = column".to_string(),
+                        ))
+                    }
+                };
+                let r = match right.as_ref() {
+                    SqlExpr::Column(c) => c.clone(),
+                    _ => {
+                        return Err(ApexError::QueryParseError(
+                            "JOIN ON must be column = column".to_string(),
+                        ))
+                    }
+                };
+                (l, r)
+            }
+            _ => {
+                return Err(ApexError::QueryParseError(
+                    "Only equi-join ON a=b is supported yet".to_string(),
+                ))
+            }
+        };
+
+        let (lk_alias0, lk_col) = split_qual(&left_key_ref);
+        let (rk_alias0, rk_col) = split_qual(&right_key_ref);
+
+        let lk_alias = if lk_alias0.is_empty() { left_alias.as_str() } else { lk_alias0 };
+        let rk_alias = if rk_alias0.is_empty() { right_alias.as_str() } else { rk_alias0 };
+
+        let left_matches = lk_alias == left_alias.as_str() || lk_alias == left_table_name.as_str();
+        let right_matches = rk_alias == right_alias.as_str() || rk_alias == right_table_name.as_str();
+        let left_swapped = lk_alias == right_alias.as_str() || lk_alias == right_table_name.as_str();
+        let right_swapped = rk_alias == left_alias.as_str() || rk_alias == left_table_name.as_str();
+
+        let (left_key_col, right_key_col) = if left_matches && right_matches {
+            (lk_col.to_string(), rk_col.to_string())
+        } else if left_swapped && right_swapped {
+            (rk_col.to_string(), lk_col.to_string())
+        } else {
+            return Err(ApexError::QueryParseError(
+                "JOIN ON must reference left and right table aliases".to_string(),
+            ));
+        };
+
+        let right_row_count = right_table.get_row_count();
+        let right_deleted = right_table.deleted_ref();
+
+        let mut right_allowed: Option<Vec<bool>> = None;
+        let mut where_pushed_down = false;
+        if let Some(ref where_expr) = stmt.where_clause {
+            if let Some(stripped) = strip_right_only_where(where_expr, &left_alias, &right_alias) {
+                let row_count = right_table.get_row_count();
+                let idxs = Self::evaluate_where(&stripped, right_table)?;
+                let mut allowed = vec![false; row_count];
+                for i in idxs {
+                    if i < allowed.len() {
+                        allowed[i] = true;
+                    }
+                }
+                right_allowed = Some(allowed);
+                where_pushed_down = true;
+            }
+        }
+        let mut hash: HashMap<String, Vec<usize>> = HashMap::new();
+        for ri in 0..right_row_count {
+            if right_deleted.get(ri) {
+                continue;
+            }
+            if let Some(ref allowed) = right_allowed {
+                if ri >= allowed.len() || !allowed[ri] {
+                    continue;
+                }
+            }
+            let v = get_col_value(right_table, &right_key_col, ri);
+            if v.is_null() {
+                continue;
+            }
+            hash.entry(v.to_string_value()).or_default().push(ri);
+        }
+
+        let left_row_count = left_table.get_row_count();
+        let left_deleted = left_table.deleted_ref();
+        let mut joined: Vec<JoinRow> = Vec::new();
+        for li in 0..left_row_count {
+            if left_deleted.get(li) {
+                continue;
+            }
+            let lv = get_col_value(left_table, &left_key_col, li);
+            let matches = if lv.is_null() {
+                None
+            } else {
+                hash.get(&lv.to_string_value()).cloned()
+            };
+
+            match join.join_type {
+                crate::query::JoinType::Inner => {
+                    if let Some(rs) = matches {
+                        for r in rs {
+                            joined.push(JoinRow { left: li, right: Some(r) });
+                        }
+                    }
+                }
+                crate::query::JoinType::Left => {
+                    if let Some(rs) = matches {
+                        for r in rs {
+                            joined.push(JoinRow { left: li, right: Some(r) });
+                        }
+                    } else {
+                        joined.push(JoinRow { left: li, right: None });
+                    }
+                }
+            }
+        }
+
+        if !where_pushed_down {
+            if let Some(ref where_expr) = stmt.where_clause {
+                let mut filtered: Vec<JoinRow> = Vec::with_capacity(joined.len());
+                for jr in joined {
+                    if eval_predicate(where_expr, left_table, right_table, &left_alias, &right_alias, jr)? {
+                        filtered.push(jr);
+                    }
+                }
+                joined = filtered;
+            }
+        }
+
+        let has_aggs = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Aggregate { .. }));
+        if !stmt.group_by.is_empty() || has_aggs {
+            use std::collections::HashSet;
+
+            struct JoinAgg {
+                func: AggregateFunc,
+                distinct: bool,
+                seen: Option<HashSet<Vec<u8>>>,
+                count: i64,
+                sum: f64,
+            }
+
+            impl JoinAgg {
+                fn new(func: AggregateFunc, distinct: bool) -> Self {
+                    let seen = if matches!(func, AggregateFunc::Count) && distinct {
+                        Some(HashSet::new())
+                    } else {
+                        None
+                    };
+                    Self { func, distinct, seen, count: 0, sum: 0.0 }
+                }
+            }
+
+            #[derive(Default)]
+            struct GroupState {
+                first: Option<JoinRow>,
+                aggs: Vec<JoinAgg>,
+            }
+
+            // Build aggregate spec list in SELECT order
+            let mut agg_specs: Vec<(AggregateFunc, Option<String>, bool, Option<String>)> = Vec::new();
+            for c in &stmt.columns {
+                if let SelectColumn::Aggregate { func, column, distinct, alias } = c {
+                    agg_specs.push((func.clone(), column.clone(), *distinct, alias.clone()));
+                }
+            }
+
+            // Group by key is serialized bytes of each key part.
+            let mut groups: HashMap<String, GroupState> = HashMap::new();
+            for jr in &joined {
+                let mut key_parts: Vec<String> = Vec::with_capacity(stmt.group_by.len());
+                for gb in &stmt.group_by {
+                    let v = value_for_ref(gb, left_table, right_table, &left_alias, &right_alias, *jr);
+                    key_parts.push(v.to_string_value());
+                }
+                let gk = key_parts.join("\u{1f}");
+                let entry = groups.entry(gk).or_insert_with(|| {
+                    let mut gs = GroupState::default();
+                    gs.first = Some(*jr);
+                    gs.aggs = agg_specs.iter().map(|(f, _, d, _)| JoinAgg::new(f.clone(), *d)).collect();
+                    gs
+                });
+
+                for (i, (func, col, distinct, _)) in agg_specs.iter().enumerate() {
+                    let agg = &mut entry.aggs[i];
+                    match func {
+                        AggregateFunc::Count => {
+                            if *distinct {
+                                if let Some(cn) = col.as_ref() {
+                                    let v = value_for_ref(cn, left_table, right_table, &left_alias, &right_alias, *jr);
+                                    if !v.is_null() {
+                                        if let Some(set) = agg.seen.as_mut() {
+                                            set.insert(v.to_bytes());
+                                        }
+                                    }
+                                }
+                            } else if col.is_none() {
+                                agg.count += 1;
+                            } else if let Some(cn) = col.as_ref() {
+                                let v = value_for_ref(cn, left_table, right_table, &left_alias, &right_alias, *jr);
+                                if !v.is_null() {
+                                    agg.count += 1;
+                                }
+                            }
+                        }
+                        AggregateFunc::Sum | AggregateFunc::Avg => {
+                            if let Some(cn) = col.as_ref() {
+                                let v = value_for_ref(cn, left_table, right_table, &left_alias, &right_alias, *jr);
+                                if let Some(n) = v.as_f64() {
+                                    agg.sum += n;
+                                    agg.count += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // HAVING evaluation on group state
+            fn eval_having_scalar_join(
+                expr: &SqlExpr,
+                gs: &GroupState,
+                agg_specs: &[(AggregateFunc, Option<String>, bool, Option<String>)],
+                left_table: &ColumnTable,
+                right_table: &ColumnTable,
+                left_alias: &str,
+                right_alias: &str,
+            ) -> Result<Value, ApexError> {
+                match expr {
+                    SqlExpr::Paren(inner) => eval_having_scalar_join(inner, gs, agg_specs, left_table, right_table, left_alias, right_alias),
+                    SqlExpr::Literal(v) => Ok(v.clone()),
+                    SqlExpr::Column(c) => {
+                        if let Some(jr) = gs.first {
+                            Ok(value_for_ref(c, left_table, right_table, left_alias, right_alias, jr))
+                        } else {
+                            Ok(Value::Null)
+                        }
+                    }
+                    SqlExpr::Function { name, args } => {
+                        let func = match name.to_uppercase().as_str() {
+                            "COUNT" => AggregateFunc::Count,
+                            "SUM" => AggregateFunc::Sum,
+                            "AVG" => AggregateFunc::Avg,
+                            _ => {
+                                return Err(ApexError::QueryParseError(
+                                    format!("Unsupported function in HAVING: {}", name),
+                                ))
+                            }
+                        };
+
+                        let col = if args.is_empty() {
+                            None
+                        } else {
+                            match &args[0] {
+                                SqlExpr::Column(c) => Some(c.clone()),
+                                _ => None,
+                            }
+                        };
+
+                        let col_d = col.as_deref();
+                        let col_base = col_d.map(|s| split_qual(s).1);
+                        for (i, (sf, sc, sd, _)) in agg_specs.iter().enumerate() {
+                            let sc_d = sc.as_deref();
+                            let sc_base = sc_d.map(|s| split_qual(s).1);
+                            let col_match = sc_d == col_d || (sc_base.is_some() && col_base.is_some() && sc_base == col_base);
+
+                            if *sf == func && col_match && *sd == false {
+                                // Non-distinct aggregate match
+                                let a = &gs.aggs[i];
+                                return Ok(match sf {
+                                    AggregateFunc::Count => Value::Int64(a.count),
+                                    AggregateFunc::Sum => Value::Float64(a.sum),
+                                    AggregateFunc::Avg => {
+                                        if a.count > 0 {
+                                            Value::Float64(a.sum / a.count as f64)
+                                        } else {
+                                            Value::Null
+                                        }
+                                    }
+                                    _ => Value::Null,
+                                });
+                            }
+                            if *sf == func && col_match && *sd {
+                                // Distinct COUNT match
+                                let a = &gs.aggs[i];
+                                return Ok(Value::Int64(a.seen.as_ref().map(|s| s.len()).unwrap_or(0) as i64));
+                            }
+                        }
+                        Ok(Value::Null)
+                    }
+                    SqlExpr::UnaryOp { op, expr } => {
+                        match op {
+                            UnaryOperator::Not => {
+                                let v = eval_having_scalar_join(expr, gs, agg_specs, left_table, right_table, left_alias, right_alias)?;
+                                Ok(Value::Bool(!v.as_bool().unwrap_or(false)))
+                            }
+                            UnaryOperator::Minus => {
+                                let v = eval_having_scalar_join(expr, gs, agg_specs, left_table, right_table, left_alias, right_alias)?;
+                                if let Some(i) = v.as_i64() {
+                                    Ok(Value::Int64(-i))
+                                } else if let Some(f) = v.as_f64() {
+                                    Ok(Value::Float64(-f))
+                                } else {
+                                    Ok(Value::Null)
+                                }
+                            }
+                        }
+                    }
+                    SqlExpr::BinaryOp { left, op, right } => {
+                        let lv = eval_having_scalar_join(left, gs, agg_specs, left_table, right_table, left_alias, right_alias)?;
+                        let rv = eval_having_scalar_join(right, gs, agg_specs, left_table, right_table, left_alias, right_alias)?;
+                        match op {
+                            BinaryOperator::And => Ok(Value::Bool(lv.as_bool().unwrap_or(false) && rv.as_bool().unwrap_or(false))),
+                            BinaryOperator::Or => Ok(Value::Bool(lv.as_bool().unwrap_or(false) || rv.as_bool().unwrap_or(false))),
+                            BinaryOperator::Eq => Ok(Value::Bool(lv == rv)),
+                            BinaryOperator::NotEq => Ok(Value::Bool(lv != rv)),
+                            BinaryOperator::Lt | BinaryOperator::Le | BinaryOperator::Gt | BinaryOperator::Ge => {
+                                if lv.is_null() || rv.is_null() {
+                                    return Ok(Value::Bool(false));
+                                }
+                                let ord = lv.partial_cmp(&rv).unwrap_or(Ordering::Equal);
+                                let b = match op {
+                                    BinaryOperator::Lt => ord == Ordering::Less,
+                                    BinaryOperator::Le => ord != Ordering::Greater,
+                                    BinaryOperator::Gt => ord == Ordering::Greater,
+                                    BinaryOperator::Ge => ord != Ordering::Less,
+                                    _ => false,
+                                };
+                                Ok(Value::Bool(b))
+                            }
+                            _ => Ok(Value::Null),
+                        }
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
+
+            fn eval_having_predicate_join(
+                expr: &SqlExpr,
+                gs: &GroupState,
+                agg_specs: &[(AggregateFunc, Option<String>, bool, Option<String>)],
+                left_table: &ColumnTable,
+                right_table: &ColumnTable,
+                left_alias: &str,
+                right_alias: &str,
+            ) -> Result<bool, ApexError> {
+                match expr {
+                    SqlExpr::Paren(inner) => eval_having_predicate_join(inner, gs, agg_specs, left_table, right_table, left_alias, right_alias),
+                    SqlExpr::Literal(v) => Ok(v.as_bool().unwrap_or(false)),
+                    SqlExpr::UnaryOp { op: UnaryOperator::Not, expr } => Ok(!eval_having_predicate_join(expr, gs, agg_specs, left_table, right_table, left_alias, right_alias)?),
+                    SqlExpr::BinaryOp { left, op, right } => match op {
+                        BinaryOperator::And => Ok(
+                            eval_having_predicate_join(left, gs, agg_specs, left_table, right_table, left_alias, right_alias)?
+                                && eval_having_predicate_join(right, gs, agg_specs, left_table, right_table, left_alias, right_alias)?,
+                        ),
+                        BinaryOperator::Or => Ok(
+                            eval_having_predicate_join(left, gs, agg_specs, left_table, right_table, left_alias, right_alias)?
+                                || eval_having_predicate_join(right, gs, agg_specs, left_table, right_table, left_alias, right_alias)?,
+                        ),
+                        BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Lt
+                        | BinaryOperator::Le
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Ge => {
+                            let lv = eval_having_scalar_join(left, gs, agg_specs, left_table, right_table, left_alias, right_alias)?;
+                            let rv = eval_having_scalar_join(right, gs, agg_specs, left_table, right_table, left_alias, right_alias)?;
+                            if lv.is_null() || rv.is_null() {
+                                return Ok(false);
+                            }
+                            let ord = lv.partial_cmp(&rv).unwrap_or(Ordering::Equal);
+                            Ok(match op {
+                                BinaryOperator::Eq => ord == Ordering::Equal,
+                                BinaryOperator::NotEq => ord != Ordering::Equal,
+                                BinaryOperator::Lt => ord == Ordering::Less,
+                                BinaryOperator::Le => ord != Ordering::Greater,
+                                BinaryOperator::Gt => ord == Ordering::Greater,
+                                BinaryOperator::Ge => ord != Ordering::Less,
+                                _ => false,
+                            })
+                        }
+                        _ => {
+                            let v = eval_having_scalar_join(expr, gs, agg_specs, left_table, right_table, left_alias, right_alias)?;
+                            Ok(v.as_bool().unwrap_or(false))
+                        }
+                    },
+                    _ => {
+                        let v = eval_having_scalar_join(expr, gs, agg_specs, left_table, right_table, left_alias, right_alias)?;
+                        Ok(v.as_bool().unwrap_or(false))
+                    }
+                }
+            }
+
+            let mut out_rows: Vec<Vec<Value>> = Vec::new();
+            for (_k, gs) in groups {
+                if let Some(ref having_expr) = stmt.having {
+                    if !eval_having_predicate_join(having_expr, &gs, &agg_specs, left_table, right_table, &left_alias, &right_alias)? {
+                        continue;
+                    }
+                }
+
+                let mut row: Vec<Value> = Vec::with_capacity(stmt.columns.len());
+                for c in &stmt.columns {
+                    match c {
+                        SelectColumn::Column(name) => {
+                            if let Some(jr) = gs.first {
+                                row.push(value_for_ref(name, left_table, right_table, &left_alias, &right_alias, jr));
+                            } else {
+                                row.push(Value::Null);
+                            }
+                        }
+                        SelectColumn::ColumnAlias { column, .. } => {
+                            if let Some(jr) = gs.first {
+                                row.push(value_for_ref(column, left_table, right_table, &left_alias, &right_alias, jr));
+                            } else {
+                                row.push(Value::Null);
+                            }
+                        }
+                        SelectColumn::Aggregate { func, column, distinct, .. } => {
+                            let idx = agg_specs.iter().position(|(f, c, d, _)| f == func && c == column && d == distinct);
+                            if let Some(i) = idx {
+                                let a = &gs.aggs[i];
+                                match func {
+                                    AggregateFunc::Count => {
+                                        if *distinct {
+                                            row.push(Value::Int64(a.seen.as_ref().map(|s| s.len()).unwrap_or(0) as i64));
+                                        } else {
+                                            row.push(Value::Int64(a.count));
+                                        }
+                                    }
+                                    AggregateFunc::Sum => row.push(Value::Float64(a.sum)),
+                                    AggregateFunc::Avg => {
+                                        if a.count > 0 {
+                                            row.push(Value::Float64(a.sum / a.count as f64));
+                                        } else {
+                                            row.push(Value::Null);
+                                        }
+                                    }
+                                    _ => row.push(Value::Null),
+                                }
+                            } else {
+                                row.push(Value::Null);
+                            }
+                        }
+                        _ => {
+                            return Err(ApexError::QueryParseError(
+                                "Unsupported SELECT item in JOIN GROUP BY".to_string(),
+                            ))
+                        }
+                    }
+                }
+                out_rows.push(row);
+            }
+
+            let mut out_columns: Vec<String> = Vec::new();
+            for c in &stmt.columns {
+                match c {
+                    SelectColumn::Column(name) => out_columns.push(split_qual(name).1.to_string()),
+                    SelectColumn::ColumnAlias { alias, .. } => out_columns.push(alias.clone()),
+                    SelectColumn::Aggregate { func, column, distinct, alias } => {
+                        let nm = alias.clone().unwrap_or_else(|| {
+                            let func_name = match func {
+                                AggregateFunc::Count => "COUNT",
+                                AggregateFunc::Sum => "SUM",
+                                AggregateFunc::Avg => "AVG",
+                                AggregateFunc::Min => "MIN",
+                                AggregateFunc::Max => "MAX",
+                            };
+                            if let Some(cn) = column {
+                                if *distinct {
+                                    format!("{}(DISTINCT {})", func_name, cn)
+                                } else {
+                                    format!("{}({})", func_name, cn)
+                                }
+                            } else {
+                                format!("{}(*)", func_name)
+                            }
+                        });
+                        out_columns.push(nm);
+                    }
+                    _ => out_columns.push("expr".to_string()),
+                }
+            }
+
+            if !stmt.order_by.is_empty() {
+                out_rows.sort_by(|a, b| {
+                    for ob in &stmt.order_by {
+                        let idx = out_columns.iter().position(|c| c == &ob.column).unwrap_or(0);
+                        let av = a.get(idx);
+                        let bv = b.get(idx);
+                        let cmp = SqlExecutor::compare_values(av, bv, ob.nulls_first);
+                        let cmp = if ob.descending { cmp.reverse() } else { cmp };
+                        if cmp != Ordering::Equal {
+                            return cmp;
+                        }
+                    }
+                    Ordering::Equal
+                });
+            }
+
+            let offset = stmt.offset.unwrap_or(0);
+            let limit = stmt.limit.unwrap_or(usize::MAX);
+            let out_rows = out_rows.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+
+            return Ok(SqlResult::new(out_columns, out_rows));
+        }
+
+        if !stmt.order_by.is_empty() {
+            joined.sort_by(|a, b| {
+                for ob in &stmt.order_by {
+                    let col_ref = &ob.column;
+                    let av = value_for_ref(col_ref, left_table, right_table, &left_alias, &right_alias, *a);
+                    let bv = value_for_ref(col_ref, left_table, right_table, &left_alias, &right_alias, *b);
+                    let cmp = SqlExecutor::compare_values(Some(&av), Some(&bv), ob.nulls_first);
+                    let cmp = if ob.descending { cmp.reverse() } else { cmp };
+                    if cmp != Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                Ordering::Equal
+            });
+        }
+
+        let offset = stmt.offset.unwrap_or(0);
+        let limit = stmt.limit.unwrap_or(usize::MAX);
+        let joined = joined.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+
+        let mut out_columns: Vec<String> = Vec::new();
+        for c in &stmt.columns {
+            match c {
+                SelectColumn::Column(name) => {
+                    out_columns.push(split_qual(name).1.to_string());
+                }
+                SelectColumn::ColumnAlias { alias, .. } => out_columns.push(alias.clone()),
+                _ => {
+                    return Err(ApexError::QueryParseError(
+                        "Only plain column projection is supported for JOIN yet".to_string(),
+                    ))
+                }
+            }
+        }
+
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(joined.len());
+        for jr in joined {
+            let mut row: Vec<Value> = Vec::with_capacity(stmt.columns.len());
+            for c in &stmt.columns {
+                match c {
+                    SelectColumn::Column(name) => {
+                        row.push(value_for_ref(name, left_table, right_table, &left_alias, &right_alias, jr));
+                    }
+                    SelectColumn::ColumnAlias { column, .. } => {
+                        row.push(value_for_ref(column, left_table, right_table, &left_alias, &right_alias, jr));
+                    }
+                    _ => {}
+                }
+            }
+            rows.push(row);
+        }
+
+        if stmt.distinct {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            rows.retain(|r| {
+                let k = r.iter().map(|v| v.to_string_value()).collect::<Vec<_>>().join("\u{1f}");
+                seen.insert(k)
+            });
+        }
+
+        Ok(SqlResult::new(out_columns, rows))
     }
     
     /// Execute SELECT statement - ULTRA-OPTIMIZED
     fn execute_select(stmt: SelectStatement, table: &mut ColumnTable) -> Result<SqlResult, ApexError> {
+        if !stmt.joins.is_empty() {
+            return Err(ApexError::QueryParseError(
+                "JOIN requires multi-table execution".to_string(),
+            ));
+        }
         // Table name validation is handled at the binding layer
         // which can access all tables and route to the correct one
         
@@ -155,6 +2856,18 @@ impl SqlExecutor {
         let no_group_by = stmt.group_by.is_empty();
         let has_limit = stmt.limit.is_some();
         let no_order = stmt.order_by.is_empty();
+
+        // ============ UNIFIED SIMPLE PIPELINE (GUARDED) ============
+        // Only handle a very small subset here to avoid regressions.
+        if !has_aggregates
+            && !has_window
+            && no_group_by
+            && stmt.having.is_none()
+            && simple_pipeline::is_eligible(&stmt)
+        {
+            // Pipeline expects an immutable table reference (no mutation)
+            return simple_pipeline::execute(&stmt, table);
+        }
         
         // ============ FAST PATHS (NO INDEX COLLECTION) ============
         
@@ -201,11 +2914,23 @@ impl SqlExecutor {
         
         // FAST PATH: Simple COUNT(*) with WHERE - count directly without collecting indices
         if has_aggregates && no_group_by && stmt.columns.len() == 1 {
-            if let SelectColumn::Aggregate { func: AggregateFunc::Count, column: None, alias } = &stmt.columns[0] {
-                if let Some(ref where_expr) = stmt.where_clause {
-                    let count = Self::count_matching_rows(where_expr, table)?;
-                    let col_name = alias.clone().unwrap_or_else(|| "COUNT(*)".to_string());
-                    return Ok(SqlResult::new(vec![col_name], vec![vec![Value::Int64(count as i64)]]));
+            if let SelectColumn::Aggregate { func: AggregateFunc::Count, column, distinct, alias } = &stmt.columns[0] {
+                if *distinct {
+                    // COUNT(DISTINCT ...) requires value materialization
+                    // (handled by generic aggregate path below)
+                } else {
+                if Self::is_count_star_like(column) {
+                    if let Some(ref where_expr) = stmt.where_clause {
+                        let count = Self::count_matching_rows(where_expr, table)?;
+                        let col_name = alias.clone().unwrap_or_else(|| {
+                            column
+                                .as_ref()
+                                .map(|c| format!("COUNT({})", c))
+                                .unwrap_or_else(|| "COUNT(*)".to_string())
+                        });
+                        return Ok(SqlResult::new(vec![col_name], vec![vec![Value::Int64(count as i64)]]));
+                    }
+                }
                 }
             }
         }
@@ -262,6 +2987,44 @@ impl SqlExecutor {
                 .map(|f| f.name().clone())
                 .collect();
             return Ok(SqlResult::with_arrow_batch(columns, batch));
+        }
+
+        // FAST PATH: For SELECT *, _id (or SELECT _id, *) with large results, build Arrow batch
+        // and then reorder columns to match the user-specified projection order.
+        let is_select_star_plus_id = stmt.columns.len() == 2
+            && stmt.columns.iter().any(|c| matches!(c, SelectColumn::All))
+            && stmt.columns.iter().any(|c| matches!(c, SelectColumn::Column(name) if name == "_id"));
+        if is_select_star_plus_id && !stmt.distinct && stmt.order_by.is_empty()
+            && stmt.limit.is_none() && matching_indices.len() > 10_000 {
+            use arrow::datatypes::Schema;
+            use std::collections::HashMap;
+            use std::sync::Arc;
+
+            let batch = table.build_record_batch_from_indices(&matching_indices)
+                .map_err(|e| ApexError::SerializationError(e.to_string()))?;
+
+            let schema_ref = batch.schema();
+            let mut by_name: HashMap<String, (arrow::datatypes::Field, arrow::array::ArrayRef)> = HashMap::new();
+            for (i, field) in schema_ref.fields().iter().enumerate() {
+                by_name.insert(field.name().clone(), (field.as_ref().clone(), batch.column(i).clone()));
+            }
+
+            let mut fields = Vec::with_capacity(result_columns.len());
+            let mut arrays = Vec::with_capacity(result_columns.len());
+            for name in &result_columns {
+                let (field, array) = by_name
+                    .get(name)
+                    .ok_or_else(|| ApexError::QueryParseError(format!("Column '{}' not found in batch", name)))?
+                    .clone();
+                fields.push(field);
+                arrays.push(array);
+            }
+
+            let schema = Arc::new(Schema::new(fields));
+            let reordered = arrow::record_batch::RecordBatch::try_new(schema, arrays)
+                .map_err(|e| ApexError::SerializationError(e.to_string()))?;
+
+            return Ok(SqlResult::with_arrow_batch(result_columns, reordered));
         }
         
         // OPTIMIZATION: For DISTINCT + LIMIT without ORDER BY, we can stop early
@@ -548,7 +3311,7 @@ impl SqlExecutor {
                         }
                     }
                 }
-                SelectColumn::Aggregate { func, column, alias } => {
+                SelectColumn::Aggregate { func, column, distinct, alias } => {
                     let name = alias.clone().unwrap_or_else(|| {
                         let func_name = match func {
                             AggregateFunc::Count => "COUNT",
@@ -558,7 +3321,11 @@ impl SqlExecutor {
                             AggregateFunc::Max => "MAX",
                         };
                         if let Some(col) = column {
-                            format!("{}({})", func_name, col)
+                            if *distinct {
+                                format!("{}(DISTINCT {})", func_name, col)
+                            } else {
+                                format!("{}({})", func_name, col)
+                            }
                         } else {
                             format!("{}(*)", func_name)
                         }
@@ -982,15 +3749,66 @@ impl SqlExecutor {
     
     /// O(1) COUNT(*) without WHERE clause
     fn try_fast_count_star(stmt: &SelectStatement, table: &ColumnTable) -> Option<SqlResult> {
-        // Check if this is a simple COUNT(*) query
+        // Check if this is a simple COUNT(*) / COUNT(constant) query
         if stmt.columns.len() == 1 {
-            if let SelectColumn::Aggregate { func: AggregateFunc::Count, column: None, alias } = &stmt.columns[0] {
-                let col_name = alias.clone().unwrap_or_else(|| "COUNT(*)".to_string());
-                let count = table.row_count() as i64;
-                return Some(SqlResult::new(vec![col_name], vec![vec![Value::Int64(count)]]));
+            if let SelectColumn::Aggregate { func: AggregateFunc::Count, column, distinct, alias } = &stmt.columns[0] {
+                if !*distinct && Self::is_count_star_like(column) {
+                    let col_name = alias.clone().unwrap_or_else(|| {
+                        column
+                            .as_ref()
+                            .map(|c| format!("COUNT({})", c))
+                            .unwrap_or_else(|| "COUNT(*)".to_string())
+                    });
+                    let count = table.row_count() as i64;
+                    return Some(SqlResult::new(vec![col_name], vec![vec![Value::Int64(count)]]));
+                }
             }
         }
         None
+    }
+
+    #[inline]
+    fn is_count_star_like(column: &Option<String>) -> bool {
+        match column {
+            None => true,
+            Some(c) => Self::is_count_constant_arg(c),
+        }
+    }
+
+    #[inline]
+    fn is_count_constant_arg(arg: &str) -> bool {
+        // Parser stores COUNT(constant) as textual representation (e.g. "1", "3.14", "'x'", "true").
+        let s = arg.trim();
+        if s.is_empty() {
+            return false;
+        }
+
+        let sl = s.to_ascii_lowercase();
+        if sl == "true" || sl == "false" || sl == "null" {
+            return true;
+        }
+        if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
+            return true;
+        }
+
+        // Numeric literal (int/float). Be permissive: accept leading +/- and a single dot.
+        let mut saw_digit = false;
+        let mut saw_dot = false;
+        for (i, ch) in s.chars().enumerate() {
+            if (ch == '+' || ch == '-') && i == 0 {
+                continue;
+            }
+            if ch.is_ascii_digit() {
+                saw_digit = true;
+                continue;
+            }
+            if ch == '.' && !saw_dot {
+                saw_dot = true;
+                continue;
+            }
+            return false;
+        }
+        saw_digit
     }
     
     /// Direct aggregate computation without index collection - ultra-fast for full table scans
@@ -1001,9 +3819,9 @@ impl SqlExecutor {
         let row_count = table.get_row_count();
         
         // Collect aggregate specs
-        let mut agg_specs: Vec<(AggregateFunc, Option<String>, String)> = Vec::new();
+        let mut agg_specs: Vec<(AggregateFunc, Option<String>, bool, String)> = Vec::new();
         for col in &stmt.columns {
-            if let SelectColumn::Aggregate { func, column, alias } = col {
+            if let SelectColumn::Aggregate { func, column, distinct, alias } = col {
                 let col_name = alias.clone().unwrap_or_else(|| {
                     let func_name = match func {
                         AggregateFunc::Count => "COUNT",
@@ -1012,31 +3830,410 @@ impl SqlExecutor {
                         AggregateFunc::Min => "MIN",
                         AggregateFunc::Max => "MAX",
                     };
-                    if let Some(c) = column { format!("{}({})", func_name, c) }
-                    else { format!("{}(*)", func_name) }
+                    if let Some(c) = column {
+                        if *distinct {
+                            format!("{}(DISTINCT {})", func_name, c)
+                        } else {
+                            format!("{}({})", func_name, c)
+                        }
+                    } else {
+                        format!("{}(*)", func_name)
+                    }
                 });
-                agg_specs.push((func.clone(), column.clone(), col_name));
+                agg_specs.push((func.clone(), column.clone(), *distinct, col_name));
+            }
+        }
+
+        // Fast path: mixed aggregates on internal _id plus COUNT(*)/COUNT(constant)
+        // Example: SELECT MIN(_id), MAX(_id), COUNT(1) FROM t
+        if agg_specs.iter().all(|(_, _, d, _)| !*d) {
+            if Self::agg_specs_id_and_count_star_like_only(&agg_specs.iter().map(|(f,c,_,n)| (f.clone(), c.clone(), n.clone())).collect::<Vec<_>>()) {
+                return Self::compute_aggregates_id_mixed_direct(&agg_specs.iter().map(|(f,c,_,n)| (f.clone(), c.clone(), n.clone())).collect::<Vec<_>>(), deleted, row_count);
             }
         }
         
         // Check if all aggregates use same numeric column
         let same_column: Option<&str> = {
-            let cols: Vec<_> = agg_specs.iter().filter_map(|(_, c, _)| c.as_deref()).collect();
+            let cols: Vec<_> = agg_specs.iter().filter_map(|(_, c, d, _)| if *d { None } else { c.as_deref() }).collect();
             if cols.is_empty() || cols.windows(2).all(|w| w[0] == w[1]) { cols.first().copied() }
             else { None }
         };
+
+        // Ultra-fast path: aggregates on internal _id (row index)
+        if let Some("_id") = same_column {
+            return Self::compute_aggregates_id_direct(
+                &agg_specs
+                    .iter()
+                    .map(|(f, c, _, n)| (f.clone(), c.clone(), n.clone()))
+                    .collect::<Vec<_>>(),
+                deleted,
+                row_count,
+            );
+        }
         
         // Ultra-fast path: direct Int64 column scan
         if let Some(col_name) = same_column {
             if let Some(col_idx) = schema.get_index(col_name) {
                 if let crate::table::column_table::TypedColumn::Int64 { data, nulls } = &columns[col_idx] {
-                    return Self::compute_aggregates_int64_direct(&agg_specs, data, nulls, deleted, row_count);
+                    return Self::compute_aggregates_int64_direct(
+                        &agg_specs
+                            .iter()
+                            .map(|(f, c, _, n)| (f.clone(), c.clone(), n.clone()))
+                            .collect::<Vec<_>>(),
+                        data,
+                        nulls,
+                        deleted,
+                        row_count,
+                    );
                 }
             }
         }
         
         // Fast path: direct scan without index collection
-        Self::compute_aggregates_direct(&agg_specs, schema, columns, deleted, row_count)
+        // Generic direct path (supports COUNT(DISTINCT))
+        Self::compute_aggregates_direct_with_distinct(&agg_specs, schema, columns, deleted, row_count)
+    }
+
+    fn compute_aggregates_direct_with_distinct(
+        agg_specs: &[(AggregateFunc, Option<String>, bool, String)],
+        schema: &crate::table::column_table::ColumnSchema,
+        columns: &[crate::table::column_table::TypedColumn],
+        deleted: &crate::table::column_table::BitVec,
+        row_count: usize,
+    ) -> Result<SqlResult, ApexError> {
+        use std::collections::HashSet;
+
+        let mut result_columns = Vec::with_capacity(agg_specs.len());
+        let mut result_values = Vec::with_capacity(agg_specs.len());
+
+        // Pre-resolve column indices
+        let col_indices: Vec<Option<usize>> = agg_specs
+            .iter()
+            .map(|(_, c, _, _)| c.as_ref().and_then(|cc| schema.get_index(cc)))
+            .collect();
+
+        // For COUNT(DISTINCT), prepare sets
+        let mut distinct_sets: Vec<Option<HashSet<Vec<u8>>>> = agg_specs
+            .iter()
+            .map(|(f, _, d, _)| {
+                if matches!(f, AggregateFunc::Count) && *d {
+                    Some(HashSet::new())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Accumulators for non-distinct aggregates
+        let mut count_star: Vec<i64> = vec![0; agg_specs.len()];
+        let mut count_col: Vec<i64> = vec![0; agg_specs.len()];
+        let mut sum: Vec<f64> = vec![0.0; agg_specs.len()];
+        let mut sum_count: Vec<i64> = vec![0; agg_specs.len()];
+        let mut minv: Vec<Option<Value>> = vec![None; agg_specs.len()];
+        let mut maxv: Vec<Option<Value>> = vec![None; agg_specs.len()];
+
+        for row_idx in 0..row_count {
+            if deleted.get(row_idx) {
+                continue;
+            }
+            for (i, (func, _, distinct, _)) in agg_specs.iter().enumerate() {
+                let ci = col_indices[i];
+                match func {
+                    AggregateFunc::Count => {
+                        if *distinct {
+                            if let Some(col_idx) = ci {
+                                if let Some(v) = columns[col_idx].get(row_idx) {
+                                    if !v.is_null() {
+                                        if let Some(set) = distinct_sets[i].as_mut() {
+                                            set.insert(v.to_bytes());
+                                        }
+                                    }
+                                }
+                            }
+                        } else if ci.is_none() {
+                            count_star[i] += 1;
+                        } else if let Some(col_idx) = ci {
+                            if let Some(v) = columns[col_idx].get(row_idx) {
+                                if !v.is_null() {
+                                    count_col[i] += 1;
+                                }
+                            }
+                        }
+                    }
+                    AggregateFunc::Sum | AggregateFunc::Avg => {
+                        if *distinct {
+                            // Not supported by parser
+                        } else if let Some(col_idx) = ci {
+                            if let Some(v) = columns[col_idx].get(row_idx) {
+                                if let Some(n) = v.as_f64() {
+                                    sum[i] += n;
+                                    sum_count[i] += 1;
+                                }
+                            }
+                        }
+                    }
+                    AggregateFunc::Min => {
+                        if *distinct {
+                            // Not supported by parser
+                        } else if let Some(col_idx) = ci {
+                            if let Some(v) = columns[col_idx].get(row_idx) {
+                                if v.is_null() {
+                                    continue;
+                                }
+                                let cur = minv[i].take();
+                                minv[i] = Some(match cur {
+                                    None => v,
+                                    Some(cv) => {
+                                        if SqlExecutor::compare_non_null(&cv, &v) == Ordering::Greater {
+                                            v
+                                        } else {
+                                            cv
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    AggregateFunc::Max => {
+                        if *distinct {
+                            // Not supported by parser
+                        } else if let Some(col_idx) = ci {
+                            if let Some(v) = columns[col_idx].get(row_idx) {
+                                if v.is_null() {
+                                    continue;
+                                }
+                                let cur = maxv[i].take();
+                                maxv[i] = Some(match cur {
+                                    None => v,
+                                    Some(cv) => {
+                                        if SqlExecutor::compare_non_null(&cv, &v) == Ordering::Less {
+                                            v
+                                        } else {
+                                            cv
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (i, (func, _, distinct, name)) in agg_specs.iter().enumerate() {
+            result_columns.push(name.clone());
+            let v = match func {
+                AggregateFunc::Count => {
+                    if *distinct {
+                        let n = distinct_sets[i].as_ref().map(|s| s.len()).unwrap_or(0);
+                        Value::Int64(n as i64)
+                    } else if col_indices[i].is_none() {
+                        Value::Int64(count_star[i])
+                    } else {
+                        Value::Int64(count_col[i])
+                    }
+                }
+                AggregateFunc::Sum => Value::Float64(sum[i]),
+                AggregateFunc::Avg => {
+                    if sum_count[i] > 0 {
+                        Value::Float64(sum[i] / sum_count[i] as f64)
+                    } else {
+                        Value::Null
+                    }
+                }
+                AggregateFunc::Min => minv[i].clone().unwrap_or(Value::Null),
+                AggregateFunc::Max => maxv[i].clone().unwrap_or(Value::Null),
+            };
+            result_values.push(v);
+        }
+
+        Ok(SqlResult::new(result_columns, vec![result_values]))
+    }
+
+    /// Ultra-fast aggregates for internal _id without index collection.
+    /// Treats _id as the row index (Int64), skipping deleted rows.
+    fn compute_aggregates_id_direct(
+        agg_specs: &[(AggregateFunc, Option<String>, String)],
+        deleted: &crate::table::column_table::BitVec,
+        row_count: usize,
+    ) -> Result<SqlResult, ApexError> {
+        let no_deletes = deleted.all_false();
+
+        // O(1) when there are no deleted rows
+        let (count_star, sum, min_val, max_val) = if no_deletes {
+            if row_count == 0 {
+                (0i64, 0i64, i64::MAX, i64::MIN)
+            } else {
+                let n = row_count as i64;
+                let minv = 0i64;
+                let maxv = n - 1;
+                let sumv = (n - 1) * n / 2;
+                (n, sumv, minv, maxv)
+            }
+        } else {
+            let mut count_star = 0i64;
+            let mut sum = 0i64;
+            let mut min_val = i64::MAX;
+            let mut max_val = i64::MIN;
+
+            for row_idx in 0..row_count {
+                if deleted.get(row_idx) {
+                    continue;
+                }
+                let v = row_idx as i64;
+                count_star += 1;
+                sum += v;
+                if v < min_val {
+                    min_val = v;
+                }
+                if v > max_val {
+                    max_val = v;
+                }
+            }
+            (count_star, sum, min_val, max_val)
+        };
+
+        let mut result_columns = Vec::with_capacity(agg_specs.len());
+        let mut result_values = Vec::with_capacity(agg_specs.len());
+
+        for (func, column, name) in agg_specs {
+            result_columns.push(name.clone());
+            let value = match func {
+                AggregateFunc::Count => {
+                    if column.is_none() {
+                        Value::Int64(count_star)
+                    } else {
+                        // _id is never NULL for non-deleted rows
+                        Value::Int64(count_star)
+                    }
+                }
+                AggregateFunc::Sum => Value::Float64(sum as f64),
+                AggregateFunc::Avg => {
+                    if count_star > 0 {
+                        Value::Float64(sum as f64 / count_star as f64)
+                    } else {
+                        Value::Null
+                    }
+                }
+                AggregateFunc::Min => {
+                    if count_star > 0 {
+                        Value::Int64(min_val)
+                    } else {
+                        Value::Null
+                    }
+                }
+                AggregateFunc::Max => {
+                    if count_star > 0 {
+                        Value::Int64(max_val)
+                    } else {
+                        Value::Null
+                    }
+                }
+            };
+            result_values.push(value);
+        }
+
+        Ok(SqlResult::new(result_columns, vec![result_values]))
+    }
+
+    #[inline]
+    fn agg_specs_id_and_count_star_like_only(agg_specs: &[(AggregateFunc, Option<String>, String)]) -> bool {
+        agg_specs.iter().all(|(func, col, _)| {
+            match func {
+                // Any aggregate on _id is allowed
+                AggregateFunc::Min | AggregateFunc::Max | AggregateFunc::Sum | AggregateFunc::Avg => {
+                    matches!(col.as_deref(), Some("_id"))
+                }
+                AggregateFunc::Count => {
+                    // COUNT(*) / COUNT(constant) / COUNT(_id)
+                    matches!(col.as_deref(), Some("_id")) || Self::is_count_star_like(col)
+                }
+            }
+        })
+    }
+
+    /// Mixed aggregate computation for `_id` plus COUNT(*)/COUNT(constant).
+    /// Keeps user-visible column names (e.g. COUNT(1)).
+    fn compute_aggregates_id_mixed_direct(
+        agg_specs: &[(AggregateFunc, Option<String>, String)],
+        deleted: &crate::table::column_table::BitVec,
+        row_count: usize,
+    ) -> Result<SqlResult, ApexError> {
+        // We can reuse the id-direct computation because it already produces all functions,
+        // but we need COUNT(constant) to behave like COUNT(*) in value semantics.
+        let no_deletes = deleted.all_false();
+
+        // O(1) when there are no deleted rows
+        let (count_star, sum, min_val, max_val) = if no_deletes {
+            if row_count == 0 {
+                (0i64, 0i64, i64::MAX, i64::MIN)
+            } else {
+                let n = row_count as i64;
+                let minv = 0i64;
+                let maxv = n - 1;
+                let sumv = (n - 1) * n / 2;
+                (n, sumv, minv, maxv)
+            }
+        } else {
+            let mut count_star = 0i64;
+            let mut sum = 0i64;
+            let mut min_val = i64::MAX;
+            let mut max_val = i64::MIN;
+            for row_idx in 0..row_count {
+                if deleted.get(row_idx) {
+                    continue;
+                }
+                let v = row_idx as i64;
+                count_star += 1;
+                sum += v;
+                if v < min_val {
+                    min_val = v;
+                }
+                if v > max_val {
+                    max_val = v;
+                }
+            }
+            (count_star, sum, min_val, max_val)
+        };
+
+        let mut result_columns = Vec::with_capacity(agg_specs.len());
+        let mut result_values = Vec::with_capacity(agg_specs.len());
+        for (func, column, name) in agg_specs {
+            result_columns.push(name.clone());
+            let value = match func {
+                AggregateFunc::Count => {
+                    // COUNT(_id) / COUNT(*) / COUNT(constant) all equal number of non-deleted rows
+                    Value::Int64(count_star)
+                }
+                AggregateFunc::Sum => Value::Float64(sum as f64),
+                AggregateFunc::Avg => {
+                    if count_star > 0 {
+                        Value::Float64(sum as f64 / count_star as f64)
+                    } else {
+                        Value::Null
+                    }
+                }
+                AggregateFunc::Min => {
+                    if count_star > 0 {
+                        Value::Int64(min_val)
+                    } else {
+                        Value::Null
+                    }
+                }
+                AggregateFunc::Max => {
+                    if count_star > 0 {
+                        Value::Int64(max_val)
+                    } else {
+                        Value::Null
+                    }
+                }
+            };
+            // Keep column name as-is (COUNT(1) etc.)
+            let _ = column;
+            result_values.push(value);
+        }
+
+        Ok(SqlResult::new(result_columns, vec![result_values]))
     }
     
     /// Ultra-fast Int64 aggregates with direct column scan (no index collection)
@@ -1150,6 +4347,7 @@ impl SqlExecutor {
     ) -> Result<SqlResult, ApexError> {
         struct Accumulator {
             col_idx: Option<usize>,
+            is_id: bool,
             count: i64,
             sum: f64,
             min: Option<Value>,
@@ -1158,9 +4356,10 @@ impl SqlExecutor {
         
         let no_deletes = deleted.all_false();
         let mut accumulators: Vec<Accumulator> = agg_specs.iter()
-            .map(|(_, col, _)| Accumulator {
-                col_idx: col.as_ref().and_then(|c| schema.get_index(c)),
-                count: 0, sum: 0.0, min: None, max: None,
+            .map(|(_, col, _)| {
+                let is_id = matches!(col.as_deref(), Some("_id"));
+                let col_idx = if is_id { None } else { col.as_ref().and_then(|c| schema.get_index(c)) };
+                Accumulator { col_idx, is_id, count: 0, sum: 0.0, min: None, max: None }
             })
             .collect();
         
@@ -1169,7 +4368,31 @@ impl SqlExecutor {
             
             for (i, (func, _, _)) in agg_specs.iter().enumerate() {
                 let acc = &mut accumulators[i];
-                if let Some(col_idx) = acc.col_idx {
+                if acc.is_id {
+                    let val = Value::Int64(row_idx as i64);
+                    acc.count += 1;
+                    if let Value::Int64(n) = &val {
+                        acc.sum += *n as f64;
+                    }
+                    if matches!(func, AggregateFunc::Min | AggregateFunc::Max) {
+                        match &acc.min {
+                            None => {
+                                acc.min = Some(val.clone());
+                                acc.max = Some(val);
+                            }
+                            Some(curr) => {
+                                if Self::compare_non_null(curr, &val) == Ordering::Greater {
+                                    acc.min = Some(val.clone());
+                                }
+                                if let Some(mx) = &acc.max {
+                                    if Self::compare_non_null(mx, &val) == Ordering::Less {
+                                        acc.max = Some(val);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(col_idx) = acc.col_idx {
                     if let Some(val) = columns[col_idx].get(row_idx) {
                         if !val.is_null() {
                             acc.count += 1;
@@ -1193,6 +4416,7 @@ impl SqlExecutor {
                         }
                     }
                 } else {
+                    // COUNT(*)
                     acc.count += 1;
                 }
             }
@@ -1880,9 +5104,9 @@ impl SqlExecutor {
         let columns = table.columns_ref();
         
         // Collect all aggregates to compute
-        let mut agg_specs: Vec<(AggregateFunc, Option<String>, String)> = Vec::new();
+        let mut agg_specs: Vec<(AggregateFunc, Option<String>, bool, String)> = Vec::new();
         for col in &stmt.columns {
-            if let SelectColumn::Aggregate { func, column, alias } = col {
+            if let SelectColumn::Aggregate { func, column, distinct, alias } = col {
                 let col_name = alias.clone().unwrap_or_else(|| {
                     let func_name = match func {
                         AggregateFunc::Count => "COUNT",
@@ -1892,19 +5116,25 @@ impl SqlExecutor {
                         AggregateFunc::Max => "MAX",
                     };
                     if let Some(c) = column {
-                        format!("{}({})", func_name, c)
+                        if *distinct {
+                            format!("{}(DISTINCT {})", func_name, c)
+                        } else {
+                            format!("{}({})", func_name, c)
+                        }
                     } else {
                         format!("{}(*)", func_name)
                     }
                 });
-                agg_specs.push((func.clone(), column.clone(), col_name));
+                agg_specs.push((func.clone(), column.clone(), *distinct, col_name));
             }
         }
+
+        let has_distinct = agg_specs.iter().any(|(f, c, d, _)| matches!(f, AggregateFunc::Count) && *d && c.is_some());
         
         // Check if all aggregates use the same numeric column - enable ultra-fast path
         let same_column: Option<&str> = {
             let cols: Vec<_> = agg_specs.iter()
-                .filter_map(|(_, c, _)| c.as_deref())
+                .filter_map(|(_, c, d, _)| if *d { None } else { c.as_deref() })
                 .collect();
             if cols.is_empty() || cols.windows(2).all(|w| w[0] == w[1]) {
                 cols.first().copied()
@@ -1912,18 +5142,245 @@ impl SqlExecutor {
                 None
             }
         };
+
+        // Ultra-fast path: all aggregates on internal _id (row index)
+        if !has_distinct {
+            if let Some("_id") = same_column {
+                return Self::compute_aggregates_id_fused(&agg_specs.iter().map(|(f,c,_,n)| (f.clone(), c.clone(), n.clone())).collect::<Vec<_>>(), matching_indices);
+            }
+        }
         
         // Ultra-fast path: all aggregates on same Int64 column
-        if let Some(col_name) = same_column {
-            if let Some(col_idx) = schema.get_index(col_name) {
-                if let crate::table::column_table::TypedColumn::Int64 { data, nulls } = &columns[col_idx] {
-                    return Self::compute_aggregates_int64_fused(&agg_specs, data, nulls, matching_indices);
+        if !has_distinct {
+            if let Some(col_name) = same_column {
+                if let Some(col_idx) = schema.get_index(col_name) {
+                    if let crate::table::column_table::TypedColumn::Int64 { data, nulls } = &columns[col_idx] {
+                        return Self::compute_aggregates_int64_fused(&agg_specs.iter().map(|(f,c,_,n)| (f.clone(), c.clone(), n.clone())).collect::<Vec<_>>(), data, nulls, matching_indices);
+                    }
                 }
             }
         }
         
         // Fast path: compute all aggregates in single pass with accumulators
-        Self::compute_aggregates_generic_fused(&agg_specs, schema, columns, matching_indices)
+        Self::compute_aggregates_generic_fused_with_distinct(&agg_specs, schema, columns, matching_indices)
+    }
+
+    fn compute_aggregates_generic_fused_with_distinct(
+        agg_specs: &[(AggregateFunc, Option<String>, bool, String)],
+        schema: &crate::table::column_table::ColumnSchema,
+        columns: &[crate::table::column_table::TypedColumn],
+        indices: &[usize],
+    ) -> Result<SqlResult, ApexError> {
+        use std::collections::HashSet;
+
+        struct Accumulator {
+            col_idx: Option<usize>,
+            distinct: bool,
+            seen: Option<HashSet<Vec<u8>>>,
+            count: i64,
+            sum: f64,
+            min: Option<Value>,
+            max: Option<Value>,
+            sum_count: i64,
+        }
+
+        let mut accumulators: Vec<Accumulator> = agg_specs
+            .iter()
+            .map(|(func, col, distinct, _)| {
+                let col_idx = col.as_ref().and_then(|c| schema.get_index(c));
+                let seen = if matches!(func, AggregateFunc::Count) && *distinct {
+                    Some(HashSet::new())
+                } else {
+                    None
+                };
+                Accumulator {
+                    col_idx,
+                    distinct: *distinct,
+                    seen,
+                    count: 0,
+                    sum: 0.0,
+                    min: None,
+                    max: None,
+                    sum_count: 0,
+                }
+            })
+            .collect();
+
+        for &row_idx in indices {
+            for (i, (func, _, _, _)) in agg_specs.iter().enumerate() {
+                let acc = &mut accumulators[i];
+                match func {
+                    AggregateFunc::Count => {
+                        if acc.distinct {
+                            if let Some(ci) = acc.col_idx {
+                                if let Some(v) = columns[ci].get(row_idx) {
+                                    if !v.is_null() {
+                                        if let Some(set) = acc.seen.as_mut() {
+                                            set.insert(v.to_bytes());
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Some(ci) = acc.col_idx {
+                            if let Some(v) = columns[ci].get(row_idx) {
+                                if !v.is_null() {
+                                    acc.count += 1;
+                                }
+                            }
+                        } else {
+                            acc.count += 1;
+                        }
+                    }
+                    AggregateFunc::Sum | AggregateFunc::Avg => {
+                        if let Some(ci) = acc.col_idx {
+                            if let Some(v) = columns[ci].get(row_idx) {
+                                if let Some(n) = v.as_f64() {
+                                    acc.sum += n;
+                                    acc.sum_count += 1;
+                                }
+                            }
+                        }
+                    }
+                    AggregateFunc::Min => {
+                        if let Some(ci) = acc.col_idx {
+                            if let Some(v) = columns[ci].get(row_idx) {
+                                if v.is_null() {
+                                    continue;
+                                }
+                                match &acc.min {
+                                    None => {
+                                        acc.min = Some(v.clone());
+                                        acc.max = Some(v);
+                                    }
+                                    Some(curr_min) => {
+                                        if SqlExecutor::compare_non_null(curr_min, &v) == Ordering::Greater {
+                                            acc.min = Some(v.clone());
+                                        }
+                                        if let Some(curr_max) = &acc.max {
+                                            if SqlExecutor::compare_non_null(curr_max, &v) == Ordering::Less {
+                                                acc.max = Some(v);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    AggregateFunc::Max => {
+                        // handled in Min block via shared logic above
+                        if let Some(ci) = acc.col_idx {
+                            if let Some(v) = columns[ci].get(row_idx) {
+                                if v.is_null() {
+                                    continue;
+                                }
+                                match &acc.max {
+                                    None => acc.max = Some(v),
+                                    Some(curr_max) => {
+                                        if SqlExecutor::compare_non_null(curr_max, &v) == Ordering::Less {
+                                            acc.max = Some(v);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut result_columns = Vec::with_capacity(agg_specs.len());
+        let mut result_values = Vec::with_capacity(agg_specs.len());
+
+        for (i, (func, _, _, name)) in agg_specs.iter().enumerate() {
+            result_columns.push(name.clone());
+            let acc = &accumulators[i];
+            let value = match func {
+                AggregateFunc::Count => {
+                    if acc.distinct {
+                        Value::Int64(acc.seen.as_ref().map(|s| s.len()).unwrap_or(0) as i64)
+                    } else {
+                        Value::Int64(acc.count)
+                    }
+                }
+                AggregateFunc::Sum => Value::Float64(acc.sum),
+                AggregateFunc::Avg => {
+                    if acc.sum_count > 0 {
+                        Value::Float64(acc.sum / acc.sum_count as f64)
+                    } else {
+                        Value::Null
+                    }
+                }
+                AggregateFunc::Min => acc.min.clone().unwrap_or(Value::Null),
+                AggregateFunc::Max => acc.max.clone().unwrap_or(Value::Null),
+            };
+            result_values.push(value);
+        }
+
+        Ok(SqlResult::new(result_columns, vec![result_values]))
+    }
+
+    /// Ultra-fast fused aggregates for internal _id using matching row indices.
+    /// Treats _id as the row index (Int64). Note that `_id` is never NULL.
+    fn compute_aggregates_id_fused(
+        agg_specs: &[(AggregateFunc, Option<String>, String)],
+        indices: &[usize],
+    ) -> Result<SqlResult, ApexError> {
+        let mut count_star = 0i64;
+        let mut sum = 0i64;
+        let mut min_val = i64::MAX;
+        let mut max_val = i64::MIN;
+
+        for &row_idx in indices {
+            let v = row_idx as i64;
+            count_star += 1;
+            sum += v;
+            if v < min_val {
+                min_val = v;
+            }
+            if v > max_val {
+                max_val = v;
+            }
+        }
+
+        let mut result_columns = Vec::with_capacity(agg_specs.len());
+        let mut result_values = Vec::with_capacity(agg_specs.len());
+        for (func, column, name) in agg_specs {
+            result_columns.push(name.clone());
+            let value = match func {
+                AggregateFunc::Count => {
+                    if column.is_none() {
+                        Value::Int64(count_star)
+                    } else {
+                        Value::Int64(count_star)
+                    }
+                }
+                AggregateFunc::Sum => Value::Float64(sum as f64),
+                AggregateFunc::Avg => {
+                    if count_star > 0 {
+                        Value::Float64(sum as f64 / count_star as f64)
+                    } else {
+                        Value::Null
+                    }
+                }
+                AggregateFunc::Min => {
+                    if count_star > 0 {
+                        Value::Int64(min_val)
+                    } else {
+                        Value::Null
+                    }
+                }
+                AggregateFunc::Max => {
+                    if count_star > 0 {
+                        Value::Int64(max_val)
+                    } else {
+                        Value::Null
+                    }
+                }
+            };
+            result_values.push(value);
+        }
+
+        Ok(SqlResult::new(result_columns, vec![result_values]))
     }
     
     /// Ultra-fast fused aggregates on Int64 column - single pass
@@ -2267,7 +5724,8 @@ impl SqlExecutor {
         struct AggState {
             func: AggregateFunc,
             col_idx: Option<usize>,
-            // shared
+            distinct: bool,
+            seen: Option<std::collections::HashSet<Vec<u8>>>,
             count_star: i64,
             count_non_null: i64,
             sum: f64,
@@ -2277,10 +5735,17 @@ impl SqlExecutor {
         }
 
         impl AggState {
-            fn new(func: AggregateFunc, col_idx: Option<usize>) -> Self {
+            fn new(func: AggregateFunc, col_idx: Option<usize>, distinct: bool) -> Self {
+                let seen = if matches!(func, AggregateFunc::Count) && distinct {
+                    Some(std::collections::HashSet::new())
+                } else {
+                    None
+                };
                 Self {
                     func,
                     col_idx,
+                    distinct,
+                    seen,
                     count_star: 0,
                     count_non_null: 0,
                     sum: 0.0,
@@ -2293,7 +5758,17 @@ impl SqlExecutor {
             fn update(&mut self, columns: &[TypedColumn], row_idx: usize) {
                 match self.func {
                     AggregateFunc::Count => {
-                        if self.col_idx.is_none() {
+                        if self.distinct {
+                            if let Some(ci) = self.col_idx {
+                                if let Some(v) = columns[ci].get(row_idx) {
+                                    if !v.is_null() {
+                                        if let Some(set) = self.seen.as_mut() {
+                                            set.insert(v.to_bytes());
+                                        }
+                                    }
+                                }
+                            }
+                        } else if self.col_idx.is_none() {
                             self.count_star += 1;
                         } else if let Some(ci) = self.col_idx {
                             if let Some(v) = columns[ci].get(row_idx) {
@@ -2360,7 +5835,9 @@ impl SqlExecutor {
             fn finalize(&self) -> Value {
                 match self.func {
                     AggregateFunc::Count => {
-                        if self.col_idx.is_none() {
+                        if self.distinct {
+                            Value::Int64(self.seen.as_ref().map(|s| s.len()).unwrap_or(0) as i64)
+                        } else if self.col_idx.is_none() {
                             Value::Int64(self.count_star)
                         } else {
                             Value::Int64(self.count_non_null)
@@ -2396,12 +5873,318 @@ impl SqlExecutor {
         }
 
         // Collect aggregate specs in SELECT order
-        let mut agg_specs: Vec<(AggregateFunc, Option<usize>)> = Vec::new();
-        for col in &stmt.columns {
-            if let SelectColumn::Aggregate { func, column, .. } = col {
-                let col_idx = column.as_ref().and_then(|c| schema.get_index(c));
-                agg_specs.push((func.clone(), col_idx));
+        let mut agg_specs: Vec<(AggregateFunc, Option<usize>, bool)> = Vec::new();
+
+        fn add_agg_spec(
+            out: &mut Vec<(AggregateFunc, Option<usize>, bool)>,
+            func: AggregateFunc,
+            col_idx: Option<usize>,
+            distinct: bool,
+        ) {
+            if !out.iter().any(|(f, c, d)| *f == func && *c == col_idx && *d == distinct) {
+                out.push((func, col_idx, distinct));
             }
+        }
+
+        // 1) Explicit aggregates in SELECT list
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate { func, column, distinct, .. } = col {
+                let col_idx = column.as_ref().and_then(|c| schema.get_index(c));
+                add_agg_spec(&mut agg_specs, func.clone(), col_idx, *distinct);
+            }
+        }
+
+        // 2) Aggregates inside expressions (e.g. CASE WHEN SUM(amount) ...)
+        fn collect_aggs_in_expr(
+            expr: &SqlExpr,
+            schema: &crate::table::column_table::ColumnSchema,
+            out: &mut Vec<(AggregateFunc, Option<usize>, bool)>,
+        ) {
+            match expr {
+                SqlExpr::Paren(inner) => collect_aggs_in_expr(inner, schema, out),
+                SqlExpr::BinaryOp { left, right, .. } => {
+                    collect_aggs_in_expr(left, schema, out);
+                    collect_aggs_in_expr(right, schema, out);
+                }
+                SqlExpr::UnaryOp { expr, .. } => collect_aggs_in_expr(expr, schema, out),
+                SqlExpr::Between { low, high, .. } => {
+                    collect_aggs_in_expr(low, schema, out);
+                    collect_aggs_in_expr(high, schema, out);
+                }
+                SqlExpr::Function { name, args } => {
+                    let func = match name.to_uppercase().as_str() {
+                        "COUNT" => Some(AggregateFunc::Count),
+                        "SUM" => Some(AggregateFunc::Sum),
+                        "AVG" => Some(AggregateFunc::Avg),
+                        "MIN" => Some(AggregateFunc::Min),
+                        "MAX" => Some(AggregateFunc::Max),
+                        _ => None,
+                    };
+                    if let Some(func) = func {
+                        let col_idx = if args.is_empty() {
+                            None
+                        } else {
+                            match &args[0] {
+                                SqlExpr::Column(c) => schema.get_index(c),
+                                _ => None,
+                            }
+                        };
+                        // DISTINCT inside expressions is not parsed/represented currently; default false.
+                        add_agg_spec(out, func, col_idx, false);
+                    }
+                    for a in args {
+                        collect_aggs_in_expr(a, schema, out);
+                    }
+                }
+                SqlExpr::Case { when_then, else_expr } => {
+                    for (c, v) in when_then {
+                        collect_aggs_in_expr(c, schema, out);
+                        collect_aggs_in_expr(v, schema, out);
+                    }
+                    if let Some(e) = else_expr {
+                        collect_aggs_in_expr(e, schema, out);
+                    }
+                }
+                SqlExpr::ScalarSubquery { .. } => {
+                    // Scalar subqueries inside GROUP BY expressions are not supported yet.
+                }
+                _ => {}
+            }
+        }
+
+        for col in &stmt.columns {
+            if let SelectColumn::Expression { expr, .. } = col {
+                collect_aggs_in_expr(expr, schema, &mut agg_specs);
+            }
+        }
+        if let Some(h) = stmt.having.as_ref() {
+            collect_aggs_in_expr(h, schema, &mut agg_specs);
+        }
+
+        // Map SELECT aggregate aliases -> agg_specs index, so HAVING can reference them
+        // e.g. SELECT COUNT(*) AS c ... HAVING c > 1
+        let mut agg_alias_to_spec_idx: HashMap<String, usize> = HashMap::new();
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate { func, column, distinct, alias } = col {
+                if let Some(alias) = alias.as_ref() {
+                    let col_idx = column.as_ref().and_then(|c| schema.get_index(c));
+                    if let Some(pos) = agg_specs
+                        .iter()
+                        .position(|(f, c, d)| *f == *func && *c == col_idx && *d == *distinct)
+                    {
+                        agg_alias_to_spec_idx.insert(alias.clone(), pos);
+                    }
+                }
+            }
+        }
+
+        fn eval_having_scalar(
+            expr: &SqlExpr,
+            schema: &crate::table::column_table::ColumnSchema,
+            columns: &[TypedColumn],
+            group_state: &GroupState,
+            agg_specs: &[(AggregateFunc, Option<usize>, bool)],
+            agg_alias_to_spec_idx: &HashMap<String, usize>,
+        ) -> Result<Value, ApexError> {
+            match expr {
+                SqlExpr::Paren(inner) => {
+                    eval_having_scalar(inner, schema, columns, group_state, agg_specs, agg_alias_to_spec_idx)
+                }
+                SqlExpr::Literal(v) => Ok(v.clone()),
+                SqlExpr::ScalarSubquery { .. } => Err(ApexError::QueryParseError(
+                    "Scalar subquery is not supported in GROUP BY/HAVING expressions".to_string(),
+                )),
+                SqlExpr::Case { when_then, else_expr } => {
+                    for (cond, val) in when_then {
+                        let cv = eval_having_scalar(
+                            cond,
+                            schema,
+                            columns,
+                            group_state,
+                            agg_specs,
+                            agg_alias_to_spec_idx,
+                        )?;
+                        if cv.as_bool().unwrap_or(false) {
+                            return eval_having_scalar(
+                                val,
+                                schema,
+                                columns,
+                                group_state,
+                                agg_specs,
+                                agg_alias_to_spec_idx,
+                            );
+                        }
+                    }
+                    if let Some(e) = else_expr {
+                        eval_having_scalar(e, schema, columns, group_state, agg_specs, agg_alias_to_spec_idx)
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                SqlExpr::Column(name) => {
+                    let row_idx = group_state.first_row_idx;
+                    if name == "_id" {
+                        Ok(Value::Int64(row_idx as i64))
+                    } else if let Some(ci) = schema.get_index(name) {
+                        Ok(columns[ci].get(row_idx).unwrap_or(Value::Null))
+                    } else {
+                        // Not a base column: try resolve as SELECT aggregate alias
+                        if let Some(&spec_idx) = agg_alias_to_spec_idx.get(name) {
+                            Ok(group_state.aggs[spec_idx].finalize())
+                        } else {
+                            Ok(Value::Null)
+                        }
+                    }
+                }
+                SqlExpr::Function { name, args } => {
+                    let func = match name.to_uppercase().as_str() {
+                        "COUNT" => AggregateFunc::Count,
+                        "SUM" => AggregateFunc::Sum,
+                        "AVG" => AggregateFunc::Avg,
+                        "MIN" => AggregateFunc::Min,
+                        "MAX" => AggregateFunc::Max,
+                        _ => {
+                            return Err(ApexError::QueryParseError(
+                                format!("Unsupported function in HAVING: {}", name),
+                            ))
+                        }
+                    };
+
+                    let col_idx = if args.is_empty() {
+                        None
+                    } else {
+                        match &args[0] {
+                            SqlExpr::Column(c) => schema.get_index(c),
+                            _ => None,
+                        }
+                    };
+
+                    for (i, (sf, sc, _sd)) in agg_specs.iter().enumerate() {
+                        if *sf == func && *sc == col_idx {
+                            return Ok(group_state.aggs[i].finalize());
+                        }
+                    }
+                    Ok(Value::Null)
+                }
+                SqlExpr::UnaryOp { op, expr } => {
+                    match op {
+                        crate::query::sql_parser::UnaryOperator::Not => {
+                            let v = eval_having_scalar(
+                                expr,
+                                schema,
+                                columns,
+                                group_state,
+                                agg_specs,
+                                agg_alias_to_spec_idx,
+                            )?;
+                            Ok(Value::Bool(!v.as_bool().unwrap_or(false)))
+                        }
+                        crate::query::sql_parser::UnaryOperator::Minus => {
+                            let v = eval_having_scalar(
+                                expr,
+                                schema,
+                                columns,
+                                group_state,
+                                agg_specs,
+                                agg_alias_to_spec_idx,
+                            )?;
+                            if let Some(i) = v.as_i64() {
+                                Ok(Value::Int64(-i))
+                            } else if let Some(f) = v.as_f64() {
+                                Ok(Value::Float64(-f))
+                            } else {
+                                Ok(Value::Null)
+                            }
+                        }
+                    }
+                }
+                SqlExpr::BinaryOp { left, op, right } => {
+                    let lv = eval_having_scalar(
+                        left,
+                        schema,
+                        columns,
+                        group_state,
+                        agg_specs,
+                        agg_alias_to_spec_idx,
+                    )?;
+                    let rv = eval_having_scalar(
+                        right,
+                        schema,
+                        columns,
+                        group_state,
+                        agg_specs,
+                        agg_alias_to_spec_idx,
+                    )?;
+                    match op {
+                        BinaryOperator::And => Ok(Value::Bool(lv.as_bool().unwrap_or(false) && rv.as_bool().unwrap_or(false))),
+                        BinaryOperator::Or => Ok(Value::Bool(lv.as_bool().unwrap_or(false) || rv.as_bool().unwrap_or(false))),
+                        BinaryOperator::Eq => Ok(Value::Bool(lv == rv)),
+                        BinaryOperator::NotEq => Ok(Value::Bool(lv != rv)),
+                        BinaryOperator::Lt | BinaryOperator::Le | BinaryOperator::Gt | BinaryOperator::Ge => {
+                            if lv.is_null() || rv.is_null() {
+                                return Ok(Value::Bool(false));
+                            }
+                            let ord = match (lv.as_f64(), rv.as_f64()) {
+                                (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+                                _ => SqlExecutor::compare_non_null(&lv, &rv),
+                            };
+                            let b = match op {
+                                BinaryOperator::Lt => ord == Ordering::Less,
+                                BinaryOperator::Le => ord != Ordering::Greater,
+                                BinaryOperator::Gt => ord == Ordering::Greater,
+                                BinaryOperator::Ge => ord != Ordering::Less,
+                                _ => false,
+                            };
+                            Ok(Value::Bool(b))
+                        }
+                        BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul | BinaryOperator::Div | BinaryOperator::Mod => {
+                            let lf = lv.as_f64();
+                            let rf = rv.as_f64();
+                            if let (Some(a), Some(b)) = (lf, rf) {
+                                let out = match op {
+                                    BinaryOperator::Add => a + b,
+                                    BinaryOperator::Sub => a - b,
+                                    BinaryOperator::Mul => a * b,
+                                    BinaryOperator::Div => a / b,
+                                    BinaryOperator::Mod => a % b,
+                                    _ => a,
+                                };
+                                Ok(Value::Float64(out))
+                            } else {
+                                Ok(Value::Null)
+                            }
+                        }
+                    }
+                }
+                SqlExpr::Like { .. }
+                | SqlExpr::Regexp { .. }
+                | SqlExpr::In { .. }
+                | SqlExpr::InSubquery { .. }
+                | SqlExpr::ExistsSubquery { .. }
+                | SqlExpr::Between { .. }
+                | SqlExpr::IsNull { .. } => Err(ApexError::QueryParseError(
+                    "Unsupported predicate in HAVING".to_string(),
+                )),
+            }
+        }
+
+        fn eval_having_predicate(
+            expr: &SqlExpr,
+            schema: &crate::table::column_table::ColumnSchema,
+            columns: &[TypedColumn],
+            group_state: &GroupState,
+            agg_specs: &[(AggregateFunc, Option<usize>, bool)],
+            agg_alias_to_spec_idx: &HashMap<String, usize>,
+        ) -> Result<bool, ApexError> {
+            let v = eval_having_scalar(
+                expr,
+                schema,
+                columns,
+                group_state,
+                agg_specs,
+                agg_alias_to_spec_idx,
+            )?;
+            Ok(v.as_bool().unwrap_or(false))
         }
 
         // Group rows and compute aggregates in a single pass
@@ -2464,7 +6247,7 @@ impl SqlExecutor {
                 first_row_idx: row_idx,
                 aggs: agg_specs
                     .iter()
-                    .map(|(func, col_idx)| AggState::new(func.clone(), *col_idx))
+                    .map(|(func, col_idx, distinct)| AggState::new(func.clone(), *col_idx, *distinct))
                     .collect(),
             });
 
@@ -2479,7 +6262,7 @@ impl SqlExecutor {
             match col {
                 SelectColumn::Column(name) => result_columns.push(name.clone()),
                 SelectColumn::ColumnAlias { alias, .. } => result_columns.push(alias.clone()),
-                SelectColumn::Aggregate { func, column, alias } => {
+                SelectColumn::Aggregate { func, column, distinct, alias } => {
                     let name = alias.clone().unwrap_or_else(|| {
                         let func_name = match func {
                             AggregateFunc::Count => "COUNT",
@@ -2489,12 +6272,19 @@ impl SqlExecutor {
                             AggregateFunc::Max => "MAX",
                         };
                         if let Some(c) = column {
-                            format!("{}({})", func_name, c)
+                            if *distinct {
+                                format!("{}(DISTINCT {})", func_name, c)
+                            } else {
+                                format!("{}({})", func_name, c)
+                            }
                         } else {
                             format!("{}(*)", func_name)
                         }
                     });
                     result_columns.push(name);
+                }
+                SelectColumn::Expression { alias, .. } => {
+                    result_columns.push(alias.clone().unwrap_or_else(|| "expr".to_string()));
                 }
                 _ => {}
             }
@@ -2613,7 +6403,7 @@ impl SqlExecutor {
                         builders.push(ColBuilder::Utf8(StringBuilder::new()));
                     }
                 }
-                SelectColumn::Aggregate { func, column, alias } => {
+                SelectColumn::Aggregate { func, column, distinct, alias } => {
                     let out_name = alias.clone().unwrap_or_else(|| {
                         let func_name = match func {
                             AggregateFunc::Count => "COUNT",
@@ -2623,7 +6413,11 @@ impl SqlExecutor {
                             AggregateFunc::Max => "MAX",
                         };
                         if let Some(c) = column {
-                            format!("{}({})", func_name, c)
+                            if *distinct {
+                                format!("{}(DISTINCT {})", func_name, c)
+                            } else {
+                                format!("{}({})", func_name, c)
+                            }
                         } else {
                             format!("{}(*)", func_name)
                         }
@@ -2675,22 +6469,44 @@ impl SqlExecutor {
                         }
                     }
                 }
+                SelectColumn::Expression { alias, .. } => {
+                    let out_name = alias.clone().unwrap_or_else(|| "expr".to_string());
+                    fields.push(Field::new(&out_name, ArrowDataType::Utf8, true));
+                    builders.push(ColBuilder::Utf8(StringBuilder::new()));
+                }
                 _ => {}
             }
         }
 
-        let having_filter = if let Some(ref having_expr) = stmt.having {
-            Some(Self::expr_to_filter(having_expr)?)
-        } else {
-            None
-        };
+        let having_expr = stmt.having.as_ref();
 
-        // Build rows (and apply HAVING) and append into Arrow builders
+        // Pre-map explicit Aggregate columns to agg_specs indices (cannot rely on sequential order
+        // once expressions also contribute aggregate specs).
+        let mut select_agg_to_spec: Vec<Option<usize>> = Vec::with_capacity(stmt.columns.len());
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate { func, column, distinct, .. } = col {
+                let col_idx = column.as_ref().and_then(|c| schema.get_index(c));
+                let idx = agg_specs
+                    .iter()
+                    .position(|(f, c, d)| f == func && *c == col_idx && *d == *distinct);
+                select_agg_to_spec.push(idx);
+            } else {
+                select_agg_to_spec.push(None);
+            }
+        }
+
+        // Build rows (apply HAVING), then ORDER BY/LIMIT/OFFSET, then append into Arrow builders.
+        // Note: groups is a HashMap so iteration order is nondeterministic.
+        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
         for (_key, group_state) in groups {
-            let mut row_values: Vec<Value> = Vec::with_capacity(result_columns.len());
-            let mut agg_i = 0usize;
+            if let Some(h) = having_expr {
+                if !eval_having_predicate(h, schema, columns, &group_state, &agg_specs, &agg_alias_to_spec_idx)? {
+                    continue;
+                }
+            }
 
-            for col in &stmt.columns {
+            let mut row_values: Vec<Value> = Vec::with_capacity(result_columns.len());
+            for (pos, col) in stmt.columns.iter().enumerate() {
                 match col {
                     SelectColumn::Column(name) => {
                         let first_idx = group_state.first_row_idx;
@@ -2713,37 +6529,42 @@ impl SqlExecutor {
                         }
                     }
                     SelectColumn::Aggregate { .. } => {
-                        let v = group_state.aggs[agg_i].finalize();
-                        agg_i += 1;
-                        row_values.push(v);
+                        let idx = select_agg_to_spec.get(pos).and_then(|x| *x);
+                        if let Some(i) = idx {
+                            row_values.push(group_state.aggs[i].finalize());
+                        } else {
+                            row_values.push(Value::Null);
+                        }
                     }
-                    _ => {}
-                }
-            }
-
-            if let Some(ref hf) = having_filter {
-                let mut row = Row::new(0);
-                for (i, col_name) in result_columns.iter().enumerate() {
-                    if let Some(v) = row_values.get(i) {
-                        row.set(col_name.clone(), v.clone());
+                    SelectColumn::Expression { expr, .. } => {
+                        row_values.push(eval_having_scalar(
+                            expr,
+                            schema,
+                            columns,
+                            &group_state,
+                            &agg_specs,
+                            &agg_alias_to_spec_idx,
+                        )?);
+                    }
+                    SelectColumn::All | SelectColumn::WindowFunction { .. } => {
+                        return Err(ApexError::QueryParseError(
+                            "Unsupported SELECT item in GROUP BY".to_string(),
+                        ));
                     }
                 }
-                if !hf.matches(&row) {
-                    continue;
-                }
             }
-
-            for (i, v) in row_values.iter().enumerate() {
-                builders[i].append_value(v);
-            }
+            out_rows.push(row_values);
         }
 
-        let arrays: Vec<ArrayRef> = builders.into_iter().map(|b| b.finish()).collect();
-        let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema, arrays)
-            .map_err(|e| ApexError::SerializationError(e.to_string()))?;
+        if !stmt.order_by.is_empty() {
+            out_rows = Self::apply_order_by(out_rows, &result_columns, &stmt.order_by)?;
+        }
 
-        Ok(SqlResult::with_arrow_batch(result_columns, batch))
+        let off = stmt.offset.unwrap_or(0);
+        let lim = stmt.limit.unwrap_or(usize::MAX);
+        let out_rows = out_rows.into_iter().skip(off).take(lim).collect::<Vec<_>>();
+
+        Ok(SqlResult::new(result_columns, out_rows))
     }
     
     /// Build Arrow arrays directly from column data using matching indices

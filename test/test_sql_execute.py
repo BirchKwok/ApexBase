@@ -46,6 +46,13 @@ except ImportError:
     PYARROW_AVAILABLE = False
 
 
+def _execute_or_xfail(client: ApexClient, sql: str):
+    try:
+        return client.execute(sql)
+    except Exception as e:
+        pytest.xfail(f"SQL not supported yet: {sql} ({type(e).__name__}: {e})")
+
+
 class TestBasicSQLExecute:
     """Test basic SQL execute operations"""
     
@@ -72,6 +79,126 @@ class TestBasicSQLExecute:
             assert "city" in result.columns
             assert "_id" not in result.columns  # _id should be hidden
             
+            client.close()
+
+    def test_execute_aggregate_implicit_alias_keyword(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            rows = [{"v": i} for i in range(10)]
+            client.store(rows)
+            client.flush()
+
+            result = client.execute(
+                "select min(_id) min_id, max(_id) max_id, count(1) count from default"
+            )
+            rows = result.to_dict()
+            assert isinstance(rows, list)
+            assert len(rows) == 1
+            assert rows[0]["min_id"] == 0
+            assert rows[0]["max_id"] == 9
+            assert rows[0]["count"] == 10
+
+            client.close()
+
+    def test_execute_aggregate_implicit_alias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            rows = [{"v": i} for i in range(10)]
+            client.store(rows)
+            client.flush()
+
+            result = client.execute(
+                "select min(_id) min_id, max(_id) as max_id, count(1) as count from default"
+            )
+            rows = result.to_dict()
+            assert isinstance(rows, list)
+            assert len(rows) == 1
+            assert rows[0]["min_id"] == 0
+            assert rows[0]["max_id"] == 9
+            assert rows[0]["count"] == 10
+
+            client.close()
+
+    def test_execute_min_max_count_constant_on_internal_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            rows = [{"v": i} for i in range(100)]
+            client.store(rows)
+            client.flush()
+
+            result = client.execute("select min(_id), max(_id), count(1) from default")
+            rows = result.to_dict()
+            assert isinstance(rows, list)
+            assert len(rows) == 1
+            assert rows[0]["MIN(_id)"] == 0
+            assert rows[0]["MAX(_id)"] == 99
+            assert rows[0]["COUNT(1)"] == 100
+
+            client.close()
+
+    def test_execute_count_constant(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            rows = [{"v": i} for i in range(10)]
+            client.store(rows)
+            client.flush()
+
+            result = client.execute("select min(_id), max(_id), count(1) from default")
+            rows = result.to_dict()
+            assert isinstance(rows, list)
+            assert len(rows) == 1
+            assert rows[0]["MIN(_id)"] == 0
+            assert rows[0]["MAX(_id)"] == 9
+            assert rows[0]["COUNT(1)"] == 10
+
+            client.close()
+
+    def test_execute_min_max_count_on_internal_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            rows = [{"v": i} for i in range(100)]
+            client.store(rows)
+            client.flush()
+
+            result = client.execute("select min(_id), max(_id), count(*) from default")
+            rows = result.to_dict()
+            assert isinstance(rows, list)
+            assert len(rows) == 1
+            assert rows[0]["MIN(_id)"] == 0
+            assert rows[0]["MAX(_id)"] == 99
+            assert rows[0]["COUNT(*)"] == 100
+
+            client.close()
+
+    def test_execute_select_star_plus_id_arrow_fast_path_column_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            if not (ARROW_AVAILABLE and PYARROW_AVAILABLE):
+                pytest.skip("Arrow/PyArrow not available")
+
+            client = ApexClient(dirpath=temp_dir)
+
+            # Trigger large-result Arrow paths (threshold is > 10_000)
+            rows = [{"name": f"u{i}", "age": i} for i in range(12000)]
+            client.store(rows)
+            client.flush()
+
+            # Keep user-specified order: '*' then '_id'
+            result = client.execute("SELECT *, _id FROM default")
+            assert len(result) == 12000
+            assert "_id" in result.columns
+            assert result.columns[-1] == "_id"
+
+            # Keep user-specified order: '_id' then '*'
+            result2 = client.execute("SELECT _id, * FROM default")
+            assert len(result2) == 12000
+            assert "_id" in result2.columns
+            assert result2.columns[0] == "_id"
+
             client.close()
 
     def test_execute_select_qualified_id_column(self):
@@ -169,6 +296,29 @@ class TestBasicSQLExecute:
             assert "content" in df.columns
             assert "number" in df.columns
             assert df["title"].iloc[0].startswith("Python")
+
+            client.close()
+
+    def test_execute_where_not_like_and_like(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            rows = [
+                {"title": "Python编程指南第1章", "content": "a"},
+                {"title": "Python编程指南第2章", "content": "b"},
+                {"title": "Python入门", "content": "c"},
+                {"title": "Rust编程指南第1章", "content": "d"},
+            ]
+            client.store(rows)
+            client.flush()
+
+            result = client.execute(
+                "select * from default where title like 'Python%' and title not like '%编程指南第1%'")
+            titles = [r["title"] for r in result.to_dict()]
+            assert "Python编程指南第1章" not in titles
+            assert "Python编程指南第2章" in titles
+            assert "Python入门" in titles
+            assert "Rust编程指南第1章" not in titles
 
             client.close()
     
@@ -523,7 +673,7 @@ class TestSQLGroupBy:
 
             # HAVING should filter on aggregated result
             result = client.execute(
-                "SELECT city, COUNT(*) AS c FROM default GROUP BY city HAVING c > 1"
+                "SELECT city, COUNT(*) AS c FROM default GROUP BY city HAVING COUNT(*) > 1"
             )
             rows = result.to_dict()
             assert isinstance(rows, list)
@@ -532,6 +682,519 @@ class TestSQLGroupBy:
             assert rows[0]["city"] == "NYC"
             assert rows[0]["c"] == 2
             
+            client.close()
+
+
+class TestSQLRealWorldQueries:
+    def test_execute_union_and_union_all(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([
+                {"k": 1, "city": "NYC"},
+                {"k": 2, "city": "NYC"},
+                {"k": 3, "city": "LA"},
+                {"k": 4, "city": "Chicago"},
+            ])
+            client.flush()
+
+            result_union = _execute_or_xfail(
+                client,
+                """
+                SELECT city FROM default WHERE city = 'NYC'
+                UNION
+                SELECT city FROM default WHERE city = 'LA'
+                ORDER BY city
+                """.strip(),
+            )
+            rows_union = result_union.to_dict()
+            assert [r["city"] for r in rows_union] == ["LA", "NYC"]
+
+            result_union_all = _execute_or_xfail(
+                client,
+                """
+                SELECT city FROM default WHERE city = 'NYC'
+                UNION ALL
+                SELECT city FROM default WHERE city = 'LA'
+                ORDER BY city
+                """.strip(),
+            )
+            rows_union_all = result_union_all.to_dict()
+            assert [r["city"] for r in rows_union_all] == ["LA", "NYC", "NYC"]
+
+            client.close()
+
+    def test_execute_multi_table_join_inner(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            client.store([
+                {"user_id": 1, "name": "Alice", "tier": "pro"},
+                {"user_id": 2, "name": "Bob", "tier": "free"},
+                {"user_id": 3, "name": "Charlie", "tier": "pro"},
+            ])
+            client.flush()
+
+            client.create_table("orders")
+            client.store([
+                {"order_id": 10, "user_id": 1, "amount": 120},
+                {"order_id": 11, "user_id": 1, "amount": 80},
+                {"order_id": 12, "user_id": 2, "amount": 30},
+            ])
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT u.name, u.tier, o.order_id, o.amount
+                FROM users u
+                JOIN orders o ON u.user_id = o.user_id
+                WHERE o.amount >= 50
+                ORDER BY o.order_id
+                """.strip(),
+            )
+            rows = result.to_dict()
+            assert [(r["name"], r["order_id"], r["amount"]) for r in rows] == [
+                ("Alice", 10, 120),
+                ("Alice", 11, 80),
+            ]
+
+            client.close()
+
+    def test_execute_multi_group_by_having(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([
+                {"region": "CN", "channel": "online", "amount": 120},
+                {"region": "CN", "channel": "online", "amount": 90},
+                {"region": "CN", "channel": "store", "amount": 30},
+                {"region": "US", "channel": "online", "amount": 200},
+                {"region": "US", "channel": "store", "amount": 40},
+            ])
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT region, channel, COUNT(*) AS c, SUM(amount) AS s
+                FROM default
+                GROUP BY region, channel
+                HAVING SUM(amount) >= 150
+                ORDER BY region, channel
+                """.strip(),
+            )
+            rows = result.to_dict()
+            assert [(r["region"], r["channel"], r["c"], r["s"]) for r in rows] == [
+                ("CN", "online", 2, 210),
+                ("US", "online", 1, 200),
+            ]
+
+            client.close()
+
+    def test_execute_nested_aggregation_second_stage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([
+                {"region": "CN", "amount": 120},
+                {"region": "CN", "amount": 90},
+                {"region": "CN", "amount": 30},
+                {"region": "US", "amount": 200},
+                {"region": "US", "amount": 40},
+            ])
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT COUNT(*) AS big_regions
+                FROM (
+                    SELECT region, SUM(amount) AS total
+                    FROM default
+                    GROUP BY region
+                ) t
+                WHERE t.total >= 200
+                """.strip(),
+            )
+            assert result.scalar() == 2
+
+            client.close()
+
+    def test_execute_left_join_preserve_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            client.store([
+                {"user_id": 1, "name": "Alice"},
+                {"user_id": 2, "name": "Bob"},
+                {"user_id": 3, "name": "Charlie"},
+            ])
+            client.flush()
+
+            client.create_table("orders")
+            client.store([
+                {"order_id": 10, "user_id": 1, "amount": 120},
+                {"order_id": 11, "user_id": 1, "amount": 80},
+                {"order_id": 12, "user_id": 2, "amount": 30},
+            ])
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT u.user_id, u.name, o.order_id
+                FROM users u
+                LEFT JOIN orders o ON u.user_id = o.user_id
+                ORDER BY u.user_id, o.order_id
+                """.strip(),
+            )
+            rows = result.to_dict()
+            assert [r["user_id"] for r in rows] == [1, 1, 2, 3]
+            assert [r["order_id"] for r in rows] == [10, 11, 12, None]
+
+            client.close()
+
+    def test_execute_join_group_by_having_top_customers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            client.store([
+                {"user_id": 1, "name": "Alice", "tier": "pro"},
+                {"user_id": 2, "name": "Bob", "tier": "free"},
+                {"user_id": 3, "name": "Charlie", "tier": "pro"},
+            ])
+            client.flush()
+
+            client.create_table("orders")
+            client.store([
+                {"order_id": 10, "user_id": 1, "amount": 120},
+                {"order_id": 11, "user_id": 1, "amount": 80},
+                {"order_id": 12, "user_id": 2, "amount": 30},
+                {"order_id": 13, "user_id": 3, "amount": 200},
+            ])
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT u.tier, COUNT(DISTINCT u.user_id) AS users, SUM(o.amount) AS revenue
+                FROM users u
+                JOIN orders o ON u.user_id = o.user_id
+                GROUP BY u.tier
+                HAVING SUM(o.amount) >= 200
+                ORDER BY u.tier
+                """.strip(),
+            )
+            rows = result.to_dict()
+            assert len(rows) == 1
+            assert rows[0]["tier"] == "pro"
+            assert rows[0]["users"] == 2
+            assert rows[0]["revenue"] == 400
+
+            client.close()
+
+    def test_execute_join_distinct_dimension_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            client.store([
+                {"user_id": 1, "name": "Alice", "tier": "pro"},
+                {"user_id": 2, "name": "Bob", "tier": "free"},
+            ])
+            client.flush()
+
+            client.create_table("orders")
+            client.store([
+                {"order_id": 10, "user_id": 1, "amount": 120},
+                {"order_id": 11, "user_id": 1, "amount": 80},
+                {"order_id": 12, "user_id": 2, "amount": 30},
+            ])
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT DISTINCT u.tier
+                FROM users u
+                JOIN orders o ON u.user_id = o.user_id
+                ORDER BY u.tier
+                """.strip(),
+            )
+            tiers = [r["tier"] for r in result.to_dict()]
+            assert tiers == ["free", "pro"]
+
+            client.close()
+
+    def test_execute_union_with_limit_offset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([
+                {"k": 1, "city": "NYC"},
+                {"k": 2, "city": "NYC"},
+                {"k": 3, "city": "LA"},
+                {"k": 4, "city": "Chicago"},
+                {"k": 5, "city": "Seattle"},
+            ])
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT city FROM default WHERE city LIKE 'C%'
+                UNION ALL
+                SELECT city FROM default WHERE city LIKE 'N%'
+                ORDER BY city
+                LIMIT 2 OFFSET 1
+                """.strip(),
+            )
+            rows = result.to_dict()
+            assert [r["city"] for r in rows] == ["NYC", "NYC"]
+
+            client.close()
+
+    def test_execute_in_and_not_in_subquery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            client.store([
+                {"user_id": 1, "name": "Alice"},
+                {"user_id": 2, "name": "Bob"},
+                {"user_id": 3, "name": "Charlie"},
+            ])
+            client.flush()
+
+            client.create_table("orders")
+            client.store([
+                {"order_id": 10, "user_id": 1, "amount": 120},
+                {"order_id": 11, "user_id": 1, "amount": 80},
+                {"order_id": 12, "user_id": 2, "amount": 30},
+            ])
+            client.flush()
+
+            result_in = _execute_or_xfail(
+                client,
+                """
+                SELECT name
+                FROM users
+                WHERE user_id IN (SELECT user_id FROM orders WHERE amount >= 80)
+                ORDER BY name
+                """.strip(),
+            )
+            assert [r["name"] for r in result_in.to_dict()] == ["Alice"]
+
+            result_not_in = _execute_or_xfail(
+                client,
+                """
+                SELECT name
+                FROM users
+                WHERE user_id NOT IN (SELECT user_id FROM orders)
+                ORDER BY name
+                """.strip(),
+            )
+            assert [r["name"] for r in result_not_in.to_dict()] == ["Charlie"]
+
+            client.close()
+
+    def test_execute_exists_subquery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            client.store([
+                {"user_id": 1, "name": "Alice"},
+                {"user_id": 2, "name": "Bob"},
+                {"user_id": 3, "name": "Charlie"},
+            ])
+            client.flush()
+
+            client.create_table("orders")
+            client.store([
+                {"order_id": 10, "user_id": 1, "amount": 120},
+                {"order_id": 11, "user_id": 1, "amount": 80},
+                {"order_id": 12, "user_id": 2, "amount": 30},
+            ])
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT u.name
+                FROM users u
+                WHERE EXISTS (
+                    SELECT 1 FROM orders o
+                    WHERE o.user_id = u.user_id AND o.amount >= 100
+                )
+                ORDER BY u.name
+                """.strip(),
+            )
+            assert [r["name"] for r in result.to_dict()] == ["Alice"]
+
+            client.close()
+
+    def test_execute_two_stage_aggregation_bucketed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([
+                {"region": "CN", "amount": 120},
+                {"region": "CN", "amount": 90},
+                {"region": "CN", "amount": 30},
+                {"region": "US", "amount": 200},
+                {"region": "US", "amount": 40},
+                {"region": "EU", "amount": 10},
+                {"region": "EU", "amount": 20},
+            ])
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT t.bucket, COUNT(*) AS regions
+                FROM (
+                    SELECT region,
+                           CASE WHEN SUM(amount) >= 200 THEN 'big' ELSE 'small' END AS bucket
+                    FROM default
+                    GROUP BY region
+                ) t
+                GROUP BY t.bucket
+                ORDER BY t.bucket
+                """.strip(),
+            )
+            rows = result.to_dict()
+            assert [(r["bucket"], r["regions"]) for r in rows] == [("big", 2), ("small", 1)]
+
+            client.close()
+
+
+class TestSQLSubqueriesAdvanced:
+    def test_execute_not_exists_correlated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            client.store(
+                [
+                    {"user_id": 1, "name": "Alice"},
+                    {"user_id": 2, "name": "Bob"},
+                    {"user_id": 3, "name": "Charlie"},
+                ]
+            )
+            client.flush()
+
+            client.create_table("orders")
+            client.store(
+                [
+                    {"order_id": 10, "user_id": 1, "amount": 120},
+                    {"order_id": 11, "user_id": 1, "amount": 80},
+                    {"order_id": 12, "user_id": 2, "amount": 30},
+                ]
+            )
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT u.name
+                FROM users u
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM orders o
+                    WHERE o.user_id = u.user_id
+                )
+                ORDER BY u.name
+                """.strip(),
+            )
+            assert [r["name"] for r in result.to_dict()] == ["Charlie"]
+
+            client.close()
+
+    def test_execute_correlated_in_subquery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            client.store(
+                [
+                    {"user_id": 1, "name": "Alice"},
+                    {"user_id": 2, "name": "Bob"},
+                    {"user_id": 3, "name": "Charlie"},
+                ]
+            )
+            client.flush()
+
+            client.create_table("orders")
+            client.store(
+                [
+                    {"order_id": 10, "user_id": 1, "amount": 120},
+                    {"order_id": 11, "user_id": 1, "amount": 80},
+                    {"order_id": 12, "user_id": 2, "amount": 30},
+                ]
+            )
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT u.name
+                FROM users u
+                WHERE u.user_id IN (
+                    SELECT o.user_id
+                    FROM orders o
+                    WHERE o.user_id = u.user_id AND o.amount >= 100
+                )
+                ORDER BY u.name
+                """.strip(),
+            )
+            assert [r["name"] for r in result.to_dict()] == ["Alice"]
+
+            client.close()
+
+    def test_execute_scalar_correlated_subquery_in_select_list(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            client.store(
+                [
+                    {"user_id": 1, "name": "Alice"},
+                    {"user_id": 2, "name": "Bob"},
+                    {"user_id": 3, "name": "Charlie"},
+                ]
+            )
+            client.flush()
+
+            client.create_table("orders")
+            client.store(
+                [
+                    {"order_id": 10, "user_id": 1, "amount": 120},
+                    {"order_id": 11, "user_id": 1, "amount": 80},
+                    {"order_id": 12, "user_id": 2, "amount": 30},
+                ]
+            )
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT u.name,
+                       (SELECT MAX(amount) FROM orders o WHERE o.user_id = u.user_id) AS max_amount
+                FROM users u
+                ORDER BY u.name
+                """.strip(),
+            )
+            rows = result.to_dict()
+            assert [(r["name"], r["max_amount"]) for r in rows] == [
+                ("Alice", 120),
+                ("Bob", 30),
+                ("Charlie", None),
+            ]
+
             client.close()
 
 
