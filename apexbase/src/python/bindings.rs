@@ -646,7 +646,8 @@ impl ApexStorage {
         let (columns, rows, rows_affected) = py.allow_threads(|| -> PyResult<(Vec<String>, Vec<Vec<Value>>, usize)> {
             let default_table = self.current_table.read().clone();
 
-            let parsed = crate::query::SqlParser::parse(&sql);
+            let parsed = crate::query::SqlParser::parse(&sql)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             fn stmt_has_join(stmt: &crate::query::SqlStatement) -> bool {
                 match stmt {
                     crate::query::SqlStatement::Select(sel) => !sel.joins.is_empty(),
@@ -740,10 +741,10 @@ impl ApexStorage {
                 }
             }
 
-            let is_join = matches!(parsed, Ok(ref s) if stmt_has_join(s));
-            let has_derived = matches!(parsed, Ok(ref s) if stmt_has_derived_from(s));
-            let has_in_subquery = matches!(parsed, Ok(ref s) if stmt_has_in_subquery(s));
-            let has_exists_subquery = matches!(parsed, Ok(ref s) if stmt_has_exists_subquery(s));
+            let is_join = stmt_has_join(&parsed);
+            let has_derived = stmt_has_derived_from(&parsed);
+            let has_in_subquery = stmt_has_in_subquery(&parsed);
+            let has_exists_subquery = stmt_has_exists_subquery(&parsed);
 
             // Robust fallback: scalar subquery in SELECT list looks like "(SELECT".
             // If present, route through the full SQL executor path.
@@ -752,20 +753,17 @@ impl ApexStorage {
             let mut tables = self.tables.write();
 
             let result = if is_join || has_derived || has_in_subquery || has_exists_subquery || has_scalar_subquery_text {
-                SqlExecutor::execute_with_tables(&sql, &mut tables, &default_table)
+                SqlExecutor::execute_with_tables_parsed(parsed, &mut tables, &default_table)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
             } else {
                 // Determine target table from SQL (fallback to current table)
-                let target_table = match parsed {
-                    Ok(ref stmt) => first_select_table(stmt).unwrap_or_else(|| default_table.clone()),
-                    Err(_) => default_table.clone(),
-                };
+                let target_table = first_select_table(&parsed).unwrap_or_else(|| default_table.clone());
 
                 let table = tables
                     .get_mut(&target_table)
                     .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
 
-                SqlExecutor::execute(&sql, table).map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                SqlExecutor::execute_parsed(parsed, table).map_err(|e| PyRuntimeError::new_err(e.to_string()))?
             };
 
             Ok((result.columns, result.rows, result.rows_affected))
@@ -799,7 +797,8 @@ impl ApexStorage {
         let batch = py.allow_threads(|| -> PyResult<arrow::record_batch::RecordBatch> {
             let default_table = self.current_table.read().clone();
 
-            let parsed = crate::query::SqlParser::parse(&sql);
+            let parsed = crate::query::SqlParser::parse(&sql)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             fn stmt_has_join(stmt: &crate::query::SqlStatement) -> bool {
                 match stmt {
                     crate::query::SqlStatement::Select(sel) => !sel.joins.is_empty(),
@@ -886,10 +885,10 @@ impl ApexStorage {
                 }
             }
 
-            let is_join = matches!(parsed, Ok(ref s) if stmt_has_join(s));
-            let has_derived = matches!(parsed, Ok(ref s) if stmt_has_derived_from(s));
-            let has_in_subquery = matches!(parsed, Ok(ref s) if stmt_has_in_subquery(s));
-            let has_exists_subquery = matches!(parsed, Ok(ref s) if stmt_has_exists_subquery(s));
+            let is_join = stmt_has_join(&parsed);
+            let has_derived = stmt_has_derived_from(&parsed);
+            let has_in_subquery = stmt_has_in_subquery(&parsed);
+            let has_exists_subquery = stmt_has_exists_subquery(&parsed);
 
             // Robust fallback: scalar subquery in SELECT list looks like "(SELECT".
             let has_scalar_subquery_text = sql.to_uppercase().contains("(SELECT");
@@ -897,17 +896,14 @@ impl ApexStorage {
             let mut tables = self.tables.write();
 
             if is_join || has_derived || has_in_subquery || has_exists_subquery || has_scalar_subquery_text {
-                let result = SqlExecutor::execute_with_tables(&sql, &mut tables, &default_table)
+                let result = SqlExecutor::execute_with_tables_parsed(parsed, &mut tables, &default_table)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 result
                     .to_record_batch()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             } else {
                 // Determine target table from SQL
-                let target_table = match parsed {
-                    Ok(ref stmt) => first_select_table(stmt).unwrap_or_else(|| default_table.clone()),
-                    Err(_) => default_table.clone(),
-                };
+                let target_table = first_select_table(&parsed).unwrap_or_else(|| default_table.clone());
 
                 let table = tables
                     .get_mut(&target_table)

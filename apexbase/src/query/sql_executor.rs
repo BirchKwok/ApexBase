@@ -16,6 +16,44 @@ use crate::io_engine::{IoEngine, StreamingFilterEvaluator};
 use std::collections::HashMap;
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
+ 
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum JoinKey {
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F32(u32),
+    F64(u64),
+    String(String),
+    Binary(Vec<u8>),
+    Bytes(Vec<u8>),
+}
+
+#[inline]
+fn join_key(v: &crate::data::Value) -> JoinKey {
+    use crate::data::Value;
+    match v {
+        Value::Null => JoinKey::Bytes(Vec::new()),
+        Value::Bool(b) => JoinKey::Bool(*b),
+        Value::Int8(x) => JoinKey::I64(*x as i64),
+        Value::Int16(x) => JoinKey::I64(*x as i64),
+        Value::Int32(x) => JoinKey::I64(*x as i64),
+        Value::Int64(x) => JoinKey::I64(*x),
+        Value::UInt8(x) => JoinKey::U64(*x as u64),
+        Value::UInt16(x) => JoinKey::U64(*x as u64),
+        Value::UInt32(x) => JoinKey::U64(*x as u64),
+        Value::UInt64(x) => JoinKey::U64(*x),
+        Value::Float32(x) => JoinKey::F32(x.to_bits()),
+        Value::Float64(x) => JoinKey::F64(x.to_bits()),
+        Value::String(s) => JoinKey::String(s.clone()),
+        Value::Binary(b) => JoinKey::Binary(b.clone()),
+        Value::Json(j) => JoinKey::Bytes(j.to_string().into_bytes()),
+        Value::Timestamp(t) => JoinKey::I64(*t),
+        Value::Date(d) => JoinKey::I64(*d as i64),
+        Value::Array(arr) => JoinKey::Bytes(crate::data::Value::Array(arr.clone()).to_bytes()),
+    }
+}
 
 // StreamingFilterEvaluator is now provided by IoEngine
 
@@ -152,7 +190,11 @@ impl SqlExecutor {
         use crate::query::sql_parser::SqlParser;
         
         let stmt = SqlParser::parse(sql)?;
-        
+
+        Self::execute_parsed(stmt, table)
+    }
+
+    pub fn execute_parsed(stmt: SqlStatement, table: &mut ColumnTable) -> Result<SqlResult, ApexError> {
         match stmt {
             SqlStatement::Select(select) => Self::execute_select(select, table),
             SqlStatement::Union(union) => Self::execute_union(union, table),
@@ -167,6 +209,15 @@ impl SqlExecutor {
         use crate::query::sql_parser::SqlParser;
 
         let stmt = SqlParser::parse(sql)?;
+
+        Self::execute_with_tables_parsed(stmt, tables, default_table)
+    }
+
+    pub fn execute_with_tables_parsed(
+        stmt: SqlStatement,
+        tables: &mut HashMap<String, ColumnTable>,
+        default_table: &str,
+    ) -> Result<SqlResult, ApexError> {
         match stmt {
             SqlStatement::Select(select) => {
                 if !select.joins.is_empty() {
@@ -2240,7 +2291,7 @@ impl SqlExecutor {
                 where_pushed_down = true;
             }
         }
-        let mut hash: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut hash: HashMap<JoinKey, Vec<usize>> = HashMap::new();
         for ri in 0..right_row_count {
             if right_deleted.get(ri) {
                 continue;
@@ -2254,7 +2305,7 @@ impl SqlExecutor {
             if v.is_null() {
                 continue;
             }
-            hash.entry(v.to_string_value()).or_default().push(ri);
+            hash.entry(join_key(&v)).or_default().push(ri);
         }
 
         let left_row_count = left_table.get_row_count();
@@ -2265,23 +2316,19 @@ impl SqlExecutor {
                 continue;
             }
             let lv = get_col_value(left_table, &left_key_col, li);
-            let matches = if lv.is_null() {
-                None
-            } else {
-                hash.get(&lv.to_string_value()).cloned()
-            };
+            let matches = if lv.is_null() { None } else { hash.get(&join_key(&lv)) };
 
             match join.join_type {
                 crate::query::JoinType::Inner => {
                     if let Some(rs) = matches {
-                        for r in rs {
+                        for &r in rs {
                             joined.push(JoinRow { left: li, right: Some(r) });
                         }
                     }
                 }
                 crate::query::JoinType::Left => {
                     if let Some(rs) = matches {
-                        for r in rs {
+                        for &r in rs {
                             joined.push(JoinRow { left: li, right: Some(r) });
                         }
                     } else {

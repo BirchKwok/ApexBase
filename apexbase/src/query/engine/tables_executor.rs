@@ -1,5 +1,5 @@
 use crate::query::engine::tables_plan::TablesPlan;
-use crate::query::engine::ops::{aggregate_join_rows, build_join_rows, project_join_rows_plain, sort_join_rows, JoinContext, JoinRow};
+use crate::query::engine::ops::{aggregate_join_rows, build_join_rows, project_join_rows_plain, sort_join_rows, try_aggregate_join_rows_fast_path, JoinContext, JoinRow};
 use crate::query::SqlResult;
 use crate::table::ColumnTable;
 use crate::ApexError;
@@ -48,6 +48,9 @@ impl PlanExecutorTables {
             TablesPlan::Project { stmt, input } => {
                 // Aggregate/group-by/having: now executed natively (still on JoinRow references).
                 if Self::stmt_has_aggregates(stmt) || !stmt.group_by.is_empty() || stmt.having.is_some() {
+                    if let Some(res) = try_aggregate_join_rows_fast_path(stmt, tables)? {
+                        return Ok(res);
+                    }
                     let (ctx, rows) = build_join_rows(stmt, tables)?;
                     return aggregate_join_rows(stmt, &ctx, &rows, tables);
                 }

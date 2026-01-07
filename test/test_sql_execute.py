@@ -17,6 +17,7 @@ from pathlib import Path
 import sys
 import os
 import numpy as np
+import time
 
 # Add the apexbase python module to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'apexbase', 'python'))
@@ -79,6 +80,121 @@ class TestBasicSQLExecute:
             assert "city" in result.columns
             assert "_id" not in result.columns  # _id should be hidden
             
+            client.close()
+
+    def test_execute_join_group_by_agg_order_alias_flexible(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            client.store([
+                {"user_id": 1, "name": "Alice", "tier": "pro"},
+                {"user_id": 2, "name": "Bob", "tier": "free"},
+                {"user_id": 3, "name": "Charlie", "tier": "pro"},
+            ])
+            client.flush()
+
+            client.create_table("orders")
+            client.store([
+                {"order_id": 10, "user_id": 1, "amount": 120},
+                {"order_id": 11, "user_id": 1, "amount": 80},
+                {"order_id": 12, "user_id": 2, "amount": 30},
+                {"order_id": 13, "user_id": 3, "amount": 200},
+            ])
+            client.flush()
+
+            # Select order/aliases differ from perf case; should still be correct.
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT SUM(o.amount) AS s, u.tier AS t, COUNT(*) AS c
+                FROM users u
+                JOIN orders o ON u.user_id = o.user_id
+                WHERE o.amount >= 50
+                GROUP BY u.tier
+                ORDER BY s DESC
+                """.strip(),
+            )
+            rows = result.to_dict()
+            assert [r["t"] for r in rows] == ["pro"]
+            assert rows[0]["c"] == 3
+            assert rows[0]["s"] == 400
+
+            client.close()
+
+    def test_execute_join_group_by_count_col(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            client.store([
+                {"user_id": 1, "tier": "pro"},
+                {"user_id": 2, "tier": "free"},
+            ])
+            client.flush()
+
+            client.create_table("orders")
+            client.store([
+                {"order_id": 10, "user_id": 1, "amount": 120},
+                {"order_id": 11, "user_id": 1, "amount": None},
+                {"order_id": 12, "user_id": 2, "amount": 80},
+            ])
+            client.flush()
+
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT u.tier, COUNT(o.amount) AS cnt
+                FROM users u
+                JOIN orders o ON u.user_id = o.user_id
+                GROUP BY u.tier
+                ORDER BY u.tier
+                """.strip(),
+            )
+            rows = result.to_dict()
+            assert [(r["tier"], r["cnt"]) for r in rows] == [("free", 1), ("pro", 2)]
+
+            client.close()
+
+    def test_execute_join_group_by_min_max_avg_with_and_where(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            client.store([
+                {"user_id": 1, "tier": "pro"},
+                {"user_id": 2, "tier": "free"},
+                {"user_id": 3, "tier": "pro"},
+            ])
+            client.flush()
+
+            client.create_table("orders")
+            client.store([
+                {"order_id": 10, "user_id": 1, "amount": 120},
+                {"order_id": 11, "user_id": 1, "amount": 80},
+                {"order_id": 12, "user_id": 2, "amount": 30},
+                {"order_id": 13, "user_id": 3, "amount": 200},
+            ])
+            client.flush()
+
+            # AND predicates split across both tables.
+            result = _execute_or_xfail(
+                client,
+                """
+                SELECT u.tier, MIN(o.amount) AS mi, MAX(o.amount) AS ma, AVG(o.amount) AS av
+                FROM users u
+                JOIN orders o ON u.user_id = o.user_id
+                WHERE u.tier = 'pro' AND o.amount >= 80
+                GROUP BY u.tier
+                """.strip(),
+            )
+            rows = result.to_dict()
+            assert len(rows) == 1
+            assert rows[0]["tier"] == "pro"
+            assert rows[0]["mi"] == 80
+            assert rows[0]["ma"] == 200
+            assert rows[0]["av"] == pytest.approx((120 + 80 + 200) / 3)
+
             client.close()
 
     def test_execute_aggregate_implicit_alias_keyword(self):
@@ -1628,6 +1744,138 @@ class TestSQLPerformance:
                 except Exception:
                     pass  # Arrow optimization might not be active
             
+            client.close()
+
+
+def _store_rows_in_chunks(client: ApexClient, rows_iter, chunk_size: int = 50_000):
+    buf = []
+    for r in rows_iter:
+        buf.append(r)
+        if len(buf) >= chunk_size:
+            client.store(buf)
+            buf.clear()
+    if buf:
+        client.store(buf)
+
+
+class TestSQLPerformance1M:
+    @pytest.mark.perf
+    @pytest.mark.slow
+    def test_perf_1m_join_filter_order_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("users")
+            t_store0 = time.perf_counter()
+            _store_rows_in_chunks(
+                client,
+                ({"user_id": i, "tier": "pro" if (i % 10 == 0) else "free"} for i in range(200_000)),
+                chunk_size=50_000,
+            )
+            t_store1 = time.perf_counter()
+            client.flush()
+            t_flush1 = time.perf_counter()
+
+            client.create_table("orders")
+            _store_rows_in_chunks(
+                client,
+                (
+                    {
+                        "order_id": i,
+                        "user_id": i % 200_000,
+                        "amount": (i % 97) * 1.0,
+                    }
+                    for i in range(1_000_000)
+                ),
+                chunk_size=50_000,
+            )
+            t_store2 = time.perf_counter()
+            client.flush()
+            t_flush2 = time.perf_counter()
+
+            sql = """
+            SELECT u.tier, COUNT(*) AS c, SUM(o.amount) AS s
+            FROM users u
+            JOIN orders o ON u.user_id = o.user_id
+            WHERE o.amount >= 50
+            GROUP BY u.tier
+            ORDER BY s DESC
+            LIMIT 10
+            """.strip()
+
+            # Warmup + repeated runs to measure executor-only improvements
+            _execute_or_xfail(client, sql).to_dict()
+            times = []
+            for _ in range(5):
+                t0 = time.perf_counter()
+                result = _execute_or_xfail(client, sql)
+                rows = result.to_dict()
+                t1 = time.perf_counter()
+                times.append(t1 - t0)
+
+            assert isinstance(rows, list)
+            assert len(rows) <= 2
+            assert all("tier" in r and "c" in r and "s" in r for r in rows)
+            avg = sum(times) / len(times)
+            print(
+                f"perf_1m_join_filter_order_limit: query_avg={avg:.3f}s query_runs={[round(x, 3) for x in times]} "
+                f"store_users={t_store1 - t_store0:.3f}s flush_users={t_flush1 - t_store1:.3f}s "
+                f"store_orders={t_store2 - t_flush1:.3f}s flush_orders={t_flush2 - t_store2:.3f}s"
+            )
+
+            client.close()
+
+    @pytest.mark.perf
+    @pytest.mark.slow
+    def test_perf_1m_nested_subquery_two_stage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            t_store0 = time.perf_counter()
+            _store_rows_in_chunks(
+                client,
+                (
+                    {
+                        "k": i,
+                        "region": f"r{i % 200}",
+                        "channel": f"c{i % 20}",
+                        "amount": float(i % 101),
+                    }
+                    for i in range(1_000_000)
+                ),
+                chunk_size=50_000,
+            )
+            t_store1 = time.perf_counter()
+            client.flush()
+            t_flush1 = time.perf_counter()
+
+            sql = """
+            SELECT COUNT(*) AS big_groups
+            FROM (
+                SELECT region, channel, SUM(amount) AS s
+                FROM default
+                GROUP BY region, channel
+                HAVING SUM(amount) >= 20000
+            ) t
+            WHERE t.s >= 20000
+            """.strip()
+
+            _execute_or_xfail(client, sql).scalar()
+            times = []
+            for _ in range(5):
+                t0 = time.perf_counter()
+                result = _execute_or_xfail(client, sql)
+                v = result.scalar()
+                t1 = time.perf_counter()
+                times.append(t1 - t0)
+
+            assert v is None or isinstance(v, (int, float, np.integer, np.floating))
+            avg = sum(times) / len(times)
+            print(
+                f"perf_1m_nested_subquery_two_stage: query_avg={avg:.3f}s query_runs={[round(x, 3) for x in times]} "
+                f"store={t_store1 - t_store0:.3f}s flush={t_flush1 - t_store1:.3f}s"
+            )
+
             client.close()
 
 

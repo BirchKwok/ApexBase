@@ -517,8 +517,56 @@ impl SqlParser {
             Token::Identifier(s) => {
                 let u = s.to_uppercase();
                 // Keep list small and stable; used only for human-friendly hints.
-                const KWS: [&str; 10] = [
-                    "SELECT", "FROM", "WHERE", "LIKE", "LIMIT", "OFFSET", "ORDER", "GROUP", "HAVING", "DISTINCT",
+                const KWS: [&str; 49] = [
+                    "SELECT",
+                    "FROM",
+                    "WHERE",
+                    "AND",
+                    "OR",
+                    "NOT",
+                    "AS",
+                    "DISTINCT",
+                    "ORDER",
+                    "BY",
+                    "ASC",
+                    "DESC",
+                    "LIMIT",
+                    "OFFSET",
+                    "NULLS",
+                    "FIRST",
+                    "LAST",
+                    "LIKE",
+                    "IN",
+                    "BETWEEN",
+                    "IS",
+                    "NULL",
+                    "GROUP",
+                    "HAVING",
+                    "COUNT",
+                    "SUM",
+                    "AVG",
+                    "MIN",
+                    "MAX",
+                    "TRUE",
+                    "FALSE",
+                    "REGEXP",
+                    "OVER",
+                    "PARTITION",
+                    "JOIN",
+                    "LEFT",
+                    "RIGHT",
+                    "FULL",
+                    "INNER",
+                    "OUTER",
+                    "ON",
+                    "UNION",
+                    "ALL",
+                    "EXISTS",
+                    "CASE",
+                    "WHEN",
+                    "THEN",
+                    "ELSE",
+                    "END",
                 ];
 
                 // Fast path for common "plural" / extra trailing char typos: FROMs, WHEREs, LIKEs, LIMITs
@@ -596,10 +644,11 @@ impl SqlParser {
             Ok(())
         } else {
             let (start, _) = self.current_span();
-            Err(self.syntax_error(
-                start,
-                format!("Expected {:?}, got {:?}", expected, self.current()),
-            ))
+            let mut msg = format!("Expected {:?}, got {:?}", expected, self.current());
+            if let Some(kw) = self.keyword_suggestion() {
+                msg = format!("{} (did you mean {}?)", msg, kw);
+            }
+            Err(self.syntax_error(start, msg))
         }
     }
 
@@ -1765,5 +1814,23 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Syntax error"));
         assert!(msg.contains("did you mean SELECT"));
+    }
+
+    #[test]
+    fn test_syntax_error_misspelled_select_keyword_selects() {
+        let sql = "selects max(_id) from default";
+        let err = SqlParser::parse(sql).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Syntax error"));
+        assert!(msg.contains("did you mean SELECT"));
+    }
+
+    #[test]
+    fn test_syntax_error_misspelled_join_keyword() {
+        let sql = "select * from t1 joinn t2 on t1.id = t2.id";
+        let err = SqlParser::parse(sql).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Syntax error"));
+        assert!(msg.contains("did you mean JOIN"));
     }
 }
