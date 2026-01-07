@@ -1,8 +1,9 @@
 //! Query executor - parses and executes queries
 
-use super::filter::{CompareOp, Filter};
-use crate::data::Value;
+use super::filter::Filter;
 use crate::{ApexError, Result};
+use crate::query::sql_expr_to_filter;
+use crate::query::sql_parser::SqlParser;
 
 /// Query executor
 pub struct QueryExecutor;
@@ -22,211 +23,9 @@ impl QueryExecutor {
             return Ok(Filter::True);
         }
 
-        // Handle AND/OR at top level
-        if let Some(filter) = self.try_parse_logical(where_clause)? {
-            return Ok(filter);
-        }
-
-        // Parse single condition
-        self.parse_condition(where_clause)
-    }
-
-    /// Try to parse logical operators (AND/OR)
-    fn try_parse_logical(&self, clause: &str) -> Result<Option<Filter>> {
-        // Split by AND (case insensitive)
-        let and_parts: Vec<&str> = self.split_by_and(clause);
-        if and_parts.len() > 1 {
-            let filters: Result<Vec<Filter>> = and_parts
-                .iter()
-                .map(|part| self.parse_condition(part.trim()))
-                .collect();
-            return Ok(Some(Filter::And(filters?)));
-        }
-
-        // Split by OR (case insensitive)
-        let or_parts: Vec<&str> = self.split_by_or(clause);
-        if or_parts.len() > 1 {
-            let filters: Result<Vec<Filter>> = or_parts
-                .iter()
-                .map(|part| self.parse_condition(part.trim()))
-                .collect();
-            return Ok(Some(Filter::Or(filters?)));
-        }
-
-        Ok(None)
-    }
-
-    /// Split by AND (respecting quotes and parentheses)
-    fn split_by_and<'a>(&self, s: &'a str) -> Vec<&'a str> {
-        self.split_by_keyword(s, " AND ")
-    }
-
-    /// Split by OR (respecting quotes and parentheses)
-    fn split_by_or<'a>(&self, s: &'a str) -> Vec<&'a str> {
-        self.split_by_keyword(s, " OR ")
-    }
-
-    /// Split by keyword (case insensitive)
-    fn split_by_keyword<'a>(&self, s: &'a str, keyword: &str) -> Vec<&'a str> {
-        let upper = s.to_uppercase();
-        let mut parts = Vec::new();
-        let mut last = 0;
-        let mut in_quote = false;
-        let mut paren_depth = 0;
-
-        let keyword_upper = keyword.to_uppercase();
-        
-        for (i, c) in s.char_indices() {
-            match c {
-                '\'' | '"' => in_quote = !in_quote,
-                '(' if !in_quote => paren_depth += 1,
-                ')' if !in_quote => paren_depth -= 1,
-                _ => {}
-            }
-
-            if !in_quote && paren_depth == 0 {
-                if upper[i..].starts_with(&keyword_upper) {
-                    parts.push(&s[last..i]);
-                    last = i + keyword.len();
-                }
-            }
-        }
-
-        if last < s.len() {
-            parts.push(&s[last..]);
-        }
-
-        if parts.is_empty() {
-            vec![s]
-        } else {
-            parts
-        }
-    }
-
-    /// Parse a single condition
-    fn parse_condition(&self, cond: &str) -> Result<Filter> {
-        let cond = cond.trim();
-
-        // Handle LIKE
-        if let Some(filter) = self.try_parse_like(cond)? {
-            return Ok(filter);
-        }
-
-        // Handle IN
-        if let Some(filter) = self.try_parse_in(cond)? {
-            return Ok(filter);
-        }
-
-        // Handle comparison operators
-        self.parse_comparison(cond)
-    }
-
-    /// Try to parse LIKE condition
-    fn try_parse_like(&self, cond: &str) -> Result<Option<Filter>> {
-        let upper = cond.to_uppercase();
-        if let Some(pos) = upper.find(" LIKE ") {
-            let field = cond[..pos].trim().to_string();
-            let pattern = cond[pos + 6..].trim();
-            let pattern = self.unquote(pattern);
-            return Ok(Some(Filter::Like { field, pattern }));
-        }
-        Ok(None)
-    }
-
-    /// Try to parse IN condition
-    fn try_parse_in(&self, cond: &str) -> Result<Option<Filter>> {
-        let upper = cond.to_uppercase();
-        if let Some(pos) = upper.find(" IN ") {
-            let field = cond[..pos].trim().to_string();
-            let values_str = cond[pos + 4..].trim();
-            
-            // Parse values list: (val1, val2, ...)
-            if values_str.starts_with('(') && values_str.ends_with(')') {
-                let inner = &values_str[1..values_str.len() - 1];
-                let values: Vec<Value> = inner
-                    .split(',')
-                    .map(|v| self.parse_value(v.trim()))
-                    .collect();
-                return Ok(Some(Filter::In { field, values }));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Parse comparison condition
-    fn parse_comparison(&self, cond: &str) -> Result<Filter> {
-        // Try different operators in order of specificity
-        let operators = [
-            (">=", CompareOp::GreaterEqual),
-            ("<=", CompareOp::LessEqual),
-            ("!=", CompareOp::NotEqual),
-            ("<>", CompareOp::NotEqual),
-            (">", CompareOp::GreaterThan),
-            ("<", CompareOp::LessThan),
-            ("=", CompareOp::Equal),
-        ];
-
-        for (op_str, op) in operators {
-            if let Some(pos) = cond.find(op_str) {
-                let field = cond[..pos].trim().to_string();
-                let value_str = cond[pos + op_str.len()..].trim();
-                let value = self.parse_value(value_str);
-
-                return Ok(Filter::Compare { field, op, value });
-            }
-        }
-
-        Err(ApexError::QueryParseError(format!(
-            "Invalid condition: {}",
-            cond
-        )))
-    }
-
-    /// Parse a value from string
-    fn parse_value(&self, s: &str) -> Value {
-        let s = s.trim();
-
-        // Handle quoted strings
-        if (s.starts_with('\'') && s.ends_with('\''))
-            || (s.starts_with('"') && s.ends_with('"'))
-        {
-            return Value::String(self.unquote(s));
-        }
-
-        // Handle boolean
-        let upper = s.to_uppercase();
-        if upper == "TRUE" {
-            return Value::Bool(true);
-        }
-        if upper == "FALSE" {
-            return Value::Bool(false);
-        }
-        if upper == "NULL" {
-            return Value::Null;
-        }
-
-        // Handle numbers
-        if let Ok(i) = s.parse::<i64>() {
-            return Value::Int64(i);
-        }
-        if let Ok(f) = s.parse::<f64>() {
-            return Value::Float64(f);
-        }
-
-        // Default to string
-        Value::String(s.to_string())
-    }
-
-    /// Remove quotes from a string
-    fn unquote(&self, s: &str) -> String {
-        let s = s.trim();
-        if (s.starts_with('\'') && s.ends_with('\''))
-            || (s.starts_with('"') && s.ends_with('"'))
-        {
-            s[1..s.len() - 1].to_string()
-        } else {
-            s.to_string()
-        }
+        // Unified SQL semantics: parse as SQL expression and compile to Filter
+        let expr = SqlParser::parse_expression(where_clause)?;
+        sql_expr_to_filter(&expr).map_err(|e| ApexError::QueryParseError(e.to_string()))
     }
 }
 
@@ -240,6 +39,7 @@ impl Default for QueryExecutor {
 mod tests {
     use super::*;
     use crate::data::Row;
+    use crate::data::Value;
 
     fn make_row(id: u64, name: &str, age: i64, city: &str) -> Row {
         let mut row = Row::new(id);

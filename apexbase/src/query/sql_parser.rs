@@ -245,6 +245,29 @@ impl SqlParser {
         parser.parse_statement()
     }
 
+    /// Parse a standalone SQL expression (same grammar as WHERE/HAVING).
+    ///
+    /// This is used to unify the non-SQL query language with SQL semantics.
+    pub fn parse_expression(expr: &str) -> Result<SqlExpr, ApexError> {
+        let tokens = Self::tokenize(expr)?;
+        let mut parser = SqlParser {
+            sql_chars: expr.chars().collect(),
+            tokens,
+            pos: 0,
+        };
+        let e = parser.parse_expr()?;
+
+        if !matches!(parser.current(), Token::Eof) {
+            let (start, _) = parser.current_span();
+            return Err(parser.syntax_error(
+                start,
+                format!("Unexpected token {:?} after end of expression", parser.current()),
+            ));
+        }
+
+        Ok(e)
+    }
+
     /// Tokenize SQL string
     fn tokenize(sql: &str) -> Result<Vec<SpannedToken>, ApexError> {
         let mut tokens: Vec<SpannedToken> = Vec::new();
@@ -689,10 +712,15 @@ impl SqlParser {
     }
 
     // Parse a SELECT used as a UNION operand: does not consume ORDER BY / LIMIT / OFFSET.
+    pub fn parse_select_statement(&mut self) -> Result<SelectStatement, ApexError> {
+        self.parse_select_internal(false)
+    }
+
     fn parse_select_part(&mut self) -> Result<SelectStatement, ApexError> {
         self.parse_select_internal(false)
     }
 
+    #[allow(dead_code)]
     fn parse_select(&mut self) -> Result<SelectStatement, ApexError> {
         self.parse_select_internal(true)
     }
@@ -1622,18 +1650,28 @@ mod tests {
     fn test_simple_select() {
         let sql = "SELECT * FROM users";
         let stmt = SqlParser::parse(sql).unwrap();
-        let SqlStatement::Select(s) = stmt;
+        let SqlStatement::Select(s) = stmt else {
+            panic!("expected select");
+        };
         assert!(!s.distinct);
         assert_eq!(s.columns.len(), 1);
         assert!(matches!(s.columns[0], SelectColumn::All));
-        assert_eq!(s.from, Some("users".to_string()));
+        assert!(matches!(
+            s.from,
+            Some(FromItem::Table {
+                table,
+                alias: None
+            }) if table == "users"
+        ));
     }
 
     #[test]
     fn test_select_with_where() {
         let sql = "SELECT name, age FROM users WHERE age > 18 AND name LIKE 'John%'";
         let stmt = SqlParser::parse(sql).unwrap();
-        let SqlStatement::Select(s) = stmt;
+        let SqlStatement::Select(s) = stmt else {
+            panic!("expected select");
+        };
         assert_eq!(s.columns.len(), 2);
         assert!(s.where_clause.is_some());
     }
@@ -1642,7 +1680,9 @@ mod tests {
     fn test_select_with_order_limit() {
         let sql = "SELECT * FROM users ORDER BY age DESC LIMIT 10 OFFSET 5";
         let stmt = SqlParser::parse(sql).unwrap();
-        let SqlStatement::Select(s) = stmt;
+        let SqlStatement::Select(s) = stmt else {
+            panic!("expected select");
+        };
         assert_eq!(s.order_by.len(), 1);
         assert!(s.order_by[0].descending);
         assert_eq!(s.limit, Some(10));
@@ -1653,10 +1693,12 @@ mod tests {
     fn test_select_qualified_id() {
         let sql = "SELECT default._id, name FROM default ORDER BY default._id";
         let stmt = SqlParser::parse(sql).unwrap();
-        let SqlStatement::Select(s) = stmt;
+        let SqlStatement::Select(s) = stmt else {
+            panic!("expected select");
+        };
         assert_eq!(s.columns.len(), 2);
         match &s.columns[0] {
-            SelectColumn::Column(c) => assert_eq!(c, "_id"),
+            SelectColumn::Column(c) => assert_eq!(c, "default._id"),
             other => panic!("unexpected column: {:?}", other),
         }
         match &s.columns[1] {
@@ -1664,14 +1706,16 @@ mod tests {
             other => panic!("unexpected column: {:?}", other),
         }
         assert_eq!(s.order_by.len(), 1);
-        assert_eq!(s.order_by[0].column, "_id");
+        assert_eq!(s.order_by[0].column, "default._id");
     }
 
     #[test]
     fn test_select_quoted_id() {
         let sql = "SELECT \"_id\", name FROM default ORDER BY \"_id\"";
         let stmt = SqlParser::parse(sql).unwrap();
-        let SqlStatement::Select(s) = stmt;
+        let SqlStatement::Select(s) = stmt else {
+            panic!("expected select");
+        };
         assert_eq!(s.columns.len(), 2);
         match &s.columns[0] {
             SelectColumn::Column(c) => assert_eq!(c, "_id"),

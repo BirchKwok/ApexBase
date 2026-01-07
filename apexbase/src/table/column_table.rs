@@ -6,7 +6,7 @@
 //! - Fast lookups: O(1) by ID via HashMap index
 
 use crate::data::{DataType, Value};
-use crate::query::{Filter, QueryExecutor};
+use crate::query::Filter;
 use crate::Result;
 use crate::table::arrow_column::ArrowStringColumn;
 use serde::{Deserialize, Serialize};
@@ -1703,22 +1703,8 @@ impl ColumnTable {
     pub fn query_with_limit(&mut self, where_clause: &str, limit: Option<usize>) -> Result<Vec<HashMap<String, Value>>> {
         // Flush write buffer before querying
         self.flush_write_buffer();
-        
-        let executor = QueryExecutor::new();
-        let filter = executor.parse(where_clause)?;
-        
-        // If limit is specified, use streaming early termination
-        if let Some(max_rows) = limit {
-            return self.query_streaming(&filter, max_rows);
-        }
-        
-        // Use column-based filtering for better performance
-        let matching_indices = filter.filter_columns(
-            &self.schema,
-            &self.columns,
-            self.row_count,
-            &self.deleted,
-        );
+
+        let matching_indices = crate::query::plan_query_indices(self, where_clause, limit, 0)?;
         
         let mut results = Vec::with_capacity(matching_indices.len());
         for row_idx in matching_indices {
@@ -1730,6 +1716,7 @@ impl ColumnTable {
     }
     
     /// Streaming query with early termination - stops after finding `limit` matches
+    #[allow(dead_code)]
     fn query_streaming(&self, filter: &Filter, limit: usize) -> Result<Vec<HashMap<String, Value>>> {
         let mut results = Vec::with_capacity(limit);
         let mut found = 0;
@@ -1753,6 +1740,7 @@ impl ColumnTable {
     
     /// Check if a single row matches the filter
     #[inline]
+    #[allow(dead_code)]
     fn filter_matches_row(&self, filter: &Filter, row_idx: usize) -> bool {
         use crate::query::{LikeMatcher, RegexpMatcher};
         
@@ -1823,6 +1811,7 @@ impl ColumnTable {
     
     /// Compare two values with the given operator
     #[inline]
+    #[allow(dead_code)]
     fn compare_values(row_val: &Value, op: &crate::query::CompareOp, target: &Value) -> bool {
         use crate::query::CompareOp;
         match op {
@@ -1845,16 +1834,7 @@ impl ColumnTable {
     /// 
     /// Used by get_ids() method for high-performance ID retrieval
     pub fn query_ids_only(&self, where_clause: &str) -> Result<Vec<u64>> {
-        let executor = QueryExecutor::new();
-        let filter = executor.parse(where_clause)?;
-        
-        // Use column-based filtering (only reads columns needed for filter)
-        let matching_indices = filter.filter_columns(
-            &self.schema,
-            &self.columns,
-            self.row_count,
-            &self.deleted,
-        );
+        let matching_indices = crate::query::plan_query_indices(self, where_clause, None, 0)?;
         
         // IDs = row indices (direct conversion, no data column reads)
         Ok(matching_indices.iter().map(|&i| i as u64).collect())
@@ -1871,21 +1851,12 @@ impl ColumnTable {
         use arrow::array::{DictionaryArray, StringArray};
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use arrow::buffer::{NullBuffer, ScalarBuffer};
-        use arrow::datatypes::Int32Type;
         use rayon::prelude::*;
         use std::sync::Arc;
 
         self.flush_write_buffer();
 
-        let executor = QueryExecutor::new();
-        let filter = executor.parse(where_clause)?;
-
-        let matching_indices = filter.filter_columns(
-            &self.schema,
-            &self.columns,
-            self.row_count,
-            &self.deleted,
-        );
+        let matching_indices = crate::query::plan_query_indices(self, where_clause, None, 0)?;
         let num_rows = matching_indices.len();
 
         // Build schema
@@ -2181,6 +2152,7 @@ impl ColumnTable {
     /// Uses direct buffer construction instead of StringBuilder for better performance.
     /// Pre-calculates total bytes to avoid reallocation.
     #[inline]
+    #[allow(dead_code)]
     fn build_string_array_contiguous(data: &[String], nulls: &BitVec, num_rows: usize) -> std::sync::Arc<dyn arrow::array::Array> {
         use arrow::array::StringArray;
         use arrow::buffer::{OffsetBuffer, Buffer};
@@ -2239,6 +2211,7 @@ impl ColumnTable {
     
     /// Build Arrow StringArray with gather from non-contiguous indices
     #[inline]
+    #[allow(dead_code)]
     fn build_string_array_gather(data: &[String], nulls: &BitVec, indices: &[usize]) -> std::sync::Arc<dyn arrow::array::Array> {
         use arrow::array::{StringBuilder, StringArray};
         use arrow::buffer::{OffsetBuffer, Buffer};

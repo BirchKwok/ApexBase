@@ -4,8 +4,9 @@
 //! Uses IoEngine for all data read operations.
 
 use crate::ApexError;
-use crate::data::{Row, Value};
+use crate::data::Value;
 use crate::query::Filter;
+use crate::query::sql_expr_to_filter;
 use crate::query::sql_parser::{
     SqlStatement, SelectStatement, SelectColumn, SqlExpr, 
     BinaryOperator, UnaryOperator, OrderByClause, AggregateFunc, FromItem
@@ -132,104 +133,15 @@ pub struct SqlExecutor;
 // All other queries keep using the existing highly-optimized legacy paths.
 mod simple_pipeline {
     use super::*;
+    use crate::query::engine::{PlanBuilder, PlanExecutor};
 
     pub(super) fn is_eligible(stmt: &SelectStatement) -> bool {
-        if !stmt.joins.is_empty() {
-            return false;
-        }
-        if !stmt.group_by.is_empty() {
-            return false;
-        }
-        if stmt.having.is_some() {
-            return false;
-        }
-
-        // Aggregates / window functions / expression projection are handled by legacy paths for now.
-        for c in &stmt.columns {
-            match c {
-                SelectColumn::All | SelectColumn::Column(_) | SelectColumn::ColumnAlias { .. } => {}
-                _ => return false,
-            }
-        }
-
-        true
+        crate::query::engine::is_simple_select_eligible(stmt)
     }
 
     pub(super) fn execute(stmt: &SelectStatement, table: &ColumnTable) -> Result<SqlResult, ApexError> {
-        // Step 1: Scan (materialize matching row indices)
-        let matching_indices: Vec<usize> = if let Some(ref where_expr) = stmt.where_clause {
-            SqlExecutor::evaluate_where(where_expr, table)?
-        } else {
-            // All non-deleted rows
-            let row_count = table.get_row_count();
-            let deleted = table.deleted_ref();
-            let mut idxs = Vec::with_capacity(row_count);
-            for i in 0..row_count {
-                if !deleted.get(i) {
-                    idxs.push(i);
-                }
-            }
-            idxs
-        };
-
-        // Step 2: Bind projection
-        let (result_columns, column_indices) = SqlExecutor::resolve_columns(&stmt.columns, table)?;
-
-        // Step 3: Sort (optional)
-        let mut indices = matching_indices;
-        if !stmt.order_by.is_empty() {
-            // Use top-k sorter for both cases:
-            // - when LIMIT is present: k = offset + limit
-            // - when LIMIT is absent: k = indices.len() (full sort)
-            let k = if let Some(lim) = stmt.limit {
-                stmt.offset.unwrap_or(0).saturating_add(lim)
-            } else {
-                indices.len()
-            };
-            indices = SqlExecutor::sort_indices_by_columns_topk(&indices, &stmt.order_by, table, k)?;
-        }
-
-        // Step 4: Limit/Offset
-        let off = stmt.offset.unwrap_or(0);
-        let lim = stmt.limit.unwrap_or(usize::MAX);
-        let indices: Vec<usize> = indices.into_iter().skip(off).take(lim).collect();
-
-        // Step 5: Project
-        // Prefer Arrow gather path when possible (same as legacy).
-        if indices.len() > 10_000 {
-            return SqlExecutor::build_arrow_direct(&result_columns, &column_indices, &indices, table);
-        }
-
-        let schema = table.schema_ref();
-        let cols = table.columns_ref();
-        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
-        for row_idx in indices {
-            let mut row = Vec::with_capacity(column_indices.len());
-            for (col_name, col_idx) in &column_indices {
-                if col_name == "_id" {
-                    row.push(Value::Int64(row_idx as i64));
-                } else if let Some(idx) = col_idx {
-                    row.push(cols[*idx].get(row_idx).unwrap_or(Value::Null));
-                } else {
-                    // Best-effort: re-resolve by name if needed
-                    if let Some(idx) = schema.get_index(col_name) {
-                        row.push(cols[idx].get(row_idx).unwrap_or(Value::Null));
-                    } else {
-                        row.push(Value::Null);
-                    }
-                }
-            }
-            rows.push(row);
-        }
-
-        // DISTINCT for simple pipeline (optional). Legacy has more optimized variants.
-        let rows = if stmt.distinct {
-            SqlExecutor::apply_distinct(rows)
-        } else {
-            rows
-        };
-
-        Ok(SqlResult::new(result_columns, rows))
+        let plan = PlanBuilder::build_simple_select_plan(stmt, table)?;
+        PlanExecutor::execute_sql_result(table, &plan)
     }
 }
 
@@ -256,25 +168,25 @@ impl SqlExecutor {
 
         let stmt = SqlParser::parse(sql)?;
         match stmt {
-            SqlStatement::Select(select) => Self::execute_select_with_tables(select, tables, default_table),
+            SqlStatement::Select(select) => {
+                if !select.joins.is_empty() {
+                    let plan = crate::query::engine::PlanBuilder::build_join_tables_plan(&select)?;
+                    crate::query::engine::PlanExecutorTables::execute_tables_plan(tables, default_table, &plan)
+                } else {
+                    Self::execute_select_with_tables(select, tables, default_table)
+                }
+            }
             SqlStatement::Union(union) => Self::execute_union_with_tables(union, tables, default_table),
         }
     }
 
     fn execute_union(union: crate::query::UnionStatement, table: &mut ColumnTable) -> Result<SqlResult, ApexError> {
-        fn exec_one(stmt: crate::query::SqlStatement, table: &mut ColumnTable) -> Result<SqlResult, ApexError> {
-            match stmt {
-                crate::query::SqlStatement::Select(sel) => {
-                    // UNION operand should not carry its own ORDER/LIMIT/OFFSET in our grammar
-                    SqlExecutor::execute_select(sel, table)
-                }
-                crate::query::SqlStatement::Union(u) => SqlExecutor::execute_union(u, table),
-            }
+        if table.has_pending_writes() {
+            table.flush_write_buffer();
         }
 
-        let left = exec_one(*union.left, table)?;
-        let right = exec_one(*union.right, table)?;
-        Self::merge_union_results(left, right, union.all, &union.order_by, union.limit, union.offset)
+        let plan = crate::query::engine::PlanBuilder::build_union_plan(&union, table)?;
+        crate::query::engine::PlanExecutor::execute_sql_result(table, &plan)
     }
 
     fn execute_union_with_tables(
@@ -316,7 +228,7 @@ impl SqlExecutor {
         Self::merge_union_results(left, right, union.all, &union.order_by, union.limit, union.offset)
     }
 
-    fn merge_union_results(
+    pub(crate) fn merge_union_results(
         left: SqlResult,
         right: SqlResult,
         all: bool,
@@ -380,7 +292,7 @@ impl SqlExecutor {
         Ok(SqlResult::new(left.columns, rows))
     }
 
-    fn execute_select_with_tables(
+    pub(crate) fn execute_select_with_tables(
         stmt: SelectStatement,
         tables: &mut HashMap<String, ColumnTable>,
         default_table: &str,
@@ -1644,23 +1556,21 @@ impl SqlExecutor {
                     .ok_or_else(|| ApexError::QueryParseError(format!("Table '{}' not found.", inner_table_name)))?;
 
                 // Support only simple aggregate scalar: MAX(col), MIN(col), SUM(col), AVG(col), COUNT(*), COUNT(col)
-                let mut agg: Option<(AggregateFunc, Option<String>)> = None;
-                match &sub.columns[0] {
+                let (func, col) = match &sub.columns[0] {
                     SelectColumn::Aggregate { func, column, distinct, .. } => {
                         if *distinct {
                             return Err(ApexError::QueryParseError(
                                 "Scalar subquery DISTINCT aggregate is not supported yet".to_string(),
                             ));
                         }
-                        agg = Some((func.clone(), column.clone()));
+                        (func.clone(), column.clone())
                     }
                     _ => {
                         return Err(ApexError::QueryParseError(
                             "Scalar subquery only supports aggregate projection".to_string(),
                         ))
                     }
-                }
-                let (func, col) = agg.unwrap();
+                };
 
                 // Reuse correlated predicate evaluator for subquery WHERE
                 let row_count = inner_table.get_row_count();
@@ -2852,10 +2762,7 @@ impl SqlExecutor {
         // Pre-compute flags
         let has_aggregates = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Aggregate { .. }));
         let has_window = stmt.columns.iter().any(|c| matches!(c, SelectColumn::WindowFunction { .. }));
-        let no_where = stmt.where_clause.is_none();
         let no_group_by = stmt.group_by.is_empty();
-        let has_limit = stmt.limit.is_some();
-        let no_order = stmt.order_by.is_empty();
 
         // ============ UNIFIED SIMPLE PIPELINE (GUARDED) ============
         // Only handle a very small subset here to avoid regressions.
@@ -2868,72 +2775,12 @@ impl SqlExecutor {
             // Pipeline expects an immutable table reference (no mutation)
             return simple_pipeline::execute(&stmt, table);
         }
-        
-        // ============ FAST PATHS (NO INDEX COLLECTION) ============
-        
-        // FAST PATH: COUNT(*) without WHERE - O(1)
-        if no_where && no_group_by {
-            if let Some(result) = Self::try_fast_count_star(&stmt, table) {
-                return Ok(result);
-            }
+
+        if let Some(plan) = crate::query::engine::PlanOptimizer::try_build_plan(&stmt, table)? {
+            return crate::query::engine::PlanExecutor::execute_sql_result(table, &plan);
         }
-        
-        // FAST PATH: Aggregates without WHERE - direct column scan
-        if has_aggregates && no_group_by && no_where {
-            return Self::execute_aggregate_direct(&stmt, table);
-        }
-        
-        // FAST PATH: Simple LIMIT without WHERE/ORDER BY - streaming (NO index collection!)
-        if no_where && no_order && has_limit && !stmt.distinct && !has_aggregates {
-            let (result_columns, column_indices) = Self::resolve_columns(&stmt.columns, table)?;
-            return Self::execute_streaming_limit(&stmt, &result_columns, &column_indices, table);
-        }
-        
-        // FAST PATH: DISTINCT + LIMIT without WHERE/ORDER BY - streaming with early termination
-        if no_where && no_order && has_limit && stmt.distinct && !has_aggregates {
-            let (result_columns, column_indices) = Self::resolve_columns(&stmt.columns, table)?;
-            return Self::execute_streaming_distinct(&stmt, &result_columns, &column_indices, table);
-        }
-        
-        // FAST PATH: ORDER BY + LIMIT without WHERE - streaming top-K
-        if no_where && !no_order && has_limit && !has_aggregates {
-            let (result_columns, column_indices) = Self::resolve_columns(&stmt.columns, table)?;
-            return Self::execute_streaming_topk(&stmt, &result_columns, &column_indices, table);
-        }
-        
-        // FAST PATH: WHERE + LIMIT without ORDER BY - streaming with early termination
-        // Handles: simple LIKE, compound AND conditions, any filter with LIMIT
-        if let Some(ref where_expr) = stmt.where_clause {
-            if no_order && has_limit && !has_aggregates && !stmt.distinct {
-                let (result_columns, column_indices) = Self::resolve_columns(&stmt.columns, table)?;
-                return Self::execute_streaming_where_limit(&stmt, &result_columns, &column_indices, table, where_expr);
-            }
-        }
-        
+
         // ============ PATHS REQUIRING INDEX COLLECTION ============
-        
-        // FAST PATH: Simple COUNT(*) with WHERE - count directly without collecting indices
-        if has_aggregates && no_group_by && stmt.columns.len() == 1 {
-            if let SelectColumn::Aggregate { func: AggregateFunc::Count, column, distinct, alias } = &stmt.columns[0] {
-                if *distinct {
-                    // COUNT(DISTINCT ...) requires value materialization
-                    // (handled by generic aggregate path below)
-                } else {
-                if Self::is_count_star_like(column) {
-                    if let Some(ref where_expr) = stmt.where_clause {
-                        let count = Self::count_matching_rows(where_expr, table)?;
-                        let col_name = alias.clone().unwrap_or_else(|| {
-                            column
-                                .as_ref()
-                                .map(|c| format!("COUNT({})", c))
-                                .unwrap_or_else(|| "COUNT(*)".to_string())
-                        });
-                        return Ok(SqlResult::new(vec![col_name], vec![vec![Value::Int64(count as i64)]]));
-                    }
-                }
-                }
-            }
-        }
         
         // Step 1: Get matching row indices based on WHERE clause
         let matching_indices: Vec<usize> = if let Some(ref where_expr) = stmt.where_clause {
@@ -2960,404 +2807,60 @@ impl SqlExecutor {
             return Self::execute_window_row_number(&stmt, &matching_indices, table);
         }
         
-        // Step 2: Determine which columns to select
+        // Step 2: Aggregates / GROUP BY remain on legacy paths for now.
+        // (Non-aggregate single-table SELECTs are handled by PlanOptimizer above.)
         let (result_columns, column_indices) = Self::resolve_columns(&stmt.columns, table)?;
-        
-        // Step 3: Check for aggregates with WHERE
+
         if has_aggregates && no_group_by {
             return Self::execute_aggregate(&stmt, &matching_indices, table);
         }
-        
+
         if !no_group_by {
-            return Self::execute_group_by(&stmt, &matching_indices, table);
-        }
-        
-        // With WHERE clause: use matching_indices for ORDER BY + LIMIT
-        if !no_order && has_limit {
-            return Self::execute_topk_with_indices(&stmt, &result_columns, &column_indices, &matching_indices, table);
-        }
-        
-        // FAST PATH: For SELECT * with large results, use optimized batch building
-        let is_select_all = matches!(stmt.columns.as_slice(), [SelectColumn::All]);
-        if is_select_all && !stmt.distinct && stmt.order_by.is_empty() 
-           && stmt.limit.is_none() && matching_indices.len() > 10_000 {
-            let batch = table.build_record_batch_from_indices(&matching_indices)
-                .map_err(|e| ApexError::SerializationError(e.to_string()))?;
-            let columns: Vec<String> = batch.schema().fields().iter()
-                .map(|f| f.name().clone())
-                .collect();
-            return Ok(SqlResult::with_arrow_batch(columns, batch));
+            let plan = crate::query::engine::PlanBuilder::build_group_by_plan(&stmt)?;
+            return crate::query::engine::PlanExecutor::execute_sql_result(table, &plan);
         }
 
-        // FAST PATH: For SELECT *, _id (or SELECT _id, *) with large results, build Arrow batch
-        // and then reorder columns to match the user-specified projection order.
-        let is_select_star_plus_id = stmt.columns.len() == 2
-            && stmt.columns.iter().any(|c| matches!(c, SelectColumn::All))
-            && stmt.columns.iter().any(|c| matches!(c, SelectColumn::Column(name) if name == "_id"));
-        if is_select_star_plus_id && !stmt.distinct && stmt.order_by.is_empty()
-            && stmt.limit.is_none() && matching_indices.len() > 10_000 {
-            use arrow::datatypes::Schema;
-            use std::collections::HashMap;
-            use std::sync::Arc;
-
-            let batch = table.build_record_batch_from_indices(&matching_indices)
-                .map_err(|e| ApexError::SerializationError(e.to_string()))?;
-
-            let schema_ref = batch.schema();
-            let mut by_name: HashMap<String, (arrow::datatypes::Field, arrow::array::ArrayRef)> = HashMap::new();
-            for (i, field) in schema_ref.fields().iter().enumerate() {
-                by_name.insert(field.name().clone(), (field.as_ref().clone(), batch.column(i).clone()));
-            }
-
-            let mut fields = Vec::with_capacity(result_columns.len());
-            let mut arrays = Vec::with_capacity(result_columns.len());
-            for name in &result_columns {
-                let (field, array) = by_name
-                    .get(name)
-                    .ok_or_else(|| ApexError::QueryParseError(format!("Column '{}' not found in batch", name)))?
-                    .clone();
-                fields.push(field);
-                arrays.push(array);
-            }
-
-            let schema = Arc::new(Schema::new(fields));
-            let reordered = arrow::record_batch::RecordBatch::try_new(schema, arrays)
-                .map_err(|e| ApexError::SerializationError(e.to_string()))?;
-
-            return Ok(SqlResult::with_arrow_batch(result_columns, reordered));
-        }
-        
-        // OPTIMIZATION: For DISTINCT + LIMIT without ORDER BY, we can stop early
-        // once we have enough unique values
-        let has_distinct_limit = stmt.distinct && stmt.limit.is_some() && stmt.order_by.is_empty();
-        
-        // Calculate how many rows we actually need to process
-        let max_rows_needed = if !stmt.order_by.is_empty() && stmt.limit.is_some() {
-            // Already truncated above
-            matching_indices.len()
-        } else if stmt.order_by.is_empty() && !stmt.distinct {
-            // Simple case: just take offset + limit
-            match (stmt.offset, stmt.limit) {
-                (Some(off), Some(lim)) => (off + lim).min(matching_indices.len()),
-                (None, Some(lim)) => lim.min(matching_indices.len()),
-                _ => matching_indices.len(),
-            }
-        } else {
-            matching_indices.len()
-        };
-        
-        // Step 4: Build result rows
-        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(max_rows_needed.min(10000));
-        let mut seen_for_distinct: Option<std::collections::HashSet<String>> = 
-            if has_distinct_limit { Some(std::collections::HashSet::new()) } else { None };
-        let distinct_limit = if has_distinct_limit { 
-            stmt.offset.unwrap_or(0) + stmt.limit.unwrap() 
-        } else { 
-            usize::MAX 
-        };
-        
-        for (processed, row_idx) in matching_indices.iter().take(max_rows_needed).enumerate() {
+        // Fallback: row materialization for legacy-only features.
+        // (Kept minimal; should be eliminated as remaining features are plan-ified.)
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(matching_indices.len().min(10000));
+        for row_idx in matching_indices.iter() {
             let mut row_values = Vec::with_capacity(result_columns.len());
-            
             for (col_name, col_idx) in column_indices.iter() {
                 if col_name == "_id" {
                     row_values.push(Value::Int64(*row_idx as i64));
                 } else if let Some(idx) = col_idx {
-                    let value = table.columns_ref()[*idx].get(*row_idx).unwrap_or(Value::Null);
-                    row_values.push(value);
+                    row_values.push(table.columns_ref()[*idx].get(*row_idx).unwrap_or(Value::Null));
                 } else {
                     row_values.push(Value::Null);
                 }
             }
-            
-            // For DISTINCT + LIMIT: check uniqueness and stop early
-            if let Some(ref mut seen) = seen_for_distinct {
-                let key = format!("{:?}", row_values);
-                if !seen.insert(key) {
-                    continue; // Skip duplicate
-                }
-                if seen.len() >= distinct_limit {
-                    rows.push(row_values);
-                    break; // Have enough unique rows
-                }
-            }
-            
             rows.push(row_values);
-            
-            // Progress check: every 100k rows for very large result sets without optimization
-            if processed > 0 && processed % 100000 == 0 && max_rows_needed > 100000 {
-                // Still processing, continue
-            }
         }
-        
-        // Step 5: Apply DISTINCT if needed (for cases without early optimization)
-        if stmt.distinct && seen_for_distinct.is_none() {
-            rows = Self::apply_distinct(rows);
-        }
-        
-        // Step 6: Apply ORDER BY (only if not already sorted via index optimization)
-        if !stmt.order_by.is_empty() && stmt.limit.is_none() {
-            rows = Self::apply_order_by(rows, &result_columns, &stmt.order_by)?;
-        }
-        
-        // Step 7: Apply LIMIT and OFFSET
-        if stmt.offset.is_some() || stmt.limit.is_some() {
-            let offset = stmt.offset.unwrap_or(0);
-            let limit = stmt.limit.unwrap_or(rows.len());
-            if offset > 0 || limit < rows.len() {
-                rows = rows.into_iter().skip(offset).take(limit).collect();
-            }
-        }
-        
         Ok(SqlResult::new(result_columns, rows))
     }
     
     /// Partial sort indices by ORDER BY columns - only get top K elements
     /// Uses BinaryHeap for O(n log k) time complexity
-    fn sort_indices_by_columns_topk(
+    pub(crate) fn sort_indices_by_columns_topk(
         indices: &[usize],
         order_by: &[OrderByClause],
         table: &ColumnTable,
         k: usize,
     ) -> Result<Vec<usize>, ApexError> {
-        use std::collections::BinaryHeap;
-        
-        if indices.is_empty() || k == 0 {
-            return Ok(Vec::new());
-        }
-        
-        let k = k.min(indices.len());
-        
-        // For small result sets, just sort directly
-        if indices.len() <= k * 2 || indices.len() <= 100 {
-            let schema = table.schema_ref();
-            let columns = table.columns_ref();
-            let order_col_indices: Vec<(Option<usize>, bool)> = order_by.iter()
-                .map(|o| {
-                    let col_idx = if o.column == "_id" { None } else { schema.get_index(&o.column) };
-                    (col_idx, o.descending)
-                })
-                .collect();
-            
-            let mut result: Vec<usize> = indices.to_vec();
-            result.sort_by(|&a, &b| {
-                for &(col_idx, desc) in &order_col_indices {
-                    let av = col_idx.map(|i| columns[i].get(a)).flatten();
-                    let bv = col_idx.map(|i| columns[i].get(b)).flatten();
-                    let cmp = Self::compare_values(av.as_ref(), bv.as_ref(), None);
-                    let cmp = if desc { cmp.reverse() } else { cmp };
-                    if cmp != Ordering::Equal { return cmp; }
-                }
-                Ordering::Equal
-            });
-            result.truncate(k);
-            return Ok(result);
-        }
-        
-        let schema = table.schema_ref();
-        let columns = table.columns_ref();
-        
-        // Get first ORDER BY column info
-        let first_order = &order_by[0];
-        let col_idx = if first_order.column == "_id" { None } else { schema.get_index(&first_order.column) };
-        let desc = first_order.descending;
-        
-        // Fast path: direct Int64 access without cloning
-        #[derive(Clone, Copy)]
-        struct HeapItem {
-            idx: usize,
-            key: i64,
-        }
-        
-        impl Eq for HeapItem {}
-        impl PartialEq for HeapItem {
-            fn eq(&self, other: &Self) -> bool { self.key == other.key }
-        }
-        impl Ord for HeapItem {
-            fn cmp(&self, other: &Self) -> Ordering {
-                // Reverse for min-heap: largest key at top (to be kicked out)
-                other.key.cmp(&self.key)
-            }
-        }
-        impl PartialOrd for HeapItem {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
-        }
-        
-        let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(k + 1);
-        
-        // Directly iterate and extract keys without closure/cloning
-        if let Some(idx) = col_idx {
-            match &columns[idx] {
-                crate::table::column_table::TypedColumn::Int64 { data, .. } => {
-                    for &row_idx in indices {
-                        let key = if desc { -data[row_idx] } else { data[row_idx] };
-                        if heap.len() < k {
-                            heap.push(HeapItem { idx: row_idx, key });
-                        } else if let Some(top) = heap.peek() {
-                            if key < top.key {
-                                heap.pop();
-                                heap.push(HeapItem { idx: row_idx, key });
-                            }
-                        }
-                    }
-                }
-                crate::table::column_table::TypedColumn::Float64 { data, .. } => {
-                    for &row_idx in indices {
-                        let key = if desc { -(data[row_idx] as i64) } else { data[row_idx] as i64 };
-                        if heap.len() < k {
-                            heap.push(HeapItem { idx: row_idx, key });
-                        } else if let Some(top) = heap.peek() {
-                            if key < top.key {
-                                heap.pop();
-                                heap.push(HeapItem { idx: row_idx, key });
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    // Non-numeric: use row index
-                    for &row_idx in indices {
-                        let key = if desc { -(row_idx as i64) } else { row_idx as i64 };
-                        if heap.len() < k {
-                            heap.push(HeapItem { idx: row_idx, key });
-                        } else if let Some(top) = heap.peek() {
-                            if key < top.key {
-                                heap.pop();
-                                heap.push(HeapItem { idx: row_idx, key });
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // ORDER BY _id
-            for &row_idx in indices {
-                let key = if desc { -(row_idx as i64) } else { row_idx as i64 };
-                if heap.len() < k {
-                    heap.push(HeapItem { idx: row_idx, key });
-                } else if let Some(top) = heap.peek() {
-                    if key < top.key {
-                        heap.pop();
-                        heap.push(HeapItem { idx: row_idx, key });
-                    }
-                }
-            }
-        }
-        
-        // Extract and sort by key
-        let mut items: Vec<_> = heap.into_vec();
-        items.sort_by_key(|h| h.key);
-        Ok(items.into_iter().map(|h| h.idx).collect())
+        crate::query::engine::ops::sort_indices_by_columns_topk(indices, order_by, table, k)
     }
     
     /// Resolve column names and indices from SELECT clause
-    fn resolve_columns(
+    pub(crate) fn resolve_columns(
         columns: &[SelectColumn],
         table: &ColumnTable,
     ) -> Result<(Vec<String>, Vec<(String, Option<usize>)>), ApexError> {
-        let mut result_names = Vec::new();
-        let mut column_indices = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let schema = table.schema_ref();
-
-        // If the user explicitly selects _id (e.g. SELECT *, _id or SELECT _id, *),
-        // we should not auto-insert _id as part of expanding '*'. This preserves
-        // the user-specified column order.
-        let explicit_id_requested = columns.iter().any(|c| match c {
-            SelectColumn::Column(name) => name == "_id",
-            SelectColumn::ColumnAlias { column, .. } => column == "_id",
-            _ => false,
-        });
-        
-        for col in columns {
-            match col {
-                SelectColumn::All => {
-                    // Add _id first only when it wasn't explicitly requested elsewhere.
-                    if !explicit_id_requested {
-                        if seen.insert("_id".to_string()) {
-                            result_names.push("_id".to_string());
-                            column_indices.push(("_id".to_string(), None));
-                        }
-                    }
-                    
-                    // Then all schema columns
-                    for (name, _) in &schema.columns {
-                        if seen.insert(name.clone()) {
-                            result_names.push(name.clone());
-                            let idx = schema.get_index(name);
-                            column_indices.push((name.clone(), idx));
-                        }
-                    }
-                }
-                SelectColumn::Column(name) => {
-                    if seen.insert(name.clone()) {
-                        result_names.push(name.clone());
-                        if name == "_id" {
-                            column_indices.push((name.clone(), None));
-                        } else {
-                            let idx = schema.get_index(name);
-                            column_indices.push((name.clone(), idx));
-                        }
-                    }
-                }
-                SelectColumn::ColumnAlias { column, alias } => {
-                    if seen.insert(alias.clone()) {
-                        result_names.push(alias.clone());
-                        if column == "_id" {
-                            column_indices.push((column.clone(), None));
-                        } else {
-                            let idx = schema.get_index(column);
-                            column_indices.push((column.clone(), idx));
-                        }
-                    }
-                }
-                SelectColumn::Aggregate { func, column, distinct, alias } => {
-                    let name = alias.clone().unwrap_or_else(|| {
-                        let func_name = match func {
-                            AggregateFunc::Count => "COUNT",
-                            AggregateFunc::Sum => "SUM",
-                            AggregateFunc::Avg => "AVG",
-                            AggregateFunc::Min => "MIN",
-                            AggregateFunc::Max => "MAX",
-                        };
-                        if let Some(col) = column {
-                            if *distinct {
-                                format!("{}(DISTINCT {})", func_name, col)
-                            } else {
-                                format!("{}({})", func_name, col)
-                            }
-                        } else {
-                            format!("{}(*)", func_name)
-                        }
-                    });
-                    if seen.insert(name.clone()) {
-                        result_names.push(name.clone());
-                        column_indices.push((name, None));
-                    }
-                }
-                SelectColumn::Expression { alias, .. } => {
-                    let name = alias.clone().unwrap_or_else(|| "expr".to_string());
-                    if seen.insert(name.clone()) {
-                        result_names.push(name.clone());
-                        column_indices.push((name, None));
-                    }
-                }
-                SelectColumn::WindowFunction { alias, name, .. } => {
-                    let col_name = alias.clone().unwrap_or_else(|| name.clone());
-                    if seen.insert(col_name.clone()) {
-                        result_names.push(col_name.clone());
-                        column_indices.push((col_name, None));
-                    }
-                }
-            }
-        }
-        
-        Ok((result_names, column_indices))
+        crate::query::engine::ops::resolve_columns(columns, table)
     }
     
     /// Evaluate WHERE clause and return matching row indices
     fn evaluate_where(expr: &SqlExpr, table: &ColumnTable) -> Result<Vec<usize>, ApexError> {
-        let filter = Self::expr_to_filter(expr)?;
+        let filter = sql_expr_to_filter(expr)?;
         let schema = table.schema_ref();
         let columns = table.columns_ref();
         let row_count = table.get_row_count();
@@ -3365,151 +2868,10 @@ impl SqlExecutor {
         
         Ok(filter.filter_columns(schema, columns, row_count, deleted))
     }
-    
-    /// Convert SQL expression to Filter
-    fn expr_to_filter(expr: &SqlExpr) -> Result<Filter, ApexError> {
-        match expr {
-            SqlExpr::BinaryOp { left, op, right } => {
-                match op {
-                    BinaryOperator::And => {
-                        let left_filter = Self::expr_to_filter(left)?;
-                        let right_filter = Self::expr_to_filter(right)?;
-                        // Flatten nested ANDs for better optimization
-                        let mut filters = Vec::new();
-                        match left_filter {
-                            Filter::And(inner) => filters.extend(inner),
-                            other => filters.push(other),
-                        }
-                        match right_filter {
-                            Filter::And(inner) => filters.extend(inner),
-                            other => filters.push(other),
-                        }
-                        Ok(Filter::And(filters))
-                    }
-                    BinaryOperator::Or => {
-                        let left_filter = Self::expr_to_filter(left)?;
-                        let right_filter = Self::expr_to_filter(right)?;
-                        Ok(Filter::Or(vec![left_filter, right_filter]))
-                    }
-                    BinaryOperator::Eq | BinaryOperator::NotEq | 
-                    BinaryOperator::Lt | BinaryOperator::Le |
-                    BinaryOperator::Gt | BinaryOperator::Ge => {
-                        let field = match left.as_ref() {
-                            SqlExpr::Column(name) => name.clone(),
-                            _ => return Err(ApexError::QueryParseError(
-                                "Left side of comparison must be column".to_string()
-                            )),
-                        };
-                        let value = match right.as_ref() {
-                            SqlExpr::Literal(v) => v.clone(),
-                            _ => return Err(ApexError::QueryParseError(
-                                "Right side of comparison must be literal".to_string()
-                            )),
-                        };
-                        let compare_op = match op {
-                            BinaryOperator::Eq => crate::query::filter::CompareOp::Equal,
-                            BinaryOperator::NotEq => crate::query::filter::CompareOp::NotEqual,
-                            BinaryOperator::Lt => crate::query::filter::CompareOp::LessThan,
-                            BinaryOperator::Le => crate::query::filter::CompareOp::LessEqual,
-                            BinaryOperator::Gt => crate::query::filter::CompareOp::GreaterThan,
-                            BinaryOperator::Ge => crate::query::filter::CompareOp::GreaterEqual,
-                            _ => unreachable!(),
-                        };
-                        Ok(Filter::Compare { field, op: compare_op, value })
-                    }
-                    _ => Err(ApexError::QueryParseError(
-                        format!("Unsupported binary operator: {:?}", op)
-                    )),
-                }
-            }
-            SqlExpr::UnaryOp { op, expr } => {
-                match op {
-                    UnaryOperator::Not => {
-                        let inner = Self::expr_to_filter(expr)?;
-                        Ok(Filter::Not(Box::new(inner)))
-                    }
-                    _ => Err(ApexError::QueryParseError(
-                        format!("Unsupported unary operator: {:?}", op)
-                    )),
-                }
-            }
-            SqlExpr::Like { column, pattern, negated } => {
-                let filter = Filter::Like { field: column.clone(), pattern: pattern.clone() };
-                if *negated {
-                    Ok(Filter::Not(Box::new(filter)))
-                } else {
-                    Ok(filter)
-                }
-            }
-            SqlExpr::Regexp { column, pattern, negated } => {
-                let filter = Filter::Regexp { field: column.clone(), pattern: pattern.clone() };
-                if *negated {
-                    Ok(Filter::Not(Box::new(filter)))
-                } else {
-                    Ok(filter)
-                }
-            }
-            SqlExpr::In { column, values, negated } => {
-                let filter = Filter::In { field: column.clone(), values: values.clone() };
-                if *negated {
-                    Ok(Filter::Not(Box::new(filter)))
-                } else {
-                    Ok(filter)
-                }
-            }
-            SqlExpr::Between { column, low, high, negated } => {
-                let low_val = match low.as_ref() {
-                    SqlExpr::Literal(v) => v.clone(),
-                    _ => return Err(ApexError::QueryParseError(
-                        "BETWEEN bounds must be literals".to_string()
-                    )),
-                };
-                let high_val = match high.as_ref() {
-                    SqlExpr::Literal(v) => v.clone(),
-                    _ => return Err(ApexError::QueryParseError(
-                        "BETWEEN bounds must be literals".to_string()
-                    )),
-                };
-                // Use native Range filter for single-pass BETWEEN evaluation
-                let filter = Filter::Range {
-                    field: column.clone(),
-                    low: low_val,
-                    high: high_val,
-                    low_inclusive: true,
-                    high_inclusive: true,
-                };
-                if *negated {
-                    Ok(Filter::Not(Box::new(filter)))
-                } else {
-                    Ok(filter)
-                }
-            }
-            SqlExpr::IsNull { column, negated } => {
-                // IS NULL is tricky - we need to check null bitmap
-                // For now, approximate with comparison to Null
-                let filter = Filter::Compare { 
-                    field: column.clone(), 
-                    op: crate::query::filter::CompareOp::Equal, 
-                    value: Value::Null 
-                };
-                if *negated {
-                    Ok(Filter::Not(Box::new(filter)))
-                } else {
-                    Ok(filter)
-                }
-            }
-            SqlExpr::Paren(inner) => Self::expr_to_filter(inner),
-            SqlExpr::Literal(Value::Bool(true)) => Ok(Filter::True),
-            SqlExpr::Literal(Value::Bool(false)) => Ok(Filter::False),
-            _ => Err(ApexError::QueryParseError(
-                format!("Cannot convert expression to filter: {:?}", expr)
-            )),
-        }
-    }
 
     /// Minimal window function execution: supports only row_number() OVER (PARTITION BY <col> ORDER BY <col>)
     /// Applies WHERE first (matching_indices), then computes row_number per partition.
-    fn execute_window_row_number(
+    pub(crate) fn execute_window_row_number(
         stmt: &SelectStatement,
         matching_indices: &[usize],
         table: &ColumnTable,
@@ -3668,18 +3030,8 @@ impl SqlExecutor {
     }
     
     /// Apply DISTINCT to result rows
-    fn apply_distinct(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
-        let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
-        
-        for row in rows {
-            let key = format!("{:?}", row);
-            if seen.insert(key) {
-                result.push(row);
-            }
-        }
-        
-        result
+    pub(crate) fn apply_distinct(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+        crate::query::engine::ops::apply_distinct(rows)
     }
     
     /// Apply ORDER BY to result rows
@@ -3721,26 +3073,12 @@ impl SqlExecutor {
     }
     
     /// Compare two values for ordering
-    fn compare_values(a: Option<&Value>, b: Option<&Value>, nulls_first: Option<bool>) -> Ordering {
-        match (a, b) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => if nulls_first.unwrap_or(false) { Ordering::Less } else { Ordering::Greater },
-            (Some(_), None) => if nulls_first.unwrap_or(false) { Ordering::Greater } else { Ordering::Less },
-            (Some(Value::Null), Some(Value::Null)) => Ordering::Equal,
-            (Some(Value::Null), Some(_)) => if nulls_first.unwrap_or(false) { Ordering::Less } else { Ordering::Greater },
-            (Some(_), Some(Value::Null)) => if nulls_first.unwrap_or(false) { Ordering::Greater } else { Ordering::Less },
-            (Some(av), Some(bv)) => Self::compare_non_null(av, bv),
-        }
+    pub(crate) fn compare_values(a: Option<&Value>, b: Option<&Value>, nulls_first: Option<bool>) -> Ordering {
+        crate::query::engine::ops::compare_values(a, b, nulls_first)
     }
     
-    fn compare_non_null(a: &Value, b: &Value) -> Ordering {
-        match (a, b) {
-            (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
-            (Value::Float64(x), Value::Float64(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-            (Value::String(x), Value::String(y)) => x.cmp(y),
-            (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-            _ => Ordering::Equal,
-        }
+    pub(crate) fn compare_non_null(a: &Value, b: &Value) -> Ordering {
+        crate::query::engine::ops::compare_non_null(a, b)
     }
     
     // ========================================================================
@@ -3748,7 +3086,7 @@ impl SqlExecutor {
     // ========================================================================
     
     /// O(1) COUNT(*) without WHERE clause
-    fn try_fast_count_star(stmt: &SelectStatement, table: &ColumnTable) -> Option<SqlResult> {
+    pub(crate) fn try_fast_count_star(stmt: &SelectStatement, table: &ColumnTable) -> Option<SqlResult> {
         // Check if this is a simple COUNT(*) / COUNT(constant) query
         if stmt.columns.len() == 1 {
             if let SelectColumn::Aggregate { func: AggregateFunc::Count, column, distinct, alias } = &stmt.columns[0] {
@@ -3768,7 +3106,7 @@ impl SqlExecutor {
     }
 
     #[inline]
-    fn is_count_star_like(column: &Option<String>) -> bool {
+    pub(crate) fn is_count_star_like(column: &Option<String>) -> bool {
         match column {
             None => true,
             Some(c) => Self::is_count_constant_arg(c),
@@ -3812,7 +3150,7 @@ impl SqlExecutor {
     }
     
     /// Direct aggregate computation without index collection - ultra-fast for full table scans
-    fn execute_aggregate_direct(stmt: &SelectStatement, table: &ColumnTable) -> Result<SqlResult, ApexError> {
+    pub(crate) fn execute_aggregate_direct(stmt: &SelectStatement, table: &ColumnTable) -> Result<SqlResult, ApexError> {
         let schema = table.schema_ref();
         let columns = table.columns_ref();
         let deleted = table.deleted_ref();
@@ -4443,7 +3781,7 @@ impl SqlExecutor {
     
     /// Streaming LIMIT without ORDER BY - early termination
     /// Uses IoEngine for data reading
-    fn execute_streaming_limit(
+    pub(crate) fn execute_streaming_limit(
         stmt: &SelectStatement,
         result_columns: &[String],
         column_indices: &[(String, Option<usize>)],
@@ -4464,101 +3802,33 @@ impl SqlExecutor {
     }
     
     /// Streaming Top-K for ORDER BY + LIMIT - ULTRA-OPTIMIZED
-    fn execute_streaming_topk(
+    pub(crate) fn execute_streaming_topk(
         stmt: &SelectStatement,
         result_columns: &[String],
         column_indices: &[(String, Option<usize>)],
         table: &ColumnTable,
     ) -> Result<SqlResult, ApexError> {
         let deleted = table.deleted_ref();
-        let columns = table.columns_ref();
-        let schema = table.schema_ref();
         let row_count = table.get_row_count();
         let no_deletes = deleted.all_false();
         let k = stmt.offset.unwrap_or(0) + stmt.limit.unwrap_or(usize::MAX);
-        
-        let first_order = &stmt.order_by[0];
-        let order_col_idx = if first_order.column == "_id" { None } else { schema.get_index(&first_order.column) };
-        let desc = first_order.descending;
-        
-        // For Int64 ORDER BY DESC/ASC, use optimized direct scan
-        let top_indices: Vec<usize> = if let Some(idx) = order_col_idx {
-            if let crate::table::column_table::TypedColumn::Int64 { data, .. } = &columns[idx] {
-                // Direct top-K selection with minimal overhead
-                let mut top_k: Vec<(i64, usize)> = Vec::with_capacity(k + 1);
-                let data_len = data.len().min(row_count);
-                
-                if no_deletes {
-                    // Ultra-fast path: no deleted rows
-                    for row_idx in 0..data_len {
-                        let val = data[row_idx];
-                        let key = if desc { -val } else { val };
-                        
-                        if top_k.len() < k {
-                            top_k.push((key, row_idx));
-                            if top_k.len() == k {
-                                // Build heap once when full
-                                top_k.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
-                            }
-                        } else if key < top_k[0].0 {
-                            // Replace worst element and re-heapify
-                            top_k[0] = (key, row_idx);
-                            // Bubble down
-                            let mut i = 0;
-                            loop {
-                                let left = 2 * i + 1;
-                                let right = 2 * i + 2;
-                                let mut largest = i;
-                                if left < k && top_k[left].0 > top_k[largest].0 { largest = left; }
-                                if right < k && top_k[right].0 > top_k[largest].0 { largest = right; }
-                                if largest == i { break; }
-                                top_k.swap(i, largest);
-                                i = largest;
-                            }
-                        }
-                    }
-                } else {
-                    for row_idx in 0..data_len {
-                        if deleted.get(row_idx) { continue; }
-                        let val = data[row_idx];
-                        let key = if desc { -val } else { val };
-                        
-                        if top_k.len() < k {
-                            top_k.push((key, row_idx));
-                            if top_k.len() == k {
-                                top_k.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
-                            }
-                        } else if key < top_k[0].0 {
-                            top_k[0] = (key, row_idx);
-                            let mut i = 0;
-                            loop {
-                                let left = 2 * i + 1;
-                                let right = 2 * i + 2;
-                                let mut largest = i;
-                                if left < k && top_k[left].0 > top_k[largest].0 { largest = left; }
-                                if right < k && top_k[right].0 > top_k[largest].0 { largest = right; }
-                                if largest == i { break; }
-                                top_k.swap(i, largest);
-                                i = largest;
-                            }
-                        }
-                    }
-                }
-                
-                top_k.sort_unstable_by_key(|x| x.0);
-                top_k.into_iter().map(|(_, idx)| idx).collect()
-            } else {
-                // Fallback for non-Int64: use simple vec
-                Self::topk_generic(row_count, k, deleted, no_deletes, desc)
+
+        // Collect candidate indices, then reuse unified engine sort semantics.
+        let mut candidates: Vec<usize> = Vec::with_capacity(row_count.min(k.saturating_mul(4)).max(1024));
+        for row_idx in 0..row_count {
+            if !no_deletes && deleted.get(row_idx) {
+                continue;
             }
-        } else {
-            // ORDER BY _id: trivial case
-            if desc {
-                (0..row_count).rev().filter(|&i| no_deletes || !deleted.get(i)).take(k).collect()
-            } else {
-                (0..row_count).filter(|&i| no_deletes || !deleted.get(i)).take(k).collect()
-            }
-        };
+            candidates.push(row_idx);
+        }
+
+        let top_indices = crate::query::engine::ops::sort_indices_by_columns_topk(
+            &candidates,
+            &stmt.order_by,
+            table,
+            k,
+        )?;
+        let columns = table.columns_ref();
         
         // Apply offset and build rows
         let offset = stmt.offset.unwrap_or(0);
@@ -4692,7 +3962,7 @@ impl SqlExecutor {
     /// Streaming WHERE + LIMIT - ULTRA-FAST early termination for any filter
     /// Handles compound conditions (AND, OR, LIKE, BETWEEN, etc.) with streaming
     /// Uses IoEngine for data reading
-    fn execute_streaming_where_limit(
+    pub(crate) fn execute_streaming_where_limit(
         stmt: &SelectStatement,
         result_columns: &[String],
         column_indices: &[(String, Option<usize>)],
@@ -4703,7 +3973,7 @@ impl SqlExecutor {
         let limit = stmt.limit.unwrap_or(usize::MAX);
         
         // Convert WHERE expression to optimized filter
-        let filter = Self::expr_to_filter(where_expr)?;
+        let filter = sql_expr_to_filter(where_expr)?;
         
         // Use IoEngine for filtered data reading with streaming early termination
         let matching_indices = IoEngine::read_filtered_indices(table, &filter, Some(limit), offset);
@@ -4725,117 +3995,39 @@ impl SqlExecutor {
         table: &ColumnTable,
         where_expr: &SqlExpr,
     ) -> Result<SqlResult, ApexError> {
-        use std::collections::BinaryHeap;
-        
         let deleted = table.deleted_ref();
         let columns = table.columns_ref();
         let schema = table.schema_ref();
         let row_count = table.get_row_count();
         let no_deletes = deleted.all_false();
         let k = stmt.offset.unwrap_or(0) + stmt.limit.unwrap_or(usize::MAX);
-        
-        // Convert WHERE expression to optimized filter
-        let filter = Self::expr_to_filter(where_expr)?;
+
+        let filter = sql_expr_to_filter(where_expr)?;
         let evaluator = StreamingFilterEvaluator::new(&filter, schema, columns);
-        
-        // Get ORDER BY info
-        let first_order = &stmt.order_by[0];
-        let order_col_idx = if first_order.column == "_id" { None } else { schema.get_index(&first_order.column) };
-        let desc = first_order.descending;
-        
-        #[derive(Clone)]
-        struct HeapItem { idx: usize, key: i64 }
-        impl Eq for HeapItem {}
-        impl PartialEq for HeapItem { fn eq(&self, other: &Self) -> bool { self.key == other.key } }
-        impl Ord for HeapItem { fn cmp(&self, other: &Self) -> std::cmp::Ordering { other.key.cmp(&self.key) } }
-        impl PartialOrd for HeapItem { fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) } }
-        
-        let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(k + 1);
-        
-        // Streaming scan with top-K selection
-        if let Some(idx) = order_col_idx {
-            match &columns[idx] {
-                crate::table::column_table::TypedColumn::Int64 { data, .. } => {
-                    let data_len = data.len().min(row_count);
-                    for row_idx in 0..data_len {
-                        if !no_deletes && deleted.get(row_idx) { continue; }
-                        if !evaluator.matches(row_idx) { continue; }
-                        
-                        let key = if desc { -data[row_idx] } else { data[row_idx] };
-                        if heap.len() < k {
-                            heap.push(HeapItem { idx: row_idx, key });
-                        } else if let Some(top) = heap.peek() {
-                            if key < top.key {
-                                heap.pop();
-                                heap.push(HeapItem { idx: row_idx, key });
-                            }
-                        }
-                    }
-                }
-                crate::table::column_table::TypedColumn::Float64 { data, .. } => {
-                    let data_len = data.len().min(row_count);
-                    for row_idx in 0..data_len {
-                        if !no_deletes && deleted.get(row_idx) { continue; }
-                        if !evaluator.matches(row_idx) { continue; }
-                        
-                        let key = if desc { -(data[row_idx] * 1000.0) as i64 } else { (data[row_idx] * 1000.0) as i64 };
-                        if heap.len() < k {
-                            heap.push(HeapItem { idx: row_idx, key });
-                        } else if let Some(top) = heap.peek() {
-                            if key < top.key {
-                                heap.pop();
-                                heap.push(HeapItem { idx: row_idx, key });
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    // Non-numeric: use row index as key
-                    for row_idx in 0..row_count {
-                        if !no_deletes && deleted.get(row_idx) { continue; }
-                        if !evaluator.matches(row_idx) { continue; }
-                        
-                        let key = if desc { -(row_idx as i64) } else { row_idx as i64 };
-                        if heap.len() < k {
-                            heap.push(HeapItem { idx: row_idx, key });
-                        } else if let Some(top) = heap.peek() {
-                            if key < top.key {
-                                heap.pop();
-                                heap.push(HeapItem { idx: row_idx, key });
-                            }
-                        }
-                    }
-                }
+
+        let mut candidates: Vec<usize> = Vec::new();
+        for row_idx in 0..row_count {
+            if !no_deletes && deleted.get(row_idx) {
+                continue;
             }
-        } else {
-            // ORDER BY _id
-            for row_idx in 0..row_count {
-                if !no_deletes && deleted.get(row_idx) { continue; }
-                if !evaluator.matches(row_idx) { continue; }
-                
-                let key = if desc { -(row_idx as i64) } else { row_idx as i64 };
-                if heap.len() < k {
-                    heap.push(HeapItem { idx: row_idx, key });
-                } else if let Some(top) = heap.peek() {
-                    if key < top.key {
-                        heap.pop();
-                        heap.push(HeapItem { idx: row_idx, key });
-                    }
-                }
+            if !evaluator.matches(row_idx) {
+                continue;
             }
+            candidates.push(row_idx);
         }
-        
-        // Sort heap items by key
-        let mut items: Vec<_> = heap.into_vec();
-        items.sort_by_key(|h| h.key);
-        
-        // Build result rows
+
+        let top_indices = crate::query::engine::ops::sort_indices_by_columns_topk(
+            &candidates,
+            &stmt.order_by,
+            table,
+            k,
+        )?;
+
         let offset = stmt.offset.unwrap_or(0);
         let limit = stmt.limit.unwrap_or(usize::MAX);
-        let mut rows = Vec::with_capacity(limit.min(items.len()));
-        
-        for item in items.into_iter().skip(offset).take(limit) {
-            let row_idx = item.idx;
+        let mut rows = Vec::with_capacity(limit.min(top_indices.len()));
+
+        for row_idx in top_indices.into_iter().skip(offset).take(limit) {
             let mut row_values = Vec::with_capacity(column_indices.len());
             for (col_name, col_idx) in column_indices {
                 if col_name == "_id" {
@@ -4848,13 +4040,13 @@ impl SqlExecutor {
             }
             rows.push(row_values);
         }
-        
+
         Ok(SqlResult::new(result_columns.to_vec(), rows))
     }
     
     /// Streaming DISTINCT + LIMIT - stops early when we have enough unique values
     /// Memory-optimized: uses u64 hash instead of String for deduplication
-    fn execute_streaming_distinct(
+    pub(crate) fn execute_streaming_distinct(
         stmt: &SelectStatement,
         result_columns: &[String],
         column_indices: &[(String, Option<usize>)],
@@ -4943,10 +4135,10 @@ impl SqlExecutor {
     }
     
     /// Count matching rows directly without collecting indices - optimized for COUNT(*) with WHERE
-    fn count_matching_rows(where_expr: &SqlExpr, table: &ColumnTable) -> Result<usize, ApexError> {
+    pub(crate) fn count_matching_rows(where_expr: &SqlExpr, table: &ColumnTable) -> Result<usize, ApexError> {
         use rayon::prelude::*;
         
-        let filter = Self::expr_to_filter(where_expr)?;
+        let filter = sql_expr_to_filter(where_expr)?;
         let schema = table.schema_ref();
         let columns = table.columns_ref();
         let deleted = table.deleted_ref();
@@ -5008,75 +4200,20 @@ impl SqlExecutor {
         matching_indices: &[usize],
         table: &ColumnTable,
     ) -> Result<SqlResult, ApexError> {
-        use std::collections::BinaryHeap;
-        
-        let columns = table.columns_ref();
-        let schema = table.schema_ref();
         let k = stmt.offset.unwrap_or(0) + stmt.limit.unwrap_or(usize::MAX);
-        
-        let first_order = &stmt.order_by[0];
-        let order_col_idx = if first_order.column == "_id" { None } else { schema.get_index(&first_order.column) };
-        let desc = first_order.descending;
-        
-        #[derive(Clone)]
-        struct HeapItem { idx: usize, key: i64 }
-        impl Eq for HeapItem {}
-        impl PartialEq for HeapItem { fn eq(&self, other: &Self) -> bool { self.key == other.key } }
-        impl Ord for HeapItem { fn cmp(&self, other: &Self) -> Ordering { other.key.cmp(&self.key) } }
-        impl PartialOrd for HeapItem { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
-        
-        let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(k + 1);
-        
-        // Use pre-filtered matching_indices
-        if let Some(idx) = order_col_idx {
-            if let crate::table::column_table::TypedColumn::Int64 { data, .. } = &columns[idx] {
-                for &row_idx in matching_indices {
-                    let key = if desc { -data[row_idx] } else { data[row_idx] };
-                    if heap.len() < k {
-                        heap.push(HeapItem { idx: row_idx, key });
-                    } else if let Some(top) = heap.peek() {
-                        if key < top.key {
-                            heap.pop();
-                            heap.push(HeapItem { idx: row_idx, key });
-                        }
-                    }
-                }
-            } else {
-                for &row_idx in matching_indices {
-                    let key = if desc { -(row_idx as i64) } else { row_idx as i64 };
-                    if heap.len() < k {
-                        heap.push(HeapItem { idx: row_idx, key });
-                    } else if let Some(top) = heap.peek() {
-                        if key < top.key {
-                            heap.pop();
-                            heap.push(HeapItem { idx: row_idx, key });
-                        }
-                    }
-                }
-            }
-        } else {
-            for &row_idx in matching_indices {
-                let key = if desc { -(row_idx as i64) } else { row_idx as i64 };
-                if heap.len() < k {
-                    heap.push(HeapItem { idx: row_idx, key });
-                } else if let Some(top) = heap.peek() {
-                    if key < top.key {
-                        heap.pop();
-                        heap.push(HeapItem { idx: row_idx, key });
-                    }
-                }
-            }
-        }
-        
-        let mut items: Vec<_> = heap.into_vec();
-        items.sort_by_key(|h| h.key);
-        
+        let top_indices = crate::query::engine::ops::sort_indices_by_columns_topk(
+            matching_indices,
+            &stmt.order_by,
+            table,
+            k,
+        )?;
+
+        let columns = table.columns_ref();
         let offset = stmt.offset.unwrap_or(0);
         let limit = stmt.limit.unwrap_or(usize::MAX);
-        let mut rows = Vec::with_capacity(limit.min(items.len()));
-        
-        for item in items.into_iter().skip(offset).take(limit) {
-            let row_idx = item.idx;
+        let mut rows = Vec::with_capacity(limit.min(top_indices.len()));
+
+        for row_idx in top_indices.into_iter().skip(offset).take(limit) {
             let mut row_values = Vec::with_capacity(column_indices.len());
             for (col_name, col_idx) in column_indices {
                 if col_name == "_id" {
@@ -5089,7 +4226,7 @@ impl SqlExecutor {
             }
             rows.push(row_values);
         }
-        
+
         Ok(SqlResult::new(result_columns.to_vec(), rows))
     }
     
@@ -5639,7 +4776,7 @@ impl SqlExecutor {
     }
     
     /// Execute GROUP BY aggregation
-    fn execute_group_by(
+    pub(crate) fn execute_group_by(
         stmt: &SelectStatement,
         matching_indices: &[usize],
         table: &ColumnTable,
@@ -6292,8 +5429,7 @@ impl SqlExecutor {
         
         // Build result rows
         use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
-        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
+        use arrow::datatypes::{DataType as ArrowDataType, Field};
         use std::sync::Arc;
 
         enum ColBuilder {
@@ -6569,129 +5705,12 @@ impl SqlExecutor {
     
     /// Build Arrow arrays directly from column data using matching indices
     /// This is much faster than row-by-row construction for large result sets
-    fn build_arrow_direct(
+    pub(crate) fn build_arrow_direct(
         result_columns: &[String],
         column_indices: &[(String, Option<usize>)],
         matching_indices: &[usize],
         table: &ColumnTable,
     ) -> Result<SqlResult, ApexError> {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringBuilder, BooleanArray};
-        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-        use std::sync::Arc;
-        use rayon::prelude::*;
-        
-        let columns = table.columns_ref();
-        let num_rows = matching_indices.len();
-        
-        // Build Arrow arrays directly from column data
-        let mut fields = Vec::with_capacity(result_columns.len());
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(result_columns.len());
-        
-        for (col_name, col_idx) in column_indices {
-            if col_name == "_id" {
-                // Build _id array from indices
-                let id_values: Vec<i64> = matching_indices.iter().map(|&i| i as i64).collect();
-                fields.push(Field::new("_id", ArrowDataType::Int64, false));
-                arrays.push(Arc::new(Int64Array::from(id_values)));
-            } else if let Some(idx) = col_idx {
-                match &columns[*idx] {
-                    TypedColumn::Int64 { data, nulls } => {
-                        // Parallel gather for Int64
-                        let values: Vec<Option<i64>> = if num_rows > 100_000 {
-                            matching_indices.par_iter()
-                                .map(|&i| {
-                                    if i < data.len() && !nulls.get(i) {
-                                        Some(data[i])
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        } else {
-                            matching_indices.iter()
-                                .map(|&i| {
-                                    if i < data.len() && !nulls.get(i) {
-                                        Some(data[i])
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        };
-                        fields.push(Field::new(col_name, ArrowDataType::Int64, true));
-                        arrays.push(Arc::new(Int64Array::from(values)));
-                    }
-                    TypedColumn::Float64 { data, nulls } => {
-                        let values: Vec<Option<f64>> = if num_rows > 100_000 {
-                            matching_indices.par_iter()
-                                .map(|&i| {
-                                    if i < data.len() && !nulls.get(i) {
-                                        Some(data[i])
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        } else {
-                            matching_indices.iter()
-                                .map(|&i| {
-                                    if i < data.len() && !nulls.get(i) {
-                                        Some(data[i])
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        };
-                        fields.push(Field::new(col_name, ArrowDataType::Float64, true));
-                        arrays.push(Arc::new(Float64Array::from(values)));
-                    }
-                    TypedColumn::String(col) => {
-                        // Use ArrowStringColumn's native Arrow conversion
-                        fields.push(Field::new(col_name, ArrowDataType::Utf8, true));
-                        arrays.push(col.to_arrow_array_indexed(matching_indices));
-                    }
-                    TypedColumn::Bool { data, nulls } => {
-                        let values: Vec<Option<bool>> = matching_indices.iter()
-                            .map(|&i| {
-                                if i < data.len() && !nulls.get(i) {
-                                    Some(data.get(i))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        fields.push(Field::new(col_name, ArrowDataType::Boolean, true));
-                        arrays.push(Arc::new(BooleanArray::from(values)));
-                    }
-                    TypedColumn::Mixed { data, nulls } => {
-                        // Mixed type - convert to string representation
-                        let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
-                        for &i in matching_indices {
-                            if i < data.len() && !nulls.get(i) {
-                                builder.append_value(data[i].to_string_value());
-                            } else {
-                                builder.append_null();
-                            }
-                        }
-                        fields.push(Field::new(col_name, ArrowDataType::Utf8, true));
-                        arrays.push(Arc::new(builder.finish()));
-                    }
-                }
-            } else {
-                // Column not found - add nulls
-                let null_values: Vec<Option<i64>> = vec![None; num_rows];
-                fields.push(Field::new(col_name, ArrowDataType::Int64, true));
-                arrays.push(Arc::new(Int64Array::from(null_values)));
-            }
-        }
-        
-        // Create RecordBatch and return SqlResult with embedded Arrow batch
-        let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema, arrays)
-            .map_err(|e| ApexError::SerializationError(e.to_string()))?;
-        
-        Ok(SqlResult::with_arrow_batch(result_columns.to_vec(), batch))
+        crate::query::engine::ops::build_arrow_direct(result_columns, column_indices, matching_indices, table)
     }
 }

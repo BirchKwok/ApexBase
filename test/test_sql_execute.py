@@ -297,6 +297,12 @@ class TestBasicSQLExecute:
             assert "number" in df.columns
             assert df["title"].iloc[0].startswith("Python")
 
+            # Regression: ensure schema matches Dictionary-encoded string arrays on Arrow fast path
+            # when explicitly requesting _id in addition to '*'.
+            df2 = client.execute("select *, _id from default").to_pandas()
+            assert len(df2) == 6000
+            assert "_id" in df2.columns
+
             client.close()
 
     def test_execute_where_not_like_and_like(self):

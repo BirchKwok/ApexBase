@@ -549,6 +549,7 @@ fn build_float64_array_optimized(
 /// 2. Each chunk builds its own string data in parallel
 /// 3. Merge chunks into final Arrow array
 #[inline(always)]
+#[allow(dead_code)]
 fn build_string_array_optimized(
     data: &[String], 
     nulls: &BitVec, 
@@ -567,6 +568,7 @@ fn build_string_array_optimized(
 
 /// Sequential string array builder - optimal for smaller datasets
 #[inline(always)]
+#[allow(dead_code)]
 fn build_string_array_sequential(
     data: &[String], 
     nulls: &BitVec, 
@@ -615,6 +617,7 @@ fn build_string_array_sequential(
 /// 
 /// Strategy: Build string data in parallel chunks, then create Arrow array
 #[inline(always)]
+#[allow(dead_code)]
 fn build_string_array_parallel(
     data: &[String], 
     nulls: &BitVec, 
@@ -982,6 +985,7 @@ fn build_float64_array_all(data: &[f64], nulls: &BitVec, num_rows: usize) -> Arr
 
 /// Build String array for all rows - ULTRA OPTIMIZED with parallel byte counting
 #[inline]
+#[allow(dead_code)]
 fn build_string_array_all(data: &[String], nulls: &BitVec, num_rows: usize) -> ArrayRef {
     use rayon::prelude::*;
     

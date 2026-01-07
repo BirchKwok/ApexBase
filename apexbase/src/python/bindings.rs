@@ -317,6 +317,7 @@ fn value_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
 }
 
 /// Convert Arrow array value at index to Python object
+#[allow(dead_code)]
 fn arrow_value_to_py(py: Python<'_>, array: &arrow::array::ArrayRef, idx: usize) -> PyResult<PyObject> {
     use arrow::array::{Array, Int64Array, Float64Array, StringArray, BooleanArray};
     use arrow::datatypes::DataType;
