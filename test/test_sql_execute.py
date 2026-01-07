@@ -12,12 +12,13 @@ This module tests:
 
 import pytest
 import tempfile
+import time
+import re
 import shutil
 from pathlib import Path
 import sys
 import os
 import numpy as np
-import time
 
 # Add the apexbase python module to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'apexbase', 'python'))
@@ -80,6 +81,141 @@ class TestBasicSQLExecute:
             assert "city" in result.columns
             assert "_id" not in result.columns  # _id should be hidden
             
+            client.close()
+
+    def test_execute_temporary_view_create_select_drop(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([{"a": 1}, {"a": 2}])
+            client.flush()
+
+            # View exists only within this execute call
+            res = client.execute(
+                """
+                CREATE VIEW v AS SELECT a FROM default WHERE a >= 2;
+                SELECT * FROM v;
+                DROP VIEW v;
+                """.strip()
+            )
+            out = res.to_dict()
+            assert out == [{"a": 2}]
+
+            # New execute: view should not exist
+            with pytest.raises(Exception):
+                client.execute("SELECT * FROM v").to_dict()
+
+            client.close()
+
+    def test_execute_temporary_view_name_conflict_with_table(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.create_table("t")
+            client.use_table("t")
+            client.store([{"x": 1}])
+            client.flush()
+            client.use_table("default")
+
+            with pytest.raises(Exception):
+                client.execute("CREATE VIEW t AS SELECT 1 AS x")
+
+            client.close()
+
+    def test_execute_string_scalar_functions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([{"s": "  Abc-XYZ  ", "n": 2}])
+            client.flush()
+
+            res = client.execute(
+                """
+                SELECT
+                  LEN('你好') AS l_unicode,
+                  MID('abcdef', 2, 3) AS mid1,
+                  MID('abcdef', 3) AS mid2,
+                  REPLACE('a-b-c', '-', '_') AS rep,
+                  TRIM('  hi  ') AS tr,
+                  UPPER('aBc') AS up,
+                  LOWER('aBc') AS lo
+                FROM default
+                """.strip()
+            )
+            row = res.first()
+
+            assert row["l_unicode"] == 2
+            assert row["mid1"] == "bcd"
+            assert row["mid2"] == "cdef"
+            assert row["rep"] == "a_b_c"
+            assert row["tr"] == "hi"
+            assert row["up"] == "ABC"
+            assert row["lo"] == "abc"
+
+            client.close()
+
+    def test_execute_scalar_standard_functions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([{"v": 1}])
+            client.flush()
+
+            res = client.execute(
+                """
+                SELECT
+                  ROUND(1.2345, 2) AS r2,
+                  ROUND(1.6) AS r0,
+                  SQRT(9) AS s,
+                  CONCAT('a', 'b', 'c') AS c,
+                  COALESCE(NULL, 'x', 'y') AS co,
+                  IFNULL(NULL, 7) AS ifn,
+                  NVL(NULL, 'z') AS nv,
+                  ISNULL(NULL, 'k') AS isn
+                FROM default
+                """.strip()
+            )
+            row = res.first()
+
+            assert row["r2"] == pytest.approx(1.23)
+            assert row["r0"] == pytest.approx(2.0)
+            assert row["s"] == pytest.approx(3.0)
+            assert row["c"] == "abc"
+            assert row["co"] == "x"
+            assert row["ifn"] == 7
+            assert row["nv"] == "z"
+            assert row["isn"] == "k"
+
+            # NOW(): returns formatted datetime string, stable within one execute
+            now_res = client.execute("SELECT NOW() AS t FROM default")
+            t = now_res.first()["t"]
+            assert isinstance(t, str)
+            assert re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", t)
+
+            now2 = client.execute("SELECT NOW() AS a, NOW() AS b FROM default").first()
+            assert now2["a"] == now2["b"]
+
+            client.close()
+
+    def test_execute_rand_function(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            rows = [{"v": i} for i in range(100)]
+            client.store(rows)
+            client.flush()
+
+            result = client.execute("SELECT rand() AS r FROM default")
+            out = result.to_dict()
+            assert len(out) == 100
+            for row in out[:10]:
+                assert isinstance(row["r"], float)
+                assert 0.0 <= row["r"] < 1.0
+
+            # Non-deterministic: expect not all values identical.
+            rs = [row["r"] for row in out]
+            assert len(set(rs)) > 1
+
             client.close()
 
     def test_execute_join_group_by_agg_order_alias_flexible(self):

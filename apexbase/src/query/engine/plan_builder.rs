@@ -8,6 +8,16 @@ use crate::ApexError;
 pub(crate) struct PlanBuilder;
 
 impl PlanBuilder {
+    pub(crate) fn build_plan(stmt: &SqlStatement, table: &ColumnTable) -> Result<LogicalPlan, ApexError> {
+        match stmt {
+            SqlStatement::Select(select) => PlanBuilder::build_select_plan(select, table),
+            SqlStatement::Union(u) => PlanBuilder::build_union_plan(u, table),
+            SqlStatement::CreateView { .. } | SqlStatement::DropView { .. } => Err(ApexError::QueryParseError(
+                "CREATE/DROP VIEW must be handled before planning".to_string(),
+            )),
+        }
+    }
+
     pub(crate) fn build_union_plan(union: &UnionStatement, table: &ColumnTable) -> Result<LogicalPlan, ApexError> {
         fn build_one(stmt: &SqlStatement, table: &ColumnTable) -> Result<LogicalPlan, ApexError> {
             match stmt {
@@ -21,6 +31,9 @@ impl PlanBuilder {
                     }
                 }
                 SqlStatement::Union(u) => PlanBuilder::build_union_plan(u, table),
+                SqlStatement::CreateView { .. } | SqlStatement::DropView { .. } => Err(ApexError::QueryParseError(
+                    "CREATE/DROP VIEW must be handled before planning".to_string(),
+                )),
             }
         }
 
@@ -86,7 +99,8 @@ impl PlanBuilder {
             };
         }
 
-        let (result_columns, column_indices) = crate::query::engine::ops::resolve_columns(&stmt.columns, table)?;
+        let (result_columns, column_indices, projected_exprs) =
+            crate::query::engine::ops::resolve_columns(&stmt.columns, table)?;
 
         // DISTINCT + LIMIT (no ORDER BY) early stop.
         if stmt.distinct && stmt.order_by.is_empty() && stmt.limit.is_some() {
@@ -103,6 +117,7 @@ impl PlanBuilder {
             input: Box::new(plan),
             result_columns,
             column_indices,
+            projected_exprs,
             prefer_arrow: !stmt.distinct,
         };
 
@@ -155,11 +170,13 @@ impl PlanBuilder {
             };
         }
 
-        let (result_columns, column_indices) = crate::query::engine::ops::resolve_columns(&stmt.columns, table)?;
+        let (result_columns, column_indices, projected_exprs) =
+            crate::query::engine::ops::resolve_columns(&stmt.columns, table)?;
         plan = LogicalPlan::Project {
             input: Box::new(plan),
             result_columns,
             column_indices,
+            projected_exprs,
             // DISTINCT is implemented on rows for now.
             prefer_arrow: !stmt.distinct,
         };

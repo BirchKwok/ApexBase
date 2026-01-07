@@ -198,6 +198,9 @@ impl SqlExecutor {
         match stmt {
             SqlStatement::Select(select) => Self::execute_select(select, table),
             SqlStatement::Union(union) => Self::execute_union(union, table),
+            SqlStatement::CreateView { .. } | SqlStatement::DropView { .. } => Err(ApexError::QueryParseError(
+                "CREATE/DROP VIEW are only supported in multi-statement execution".to_string(),
+            )),
         }
     }
 
@@ -228,6 +231,9 @@ impl SqlExecutor {
                 }
             }
             SqlStatement::Union(union) => Self::execute_union_with_tables(union, tables, default_table),
+            SqlStatement::CreateView { .. } | SqlStatement::DropView { .. } => Err(ApexError::QueryParseError(
+                "CREATE/DROP VIEW are only supported in multi-statement execution".to_string(),
+            )),
         }
     }
 
@@ -271,6 +277,10 @@ impl SqlExecutor {
                     SqlExecutor::execute_select(sel, table)
                 }
                 crate::query::SqlStatement::Union(u) => SqlExecutor::execute_union_with_tables(u, tables, default_table),
+                crate::query::SqlStatement::CreateView { .. }
+                | crate::query::SqlStatement::DropView { .. } => Err(ApexError::QueryParseError(
+                    "CREATE/DROP VIEW are only supported in multi-statement execution".to_string(),
+                )),
             }
         }
 
@@ -1037,6 +1047,222 @@ impl SqlExecutor {
                             inner_alias,
                             inner_table_name,
                         )),
+                        SqlExpr::Function { name, args } => {
+                            if name.eq_ignore_ascii_case("rand") {
+                                if !args.is_empty() {
+                                    return Err(ApexError::QueryParseError(
+                                        "RAND() does not accept arguments".to_string(),
+                                    ));
+                                }
+                                return Ok(Value::Float64(rand::random::<f64>()));
+                            }
+                            if name.eq_ignore_ascii_case("len") {
+                                if args.len() != 1 {
+                                    return Err(ApexError::QueryParseError(
+                                        "LEN() expects 1 argument".to_string(),
+                                    ));
+                                }
+                                let v = eval_scalar(
+                                    &args[0],
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    inner_alias,
+                                    inner_table_name,
+                                )?;
+                                if v.is_null() {
+                                    return Ok(Value::Null);
+                                }
+                                let s = v.to_string_value();
+                                return Ok(Value::Int64(s.chars().count() as i64));
+                            }
+                            if name.eq_ignore_ascii_case("trim") {
+                                if args.len() != 1 {
+                                    return Err(ApexError::QueryParseError(
+                                        "TRIM() expects 1 argument".to_string(),
+                                    ));
+                                }
+                                let v = eval_scalar(
+                                    &args[0],
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    inner_alias,
+                                    inner_table_name,
+                                )?;
+                                if v.is_null() {
+                                    return Ok(Value::Null);
+                                }
+                                return Ok(Value::String(v.to_string_value().trim().to_string()));
+                            }
+                            if name.eq_ignore_ascii_case("upper") {
+                                if args.len() != 1 {
+                                    return Err(ApexError::QueryParseError(
+                                        "UPPER() expects 1 argument".to_string(),
+                                    ));
+                                }
+                                let v = eval_scalar(
+                                    &args[0],
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    inner_alias,
+                                    inner_table_name,
+                                )?;
+                                if v.is_null() {
+                                    return Ok(Value::Null);
+                                }
+                                return Ok(Value::String(v.to_string_value().to_uppercase()));
+                            }
+                            if name.eq_ignore_ascii_case("lower") {
+                                if args.len() != 1 {
+                                    return Err(ApexError::QueryParseError(
+                                        "LOWER() expects 1 argument".to_string(),
+                                    ));
+                                }
+                                let v = eval_scalar(
+                                    &args[0],
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    inner_alias,
+                                    inner_table_name,
+                                )?;
+                                if v.is_null() {
+                                    return Ok(Value::Null);
+                                }
+                                return Ok(Value::String(v.to_string_value().to_lowercase()));
+                            }
+                            if name.eq_ignore_ascii_case("replace") {
+                                if args.len() != 3 {
+                                    return Err(ApexError::QueryParseError(
+                                        "REPLACE() expects 3 arguments".to_string(),
+                                    ));
+                                }
+                                let s0 = eval_scalar(
+                                    &args[0],
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    inner_alias,
+                                    inner_table_name,
+                                )?;
+                                let from0 = eval_scalar(
+                                    &args[1],
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    inner_alias,
+                                    inner_table_name,
+                                )?;
+                                let to0 = eval_scalar(
+                                    &args[2],
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    inner_alias,
+                                    inner_table_name,
+                                )?;
+                                if s0.is_null() || from0.is_null() || to0.is_null() {
+                                    return Ok(Value::Null);
+                                }
+                                let s = s0.to_string_value();
+                                let from = from0.to_string_value();
+                                let to = to0.to_string_value();
+                                return Ok(Value::String(s.replace(&from, &to)));
+                            }
+                            if name.eq_ignore_ascii_case("mid") {
+                                if args.len() != 2 && args.len() != 3 {
+                                    return Err(ApexError::QueryParseError(
+                                        "MID() expects 2 or 3 arguments".to_string(),
+                                    ));
+                                }
+                                let s0 = eval_scalar(
+                                    &args[0],
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    inner_alias,
+                                    inner_table_name,
+                                )?;
+                                let start0 = eval_scalar(
+                                    &args[1],
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                    inner_table,
+                                    inner_row,
+                                    inner_alias,
+                                    inner_table_name,
+                                )?;
+                                if s0.is_null() || start0.is_null() {
+                                    return Ok(Value::Null);
+                                }
+                                let s = s0.to_string_value();
+                                let mut start = start0.as_i64().unwrap_or(1);
+                                if start < 1 {
+                                    start = 1;
+                                }
+                                let start_idx = (start - 1) as usize;
+                                let chars: Vec<char> = s.chars().collect();
+                                if start_idx >= chars.len() {
+                                    return Ok(Value::String(String::new()));
+                                }
+                                let end_idx = if args.len() == 3 {
+                                    let len0 = eval_scalar(
+                                        &args[2],
+                                        outer_table,
+                                        outer_row,
+                                        outer_alias,
+                                        outer_table_name,
+                                        inner_table,
+                                        inner_row,
+                                        inner_alias,
+                                        inner_table_name,
+                                    )?;
+                                    if len0.is_null() {
+                                        return Ok(Value::Null);
+                                    }
+                                    let mut l = len0.as_i64().unwrap_or(0);
+                                    if l < 0 {
+                                        l = 0;
+                                    }
+                                    (start_idx + l as usize).min(chars.len())
+                                } else {
+                                    chars.len()
+                                };
+                                let out: String = chars[start_idx..end_idx].iter().collect();
+                                return Ok(Value::String(out));
+                            }
+                            Err(ApexError::QueryParseError(
+                                format!("Unsupported function: {}", name),
+                            ))
+                        }
                         SqlExpr::UnaryOp { op: UnaryOperator::Minus, expr } => {
                             let v = eval_scalar(
                                 expr,
@@ -1307,6 +1533,102 @@ impl SqlExecutor {
                         }
                         SqlExpr::Literal(v) => v.clone(),
                         SqlExpr::Column(c) => get_outer_value(c, outer_table, outer_row, outer_alias, outer_table_name),
+                        SqlExpr::Function { name, args } => {
+                            if name.eq_ignore_ascii_case("rand") {
+                                if !args.is_empty() {
+                                    return Value::Null;
+                                }
+                                Value::Float64(rand::random::<f64>())
+                            } else if name.eq_ignore_ascii_case("len") {
+                                if args.len() != 1 {
+                                    return Value::Null;
+                                }
+                                let v = eval_outer_scalar(&args[0], outer_table, outer_row, outer_alias, outer_table_name);
+                                if v.is_null() {
+                                    Value::Null
+                                } else {
+                                    let s = v.to_string_value();
+                                    Value::Int64(s.chars().count() as i64)
+                                }
+                            } else if name.eq_ignore_ascii_case("trim") {
+                                if args.len() != 1 {
+                                    return Value::Null;
+                                }
+                                let v = eval_outer_scalar(&args[0], outer_table, outer_row, outer_alias, outer_table_name);
+                                if v.is_null() {
+                                    Value::Null
+                                } else {
+                                    Value::String(v.to_string_value().trim().to_string())
+                                }
+                            } else if name.eq_ignore_ascii_case("upper") {
+                                if args.len() != 1 {
+                                    return Value::Null;
+                                }
+                                let v = eval_outer_scalar(&args[0], outer_table, outer_row, outer_alias, outer_table_name);
+                                if v.is_null() {
+                                    Value::Null
+                                } else {
+                                    Value::String(v.to_string_value().to_uppercase())
+                                }
+                            } else if name.eq_ignore_ascii_case("lower") {
+                                if args.len() != 1 {
+                                    return Value::Null;
+                                }
+                                let v = eval_outer_scalar(&args[0], outer_table, outer_row, outer_alias, outer_table_name);
+                                if v.is_null() {
+                                    Value::Null
+                                } else {
+                                    Value::String(v.to_string_value().to_lowercase())
+                                }
+                            } else if name.eq_ignore_ascii_case("replace") {
+                                if args.len() != 3 {
+                                    return Value::Null;
+                                }
+                                let s0 = eval_outer_scalar(&args[0], outer_table, outer_row, outer_alias, outer_table_name);
+                                let from0 = eval_outer_scalar(&args[1], outer_table, outer_row, outer_alias, outer_table_name);
+                                let to0 = eval_outer_scalar(&args[2], outer_table, outer_row, outer_alias, outer_table_name);
+                                if s0.is_null() || from0.is_null() || to0.is_null() {
+                                    Value::Null
+                                } else {
+                                    Value::String(s0.to_string_value().replace(&from0.to_string_value(), &to0.to_string_value()))
+                                }
+                            } else if name.eq_ignore_ascii_case("mid") {
+                                if args.len() != 2 && args.len() != 3 {
+                                    return Value::Null;
+                                }
+                                let s0 = eval_outer_scalar(&args[0], outer_table, outer_row, outer_alias, outer_table_name);
+                                let start0 = eval_outer_scalar(&args[1], outer_table, outer_row, outer_alias, outer_table_name);
+                                if s0.is_null() || start0.is_null() {
+                                    return Value::Null;
+                                }
+                                let s = s0.to_string_value();
+                                let mut start = start0.as_i64().unwrap_or(1);
+                                if start < 1 {
+                                    start = 1;
+                                }
+                                let start_idx = (start - 1) as usize;
+                                let chars: Vec<char> = s.chars().collect();
+                                if start_idx >= chars.len() {
+                                    return Value::String(String::new());
+                                }
+                                let end_idx = if args.len() == 3 {
+                                    let len0 = eval_outer_scalar(&args[2], outer_table, outer_row, outer_alias, outer_table_name);
+                                    if len0.is_null() {
+                                        return Value::Null;
+                                    }
+                                    let mut l = len0.as_i64().unwrap_or(0);
+                                    if l < 0 {
+                                        l = 0;
+                                    }
+                                    (start_idx + l as usize).min(chars.len())
+                                } else {
+                                    chars.len()
+                                };
+                                Value::String(chars[start_idx..end_idx].iter().collect())
+                            } else {
+                                Value::Null
+                            }
+                        }
                         SqlExpr::UnaryOp { op: UnaryOperator::Minus, expr } => {
                             let v = eval_outer_scalar(expr, outer_table, outer_row, outer_alias, outer_table_name);
                             if let Some(i) = v.as_i64() {
@@ -1819,6 +2141,199 @@ impl SqlExecutor {
                     }
                     SqlExpr::Literal(v) => Ok(v.clone()),
                     SqlExpr::Column(c) => Ok(get_outer_value_local(c, outer_table, outer_row, outer_alias, outer_table_name)),
+                    SqlExpr::Function { name, args } => {
+                        if name.eq_ignore_ascii_case("rand") {
+                            if !args.is_empty() {
+                                return Err(ApexError::QueryParseError(
+                                    "RAND() does not accept arguments".to_string(),
+                                ));
+                            }
+                            Ok(Value::Float64(rand::random::<f64>()))
+                        } else if name.eq_ignore_ascii_case("len") {
+                            if args.len() != 1 {
+                                return Err(ApexError::QueryParseError(
+                                    "LEN() expects 1 argument".to_string(),
+                                ));
+                            }
+                            let v = eval_outer_expr(
+                                &args[0],
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )?;
+                            if v.is_null() {
+                                Ok(Value::Null)
+                            } else {
+                                Ok(Value::Int64(v.to_string_value().chars().count() as i64))
+                            }
+                        } else if name.eq_ignore_ascii_case("trim") {
+                            if args.len() != 1 {
+                                return Err(ApexError::QueryParseError(
+                                    "TRIM() expects 1 argument".to_string(),
+                                ));
+                            }
+                            let v = eval_outer_expr(
+                                &args[0],
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )?;
+                            if v.is_null() {
+                                Ok(Value::Null)
+                            } else {
+                                Ok(Value::String(v.to_string_value().trim().to_string()))
+                            }
+                        } else if name.eq_ignore_ascii_case("upper") {
+                            if args.len() != 1 {
+                                return Err(ApexError::QueryParseError(
+                                    "UPPER() expects 1 argument".to_string(),
+                                ));
+                            }
+                            let v = eval_outer_expr(
+                                &args[0],
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )?;
+                            if v.is_null() {
+                                Ok(Value::Null)
+                            } else {
+                                Ok(Value::String(v.to_string_value().to_uppercase()))
+                            }
+                        } else if name.eq_ignore_ascii_case("lower") {
+                            if args.len() != 1 {
+                                return Err(ApexError::QueryParseError(
+                                    "LOWER() expects 1 argument".to_string(),
+                                ));
+                            }
+                            let v = eval_outer_expr(
+                                &args[0],
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )?;
+                            if v.is_null() {
+                                Ok(Value::Null)
+                            } else {
+                                Ok(Value::String(v.to_string_value().to_lowercase()))
+                            }
+                        } else if name.eq_ignore_ascii_case("replace") {
+                            if args.len() != 3 {
+                                return Err(ApexError::QueryParseError(
+                                    "REPLACE() expects 3 arguments".to_string(),
+                                ));
+                            }
+                            let s0 = eval_outer_expr(
+                                &args[0],
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )?;
+                            let from0 = eval_outer_expr(
+                                &args[1],
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )?;
+                            let to0 = eval_outer_expr(
+                                &args[2],
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )?;
+                            if s0.is_null() || from0.is_null() || to0.is_null() {
+                                Ok(Value::Null)
+                            } else {
+                                Ok(Value::String(
+                                    s0.to_string_value().replace(&from0.to_string_value(), &to0.to_string_value()),
+                                ))
+                            }
+                        } else if name.eq_ignore_ascii_case("mid") {
+                            if args.len() != 2 && args.len() != 3 {
+                                return Err(ApexError::QueryParseError(
+                                    "MID() expects 2 or 3 arguments".to_string(),
+                                ));
+                            }
+                            let s0 = eval_outer_expr(
+                                &args[0],
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )?;
+                            let start0 = eval_outer_expr(
+                                &args[1],
+                                tables,
+                                default_table,
+                                outer_table,
+                                outer_row,
+                                outer_alias,
+                                outer_table_name,
+                            )?;
+                            if s0.is_null() || start0.is_null() {
+                                return Ok(Value::Null);
+                            }
+                            let s = s0.to_string_value();
+                            let mut start = start0.as_i64().unwrap_or(1);
+                            if start < 1 {
+                                start = 1;
+                            }
+                            let start_idx = (start - 1) as usize;
+                            let chars: Vec<char> = s.chars().collect();
+                            if start_idx >= chars.len() {
+                                return Ok(Value::String(String::new()));
+                            }
+                            let end_idx = if args.len() == 3 {
+                                let len0 = eval_outer_expr(
+                                    &args[2],
+                                    tables,
+                                    default_table,
+                                    outer_table,
+                                    outer_row,
+                                    outer_alias,
+                                    outer_table_name,
+                                )?;
+                                if len0.is_null() {
+                                    return Ok(Value::Null);
+                                }
+                                let mut l = len0.as_i64().unwrap_or(0);
+                                if l < 0 {
+                                    l = 0;
+                                }
+                                (start_idx + l as usize).min(chars.len())
+                            } else {
+                                chars.len()
+                            };
+                            Ok(Value::String(chars[start_idx..end_idx].iter().collect()))
+                        } else {
+                            Err(ApexError::QueryParseError(
+                                format!("Unsupported function: {}", name),
+                            ))
+                        }
+                    }
                     SqlExpr::UnaryOp { op: UnaryOperator::Minus, expr } => {
                         let v = eval_outer_expr(expr, tables, default_table, outer_table, outer_row, outer_alias, outer_table_name)?;
                         if let Some(i) = v.as_i64() {
@@ -2135,6 +2650,120 @@ impl SqlExecutor {
                     SqlExpr::Paren(inner) => eval_scalar(inner, left_table, right_table, left_alias, right_alias, jr),
                     SqlExpr::Literal(v) => Ok(v.clone()),
                     SqlExpr::Column(c) => Ok(value_for_ref(c, left_table, right_table, left_alias, right_alias, jr)),
+                    SqlExpr::Function { name, args } => {
+                        if name.eq_ignore_ascii_case("rand") {
+                            if !args.is_empty() {
+                                return Err(ApexError::QueryParseError(
+                                    "RAND() does not accept arguments".to_string(),
+                                ));
+                            }
+                            return Ok(Value::Float64(rand::random::<f64>()));
+                        }
+                        if name.eq_ignore_ascii_case("len") {
+                            if args.len() != 1 {
+                                return Err(ApexError::QueryParseError(
+                                    "LEN() expects 1 argument".to_string(),
+                                ));
+                            }
+                            let v = eval_scalar(&args[0], left_table, right_table, left_alias, right_alias, jr)?;
+                            if v.is_null() {
+                                return Ok(Value::Null);
+                            }
+                            let s = v.to_string_value();
+                            return Ok(Value::Int64(s.chars().count() as i64));
+                        }
+                        if name.eq_ignore_ascii_case("trim") {
+                            if args.len() != 1 {
+                                return Err(ApexError::QueryParseError(
+                                    "TRIM() expects 1 argument".to_string(),
+                                ));
+                            }
+                            let v = eval_scalar(&args[0], left_table, right_table, left_alias, right_alias, jr)?;
+                            if v.is_null() {
+                                return Ok(Value::Null);
+                            }
+                            return Ok(Value::String(v.to_string_value().trim().to_string()));
+                        }
+                        if name.eq_ignore_ascii_case("upper") {
+                            if args.len() != 1 {
+                                return Err(ApexError::QueryParseError(
+                                    "UPPER() expects 1 argument".to_string(),
+                                ));
+                            }
+                            let v = eval_scalar(&args[0], left_table, right_table, left_alias, right_alias, jr)?;
+                            if v.is_null() {
+                                return Ok(Value::Null);
+                            }
+                            return Ok(Value::String(v.to_string_value().to_uppercase()));
+                        }
+                        if name.eq_ignore_ascii_case("lower") {
+                            if args.len() != 1 {
+                                return Err(ApexError::QueryParseError(
+                                    "LOWER() expects 1 argument".to_string(),
+                                ));
+                            }
+                            let v = eval_scalar(&args[0], left_table, right_table, left_alias, right_alias, jr)?;
+                            if v.is_null() {
+                                return Ok(Value::Null);
+                            }
+                            return Ok(Value::String(v.to_string_value().to_lowercase()));
+                        }
+                        if name.eq_ignore_ascii_case("replace") {
+                            if args.len() != 3 {
+                                return Err(ApexError::QueryParseError(
+                                    "REPLACE() expects 3 arguments".to_string(),
+                                ));
+                            }
+                            let s0 = eval_scalar(&args[0], left_table, right_table, left_alias, right_alias, jr)?;
+                            let from0 = eval_scalar(&args[1], left_table, right_table, left_alias, right_alias, jr)?;
+                            let to0 = eval_scalar(&args[2], left_table, right_table, left_alias, right_alias, jr)?;
+                            if s0.is_null() || from0.is_null() || to0.is_null() {
+                                return Ok(Value::Null);
+                            }
+                            return Ok(Value::String(
+                                s0.to_string_value().replace(&from0.to_string_value(), &to0.to_string_value()),
+                            ));
+                        }
+                        if name.eq_ignore_ascii_case("mid") {
+                            if args.len() != 2 && args.len() != 3 {
+                                return Err(ApexError::QueryParseError(
+                                    "MID() expects 2 or 3 arguments".to_string(),
+                                ));
+                            }
+                            let s0 = eval_scalar(&args[0], left_table, right_table, left_alias, right_alias, jr)?;
+                            let start0 = eval_scalar(&args[1], left_table, right_table, left_alias, right_alias, jr)?;
+                            if s0.is_null() || start0.is_null() {
+                                return Ok(Value::Null);
+                            }
+                            let s = s0.to_string_value();
+                            let mut start = start0.as_i64().unwrap_or(1);
+                            if start < 1 {
+                                start = 1;
+                            }
+                            let start_idx = (start - 1) as usize;
+                            let chars: Vec<char> = s.chars().collect();
+                            if start_idx >= chars.len() {
+                                return Ok(Value::String(String::new()));
+                            }
+                            let end_idx = if args.len() == 3 {
+                                let len0 = eval_scalar(&args[2], left_table, right_table, left_alias, right_alias, jr)?;
+                                if len0.is_null() {
+                                    return Ok(Value::Null);
+                                }
+                                let mut l = len0.as_i64().unwrap_or(0);
+                                if l < 0 {
+                                    l = 0;
+                                }
+                                (start_idx + l as usize).min(chars.len())
+                            } else {
+                                chars.len()
+                            };
+                            return Ok(Value::String(chars[start_idx..end_idx].iter().collect()));
+                        }
+                        Err(ApexError::QueryParseError(
+                            format!("Unsupported function: {}", name),
+                        ))
+                    }
                     SqlExpr::UnaryOp { op, expr } => match op {
                         UnaryOperator::Not => {
                             let v = eval_predicate(expr, left_table, right_table, left_alias, right_alias, jr)?;
@@ -2178,9 +2807,7 @@ impl SqlExecutor {
             match expr {
                 SqlExpr::Paren(inner) => eval_predicate(inner, left_table, right_table, left_alias, right_alias, jr),
                 SqlExpr::Literal(v) => Ok(v.as_bool().unwrap_or(false)),
-                SqlExpr::UnaryOp { op: UnaryOperator::Not, expr } => {
-                    Ok(!eval_predicate(expr, left_table, right_table, left_alias, right_alias, jr)?)
-                }
+                SqlExpr::UnaryOp { op: UnaryOperator::Not, expr } => Ok(!eval_predicate(expr, left_table, right_table, left_alias, right_alias, jr)?),
                 SqlExpr::BinaryOp { left, op, right } => match op {
                     BinaryOperator::And => Ok(
                         eval_predicate(left, left_table, right_table, left_alias, right_alias, jr)?
@@ -2460,6 +3087,14 @@ impl SqlExecutor {
                         }
                     }
                     SqlExpr::Function { name, args } => {
+                        if name.eq_ignore_ascii_case("rand") {
+                            if !args.is_empty() {
+                                return Err(ApexError::QueryParseError(
+                                    "RAND() does not accept arguments".to_string(),
+                                ));
+                            }
+                            return Ok(Value::Float64(rand::random::<f64>()));
+                        }
                         let func = match name.to_uppercase().as_str() {
                             "COUNT" => AggregateFunc::Count,
                             "SUM" => AggregateFunc::Sum,
@@ -2902,7 +3537,8 @@ impl SqlExecutor {
         columns: &[SelectColumn],
         table: &ColumnTable,
     ) -> Result<(Vec<String>, Vec<(String, Option<usize>)>), ApexError> {
-        crate::query::engine::ops::resolve_columns(columns, table)
+        let (cols, idxs, _exprs) = crate::query::engine::ops::resolve_columns(columns, table)?;
+        Ok((cols, idxs))
     }
     
     /// Evaluate WHERE clause and return matching row indices
@@ -2987,6 +3623,12 @@ impl SqlExecutor {
         let schema = table.schema_ref();
         let columns = table.columns_ref();
 
+        // Expand SELECT list (including `*`) into a concrete output schema.
+        // For window execution we only support a single window column, which will
+        // be represented as a synthetic column name with no underlying index.
+        let (result_columns, column_indices, _exprs) =
+            crate::query::engine::ops::resolve_columns(&stmt.columns, table)?;
+
         let part_idx = schema.get_index(&partition_col)
             .ok_or_else(|| ApexError::QueryParseError(format!("Unknown PARTITION BY column: {}", partition_col)))?;
         let order_idx = if order_clause.column == "_id" {
@@ -3005,17 +3647,6 @@ impl SqlExecutor {
                 other => PartKey::Other(other.to_string_value()),
             };
             groups.entry(key).or_insert_with(Vec::new).push(row_idx);
-        }
-
-        // Result columns (respect SELECT list ordering)
-        let mut result_columns = Vec::new();
-        for col in &stmt.columns {
-            match col {
-                SelectColumn::Column(name) => result_columns.push(name.clone()),
-                SelectColumn::ColumnAlias { alias, .. } => result_columns.push(alias.clone()),
-                SelectColumn::WindowFunction { alias, .. } => result_columns.push(alias.clone().unwrap_or_else(|| window_alias.clone())),
-                _ => {}
-            }
         }
 
         // Build output rows
@@ -3043,30 +3674,16 @@ impl SqlExecutor {
             for (pos, row_idx) in idxs.into_iter().enumerate() {
                 let rn = (pos + 1) as i64;
                 let mut row = Vec::with_capacity(result_columns.len());
-                for col in &stmt.columns {
-                    match col {
-                        SelectColumn::Column(name) => {
-                            if name == "_id" {
-                                row.push(Value::Int64(row_idx as i64));
-                            } else if let Some(ci) = schema.get_index(name) {
-                                row.push(columns[ci].get(row_idx).unwrap_or(Value::Null));
-                            } else {
-                                row.push(Value::Null);
-                            }
-                        }
-                        SelectColumn::ColumnAlias { column, .. } => {
-                            if column == "_id" {
-                                row.push(Value::Int64(row_idx as i64));
-                            } else if let Some(ci) = schema.get_index(column) {
-                                row.push(columns[ci].get(row_idx).unwrap_or(Value::Null));
-                            } else {
-                                row.push(Value::Null);
-                            }
-                        }
-                        SelectColumn::WindowFunction { .. } => {
-                            row.push(Value::Int64(rn));
-                        }
-                        _ => {}
+                for (col_name, col_idx) in column_indices.iter() {
+                    if col_name == &window_alias {
+                        row.push(Value::Int64(rn));
+                    } else if col_name == "_id" {
+                        row.push(Value::Int64(row_idx as i64));
+                    } else if let Some(ci) = col_idx {
+                        row.push(columns[*ci].get(row_idx).unwrap_or(Value::Null));
+                    } else {
+                        // Synthetic / unsupported expression columns (not expected in window path)
+                        row.push(Value::Null);
                     }
                 }
                 out_rows.push(row);
@@ -5221,6 +5838,14 @@ impl SqlExecutor {
                     }
                 }
                 SqlExpr::Function { name, args } => {
+                    if name.eq_ignore_ascii_case("rand") {
+                        if !args.is_empty() {
+                            return Err(ApexError::QueryParseError(
+                                "RAND() does not accept arguments".to_string(),
+                            ));
+                        }
+                        return Ok(Value::Float64(rand::random::<f64>()));
+                    }
                     let func = match name.to_uppercase().as_str() {
                         "COUNT" => AggregateFunc::Count,
                         "SUM" => AggregateFunc::Sum,
@@ -5758,6 +6383,15 @@ impl SqlExecutor {
         matching_indices: &[usize],
         table: &ColumnTable,
     ) -> Result<SqlResult, ApexError> {
-        crate::query::engine::ops::build_arrow_direct(result_columns, column_indices, matching_indices, table)
+        let projected_exprs = vec![None; column_indices.len()];
+        let ctx = crate::query::engine::ops::new_eval_context();
+        crate::query::engine::ops::build_arrow_direct(
+            result_columns,
+            column_indices,
+            &projected_exprs,
+            matching_indices,
+            table,
+            &ctx,
+        )
     }
 }

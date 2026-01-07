@@ -74,6 +74,8 @@ impl Value {
                     None
                 }
             }
+            Value::Timestamp(v) => Some(*v),
+            Value::Date(v) => Some(*v as i64),
             _ => None,
         }
     }

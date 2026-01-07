@@ -19,6 +19,8 @@ use crate::data::Value;
 pub enum SqlStatement {
     Select(SelectStatement),
     Union(UnionStatement),
+    CreateView { name: String, stmt: SelectStatement },
+    DropView { name: String },
 }
 
 #[derive(Debug, Clone)]
@@ -208,12 +210,14 @@ enum Token {
     Union, All,
     Exists,
     Case, When, Then, Else, End,
+    Create, Drop, View,
     // Symbols
     Star,           // *
     Comma,          // ,
     Dot,            // .
     LParen,         // (
     RParen,         // )
+    Semicolon,      // ;
     Eq,             // =
     NotEq,          // != or <>
     Lt,             // <
@@ -243,6 +247,17 @@ impl SqlParser {
             pos: 0,
         };
         parser.parse_statement()
+    }
+
+    /// Parse multiple SQL statements separated by semicolons.
+    pub fn parse_multi(sql: &str) -> Result<Vec<SqlStatement>, ApexError> {
+        let tokens = Self::tokenize(sql)?;
+        let mut parser = SqlParser {
+            sql_chars: sql.chars().collect(),
+            tokens,
+            pos: 0,
+        };
+        parser.parse_statements()
     }
 
     /// Parse a standalone SQL expression (same grammar as WHERE/HAVING).
@@ -291,6 +306,7 @@ impl SqlParser {
                 '.' => { tokens.push(SpannedToken { token: Token::Dot, start: i, end: i + 1 }); i += 1; continue; }
                 '(' => { tokens.push(SpannedToken { token: Token::LParen, start: i, end: i + 1 }); i += 1; continue; }
                 ')' => { tokens.push(SpannedToken { token: Token::RParen, start: i, end: i + 1 }); i += 1; continue; }
+                ';' => { tokens.push(SpannedToken { token: Token::Semicolon, start: i, end: i + 1 }); i += 1; continue; }
                 '+' => { tokens.push(SpannedToken { token: Token::Plus, start: i, end: i + 1 }); i += 1; continue; }
                 '-' => { tokens.push(SpannedToken { token: Token::Minus, start: i, end: i + 1 }); i += 1; continue; }
                 '/' => { tokens.push(SpannedToken { token: Token::Slash, start: i, end: i + 1 }); i += 1; continue; }
@@ -452,6 +468,9 @@ impl SqlParser {
                     "THEN" => Token::Then,
                     "ELSE" => Token::Else,
                     "END" => Token::End,
+                    "CREATE" => Token::Create,
+                    "DROP" => Token::Drop,
+                    "VIEW" => Token::View,
                     _ => Token::Identifier(word),
                 };
                 tokens.push(SpannedToken { token, start, end: i });
@@ -475,6 +494,24 @@ impl SqlParser {
     fn current_span(&self) -> (usize, usize) {
         let t = &self.tokens[self.pos];
         (t.start, t.end)
+    }
+
+    fn parse_statements(&mut self) -> Result<Vec<SqlStatement>, ApexError> {
+        let mut out = Vec::new();
+        while !matches!(self.current(), Token::Eof) {
+            while matches!(self.current(), Token::Semicolon) {
+                self.advance();
+            }
+            if matches!(self.current(), Token::Eof) {
+                break;
+            }
+            let stmt = self.parse_statement()?;
+            out.push(stmt);
+            while matches!(self.current(), Token::Semicolon) {
+                self.advance();
+            }
+        }
+        Ok(out)
     }
 
     fn format_near(&self, at: usize) -> String {
@@ -732,30 +769,59 @@ impl SqlParser {
                             s.offset = offset;
                             stmt = SqlStatement::Select(s);
                         }
+                        _ => {}
                     }
-                }
-
-                // Reject trailing tokens
-                if !matches!(self.current(), Token::Eof) {
-                    let (start, _) = self.current_span();
-                    let mut msg = format!("Unexpected token {:?} after end of statement", self.current());
-                    if let Some(kw) = self.keyword_suggestion() {
-                        msg = format!("{} (did you mean {}?)", msg, kw);
-                    }
-                    return Err(self.syntax_error(start, msg));
                 }
 
                 Ok(stmt)
             }
+            Token::Create => {
+                self.advance();
+                if !matches!(self.current(), Token::View) {
+                    let (start, _) = self.current_span();
+                    return Err(self.syntax_error(start, "Expected VIEW after CREATE".to_string()));
+                }
+                self.advance();
+                let name = match self.current().clone() {
+                    Token::Identifier(s) => {
+                        self.advance();
+                        s
+                    }
+                    _ => {
+                        let (start, _) = self.current_span();
+                        return Err(self.syntax_error(start, "Expected view name".to_string()));
+                    }
+                };
+                self.expect(Token::As)?;
+                if !matches!(self.current(), Token::Select) {
+                    let (start, _) = self.current_span();
+                    return Err(self.syntax_error(start, "Expected SELECT after AS".to_string()));
+                }
+                let stmt = self.parse_select_internal(true)?;
+                Ok(SqlStatement::CreateView { name, stmt })
+            }
+            Token::Drop => {
+                self.advance();
+                if !matches!(self.current(), Token::View) {
+                    let (start, _) = self.current_span();
+                    return Err(self.syntax_error(start, "Expected VIEW after DROP".to_string()));
+                }
+                self.advance();
+                let name = match self.current().clone() {
+                    Token::Identifier(s) => {
+                        self.advance();
+                        s
+                    }
+                    _ => {
+                        let (start, _) = self.current_span();
+                        return Err(self.syntax_error(start, "Expected view name".to_string()));
+                    }
+                };
+                Ok(SqlStatement::DropView { name })
+            }
             _ => {
                 let (start, _) = self.current_span();
-                let mut msg = "Expected SELECT statement".to_string();
-                if let Some(kw) = self.keyword_suggestion() {
-                    if kw == "SELECT" {
-                        msg = format!("{} (did you mean SELECT?)", msg);
-                    }
-                }
-                Err(self.syntax_error(start, msg))
+                Err(self.syntax_error(start, "Expected SQL statement".to_string()))
             }
         }
     }
@@ -1085,48 +1151,57 @@ impl SqlParser {
 
                 // Only window function supported: row_number() OVER (...)
                 if matches!(self.current(), Token::LParen) {
-                    self.advance();
-                    self.expect(Token::RParen)?;
+                    // Parse function call.
+                    // If it is followed by OVER, treat it as a window function.
+                    // Otherwise, treat it as a scalar expression in the SELECT list.
+                    let func_expr = self.parse_function_call_from_name(name.clone())?;
 
-                    if !matches!(self.current(), Token::Over) {
-                        return Err(ApexError::QueryParseError(
-                            format!("Unsupported function in SELECT list: {}", name)
-                        ));
-                    }
-
-                    self.advance();
-                    self.expect(Token::LParen)?;
-
-                    let mut partition_by = Vec::new();
-                    if matches!(self.current(), Token::Partition) {
+                    if matches!(self.current(), Token::Over) {
+                        // Only window function supported: row_number() OVER (...)
+                        // Existing behavior expects empty args.
                         self.advance();
-                        self.expect(Token::By)?;
-                        partition_by = self.parse_column_list()?;
-                    }
+                        self.expect(Token::LParen)?;
 
-                    let order_by = if matches!(self.current(), Token::Order) {
-                        self.advance();
-                        self.expect(Token::By)?;
-                        self.parse_order_by()?
+                        let mut partition_by = Vec::new();
+                        if matches!(self.current(), Token::Partition) {
+                            self.advance();
+                            self.expect(Token::By)?;
+                            partition_by = self.parse_column_list()?;
+                        }
+
+                        let order_by = if matches!(self.current(), Token::Order) {
+                            self.advance();
+                            self.expect(Token::By)?;
+                            self.parse_order_by()?
+                        } else {
+                            Vec::new()
+                        };
+
+                        self.expect(Token::RParen)?;
+
+                        let alias = if matches!(self.current(), Token::As) {
+                            self.advance();
+                            self.parse_alias_identifier()
+                        } else {
+                            self.parse_alias_identifier()
+                        };
+
+                        columns.push(SelectColumn::WindowFunction {
+                            name,
+                            partition_by,
+                            order_by,
+                            alias,
+                        });
                     } else {
-                        Vec::new()
-                    };
+                        let alias = if matches!(self.current(), Token::As) {
+                            self.advance();
+                            self.parse_alias_identifier()
+                        } else {
+                            self.parse_alias_identifier()
+                        };
 
-                    self.expect(Token::RParen)?;
-
-                    let alias = if matches!(self.current(), Token::As) {
-                        self.advance();
-                        self.parse_alias_identifier()
-                    } else {
-                        None
-                    };
-
-                    columns.push(SelectColumn::WindowFunction {
-                        name,
-                        partition_by,
-                        order_by,
-                        alias,
-                    });
+                        columns.push(SelectColumn::Expression { expr: func_expr, alias });
+                    }
                 } else {
                     // Regular column with optional alias
                     if matches!(self.current(), Token::As) {
@@ -1137,7 +1212,12 @@ impl SqlParser {
                             return Err(ApexError::QueryParseError("Expected alias after AS".to_string()));
                         }
                     } else {
-                        columns.push(SelectColumn::Column(name));
+                        // Allow implicit aliases: col alias
+                        if let Some(alias) = self.parse_alias_identifier() {
+                            columns.push(SelectColumn::ColumnAlias { column: name, alias });
+                        } else {
+                            columns.push(SelectColumn::Column(name));
+                        }
                     }
                 }
             } else {
@@ -1162,7 +1242,7 @@ impl SqlParser {
                         self.advance();
                         self.parse_alias_identifier()
                     } else {
-                        None
+                        self.parse_alias_identifier()
                     };
                     columns.push(SelectColumn::Expression { expr, alias });
                 } else {

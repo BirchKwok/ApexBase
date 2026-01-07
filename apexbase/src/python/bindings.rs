@@ -10,12 +10,12 @@ use crate::data::Value;
 use crate::table::{ColumnTable, ColumnSchema};
 use crate::fts::FtsManager;
 use crate::fts::FtsConfig;
-use crate::io_engine::IoEngine;
 use crate::query::SqlExecutor;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::fs;
 use parking_lot::RwLock;
@@ -646,12 +646,105 @@ impl ApexStorage {
         let (columns, rows, rows_affected) = py.allow_threads(|| -> PyResult<(Vec<String>, Vec<Vec<Value>>, usize)> {
             let default_table = self.current_table.read().clone();
 
-            let parsed = crate::query::SqlParser::parse(&sql)
+            let statements = crate::query::SqlParser::parse_multi(&sql)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            // Per-execute temporary view registry: view_name -> SelectStatement
+            let mut views: HashMap<String, crate::query::SelectStatement> = HashMap::new();
+
+            fn expand_from_item(
+                item: &mut crate::query::FromItem,
+                views: &HashMap<String, crate::query::SelectStatement>,
+            ) {
+                match item {
+                    crate::query::FromItem::Table { table, alias } => {
+                        if let Some(v) = views.get(table) {
+                            let a = alias.clone().unwrap_or_else(|| table.clone());
+                            *item = crate::query::FromItem::Subquery {
+                                stmt: Box::new(v.clone()),
+                                alias: a,
+                            };
+                        }
+                    }
+                    crate::query::FromItem::Subquery { stmt, .. } => {
+                        expand_select(stmt, views);
+                    }
+                }
+            }
+
+            fn expand_expr(expr: &mut crate::query::SqlExpr, views: &HashMap<String, crate::query::SelectStatement>) {
+                use crate::query::SqlExpr;
+                match expr {
+                    SqlExpr::BinaryOp { left, right, .. } => {
+                        expand_expr(left, views);
+                        expand_expr(right, views);
+                    }
+                    SqlExpr::UnaryOp { expr, .. } => expand_expr(expr, views),
+                    SqlExpr::Paren(inner) => expand_expr(inner, views),
+                    SqlExpr::Between { low, high, .. } => {
+                        expand_expr(low, views);
+                        expand_expr(high, views);
+                    }
+                    SqlExpr::InSubquery { stmt, .. }
+                    | SqlExpr::ExistsSubquery { stmt }
+                    | SqlExpr::ScalarSubquery { stmt } => {
+                        expand_select(stmt, views);
+                    }
+                    SqlExpr::Case { when_then, else_expr } => {
+                        for (w, t) in when_then.iter_mut() {
+                            expand_expr(w, views);
+                            expand_expr(t, views);
+                        }
+                        if let Some(e) = else_expr {
+                            expand_expr(e, views);
+                        }
+                    }
+                    SqlExpr::Function { args, .. } => {
+                        for a in args.iter_mut() {
+                            expand_expr(a, views);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            fn expand_select(stmt: &mut crate::query::SelectStatement, views: &HashMap<String, crate::query::SelectStatement>) {
+                if let Some(from) = stmt.from.as_mut() {
+                    expand_from_item(from, views);
+                }
+                for j in stmt.joins.iter_mut() {
+                    expand_from_item(&mut j.right, views);
+                    expand_expr(&mut j.on, views);
+                }
+                if let Some(w) = stmt.where_clause.as_mut() {
+                    expand_expr(w, views);
+                }
+                if let Some(h) = stmt.having.as_mut() {
+                    expand_expr(h, views);
+                }
+                for c in stmt.columns.iter_mut() {
+                    if let crate::query::SelectColumn::Expression { expr, .. } = c {
+                        expand_expr(expr, views);
+                    }
+                }
+            }
+
+            fn expand_stmt(stmt: &mut crate::query::SqlStatement, views: &HashMap<String, crate::query::SelectStatement>) {
+                match stmt {
+                    crate::query::SqlStatement::Select(s) => expand_select(s, views),
+                    crate::query::SqlStatement::Union(u) => {
+                        expand_stmt(&mut u.left, views);
+                        expand_stmt(&mut u.right, views);
+                    }
+                    _ => {}
+                }
+            }
+
             fn stmt_has_join(stmt: &crate::query::SqlStatement) -> bool {
                 match stmt {
                     crate::query::SqlStatement::Select(sel) => !sel.joins.is_empty(),
                     crate::query::SqlStatement::Union(u) => stmt_has_join(&u.left) || stmt_has_join(&u.right),
+                    _ => false,
                 }
             }
 
@@ -662,6 +755,7 @@ impl ApexStorage {
                         crate::query::FromItem::Subquery { alias, .. } => alias.clone(),
                     }),
                     crate::query::SqlStatement::Union(u) => first_select_table(&u.left),
+                    _ => None,
                 }
             }
 
@@ -673,6 +767,7 @@ impl ApexStorage {
                     crate::query::SqlStatement::Union(u) => {
                         stmt_has_derived_from(&u.left) || stmt_has_derived_from(&u.right)
                     }
+                    _ => false,
                 }
             }
 
@@ -721,6 +816,7 @@ impl ApexStorage {
                     crate::query::SqlStatement::Union(u) => {
                         stmt_has_in_subquery(&u.left) || stmt_has_in_subquery(&u.right)
                     }
+                    _ => false,
                 }
             }
 
@@ -738,34 +834,97 @@ impl ApexStorage {
                     crate::query::SqlStatement::Union(u) => {
                         stmt_has_exists_subquery(&u.left) || stmt_has_exists_subquery(&u.right)
                     }
+                    _ => false,
                 }
             }
 
-            let is_join = stmt_has_join(&parsed);
-            let has_derived = stmt_has_derived_from(&parsed);
-            let has_in_subquery = stmt_has_in_subquery(&parsed);
-            let has_exists_subquery = stmt_has_exists_subquery(&parsed);
-
-            // Robust fallback: scalar subquery in SELECT list looks like "(SELECT".
-            // If present, route through the full SQL executor path.
-            let has_scalar_subquery_text = sql.to_uppercase().contains("(SELECT");
-
             let mut tables = self.tables.write();
 
-            let result = if is_join || has_derived || has_in_subquery || has_exists_subquery || has_scalar_subquery_text {
-                SqlExecutor::execute_with_tables_parsed(parsed, &mut tables, &default_table)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-            } else {
-                // Determine target table from SQL (fallback to current table)
-                let target_table = first_select_table(&parsed).unwrap_or_else(|| default_table.clone());
+            let mut last: Option<crate::query::SqlResult> = None;
 
-                let table = tables
-                    .get_mut(&target_table)
-                    .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
+            for stmt in statements {
+                match stmt {
+                    crate::query::SqlStatement::CreateView { name, stmt } => {
+                        if tables.contains_key(&name) {
+                            return Err(PyValueError::new_err(format!(
+                                "View name '{}' conflicts with existing table",
+                                name
+                            )));
+                        }
+                        if views.contains_key(&name) {
+                            return Err(PyValueError::new_err(format!(
+                                "View '{}' already exists",
+                                name
+                            )));
+                        }
+                        views.insert(name, stmt);
+                    }
+                    crate::query::SqlStatement::DropView { name } => {
+                        if views.remove(&name).is_none() {
+                            return Err(PyValueError::new_err(format!(
+                                "View '{}' not found",
+                                name
+                            )));
+                        }
+                    }
+                    mut q @ (crate::query::SqlStatement::Select(_) | crate::query::SqlStatement::Union(_)) => {
+                        expand_stmt(&mut q, &views);
 
-                SqlExecutor::execute_parsed(parsed, table).map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-            };
+                        // Important: expanding views into derived tables may cause the legacy executor
+                        // to materialize subqueries into `tables` (by alias). Those must not leak
+                        // across execute() calls, since views are per-execute.
+                        let cleanup_after = !views.is_empty();
+                        let before_keys: Vec<String> = if cleanup_after {
+                            tables.keys().cloned().collect()
+                        } else {
+                            Vec::new()
+                        };
 
+                        let is_join = stmt_has_join(&q);
+                        let has_derived = stmt_has_derived_from(&q);
+                        let has_in_subquery = stmt_has_in_subquery(&q);
+                        let has_exists_subquery = stmt_has_exists_subquery(&q);
+                        let has_scalar_subquery_text = sql.to_uppercase().contains("(SELECT");
+
+                        let result = if !views.is_empty()
+                            || is_join
+                            || has_derived
+                            || has_in_subquery
+                            || has_exists_subquery
+                            || has_scalar_subquery_text
+                        {
+                            SqlExecutor::execute_with_tables_parsed(q, &mut tables, &default_table)
+                                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                        } else {
+                            let target_table = first_select_table(&q).unwrap_or_else(|| default_table.clone());
+
+                            let table = tables
+                                .get_mut(&target_table)
+                                .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
+
+                            SqlExecutor::execute_parsed(q, table)
+                                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                        };
+
+                        if cleanup_after {
+                            let before_set: std::collections::HashSet<String> =
+                                before_keys.into_iter().collect();
+                            let to_remove: Vec<String> = tables
+                                .keys()
+                                .filter(|k| !before_set.contains(*k))
+                                .cloned()
+                                .collect();
+                            for k in to_remove {
+                                tables.remove(&k);
+                            }
+                        }
+
+                        last = Some(result);
+                    }
+                }
+            }
+
+            let result = last.unwrap_or_else(|| crate::query::SqlResult::new(Vec::new(), Vec::new()));
             Ok((result.columns, result.rows, result.rows_affected))
         })?;
 
@@ -797,12 +956,103 @@ impl ApexStorage {
         let batch = py.allow_threads(|| -> PyResult<arrow::record_batch::RecordBatch> {
             let default_table = self.current_table.read().clone();
 
-            let parsed = crate::query::SqlParser::parse(&sql)
+            let statements = crate::query::SqlParser::parse_multi(&sql)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            let mut views: HashMap<String, crate::query::SelectStatement> = HashMap::new();
+
+            fn expand_from_item(
+                item: &mut crate::query::FromItem,
+                views: &HashMap<String, crate::query::SelectStatement>,
+            ) {
+                match item {
+                    crate::query::FromItem::Table { table, alias } => {
+                        if let Some(v) = views.get(table) {
+                            let a = alias.clone().unwrap_or_else(|| table.clone());
+                            *item = crate::query::FromItem::Subquery {
+                                stmt: Box::new(v.clone()),
+                                alias: a,
+                            };
+                        }
+                    }
+                    crate::query::FromItem::Subquery { stmt, .. } => {
+                        expand_select(stmt, views);
+                    }
+                }
+            }
+
+            fn expand_expr(expr: &mut crate::query::SqlExpr, views: &HashMap<String, crate::query::SelectStatement>) {
+                use crate::query::SqlExpr;
+                match expr {
+                    SqlExpr::BinaryOp { left, right, .. } => {
+                        expand_expr(left, views);
+                        expand_expr(right, views);
+                    }
+                    SqlExpr::UnaryOp { expr, .. } => expand_expr(expr, views),
+                    SqlExpr::Paren(inner) => expand_expr(inner, views),
+                    SqlExpr::Between { low, high, .. } => {
+                        expand_expr(low, views);
+                        expand_expr(high, views);
+                    }
+                    SqlExpr::InSubquery { stmt, .. }
+                    | SqlExpr::ExistsSubquery { stmt }
+                    | SqlExpr::ScalarSubquery { stmt } => {
+                        expand_select(stmt, views);
+                    }
+                    SqlExpr::Case { when_then, else_expr } => {
+                        for (w, t) in when_then.iter_mut() {
+                            expand_expr(w, views);
+                            expand_expr(t, views);
+                        }
+                        if let Some(e) = else_expr {
+                            expand_expr(e, views);
+                        }
+                    }
+                    SqlExpr::Function { args, .. } => {
+                        for a in args.iter_mut() {
+                            expand_expr(a, views);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            fn expand_select(stmt: &mut crate::query::SelectStatement, views: &HashMap<String, crate::query::SelectStatement>) {
+                if let Some(from) = stmt.from.as_mut() {
+                    expand_from_item(from, views);
+                }
+                for j in stmt.joins.iter_mut() {
+                    expand_from_item(&mut j.right, views);
+                    expand_expr(&mut j.on, views);
+                }
+                if let Some(w) = stmt.where_clause.as_mut() {
+                    expand_expr(w, views);
+                }
+                if let Some(h) = stmt.having.as_mut() {
+                    expand_expr(h, views);
+                }
+                for c in stmt.columns.iter_mut() {
+                    if let crate::query::SelectColumn::Expression { expr, .. } = c {
+                        expand_expr(expr, views);
+                    }
+                }
+            }
+
+            fn expand_stmt(stmt: &mut crate::query::SqlStatement, views: &HashMap<String, crate::query::SelectStatement>) {
+                match stmt {
+                    crate::query::SqlStatement::Select(s) => expand_select(s, views),
+                    crate::query::SqlStatement::Union(u) => {
+                        expand_stmt(&mut u.left, views);
+                        expand_stmt(&mut u.right, views);
+                    }
+                    _ => {}
+                }
+            }
             fn stmt_has_join(stmt: &crate::query::SqlStatement) -> bool {
                 match stmt {
                     crate::query::SqlStatement::Select(sel) => !sel.joins.is_empty(),
                     crate::query::SqlStatement::Union(u) => stmt_has_join(&u.left) || stmt_has_join(&u.right),
+                    _ => false,
                 }
             }
 
@@ -813,6 +1063,7 @@ impl ApexStorage {
                         crate::query::FromItem::Subquery { alias, .. } => alias.clone(),
                     }),
                     crate::query::SqlStatement::Union(u) => first_select_table(&u.left),
+                    _ => None,
                 }
             }
 
@@ -824,6 +1075,7 @@ impl ApexStorage {
                     crate::query::SqlStatement::Union(u) => {
                         stmt_has_derived_from(&u.left) || stmt_has_derived_from(&u.right)
                     }
+                    _ => false,
                 }
             }
 
@@ -870,6 +1122,7 @@ impl ApexStorage {
                     crate::query::SqlStatement::Union(u) => {
                         stmt_has_in_subquery(&u.left) || stmt_has_in_subquery(&u.right)
                     }
+                    _ => false,
                 }
             }
 
@@ -882,36 +1135,77 @@ impl ApexStorage {
                     crate::query::SqlStatement::Union(u) => {
                         stmt_has_exists_subquery(&u.left) || stmt_has_exists_subquery(&u.right)
                     }
+                    _ => false,
                 }
             }
 
-            let is_join = stmt_has_join(&parsed);
-            let has_derived = stmt_has_derived_from(&parsed);
-            let has_in_subquery = stmt_has_in_subquery(&parsed);
-            let has_exists_subquery = stmt_has_exists_subquery(&parsed);
-
-            // Robust fallback: scalar subquery in SELECT list looks like "(SELECT".
-            let has_scalar_subquery_text = sql.to_uppercase().contains("(SELECT");
-
             let mut tables = self.tables.write();
 
-            if is_join || has_derived || has_in_subquery || has_exists_subquery || has_scalar_subquery_text {
-                let result = SqlExecutor::execute_with_tables_parsed(parsed, &mut tables, &default_table)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                result
-                    .to_record_batch()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-            } else {
-                // Determine target table from SQL
-                let target_table = first_select_table(&parsed).unwrap_or_else(|| default_table.clone());
+            let mut last_batch: Option<arrow::record_batch::RecordBatch> = None;
 
-                let table = tables
-                    .get_mut(&target_table)
-                    .ok_or_else(|| PyValueError::new_err(format!("Table '{}' not found.", target_table)))?;
+            for stmt in statements {
+                match stmt {
+                    crate::query::SqlStatement::CreateView { name, stmt } => {
+                        if tables.contains_key(&name) {
+                            return Err(PyValueError::new_err(format!(
+                                "View name '{}' conflicts with existing table",
+                                name
+                            )));
+                        }
+                        if views.contains_key(&name) {
+                            return Err(PyValueError::new_err(format!(
+                                "View '{}' already exists",
+                                name
+                            )));
+                        }
+                        views.insert(name, stmt);
+                    }
+                    crate::query::SqlStatement::DropView { name } => {
+                        if views.remove(&name).is_none() {
+                            return Err(PyValueError::new_err(format!(
+                                "View '{}' not found",
+                                name
+                            )));
+                        }
+                    }
+                    mut q @ (crate::query::SqlStatement::Select(_) | crate::query::SqlStatement::Union(_)) => {
+                        expand_stmt(&mut q, &views);
 
-                IoEngine::execute_sql_arrow(table, &sql)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                        let cleanup_after = !views.is_empty();
+                        let before_keys: Vec<String> = if cleanup_after {
+                            tables.keys().cloned().collect()
+                        } else {
+                            Vec::new()
+                        };
+
+                        let result = SqlExecutor::execute_with_tables_parsed(q, &mut tables, &default_table)
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+                        if cleanup_after {
+                            let before_set: std::collections::HashSet<String> =
+                                before_keys.into_iter().collect();
+                            let to_remove: Vec<String> = tables
+                                .keys()
+                                .filter(|k| !before_set.contains(*k))
+                                .cloned()
+                                .collect();
+                            for k in to_remove {
+                                tables.remove(&k);
+                            }
+                        }
+
+                        let b = result
+                            .to_record_batch()
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                        last_batch = Some(b);
+                    }
+                }
             }
+
+            Ok(last_batch.unwrap_or_else(|| {
+                // Empty result batch
+                arrow::record_batch::RecordBatch::new_empty(Arc::new(arrow::datatypes::Schema::empty()))
+            }))
         })?;
 
         if batch.num_rows() == 0 {

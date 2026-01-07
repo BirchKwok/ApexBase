@@ -1,6 +1,7 @@
 use crate::query::Filter;
 use crate::query::sql_parser::OrderByClause;
 use crate::query::sql_parser::SelectStatement;
+use crate::query::sql_parser::SqlExpr;
 
 #[derive(Debug, Clone)]
 pub(crate) enum LogicalPlan {
@@ -26,6 +27,7 @@ pub(crate) enum LogicalPlan {
         input: Box<LogicalPlan>,
         result_columns: Vec<String>,
         column_indices: Vec<(String, Option<usize>)>,
+        projected_exprs: Vec<Option<SqlExpr>>,
         prefer_arrow: bool,
     },
 

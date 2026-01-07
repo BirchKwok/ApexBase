@@ -63,3 +63,45 @@ class TestWindowRegexp:
             print(f"window+regexp rows={len(out)} time_sec={(t1 - t0):.6f}")
 
             client.close()
+
+    def test_row_number_over_implicit_alias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            rows = [
+                {"title": "A", "number": 2},
+                {"title": "A", "number": 1},
+                {"title": "B", "number": 3},
+            ]
+            client.store(rows)
+            client.flush()
+
+            sql = "SELECT row_number() OVER (PARTITION BY title ORDER BY number ASC) rid FROM default"
+            result = client.execute(sql)
+            out = result.to_dict()
+            assert len(out) == 3
+            assert all("rid" in r for r in out)
+
+            client.close()
+
+    def test_select_star_with_row_number_alias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            rows = [
+                {"title": "A", "number": 2},
+                {"title": "A", "number": 1},
+                {"title": "B", "number": 3},
+            ]
+            client.store(rows)
+            client.flush()
+
+            sql = "SELECT *, row_number() OVER (PARTITION BY title ORDER BY number ASC) rid FROM default"
+            result = client.execute(sql)
+            out = result.to_dict()
+            assert len(out) == 3
+            assert all("title" in r for r in out)
+            assert all("number" in r for r in out)
+            assert all("rid" in r for r in out)
+
+            client.close()

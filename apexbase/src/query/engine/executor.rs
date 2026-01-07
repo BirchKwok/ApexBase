@@ -55,12 +55,22 @@ impl PlanExecutor {
                 input,
                 result_columns,
                 column_indices,
+                projected_exprs,
                 prefer_arrow,
             } => {
                 let indices = Self::execute_indices(table, input);
 
+                let ctx = crate::query::engine::ops::new_eval_context();
+
                 if *prefer_arrow && indices.len() > 10_000 {
-                    return crate::query::engine::ops::build_arrow_direct(result_columns, column_indices, &indices, table);
+                    return crate::query::engine::ops::build_arrow_direct(
+                        result_columns,
+                        column_indices,
+                        projected_exprs,
+                        &indices,
+                        table,
+                        &ctx,
+                    );
                 }
 
                 let schema = table.schema_ref();
@@ -68,7 +78,16 @@ impl PlanExecutor {
                 let mut rows: Vec<Vec<crate::data::Value>> = Vec::with_capacity(indices.len());
                 for row_idx in indices {
                     let mut row = Vec::with_capacity(column_indices.len());
-                    for (col_name, col_idx) in column_indices {
+                    for (pos, (col_name, col_idx)) in column_indices.iter().enumerate() {
+                        if let Some(expr) = projected_exprs.get(pos).and_then(|e| e.clone()) {
+                            row.push(crate::query::engine::ops::eval_scalar_expr(
+                                &expr,
+                                table,
+                                row_idx,
+                                &ctx,
+                            )?);
+                            continue;
+                        }
                         if col_name == "_id" {
                             row.push(crate::data::Value::Int64(row_idx as i64));
                         } else if let Some(idx) = col_idx {
