@@ -68,7 +68,16 @@ impl PlanBuilder {
         }
 
         let filter = match stmt.where_clause.as_ref() {
-            Some(expr) => Some(sql_expr_to_filter(expr)?),
+            Some(expr) => match sql_expr_to_filter(expr) {
+                Ok(f) => Some(f),
+                Err(_) => {
+                    // Complex expressions (e.g. a+b>10) are supported by legacy SqlExecutor,
+                    // but not by the Filter-based unified plan.
+                    return Err(ApexError::QueryParseError(
+                        "not eligible for select plan".to_string(),
+                    ));
+                }
+            },
             None => None,
         };
 
@@ -90,13 +99,27 @@ impl PlanBuilder {
             };
         }
 
-        // LIMIT/OFFSET pushed down as indices trimming.
+        // LIMIT/OFFSET.
+        // If there's no ORDER BY, we can push it down to Scan to avoid materializing and then
+        // slicing a full indices Vec in a separate Limit node.
         if stmt.limit.is_some() || stmt.offset.is_some() {
-            plan = LogicalPlan::Limit {
-                input: Box::new(plan),
-                limit: stmt.limit,
-                offset: stmt.offset.unwrap_or(0),
-            };
+            if stmt.order_by.is_empty() {
+                let (filter0, _limit0, _offset0) = match &plan {
+                    LogicalPlan::Scan { filter, limit, offset } => (filter.clone(), *limit, *offset),
+                    _ => (None, None, 0),
+                };
+                plan = LogicalPlan::Scan {
+                    filter: filter0,
+                    limit: stmt.limit,
+                    offset: stmt.offset.unwrap_or(0),
+                };
+            } else {
+                plan = LogicalPlan::Limit {
+                    input: Box::new(plan),
+                    limit: stmt.limit,
+                    offset: stmt.offset.unwrap_or(0),
+                };
+            }
         }
 
         let (result_columns, column_indices, projected_exprs) =
@@ -141,7 +164,16 @@ impl PlanBuilder {
         }
 
         let filter = match stmt.where_clause.as_ref() {
-            Some(expr) => Some(sql_expr_to_filter(expr)?),
+            Some(expr) => match sql_expr_to_filter(expr) {
+                Ok(f) => Some(f),
+                Err(_) => {
+                    // Complex expressions (e.g. a+b>10) are supported by legacy SqlExecutor
+                    // but not by the Filter-based simple plan.
+                    return Err(ApexError::QueryParseError(
+                        "not eligible for simple select plan".to_string(),
+                    ));
+                }
+            },
             None => None,
         };
 
@@ -163,11 +195,23 @@ impl PlanBuilder {
         }
 
         if stmt.limit.is_some() || stmt.offset.is_some() {
-            plan = LogicalPlan::Limit {
-                input: Box::new(plan),
-                limit: stmt.limit,
-                offset: stmt.offset.unwrap_or(0),
-            };
+            if stmt.order_by.is_empty() {
+                let (filter0, _limit0, _offset0) = match &plan {
+                    LogicalPlan::Scan { filter, limit, offset } => (filter.clone(), *limit, *offset),
+                    _ => (None, None, 0),
+                };
+                plan = LogicalPlan::Scan {
+                    filter: filter0,
+                    limit: stmt.limit,
+                    offset: stmt.offset.unwrap_or(0),
+                };
+            } else {
+                plan = LogicalPlan::Limit {
+                    input: Box::new(plan),
+                    limit: stmt.limit,
+                    offset: stmt.offset.unwrap_or(0),
+                };
+            }
         }
 
         let (result_columns, column_indices, projected_exprs) =

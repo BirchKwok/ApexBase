@@ -16,6 +16,9 @@ use crate::io_engine::{IoEngine, StreamingFilterEvaluator};
 use std::collections::HashMap;
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
+use crate::query::{LikeMatcher, RegexpMatcher};
+use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array};
+use arrow::datatypes::DataType as ArrowDataType;
  
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -297,6 +300,75 @@ impl SqlExecutor {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<SqlResult, ApexError> {
+        fn arrow_batch_to_rows(
+            batch: &arrow::record_batch::RecordBatch,
+            columns: &[String],
+        ) -> Vec<Vec<Value>> {
+            let schema = batch.schema();
+            let mut idx_map: Vec<Option<usize>> = Vec::with_capacity(columns.len());
+            for c in columns {
+                idx_map.push(schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == c));
+            }
+
+            let mut out: Vec<Vec<Value>> = Vec::with_capacity(batch.num_rows());
+            for row_idx in 0..batch.num_rows() {
+                let mut row: Vec<Value> = Vec::with_capacity(columns.len());
+                for (col_pos, _) in columns.iter().enumerate() {
+                    let Some(col_idx) = idx_map[col_pos] else {
+                        row.push(Value::Null);
+                        continue;
+                    };
+                    let col = batch.column(col_idx);
+                    if col.is_null(row_idx) {
+                        row.push(Value::Null);
+                        continue;
+                    }
+                    let dt = schema.field(col_idx).data_type();
+                    let v = match dt {
+                        ArrowDataType::Int64 => {
+                            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                            Value::Int64(arr.value(row_idx))
+                        }
+                        ArrowDataType::UInt64 => {
+                            let arr = col.as_any().downcast_ref::<UInt64Array>().unwrap();
+                            Value::UInt64(arr.value(row_idx))
+                        }
+                        ArrowDataType::Float64 => {
+                            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                            Value::Float64(arr.value(row_idx))
+                        }
+                        ArrowDataType::Boolean => {
+                            let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+                            Value::Bool(arr.value(row_idx))
+                        }
+                        ArrowDataType::Utf8 => {
+                            let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                            Value::String(arr.value(row_idx).to_string())
+                        }
+                        _ => Value::Null,
+                    };
+                    row.push(v);
+                }
+                out.push(row);
+            }
+            out
+        }
+
+        fn ensure_rows(mut r: SqlResult) -> SqlResult {
+            if r.rows.is_empty() {
+                if let Some(batch) = r.arrow_batch.as_ref() {
+                    r.rows = arrow_batch_to_rows(batch, &r.columns);
+                }
+            }
+            r
+        }
+
+        let left = ensure_rows(left);
+        let right = ensure_rows(right);
+
         if left.columns != right.columns {
             return Err(ApexError::QueryParseError(
                 "UNION requires both sides to have the same columns".to_string(),
@@ -3455,11 +3527,24 @@ impl SqlExecutor {
             && simple_pipeline::is_eligible(&stmt)
         {
             // Pipeline expects an immutable table reference (no mutation)
-            return simple_pipeline::execute(&stmt, table);
+            match simple_pipeline::execute(&stmt, table) {
+                Ok(r) => return Ok(r),
+                Err(ApexError::QueryParseError(msg))
+                    if msg == "not eligible for simple select plan" =>
+                {
+                    // Fall back to legacy paths (supports complex WHERE expressions).
+                }
+                Err(e) => return Err(e),
+            }
         }
 
-        if let Some(plan) = crate::query::engine::PlanOptimizer::try_build_plan(&stmt, table)? {
-            return crate::query::engine::PlanExecutor::execute_sql_result(table, &plan);
+        match crate::query::engine::PlanOptimizer::try_build_plan(&stmt, table) {
+            Ok(Some(plan)) => return crate::query::engine::PlanExecutor::execute_sql_result(table, &plan),
+            Ok(None) => {}
+            Err(ApexError::QueryParseError(msg)) if msg == "not eligible for select plan" => {
+                // Fall back to legacy paths (supports complex WHERE expressions).
+            }
+            Err(e) => return Err(e),
         }
 
         // ============ PATHS REQUIRING INDEX COLLECTION ============
@@ -3504,8 +3589,23 @@ impl SqlExecutor {
 
         // Fallback: row materialization for legacy-only features.
         // (Kept minimal; should be eliminated as remaining features are plan-ified.)
-        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(matching_indices.len().min(10000));
-        for row_idx in matching_indices.iter() {
+        let mut final_indices: Vec<usize> = matching_indices;
+
+        // Preserve ORDER BY + LIMIT/OFFSET semantics even on legacy fallback.
+        if !stmt.order_by.is_empty() {
+            let offset = stmt.offset.unwrap_or(0);
+            let limit = stmt.limit.unwrap_or(usize::MAX);
+            let k = offset.saturating_add(limit);
+            final_indices = Self::sort_indices_by_columns_topk(&final_indices, &stmt.order_by, table, k)?;
+            final_indices = final_indices.into_iter().skip(offset).take(limit).collect();
+        } else if stmt.limit.is_some() || stmt.offset.is_some() {
+            let offset = stmt.offset.unwrap_or(0);
+            let limit = stmt.limit.unwrap_or(usize::MAX);
+            final_indices = final_indices.into_iter().skip(offset).take(limit).collect();
+        }
+
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(final_indices.len().min(10000));
+        for row_idx in final_indices.iter() {
             let mut row_values = Vec::with_capacity(result_columns.len());
             for (col_name, col_idx) in column_indices.iter() {
                 if col_name == "_id" {
@@ -3543,13 +3643,184 @@ impl SqlExecutor {
     
     /// Evaluate WHERE clause and return matching row indices
     fn evaluate_where(expr: &SqlExpr, table: &ColumnTable) -> Result<Vec<usize>, ApexError> {
-        let filter = sql_expr_to_filter(expr)?;
-        let schema = table.schema_ref();
-        let columns = table.columns_ref();
-        let row_count = table.get_row_count();
+        // Fast path: compile to optimized Filter.
+        if let Ok(filter) = sql_expr_to_filter(expr) {
+            let schema = table.schema_ref();
+            let columns = table.columns_ref();
+            let row_count = table.get_row_count();
+            let deleted = table.deleted_ref();
+            return Ok(filter.filter_columns(schema, columns, row_count, deleted));
+        }
+
+        // Fallback: row-wise predicate evaluation for complex expressions
+        // (e.g. WHERE a + b > 10).
+        let ctx = crate::query::engine::ops::new_eval_context();
         let deleted = table.deleted_ref();
-        
-        Ok(filter.filter_columns(schema, columns, row_count, deleted))
+        let row_count = table.get_row_count();
+        let no_deletes = deleted.all_false();
+
+        let mut out = Vec::new();
+        out.reserve(row_count.min(1024));
+        for row_idx in 0..row_count {
+            if !no_deletes && deleted.get(row_idx) {
+                continue;
+            }
+            if Self::eval_where_predicate(expr, table, row_idx, &ctx)? {
+                out.push(row_idx);
+            }
+        }
+        Ok(out)
+    }
+
+    fn eval_where_predicate(
+        expr: &SqlExpr,
+        table: &ColumnTable,
+        row_idx: usize,
+        ctx: &crate::query::engine::ops::EvalContext,
+    ) -> Result<bool, ApexError> {
+        use crate::data::Value;
+
+        #[inline]
+        fn to_bool(v: Value) -> bool {
+            v.as_bool().unwrap_or(false)
+        }
+
+        match expr {
+            SqlExpr::Paren(inner) => Self::eval_where_predicate(inner, table, row_idx, ctx),
+            SqlExpr::Literal(v) => Ok(v.as_bool().unwrap_or(false)),
+            SqlExpr::UnaryOp { op: UnaryOperator::Not, expr } => {
+                Ok(!Self::eval_where_predicate(expr, table, row_idx, ctx)?)
+            }
+            SqlExpr::BinaryOp { left, op, right } => match op {
+                BinaryOperator::And => Ok(
+                    Self::eval_where_predicate(left, table, row_idx, ctx)?
+                        && Self::eval_where_predicate(right, table, row_idx, ctx)?,
+                ),
+                BinaryOperator::Or => Ok(
+                    Self::eval_where_predicate(left, table, row_idx, ctx)?
+                        || Self::eval_where_predicate(right, table, row_idx, ctx)?,
+                ),
+                BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::Le
+                | BinaryOperator::Gt
+                | BinaryOperator::Ge => {
+                    let lv = crate::query::engine::ops::eval_scalar_expr(left, table, row_idx, ctx)?;
+                    let rv = crate::query::engine::ops::eval_scalar_expr(right, table, row_idx, ctx)?;
+                    if lv.is_null() || rv.is_null() {
+                        return Ok(false);
+                    }
+                    let ord = lv.partial_cmp(&rv).unwrap_or(Ordering::Equal);
+                    Ok(match op {
+                        BinaryOperator::Eq => ord == Ordering::Equal,
+                        BinaryOperator::NotEq => ord != Ordering::Equal,
+                        BinaryOperator::Lt => ord == Ordering::Less,
+                        BinaryOperator::Le => ord != Ordering::Greater,
+                        BinaryOperator::Gt => ord == Ordering::Greater,
+                        BinaryOperator::Ge => ord != Ordering::Less,
+                        _ => false,
+                    })
+                }
+                // For arithmetic (or other) operators used as predicate, evaluate as scalar and coerce to bool.
+                _ => {
+                    let v = crate::query::engine::ops::eval_scalar_expr(expr, table, row_idx, ctx)?;
+                    Ok(to_bool(v))
+                }
+            },
+            SqlExpr::Like {
+                column,
+                pattern,
+                negated,
+            } => {
+                let v = crate::query::engine::ops::eval_scalar_expr(
+                    &SqlExpr::Column(column.clone()),
+                    table,
+                    row_idx,
+                    ctx,
+                )?;
+                let s = match v {
+                    Value::String(s) => s,
+                    _ => return Ok(false),
+                };
+                let m = LikeMatcher::new(pattern);
+                let ok = m.matches(s.as_str());
+                Ok(if *negated { !ok } else { ok })
+            }
+            SqlExpr::Regexp {
+                column,
+                pattern,
+                negated,
+            } => {
+                let v = crate::query::engine::ops::eval_scalar_expr(
+                    &SqlExpr::Column(column.clone()),
+                    table,
+                    row_idx,
+                    ctx,
+                )?;
+                let s = match v {
+                    Value::String(s) => s,
+                    _ => return Ok(false),
+                };
+                let m = RegexpMatcher::new(pattern);
+                let ok = m.matches(s.as_str());
+                Ok(if *negated { !ok } else { ok })
+            }
+            SqlExpr::In {
+                column,
+                values,
+                negated,
+            } => {
+                let v = crate::query::engine::ops::eval_scalar_expr(
+                    &SqlExpr::Column(column.clone()),
+                    table,
+                    row_idx,
+                    ctx,
+                )?;
+                let ok = values.iter().any(|x| &v == x);
+                Ok(if *negated { !ok } else { ok })
+            }
+            SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => {
+                let v = crate::query::engine::ops::eval_scalar_expr(
+                    &SqlExpr::Column(column.clone()),
+                    table,
+                    row_idx,
+                    ctx,
+                )?;
+                if v.is_null() {
+                    return Ok(false);
+                }
+                let lv = crate::query::engine::ops::eval_scalar_expr(low, table, row_idx, ctx)?;
+                let hv = crate::query::engine::ops::eval_scalar_expr(high, table, row_idx, ctx)?;
+                if lv.is_null() || hv.is_null() {
+                    return Ok(false);
+                }
+                let ok_low = v.partial_cmp(&lv).map(|o| o != Ordering::Less).unwrap_or(false);
+                let ok_high = v.partial_cmp(&hv).map(|o| o != Ordering::Greater).unwrap_or(false);
+                let ok = ok_low && ok_high;
+                Ok(if *negated { !ok } else { ok })
+            }
+            SqlExpr::IsNull { column, negated } => {
+                let v = crate::query::engine::ops::eval_scalar_expr(
+                    &SqlExpr::Column(column.clone()),
+                    table,
+                    row_idx,
+                    ctx,
+                )?;
+                let ok = v.is_null();
+                Ok(if *negated { !ok } else { ok })
+            }
+            // Fallback: treat scalar expression as boolean
+            _ => {
+                let v = crate::query::engine::ops::eval_scalar_expr(expr, table, row_idx, ctx)?;
+                Ok(to_bool(v))
+            }
+        }
     }
 
     /// Minimal window function execution: supports only row_number() OVER (PARTITION BY <col> ORDER BY <col>)
@@ -4637,16 +4908,45 @@ impl SqlExecutor {
         let limit = stmt.limit.unwrap_or(usize::MAX);
         
         // Convert WHERE expression to optimized filter
-        let filter = sql_expr_to_filter(where_expr)?;
-        
-        // Use IoEngine for filtered data reading with streaming early termination
-        let matching_indices = IoEngine::read_filtered_indices(table, &filter, Some(limit), offset);
-        
-        // Build result rows using IoEngine
-        let rows: Vec<Vec<Value>> = matching_indices.iter()
-            .map(|&row_idx| IoEngine::build_row_values(table, row_idx, column_indices))
-            .collect();
-        
+        if let Ok(filter) = sql_expr_to_filter(where_expr) {
+            // Use IoEngine for filtered data reading with streaming early termination
+            let matching_indices =
+                IoEngine::read_filtered_indices(table, &filter, Some(limit), offset);
+
+            // Build result rows using IoEngine
+            let rows: Vec<Vec<Value>> = matching_indices
+                .iter()
+                .map(|&row_idx| IoEngine::build_row_values(table, row_idx, column_indices))
+                .collect();
+
+            return Ok(SqlResult::new(result_columns.to_vec(), rows));
+        }
+
+        // Fallback: row-wise predicate evaluation with early termination
+        let ctx = crate::query::engine::ops::new_eval_context();
+        let deleted = table.deleted_ref();
+        let row_count = table.get_row_count();
+        let no_deletes = deleted.all_false();
+
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(limit.min(1024));
+        let mut seen_matches = 0usize;
+        for row_idx in 0..row_count {
+            if !no_deletes && deleted.get(row_idx) {
+                continue;
+            }
+            if !Self::eval_where_predicate(where_expr, table, row_idx, &ctx)? {
+                continue;
+            }
+            seen_matches += 1;
+            if seen_matches <= offset {
+                continue;
+            }
+            rows.push(IoEngine::build_row_values(table, row_idx, column_indices));
+            if rows.len() >= limit {
+                break;
+            }
+        }
+
         Ok(SqlResult::new(result_columns.to_vec(), rows))
     }
     
@@ -4666,18 +4966,29 @@ impl SqlExecutor {
         let no_deletes = deleted.all_false();
         let k = stmt.offset.unwrap_or(0) + stmt.limit.unwrap_or(usize::MAX);
 
-        let filter = sql_expr_to_filter(where_expr)?;
-        let evaluator = StreamingFilterEvaluator::new(&filter, schema, columns);
-
         let mut candidates: Vec<usize> = Vec::new();
-        for row_idx in 0..row_count {
-            if !no_deletes && deleted.get(row_idx) {
-                continue;
+        if let Ok(filter) = sql_expr_to_filter(where_expr) {
+            let evaluator = StreamingFilterEvaluator::new(&filter, schema, columns);
+            for row_idx in 0..row_count {
+                if !no_deletes && deleted.get(row_idx) {
+                    continue;
+                }
+                if !evaluator.matches(row_idx) {
+                    continue;
+                }
+                candidates.push(row_idx);
             }
-            if !evaluator.matches(row_idx) {
-                continue;
+        } else {
+            let ctx = crate::query::engine::ops::new_eval_context();
+            for row_idx in 0..row_count {
+                if !no_deletes && deleted.get(row_idx) {
+                    continue;
+                }
+                if !Self::eval_where_predicate(where_expr, table, row_idx, &ctx)? {
+                    continue;
+                }
+                candidates.push(row_idx);
             }
-            candidates.push(row_idx);
         }
 
         let top_indices = crate::query::engine::ops::sort_indices_by_columns_topk(

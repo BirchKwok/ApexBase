@@ -1,12 +1,267 @@
 use crate::io_engine::IoEngine;
+use crate::io_engine::StreamingFilterEvaluator;
 use crate::query::engine::logical_plan::LogicalPlan;
 use crate::query::sql_expr_to_filter;
 use crate::query::SqlExecutor;
 use crate::query::SqlResult;
 use crate::table::ColumnTable;
 use crate::ApexError;
+use arrow::array::{
+    ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
+};
+use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use std::sync::Arc;
 
 pub(crate) struct PlanExecutor;
+
+enum ColBuilder {
+    Int64(Int64Builder),
+    Float64(Float64Builder),
+    Boolean(BooleanBuilder),
+    Utf8(StringBuilder),
+}
+
+impl ColBuilder {
+    fn finish(self) -> ArrayRef {
+        match self {
+            ColBuilder::Int64(mut b) => Arc::new(b.finish()) as ArrayRef,
+            ColBuilder::Float64(mut b) => Arc::new(b.finish()) as ArrayRef,
+            ColBuilder::Boolean(mut b) => Arc::new(b.finish()) as ArrayRef,
+            ColBuilder::Utf8(mut b) => Arc::new(b.finish()) as ArrayRef,
+        }
+    }
+}
+
+impl PlanExecutor {
+    fn try_execute_project_scan_streaming_arrow(
+        table: &ColumnTable,
+        scan_filter: &Option<crate::query::Filter>,
+        scan_limit: Option<usize>,
+        scan_offset: usize,
+        result_columns: &[String],
+        column_indices: &[(String, Option<usize>)],
+        projected_exprs: &[Option<crate::query::sql_parser::SqlExpr>],
+    ) -> Result<Option<SqlResult>, ApexError> {
+        // Only support pure column projection (no expressions) in streaming path.
+        if projected_exprs.iter().any(|e| e.is_some()) {
+            return Ok(None);
+        }
+
+        let schema = table.schema_ref();
+        let columns = table.columns_ref();
+        let deleted = table.deleted_ref();
+        let row_count = table.get_row_count();
+        let no_deletes = deleted.all_false();
+
+        let max_results = scan_limit.unwrap_or(usize::MAX);
+
+        // Prepare Arrow schema + builders.
+        let mut fields: Vec<Field> = Vec::with_capacity(result_columns.len());
+        let mut builders: Vec<ColBuilder> = Vec::with_capacity(result_columns.len());
+
+        // Conservative initial capacity to reduce reallocations but avoid over-reserving.
+        let cap = max_results.min(8192).max(1024);
+
+        for (col_name, col_idx) in column_indices {
+            if col_name == "_id" {
+                fields.push(Field::new("_id", ArrowDataType::Int64, false));
+                builders.push(ColBuilder::Int64(Int64Builder::with_capacity(cap)));
+                continue;
+            }
+
+            let idx = if let Some(i) = col_idx {
+                *i
+            } else if let Some(i) = schema.get_index(col_name) {
+                i
+            } else {
+                // Unknown column -> return NULL int64 column (keeps behavior consistent with legacy)
+                fields.push(Field::new(col_name, ArrowDataType::Int64, true));
+                builders.push(ColBuilder::Int64(Int64Builder::with_capacity(cap)));
+                continue;
+            };
+
+            match &columns[idx] {
+                crate::table::column_table::TypedColumn::Int64 { .. }
+                | crate::table::column_table::TypedColumn::Mixed { .. } => {
+                    // Mixed will be stringified.
+                    if matches!(
+                        &columns[idx],
+                        crate::table::column_table::TypedColumn::Int64 { .. }
+                    ) {
+                        fields.push(Field::new(col_name, ArrowDataType::Int64, true));
+                        builders.push(ColBuilder::Int64(Int64Builder::with_capacity(cap)));
+                    } else {
+                        fields.push(Field::new(col_name, ArrowDataType::Utf8, true));
+                        builders.push(ColBuilder::Utf8(StringBuilder::with_capacity(cap, cap * 16)));
+                    }
+                }
+                crate::table::column_table::TypedColumn::Float64 { .. } => {
+                    fields.push(Field::new(col_name, ArrowDataType::Float64, true));
+                    builders.push(ColBuilder::Float64(Float64Builder::with_capacity(cap)));
+                }
+                crate::table::column_table::TypedColumn::Bool { .. } => {
+                    fields.push(Field::new(col_name, ArrowDataType::Boolean, true));
+                    builders.push(ColBuilder::Boolean(BooleanBuilder::with_capacity(cap)));
+                }
+                crate::table::column_table::TypedColumn::String(_) => {
+                    fields.push(Field::new(col_name, ArrowDataType::Utf8, true));
+                    builders.push(ColBuilder::Utf8(StringBuilder::with_capacity(cap, cap * 16)));
+                }
+            }
+        }
+
+        let evaluator = scan_filter
+            .as_ref()
+            .map(|f| StreamingFilterEvaluator::new(f, schema, columns));
+
+        let mut seen_non_deleted = 0usize;
+        let mut seen_matches = 0usize;
+        let mut produced = 0usize;
+
+        for row_idx in 0..row_count {
+            if !no_deletes && deleted.get(row_idx) {
+                continue;
+            }
+
+            // Apply filter if present.
+            if let Some(ev) = evaluator.as_ref() {
+                if !ev.matches(row_idx) {
+                    continue;
+                }
+
+                seen_matches += 1;
+                if seen_matches <= scan_offset {
+                    continue;
+                }
+            } else {
+                // No filter: offset/limit are applied on non-deleted rows.
+                seen_non_deleted += 1;
+                if seen_non_deleted <= scan_offset {
+                    continue;
+                }
+            }
+
+            // Emit row.
+            for (pos, (col_name, col_idx)) in column_indices.iter().enumerate() {
+                match &mut builders[pos] {
+                    ColBuilder::Int64(b) => {
+                        if col_name == "_id" {
+                            b.append_value(row_idx as i64);
+                            continue;
+                        }
+                        let idx = if let Some(i) = col_idx {
+                            *i
+                        } else if let Some(i) = schema.get_index(col_name) {
+                            i
+                        } else {
+                            b.append_null();
+                            continue;
+                        };
+                        match &columns[idx] {
+                            crate::table::column_table::TypedColumn::Int64 { data, nulls } => {
+                                if row_idx < data.len() && !nulls.get(row_idx) {
+                                    b.append_value(data[row_idx]);
+                                } else {
+                                    b.append_null();
+                                }
+                            }
+                            _ => {
+                                // Unknown/unexpected -> NULL
+                                b.append_null();
+                            }
+                        }
+                    }
+                    ColBuilder::Float64(b) => {
+                        let idx = if let Some(i) = col_idx {
+                            *i
+                        } else if let Some(i) = schema.get_index(col_name) {
+                            i
+                        } else {
+                            b.append_null();
+                            continue;
+                        };
+                        match &columns[idx] {
+                            crate::table::column_table::TypedColumn::Float64 { data, nulls } => {
+                                if row_idx < data.len() && !nulls.get(row_idx) {
+                                    b.append_value(data[row_idx]);
+                                } else {
+                                    b.append_null();
+                                }
+                            }
+                            _ => b.append_null(),
+                        }
+                    }
+                    ColBuilder::Boolean(b) => {
+                        let idx = if let Some(i) = col_idx {
+                            *i
+                        } else if let Some(i) = schema.get_index(col_name) {
+                            i
+                        } else {
+                            b.append_null();
+                            continue;
+                        };
+                        match &columns[idx] {
+                            crate::table::column_table::TypedColumn::Bool { data, nulls } => {
+                                if row_idx < data.len() && !nulls.get(row_idx) {
+                                    b.append_value(data.get(row_idx));
+                                } else {
+                                    b.append_null();
+                                }
+                            }
+                            _ => b.append_null(),
+                        }
+                    }
+                    ColBuilder::Utf8(b) => {
+                        let idx = if let Some(i) = col_idx {
+                            *i
+                        } else if let Some(i) = schema.get_index(col_name) {
+                            i
+                        } else {
+                            b.append_null();
+                            continue;
+                        };
+                        match &columns[idx] {
+                            crate::table::column_table::TypedColumn::String(col) => {
+                                if let Some(s) = col.get(row_idx) {
+                                    b.append_value(s);
+                                } else {
+                                    b.append_null();
+                                }
+                            }
+                            crate::table::column_table::TypedColumn::Mixed { data, nulls } => {
+                                if row_idx < data.len() && !nulls.get(row_idx) {
+                                    b.append_value(data[row_idx].to_string_value());
+                                } else {
+                                    b.append_null();
+                                }
+                            }
+                            _ => {
+                                // Fallback: use generic Value get to string.
+                                match columns[idx].get(row_idx) {
+                                    Some(v) if !v.is_null() => b.append_value(v.to_string_value()),
+                                    _ => b.append_null(),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            produced += 1;
+            if produced >= max_results {
+                break;
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let arrays = builders.into_iter().map(|b| b.finish()).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|e| ApexError::SerializationError(e.to_string()))?;
+
+        Ok(Some(SqlResult::with_arrow_batch(result_columns.to_vec(), batch)))
+    }
+}
 
 impl PlanExecutor {
     pub(crate) fn execute_indices(table: &ColumnTable, plan: &LogicalPlan) -> Vec<usize> {
@@ -58,11 +313,28 @@ impl PlanExecutor {
                 projected_exprs,
                 prefer_arrow,
             } => {
+                // Streaming Arrow fast path: Project over Scan (no indices Vec materialization).
+                if *prefer_arrow {
+                    if let LogicalPlan::Scan { filter, limit, offset } = input.as_ref() {
+                        if let Some(res) = Self::try_execute_project_scan_streaming_arrow(
+                            table,
+                            filter,
+                            *limit,
+                            *offset,
+                            result_columns,
+                            column_indices,
+                            projected_exprs,
+                        )? {
+                            return Ok(res);
+                        }
+                    }
+                }
+
                 let indices = Self::execute_indices(table, input);
 
                 let ctx = crate::query::engine::ops::new_eval_context();
 
-                if *prefer_arrow && indices.len() > 10_000 {
+                if *prefer_arrow {
                     return crate::query::engine::ops::build_arrow_direct(
                         result_columns,
                         column_indices,

@@ -83,6 +83,51 @@ class TestBasicSQLExecute:
             
             client.close()
 
+    def test_where_multi_column_arithmetic_predicate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store(
+                [
+                    {"a": 3, "b": 7},
+                    {"a": 6, "b": 5},
+                    {"a": 1, "b": 2},
+                    {"a": 10, "b": 0},
+                ]
+            )
+            client.flush()
+
+            res = client.execute(
+                "SELECT a, b FROM default WHERE a + b > 10 ORDER BY a ASC"
+            )
+            out = res.to_dict()
+            assert out == [{"a": 6, "b": 5}]
+
+            client.close()
+
+    def test_where_multi_column_arithmetic_predicate_with_limit_offset(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store(
+                [
+                    {"a": 9, "b": 3},
+                    {"a": 8, "b": 4},
+                    {"a": 7, "b": 4},
+                    {"a": 6, "b": 6},
+                    {"a": 5, "b": 6},
+                ]
+            )
+            client.flush()
+
+            res = client.execute(
+                "SELECT a, b FROM default WHERE a + b > 10 ORDER BY a DESC LIMIT 2 OFFSET 1"
+            )
+            out = res.to_dict()
+            assert out == [{"a": 8, "b": 4}, {"a": 7, "b": 4}]
+
+            client.close()
+
     def test_execute_temporary_view_create_select_drop(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
