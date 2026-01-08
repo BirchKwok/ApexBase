@@ -430,14 +430,14 @@ impl TypedColumn {
         match self {
             TypedColumn::Int64 { data, nulls } => {
                 if index >= data.len() || nulls.get(index) {
-                    Some(Value::Null)
+                    None
                 } else {
                     Some(Value::Int64(data[index]))
                 }
             }
             TypedColumn::Float64 { data, nulls } => {
                 if index >= data.len() || nulls.get(index) {
-                    Some(Value::Null)
+                    None
                 } else {
                     Some(Value::Float64(data[index]))
                 }
@@ -447,20 +447,26 @@ impl TypedColumn {
             }
             TypedColumn::Bool { data, nulls } => {
                 if index >= data.len() || nulls.get(index) {
-                    Some(Value::Null)
+                    None
                 } else {
                     Some(Value::Bool(data.get(index)))
                 }
             }
             TypedColumn::Mixed { data, nulls } => {
-                if index >= data.len() {
+                if index >= data.len() || nulls.get(index) {
                     None
-                } else if nulls.get(index) {
-                    Some(Value::Null)
                 } else {
                     Some(data[index].clone())
                 }
             }
+        }
+    }
+
+    #[inline]
+    pub fn get_str(&self, index: usize) -> Option<&str> {
+        match self {
+            TypedColumn::String(col) => col.get(index),
+            _ => None,
         }
     }
 

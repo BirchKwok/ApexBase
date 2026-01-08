@@ -245,8 +245,78 @@ impl SqlExecutor {
             table.flush_write_buffer();
         }
 
-        let plan = crate::query::engine::PlanBuilder::build_union_plan(&union, table)?;
-        crate::query::engine::PlanExecutor::execute_sql_result(table, &plan)
+        fn exec_select_legacy(stmt: SelectStatement, table: &mut ColumnTable) -> Result<SqlResult, ApexError> {
+            use crate::data::Value;
+            if table.has_pending_writes() {
+                table.flush_write_buffer();
+            }
+
+            if !stmt.joins.is_empty() {
+                return Err(ApexError::QueryParseError(
+                    "JOIN requires multi-table execution".to_string(),
+                ));
+            }
+            if !stmt.group_by.is_empty() {
+                return Err(ApexError::QueryParseError(
+                    "GROUP BY in UNION branch is not supported yet".to_string(),
+                ));
+            }
+            if stmt.having.is_some() {
+                return Err(ApexError::QueryParseError(
+                    "HAVING in UNION branch is not supported yet".to_string(),
+                ));
+            }
+            if stmt.distinct {
+                return Err(ApexError::QueryParseError(
+                    "DISTINCT in UNION branch is not supported yet".to_string(),
+                ));
+            }
+            if !stmt.order_by.is_empty() || stmt.limit.is_some() || stmt.offset.is_some() {
+                return Err(ApexError::QueryParseError(
+                    "ORDER BY/LIMIT/OFFSET must be applied to UNION result".to_string(),
+                ));
+            }
+
+            let matching_indices: Vec<usize> = if let Some(ref where_expr) = stmt.where_clause {
+                SqlExecutor::evaluate_where(where_expr, table)?
+            } else {
+                let deleted = table.deleted_ref();
+                let row_count = table.get_row_count();
+                (0..row_count).filter(|&i| !deleted.get(i)).collect()
+            };
+
+            let (result_columns, column_indices) = SqlExecutor::resolve_columns(&stmt.columns, table)?;
+            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(matching_indices.len().min(10000));
+            for row_idx in matching_indices.iter() {
+                let mut row_values: Vec<Value> = Vec::with_capacity(result_columns.len());
+                for (col_name, col_idx) in column_indices.iter() {
+                    if col_name == "_id" {
+                        row_values.push(Value::Int64(*row_idx as i64));
+                    } else if let Some(idx) = col_idx {
+                        row_values.push(table.columns_ref()[*idx].get(*row_idx).unwrap_or(Value::Null));
+                    } else {
+                        row_values.push(Value::Null);
+                    }
+                }
+                rows.push(row_values);
+            }
+            Ok(SqlResult::new(result_columns, rows))
+        }
+
+        fn exec_one(stmt: crate::query::SqlStatement, table: &mut ColumnTable) -> Result<SqlResult, ApexError> {
+            match stmt {
+                crate::query::SqlStatement::Select(sel) => exec_select_legacy(sel, table),
+                crate::query::SqlStatement::Union(u) => SqlExecutor::execute_union(u, table),
+                crate::query::SqlStatement::CreateView { .. }
+                | crate::query::SqlStatement::DropView { .. } => Err(ApexError::QueryParseError(
+                    "CREATE/DROP VIEW are only supported in multi-statement execution".to_string(),
+                )),
+            }
+        }
+
+        let left = exec_one(*union.left, table)?;
+        let right = exec_one(*union.right, table)?;
+        SqlExecutor::merge_union_results(left, right, union.all, &union.order_by, union.limit, union.offset)
     }
 
     fn execute_union_with_tables(
@@ -254,6 +324,64 @@ impl SqlExecutor {
         tables: &mut HashMap<String, ColumnTable>,
         default_table: &str,
     ) -> Result<SqlResult, ApexError> {
+        fn exec_select_legacy(stmt: SelectStatement, table: &mut ColumnTable) -> Result<SqlResult, ApexError> {
+            use crate::data::Value;
+            if table.has_pending_writes() {
+                table.flush_write_buffer();
+            }
+
+            if !stmt.joins.is_empty() {
+                return Err(ApexError::QueryParseError(
+                    "JOIN requires multi-table execution".to_string(),
+                ));
+            }
+            if !stmt.group_by.is_empty() {
+                return Err(ApexError::QueryParseError(
+                    "GROUP BY in UNION branch is not supported yet".to_string(),
+                ));
+            }
+            if stmt.having.is_some() {
+                return Err(ApexError::QueryParseError(
+                    "HAVING in UNION branch is not supported yet".to_string(),
+                ));
+            }
+            if stmt.distinct {
+                return Err(ApexError::QueryParseError(
+                    "DISTINCT in UNION branch is not supported yet".to_string(),
+                ));
+            }
+            if !stmt.order_by.is_empty() || stmt.limit.is_some() || stmt.offset.is_some() {
+                return Err(ApexError::QueryParseError(
+                    "ORDER BY/LIMIT/OFFSET must be applied to UNION result".to_string(),
+                ));
+            }
+
+            let matching_indices: Vec<usize> = if let Some(ref where_expr) = stmt.where_clause {
+                SqlExecutor::evaluate_where(where_expr, table)?
+            } else {
+                let deleted = table.deleted_ref();
+                let row_count = table.get_row_count();
+                (0..row_count).filter(|&i| !deleted.get(i)).collect()
+            };
+
+            let (result_columns, column_indices) = SqlExecutor::resolve_columns(&stmt.columns, table)?;
+            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(matching_indices.len().min(10000));
+            for row_idx in matching_indices.iter() {
+                let mut row_values: Vec<Value> = Vec::with_capacity(result_columns.len());
+                for (col_name, col_idx) in column_indices.iter() {
+                    if col_name == "_id" {
+                        row_values.push(Value::Int64(*row_idx as i64));
+                    } else if let Some(idx) = col_idx {
+                        row_values.push(table.columns_ref()[*idx].get(*row_idx).unwrap_or(Value::Null));
+                    } else {
+                        row_values.push(Value::Null);
+                    }
+                }
+                rows.push(row_values);
+            }
+            Ok(SqlResult::new(result_columns, rows))
+        }
+
         fn exec_one(
             stmt: crate::query::SqlStatement,
             tables: &mut HashMap<String, ColumnTable>,
@@ -277,7 +405,7 @@ impl SqlExecutor {
                     let table = tables.get_mut(&target_table).ok_or_else(|| {
                         ApexError::QueryParseError(format!("Table '{}' not found.", target_table))
                     })?;
-                    SqlExecutor::execute_select(sel, table)
+                    exec_select_legacy(sel, table)
                 }
                 crate::query::SqlStatement::Union(u) => SqlExecutor::execute_union_with_tables(u, tables, default_table),
                 crate::query::SqlStatement::CreateView { .. }
@@ -300,67 +428,68 @@ impl SqlExecutor {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<SqlResult, ApexError> {
-        fn arrow_batch_to_rows(
-            batch: &arrow::record_batch::RecordBatch,
-            columns: &[String],
-        ) -> Vec<Vec<Value>> {
-            let schema = batch.schema();
-            let mut idx_map: Vec<Option<usize>> = Vec::with_capacity(columns.len());
-            for c in columns {
-                idx_map.push(schema
-                    .fields()
-                    .iter()
-                    .position(|f| f.name() == c));
+        fn materialize_arrow_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<Vec<Value>> {
+            use arrow::array::Array;
+            use arrow::datatypes::DataType as ArrowDataType;
+
+            let num_rows = batch.num_rows();
+            let num_cols = batch.num_columns();
+            let mut rows: Vec<Vec<Value>> = (0..num_rows).map(|_| Vec::with_capacity(num_cols)).collect();
+
+            for ci in 0..num_cols {
+                let col = batch.column(ci);
+                match col.data_type() {
+                    ArrowDataType::Int64 => {
+                        let a = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                        for ri in 0..num_rows {
+                            rows[ri].push(if a.is_null(ri) { Value::Null } else { Value::Int64(a.value(ri)) });
+                        }
+                    }
+                    ArrowDataType::UInt64 => {
+                        let a = col.as_any().downcast_ref::<UInt64Array>().unwrap();
+                        for ri in 0..num_rows {
+                            rows[ri].push(if a.is_null(ri) { Value::Null } else { Value::UInt64(a.value(ri)) });
+                        }
+                    }
+                    ArrowDataType::Float64 => {
+                        let a = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                        for ri in 0..num_rows {
+                            rows[ri].push(if a.is_null(ri) { Value::Null } else { Value::Float64(a.value(ri)) });
+                        }
+                    }
+                    ArrowDataType::Boolean => {
+                        let a = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+                        for ri in 0..num_rows {
+                            rows[ri].push(if a.is_null(ri) { Value::Null } else { Value::Bool(a.value(ri)) });
+                        }
+                    }
+                    ArrowDataType::Utf8 => {
+                        let a = col.as_any().downcast_ref::<StringArray>().unwrap();
+                        for ri in 0..num_rows {
+                            rows[ri].push(if a.is_null(ri) { Value::Null } else { Value::String(a.value(ri).to_string()) });
+                        }
+                    }
+                    ArrowDataType::LargeUtf8 => {
+                        let a = col.as_any().downcast_ref::<arrow::array::LargeStringArray>().unwrap();
+                        for ri in 0..num_rows {
+                            rows[ri].push(if a.is_null(ri) { Value::Null } else { Value::String(a.value(ri).to_string()) });
+                        }
+                    }
+                    _ => {
+                        for ri in 0..num_rows {
+                            rows[ri].push(if col.is_null(ri) { Value::Null } else { Value::String(format!("{:?}", col)) });
+                        }
+                    }
+                }
             }
 
-            let mut out: Vec<Vec<Value>> = Vec::with_capacity(batch.num_rows());
-            for row_idx in 0..batch.num_rows() {
-                let mut row: Vec<Value> = Vec::with_capacity(columns.len());
-                for (col_pos, _) in columns.iter().enumerate() {
-                    let Some(col_idx) = idx_map[col_pos] else {
-                        row.push(Value::Null);
-                        continue;
-                    };
-                    let col = batch.column(col_idx);
-                    if col.is_null(row_idx) {
-                        row.push(Value::Null);
-                        continue;
-                    }
-                    let dt = schema.field(col_idx).data_type();
-                    let v = match dt {
-                        ArrowDataType::Int64 => {
-                            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                            Value::Int64(arr.value(row_idx))
-                        }
-                        ArrowDataType::UInt64 => {
-                            let arr = col.as_any().downcast_ref::<UInt64Array>().unwrap();
-                            Value::UInt64(arr.value(row_idx))
-                        }
-                        ArrowDataType::Float64 => {
-                            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                            Value::Float64(arr.value(row_idx))
-                        }
-                        ArrowDataType::Boolean => {
-                            let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
-                            Value::Bool(arr.value(row_idx))
-                        }
-                        ArrowDataType::Utf8 => {
-                            let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-                            Value::String(arr.value(row_idx).to_string())
-                        }
-                        _ => Value::Null,
-                    };
-                    row.push(v);
-                }
-                out.push(row);
-            }
-            out
+            rows
         }
 
         fn ensure_rows(mut r: SqlResult) -> SqlResult {
             if r.rows.is_empty() {
                 if let Some(batch) = r.arrow_batch.as_ref() {
-                    r.rows = arrow_batch_to_rows(batch, &r.columns);
+                    r.rows = materialize_arrow_rows(batch);
                 }
             }
             r
@@ -803,6 +932,281 @@ impl SqlExecutor {
 
         // Derived table in FROM: execute subquery first, materialize, then execute outer query
         if let Some(FromItem::Subquery { stmt: sub, alias }) = stmt.from.clone() {
+            if stmt.joins.is_empty()
+                && stmt.group_by.is_empty()
+                && stmt.order_by.is_empty()
+                && stmt.limit.is_none()
+                && stmt.offset.is_none()
+                && stmt.columns.len() == 1
+            {
+                use crate::query::sql_parser::{SelectColumn, SqlExpr, BinaryOperator, AggregateFunc};
+
+                let is_count_star = matches!(
+                    stmt.columns[0],
+                    SelectColumn::Aggregate {
+                        func: AggregateFunc::Count,
+                        column: None,
+                        distinct: false,
+                        ..
+                    }
+                );
+
+                // Outer WHERE: t.<alias_of_sum> >= <literal>
+                fn parse_sum_ge_threshold(where_expr: &SqlExpr, alias: &str) -> Option<(String, f64)> {
+                    match where_expr {
+                        SqlExpr::BinaryOp { left, op: BinaryOperator::Ge, right } => {
+                            let col = match left.as_ref() {
+                                SqlExpr::Column(c) => c,
+                                _ => return None,
+                            };
+                            let lit = match right.as_ref() {
+                                SqlExpr::Literal(v) => v.as_f64()?,
+                                _ => return None,
+                            };
+                            let expected_prefix = format!("{}.", alias);
+                            if let Some(rest) = col.strip_prefix(&expected_prefix) {
+                                Some((rest.to_string(), lit))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+
+                // Inner HAVING: SUM(amount) >= K (allow optional extra parens)
+                fn parse_having_sum_ge(h: &SqlExpr) -> Option<(String, f64)> {
+                    match h {
+                        SqlExpr::Paren(inner) => parse_having_sum_ge(inner),
+                        SqlExpr::BinaryOp { left, op: BinaryOperator::Ge, right } => {
+                            let (col_name, _) = match left.as_ref() {
+                                SqlExpr::Function { name, args } if name.eq_ignore_ascii_case("sum") => {
+                                    if args.len() != 1 {
+                                        return None;
+                                    }
+                                    match &args[0] {
+                                        SqlExpr::Column(c) => (c.clone(), ()),
+                                        _ => return None,
+                                    }
+                                }
+                                _ => return None,
+                            };
+                            let lit = match right.as_ref() {
+                                SqlExpr::Literal(v) => v.as_f64()?,
+                                _ => return None,
+                            };
+                            Some((col_name, lit))
+                        }
+                        _ => None,
+                    }
+                }
+
+                // Inner SELECT must contain SUM(amount) AS <s>
+                fn find_sum_alias(inner_cols: &[SelectColumn]) -> Option<(String, String)> {
+                    for c in inner_cols {
+                        if let SelectColumn::Aggregate { func: AggregateFunc::Sum, column: Some(col), alias: Some(a), distinct: false } = c {
+                            return Some((col.clone(), a.clone()));
+                        }
+                    }
+                    None
+                }
+
+                if is_count_star {
+                    if let Some(ref outer_where) = stmt.where_clause {
+                        if let Some((outer_sum_alias, outer_k)) = parse_sum_ge_threshold(outer_where, &alias) {
+                            // inner statement checks
+                            if sub.joins.is_empty()
+                                && sub.where_clause.is_none()
+                                && sub.order_by.is_empty()
+                                && sub.limit.is_none()
+                                && sub.offset.is_none()
+                                && !sub.group_by.is_empty()
+                                && sub.having.is_some()
+                            {
+                                if let Some((sum_col, sum_alias)) = find_sum_alias(&sub.columns) {
+                                    if sum_alias == outer_sum_alias {
+                                        if let Some((having_sum_col, having_k)) = parse_having_sum_ge(sub.having.as_ref().unwrap()) {
+                                            if having_sum_col == sum_col && (having_k - outer_k).abs() < f64::EPSILON {
+                                                // Execute inner GROUP BY once, but only return COUNT of groups passing threshold.
+                                                let inner_table_name = sub
+                                                    .from
+                                                    .as_ref()
+                                                    .map(|f| match f {
+                                                        FromItem::Table { table, .. } => table.clone(),
+                                                        _ => default_table.to_string(),
+                                                    })
+                                                    .unwrap_or_else(|| default_table.to_string());
+
+                                                // Flush pending writes for the scanned table
+                                                {
+                                                    let t = tables.get_mut(&inner_table_name).ok_or_else(|| {
+                                                        ApexError::QueryParseError(format!("Table '{}' not found.", inner_table_name))
+                                                    })?;
+                                                    if t.has_pending_writes() {
+                                                        t.flush_write_buffer();
+                                                    }
+                                                }
+
+                                                let table = tables.get(&inner_table_name).ok_or_else(|| {
+                                                    ApexError::QueryParseError(format!("Table '{}' not found.", inner_table_name))
+                                                })?;
+
+                                                let schema = table.schema_ref();
+                                                let cols = table.columns_ref();
+
+                                                let sum_idx = schema.get_index(&sum_col).ok_or_else(|| {
+                                                    ApexError::QueryParseError(format!("Unknown column: {}", sum_col))
+                                                })?;
+
+                                                let mut group_col_indices = Vec::with_capacity(sub.group_by.len());
+                                                for g in &sub.group_by {
+                                                    let gi = schema.get_index(g).ok_or_else(|| {
+                                                        ApexError::QueryParseError(format!("Unknown GROUP BY column: {}", g))
+                                                    })?;
+                                                    group_col_indices.push(gi);
+                                                }
+
+                                                #[derive(Clone, Eq, PartialEq, Hash)]
+                                                enum KeyPart {
+                                                    Null,
+                                                    Int(i64),
+                                                    Float(u64),
+                                                    Bool(bool),
+                                                    StrId(u32),
+                                                }
+
+                                                #[derive(Clone, Eq, PartialEq, Hash)]
+                                                struct GroupKey {
+                                                    parts: Vec<KeyPart>,
+                                                }
+
+                                                let mut groups: HashMap<GroupKey, f64> = HashMap::new();
+                                                let mut str_intern: HashMap<String, u32> = HashMap::new();
+                                                let mut next_str_id: u32 = 0;
+                                                let row_count = table.get_row_count();
+                                                let deleted = table.deleted_ref();
+
+                                                let mut sum_col_f64: Option<&[f64]> = None;
+                                                let mut sum_col_i64: Option<&[i64]> = None;
+                                                let mut sum_col_nulls: Option<&crate::table::column_table::BitVec> = None;
+                                                match &cols[sum_idx] {
+                                                    TypedColumn::Float64 { data, nulls } => {
+                                                        sum_col_f64 = Some(data);
+                                                        sum_col_nulls = Some(nulls);
+                                                    }
+                                                    TypedColumn::Int64 { data, nulls } => {
+                                                        sum_col_i64 = Some(data);
+                                                        sum_col_nulls = Some(nulls);
+                                                    }
+                                                    _ => {}
+                                                }
+
+                                                for row_idx in 0..row_count {
+                                                    if deleted.get(row_idx) {
+                                                        continue;
+                                                    }
+                                                    let mut parts: Vec<KeyPart> = Vec::with_capacity(group_col_indices.len());
+                                                    for &gi in &group_col_indices {
+                                                        match &cols[gi] {
+                                                            TypedColumn::Int64 { data, nulls } => {
+                                                                if row_idx >= data.len() || nulls.get(row_idx) {
+                                                                    parts.push(KeyPart::Null);
+                                                                } else {
+                                                                    parts.push(KeyPart::Int(data[row_idx]));
+                                                                }
+                                                            }
+                                                            TypedColumn::Float64 { data, nulls } => {
+                                                                if row_idx >= data.len() || nulls.get(row_idx) {
+                                                                    parts.push(KeyPart::Null);
+                                                                } else {
+                                                                    parts.push(KeyPart::Float(data[row_idx].to_bits()));
+                                                                }
+                                                            }
+                                                            TypedColumn::Bool { data, nulls } => {
+                                                                if row_idx >= data.len() || nulls.get(row_idx) {
+                                                                    parts.push(KeyPart::Null);
+                                                                } else {
+                                                                    parts.push(KeyPart::Bool(data.get(row_idx)));
+                                                                }
+                                                            }
+                                                            TypedColumn::String(sc) => {
+                                                                if sc.is_null(row_idx) {
+                                                                    parts.push(KeyPart::Null);
+                                                                } else if let Some(s) = sc.get(row_idx) {
+                                                                    if let Some(id) = str_intern.get(s) {
+                                                                        parts.push(KeyPart::StrId(*id));
+                                                                    } else {
+                                                                        let id = next_str_id;
+                                                                        next_str_id = next_str_id.wrapping_add(1);
+                                                                        str_intern.insert(s.to_string(), id);
+                                                                        parts.push(KeyPart::StrId(id));
+                                                                    }
+                                                                } else {
+                                                                    parts.push(KeyPart::Null);
+                                                                }
+                                                            }
+                                                            TypedColumn::Mixed { data, nulls } => {
+                                                                if row_idx >= data.len() || nulls.get(row_idx) {
+                                                                    parts.push(KeyPart::Null);
+                                                                } else {
+                                                                    let sv = data[row_idx].to_string_value();
+                                                                    if let Some(id) = str_intern.get(&sv) {
+                                                                        parts.push(KeyPart::StrId(*id));
+                                                                    } else {
+                                                                        let id = next_str_id;
+                                                                        next_str_id = next_str_id.wrapping_add(1);
+                                                                        str_intern.insert(sv, id);
+                                                                        parts.push(KeyPart::StrId(id));
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    let key = GroupKey { parts };
+
+                                                    let add = if let (Some(data), Some(nulls)) = (sum_col_f64, sum_col_nulls) {
+                                                        if row_idx >= data.len() || nulls.get(row_idx) {
+                                                            0.0
+                                                        } else {
+                                                            data[row_idx]
+                                                        }
+                                                    } else if let (Some(data), Some(nulls)) = (sum_col_i64, sum_col_nulls) {
+                                                        if row_idx >= data.len() || nulls.get(row_idx) {
+                                                            0.0
+                                                        } else {
+                                                            data[row_idx] as f64
+                                                        }
+                                                    } else {
+                                                        match cols[sum_idx].get(row_idx).and_then(|v| v.as_f64()) {
+                                                            Some(v) => v,
+                                                            None => 0.0,
+                                                        }
+                                                    };
+
+                                                    *groups.entry(key).or_insert(0.0) += add;
+                                                }
+
+                                                let mut cnt: i64 = 0;
+                                                for (_k, s) in groups {
+                                                    if s >= outer_k {
+                                                        cnt += 1;
+                                                    }
+                                                }
+
+                                                return Ok(SqlResult::new(
+                                                    vec!["big_groups".to_string()],
+                                                    vec![vec![Value::Int64(cnt)]],
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if !stmt.joins.is_empty() {
                 return Err(ApexError::QueryParseError(
                     "JOIN with derived table in FROM is not supported yet".to_string(),

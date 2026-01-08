@@ -924,7 +924,23 @@ impl ApexStorage {
                 }
             }
 
-            let result = last.unwrap_or_else(|| crate::query::SqlResult::new(Vec::new(), Vec::new()));
+            let mut result = last.unwrap_or_else(|| crate::query::SqlResult::new(Vec::new(), Vec::new()));
+            if result.rows.is_empty() {
+                if let Some(batch) = result.arrow_batch.take() {
+                    let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(batch.num_rows());
+                    let num_cols = batch.num_columns();
+                    for row_idx in 0..batch.num_rows() {
+                        let mut row: Vec<Value> = Vec::with_capacity(num_cols);
+                        for col_idx in 0..num_cols {
+                            let arr = batch.column(col_idx);
+                            let values = arrow_array_to_values(arr)?;
+                            row.push(values.get(row_idx).cloned().unwrap_or(Value::Null));
+                        }
+                        out_rows.push(row);
+                    }
+                    result.rows = out_rows;
+                }
+            }
             Ok((result.columns, result.rows, result.rows_affected))
         })?;
 

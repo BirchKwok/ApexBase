@@ -15,7 +15,7 @@ from pathlib import Path
 def run_pytest(args):
     """Run pytest with the given arguments"""
     # Change to the project root directory
-    project_root = Path(__file__).parent.parent
+    project_root = Path(__file__).parent
     os.chdir(project_root)
     
     # Build pytest command
@@ -117,7 +117,7 @@ def check_dependencies():
 
 def list_tests():
     """List all available tests"""
-    project_root = Path(__file__).parent.parent
+    project_root = Path(__file__).parent
     os.chdir(project_root)
     
     try:
