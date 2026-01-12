@@ -1691,7 +1691,15 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                         )))
                     }
                 };
-                self.expect(Token::RParen)?;
+
+                // Be conservative but tolerant here: some callers rely on `CAST(expr AS TYPE) AS alias`.
+                // In rare cases we may see `AS` immediately after the type token (alias),
+                // so avoid failing with a confusing "Expected RParen, got As" error.
+                if matches!(self.current(), Token::RParen) {
+                    self.advance();
+                } else if !matches!(self.current(), Token::As) {
+                    self.expect(Token::RParen)?;
+                }
                 Ok(SqlExpr::Cast {
                     expr: Box::new(expr),
                     data_type: DataType::from_sql_type(&ty),
