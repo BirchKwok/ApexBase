@@ -83,6 +83,41 @@ class TestBasicSQLExecute:
             
             client.close()
 
+    def test_execute_cast_expression(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            client.store([{"s": "123", "f": "1.25", "b": "true", "n": 7}])
+            client.flush()
+
+            res = client.execute(
+                """
+                SELECT
+                  CAST('123' AS INT) AS i1,
+                  CAST(s AS BIGINT) AS i2,
+                  CAST(f AS DOUBLE) AS d1,
+                  CAST(n AS VARCHAR) AS s1,
+                  CAST(b AS BOOLEAN) AS bo
+                FROM default
+                """.strip()
+            )
+            row = res.first()
+            assert row["i1"] == 123
+            assert row["i2"] == 123
+            assert row["d1"] == pytest.approx(1.25)
+            assert row["s1"] == "7"
+            assert row["bo"] is True
+
+            # NULL propagation
+            r2 = client.execute("SELECT CAST(NULL AS INT) AS x FROM default").first()
+            assert r2["x"] is None
+
+            # Invalid cast should error
+            with pytest.raises(Exception):
+                client.execute("SELECT CAST('abc' AS INT) AS x FROM default").to_dict()
+
+            client.close()
+
     def test_where_multi_column_arithmetic_predicate(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
@@ -183,7 +218,9 @@ class TestBasicSQLExecute:
                   REPLACE('a-b-c', '-', '_') AS rep,
                   TRIM('  hi  ') AS tr,
                   UPPER('aBc') AS up,
-                  LOWER('aBc') AS lo
+                  LOWER('aBc') AS lo,
+                  UCASE('aBc') AS uca,
+                  LCASE('aBc') AS lca
                 FROM default
                 """.strip()
             )
@@ -196,6 +233,35 @@ class TestBasicSQLExecute:
             assert row["tr"] == "hi"
             assert row["up"] == "ABC"
             assert row["lo"] == "abc"
+            assert row["uca"] == "ABC"
+            assert row["lca"] == "abc"
+
+            res2 = client.execute(
+                """
+                SELECT
+                  UCASE(NULL) AS u_null,
+                  LCASE(NULL) AS l_null
+                FROM default
+                """.strip()
+            )
+            row2 = res2.first()
+            assert row2["u_null"] is None
+            assert row2["l_null"] is None
+
+            # UCASE/LCASE: only allow string literal or column name
+            with pytest.raises(Exception):
+                client.execute("SELECT UCASE(1) AS x FROM default").to_dict()
+
+            with pytest.raises(Exception):
+                client.execute("SELECT LCASE(1) AS x FROM default").to_dict()
+
+            # Column exists but non-string values should error
+            with pytest.raises(Exception):
+                client.execute("SELECT UCASE(n) AS x FROM default").to_dict()
+
+            # Nested expression should error
+            with pytest.raises(Exception):
+                client.execute("SELECT UCASE(LOWER('a')) AS x FROM default").to_dict()
 
             client.close()
 

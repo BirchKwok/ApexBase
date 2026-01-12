@@ -178,10 +178,106 @@ pub(crate) fn eval_scalar_expr(
         Value::Null
     }
 
+    fn is_string_literal_or_column(expr: &SqlExpr) -> bool {
+        match expr {
+            SqlExpr::Paren(inner) => is_string_literal_or_column(inner),
+            SqlExpr::Column(_) => true,
+            SqlExpr::Literal(v) => matches!(v, Value::String(_) | Value::Null),
+            _ => false,
+        }
+    }
+
+    fn cast_value(v: Value, target: crate::data::DataType) -> Result<Value, ApexError> {
+        use crate::data::DataType;
+
+        if v.is_null() {
+            return Ok(Value::Null);
+        }
+
+        match target {
+            DataType::String => Ok(Value::String(v.to_string_value())),
+            DataType::Bool => match v {
+                Value::Bool(b) => Ok(Value::Bool(b)),
+                Value::Int8(i) => Ok(Value::Bool(i != 0)),
+                Value::Int16(i) => Ok(Value::Bool(i != 0)),
+                Value::Int32(i) => Ok(Value::Bool(i != 0)),
+                Value::Int64(i) => Ok(Value::Bool(i != 0)),
+                Value::UInt8(i) => Ok(Value::Bool(i != 0)),
+                Value::UInt16(i) => Ok(Value::Bool(i != 0)),
+                Value::UInt32(i) => Ok(Value::Bool(i != 0)),
+                Value::UInt64(i) => Ok(Value::Bool(i != 0)),
+                Value::Float32(f) => Ok(Value::Bool(f != 0.0)),
+                Value::Float64(f) => Ok(Value::Bool(f != 0.0)),
+                Value::String(s) => {
+                    let ls = s.trim().to_lowercase();
+                    match ls.as_str() {
+                        "true" | "1" | "t" | "yes" | "y" => Ok(Value::Bool(true)),
+                        "false" | "0" | "f" | "no" | "n" => Ok(Value::Bool(false)),
+                        _ => Err(ApexError::QueryParseError(format!(
+                            "Cannot CAST value '{}' to BOOLEAN",
+                            s
+                        ))),
+                    }
+                }
+                other => Err(ApexError::QueryParseError(format!(
+                    "Cannot CAST {:?} to BOOLEAN",
+                    other
+                ))),
+            },
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => {
+                if let Some(i) = v.as_i64() {
+                    Ok(Value::Int64(i))
+                } else if let Value::String(s) = v {
+                    let t = s.trim();
+                    let parsed: i64 = t.parse().map_err(|_| {
+                        ApexError::QueryParseError(format!("Cannot CAST value '{}' to INTEGER", s))
+                    })?;
+                    Ok(Value::Int64(parsed))
+                } else {
+                    Err(ApexError::QueryParseError(format!(
+                        "Cannot CAST value '{}' to INTEGER",
+                        v.to_string_value()
+                    )))
+                }
+            }
+            DataType::Float32 | DataType::Float64 => {
+                if let Some(f) = v.as_f64() {
+                    Ok(Value::Float64(f))
+                } else if let Value::String(s) = v {
+                    let t = s.trim();
+                    let parsed: f64 = t.parse().map_err(|_| {
+                        ApexError::QueryParseError(format!("Cannot CAST value '{}' to DOUBLE", s))
+                    })?;
+                    Ok(Value::Float64(parsed))
+                } else {
+                    Err(ApexError::QueryParseError(format!(
+                        "Cannot CAST value '{}' to DOUBLE",
+                        v.to_string_value()
+                    )))
+                }
+            }
+            _ => Err(ApexError::QueryParseError(format!(
+                "Unsupported CAST target type: {}",
+                target
+            ))),
+        }
+    }
+
     match expr {
         SqlExpr::Paren(inner) => eval_scalar_expr(inner, table, row_idx, ctx),
         SqlExpr::Literal(v) => Ok(v.clone()),
         SqlExpr::Column(c) => Ok(get_col_value(table, c, row_idx)),
+        SqlExpr::Cast { expr, data_type } => {
+            let v = eval_scalar_expr(expr, table, row_idx, ctx)?;
+            cast_value(v, *data_type)
+        }
         SqlExpr::UnaryOp { op: UnaryOperator::Minus, expr } => {
             let v = eval_scalar_expr(expr, table, row_idx, ctx)?;
             if let Some(i) = v.as_i64() {
@@ -416,6 +512,29 @@ pub(crate) fn eval_scalar_expr(
                     }
                     Ok(Value::String(v.to_string_value().to_uppercase()))
                 }
+                "UCASE" => {
+                    if args.len() != 1 {
+                        return Err(ApexError::QueryParseError(
+                            "UCASE() expects 1 argument".to_string(),
+                        ));
+                    }
+                    if !is_string_literal_or_column(&args[0]) {
+                        return Err(ApexError::QueryParseError(
+                            "UCASE() expects a string literal or column".to_string(),
+                        ));
+                    }
+
+                    let v = eval_scalar_expr(&args[0], table, row_idx, ctx)?;
+                    if v.is_null() {
+                        return Ok(Value::Null);
+                    }
+                    if !matches!(v, Value::String(_)) {
+                        return Err(ApexError::QueryParseError(
+                            "UCASE() expects a string literal or string column".to_string(),
+                        ));
+                    }
+                    Ok(Value::String(v.to_string_value().to_uppercase()))
+                }
                 "LOWER" => {
                     if args.len() != 1 {
                         return Err(ApexError::QueryParseError(
@@ -425,6 +544,29 @@ pub(crate) fn eval_scalar_expr(
                     let v = eval_scalar_expr(&args[0], table, row_idx, ctx)?;
                     if v.is_null() {
                         return Ok(Value::Null);
+                    }
+                    Ok(Value::String(v.to_string_value().to_lowercase()))
+                }
+                "LCASE" => {
+                    if args.len() != 1 {
+                        return Err(ApexError::QueryParseError(
+                            "LCASE() expects 1 argument".to_string(),
+                        ));
+                    }
+                    if !is_string_literal_or_column(&args[0]) {
+                        return Err(ApexError::QueryParseError(
+                            "LCASE() expects a string literal or column".to_string(),
+                        ));
+                    }
+
+                    let v = eval_scalar_expr(&args[0], table, row_idx, ctx)?;
+                    if v.is_null() {
+                        return Ok(Value::Null);
+                    }
+                    if !matches!(v, Value::String(_)) {
+                        return Err(ApexError::QueryParseError(
+                            "LCASE() expects a string literal or string column".to_string(),
+                        ));
                     }
                     Ok(Value::String(v.to_string_value().to_lowercase()))
                 }

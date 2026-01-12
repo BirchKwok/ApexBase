@@ -12,6 +12,7 @@
 //! - GROUP BY / HAVING
 
 use crate::ApexError;
+use crate::data::DataType;
 use crate::data::Value;
 
 /// SQL Statement types
@@ -147,6 +148,8 @@ pub enum SqlExpr {
     IsNull { column: String, negated: bool },
     /// Function call
     Function { name: String, args: Vec<SqlExpr> },
+    /// CAST(expr AS TYPE)
+    Cast { expr: Box<SqlExpr>, data_type: DataType },
     /// Parenthesized expression
     Paren(Box<SqlExpr>),
 }
@@ -209,6 +212,7 @@ enum Token {
     Join, Left, Right, Full, Inner, Outer, On,
     Union, All,
     Exists,
+    Cast,
     Case, When, Then, Else, End,
     Create, Drop, View,
     // Symbols
@@ -463,6 +467,7 @@ impl SqlParser {
                     "UNION" => Token::Union,
                     "ALL" => Token::All,
                     "EXISTS" => Token::Exists,
+                    "CAST" => Token::Cast,
                     "CASE" => Token::Case,
                     "WHEN" => Token::When,
                     "THEN" => Token::Then,
@@ -1233,6 +1238,7 @@ impl SqlParser {
                         | Token::Null
                         | Token::LParen
                         | Token::Exists
+                        | Token::Cast
                         | Token::Case
                         | Token::Not
                         | Token::Minus
@@ -1666,6 +1672,29 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                 self.expect(Token::RParen)?;
                 Ok(SqlExpr::ExistsSubquery {
                     stmt: Box::new(sub),
+                })
+            }
+            Token::Cast => {
+                self.advance();
+                self.expect(Token::LParen)?;
+                let expr = self.parse_expr()?;
+                self.expect(Token::As)?;
+                let ty = match self.current().clone() {
+                    Token::Identifier(t) => {
+                        self.advance();
+                        t
+                    }
+                    other => {
+                        return Err(ApexError::QueryParseError(format!(
+                            "Expected type name after AS in CAST(), got {:?}",
+                            other
+                        )))
+                    }
+                };
+                self.expect(Token::RParen)?;
+                Ok(SqlExpr::Cast {
+                    expr: Box::new(expr),
+                    data_type: DataType::from_sql_type(&ty),
                 })
             }
             Token::Case => {
