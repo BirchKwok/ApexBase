@@ -303,8 +303,14 @@ impl SelectStatement {
     fn extract_columns_from_expr(expr: &SqlExpr, columns: &mut Vec<String>) {
         match expr {
             SqlExpr::Column(name) => {
-                if name != "_id" {
-                    columns.push(name.clone());
+                // Strip table prefix if present (e.g., "o.user_id" -> "user_id")
+                let actual_name = if let Some(dot_pos) = name.rfind('.') {
+                    &name[dot_pos + 1..]
+                } else {
+                    name.as_str()
+                };
+                if actual_name != "_id" {
+                    columns.push(actual_name.to_string());
                 }
             }
             SqlExpr::BinaryOp { left, right, .. } => {
@@ -320,8 +326,14 @@ impl SelectStatement {
             SqlExpr::Between { column, .. } |
             SqlExpr::IsNull { column, .. } |
             SqlExpr::InSubquery { column, .. } => {
-                if column != "_id" {
-                    columns.push(column.clone());
+                // Strip table prefix if present
+                let actual_name = if let Some(dot_pos) = column.rfind('.') {
+                    &column[dot_pos + 1..]
+                } else {
+                    column.as_str()
+                };
+                if actual_name != "_id" {
+                    columns.push(actual_name.to_string());
                 }
             }
             SqlExpr::Case { when_then, else_expr } => {
@@ -343,6 +355,48 @@ impl SelectStatement {
             }
             SqlExpr::Paren(inner) => {
                 Self::extract_columns_from_expr(inner, columns);
+            }
+            SqlExpr::ExistsSubquery { stmt } | SqlExpr::ScalarSubquery { stmt } => {
+                // For correlated subqueries, extract outer column references from WHERE clause
+                // These are columns like "u.user_id" or "outer_table.col" that reference the outer query
+                if let Some(ref where_clause) = stmt.where_clause {
+                    Self::extract_outer_refs_from_subquery(where_clause, columns);
+                }
+            }
+            SqlExpr::InSubquery { column, stmt, .. } => {
+                // The column being compared (e.g., "user_id" in "user_id IN (SELECT ...)")
+                if column != "_id" {
+                    columns.push(column.clone());
+                }
+                // Also extract outer references from subquery WHERE clause
+                if let Some(ref where_clause) = stmt.where_clause {
+                    Self::extract_outer_refs_from_subquery(where_clause, columns);
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    /// Extract outer column references from subquery expressions
+    /// These are qualified column names like "u.col" or "table.col" that reference outer tables
+    fn extract_outer_refs_from_subquery(expr: &SqlExpr, columns: &mut Vec<String>) {
+        match expr {
+            SqlExpr::Column(name) => {
+                let clean_name = name.trim_matches('"');
+                // Check for qualified names like "u.user_id" or "users.user_id"
+                if let Some(dot_pos) = clean_name.find('.') {
+                    let col_part = &clean_name[dot_pos + 1..];
+                    if col_part != "_id" && !columns.contains(&col_part.to_string()) {
+                        columns.push(col_part.to_string());
+                    }
+                }
+            }
+            SqlExpr::BinaryOp { left, right, .. } => {
+                Self::extract_outer_refs_from_subquery(left, columns);
+                Self::extract_outer_refs_from_subquery(right, columns);
+            }
+            SqlExpr::UnaryOp { expr: inner, .. } | SqlExpr::Paren(inner) => {
+                Self::extract_outer_refs_from_subquery(inner, columns);
             }
             _ => {}
         }

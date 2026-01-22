@@ -386,43 +386,67 @@ impl TableStorageBackend {
     // ========================================================================
 
     /// Insert rows (updates cache and marks dirty)
+    /// Optimized with parallel conversion for large batches
     pub fn insert_rows(&self, rows: &[HashMap<String, Value>]) -> io::Result<Vec<u64>> {
         use crate::storage::on_demand::ColumnValue;
+        use rayon::prelude::*;
 
         if rows.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Convert to ColumnValue format
-        let converted: Vec<HashMap<String, ColumnValue>> = rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|(k, v)| {
-                        let cv = match v {
-                            Value::Int64(i) => ColumnValue::Int64(*i),
-                            Value::Int32(i) => ColumnValue::Int64(*i as i64),
-                            Value::Float64(f) => ColumnValue::Float64(*f),
-                            Value::Float32(f) => ColumnValue::Float64(*f as f64),
-                            Value::String(s) => ColumnValue::String(s.clone()),
-                            Value::Bool(b) => ColumnValue::Bool(*b),
-                            Value::Binary(b) => ColumnValue::Binary(b.clone()),
-                            Value::Null => ColumnValue::Null,
-                            _ => ColumnValue::String(serde_json::to_string(v).unwrap_or_default()),
-                        };
-                        (k.clone(), cv)
-                    })
-                    .collect()
-            })
-            .collect();
+        // Convert to ColumnValue format - use parallel for large batches
+        let converted: Vec<HashMap<String, ColumnValue>> = if rows.len() > 1000 {
+            rows.par_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|(k, v)| {
+                            let cv = match v {
+                                Value::Int64(i) => ColumnValue::Int64(*i),
+                                Value::Int32(i) => ColumnValue::Int64(*i as i64),
+                                Value::Float64(f) => ColumnValue::Float64(*f),
+                                Value::Float32(f) => ColumnValue::Float64(*f as f64),
+                                Value::String(s) => ColumnValue::String(s.clone()),
+                                Value::Bool(b) => ColumnValue::Bool(*b),
+                                Value::Binary(b) => ColumnValue::Binary(b.clone()),
+                                Value::Null => ColumnValue::Null,
+                                _ => ColumnValue::String(serde_json::to_string(v).unwrap_or_default()),
+                            };
+                            (k.clone(), cv)
+                        })
+                        .collect()
+                })
+                .collect()
+        } else {
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|(k, v)| {
+                            let cv = match v {
+                                Value::Int64(i) => ColumnValue::Int64(*i),
+                                Value::Int32(i) => ColumnValue::Int64(*i as i64),
+                                Value::Float64(f) => ColumnValue::Float64(*f),
+                                Value::Float32(f) => ColumnValue::Float64(*f as f64),
+                                Value::String(s) => ColumnValue::String(s.clone()),
+                                Value::Bool(b) => ColumnValue::Bool(*b),
+                                Value::Binary(b) => ColumnValue::Binary(b.clone()),
+                                Value::Null => ColumnValue::Null,
+                                _ => ColumnValue::String(serde_json::to_string(v).unwrap_or_default()),
+                            };
+                            (k.clone(), cv)
+                        })
+                        .collect()
+                })
+                .collect()
+        };
 
         // Insert into storage
         let ids = self.storage.insert_rows(&converted)?;
 
-        // Update schema if new columns
+        // Update schema if new columns (only check first row for perf)
         {
             let mut schema = self.schema.write();
-            for row in rows {
+            if let Some(row) = rows.first() {
                 for (k, v) in row {
                     if k != "_id" && !schema.iter().any(|(n, _)| n == k) {
                         schema.push((k.clone(), v.data_type()));

@@ -315,6 +315,55 @@ impl ColumnData {
         }
     }
 
+    /// Batch extend strings - much faster than individual push_string calls
+    #[inline]
+    pub fn extend_strings(&mut self, values: &[String]) {
+        if let ColumnData::String { offsets, data } = self {
+            // Pre-calculate total size needed
+            let total_len: usize = values.iter().map(|s| s.len()).sum();
+            data.reserve(total_len);
+            offsets.reserve(values.len());
+            
+            for s in values {
+                data.extend_from_slice(s.as_bytes());
+                offsets.push(data.len() as u32);
+            }
+        }
+    }
+
+    /// Batch extend binary data
+    #[inline]
+    pub fn extend_bytes(&mut self, values: &[Vec<u8>]) {
+        if let ColumnData::Binary { offsets, data } = self {
+            let total_len: usize = values.iter().map(|b| b.len()).sum();
+            data.reserve(total_len);
+            offsets.reserve(values.len());
+            
+            for b in values {
+                data.extend_from_slice(b);
+                offsets.push(data.len() as u32);
+            }
+        }
+    }
+
+    /// Batch extend bools
+    #[inline]
+    pub fn extend_bools(&mut self, values: &[bool]) {
+        if let ColumnData::Bool { data, len } = self {
+            for &value in values {
+                let byte_idx = *len / 8;
+                let bit_idx = *len % 8;
+                if byte_idx >= data.len() {
+                    data.push(0);
+                }
+                if value {
+                    data[byte_idx] |= 1 << bit_idx;
+                }
+                *len += 1;
+            }
+        }
+    }
+
     /// Serialize to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -715,8 +764,9 @@ pub struct OnDemandStorage {
     nulls: RwLock<Vec<Vec<u8>>>,
     /// Deleted row bitmap (packed bits, 1 = deleted)
     deleted: RwLock<Vec<u8>>,
-    /// ID to row index mapping for fast lookups
-    id_to_idx: RwLock<HashMap<u64, usize>>,
+    /// ID to row index mapping for fast lookups (lazy-loaded)
+    /// Only built when needed for delete/exists operations
+    id_to_idx: RwLock<Option<HashMap<u64, usize>>>,
 }
 
 impl OnDemandStorage {
@@ -736,7 +786,7 @@ impl OnDemandStorage {
             next_id: AtomicU64::new(0),
             nulls: RwLock::new(Vec::new()),
             deleted: RwLock::new(Vec::new()),
-            id_to_idx: RwLock::new(HashMap::new()),
+            id_to_idx: RwLock::new(Some(HashMap::new())),
         };
 
         // Write initial file
@@ -772,19 +822,20 @@ impl OnDemandStorage {
             column_index.push(entry);
         }
 
-        // Read IDs into memory (always needed for lookups)
+        // Read IDs into memory (needed for read_ids and row count)
         let id_count = header.row_count as usize;
         let mut id_bytes = vec![0u8; id_count * 8];
         if id_count > 0 {
             file.read_exact_at(&mut id_bytes, header.id_column_offset)?;
         }
         let mut ids = Vec::with_capacity(id_count);
-        let mut id_to_idx = HashMap::with_capacity(id_count);
         for i in 0..id_count {
             let id = u64::from_le_bytes(id_bytes[i * 8..(i + 1) * 8].try_into().unwrap());
             ids.push(id);
-            id_to_idx.insert(id, i);
         }
+        // NOTE: id_to_idx HashMap is NOT built here - lazy loaded when needed
+        // This saves ~200MB+ memory for 10M rows (only needed for delete/exists ops)
+        
         // If no rows exist, start from 0; otherwise start after max existing ID
         let next_id = if ids.is_empty() {
             0
@@ -811,7 +862,7 @@ impl OnDemandStorage {
             next_id: AtomicU64::new(next_id),
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(deleted),
-            id_to_idx: RwLock::new(id_to_idx),
+            id_to_idx: RwLock::new(None),  // Lazy loaded when needed
         })
     }
 
@@ -964,6 +1015,24 @@ impl OnDemandStorage {
     }
 
     // ========================================================================
+    // Internal helpers
+    // ========================================================================
+
+    /// Ensure id_to_idx HashMap is built (lazy load)
+    /// Called automatically by delete/exists/get_row_idx operations
+    fn ensure_id_index(&self) {
+        let mut id_to_idx = self.id_to_idx.write();
+        if id_to_idx.is_none() {
+            let ids = self.ids.read();
+            let mut map = HashMap::with_capacity(ids.len());
+            for (idx, &id) in ids.iter().enumerate() {
+                map.insert(id, idx);
+            }
+            *id_to_idx = Some(map);
+        }
+    }
+
+    // ========================================================================
     // Internal read helpers
     // ========================================================================
 
@@ -1091,6 +1160,108 @@ impl OnDemandStorage {
         }
     }
 
+    /// Optimized scattered read for variable-length columns (String/Binary)
+    /// Only reads the offsets and data for the requested row indices
+    fn read_variable_column_scattered(
+        &self,
+        file: &File,
+        index: &ColumnIndexEntry,
+        dtype: ColumnType,
+        row_indices: &[usize],
+    ) -> io::Result<ColumnData> {
+        if row_indices.is_empty() {
+            return Ok(match dtype {
+                ColumnType::String => ColumnData::String { offsets: vec![0], data: Vec::new() },
+                _ => ColumnData::Binary { offsets: vec![0], data: Vec::new() },
+            });
+        }
+
+        // Variable-length format: [count:u64][offsets:u32*(count+1)][data_len:u64][data:bytes]
+        // Read header to get total count
+        let mut header_buf = [0u8; 8];
+        file.read_exact_at(&mut header_buf, index.data_offset)?;
+        let total_count = u64::from_le_bytes(header_buf) as usize;
+
+        // Read only the offsets we need (need idx and idx+1 for each row)
+        // Collect unique offset indices needed
+        let mut offset_indices: Vec<usize> = Vec::with_capacity(row_indices.len() * 2);
+        for &idx in row_indices {
+            if idx < total_count {
+                offset_indices.push(idx);
+                offset_indices.push(idx + 1);
+            }
+        }
+        offset_indices.sort_unstable();
+        offset_indices.dedup();
+
+        if offset_indices.is_empty() {
+            return Ok(match dtype {
+                ColumnType::String => ColumnData::String { offsets: vec![0], data: Vec::new() },
+                _ => ColumnData::Binary { offsets: vec![0], data: Vec::new() },
+            });
+        }
+
+        // Read required offsets in batches (optimize for contiguous ranges)
+        let mut offset_map: HashMap<usize, u32> = HashMap::with_capacity(offset_indices.len());
+        let offset_base = index.data_offset + 8; // skip count header
+        
+        // For small number of indices, read individually
+        // For larger sets, read a range that covers all needed offsets
+        let min_idx = *offset_indices.first().unwrap();
+        let max_idx = *offset_indices.last().unwrap();
+        
+        if max_idx - min_idx < offset_indices.len() * 4 {
+            // Indices are sparse enough - read range
+            let range_count = max_idx - min_idx + 1;
+            let mut offset_buf = vec![0u8; range_count * 4];
+            file.read_exact_at(&mut offset_buf, offset_base + (min_idx * 4) as u64)?;
+            
+            for &idx in &offset_indices {
+                let local_idx = idx - min_idx;
+                let off = u32::from_le_bytes(offset_buf[local_idx * 4..(local_idx + 1) * 4].try_into().unwrap());
+                offset_map.insert(idx, off);
+            }
+        } else {
+            // Very sparse - read individually
+            let mut buf = [0u8; 4];
+            for &idx in &offset_indices {
+                file.read_exact_at(&mut buf, offset_base + (idx * 4) as u64)?;
+                offset_map.insert(idx, u32::from_le_bytes(buf));
+            }
+        }
+
+        // Calculate data offset base: skip count(8) + offsets((total_count+1)*4) + data_len(8)
+        let data_base = index.data_offset + 8 + (total_count + 1) as u64 * 4 + 8;
+
+        // Read data for each requested row and build result
+        let mut result_offsets = vec![0u32];
+        let mut result_data = Vec::new();
+
+        for &idx in row_indices {
+            if idx < total_count {
+                let start = *offset_map.get(&idx).unwrap_or(&0);
+                let end = *offset_map.get(&(idx + 1)).unwrap_or(&start);
+                let len = (end - start) as usize;
+                
+                if len > 0 {
+                    let mut chunk = vec![0u8; len];
+                    file.read_exact_at(&mut chunk, data_base + start as u64)?;
+                    result_data.extend_from_slice(&chunk);
+                }
+                result_offsets.push(result_data.len() as u32);
+            } else {
+                // Out of bounds - push empty
+                result_offsets.push(result_data.len() as u32);
+            }
+        }
+
+        match dtype {
+            ColumnType::String => Ok(ColumnData::String { offsets: result_offsets, data: result_data }),
+            ColumnType::Binary => Ok(ColumnData::Binary { offsets: result_offsets, data: result_data }),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Not a variable type")),
+        }
+    }
+
     fn read_column_scattered(
         &self,
         file: &File,
@@ -1123,9 +1294,8 @@ impl OnDemandStorage {
                 Ok(ColumnData::Float64(values))
             }
             ColumnType::String | ColumnType::Binary => {
-                // Variable-length: read full column for now
-                // TODO: Optimize with offset index for truly scattered reads
-                self.read_variable_column_range(file, index, dtype, 0, _total_rows)
+                // Optimized scattered read for variable-length types
+                self.read_variable_column_scattered(file, index, dtype, row_indices)
             }
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Unsupported type for scattered read")),
         }
@@ -1263,23 +1433,17 @@ impl OnDemandStorage {
             }
             for (name, values) in string_columns {
                 if let Some(idx) = schema.get_index(&name) {
-                    for v in &values {
-                        columns[idx].push_string(v);
-                    }
+                    columns[idx].extend_strings(&values);
                 }
             }
             for (name, values) in binary_columns {
                 if let Some(idx) = schema.get_index(&name) {
-                    for v in &values {
-                        columns[idx].push_bytes(v);
-                    }
+                    columns[idx].extend_bytes(&values);
                 }
             }
             for (name, values) in bool_columns {
                 if let Some(idx) = schema.get_index(&name) {
-                    for v in values {
-                        columns[idx].push_bool(v);
-                    }
+                    columns[idx].extend_bools(&values);
                 }
             }
         }
@@ -1292,13 +1456,15 @@ impl OnDemandStorage {
             header.modified_at = chrono::Utc::now().timestamp();
         }
         
-        // Update id_to_idx mapping
+        // Update id_to_idx mapping only if it's already built
         {
             let ids_guard = self.ids.read();
             let mut id_to_idx = self.id_to_idx.write();
-            let start_idx = ids_guard.len() - ids.len();
-            for (i, &id) in ids.iter().enumerate() {
-                id_to_idx.insert(id, start_idx + i);
+            if let Some(map) = id_to_idx.as_mut() {
+                let start_idx = ids_guard.len() - ids.len();
+                for (i, &id) in ids.iter().enumerate() {
+                    map.insert(id, start_idx + i);
+                }
             }
         }
         
@@ -1461,13 +1627,15 @@ impl OnDemandStorage {
             header.modified_at = chrono::Utc::now().timestamp();
         }
         
-        // Update id_to_idx mapping
+        // Update id_to_idx mapping only if it's already built
         {
             let ids_guard = self.ids.read();
             let mut id_to_idx = self.id_to_idx.write();
-            let start_idx = ids_guard.len() - ids.len();
-            for (i, &id) in ids.iter().enumerate() {
-                id_to_idx.insert(id, start_idx + i);
+            if let Some(map) = id_to_idx.as_mut() {
+                let start_idx = ids_guard.len() - ids.len();
+                for (i, &id) in ids.iter().enumerate() {
+                    map.insert(id, start_idx + i);
+                }
             }
         }
         
@@ -1488,8 +1656,11 @@ impl OnDemandStorage {
     /// Delete a row by ID (soft delete)
     /// Returns true if the row was found and deleted
     pub fn delete(&self, id: u64) -> bool {
+        self.ensure_id_index();
         let id_to_idx = self.id_to_idx.read();
-        if let Some(&row_idx) = id_to_idx.get(&id) {
+        let map = id_to_idx.as_ref().unwrap();
+        if let Some(&row_idx) = map.get(&id) {
+            drop(id_to_idx);  // Release read lock before write
             let mut deleted = self.deleted.write();
             let byte_idx = row_idx / 8;
             let bit_idx = row_idx % 8;
@@ -1510,12 +1681,14 @@ impl OnDemandStorage {
     /// Delete multiple rows by IDs (soft delete)
     /// Returns true if all rows were found and deleted
     pub fn delete_batch(&self, ids: &[u64]) -> bool {
+        self.ensure_id_index();
         let id_to_idx = self.id_to_idx.read();
+        let map = id_to_idx.as_ref().unwrap();
         let mut deleted = self.deleted.write();
         let mut all_found = true;
         
         for &id in ids {
-            if let Some(&row_idx) = id_to_idx.get(&id) {
+            if let Some(&row_idx) = map.get(&id) {
                 let byte_idx = row_idx / 8;
                 let bit_idx = row_idx % 8;
                 
@@ -1547,8 +1720,10 @@ impl OnDemandStorage {
 
     /// Check if an ID exists and is not deleted
     pub fn exists(&self, id: u64) -> bool {
+        self.ensure_id_index();
         let id_to_idx = self.id_to_idx.read();
-        if let Some(&row_idx) = id_to_idx.get(&id) {
+        let map = id_to_idx.as_ref().unwrap();
+        if let Some(&row_idx) = map.get(&id) {
             !self.is_deleted(row_idx)
         } else {
             false
@@ -1557,8 +1732,10 @@ impl OnDemandStorage {
 
     /// Get row index for an ID (None if not found or deleted)
     pub fn get_row_idx(&self, id: u64) -> Option<usize> {
+        self.ensure_id_index();
         let id_to_idx = self.id_to_idx.read();
-        if let Some(&row_idx) = id_to_idx.get(&id) {
+        let map = id_to_idx.as_ref().unwrap();
+        if let Some(&row_idx) = map.get(&id) {
             if !self.is_deleted(row_idx) {
                 Some(row_idx)
             } else {
@@ -1800,12 +1977,14 @@ impl OnDemandStorage {
             header.column_count = self.schema.read().column_count() as u32;
         }
         
-        // Update id_to_idx mapping
+        // Update id_to_idx mapping only if it's already built
         {
             let ids_guard = self.ids.read();
             let mut id_to_idx = self.id_to_idx.write();
-            let row_idx = ids_guard.len() - 1;
-            id_to_idx.insert(id, row_idx);
+            if let Some(map) = id_to_idx.as_mut() {
+                let row_idx = ids_guard.len() - 1;
+                map.insert(id, row_idx);
+            }
         }
         
         // Extend deleted bitmap
@@ -1838,16 +2017,24 @@ impl OnDemandStorage {
         let nulls = self.nulls.read();
         let deleted = self.deleted.read();
 
-        // Filter out deleted rows - get indices of non-deleted rows
-        let active_indices: Vec<usize> = (0..ids.len())
-            .filter(|&i| {
-                let byte_idx = i / 8;
-                let bit_idx = i % 8;
-                byte_idx >= deleted.len() || (deleted[byte_idx] >> bit_idx) & 1 == 0
-            })
-            .collect();
+        // Check if there are any deleted rows (optimization: skip filtering if none)
+        let has_deleted = deleted.iter().any(|&b| b != 0);
         
-        let active_ids: Vec<u64> = active_indices.iter().map(|&i| ids[i]).collect();
+        // Filter out deleted rows - get indices of non-deleted rows
+        let (active_indices, active_ids): (Option<Vec<usize>>, Vec<u64>) = if has_deleted {
+            let indices: Vec<usize> = (0..ids.len())
+                .filter(|&i| {
+                    let byte_idx = i / 8;
+                    let bit_idx = i % 8;
+                    byte_idx >= deleted.len() || (deleted[byte_idx] >> bit_idx) & 1 == 0
+                })
+                .collect();
+            let filtered_ids: Vec<u64> = indices.iter().map(|&i| ids[i]).collect();
+            (Some(indices), filtered_ids)
+        } else {
+            // No deleted rows - use all IDs directly (avoid copying)
+            (None, ids.clone())
+        };
 
         // Serialize schema
         let schema_bytes = schema.to_bytes();
@@ -1862,14 +2049,21 @@ impl OnDemandStorage {
         let mut column_index_entries = Vec::with_capacity(schema.column_count());
 
         // Pre-compute filtered column data for accurate size calculation
-        let mut filtered_columns: Vec<ColumnData> = Vec::with_capacity(schema.column_count());
-        for col_idx in 0..schema.column_count() {
-            if col_idx < columns.len() {
-                filtered_columns.push(columns[col_idx].filter_by_indices(&active_indices));
-            } else {
-                filtered_columns.push(ColumnData::new(ColumnType::Int64));
+        // Optimization: skip filtering if no rows were deleted
+        let filtered_columns: Vec<ColumnData> = if let Some(ref indices) = active_indices {
+            let mut cols = Vec::with_capacity(schema.column_count());
+            for col_idx in 0..schema.column_count() {
+                if col_idx < columns.len() {
+                    cols.push(columns[col_idx].filter_by_indices(indices));
+                } else {
+                    cols.push(ColumnData::new(ColumnType::Int64));
+                }
             }
-        }
+            cols
+        } else {
+            // No filtering needed - clone columns directly
+            columns.iter().cloned().collect()
+        };
 
         for (col_idx, _col_def) in schema.columns.iter().enumerate() {
             let expected_null_len = (active_ids.len() + 7) / 8;
@@ -1984,6 +2178,7 @@ impl OnDemandStorage {
     // ========================================================================
 
     /// Insert rows using generic value type (compatibility with ColumnarStorage)
+    /// Optimized with single-pass column collection
     pub fn insert_rows(&self, rows: &[HashMap<String, ColumnValue>]) -> io::Result<Vec<u64>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -2005,13 +2200,15 @@ impl OnDemandStorage {
                 header.row_count = self.ids.read().len() as u64;
             }
             
-            // Update id_to_idx mapping
+            // Update id_to_idx mapping only if it's already built
             {
                 let ids_guard = self.ids.read();
                 let mut id_to_idx = self.id_to_idx.write();
-                let start_idx = ids_guard.len() - ids.len();
-                for (i, &id) in ids.iter().enumerate() {
-                    id_to_idx.insert(id, start_idx + i);
+                if let Some(map) = id_to_idx.as_mut() {
+                    let start_idx = ids_guard.len() - ids.len();
+                    for (i, &id) in ids.iter().enumerate() {
+                        map.insert(id, start_idx + i);
+                    }
                 }
             }
             
@@ -2025,79 +2222,84 @@ impl OnDemandStorage {
             return Ok(ids);
         }
 
-        // Collect column data by type
+        // Single-pass optimized: determine column types from first non-empty row
+        // and pre-allocate all vectors
+        let num_rows = rows.len();
         let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
         let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
         let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
         let mut binary_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
 
-        // First pass: determine column types from ALL rows (not just first)
-        // This handles heterogeneous schemas where different rows have different columns
-        for row in rows {
+        // Determine schema from first few rows (most data is homogeneous)
+        let sample_size = std::cmp::min(10, num_rows);
+        for row in rows.iter().take(sample_size) {
             for (key, val) in row {
-                // Skip if column already registered
                 if int_columns.contains_key(key) || float_columns.contains_key(key) 
                     || string_columns.contains_key(key) || binary_columns.contains_key(key)
                     || bool_columns.contains_key(key) {
                     continue;
                 }
                 match val {
-                    ColumnValue::Int64(_) => { int_columns.insert(key.clone(), Vec::with_capacity(rows.len())); }
-                    ColumnValue::Float64(_) => { float_columns.insert(key.clone(), Vec::with_capacity(rows.len())); }
-                    ColumnValue::String(_) => { string_columns.insert(key.clone(), Vec::with_capacity(rows.len())); }
-                    ColumnValue::Binary(_) => { binary_columns.insert(key.clone(), Vec::with_capacity(rows.len())); }
-                    ColumnValue::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(rows.len())); }
-                    ColumnValue::Null => {
-                        // Store NULL as a string column with special marker
-                        string_columns.insert(key.clone(), Vec::with_capacity(rows.len()));
-                    }
+                    ColumnValue::Int64(_) => { int_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValue::Float64(_) => { float_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValue::String(_) => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValue::Binary(_) => { binary_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValue::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValue::Null => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                 }
             }
         }
 
-        // Second pass: collect values, ensuring all columns have same length
-        // For each row, add value if present or default if missing
+        // Single pass: collect all values
         for row in rows {
-            // Process int columns
+            // Handle new columns discovered mid-stream (rare case)
+            for (key, val) in row {
+                if !int_columns.contains_key(key) && !float_columns.contains_key(key) 
+                    && !string_columns.contains_key(key) && !binary_columns.contains_key(key)
+                    && !bool_columns.contains_key(key) {
+                    match val {
+                        ColumnValue::Int64(_) => { int_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValue::Float64(_) => { float_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValue::String(_) => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValue::Binary(_) => { binary_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValue::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValue::Null => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    }
+                }
+            }
+            
+            // Collect values for all columns
             for (key, col) in int_columns.iter_mut() {
-                if let Some(ColumnValue::Int64(v)) = row.get(key) {
-                    col.push(*v);
-                } else {
-                    col.push(0); // Default for missing int
-                }
+                col.push(match row.get(key) {
+                    Some(ColumnValue::Int64(v)) => *v,
+                    _ => 0,
+                });
             }
-            // Process float columns
             for (key, col) in float_columns.iter_mut() {
-                if let Some(ColumnValue::Float64(v)) = row.get(key) {
-                    col.push(*v);
-                } else {
-                    col.push(0.0); // Default for missing float
-                }
+                col.push(match row.get(key) {
+                    Some(ColumnValue::Float64(v)) => *v,
+                    _ => 0.0,
+                });
             }
-            // Process string columns
             for (key, col) in string_columns.iter_mut() {
-                match row.get(key) {
-                    Some(ColumnValue::String(v)) => col.push(v.clone()),
-                    Some(ColumnValue::Null) => col.push("\x00__NULL__\x00".to_string()), // Special NULL marker
-                    _ => col.push(String::new()), // Default for missing string
-                }
+                col.push(match row.get(key) {
+                    Some(ColumnValue::String(v)) => v.clone(),
+                    Some(ColumnValue::Null) => "\x00__NULL__\x00".to_string(),
+                    _ => String::new(),
+                });
             }
-            // Process binary columns
             for (key, col) in binary_columns.iter_mut() {
-                if let Some(ColumnValue::Binary(v)) = row.get(key) {
-                    col.push(v.clone());
-                } else {
-                    col.push(Vec::new()); // Default for missing binary
-                }
+                col.push(match row.get(key) {
+                    Some(ColumnValue::Binary(v)) => v.clone(),
+                    _ => Vec::new(),
+                });
             }
-            // Process bool columns
             for (key, col) in bool_columns.iter_mut() {
-                if let Some(ColumnValue::Bool(v)) = row.get(key) {
-                    col.push(*v);
-                } else {
-                    col.push(false); // Default for missing bool
-                }
+                col.push(match row.get(key) {
+                    Some(ColumnValue::Bool(v)) => *v,
+                    _ => false,
+                });
             }
         }
 

@@ -16,7 +16,7 @@ use arrow::compute::{self, SortOptions};
 use arrow::compute::kernels::cmp;
 use arrow::compute::kernels::numeric as arith;
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-use std::collections::HashMap;
+use ahash::AHashMap;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,6 +27,8 @@ use crate::query::sql_parser::FromItem;
 use crate::storage::TableStorageBackend;
 use crate::data::{DataType, Value};
 use std::collections::HashSet;
+use ahash::AHasher;
+use std::hash::{Hash, Hasher};
 
 /// V3 Native Query Executor
 /// 
@@ -138,9 +140,7 @@ impl ApexExecutor {
         base_dir: &Path,
         default_table_path: &Path,
     ) -> io::Result<ApexResult> {
-        use std::collections::HashMap;
-
-        let mut views: HashMap<String, SelectStatement> = HashMap::new();
+        let mut views: AHashMap<String, SelectStatement> = AHashMap::new();
         let mut last_result: Option<ApexResult> = None;
 
         for stmt in stmts {
@@ -176,7 +176,7 @@ impl ApexExecutor {
         last_result.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No query to execute"))
     }
 
-    fn rewrite_select_views(mut select: SelectStatement, views: &std::collections::HashMap<String, SelectStatement>) -> SelectStatement {
+    fn rewrite_select_views(mut select: SelectStatement, views: &AHashMap<String, SelectStatement>) -> SelectStatement {
         if let Some(from) = &select.from {
             match from {
                 FromItem::Table { table, alias } => {
@@ -215,6 +215,7 @@ impl ApexExecutor {
                     let backend = TableStorageBackend::open(storage_path)?;
                     
                     // Check if any SELECT column contains a scalar subquery
+                    // Scalar subqueries may reference arbitrary columns, so read all
                     let has_scalar_subquery = stmt.columns.iter().any(|col| {
                         if let SelectColumn::Expression { expr, .. } = col {
                             Self::expr_contains_scalar_subquery(expr)
@@ -223,12 +224,12 @@ impl ApexExecutor {
                         }
                     });
                     
-                    // Read all columns when there's a WHERE clause or scalar subquery
-                    // This ensures all referenced columns are available
-                    if stmt.where_clause.is_some() || has_scalar_subquery {
+                    if has_scalar_subquery {
+                        // Scalar subqueries need all columns for correlated references
                         backend.read_columns_to_arrow(None, 0, None)?
                     } else {
-                        // No WHERE clause or scalar subquery - use optimized column reading
+                        // Optimized column projection: only read columns needed by
+                        // SELECT, WHERE, ORDER BY, GROUP BY, and HAVING clauses
                         let required_cols = stmt.required_columns();
                         let col_refs: Option<Vec<&str>> = required_cols
                             .as_ref()
@@ -504,51 +505,167 @@ impl ApexExecutor {
                 format!("Right join key '{}' not found", right_key),
             ))?;
 
-        // Build hash table from right side (smaller table ideally)
-        let mut hash_table: HashMap<u64, Vec<usize>> = HashMap::new();
-        for i in 0..right.num_rows() {
-            let hash = Self::hash_array_value(right_key_col, i);
-            hash_table.entry(hash).or_default().push(i);
-        }
+        // For INNER JOIN, swap tables if right is larger (build from smaller table)
+        let should_swap = !matches!(join_type, JoinType::Left) && right.num_rows() > left.num_rows() * 2;
+        
+        let (build_batch, probe_batch, build_key_col, probe_key_col, build_key, probe_key, swapped) = if should_swap {
+            (left, right, left_key_col, right_key_col, left_key, right_key, true)
+        } else {
+            (right, left, right_key_col, left_key_col, right_key, left_key, false)
+        };
 
-        // Probe with left side
-        let mut left_indices: Vec<u32> = Vec::new();
-        let mut right_indices: Vec<Option<u32>> = Vec::new();
+        // Build hash table from build side (smaller table for INNER JOIN)
+        let build_rows = build_batch.num_rows();
+        
+        // For Int64 keys, use optimized direct hash building
+        let hash_table: AHashMap<u64, Vec<usize>> = if let Some(build_int_arr) = build_key_col.as_any().downcast_ref::<Int64Array>() {
+            let mut table: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(build_rows);
+            for i in 0..build_rows {
+                if !build_int_arr.is_null(i) {
+                    let val = build_int_arr.value(i);
+                    let hash = {
+                        let mut h = AHasher::default();
+                        val.hash(&mut h);
+                        h.finish()
+                    };
+                    table.entry(hash).or_insert_with(|| Vec::with_capacity(2)).push(i);
+                }
+            }
+            table
+        } else {
+            let mut table: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(build_rows);
+            for i in 0..build_rows {
+                let hash = Self::hash_array_value_fast(build_key_col, i);
+                table.entry(hash).or_insert_with(|| Vec::with_capacity(4)).push(i);
+            }
+            table
+        };
+        
+        let right_rows = right.num_rows();
 
-        for left_idx in 0..left.num_rows() {
-            let left_hash = Self::hash_array_value(left_key_col, left_idx);
+        // Probe phase - use probe_batch (which may be swapped)
+        let probe_rows = probe_batch.num_rows();
+        let is_left_join = matches!(join_type, JoinType::Left);
+        
+        // Check if key columns are Int64 (most common case) - can skip equality check
+        let is_int64_key = probe_key_col.as_any().downcast_ref::<Int64Array>().is_some() 
+            && build_key_col.as_any().downcast_ref::<Int64Array>().is_some();
+
+        // For INNER JOIN with Int64 keys, use optimized path without Option overhead
+        let is_inner_join_fast_path = is_int64_key && (!is_left_join || swapped);
+        
+        // Collect probe_idx -> build_idx mappings
+        let (probe_indices, build_indices_u32, build_indices_opt): (Vec<u32>, Vec<u32>, Vec<Option<u32>>) = 
+        if is_inner_join_fast_path {
+            // Ultra-fast INNER JOIN path with direct u32 vectors - no Option overhead
+            let probe_int_arr = probe_key_col.as_any().downcast_ref::<Int64Array>().unwrap();
             
-            if let Some(right_matches) = hash_table.get(&left_hash) {
-                // Verify actual equality (hash collision check)
-                for &right_idx in right_matches {
-                    if Self::arrays_equal_at(left_key_col, left_idx, right_key_col, right_idx) {
-                        left_indices.push(left_idx as u32);
-                        right_indices.push(Some(right_idx as u32));
+            let est_matches = probe_rows;
+            let mut probe_idx_vec: Vec<u32> = Vec::with_capacity(est_matches);
+            let mut build_idx_vec: Vec<u32> = Vec::with_capacity(est_matches);
+            
+            for probe_idx in 0..probe_rows {
+                let probe_val = probe_int_arr.value(probe_idx);
+                let probe_hash = {
+                    let mut h = AHasher::default();
+                    probe_val.hash(&mut h);
+                    h.finish()
+                };
+                
+                if let Some(build_matches) = hash_table.get(&probe_hash) {
+                    for &build_idx in build_matches {
+                        probe_idx_vec.push(probe_idx as u32);
+                        build_idx_vec.push(build_idx as u32);
                     }
                 }
             }
+            (probe_idx_vec, build_idx_vec, Vec::new())
+        } else if is_int64_key {
+            // LEFT JOIN with Int64 keys - needs Option for NULL handling
+            let probe_int_arr = probe_key_col.as_any().downcast_ref::<Int64Array>().unwrap();
             
-            // For LEFT JOIN, include unmatched left rows
-            if matches!(join_type, JoinType::Left) {
-                let matched = right_indices.iter().rev()
-                    .take_while(|r| r.is_some())
-                    .any(|r| {
-                        if let Some(ri) = r {
-                            left_indices.iter().rev()
-                                .zip(std::iter::repeat(*ri))
-                                .take(1)
-                                .any(|(li, _)| *li == left_idx as u32)
-                        } else {
-                            false
-                        }
-                    });
+            let est_matches = probe_rows;
+            let mut probe_idx_vec: Vec<u32> = Vec::with_capacity(est_matches);
+            let mut build_idx_vec: Vec<Option<u32>> = Vec::with_capacity(est_matches);
+            
+            for probe_idx in 0..probe_rows {
+                let probe_val = probe_int_arr.value(probe_idx);
+                let probe_hash = {
+                    let mut h = AHasher::default();
+                    probe_val.hash(&mut h);
+                    h.finish()
+                };
                 
-                if !matched && !hash_table.contains_key(&left_hash) {
-                    left_indices.push(left_idx as u32);
-                    right_indices.push(None);
+                if let Some(build_matches) = hash_table.get(&probe_hash) {
+                    for &build_idx in build_matches {
+                        probe_idx_vec.push(probe_idx as u32);
+                        build_idx_vec.push(Some(build_idx as u32));
+                    }
+                } else {
+                    probe_idx_vec.push(probe_idx as u32);
+                    build_idx_vec.push(None);
                 }
             }
-        }
+            (probe_idx_vec, Vec::new(), build_idx_vec)
+        } else {
+            let mut probe_idx_vec: Vec<u32> = Vec::with_capacity(probe_rows);
+            let mut build_idx_vec: Vec<Option<u32>> = Vec::with_capacity(probe_rows);
+            
+            if is_left_join && !swapped {
+                for probe_idx in 0..probe_rows {
+                    let probe_hash = Self::hash_array_value_fast(probe_key_col, probe_idx);
+                    let mut found_match = false;
+                    
+                    if let Some(build_matches) = hash_table.get(&probe_hash) {
+                        for &build_idx in build_matches {
+                            if Self::arrays_equal_at(probe_key_col, probe_idx, build_key_col, build_idx) {
+                                probe_idx_vec.push(probe_idx as u32);
+                                build_idx_vec.push(Some(build_idx as u32));
+                                found_match = true;
+                            }
+                        }
+                    }
+                    
+                    if !found_match {
+                        probe_idx_vec.push(probe_idx as u32);
+                        build_idx_vec.push(None);
+                    }
+                }
+            } else {
+                for probe_idx in 0..probe_rows {
+                    let probe_hash = Self::hash_array_value_fast(probe_key_col, probe_idx);
+                    
+                    if let Some(build_matches) = hash_table.get(&probe_hash) {
+                        for &build_idx in build_matches {
+                            if Self::arrays_equal_at(probe_key_col, probe_idx, build_key_col, build_idx) {
+                                probe_idx_vec.push(probe_idx as u32);
+                                build_idx_vec.push(Some(build_idx as u32));
+                            }
+                        }
+                    }
+                }
+            }
+            (probe_idx_vec, Vec::new(), build_idx_vec)
+        };
+        
+        // Convert back to left/right indices based on whether we swapped
+        // For INNER JOIN fast path, use direct u32 indices
+        let (left_indices, right_indices_u32, right_indices_opt): (Vec<u32>, Vec<u32>, Vec<Option<u32>>) = 
+        if is_inner_join_fast_path {
+            if swapped {
+                (build_indices_u32.clone(), probe_indices.clone(), Vec::new())
+            } else {
+                (probe_indices, build_indices_u32, Vec::new())
+            }
+        } else if swapped {
+            (build_indices_opt.iter().map(|x| x.unwrap_or(0)).collect(), 
+             Vec::new(),
+             probe_indices.iter().map(|x| Some(*x)).collect())
+        } else {
+            (probe_indices, Vec::new(), build_indices_opt)
+        };
+        
+        let left_rows = left.num_rows();
 
         // Build result schema (combine left and right, avoiding duplicate key column)
         let mut fields: Vec<Field> = left.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
@@ -567,8 +684,8 @@ impl ApexExecutor {
         // Build result columns
         let mut columns: Vec<ArrayRef> = Vec::new();
 
-        // Take from left
-        let left_indices_array = arrow::array::UInt32Array::from(left_indices.clone());
+        // Take from left - avoid clone by creating array directly
+        let left_indices_array = arrow::array::UInt32Array::from(left_indices);
         for col in left.columns() {
             let taken = compute::take(col.as_ref(), &left_indices_array, None)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -576,11 +693,25 @@ impl ApexExecutor {
         }
 
         // Take from right (excluding join key to avoid duplication)
-        for (col_idx, field) in right.schema().fields().iter().enumerate() {
-            if field.name() != right_key {
-                let right_col = right.column(col_idx);
-                let taken = Self::take_with_nulls(right_col, &right_indices)?;
-                columns.push(taken);
+        // Use direct u32 indices for INNER JOIN fast path (no Option overhead)
+        if is_inner_join_fast_path {
+            let right_indices_array = arrow::array::UInt32Array::from(right_indices_u32);
+            for (col_idx, field) in right.schema().fields().iter().enumerate() {
+                if field.name() != right_key {
+                    let right_col = right.column(col_idx);
+                    let taken = compute::take(right_col.as_ref(), &right_indices_array, None)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    columns.push(taken);
+                }
+            }
+        } else {
+            // LEFT JOIN path - handle nulls with Option indices
+            for (col_idx, field) in right.schema().fields().iter().enumerate() {
+                if field.name() != right_key {
+                    let right_col = right.column(col_idx);
+                    let taken = Self::take_with_nulls(right_col, &right_indices_opt)?;
+                    columns.push(taken);
+                }
             }
         }
 
@@ -588,12 +719,15 @@ impl ApexExecutor {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
-    /// Hash a value at given index in an array
+    /// Hash a value at given index in an array (legacy, uses DefaultHasher)
     fn hash_array_value(array: &ArrayRef, idx: usize) -> u64 {
-        use std::hash::{Hash, Hasher};
-        use std::collections::hash_map::DefaultHasher;
-        
-        let mut hasher = DefaultHasher::new();
+        Self::hash_array_value_fast(array, idx)
+    }
+
+    /// Fast hash using ahash (2-3x faster than DefaultHasher)
+    #[inline]
+    fn hash_array_value_fast(array: &ArrayRef, idx: usize) -> u64 {
+        let mut hasher = AHasher::default();
         
         if array.is_null(idx) {
             0u64.hash(&mut hasher);
@@ -610,6 +744,27 @@ impl ApexExecutor {
         }
         
         hasher.finish()
+    }
+
+    /// Strip table alias prefix from column name (e.g., "o.user_id" -> "user_id")
+    fn strip_table_prefix(col_name: &str) -> &str {
+        if let Some(dot_pos) = col_name.find('.') {
+            &col_name[dot_pos + 1..]
+        } else {
+            col_name
+        }
+    }
+    
+    /// Get column from batch, stripping table prefix if needed
+    fn get_column_by_name<'a>(batch: &'a RecordBatch, col_name: &str) -> Option<&'a ArrayRef> {
+        let clean_name = col_name.trim_matches('"');
+        // Try exact match first
+        if let Some(col) = batch.column_by_name(clean_name) {
+            return Some(col);
+        }
+        // Try without table prefix (e.g., "o.user_id" -> "user_id")
+        let stripped = Self::strip_table_prefix(clean_name);
+        batch.column_by_name(stripped)
     }
 
     /// Check if two array values are equal at given indices
@@ -734,7 +889,7 @@ impl ApexExecutor {
             }
             SqlExpr::IsNull { column, negated } => {
                 let col_name = column.trim_matches('"');
-                let array = batch.column_by_name(col_name)
+                let array = Self::get_column_by_name(batch, col_name)
                     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
                 let null_mask = compute::is_null(array)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -747,7 +902,7 @@ impl ApexExecutor {
             }
             SqlExpr::Between { column, low, high, negated } => {
                 let col_name = column.trim_matches('"');
-                let val = batch.column_by_name(col_name)
+                let val = Self::get_column_by_name(batch, col_name)
                     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
                 let low_val = Self::evaluate_expr_to_array(batch, low)?;
                 let high_val = Self::evaluate_expr_to_array(batch, high)?;
@@ -2299,7 +2454,7 @@ impl ApexExecutor {
         negated: bool,
     ) -> io::Result<BooleanArray> {
         let col_name = column.trim_matches('"');
-        let target = batch.column_by_name(col_name)
+        let target = Self::get_column_by_name(batch, col_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
         let num_rows = batch.num_rows();
         
@@ -2330,7 +2485,7 @@ impl ApexExecutor {
         negated: bool,
     ) -> io::Result<BooleanArray> {
         let col_name = column.trim_matches('"');
-        let array = batch.column_by_name(col_name)
+        let array = Self::get_column_by_name(batch, col_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
         
         let string_array = array
@@ -2367,7 +2522,7 @@ impl ApexExecutor {
         negated: bool,
     ) -> io::Result<BooleanArray> {
         let col_name = column.trim_matches('"');
-        let array = batch.column_by_name(col_name)
+        let array = Self::get_column_by_name(batch, col_name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
         
         let string_array = array
@@ -2816,8 +2971,6 @@ impl ApexExecutor {
 
     /// Execute GROUP BY aggregation query
     fn execute_group_by(batch: &RecordBatch, stmt: &SelectStatement) -> io::Result<ApexResult> {
-        use std::collections::HashMap;
-        
         if stmt.group_by.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "GROUP BY requires at least one column"));
         }
@@ -2832,20 +2985,26 @@ impl ApexExecutor {
             }
         }).collect();
         
-        // Create groups: key -> row indices
-        let mut groups: HashMap<u64, Vec<usize>> = HashMap::new();
+        // Create groups: key -> row indices (using AHashMap for speed)
+        let num_rows = batch.num_rows();
+        let estimated_groups = (num_rows / 10).max(16); // Estimate ~10 rows per group
+        let mut groups: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(estimated_groups);
         
-        for row_idx in 0..batch.num_rows() {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            for col_name in &group_cols {
-                if let Some(col) = batch.column_by_name(col_name) {
-                    use std::hash::Hasher;
-                    hasher.write_u64(Self::hash_array_value(col, row_idx));
+        // Pre-fetch column references to avoid repeated lookups
+        let group_col_refs: Vec<Option<&ArrayRef>> = group_cols.iter()
+            .map(|col_name| batch.column_by_name(col_name))
+            .collect();
+        
+        // Build groups sequentially (parallel overhead not worth it for typical GROUP BY sizes)
+        for row_idx in 0..num_rows {
+            let mut hasher = AHasher::default();
+            for col_opt in &group_col_refs {
+                if let Some(col) = col_opt {
+                    hasher.write_u64(Self::hash_array_value_fast(col, row_idx));
                 }
             }
-            use std::hash::Hasher;
             let key = hasher.finish();
-            groups.entry(key).or_insert_with(Vec::new).push(row_idx);
+            groups.entry(key).or_insert_with(|| Vec::with_capacity(16)).push(row_idx);
         }
 
         // Build result arrays
@@ -3353,7 +3512,7 @@ impl ApexExecutor {
         }
     }
 
-    /// Compute aggregate for each group
+    /// Compute aggregate for each group (parallelized for large datasets)
     fn compute_aggregate_for_groups(
         batch: &RecordBatch,
         func: &crate::query::AggregateFunc,
@@ -3363,7 +3522,8 @@ impl ApexExecutor {
         distinct: bool,
     ) -> io::Result<(Field, ArrayRef)> {
         use crate::query::AggregateFunc;
-        use std::collections::HashSet;
+        use ahash::AHashSet;
+        use rayon::prelude::*;
         
         let func_name = match func {
             AggregateFunc::Count => "COUNT",
@@ -3389,39 +3549,76 @@ impl ApexExecutor {
 
         match func {
             AggregateFunc::Count => {
+                let use_parallel = group_indices.len() > 100;
                 let counts: Vec<i64> = if let Some(col_name) = &actual_column {
                     if col_name == "*" || col_name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-                        group_indices.iter().map(|g| g.len() as i64).collect()
+                        if use_parallel {
+                            group_indices.par_iter().map(|g| g.len() as i64).collect()
+                        } else {
+                            group_indices.iter().map(|g| g.len() as i64).collect()
+                        }
                     } else if let Some(array) = batch.column_by_name(col_name) {
                         if distinct {
                             // COUNT(DISTINCT column) - count unique values per group
                             if let Some(int_arr) = array.as_any().downcast_ref::<Int64Array>() {
-                                group_indices.iter().map(|g| {
-                                    let unique: HashSet<i64> = g.iter()
-                                        .filter(|&&i| !int_arr.is_null(i))
-                                        .map(|&i| int_arr.value(i))
-                                        .collect();
-                                    unique.len() as i64
-                                }).collect()
+                                if use_parallel {
+                                    group_indices.par_iter().map(|g| {
+                                        let unique: AHashSet<i64> = g.iter()
+                                            .filter(|&&i| !int_arr.is_null(i))
+                                            .map(|&i| int_arr.value(i))
+                                            .collect();
+                                        unique.len() as i64
+                                    }).collect()
+                                } else {
+                                    group_indices.iter().map(|g| {
+                                        let unique: AHashSet<i64> = g.iter()
+                                            .filter(|&&i| !int_arr.is_null(i))
+                                            .map(|&i| int_arr.value(i))
+                                            .collect();
+                                        unique.len() as i64
+                                    }).collect()
+                                }
                             } else if let Some(str_arr) = array.as_any().downcast_ref::<StringArray>() {
-                                group_indices.iter().map(|g| {
-                                    let unique: HashSet<&str> = g.iter()
-                                        .filter(|&&i| !str_arr.is_null(i))
-                                        .map(|&i| str_arr.value(i))
-                                        .collect();
-                                    unique.len() as i64
-                                }).collect()
+                                if use_parallel {
+                                    group_indices.par_iter().map(|g| {
+                                        let unique: AHashSet<&str> = g.iter()
+                                            .filter(|&&i| !str_arr.is_null(i))
+                                            .map(|&i| str_arr.value(i))
+                                            .collect();
+                                        unique.len() as i64
+                                    }).collect()
+                                } else {
+                                    group_indices.iter().map(|g| {
+                                        let unique: AHashSet<&str> = g.iter()
+                                            .filter(|&&i| !str_arr.is_null(i))
+                                            .map(|&i| str_arr.value(i))
+                                            .collect();
+                                        unique.len() as i64
+                                    }).collect()
+                                }
+                            } else {
+                                if use_parallel {
+                                    group_indices.par_iter().map(|g| g.iter().filter(|&&i| !array.is_null(i)).count() as i64).collect()
+                                } else {
+                                    group_indices.iter().map(|g| g.iter().filter(|&&i| !array.is_null(i)).count() as i64).collect()
+                                }
+                            }
+                        } else {
+                            if use_parallel {
+                                group_indices.par_iter().map(|g| g.iter().filter(|&&i| !array.is_null(i)).count() as i64).collect()
                             } else {
                                 group_indices.iter().map(|g| g.iter().filter(|&&i| !array.is_null(i)).count() as i64).collect()
                             }
-                        } else {
-                            group_indices.iter().map(|g| g.iter().filter(|&&i| !array.is_null(i)).count() as i64).collect()
                         }
                     } else {
                         vec![0; group_indices.len()]
                     }
                 } else {
-                    group_indices.iter().map(|g| g.len() as i64).collect()
+                    if use_parallel {
+                        group_indices.par_iter().map(|g| g.len() as i64).collect()
+                    } else {
+                        group_indices.iter().map(|g| g.len() as i64).collect()
+                    }
                 };
                 Ok((Field::new(&output_name, ArrowDataType::Int64, false), Arc::new(Int64Array::from(counts))))
             }
@@ -3430,14 +3627,27 @@ impl ApexExecutor {
                 let array = batch.column_by_name(col_name).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
                 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
-                    let sums: Vec<i64> = group_indices.iter().map(|g| {
-                        g.iter().filter_map(|&i| if int_array.is_null(i) { None } else { Some(int_array.value(i)) }).sum()
-                    }).collect();
+                    // Use parallel iteration for large group counts
+                    let sums: Vec<i64> = if group_indices.len() > 100 {
+                        group_indices.par_iter().map(|g| {
+                            g.iter().filter_map(|&i| if int_array.is_null(i) { None } else { Some(int_array.value(i)) }).sum()
+                        }).collect()
+                    } else {
+                        group_indices.iter().map(|g| {
+                            g.iter().filter_map(|&i| if int_array.is_null(i) { None } else { Some(int_array.value(i)) }).sum()
+                        }).collect()
+                    };
                     Ok((Field::new(&output_name, ArrowDataType::Int64, false), Arc::new(Int64Array::from(sums))))
                 } else if let Some(float_array) = array.as_any().downcast_ref::<Float64Array>() {
-                    let sums: Vec<f64> = group_indices.iter().map(|g| {
-                        g.iter().filter_map(|&i| if float_array.is_null(i) { None } else { Some(float_array.value(i)) }).sum()
-                    }).collect();
+                    let sums: Vec<f64> = if group_indices.len() > 100 {
+                        group_indices.par_iter().map(|g| {
+                            g.iter().filter_map(|&i| if float_array.is_null(i) { None } else { Some(float_array.value(i)) }).sum()
+                        }).collect()
+                    } else {
+                        group_indices.iter().map(|g| {
+                            g.iter().filter_map(|&i| if float_array.is_null(i) { None } else { Some(float_array.value(i)) }).sum()
+                        }).collect()
+                    };
                     Ok((Field::new(&output_name, ArrowDataType::Float64, false), Arc::new(Float64Array::from(sums))))
                 } else {
                     Err(io::Error::new(io::ErrorKind::InvalidData, "SUM requires numeric column"))
@@ -3658,20 +3868,24 @@ impl ApexExecutor {
 
         let (func_name, func_args, partition_by, order_by, _) = &window_specs[0];
 
-        // Group rows by partition key
-        let mut groups: HashMap<u64, Vec<usize>> = HashMap::new();
+        // Group rows by partition key (using AHashMap for speed)
+        let num_rows = batch.num_rows();
+        let mut groups: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(num_rows / 10 + 1);
         
-        for row_idx in 0..batch.num_rows() {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            for col_name in partition_by {
-                if let Some(col) = batch.column_by_name(col_name.trim_matches('"')) {
-                    use std::hash::Hasher;
-                    hasher.write_u64(Self::hash_array_value(col, row_idx));
+        // Pre-fetch partition column references
+        let partition_col_refs: Vec<Option<&ArrayRef>> = partition_by.iter()
+            .map(|col_name| batch.column_by_name(col_name.trim_matches('"')))
+            .collect();
+        
+        for row_idx in 0..num_rows {
+            let mut hasher = AHasher::default();
+            for col_opt in &partition_col_refs {
+                if let Some(col) = col_opt {
+                    hasher.write_u64(Self::hash_array_value_fast(col, row_idx));
                 }
             }
-            use std::hash::Hasher;
             let key = hasher.finish();
-            groups.entry(key).or_insert_with(Vec::new).push(row_idx);
+            groups.entry(key).or_insert_with(|| Vec::with_capacity(16)).push(row_idx);
         }
 
         // Build window function result array
