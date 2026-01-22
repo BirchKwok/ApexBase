@@ -12,8 +12,8 @@ from pathlib import Path
 import numpy as np
 import re
 
-# Import Rust core (V3Storage only - ApexStorage is deprecated)
-from apexbase._core import V3Storage, __version__ as _core_version
+# Import Rust core
+from apexbase._core import ApexStorage, __version__ as _core_version
 
 # FTS is now directly implemented in Rust layer, no need for Python nanofts package
 # But keep compatibility flag
@@ -1705,12 +1705,9 @@ class _LegacyApexClient:
         return f"ApexClient(path='{self._dirpath}', table='{self._current_table}')"
 
 
-# Import V3Client and make it the default ApexClient
-from .v3_client import V3Client
-
-# V3Client is now the default ApexClient
-ApexClient = V3Client
+# Import ApexClient from client module
+from .client import ApexClient
 
 # Exports
-__all__ = ['ApexClient', 'V3Client', 'V3Storage', 'ResultView', 'DurabilityLevel', '__version__', 'FTS_AVAILABLE', 'ARROW_AVAILABLE', 'POLARS_AVAILABLE']
+__all__ = ['ApexClient', 'ApexStorage', 'ResultView', 'DurabilityLevel', '__version__', 'FTS_AVAILABLE', 'ARROW_AVAILABLE', 'POLARS_AVAILABLE']
 

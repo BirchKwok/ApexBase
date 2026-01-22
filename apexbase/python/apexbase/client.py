@@ -1,8 +1,7 @@
 """
-V3Client - ApexClient-compatible wrapper for V3Storage
+ApexClient - High-performance embedded database client
 
-This module provides a V3Client class that wraps V3Storage with the same API
-as ApexClient, allowing existing tests to run with the V3 on-demand storage engine.
+This module provides the ApexClient class that wraps ApexStorage with on-demand storage engine.
 """
 
 import os
@@ -18,7 +17,7 @@ from typing import List, Dict, Union, Optional, Literal
 from pathlib import Path
 import numpy as np
 
-from apexbase._core import V3Storage
+from apexbase._core import ApexStorage
 from . import ResultView, _empty_result_view, _registry, DurabilityLevel
 
 import pyarrow as pa
@@ -29,12 +28,11 @@ ARROW_AVAILABLE = True
 POLARS_AVAILABLE = True
 
 
-class V3Client:
+class ApexClient:
     """
-    V3Client - ApexClient-compatible wrapper for V3Storage
+    ApexClient - High-performance embedded database client
     
-    Uses V3 on-demand storage format (.apex) for persistence.
-    Provides the same API as ApexClient for compatibility.
+    Uses on-demand storage format (.apex) for persistence.
     """
     
     def __init__(
@@ -69,7 +67,7 @@ class V3Client:
         self._durability = durability
         
         # Initialize V3 storage engine
-        self._storage = V3Storage(str(self._db_path), drop_if_exists=drop_if_exists)
+        self._storage = ApexStorage(str(self._db_path), drop_if_exists=drop_if_exists)
         self._connected = True
         self._lock = threading.RLock()
         
@@ -101,7 +99,7 @@ class V3Client:
     
     def _check_connection(self):
         if self._is_closed or self._storage is None:
-            raise RuntimeError("V3Client connection has been closed, cannot perform operations.")
+            raise RuntimeError("ApexClient connection has been closed, cannot perform operations.")
 
     # ============ Table Management ============
 
@@ -152,7 +150,7 @@ class V3Client:
         index_fields: Optional[List[str]] = None,
         lazy_load: bool = False,
         cache_size: int = 10000
-    ) -> 'V3Client':
+    ) -> 'ApexClient':
         self._check_connection()
         
         table = table_name or self._current_table
@@ -304,7 +302,7 @@ class V3Client:
             if show_internal_id is None:
                 show_internal_id = self._should_show_internal_id(sql)
             
-            # V3Storage.execute returns a dict with columns and rows
+            # ApexStorage.execute returns a dict with columns and rows
             result = self._storage.execute(sql)
             
             if result is None:
@@ -504,17 +502,17 @@ class V3Client:
 
     # ============ DataFrame Import ============
 
-    def from_pandas(self, df) -> 'V3Client':
+    def from_pandas(self, df) -> 'ApexClient':
         records = df.to_dict('records')
         self.store(records)
         return self
 
-    def from_pyarrow(self, table) -> 'V3Client':
+    def from_pyarrow(self, table) -> 'ApexClient':
         records = table.to_pylist()
         self.store(records)
         return self
 
-    def from_polars(self, df) -> 'V3Client':
+    def from_polars(self, df) -> 'ApexClient':
         records = df.to_dicts()
         self.store(records)
         return self
@@ -523,7 +521,7 @@ class V3Client:
 
     def optimize(self):
         self._check_connection()
-        # V3Storage doesn't have optimize, just flush
+        # ApexStorage doesn't have optimize, just flush
         self.flush()
 
     def count_rows(self, table_name: str = None) -> int:
@@ -622,7 +620,7 @@ class V3Client:
 
     def set_fts_fuzzy_config(self, threshold: float = 0.7, max_distance: int = 2, 
                              max_candidates: int = 20, table_name: str = None):
-        pass  # V3Storage doesn't expose this yet
+        pass  # ApexStorage doesn't expose this yet
 
     def get_fts_stats(self, table_name: str = None) -> Dict:
         table = table_name or self._current_table
@@ -641,10 +639,10 @@ class V3Client:
         return {'fts_enabled': True, 'engine_initialized': False, 'table': table}
 
     def compact_fts_index(self, table_name: str = None):
-        pass  # V3Storage doesn't expose this yet
+        pass  # ApexStorage doesn't expose this yet
 
     def warmup_fts_terms(self, terms: List[str], table_name: str = None) -> int:
-        return 0  # V3Storage doesn't expose this yet
+        return 0  # ApexStorage doesn't expose this yet
 
     # ============ Lifecycle ============
 

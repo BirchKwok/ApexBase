@@ -6,7 +6,7 @@
 use crate::data::Value;
 use crate::storage::{TableStorageBackend, StorageManager};
 use crate::storage::on_demand::ColumnValue;
-use crate::query::{V3Executor, V3Result, SqlParser};
+use crate::query::{ApexExecutor, ApexResult, SqlParser};
 use crate::fts::FtsManager;
 use crate::fts::FtsConfig;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
@@ -123,9 +123,9 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
 /// - On-demand column reading (only loads requested columns)
 /// - On-demand row range reading (only loads requested rows)
 /// - Soft delete with deleted bitmap
-/// - Full SQL query support via V3Executor
-#[pyclass(name = "V3Storage")]
-pub struct V3StorageImpl {
+/// - Full SQL query support via ApexExecutor
+#[pyclass(name = "ApexStorage")]
+pub struct ApexStorageImpl {
     /// Base directory path
     base_dir: PathBuf,
     /// Table paths (table_name -> path)
@@ -139,7 +139,7 @@ pub struct V3StorageImpl {
 }
 
 #[pymethods]
-impl V3StorageImpl {
+impl ApexStorageImpl {
     /// Create or open a V3 storage
     ///
     /// Parameters:
@@ -401,8 +401,8 @@ impl V3StorageImpl {
         let base_dir = self.base_dir.clone();
 
         let (columns, rows) = py.allow_threads(|| -> PyResult<(Vec<String>, Vec<Vec<Value>>)> {
-            // Execute using V3Executor
-            let result = V3Executor::execute_with_base_dir(&sql, &base_dir, &table_path)
+            // Execute using ApexExecutor
+            let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             
             let batch = result.to_record_batch()
@@ -559,7 +559,7 @@ impl V3StorageImpl {
             
             // Query for this specific ID
             let sql = format!("SELECT * FROM data WHERE _id = {}", id);
-            let result = V3Executor::execute(&sql, &table_path)
+            let result = ApexExecutor::execute(&sql, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             
             let batch = result.to_record_batch()
@@ -605,7 +605,7 @@ impl V3StorageImpl {
         
         let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
             let sql = format!("SELECT * FROM data WHERE _id IN ({})", ids_str);
-            let result = V3Executor::execute(&sql, &table_path)
+            let result = ApexExecutor::execute(&sql, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             
             let batch = result.to_record_batch()
@@ -642,7 +642,7 @@ impl V3StorageImpl {
         
         let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
             let sql = "SELECT * FROM data";
-            let result = V3Executor::execute(sql, &table_path)
+            let result = ApexExecutor::execute(sql, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             
             let batch = result.to_record_batch()
@@ -685,7 +685,7 @@ impl V3StorageImpl {
                 format!("SELECT * FROM data WHERE {}", where_clause)
             };
             
-            let result = V3Executor::execute(&sql, &table_path)
+            let result = ApexExecutor::execute(&sql, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             
             let batch = result.to_record_batch()

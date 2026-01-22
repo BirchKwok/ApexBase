@@ -1,7 +1,7 @@
 //! Python bindings via PyO3
 //!
-//! V3Storage is the only storage implementation (on-demand reading without ColumnTable)
+//! ApexStorage is the storage implementation using on-demand reading.
 
-mod v3_bindings;
+mod bindings;
 
-pub use v3_bindings::V3StorageImpl as V3Storage;
+pub use bindings::ApexStorageImpl as ApexStorage;

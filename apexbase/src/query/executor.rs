@@ -32,10 +32,10 @@ use std::collections::HashSet;
 /// 
 /// Executes SQL queries directly on V3 storage using Arrow compute kernels.
 /// This replaces the ColumnTable-based execution path.
-pub struct V3Executor;
+pub struct ApexExecutor;
 
 /// Query execution result
-pub enum V3Result {
+pub enum ApexResult {
     /// Query returned data rows
     Data(RecordBatch),
     /// Query returned empty result
@@ -44,12 +44,12 @@ pub enum V3Result {
     Scalar(i64),
 }
 
-impl V3Result {
+impl ApexResult {
     pub fn to_record_batch(self) -> io::Result<RecordBatch> {
         match self {
-            V3Result::Data(batch) => Ok(batch),
-            V3Result::Empty(schema) => Ok(RecordBatch::new_empty(schema)),
-            V3Result::Scalar(val) => {
+            ApexResult::Data(batch) => Ok(batch),
+            ApexResult::Empty(schema) => Ok(RecordBatch::new_empty(schema)),
+            ApexResult::Scalar(val) => {
                 let schema = Arc::new(Schema::new(vec![
                     Field::new("result", ArrowDataType::Int64, false),
                 ]));
@@ -62,16 +62,16 @@ impl V3Result {
 
     pub fn num_rows(&self) -> usize {
         match self {
-            V3Result::Data(batch) => batch.num_rows(),
-            V3Result::Empty(_) => 0,
-            V3Result::Scalar(_) => 1,
+            ApexResult::Data(batch) => batch.num_rows(),
+            ApexResult::Empty(_) => 0,
+            ApexResult::Scalar(_) => 1,
         }
     }
 }
 
-impl V3Executor {
+impl ApexExecutor {
     /// Execute a SQL query on V3 storage (single table)
-    pub fn execute(sql: &str, storage_path: &Path) -> io::Result<V3Result> {
+    pub fn execute(sql: &str, storage_path: &Path) -> io::Result<ApexResult> {
         let stmt = SqlParser::parse(sql)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
@@ -79,7 +79,7 @@ impl V3Executor {
     }
 
     /// Execute a SQL query with multi-table support (for JOINs)
-    pub fn execute_with_base_dir(sql: &str, base_dir: &Path, default_table_path: &Path) -> io::Result<V3Result> {
+    pub fn execute_with_base_dir(sql: &str, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
         // Support multi-statement execution (e.g., CREATE VIEW; SELECT ...; DROP VIEW;)
         // Parse as multi-statement unconditionally to avoid relying on string heuristics.
         let stmts = SqlParser::parse_multi(sql)
@@ -100,7 +100,7 @@ impl V3Executor {
     }
 
     /// Execute a parsed SQL statement (single table)
-    pub fn execute_parsed(stmt: SqlStatement, storage_path: &Path) -> io::Result<V3Result> {
+    pub fn execute_parsed(stmt: SqlStatement, storage_path: &Path) -> io::Result<ApexResult> {
         match stmt {
             SqlStatement::Select(select) => Self::execute_select(select, storage_path),
             SqlStatement::Union(union) => Self::execute_union(union, storage_path),
@@ -112,7 +112,7 @@ impl V3Executor {
     }
 
     /// Execute a parsed SQL statement with multi-table support
-    pub fn execute_parsed_multi(stmt: SqlStatement, base_dir: &Path, default_table_path: &Path) -> io::Result<V3Result> {
+    pub fn execute_parsed_multi(stmt: SqlStatement, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
         match stmt {
             SqlStatement::Select(select) => {
                 if select.joins.is_empty() {
@@ -137,11 +137,11 @@ impl V3Executor {
         stmts: Vec<SqlStatement>,
         base_dir: &Path,
         default_table_path: &Path,
-    ) -> io::Result<V3Result> {
+    ) -> io::Result<ApexResult> {
         use std::collections::HashMap;
 
         let mut views: HashMap<String, SelectStatement> = HashMap::new();
-        let mut last_result: Option<V3Result> = None;
+        let mut last_result: Option<ApexResult> = None;
 
         for stmt in stmts {
             match stmt {
@@ -197,7 +197,7 @@ impl V3Executor {
     }
 
     /// Execute SELECT statement
-    fn execute_select(stmt: SelectStatement, storage_path: &Path) -> io::Result<V3Result> {
+    fn execute_select(stmt: SelectStatement, storage_path: &Path) -> io::Result<ApexResult> {
         // Check for derived table (FROM subquery)
         let batch = match &stmt.from {
             Some(FromItem::Subquery { stmt: sub_stmt, .. }) => {
@@ -259,7 +259,7 @@ impl V3Executor {
             if has_aggregation && stmt.group_by.is_empty() {
                 return Self::execute_aggregation(&batch, &stmt);
             }
-            return Ok(V3Result::Empty(batch.schema()));
+            return Ok(ApexResult::Empty(batch.schema()));
         }
 
         // Apply WHERE filter (with storage path for subquery support)
@@ -274,7 +274,7 @@ impl V3Executor {
             if has_aggregation && stmt.group_by.is_empty() {
                 return Self::execute_aggregation(&filtered, &stmt);
             }
-            return Ok(V3Result::Empty(filtered.schema()));
+            return Ok(ApexResult::Empty(filtered.schema()));
         }
 
         // Check for window functions
@@ -313,11 +313,11 @@ impl V3Executor {
             projected
         };
 
-        Ok(V3Result::Data(result))
+        Ok(ApexResult::Data(result))
     }
 
     /// Execute SELECT statement with JOINs
-    fn execute_select_with_joins(stmt: SelectStatement, base_dir: &Path, default_table_path: &Path) -> io::Result<V3Result> {
+    fn execute_select_with_joins(stmt: SelectStatement, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
         // Get the left (base) table
         let left_table_name = match &stmt.from {
             Some(FromItem::Table { table, .. }) => table.clone(),
@@ -366,7 +366,7 @@ impl V3Executor {
         }
 
         if result_batch.num_rows() == 0 {
-            return Ok(V3Result::Empty(result_batch.schema()));
+            return Ok(ApexResult::Empty(result_batch.schema()));
         }
 
         // Apply WHERE filter (with storage path for subquery support)
@@ -377,7 +377,7 @@ impl V3Executor {
         };
 
         if filtered.num_rows() == 0 {
-            return Ok(V3Result::Empty(filtered.schema()));
+            return Ok(ApexResult::Empty(filtered.schema()));
         }
 
         // Check for aggregation
@@ -412,7 +412,7 @@ impl V3Executor {
             projected
         };
 
-        Ok(V3Result::Data(result))
+        Ok(ApexResult::Data(result))
     }
 
     /// Resolve table path from FROM clause
@@ -430,7 +430,7 @@ impl V3Executor {
                 }
             }
             // For other tables, resolve from base directory
-            base_dir.join(format!("{}.apex", table_name))
+            return base_dir.join(format!("{}.apex", table_name));
         }
         // No FROM clause - use default_table_path
         default_table_path.to_path_buf()
@@ -2606,7 +2606,7 @@ impl V3Executor {
     fn execute_aggregation(
         batch: &RecordBatch,
         stmt: &SelectStatement,
-    ) -> io::Result<V3Result> {
+    ) -> io::Result<ApexResult> {
         let mut fields: Vec<Field> = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
 
@@ -2619,14 +2619,14 @@ impl V3Executor {
         }
 
         if fields.is_empty() {
-            return Ok(V3Result::Scalar(batch.num_rows() as i64));
+            return Ok(ApexResult::Scalar(batch.num_rows() as i64));
         }
 
         let schema = Arc::new(Schema::new(fields));
         let result = RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        Ok(V3Result::Data(result))
+        Ok(ApexResult::Data(result))
     }
 
     /// Compute a single aggregate function
@@ -2815,7 +2815,7 @@ impl V3Executor {
     }
 
     /// Execute GROUP BY aggregation query
-    fn execute_group_by(batch: &RecordBatch, stmt: &SelectStatement) -> io::Result<V3Result> {
+    fn execute_group_by(batch: &RecordBatch, stmt: &SelectStatement) -> io::Result<ApexResult> {
         use std::collections::HashMap;
         
         if stmt.group_by.is_empty() {
@@ -2902,7 +2902,7 @@ impl V3Executor {
         }
 
         if result_fields.is_empty() {
-            return Ok(V3Result::Scalar(num_groups as i64));
+            return Ok(ApexResult::Scalar(num_groups as i64));
         }
 
         let schema = Arc::new(Schema::new(result_fields));
@@ -2921,7 +2921,7 @@ impl V3Executor {
             result = Self::apply_order_by(&result, &stmt.order_by)?;
         }
 
-        Ok(V3Result::Data(result))
+        Ok(ApexResult::Data(result))
     }
 
     /// Evaluate expression for groups (handles CASE with aggregates)
@@ -3503,7 +3503,7 @@ impl V3Executor {
     }
 
     /// Execute UNION statement
-    fn execute_union(union: UnionStatement, storage_path: &Path) -> io::Result<V3Result> {
+    fn execute_union(union: UnionStatement, storage_path: &Path) -> io::Result<ApexResult> {
         // Execute left side
         let left_result = Self::execute_parsed(*union.left, storage_path)?;
         let left_batch = left_result.to_record_batch()?;
@@ -3541,7 +3541,7 @@ impl V3Executor {
             result = Self::apply_limit_offset(&result, union.limit, union.offset)?;
         }
 
-        Ok(V3Result::Data(result))
+        Ok(ApexResult::Data(result))
     }
 
     /// Concatenate two record batches
@@ -3634,7 +3634,7 @@ impl V3Executor {
     }
 
     /// Execute window function (ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD)
-    fn execute_window_function(batch: &RecordBatch, stmt: &SelectStatement) -> io::Result<V3Result> {
+    fn execute_window_function(batch: &RecordBatch, stmt: &SelectStatement) -> io::Result<ApexResult> {
         // Collect window specs: (func_name, args, partition_by, order_by, output_name)
         let mut window_specs: Vec<(String, Vec<String>, Vec<String>, Vec<crate::query::OrderByClause>, String)> = Vec::new();
         
@@ -3934,7 +3934,7 @@ impl V3Executor {
         let result = RecordBatch::try_new(schema, result_arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        Ok(V3Result::Data(result))
+        Ok(ApexResult::Data(result))
     }
 
     /// Compare two array values for sorting
@@ -3995,7 +3995,7 @@ mod tests {
         let path = dir.path().join("test.apex");
         create_test_storage(&path);
 
-        let result = V3Executor::execute("SELECT * FROM default", &path).unwrap();
+        let result = ApexExecutor::execute("SELECT * FROM default", &path).unwrap();
         let batch = result.to_record_batch().unwrap();
         assert_eq!(batch.num_rows(), 5);
     }
@@ -4006,7 +4006,7 @@ mod tests {
         let path = dir.path().join("test.apex");
         create_test_storage(&path);
 
-        let result = V3Executor::execute("SELECT * FROM default WHERE age > 30", &path).unwrap();
+        let result = ApexExecutor::execute("SELECT * FROM default WHERE age > 30", &path).unwrap();
         let batch = result.to_record_batch().unwrap();
         assert_eq!(batch.num_rows(), 3); // age 35, 40, 45
     }
@@ -4017,7 +4017,7 @@ mod tests {
         let path = dir.path().join("test.apex");
         create_test_storage(&path);
 
-        let result = V3Executor::execute("SELECT * FROM default LIMIT 2", &path).unwrap();
+        let result = ApexExecutor::execute("SELECT * FROM default LIMIT 2", &path).unwrap();
         let batch = result.to_record_batch().unwrap();
         assert_eq!(batch.num_rows(), 2);
     }
@@ -4028,7 +4028,7 @@ mod tests {
         let path = dir.path().join("test.apex");
         create_test_storage(&path);
 
-        let result = V3Executor::execute("SELECT COUNT(*) FROM default", &path).unwrap();
+        let result = ApexExecutor::execute("SELECT COUNT(*) FROM default", &path).unwrap();
         let batch = result.to_record_batch().unwrap();
         assert_eq!(batch.num_rows(), 1);
         
@@ -4042,7 +4042,7 @@ mod tests {
         let path = dir.path().join("test.apex");
         create_test_storage(&path);
 
-        let result = V3Executor::execute("SELECT SUM(age) FROM default", &path).unwrap();
+        let result = ApexExecutor::execute("SELECT SUM(age) FROM default", &path).unwrap();
         let batch = result.to_record_batch().unwrap();
         
         let sum_array = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -4055,7 +4055,7 @@ mod tests {
         let path = dir.path().join("test.apex");
         create_test_storage(&path);
 
-        let result = V3Executor::execute("SELECT * FROM default ORDER BY age DESC LIMIT 2", &path).unwrap();
+        let result = ApexExecutor::execute("SELECT * FROM default ORDER BY age DESC LIMIT 2", &path).unwrap();
         let batch = result.to_record_batch().unwrap();
         assert_eq!(batch.num_rows(), 2);
         

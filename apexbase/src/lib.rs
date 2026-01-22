@@ -14,15 +14,14 @@ pub mod fts;
 pub use storage::{ColumnarStorage, ColumnType, ColumnValue, FileSchema};
 pub use table::TableCatalog;
 pub use data::{DataType, Value, Row};
-pub use query::{V3Executor, V3Result};
+pub use query::{ApexExecutor, ApexResult};
 
 use pyo3::prelude::*;
 
 /// Python module entry point
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // V3Storage is the only storage class (on-demand reading, no ColumnTable dependency)
-    m.add_class::<python::V3Storage>()?;
+    m.add_class::<python::ApexStorage>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
