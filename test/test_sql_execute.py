@@ -259,9 +259,9 @@ class TestBasicSQLExecute:
             with pytest.raises(Exception):
                 client.execute("SELECT UCASE(n) AS x FROM default").to_dict()
 
-            # Nested expression should error
-            with pytest.raises(Exception):
-                client.execute("SELECT UCASE(LOWER('a')) AS x FROM default").to_dict()
+            # Nested expression is supported
+            r3 = client.execute("SELECT UCASE(LOWER('a')) AS x FROM default").first()
+            assert r3["x"] == "A"
 
             client.close()
 

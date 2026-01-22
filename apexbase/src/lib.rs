@@ -9,21 +9,20 @@ pub mod query;
 pub mod data;
 pub mod python;
 pub mod fts;
-pub mod io_engine;
 
 // Re-export main types
 pub use storage::{ColumnarStorage, ColumnType, ColumnValue, FileSchema};
-pub use table::{TableCatalog, ColumnTable};
+pub use table::TableCatalog;
 pub use data::{DataType, Value, Row};
-pub use query::QueryExecutor;
-pub use io_engine::{IoEngine, IoResult, QueryHints, IoStrategy, WriteHints, WriteResult};
+pub use query::{V3Executor, V3Result};
 
 use pyo3::prelude::*;
 
 /// Python module entry point
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<python::ApexStorage>()?;
+    // V3Storage is the only storage class (on-demand reading, no ColumnTable dependency)
+    m.add_class::<python::V3Storage>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

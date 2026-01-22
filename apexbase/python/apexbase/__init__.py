@@ -12,8 +12,8 @@ from pathlib import Path
 import numpy as np
 import re
 
-# Import Rust core
-from apexbase._core import ApexStorage as RustStorage, __version__ as _core_version
+# Import Rust core (V3Storage only - ApexStorage is deprecated)
+from apexbase._core import V3Storage, __version__ as _core_version
 
 # FTS is now directly implemented in Rust layer, no need for Python nanofts package
 # But keep compatibility flag
@@ -316,16 +316,12 @@ def _empty_result_view() -> ResultView:
 DurabilityLevel = Literal['fast', 'safe', 'max']
 
 
-class ApexClient:
+class _LegacyApexClient:
     """
-    ApexBase client - High-performance embedded database based on Rust core
+    [DEPRECATED] Legacy ApexClient - kept for reference only.
+    Use ApexClient (which is now V3Client) instead.
     
-    Features:
-    - Custom single-file storage format (.apex)
-    - High-performance batch writes
-    - Full-text search support (NanoFTS)
-    - Integration with Pandas, Polars, PyArrow
-    - Configurable durability levels
+    This class is no longer functional as RustStorage has been removed.
     """
     
     def __init__(
@@ -395,21 +391,13 @@ class ApexClient:
         if self._auto_manage:
             _registry.register(self, str(self._db_path))
         
-        # Handle drop_if_exists
-        if drop_if_exists and self._db_path.exists():
-            self._db_path.unlink()
-            # Also clean up FTS indexes
-            fts_dir = self._dirpath / "fts_indexes"
-            if fts_dir.exists():
-                shutil.rmtree(fts_dir)
-        
         # Validate durability parameter
         if durability not in ('fast', 'safe', 'max'):
             raise ValueError(f"durability must be 'fast', 'safe', or 'max', got '{durability}'")
         self._durability = durability
         
-        # Initialize Rust storage engine, pass durability configuration
-        self._storage = RustStorage(str(self._db_path), durability=durability)
+        # Initialize Rust storage engine, pass drop_if_exists to Rust level
+        self._storage = RustStorage(str(self._db_path), drop_if_exists=drop_if_exists, durability=durability)
         
         self._current_table = "default"
         self._batch_size = batch_size
@@ -1717,6 +1705,12 @@ class ApexClient:
         return f"ApexClient(path='{self._dirpath}', table='{self._current_table}')"
 
 
+# Import V3Client and make it the default ApexClient
+from .v3_client import V3Client
+
+# V3Client is now the default ApexClient
+ApexClient = V3Client
+
 # Exports
-__all__ = ['ApexClient', 'ResultView', 'DurabilityLevel', '__version__', 'FTS_AVAILABLE', 'ARROW_AVAILABLE', 'POLARS_AVAILABLE']
+__all__ = ['ApexClient', 'V3Client', 'V3Storage', 'ResultView', 'DurabilityLevel', '__version__', 'FTS_AVAILABLE', 'ARROW_AVAILABLE', 'POLARS_AVAILABLE']
 

@@ -1,6 +1,6 @@
 //! Table management module
 //!
-//! Provides columnar table storage with high-performance operations.
+//! Provides table catalog and Arrow-based column storage.
 
 mod catalog;
 mod schema;
@@ -9,6 +9,6 @@ pub mod arrow_column;
 
 pub use catalog::{TableCatalog, TableEntry};
 pub use schema::Schema;
-pub use column_table::{ColumnTable, ColumnSchema, TypedColumn};
+pub use column_table::{BitVec, TypedColumn, ColumnSchema};
 pub use arrow_column::{ArrowTypedColumn, ArrowStringColumn};
 

@@ -88,8 +88,10 @@ pub enum SelectColumn {
     /// SELECT expression AS alias
     Expression { expr: SqlExpr, alias: Option<String> },
     /// SELECT row_number() OVER (PARTITION BY ... ORDER BY ...) AS alias
+    /// Also supports LAG(col, offset, default) and LEAD(col, offset, default)
     WindowFunction {
         name: String,
+        args: Vec<String>,  // Function arguments (column, offset, default)
         partition_by: Vec<String>,
         order_by: Vec<OrderByClause>,
         alias: Option<String>,
@@ -180,6 +182,171 @@ pub enum BinaryOperator {
 pub enum UnaryOperator {
     Not,
     Minus,
+}
+
+// ============================================================================
+// Column Extraction for On-Demand Reading
+// ============================================================================
+
+impl SelectStatement {
+    /// Extract all column names required by this SELECT statement
+    /// Returns None if SELECT * is used (meaning all columns needed)
+    pub fn required_columns(&self) -> Option<Vec<String>> {
+        let mut columns = Vec::new();
+        let mut has_star = false;
+        let mut has_explicit_id = false;
+        
+        // Extract from SELECT clause
+        for col in &self.columns {
+            match col {
+                SelectColumn::All => {
+                    has_star = true;
+                }
+                SelectColumn::Column(name) => {
+                    // Strip table prefix if present (e.g., "default._id" -> "_id")
+                    let actual_name = if let Some(dot_pos) = name.rfind('.') {
+                        &name[dot_pos + 1..]
+                    } else {
+                        name.as_str()
+                    };
+                    if actual_name == "_id" {
+                        has_explicit_id = true;
+                    } else {
+                        columns.push(actual_name.to_string());
+                    }
+                }
+                SelectColumn::ColumnAlias { column, .. } => {
+                    if column == "_id" {
+                        has_explicit_id = true;
+                    } else {
+                        columns.push(column.clone());
+                    }
+                }
+                SelectColumn::Aggregate { column, .. } => {
+                    if let Some(col) = column {
+                        if col == "_id" {
+                            has_explicit_id = true;
+                        } else if col != "*" && !col.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                            // Skip constants like "1", "2" and "*" - only add real column names
+                            columns.push(col.clone());
+                        }
+                    }
+                }
+                SelectColumn::Expression { expr, .. } => {
+                    Self::extract_columns_from_expr(expr, &mut columns);
+                }
+                SelectColumn::WindowFunction { args, partition_by, order_by, .. } => {
+                    // Add columns from args (for LAG/LEAD)
+                    for arg in args {
+                        if !arg.starts_with("Int") && !arg.starts_with("Float") && arg != "_id" {
+                            columns.push(arg.clone());
+                        }
+                    }
+                    for col in partition_by {
+                        if col != "_id" {
+                            columns.push(col.clone());
+                        }
+                    }
+                    for ob in order_by {
+                        if ob.column != "_id" {
+                            columns.push(ob.column.clone());
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Extract from WHERE clause
+        if let Some(ref expr) = self.where_clause {
+            Self::extract_columns_from_expr(expr, &mut columns);
+        }
+        
+        // Extract from ORDER BY
+        for ob in &self.order_by {
+            if ob.column != "_id" {
+                columns.push(ob.column.clone());
+            }
+        }
+        
+        // Extract from GROUP BY
+        for col in &self.group_by {
+            if col != "_id" {
+                columns.push(col.clone());
+            }
+        }
+        
+        // Extract from HAVING
+        if let Some(ref expr) = self.having {
+            Self::extract_columns_from_expr(expr, &mut columns);
+        }
+        
+        if has_star {
+            None  // SELECT * means all columns
+        } else {
+            // Include _id if explicitly requested
+            if has_explicit_id {
+                columns.push("_id".to_string());
+            }
+            // Deduplicate
+            columns.sort();
+            columns.dedup();
+            // If no columns needed (e.g., COUNT(*)), return None to get all columns
+            // so the batch has correct row count for aggregation
+            if columns.is_empty() {
+                None
+            } else {
+                Some(columns)
+            }
+        }
+    }
+    
+    fn extract_columns_from_expr(expr: &SqlExpr, columns: &mut Vec<String>) {
+        match expr {
+            SqlExpr::Column(name) => {
+                if name != "_id" {
+                    columns.push(name.clone());
+                }
+            }
+            SqlExpr::BinaryOp { left, right, .. } => {
+                Self::extract_columns_from_expr(left, columns);
+                Self::extract_columns_from_expr(right, columns);
+            }
+            SqlExpr::UnaryOp { expr, .. } => {
+                Self::extract_columns_from_expr(expr, columns);
+            }
+            SqlExpr::Like { column, .. } | 
+            SqlExpr::Regexp { column, .. } |
+            SqlExpr::In { column, .. } |
+            SqlExpr::Between { column, .. } |
+            SqlExpr::IsNull { column, .. } |
+            SqlExpr::InSubquery { column, .. } => {
+                if column != "_id" {
+                    columns.push(column.clone());
+                }
+            }
+            SqlExpr::Case { when_then, else_expr } => {
+                for (cond, then_expr) in when_then {
+                    Self::extract_columns_from_expr(cond, columns);
+                    Self::extract_columns_from_expr(then_expr, columns);
+                }
+                if let Some(else_e) = else_expr {
+                    Self::extract_columns_from_expr(else_e, columns);
+                }
+            }
+            SqlExpr::Function { args, .. } => {
+                for arg in args {
+                    Self::extract_columns_from_expr(arg, columns);
+                }
+            }
+            SqlExpr::Cast { expr, .. } => {
+                Self::extract_columns_from_expr(expr, columns);
+            }
+            SqlExpr::Paren(inner) => {
+                Self::extract_columns_from_expr(inner, columns);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// SQL Parser
@@ -1162,8 +1329,18 @@ impl SqlParser {
                     let func_expr = self.parse_function_call_from_name(name.clone())?;
 
                     if matches!(self.current(), Token::Over) {
-                        // Only window function supported: row_number() OVER (...)
-                        // Existing behavior expects empty args.
+                        // Window function: func(args...) OVER (PARTITION BY ... ORDER BY ...)
+                        // Extract args from the function expression
+                        let args = if let SqlExpr::Function { args: func_args, .. } = &func_expr {
+                            func_args.iter().filter_map(|a| {
+                                if let SqlExpr::Column(c) = a { Some(c.clone()) }
+                                else if let SqlExpr::Literal(v) = a { Some(format!("{:?}", v)) }
+                                else { None }
+                            }).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        
                         self.advance();
                         self.expect(Token::LParen)?;
 
@@ -1193,6 +1370,7 @@ impl SqlParser {
 
                         columns.push(SelectColumn::WindowFunction {
                             name,
+                            args,
                             partition_by,
                             order_by,
                             alias,
