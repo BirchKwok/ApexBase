@@ -6,6 +6,8 @@ mod expr_compiler;
 mod filter;
 mod sql_parser;
 mod executor;
+pub mod jit;
+pub mod vectorized;
 
 pub use expr_compiler::sql_expr_to_filter;
 pub use filter::{Filter, CompareOp, LikeMatcher, RegexpMatcher};

@@ -39,7 +39,7 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Int64 | ColumnType::Int32 | ColumnType::Int16 | ColumnType::Int8 |
         ColumnType::UInt64 | ColumnType::UInt32 | ColumnType::UInt16 | ColumnType::UInt8 => DataType::Int64,
         ColumnType::Float64 | ColumnType::Float32 => DataType::Float64,
-        ColumnType::String => DataType::String,
+        ColumnType::String | ColumnType::StringDict => DataType::String,
         ColumnType::Bool => DataType::Bool,
         ColumnType::Binary => DataType::Binary,
         ColumnType::Null => DataType::String,
@@ -156,6 +156,29 @@ pub fn column_data_to_typed_column(cd: &ColumnData, _dtype: DataType) -> TypedCo
                 nulls.push(false);
             }
             TypedColumn::Mixed { data: values, nulls }
+        }
+        ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+            // Convert dictionary-encoded string to regular String column
+            let mut arrow_col = ArrowStringColumn::new();
+            for &idx in indices {
+                if idx == 0 {
+                    arrow_col.push_null();
+                } else {
+                    let dict_idx = (idx - 1) as usize;
+                    if dict_idx + 1 < dict_offsets.len() {
+                        let start = dict_offsets[dict_idx] as usize;
+                        let end = dict_offsets[dict_idx + 1] as usize;
+                        if let Ok(s) = std::str::from_utf8(&dict_data[start..end]) {
+                            arrow_col.push(s);
+                        } else {
+                            arrow_col.push_null();
+                        }
+                    } else {
+                        arrow_col.push_null();
+                    }
+                }
+            }
+            TypedColumn::String(arrow_col)
         }
     }
 }
@@ -659,7 +682,7 @@ impl TableStorageBackend {
         }
         
         // Read columns from storage (only the requested ones!)
-        let col_data = self.storage.read_columns(column_names, start_row, row_count)?;
+        let mut col_data = self.storage.read_columns(column_names, start_row, row_count)?;
         
         if col_data.is_empty() {
             // Return empty batch with schema (including _id if requested)
@@ -716,80 +739,148 @@ impl TableStorageBackend {
         };
 
         for col_name in &col_order {
-            if let Some(data) = col_data.get(col_name) {
-                let dtype = schema.iter()
-                    .find(|(n, _)| n == col_name)
-                    .map(|(_, dt)| dt.clone())
-                    .unwrap_or(DataType::String);
-
-                let col_len = data.len();
+            // Use remove() to take ownership and avoid clone
+            if let Some(data) = col_data.remove(col_name) {
                 let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
                     ColumnData::Int64(values) => {
-                        // Pad with NULLs if column is shorter than expected
+                        // Zero-copy: take ownership of the Vec directly
                         if values.len() < expected_row_count {
-                            let mut padded: Vec<Option<i64>> = values.iter().map(|&v| Some(v)).collect();
-                            padded.extend(std::iter::repeat(None).take(expected_row_count - values.len()));
+                            let mut padded: Vec<Option<i64>> = values.into_iter().map(Some).collect();
+                            padded.extend(std::iter::repeat(None).take(expected_row_count - padded.len()));
                             (ArrowDataType::Int64, Arc::new(Int64Array::from(padded)))
+                        } else if values.len() > expected_row_count {
+                            // Truncate to expected row count
+                            let truncated: Vec<i64> = values.into_iter().take(expected_row_count).collect();
+                            (ArrowDataType::Int64, Arc::new(Int64Array::from(truncated)))
                         } else {
-                            (ArrowDataType::Int64, Arc::new(Int64Array::from(values.clone())))
+                            // Direct conversion without clone
+                            (ArrowDataType::Int64, Arc::new(Int64Array::from(values)))
                         }
                     }
                     ColumnData::Float64(values) => {
                         if values.len() < expected_row_count {
-                            let mut padded: Vec<Option<f64>> = values.iter().map(|&v| Some(v)).collect();
-                            padded.extend(std::iter::repeat(None).take(expected_row_count - values.len()));
+                            let mut padded: Vec<Option<f64>> = values.into_iter().map(Some).collect();
+                            padded.extend(std::iter::repeat(None).take(expected_row_count - padded.len()));
                             (ArrowDataType::Float64, Arc::new(Float64Array::from(padded)))
+                        } else if values.len() > expected_row_count {
+                            // Truncate to expected row count
+                            let truncated: Vec<f64> = values.into_iter().take(expected_row_count).collect();
+                            (ArrowDataType::Float64, Arc::new(Float64Array::from(truncated)))
                         } else {
-                            (ArrowDataType::Float64, Arc::new(Float64Array::from(values.clone())))
+                            (ArrowDataType::Float64, Arc::new(Float64Array::from(values)))
                         }
                     }
                     ColumnData::String { offsets, data: bytes } => {
+                        // Optimized: use &str references instead of allocating Strings
                         let count = offsets.len().saturating_sub(1);
-                        let mut strings: Vec<Option<String>> = (0..count)
+                        let strings: Vec<Option<&str>> = (0..count)
                             .map(|i| {
                                 let start = offsets[i] as usize;
                                 let end = offsets[i + 1] as usize;
-                                std::str::from_utf8(&bytes[start..end])
-                                    .ok()
-                                    .map(|s| s.to_string())
+                                std::str::from_utf8(&bytes[start..end]).ok()
                             })
                             .collect();
-                        // Pad with NULLs if column is shorter than expected
                         if strings.len() < expected_row_count {
-                            strings.extend(std::iter::repeat(None).take(expected_row_count - strings.len()));
+                            // Need to convert to owned for padding
+                            let mut owned: Vec<Option<String>> = strings.into_iter()
+                                .map(|s| s.map(|s| s.to_string()))
+                                .collect();
+                            owned.extend(std::iter::repeat(None).take(expected_row_count - owned.len()));
+                            (ArrowDataType::Utf8, Arc::new(StringArray::from(owned)))
+                        } else if strings.len() > expected_row_count {
+                            // Truncate to expected row count
+                            let truncated: Vec<Option<&str>> = strings.into_iter().take(expected_row_count).collect();
+                            (ArrowDataType::Utf8, Arc::new(StringArray::from(truncated)))
+                        } else {
+                            (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
                         }
-                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
                     }
                     ColumnData::Bool { data: packed, len } => {
-                        let mut bools: Vec<Option<bool>> = (0..*len)
+                        let mut bools: Vec<Option<bool>> = (0..len)
                             .map(|i| {
                                 let byte_idx = i / 8;
                                 let bit_idx = i % 8;
                                 Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
                             })
                             .collect();
-                        // Pad with NULLs if column is shorter than expected
                         if bools.len() < expected_row_count {
                             bools.extend(std::iter::repeat(None).take(expected_row_count - bools.len()));
+                        } else if bools.len() > expected_row_count {
+                            bools.truncate(expected_row_count);
                         }
                         (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
                     }
                     ColumnData::Binary { offsets, data: bytes } => {
                         use arrow::array::BinaryArray;
-                        // Keep as binary data in Arrow
                         let count = offsets.len().saturating_sub(1);
-                        let mut binary_data: Vec<Option<&[u8]>> = (0..count)
+                        let binary_data: Vec<Option<&[u8]>> = (0..count)
                             .map(|i| {
                                 let start = offsets[i] as usize;
                                 let end = offsets[i + 1] as usize;
                                 Some(&bytes[start..end] as &[u8])
                             })
                             .collect();
-                        // Pad with NULLs if column is shorter than expected
                         if binary_data.len() < expected_row_count {
-                            binary_data.extend(std::iter::repeat(None).take(expected_row_count - binary_data.len()));
+                            // Need owned data for padding
+                            let mut owned: Vec<Option<Vec<u8>>> = binary_data.into_iter()
+                                .map(|b| b.map(|s| s.to_vec()))
+                                .collect();
+                            owned.extend(std::iter::repeat(None).take(expected_row_count - owned.len()));
+                            let refs: Vec<Option<&[u8]>> = owned.iter()
+                                .map(|o| o.as_ref().map(|v| v.as_slice()))
+                                .collect();
+                            (ArrowDataType::Binary, Arc::new(BinaryArray::from(refs)))
+                        } else if binary_data.len() > expected_row_count {
+                            // Truncate to expected row count
+                            let truncated: Vec<Option<&[u8]>> = binary_data.into_iter().take(expected_row_count).collect();
+                            (ArrowDataType::Binary, Arc::new(BinaryArray::from(truncated)))
+                        } else {
+                            (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
                         }
-                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    }
+                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                        // OPTIMIZATION: Use Arrow DictionaryArray to preserve dictionary encoding
+                        // This avoids string decoding and allows executor to use indices directly
+                        use arrow::array::{DictionaryArray, UInt32Array};
+                        use arrow::datatypes::UInt32Type;
+                        
+                        // Build dictionary values (unique strings)
+                        let dict_count = dict_offsets.len().saturating_sub(1);
+                        let dict_strings: Vec<Option<&str>> = (0..dict_count)
+                            .map(|i| {
+                                let start = dict_offsets[i] as usize;
+                                let end = dict_offsets[i + 1] as usize;
+                                std::str::from_utf8(&dict_data[start..end]).ok()
+                            })
+                            .collect();
+                        let values = StringArray::from(dict_strings);
+                        
+                        // Convert indices (0 = NULL, 1+ = dict index)
+                        // Arrow DictionaryArray uses 0-based indices, NULL is separate
+                        // Truncate or pad indices to match expected_row_count
+                        let keys: Vec<Option<u32>> = if indices.len() > expected_row_count {
+                            indices.iter().take(expected_row_count)
+                                .map(|&idx| if idx == 0 { None } else { Some(idx - 1) })
+                                .collect()
+                        } else if indices.len() < expected_row_count {
+                            let mut keys: Vec<Option<u32>> = indices.iter()
+                                .map(|&idx| if idx == 0 { None } else { Some(idx - 1) })
+                                .collect();
+                            keys.extend(std::iter::repeat(None).take(expected_row_count - keys.len()));
+                            keys
+                        } else {
+                            indices.iter()
+                                .map(|&idx| if idx == 0 { None } else { Some(idx - 1) })
+                                .collect()
+                        };
+                        let keys_array = UInt32Array::from(keys);
+                        
+                        // Create DictionaryArray
+                        let dict_array = DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        
+                        (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)), 
+                         Arc::new(dict_array) as ArrayRef)
                     }
                 };
 
@@ -808,9 +899,501 @@ impl TableStorageBackend {
         self.read_columns_to_arrow(None, 0, None)
     }
 
+    /// Read columns with predicate pushdown to Arrow
+    /// Filters rows at storage level before converting to Arrow
+    pub fn read_columns_filtered_to_arrow(
+        &self,
+        column_names: Option<&[&str]>,
+        filter_column: &str,
+        filter_op: &str,
+        filter_value: f64,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
+        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use std::sync::Arc;
+
+        let (col_data, matching_indices) = self.storage.read_columns_filtered(
+            column_names, filter_column, filter_op, filter_value
+        )?;
+        
+        if col_data.is_empty() || matching_indices.is_empty() {
+            // Return empty batch with proper schema
+            let schema = self.schema.read();
+            let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+            let mut fields: Vec<Field> = Vec::new();
+            if include_id {
+                fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            }
+            for (name, dt) in schema.iter() {
+                if column_names.map(|cols| cols.contains(&name.as_str())).unwrap_or(true) {
+                    let arrow_dt = match dt {
+                        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => ArrowDataType::Int64,
+                        DataType::Float64 | DataType::Float32 => ArrowDataType::Float64,
+                        DataType::String => ArrowDataType::Utf8,
+                        DataType::Bool => ArrowDataType::Boolean,
+                        _ => ArrowDataType::Utf8,
+                    };
+                    fields.push(Field::new(name, arrow_dt, true));
+                }
+            }
+            let schema = Arc::new(Schema::new(fields));
+            return Ok(arrow::record_batch::RecordBatch::new_empty(schema));
+        }
+
+        // Build Arrow arrays from filtered ColumnData
+        let schema = self.schema.read();
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+        let expected_row_count = matching_indices.len();
+
+        // Include _id column with filtered indices
+        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        if include_id {
+            let all_ids = self.storage.read_ids(0, None)?;
+            let filtered_ids: Vec<i64> = matching_indices.iter()
+                .map(|&i| all_ids.get(i).copied().unwrap_or(0) as i64)
+                .collect();
+            fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            arrays.push(Arc::new(Int64Array::from(filtered_ids)));
+        }
+
+        // Determine column order
+        let col_order: Vec<String> = if let Some(names) = column_names {
+            names.iter().filter(|&s| *s != "_id").map(|s| s.to_string()).collect()
+        } else {
+            schema.iter().map(|(n, _)| n.clone()).collect()
+        };
+
+        for col_name in &col_order {
+            if let Some(data) = col_data.get(col_name) {
+                let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
+                    ColumnData::Int64(values) => {
+                        (ArrowDataType::Int64, Arc::new(Int64Array::from_iter_values(values.iter().copied())))
+                    }
+                    ColumnData::Float64(values) => {
+                        (ArrowDataType::Float64, Arc::new(Float64Array::from_iter_values(values.iter().copied())))
+                    }
+                    ColumnData::String { offsets, data: bytes } => {
+                        let count = offsets.len().saturating_sub(1);
+                        let strings: Vec<Option<&str>> = (0..count)
+                            .map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                std::str::from_utf8(&bytes[start..end]).ok()
+                            })
+                            .collect();
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    }
+                    ColumnData::Bool { data: packed, len } => {
+                        let bools: Vec<Option<bool>> = (0..*len)
+                            .map(|i| {
+                                let byte_idx = i / 8;
+                                let bit_idx = i % 8;
+                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                            })
+                            .collect();
+                        (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
+                    }
+                    ColumnData::Binary { offsets, data: bytes } => {
+                        use arrow::array::BinaryArray;
+                        let count = offsets.len().saturating_sub(1);
+                        let binary_data: Vec<Option<&[u8]>> = (0..count)
+                            .map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                Some(&bytes[start..end] as &[u8])
+                            })
+                            .collect();
+                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    }
+                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                        let strings: Vec<Option<String>> = indices.iter()
+                            .map(|&idx| {
+                                if idx == 0 { None } else {
+                                    let dict_idx = (idx - 1) as usize;
+                                    if dict_idx + 1 < dict_offsets.len() {
+                                        let start = dict_offsets[dict_idx] as usize;
+                                        let end = dict_offsets[dict_idx + 1] as usize;
+                                        std::str::from_utf8(&dict_data[start..end]).ok().map(|s| s.to_string())
+                                    } else { None }
+                                }
+                            })
+                            .collect();
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    }
+                };
+
+                fields.push(Field::new(col_name, arrow_dt, true));
+                arrays.push(array);
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// Read columns for specific row indices to Arrow (for late materialization)
+    /// Only reads the specified rows from disk, reducing I/O for filtered queries
+    pub fn read_columns_by_indices_to_arrow(
+        &self,
+        row_indices: &[usize],
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
+        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use std::sync::Arc;
+
+        if row_indices.is_empty() {
+            // Return empty batch with full schema
+            return self.read_columns_to_arrow(None, 0, Some(0));
+        }
+
+        let schema = self.schema.read();
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+
+        // Include _id column
+        let all_ids = self.storage.read_ids(0, None)?;
+        let filtered_ids: Vec<i64> = row_indices.iter()
+            .map(|&i| all_ids.get(i).copied().unwrap_or(0) as i64)
+            .collect();
+        fields.push(Field::new("_id", ArrowDataType::Int64, false));
+        arrays.push(Arc::new(Int64Array::from(filtered_ids)));
+
+        // Read each column for the specified row indices
+        for (col_name, dt) in schema.iter() {
+            let col_data = self.storage.read_column_by_indices(col_name, row_indices)?;
+            
+            let (arrow_dt, array): (ArrowDataType, ArrayRef) = match col_data {
+                ColumnData::Int64(values) => {
+                    (ArrowDataType::Int64, Arc::new(Int64Array::from(values)))
+                }
+                ColumnData::Float64(values) => {
+                    (ArrowDataType::Float64, Arc::new(Float64Array::from(values)))
+                }
+                ColumnData::String { offsets, data: bytes } => {
+                    let count = offsets.len().saturating_sub(1);
+                    let strings: Vec<Option<&str>> = (0..count)
+                        .map(|i| {
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            std::str::from_utf8(&bytes[start..end]).ok()
+                        })
+                        .collect();
+                    (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                }
+                ColumnData::Bool { data: packed, len } => {
+                    let bools: Vec<Option<bool>> = (0..len)
+                        .map(|i| {
+                            let byte_idx = i / 8;
+                            let bit_idx = i % 8;
+                            Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                        })
+                        .collect();
+                    (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
+                }
+                ColumnData::Binary { offsets, data: bytes } => {
+                    use arrow::array::BinaryArray;
+                    let count = offsets.len().saturating_sub(1);
+                    let binary_data: Vec<Option<&[u8]>> = (0..count)
+                        .map(|i| {
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            Some(&bytes[start..end] as &[u8])
+                        })
+                        .collect();
+                    (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                }
+                ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                    let strings: Vec<Option<String>> = indices.iter()
+                        .map(|&idx| {
+                            if idx == 0 { None } else {
+                                let dict_idx = (idx - 1) as usize;
+                                if dict_idx + 1 < dict_offsets.len() {
+                                    let start = dict_offsets[dict_idx] as usize;
+                                    let end = dict_offsets[dict_idx + 1] as usize;
+                                    std::str::from_utf8(&dict_data[start..end]).ok().map(|s| s.to_string())
+                                } else { None }
+                            }
+                        })
+                        .collect();
+                    (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                }
+            };
+            
+            fields.push(Field::new(col_name, arrow_dt, true));
+            arrays.push(array);
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// Read columns with STRING predicate pushdown to Arrow
+    /// Filters rows at storage level for string equality (much faster than post-filtering)
+    pub fn read_columns_filtered_string_to_arrow(
+        &self,
+        column_names: Option<&[&str]>,
+        filter_column: &str,
+        filter_value: &str,
+        filter_eq: bool,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
+        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use std::sync::Arc;
+
+        let (col_data, matching_indices) = self.storage.read_columns_filtered_string(
+            column_names, filter_column, filter_value, filter_eq
+        )?;
+        
+        if col_data.is_empty() || matching_indices.is_empty() {
+            // Return empty batch with proper schema
+            return self.read_columns_to_arrow(column_names, 0, Some(0));
+        }
+
+        let schema = self.schema.read();
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+
+        // Include _id column with filtered indices
+        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        if include_id {
+            let all_ids = self.storage.read_ids(0, None)?;
+            let filtered_ids: Vec<i64> = matching_indices.iter()
+                .map(|&i| all_ids.get(i).copied().unwrap_or(0) as i64)
+                .collect();
+            fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            arrays.push(Arc::new(Int64Array::from(filtered_ids)));
+        }
+
+        // Determine column order
+        let col_order: Vec<String> = if let Some(names) = column_names {
+            names.iter().filter(|&s| *s != "_id").map(|s| s.to_string()).collect()
+        } else {
+            schema.iter().map(|(n, _)| n.clone()).collect()
+        };
+
+        for col_name in &col_order {
+            if let Some(data) = col_data.get(col_name) {
+                let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
+                    ColumnData::Int64(values) => {
+                        (ArrowDataType::Int64, Arc::new(Int64Array::from_iter_values(values.iter().copied())))
+                    }
+                    ColumnData::Float64(values) => {
+                        (ArrowDataType::Float64, Arc::new(Float64Array::from_iter_values(values.iter().copied())))
+                    }
+                    ColumnData::String { offsets, data: bytes } => {
+                        let count = offsets.len().saturating_sub(1);
+                        let strings: Vec<Option<&str>> = (0..count)
+                            .map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                std::str::from_utf8(&bytes[start..end]).ok()
+                            })
+                            .collect();
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    }
+                    ColumnData::Bool { data: packed, len } => {
+                        let bools: Vec<Option<bool>> = (0..*len)
+                            .map(|i| {
+                                let byte_idx = i / 8;
+                                let bit_idx = i % 8;
+                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                            })
+                            .collect();
+                        (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
+                    }
+                    ColumnData::Binary { offsets, data: bytes } => {
+                        use arrow::array::BinaryArray;
+                        let count = offsets.len().saturating_sub(1);
+                        let binary_data: Vec<Option<&[u8]>> = (0..count)
+                            .map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                Some(&bytes[start..end] as &[u8])
+                            })
+                            .collect();
+                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    }
+                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                        let strings: Vec<Option<String>> = indices.iter()
+                            .map(|&idx| {
+                                if idx == 0 { None } else {
+                                    let dict_idx = (idx - 1) as usize;
+                                    if dict_idx + 1 < dict_offsets.len() {
+                                        let start = dict_offsets[dict_idx] as usize;
+                                        let end = dict_offsets[dict_idx + 1] as usize;
+                                        std::str::from_utf8(&dict_data[start..end]).ok().map(|s| s.to_string())
+                                    } else { None }
+                                }
+                            })
+                            .collect();
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    }
+                };
+
+                fields.push(Field::new(col_name, arrow_dt, true));
+                arrays.push(array);
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
     /// Get underlying storage for direct access
     pub fn storage(&self) -> &OnDemandStorage {
         &self.storage
+    }
+}
+
+// ============================================================================
+// Incremental Storage Backend - Fast Writes with WAL
+// ============================================================================
+
+use crate::storage::incremental::IncrementalStorage;
+use crate::storage::on_demand::ColumnValue as OnDemandColumnValue;
+
+/// High-performance storage backend with incremental writes
+/// 
+/// Uses WAL (Write-Ahead Log) for fast append-only writes:
+/// - Writes append to WAL file - O(1) time
+/// - Reads merge main file + WAL transparently
+/// - Background compaction merges WAL into main file
+/// 
+/// This provides significantly faster write performance compared to
+/// TableStorageBackend which rewrites the entire file on each save.
+pub struct IncrementalStorageBackend {
+    storage: IncrementalStorage,
+    /// Schema mapping (column_name -> DataType)
+    schema: RwLock<Vec<(String, DataType)>>,
+}
+
+impl IncrementalStorageBackend {
+    /// Create a new incremental storage
+    pub fn create(path: &Path) -> io::Result<Self> {
+        let storage = IncrementalStorage::create(path)?;
+        Ok(Self {
+            storage,
+            schema: RwLock::new(Vec::new()),
+        })
+    }
+
+    /// Open existing incremental storage
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let storage = IncrementalStorage::open(path)?;
+        let schema: Vec<(String, DataType)> = storage.get_schema()
+            .into_iter()
+            .map(|(name, ct)| (name, column_type_to_datatype(ct)))
+            .collect();
+        
+        Ok(Self {
+            storage,
+            schema: RwLock::new(schema),
+        })
+    }
+
+    /// Open or create
+    pub fn open_or_create(path: &Path) -> io::Result<Self> {
+        if path.exists() {
+            Self::open(path)
+        } else {
+            Self::create(path)
+        }
+    }
+
+    /// Get row count
+    pub fn row_count(&self) -> u64 {
+        self.storage.row_count()
+    }
+
+    /// Get schema
+    pub fn get_schema(&self) -> Vec<(String, DataType)> {
+        self.schema.read().clone()
+    }
+
+    /// Insert rows - FAST incremental write
+    pub fn insert_rows(&self, rows: &[HashMap<String, Value>]) -> io::Result<Vec<u64>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Convert Value to ColumnValue
+        let converted: Vec<HashMap<String, OnDemandColumnValue>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|(k, v)| {
+                        let cv = match v {
+                            Value::Int64(i) => OnDemandColumnValue::Int64(*i),
+                            Value::Int32(i) => OnDemandColumnValue::Int64(*i as i64),
+                            Value::Float64(f) => OnDemandColumnValue::Float64(*f),
+                            Value::Float32(f) => OnDemandColumnValue::Float64(*f as f64),
+                            Value::String(s) => OnDemandColumnValue::String(s.clone()),
+                            Value::Bool(b) => OnDemandColumnValue::Bool(*b),
+                            Value::Binary(b) => OnDemandColumnValue::Binary(b.clone()),
+                            Value::Null => OnDemandColumnValue::Null,
+                            _ => OnDemandColumnValue::String(serde_json::to_string(v).unwrap_or_default()),
+                        };
+                        (k.clone(), cv)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Insert into storage (fast WAL append)
+        let ids = self.storage.insert_rows(&converted)?;
+
+        // Update schema if new columns
+        {
+            let mut schema = self.schema.write();
+            if let Some(row) = rows.first() {
+                for (k, v) in row {
+                    if k != "_id" && !schema.iter().any(|(n, _)| n == k) {
+                        schema.push((k.clone(), v.data_type()));
+                    }
+                }
+            }
+        }
+
+        Ok(ids)
+    }
+
+    /// Delete row by ID
+    pub fn delete(&self, id: u64) -> io::Result<bool> {
+        self.storage.delete(id)
+    }
+
+    /// Save/compact (merge WAL into main file)
+    pub fn save(&self) -> io::Result<()> {
+        self.storage.save()
+    }
+
+    /// Flush WAL to disk (without compaction)
+    pub fn flush(&self) -> io::Result<()> {
+        self.storage.flush()
+    }
+
+    /// Check if compaction is needed
+    pub fn needs_compaction(&self) -> bool {
+        self.storage.needs_compaction()
+    }
+
+    /// Compact WAL into main file
+    pub fn compact(&self) -> io::Result<()> {
+        self.storage.compact()
+    }
+
+    /// Get WAL record count
+    pub fn wal_record_count(&self) -> usize {
+        self.storage.wal_record_count()
+    }
+
+    /// Close storage
+    pub fn close(&self) -> io::Result<()> {
+        self.storage.close()
     }
 }
 

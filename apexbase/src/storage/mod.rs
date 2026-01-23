@@ -3,9 +3,12 @@
 //! This module provides the core columnar storage format for ApexBase.
 //! The V3 format supports on-demand column/row reading without loading
 //! the entire dataset into memory.
+//!
+//! Incremental writes use WAL (Write-Ahead Log) for fast append-only writes.
 
 pub mod on_demand;
 pub mod backend;
+pub mod incremental;
 
 // Re-export all public types from on_demand
 pub use on_demand::{
@@ -27,10 +30,19 @@ pub use backend::{
     TableStorageBackend,
     TableMetadata,
     StorageManager,
+    IncrementalStorageBackend,
     typed_column_to_column_data,
     column_data_to_typed_column,
     datatype_to_column_type,
     column_type_to_datatype,
+};
+
+// Re-export incremental storage types
+pub use incremental::{
+    IncrementalStorage,
+    WalRecord,
+    WalWriter,
+    WalReader,
 };
 
 // Type alias for backward compatibility

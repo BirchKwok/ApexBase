@@ -298,11 +298,41 @@ impl ApexStorageImpl {
             Ok::<Vec<u64>, PyErr>(ids)
         })?;
 
-        // Index in FTS if enabled
-        for (i, item) in data.iter().enumerate() {
-            if let Ok(dict) = item.downcast::<PyDict>() {
-                if i < ids.len() {
-                    let _ = self.index_for_fts(ids[i] as i64, &dict);
+        // Index in FTS if enabled (batch operation - only if FTS manager exists)
+        {
+            let mgr = self.fts_manager.read();
+            if mgr.is_some() {
+                let table_name = self.current_table.read().clone();
+                let index_fields = self.fts_index_fields.read().get(&table_name).cloned();
+                
+                if let Some(m) = mgr.as_ref() {
+                    if let Ok(engine) = m.get_engine(&table_name) {
+                        for (i, item) in data.iter().enumerate() {
+                            if let Ok(dict) = item.downcast::<PyDict>() {
+                                if i < ids.len() {
+                                    // Build fields map inline
+                                    let mut fields = HashMap::new();
+                                    for (key, value) in dict.iter() {
+                                        if let Ok(key_str) = key.extract::<String>() {
+                                            if key_str == "_id" { continue; }
+                                            let should_index = match &index_fields {
+                                                Some(idx_fields) => idx_fields.contains(&key_str),
+                                                None => value.extract::<String>().is_ok(),
+                                            };
+                                            if should_index {
+                                                if let Ok(s) = value.extract::<String>() {
+                                                    fields.insert(key_str, s);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !fields.is_empty() {
+                                        let _ = engine.add_document(ids[i], fields);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -444,6 +474,113 @@ impl ApexStorageImpl {
         out.set_item("rows_affected", 0)?;
         
         Ok(out.into())
+    }
+    
+    /// Execute SQL query and return Arrow FFI pointers for zero-copy transfer
+    /// Returns (schema_ptr, array_ptr) that can be imported by PyArrow
+    fn _execute_arrow_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(usize, usize)> {
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        use arrow::array::{StructArray, Array};
+        
+        let sql = sql.to_string();
+        let table_path = self.get_current_table_path()?;
+        let base_dir = self.base_dir.clone();
+
+        // Execute query in Rust thread pool
+        let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
+            let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            
+            result.to_record_batch()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        
+        // Empty result
+        if batch.num_rows() == 0 {
+            return Ok((0, 0));
+        }
+        
+        // Convert RecordBatch to StructArray for FFI export
+        let struct_array: StructArray = batch.into();
+        let array_data = struct_array.to_data();
+        
+        // Export to FFI
+        let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&array_data)
+            .map_err(|e| PyRuntimeError::new_err(format!("FFI export failed: {}", e)))?;
+        
+        // Leak the FFI structs to get stable pointers (caller must free via _free_arrow_ffi)
+        let schema_ptr = Box::into_raw(Box::new(ffi_schema)) as usize;
+        let array_ptr = Box::into_raw(Box::new(ffi_array)) as usize;
+        
+        Ok((schema_ptr, array_ptr))
+    }
+    
+    /// Free Arrow FFI pointers allocated by _execute_arrow_ffi or _query_arrow_ffi
+    fn _free_arrow_ffi(&self, schema_ptr: usize, array_ptr: usize) -> PyResult<()> {
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        
+        if schema_ptr != 0 {
+            unsafe {
+                let _ = Box::from_raw(schema_ptr as *mut FFI_ArrowSchema);
+            }
+        }
+        if array_ptr != 0 {
+            unsafe {
+                let _ = Box::from_raw(array_ptr as *mut FFI_ArrowArray);
+            }
+        }
+        Ok(())
+    }
+    
+    /// Query with Arrow FFI (zero-copy transfer)
+    fn _query_arrow_ffi(&self, py: Python<'_>, where_clause: &str, limit: Option<usize>) -> PyResult<(usize, usize)> {
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        use arrow::array::{StructArray, Array};
+        
+        let table_path = self.get_current_table_path()?;
+        let base_dir = self.base_dir.clone();
+        let where_clause = where_clause.to_string();
+        
+        // Build SQL from where clause
+        let sql = if let Some(lim) = limit {
+            if where_clause == "1=1" || where_clause.is_empty() {
+                format!("SELECT * FROM default LIMIT {}", lim)
+            } else {
+                format!("SELECT * FROM default WHERE {} LIMIT {}", where_clause, lim)
+            }
+        } else {
+            if where_clause == "1=1" || where_clause.is_empty() {
+                "SELECT * FROM default".to_string()
+            } else {
+                format!("SELECT * FROM default WHERE {}", where_clause)
+            }
+        };
+        
+        // Execute query
+        let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
+            let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            
+            result.to_record_batch()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        
+        // Empty result
+        if batch.num_rows() == 0 {
+            return Ok((0, 0));
+        }
+        
+        // Convert to StructArray for FFI
+        let struct_array: StructArray = batch.into();
+        let array_data = struct_array.to_data();
+        
+        let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&array_data)
+            .map_err(|e| PyRuntimeError::new_err(format!("FFI export failed: {}", e)))?;
+        
+        let schema_ptr = Box::into_raw(Box::new(ffi_schema)) as usize;
+        let array_ptr = Box::into_raw(Box::new(ffi_array)) as usize;
+        
+        Ok((schema_ptr, array_ptr))
     }
 
     // ========== Table Management ==========

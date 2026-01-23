@@ -108,6 +108,18 @@ pub enum AggregateFunc {
     Max,
 }
 
+impl std::fmt::Display for AggregateFunc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AggregateFunc::Count => write!(f, "COUNT"),
+            AggregateFunc::Sum => write!(f, "SUM"),
+            AggregateFunc::Avg => write!(f, "AVG"),
+            AggregateFunc::Min => write!(f, "MIN"),
+            AggregateFunc::Max => write!(f, "MAX"),
+        }
+    }
+}
+
 /// ORDER BY clause
 #[derive(Debug, Clone)]
 pub struct OrderByClause {
@@ -189,6 +201,23 @@ pub enum UnaryOperator {
 // ============================================================================
 
 impl SelectStatement {
+    /// Extract columns needed only for WHERE clause evaluation
+    /// Used for late materialization optimization
+    pub fn where_columns(&self) -> Vec<String> {
+        let mut columns = Vec::new();
+        if let Some(ref expr) = self.where_clause {
+            Self::extract_columns_from_expr(expr, &mut columns);
+        }
+        columns.sort();
+        columns.dedup();
+        columns
+    }
+    
+    /// Check if this query uses SELECT * (needs all columns)
+    pub fn is_select_star(&self) -> bool {
+        self.columns.iter().any(|col| matches!(col, SelectColumn::All))
+    }
+    
     /// Extract all column names required by this SELECT statement
     /// Returns None if SELECT * is used (meaning all columns needed)
     pub fn required_columns(&self) -> Option<Vec<String>> {
