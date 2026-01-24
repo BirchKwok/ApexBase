@@ -1038,6 +1038,8 @@ pub struct OnDemandStorage {
     /// ID to row index mapping for fast lookups (lazy-loaded)
     /// Only built when needed for delete/exists operations
     id_to_idx: RwLock<Option<HashMap<u64, usize>>>,
+    /// Cached count of active (non-deleted) rows for O(1) COUNT(*)
+    active_count: AtomicU64,
 }
 
 impl OnDemandStorage {
@@ -1059,6 +1061,7 @@ impl OnDemandStorage {
             nulls: RwLock::new(Vec::new()),
             deleted: RwLock::new(Vec::new()),
             id_to_idx: RwLock::new(Some(HashMap::new())),
+            active_count: AtomicU64::new(0),
         };
 
         // Write initial file
@@ -1140,6 +1143,7 @@ impl OnDemandStorage {
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(deleted),
             id_to_idx: RwLock::new(None),  // Lazy loaded when needed
+            active_count: AtomicU64::new(id_count as u64),  // All rows active on fresh open
         })
     }
 
@@ -1488,6 +1492,493 @@ impl OnDemandStorage {
 
         Ok((result, matching_indices))
     }
+    
+    /// Read columns with STRING predicate pushdown and early termination for LIMIT
+    /// Stops scanning once we have enough matching rows - much faster for LIMIT queries
+    pub fn read_columns_filtered_string_with_limit(
+        &self,
+        column_names: Option<&[&str]>,
+        filter_column: &str,
+        filter_value: &str,
+        filter_eq: bool,
+        limit: usize,
+        offset: usize,
+    ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
+        let header = self.header.read();
+        let schema = self.schema.read();
+        let column_index = self.column_index.read();
+        
+        let total_rows = header.row_count as usize;
+        if total_rows == 0 {
+            return Ok((HashMap::new(), Vec::new()));
+        }
+
+        let filter_col_idx = schema.get_index(filter_column).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("Filter column not found: {}", filter_column))
+        })?;
+        
+        let (_, filter_col_type) = &schema.columns[filter_col_idx];
+        let filter_index = &column_index[filter_col_idx];
+        
+        if !matches!(filter_col_type, ColumnType::String | ColumnType::StringDict) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "String filter requires string column"));
+        }
+        
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+        })?;
+        
+        let mut mmap_cache = self.mmap_cache.write();
+        let needed = offset + limit;
+
+        // For dictionary-encoded strings, use fast integer key scan with early termination
+        // Format: [row_count:u64][dict_size:u64][indices:u32*row_count][dict_offsets:u32*dict_size][dict_data_len:u64][dict_data]
+        if *filter_col_type == ColumnType::StringDict {
+            let base_offset = filter_index.data_offset;
+            
+            // Read header: [row_count:u64][dict_size:u64]
+            let mut header = [0u8; 16];
+            mmap_cache.read_at(file, &mut header, base_offset)?;
+            let stored_rows = u64::from_le_bytes(header[0..8].try_into().unwrap()) as usize;
+            let dict_size = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
+            
+            if stored_rows == 0 || dict_size == 0 {
+                return Ok((HashMap::new(), Vec::new()));
+            }
+            
+            // Read dict_offsets
+            let dict_offsets_offset = base_offset + 16 + (stored_rows * 4) as u64;
+            let mut dict_offsets_buf = vec![0u8; dict_size * 4];
+            mmap_cache.read_at(file, &mut dict_offsets_buf, dict_offsets_offset)?;
+            
+            let mut dict_offsets = Vec::with_capacity(dict_size);
+            for i in 0..dict_size {
+                dict_offsets.push(u32::from_le_bytes(dict_offsets_buf[i * 4..(i + 1) * 4].try_into().unwrap()));
+            }
+            
+            // Read dict_data_len and dict_data
+            let dict_data_len_offset = dict_offsets_offset + (dict_size * 4) as u64;
+            let mut data_len_buf = [0u8; 8];
+            mmap_cache.read_at(file, &mut data_len_buf, dict_data_len_offset)?;
+            let dict_data_len = u64::from_le_bytes(data_len_buf) as usize;
+            
+            let dict_data_offset = dict_data_len_offset + 8;
+            let mut dict_data = vec![0u8; dict_data_len];
+            if dict_data_len > 0 {
+                mmap_cache.read_at(file, &mut dict_data, dict_data_offset)?;
+            }
+            
+            // Find target key in dictionary
+            // dict_offsets[i] gives start of string i, dict_offsets[i+1] or dict_data_len gives end
+            let filter_bytes = filter_value.as_bytes();
+            let mut target_key: Option<u32> = None;
+            let dict_count = dict_size.saturating_sub(1); // dict_offsets has dict_size elements, so dict_count = dict_size - 1 strings
+            
+            for i in 0..dict_count {
+                let start = dict_offsets[i] as usize;
+                let end = if i + 1 < dict_size { dict_offsets[i + 1] as usize } else { dict_data_len };
+                if end <= dict_data.len() && start <= end && &dict_data[start..end] == filter_bytes {
+                    target_key = Some((i + 1) as u32); // +1 because 0 = NULL
+                    break;
+                }
+            }
+            
+            let target_key = match (target_key, filter_eq) {
+                (Some(k), true) => k,
+                (None, true) => return Ok((HashMap::new(), Vec::new())),
+                _ => return self.read_columns_filtered_string(column_names, filter_column, filter_value, filter_eq),
+            };
+            
+            // Stream through indices with early termination
+            let indices_offset = base_offset + 16; // indices start right after header
+            let mut matching_indices = Vec::with_capacity(needed.min(1000));
+            
+            // Read indices in chunks for efficiency
+            const CHUNK_SIZE: usize = 4096;
+            let mut chunk_buf = vec![0u32; CHUNK_SIZE];
+            let mut row = 0usize;
+            
+            while row < stored_rows && matching_indices.len() < needed {
+                let chunk_rows = CHUNK_SIZE.min(stored_rows - row);
+                let chunk_bytes = unsafe {
+                    std::slice::from_raw_parts_mut(chunk_buf.as_mut_ptr() as *mut u8, chunk_rows * 4)
+                };
+                mmap_cache.read_at(file, chunk_bytes, indices_offset + (row * 4) as u64)?;
+                
+                for i in 0..chunk_rows {
+                    if chunk_buf[i] == target_key {
+                        matching_indices.push(row + i);
+                        if matching_indices.len() >= needed {
+                            break;
+                        }
+                    }
+                }
+                row += chunk_rows;
+            }
+            
+            // Apply offset
+            let final_indices: Vec<usize> = matching_indices.into_iter().skip(offset).take(limit).collect();
+            
+            if final_indices.is_empty() {
+                return Ok((HashMap::new(), Vec::new()));
+            }
+            
+            // Read columns for matching rows
+            let col_indices: Vec<usize> = match column_names {
+                Some(names) => names.iter().filter_map(|name| schema.get_index(name)).collect(),
+                None => (0..schema.column_count()).collect(),
+            };
+            
+            let mut result = HashMap::new();
+            for &col_idx in &col_indices {
+                let (col_name, col_type) = &schema.columns[col_idx];
+                let index_entry = &column_index[col_idx];
+                let col_data = self.read_column_scattered_mmap(&mut mmap_cache, file, index_entry, *col_type, &final_indices, total_rows)?;
+                result.insert(col_name.clone(), col_data);
+            }
+            
+            return Ok((result, final_indices));
+        }
+        
+        // Fallback to regular method for non-dictionary strings
+        self.read_columns_filtered_string(column_names, filter_column, filter_value, filter_eq)
+    }
+
+    /// Read columns with numeric range filter and early termination for LIMIT
+    /// Optimized for SELECT * WHERE col BETWEEN low AND high LIMIT n
+    pub fn read_columns_filtered_range_with_limit(
+        &self,
+        column_names: Option<&[&str]>,
+        filter_column: &str,
+        low: f64,
+        high: f64,
+        limit: usize,
+        offset: usize,
+    ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
+        let schema = self.schema.read();
+        let column_index = self.column_index.read();
+        let header = self.header.read();
+        let deleted = self.deleted.read();
+        
+        let filter_col_idx = schema.get_index(filter_column).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("Column not found: {}", filter_column))
+        })?;
+        
+        let (_, filter_col_type) = &schema.columns[filter_col_idx];
+        let filter_index = &column_index[filter_col_idx];
+        let total_rows = header.row_count as usize;
+        
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+        })?;
+        
+        let mut mmap_cache = self.mmap_cache.write();
+        let needed = offset + limit;
+        
+        // Only works for numeric columns
+        if !matches!(filter_col_type, ColumnType::Int64 | ColumnType::Float64 | 
+                     ColumnType::Int32 | ColumnType::Int16 | ColumnType::Int8 |
+                     ColumnType::UInt64 | ColumnType::UInt32 | ColumnType::UInt16 | ColumnType::UInt8 |
+                     ColumnType::Float32) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Range filter only works on numeric columns"));
+        }
+        
+        // Stream through the filter column in chunks with early termination
+        const CHUNK_SIZE: usize = 8192;
+        let mut matching_indices = Vec::with_capacity(needed);
+        let mut row_start = 0;
+        
+        while row_start < total_rows && matching_indices.len() < needed {
+            let chunk_rows = CHUNK_SIZE.min(total_rows - row_start);
+            
+            // Read chunk of filter column
+            let chunk_data = self.read_column_range_mmap(
+                &mut mmap_cache, file, filter_index, *filter_col_type, 
+                row_start, chunk_rows, total_rows
+            )?;
+            
+            // Evaluate range predicate on chunk
+            match &chunk_data {
+                ColumnData::Int64(values) => {
+                    let low_i = low as i64;
+                    let high_i = high as i64;
+                    for (i, &v) in values.iter().enumerate() {
+                        let row_idx = row_start + i;
+                        // Check deleted bitmap
+                        let byte_idx = row_idx / 8;
+                        let bit_idx = row_idx % 8;
+                        let is_deleted = byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 == 1;
+                        
+                        if !is_deleted && v >= low_i && v <= high_i {
+                            matching_indices.push(row_idx);
+                            if matching_indices.len() >= needed {
+                                break;
+                            }
+                        }
+                    }
+                }
+                ColumnData::Float64(values) => {
+                    for (i, &v) in values.iter().enumerate() {
+                        let row_idx = row_start + i;
+                        let byte_idx = row_idx / 8;
+                        let bit_idx = row_idx % 8;
+                        let is_deleted = byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 == 1;
+                        
+                        if !is_deleted && v >= low && v <= high {
+                            matching_indices.push(row_idx);
+                            if matching_indices.len() >= needed {
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            
+            row_start += chunk_rows;
+        }
+        
+        // Apply offset
+        let final_indices: Vec<usize> = matching_indices.into_iter().skip(offset).take(limit).collect();
+        
+        if final_indices.is_empty() {
+            return Ok((HashMap::new(), Vec::new()));
+        }
+        
+        // Read columns for matching rows
+        let col_indices: Vec<usize> = match column_names {
+            Some(names) => names.iter().filter_map(|name| schema.get_index(name)).collect(),
+            None => (0..schema.column_count()).collect(),
+        };
+        
+        let mut result = HashMap::new();
+        for &col_idx in &col_indices {
+            let (col_name, col_type) = &schema.columns[col_idx];
+            let index_entry = &column_index[col_idx];
+            let col_data = self.read_column_scattered_mmap(&mut mmap_cache, file, index_entry, *col_type, &final_indices, total_rows)?;
+            result.insert(col_name.clone(), col_data);
+        }
+        
+        Ok((result, final_indices))
+    }
+
+    /// Read columns with combined STRING + NUMERIC filter and early termination
+    /// Optimized for SELECT * WHERE string_col = 'value' AND numeric_col > N LIMIT n
+    /// Two-stage filter: first string equality (fast dict scan), then numeric comparison
+    pub fn read_columns_filtered_string_numeric_with_limit(
+        &self,
+        column_names: Option<&[&str]>,
+        string_column: &str,
+        string_value: &str,
+        numeric_column: &str,
+        numeric_op: &str,  // ">" | ">=" | "<" | "<=" | "="
+        numeric_value: f64,
+        limit: usize,
+        offset: usize,
+    ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
+        let header = self.header.read();
+        let schema = self.schema.read();
+        let column_index = self.column_index.read();
+        let deleted = self.deleted.read();
+        
+        let total_rows = header.row_count as usize;
+        if total_rows == 0 {
+            return Ok((HashMap::new(), Vec::new()));
+        }
+
+        // Get string column info
+        let str_col_idx = schema.get_index(string_column).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("String column not found: {}", string_column))
+        })?;
+        let (_, str_col_type) = &schema.columns[str_col_idx];
+        let str_index = &column_index[str_col_idx];
+        
+        // Get numeric column info
+        let num_col_idx = schema.get_index(numeric_column).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("Numeric column not found: {}", numeric_column))
+        })?;
+        let (_, num_col_type) = &schema.columns[num_col_idx];
+        let num_index = &column_index[num_col_idx];
+        
+        // Validate column types
+        if !matches!(str_col_type, ColumnType::String | ColumnType::StringDict) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "String filter requires string column"));
+        }
+        if !matches!(num_col_type, ColumnType::Int64 | ColumnType::Float64 | 
+                     ColumnType::Int32 | ColumnType::Int16 | ColumnType::Int8 |
+                     ColumnType::UInt64 | ColumnType::UInt32 | ColumnType::UInt16 | ColumnType::UInt8 |
+                     ColumnType::Float32) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Numeric filter requires numeric column"));
+        }
+        
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+        })?;
+        
+        let mut mmap_cache = self.mmap_cache.write();
+        let needed = offset + limit;
+
+        // For StringDict, use fast dictionary-based filter
+        if *str_col_type == ColumnType::StringDict {
+            let base_offset = str_index.data_offset;
+            
+            // Read dictionary header and find target key
+            let mut str_header = [0u8; 16];
+            mmap_cache.read_at(file, &mut str_header, base_offset)?;
+            let stored_rows = u64::from_le_bytes(str_header[0..8].try_into().unwrap()) as usize;
+            let dict_size = u64::from_le_bytes(str_header[8..16].try_into().unwrap()) as usize;
+            
+            if stored_rows == 0 || dict_size == 0 {
+                return Ok((HashMap::new(), Vec::new()));
+            }
+            
+            // Read dictionary
+            let dict_offsets_offset = base_offset + 16 + (stored_rows * 4) as u64;
+            let mut dict_offsets_buf = vec![0u8; dict_size * 4];
+            mmap_cache.read_at(file, &mut dict_offsets_buf, dict_offsets_offset)?;
+            
+            let mut dict_offsets = Vec::with_capacity(dict_size);
+            for i in 0..dict_size {
+                dict_offsets.push(u32::from_le_bytes(dict_offsets_buf[i * 4..(i + 1) * 4].try_into().unwrap()));
+            }
+            
+            let dict_data_len_offset = dict_offsets_offset + (dict_size * 4) as u64;
+            let mut data_len_buf = [0u8; 8];
+            mmap_cache.read_at(file, &mut data_len_buf, dict_data_len_offset)?;
+            let dict_data_len = u64::from_le_bytes(data_len_buf) as usize;
+            
+            let dict_data_offset = dict_data_len_offset + 8;
+            let mut dict_data = vec![0u8; dict_data_len];
+            if dict_data_len > 0 {
+                mmap_cache.read_at(file, &mut dict_data, dict_data_offset)?;
+            }
+            
+            // Find target key
+            let filter_bytes = string_value.as_bytes();
+            let mut target_key: Option<u32> = None;
+            let dict_count = dict_size.saturating_sub(1);
+            
+            for i in 0..dict_count {
+                let start = dict_offsets[i] as usize;
+                let end = if i + 1 < dict_size { dict_offsets[i + 1] as usize } else { dict_data_len };
+                if end <= dict_data.len() && start <= end && &dict_data[start..end] == filter_bytes {
+                    target_key = Some((i + 1) as u32);
+                    break;
+                }
+            }
+            
+            let target_key = match target_key {
+                Some(k) => k,
+                None => return Ok((HashMap::new(), Vec::new())),
+            };
+            
+            // Two-stage streaming filter with early termination
+            let str_indices_offset = base_offset + 16;
+            let mut matching_indices = Vec::with_capacity(needed.min(1000));
+            
+            const CHUNK_SIZE: usize = 8192;
+            let mut row = 0usize;
+            
+            while row < stored_rows && matching_indices.len() < needed {
+                let chunk_rows = CHUNK_SIZE.min(stored_rows - row);
+                
+                // Read string indices chunk
+                let mut str_chunk = vec![0u32; chunk_rows];
+                let chunk_bytes = unsafe {
+                    std::slice::from_raw_parts_mut(str_chunk.as_mut_ptr() as *mut u8, chunk_rows * 4)
+                };
+                mmap_cache.read_at(file, chunk_bytes, str_indices_offset + (row * 4) as u64)?;
+                
+                // Read numeric column chunk
+                let num_chunk = self.read_column_range_mmap(
+                    &mut mmap_cache, file, num_index, *num_col_type, row, chunk_rows, total_rows
+                )?;
+                
+                // Combined filter
+                for i in 0..chunk_rows {
+                    let row_idx = row + i;
+                    
+                    // Check deleted
+                    let byte_idx = row_idx / 8;
+                    let bit_idx = row_idx % 8;
+                    let is_deleted = byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 == 1;
+                    if is_deleted {
+                        continue;
+                    }
+                    
+                    // Check string match
+                    if str_chunk[i] != target_key {
+                        continue;
+                    }
+                    
+                    // Check numeric condition
+                    let num_match = match &num_chunk {
+                        ColumnData::Int64(values) => {
+                            let v = values[i] as f64;
+                            match numeric_op {
+                                ">" => v > numeric_value,
+                                ">=" => v >= numeric_value,
+                                "<" => v < numeric_value,
+                                "<=" => v <= numeric_value,
+                                "=" => (v - numeric_value).abs() < f64::EPSILON,
+                                _ => false,
+                            }
+                        }
+                        ColumnData::Float64(values) => {
+                            let v = values[i];
+                            match numeric_op {
+                                ">" => v > numeric_value,
+                                ">=" => v >= numeric_value,
+                                "<" => v < numeric_value,
+                                "<=" => v <= numeric_value,
+                                "=" => (v - numeric_value).abs() < f64::EPSILON,
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    };
+                    
+                    if num_match {
+                        matching_indices.push(row_idx);
+                        if matching_indices.len() >= needed {
+                            break;
+                        }
+                    }
+                }
+                
+                row += chunk_rows;
+            }
+            
+            // Apply offset
+            let final_indices: Vec<usize> = matching_indices.into_iter().skip(offset).take(limit).collect();
+            
+            if final_indices.is_empty() {
+                return Ok((HashMap::new(), Vec::new()));
+            }
+            
+            // Read columns for matching rows
+            let col_indices: Vec<usize> = match column_names {
+                Some(names) => names.iter().filter_map(|name| schema.get_index(name)).collect(),
+                None => (0..schema.column_count()).collect(),
+            };
+            
+            let mut result = HashMap::new();
+            for &col_idx in &col_indices {
+                let (col_name, col_type) = &schema.columns[col_idx];
+                let index_entry = &column_index[col_idx];
+                let col_data = self.read_column_scattered_mmap(&mut mmap_cache, file, index_entry, *col_type, &final_indices, total_rows)?;
+                result.insert(col_name.clone(), col_data);
+            }
+            
+            return Ok((result, final_indices));
+        }
+        
+        // Fallback for non-dictionary strings
+        Err(io::Error::new(io::ErrorKind::InvalidInput, "Combined filter requires dictionary-encoded string column"))
+    }
 
     /// Read a single column for specific row indices
     pub fn read_column_by_indices(
@@ -1523,6 +2014,15 @@ impl OnDemandStorage {
         let start = start_row.min(total);
         let count = row_count.map(|c| c.min(total - start)).unwrap_or(total - start);
         Ok(ids[start..start + count].to_vec())
+    }
+
+    /// Read IDs for specific row indices (optimized for scattered access)
+    pub fn read_ids_by_indices(&self, row_indices: &[usize]) -> io::Result<Vec<i64>> {
+        let ids = self.ids.read();
+        let total = ids.len();
+        Ok(row_indices.iter()
+            .map(|&i| if i < total { ids[i] as i64 } else { 0 })
+            .collect())
     }
 
     // ========================================================================
@@ -1762,6 +2262,7 @@ impl OnDemandStorage {
     }
 
     /// Read StringDict column with scattered row indices
+    /// OPTIMIZED: Only reads the specific indices needed, not all indices
     fn read_string_dict_column_scattered_mmap(
         &self,
         mmap_cache: &mut MmapCache,
@@ -1785,19 +2286,55 @@ impl OnDemandStorage {
         let total_rows = u64::from_le_bytes(header[0..8].try_into().unwrap()) as usize;
         let dict_size = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
         
-        // Read all indices (we need random access)
         let all_indices_offset = base_offset + 16;
-        let mut all_indices_buf = vec![0u8; total_rows * 4];
-        mmap_cache.read_at(file, &mut all_indices_buf, all_indices_offset)?;
+        let n = row_indices.len();
         
-        // Extract only the indices we need
-        let mut indices = Vec::with_capacity(row_indices.len());
-        for &row_idx in row_indices {
-            if row_idx < total_rows {
-                let idx = u32::from_le_bytes(all_indices_buf[row_idx * 4..(row_idx + 1) * 4].try_into().unwrap());
-                indices.push(idx);
+        // OPTIMIZED: Read only the specific indices we need instead of all indices
+        // For small scattered reads, read individually; for dense reads, read a range
+        let mut indices = Vec::with_capacity(n);
+        
+        if n <= 128 {
+            // Small number of indices - read each one individually
+            let mut buf = [0u8; 4];
+            for &row_idx in row_indices {
+                if row_idx < total_rows {
+                    mmap_cache.read_at(file, &mut buf, all_indices_offset + (row_idx * 4) as u64)?;
+                    indices.push(u32::from_le_bytes(buf));
+                } else {
+                    indices.push(0);
+                }
+            }
+        } else {
+            // For larger reads, find min/max and read that range
+            let min_idx = *row_indices.iter().min().unwrap_or(&0);
+            let max_idx = *row_indices.iter().max().unwrap_or(&0);
+            let range_size = max_idx - min_idx + 1;
+            
+            // If range is reasonably dense, read the whole range
+            if range_size <= n * 4 && range_size <= total_rows {
+                let mut range_buf = vec![0u8; range_size * 4];
+                mmap_cache.read_at(file, &mut range_buf, all_indices_offset + (min_idx * 4) as u64)?;
+                
+                for &row_idx in row_indices {
+                    if row_idx < total_rows {
+                        let local_idx = row_idx - min_idx;
+                        let idx = u32::from_le_bytes(range_buf[local_idx * 4..(local_idx + 1) * 4].try_into().unwrap());
+                        indices.push(idx);
+                    } else {
+                        indices.push(0);
+                    }
+                }
             } else {
-                indices.push(0); // NULL for out-of-bounds
+                // Sparse - read individually
+                let mut buf = [0u8; 4];
+                for &row_idx in row_indices {
+                    if row_idx < total_rows {
+                        mmap_cache.read_at(file, &mut buf, all_indices_offset + (row_idx * 4) as u64)?;
+                        indices.push(u32::from_le_bytes(buf));
+                    } else {
+                        indices.push(0);
+                    }
+                }
             }
         }
         
@@ -1931,6 +2468,88 @@ impl OnDemandStorage {
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Not a variable type")),
         }
     }
+    
+    /// Optimized scattered read for numeric types using row-group based I/O
+    /// Reads data in larger chunks (row-groups) to reduce number of I/O operations
+    fn read_numeric_scattered_optimized<T: Copy + Default + 'static>(
+        mmap_cache: &mut MmapCache,
+        file: &File,
+        index: &ColumnIndexEntry,
+        row_indices: &[usize],
+        header_size: u64,
+    ) -> io::Result<Vec<T>> {
+        if row_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        let n = row_indices.len();
+        let elem_size = std::mem::size_of::<T>();
+        
+        // For small numbers, simple sequential read without sorting is faster
+        if n <= 128 {
+            let mut values = Vec::with_capacity(n);
+            let mut buf = [0u8; 8];
+            for &idx in row_indices {
+                mmap_cache.read_at(file, &mut buf[..elem_size], index.data_offset + header_size + (idx * elem_size) as u64)?;
+                let val: T = unsafe { std::ptr::read(buf.as_ptr() as *const T) };
+                values.push(val);
+            }
+            return Ok(values);
+        }
+        
+        // ROW-GROUP BASED READING for larger scattered reads
+        const ROW_GROUP_SIZE: usize = 8192;
+        
+        // Sort indices and track original positions
+        let mut indexed: Vec<(usize, usize)> = row_indices.iter().enumerate().map(|(i, &idx)| (idx, i)).collect();
+        indexed.sort_unstable_by_key(|&(idx, _)| idx);
+        
+        let mut result: Vec<T> = vec![T::default(); n];
+        let mut i = 0;
+        
+        // Process by row-groups
+        while i < indexed.len() {
+            let first_idx = indexed[i].0;
+            let group_start = (first_idx / ROW_GROUP_SIZE) * ROW_GROUP_SIZE;
+            let group_end = group_start + ROW_GROUP_SIZE;
+            
+            // Find all indices within this row-group
+            let mut group_indices = Vec::new();
+            while i < indexed.len() && indexed[i].0 < group_end {
+                group_indices.push(indexed[i]);
+                i += 1;
+            }
+            
+            // Decide read strategy based on density within group
+            let indices_in_group = group_indices.len();
+            let span = group_indices.last().unwrap().0 - group_indices.first().unwrap().0 + 1;
+            
+            // If indices are dense enough, read the span; otherwise read full group
+            if indices_in_group * 4 >= span || span <= 256 {
+                // Dense or small span: read just the span
+                let read_start = group_indices.first().unwrap().0;
+                let read_len = span;
+                let mut buf: Vec<u8> = vec![0u8; read_len * elem_size];
+                mmap_cache.read_at(file, &mut buf, index.data_offset + header_size + (read_start * elem_size) as u64)?;
+                
+                for (idx, orig_pos) in group_indices {
+                    let offset = idx - read_start;
+                    let val: T = unsafe { std::ptr::read(buf.as_ptr().add(offset * elem_size) as *const T) };
+                    result[orig_pos] = val;
+                }
+            } else {
+                // Sparse: read individual values (but they're sorted so still sequential-ish)
+                let mut buf = [0u8; 8];
+                for (idx, orig_pos) in group_indices {
+                    mmap_cache.read_at(file, &mut buf[..elem_size], index.data_offset + header_size + (idx * elem_size) as u64)?;
+                    let val: T = unsafe { std::ptr::read(buf.as_ptr() as *const T) };
+                    result[orig_pos] = val;
+                }
+            }
+        }
+        
+        Ok(result)
+    }
 
     fn read_column_scattered_mmap(
         &self,
@@ -1947,22 +2566,12 @@ impl OnDemandStorage {
         match dtype {
             ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
             ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 => {
-                let mut values = Vec::with_capacity(row_indices.len());
-                let mut buf = [0u8; 8];
-                for &idx in row_indices {
-                    mmap_cache.read_at(file, &mut buf, index.data_offset + HEADER_SIZE + (idx * 8) as u64)?;
-                    values.push(i64::from_le_bytes(buf));
-                }
-                Ok(ColumnData::Int64(values))
+                Self::read_numeric_scattered_optimized::<i64>(mmap_cache, file, index, row_indices, HEADER_SIZE)
+                    .map(ColumnData::Int64)
             }
             ColumnType::Float64 | ColumnType::Float32 => {
-                let mut values = Vec::with_capacity(row_indices.len());
-                let mut buf = [0u8; 8];
-                for &idx in row_indices {
-                    mmap_cache.read_at(file, &mut buf, index.data_offset + HEADER_SIZE + (idx * 8) as u64)?;
-                    values.push(f64::from_le_bytes(buf));
-                }
-                Ok(ColumnData::Float64(values))
+                Self::read_numeric_scattered_optimized::<f64>(mmap_cache, file, index, row_indices, HEADER_SIZE)
+                    .map(ColumnData::Float64)
             }
             ColumnType::String | ColumnType::Binary => {
                 // Optimized scattered read for variable-length types
@@ -2181,6 +2790,9 @@ impl OnDemandStorage {
             let new_len = (self.ids.read().len() + 7) / 8;
             deleted.resize(new_len, 0);
         }
+        
+        // Update active count (new rows are not deleted)
+        self.active_count.fetch_add(row_count as u64, Ordering::Relaxed);
 
         Ok(ids)
     }
@@ -2352,6 +2964,9 @@ impl OnDemandStorage {
             let new_len = (self.ids.read().len() + 7) / 8;
             deleted.resize(new_len, 0);
         }
+        
+        // Update active count (new rows are not deleted)
+        self.active_count.fetch_add(row_count as u64, Ordering::Relaxed);
 
         Ok(ids)
     }
@@ -2377,6 +2992,12 @@ impl OnDemandStorage {
                 deleted.resize(byte_idx + 1, 0);
             }
             
+            // Only decrement if not already deleted
+            let was_deleted = (deleted[byte_idx] >> bit_idx) & 1 == 1;
+            if !was_deleted {
+                self.active_count.fetch_sub(1, Ordering::Relaxed);
+            }
+            
             // Set the deleted bit
             deleted[byte_idx] |= 1 << bit_idx;
             true
@@ -2393,6 +3014,7 @@ impl OnDemandStorage {
         let map = id_to_idx.as_ref().unwrap();
         let mut deleted = self.deleted.write();
         let mut all_found = true;
+        let mut deleted_count = 0u64;
         
         for &id in ids {
             if let Some(&row_idx) = map.get(&id) {
@@ -2403,10 +3025,21 @@ impl OnDemandStorage {
                     deleted.resize(byte_idx + 1, 0);
                 }
                 
+                // Only count if not already deleted
+                let was_deleted = (deleted[byte_idx] >> bit_idx) & 1 == 1;
+                if !was_deleted {
+                    deleted_count += 1;
+                }
+                
                 deleted[byte_idx] |= 1 << bit_idx;
             } else {
                 all_found = false;
             }
+        }
+        
+        // Update active count
+        if deleted_count > 0 {
+            self.active_count.fetch_sub(deleted_count, Ordering::Relaxed);
         }
         
         all_found
@@ -2453,22 +3086,9 @@ impl OnDemandStorage {
         }
     }
 
-    /// Get the count of non-deleted rows
+    /// Get the count of non-deleted rows - O(1) from cached value
     pub fn active_row_count(&self) -> u64 {
-        let ids = self.ids.read();
-        let deleted = self.deleted.read();
-        let mut count = 0u64;
-        
-        for i in 0..ids.len() {
-            let byte_idx = i / 8;
-            let bit_idx = i % 8;
-            let is_deleted = byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 == 1;
-            if !is_deleted {
-                count += 1;
-            }
-        }
-        
-        count
+        self.active_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Add a new column to schema and storage with padding for existing rows
@@ -2987,6 +3607,9 @@ impl OnDemandStorage {
                 let new_len = (self.ids.read().len() + 7) / 8;
                 deleted.resize(new_len, 0);
             }
+            
+            // Update active count
+            self.active_count.fetch_add(row_count as u64, Ordering::Relaxed);
             
             return Ok(ids);
         }

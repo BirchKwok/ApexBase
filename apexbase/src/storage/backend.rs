@@ -1044,7 +1044,6 @@ impl TableStorageBackend {
         use std::sync::Arc;
 
         if row_indices.is_empty() {
-            // Return empty batch with full schema
             return self.read_columns_to_arrow(None, 0, Some(0));
         }
 
@@ -1061,7 +1060,7 @@ impl TableStorageBackend {
         arrays.push(Arc::new(Int64Array::from(filtered_ids)));
 
         // Read each column for the specified row indices
-        for (col_name, dt) in schema.iter() {
+        for (col_name, _dt) in schema.iter() {
             let col_data = self.storage.read_column_by_indices(col_name, row_indices)?;
             
             let (arrow_dt, array): (ArrowDataType, ArrayRef) = match col_data {
@@ -1242,10 +1241,374 @@ impl TableStorageBackend {
         arrow::record_batch::RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
+    
+    /// Read columns with STRING predicate pushdown and LIMIT early termination
+    /// Much faster for queries like SELECT * WHERE col = 'value' LIMIT n
+    pub fn read_columns_filtered_string_with_limit_to_arrow(
+        &self,
+        column_names: Option<&[&str]>,
+        filter_column: &str,
+        filter_value: &str,
+        filter_eq: bool,
+        limit: usize,
+        offset: usize,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
+        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use std::sync::Arc;
+
+        let (col_data, matching_indices) = self.storage.read_columns_filtered_string_with_limit(
+            column_names, filter_column, filter_value, filter_eq, limit, offset
+        )?;
+        
+        if col_data.is_empty() || matching_indices.is_empty() {
+            return self.read_columns_to_arrow(column_names, 0, Some(0));
+        }
+
+        let schema = self.schema.read();
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+
+        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        if include_id {
+            // OPTIMIZED: Read only the IDs we need instead of all IDs
+            let filtered_ids = self.storage.read_ids_by_indices(&matching_indices)?;
+            fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            arrays.push(Arc::new(Int64Array::from(filtered_ids)));
+        }
+
+        let col_order: Vec<String> = if let Some(names) = column_names {
+            names.iter().filter(|&s| *s != "_id").map(|s| s.to_string()).collect()
+        } else {
+            schema.iter().map(|(n, _)| n.clone()).collect()
+        };
+
+        for col_name in &col_order {
+            if let Some(data) = col_data.get(col_name) {
+                let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
+                    ColumnData::Int64(values) => {
+                        (ArrowDataType::Int64, Arc::new(Int64Array::from_iter_values(values.iter().copied())))
+                    }
+                    ColumnData::Float64(values) => {
+                        (ArrowDataType::Float64, Arc::new(Float64Array::from_iter_values(values.iter().copied())))
+                    }
+                    ColumnData::String { offsets, data: bytes } => {
+                        let count = offsets.len().saturating_sub(1);
+                        let strings: Vec<Option<&str>> = (0..count)
+                            .map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                std::str::from_utf8(&bytes[start..end]).ok()
+                            })
+                            .collect();
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    }
+                    ColumnData::Bool { data: packed, len } => {
+                        let bools: Vec<Option<bool>> = (0..*len)
+                            .map(|i| {
+                                let byte_idx = i / 8;
+                                let bit_idx = i % 8;
+                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                            })
+                            .collect();
+                        (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
+                    }
+                    ColumnData::Binary { offsets, data: bytes } => {
+                        use arrow::array::BinaryArray;
+                        let count = offsets.len().saturating_sub(1);
+                        let binary_data: Vec<Option<&[u8]>> = (0..count)
+                            .map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                Some(&bytes[start..end] as &[u8])
+                            })
+                            .collect();
+                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    }
+                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                        // OPTIMIZED: Use Arrow DictionaryArray to avoid string allocations
+                        use arrow::array::{DictionaryArray, UInt32Array};
+                        use arrow::datatypes::UInt32Type;
+                        
+                        // Build dictionary values (unique strings) - use &str references
+                        let dict_count = dict_offsets.len().saturating_sub(1);
+                        let dict_strings: Vec<Option<&str>> = (0..dict_count)
+                            .map(|i| {
+                                let start = dict_offsets[i] as usize;
+                                let end = dict_offsets[i + 1] as usize;
+                                std::str::from_utf8(&dict_data[start..end]).ok()
+                            })
+                            .collect();
+                        let values = StringArray::from(dict_strings);
+                        
+                        // Convert indices (0 = NULL, 1+ = dict index)
+                        let keys: Vec<Option<u32>> = indices.iter()
+                            .map(|&idx| if idx == 0 { None } else { Some(idx - 1) })
+                            .collect();
+                        let keys_array = UInt32Array::from(keys);
+                        
+                        let dict_array = DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        
+                        (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)), 
+                         Arc::new(dict_array) as ArrayRef)
+                    }
+                };
+                fields.push(Field::new(col_name, arrow_dt, true));
+                arrays.push(array);
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// Read columns with numeric RANGE predicate pushdown and LIMIT early termination
+    /// Much faster for queries like SELECT * WHERE col BETWEEN low AND high LIMIT n
+    pub fn read_columns_filtered_range_with_limit_to_arrow(
+        &self,
+        column_names: Option<&[&str]>,
+        filter_column: &str,
+        low: f64,
+        high: f64,
+        limit: usize,
+        offset: usize,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
+        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use std::sync::Arc;
+
+        let (col_data, matching_indices) = self.storage.read_columns_filtered_range_with_limit(
+            column_names, filter_column, low, high, limit, offset
+        )?;
+        
+        if col_data.is_empty() || matching_indices.is_empty() {
+            return self.read_columns_to_arrow(column_names, 0, Some(0));
+        }
+
+        let schema = self.schema.read();
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+
+        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        if include_id {
+            let filtered_ids = self.storage.read_ids_by_indices(&matching_indices)?;
+            fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            arrays.push(Arc::new(Int64Array::from(filtered_ids)));
+        }
+
+        let col_order: Vec<String> = if let Some(names) = column_names {
+            names.iter().filter(|&s| *s != "_id").map(|s| s.to_string()).collect()
+        } else {
+            schema.iter().map(|(n, _)| n.clone()).collect()
+        };
+
+        for col_name in &col_order {
+            if let Some(data) = col_data.get(col_name) {
+                let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
+                    ColumnData::Int64(values) => {
+                        (ArrowDataType::Int64, Arc::new(Int64Array::from_iter_values(values.iter().copied())))
+                    }
+                    ColumnData::Float64(values) => {
+                        (ArrowDataType::Float64, Arc::new(Float64Array::from_iter_values(values.iter().copied())))
+                    }
+                    ColumnData::String { offsets, data: bytes } => {
+                        let count = offsets.len().saturating_sub(1);
+                        let strings: Vec<Option<&str>> = (0..count)
+                            .map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                std::str::from_utf8(&bytes[start..end]).ok()
+                            })
+                            .collect();
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    }
+                    ColumnData::Bool { data: packed, len } => {
+                        let bools: Vec<Option<bool>> = (0..*len)
+                            .map(|i| {
+                                let byte_idx = i / 8;
+                                let bit_idx = i % 8;
+                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                            })
+                            .collect();
+                        (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
+                    }
+                    ColumnData::Binary { offsets, data: bytes } => {
+                        use arrow::array::BinaryArray;
+                        let count = offsets.len().saturating_sub(1);
+                        let binary_data: Vec<Option<&[u8]>> = (0..count)
+                            .map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                Some(&bytes[start..end])
+                            })
+                            .collect();
+                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    }
+                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                        // OPTIMIZED: Use Arrow DictionaryArray to avoid string allocations
+                        use arrow::array::{DictionaryArray, UInt32Array};
+                        use arrow::datatypes::UInt32Type;
+                        
+                        // Build dictionary values (unique strings) - use &str references
+                        let dict_count = dict_offsets.len().saturating_sub(1);
+                        let dict_strings: Vec<Option<&str>> = (0..dict_count)
+                            .map(|i| {
+                                let start = dict_offsets[i] as usize;
+                                let end = dict_offsets[i + 1] as usize;
+                                std::str::from_utf8(&dict_data[start..end]).ok()
+                            })
+                            .collect();
+                        let values = StringArray::from(dict_strings);
+                        
+                        // Convert indices (0 = NULL, 1+ = dict index)
+                        let keys: Vec<Option<u32>> = indices.iter()
+                            .map(|&idx| if idx == 0 { None } else { Some(idx - 1) })
+                            .collect();
+                        let keys_array = UInt32Array::from(keys);
+                        
+                        let dict_array = DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        
+                        (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)), 
+                         Arc::new(dict_array) as ArrayRef)
+                    }
+                };
+                fields.push(Field::new(col_name, arrow_dt, true));
+                arrays.push(array);
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
 
     /// Get underlying storage for direct access
     pub fn storage(&self) -> &OnDemandStorage {
         &self.storage
+    }
+
+    /// Read columns with combined STRING + NUMERIC filter and LIMIT early termination
+    /// Optimized for SELECT * WHERE string_col = 'value' AND numeric_col > N LIMIT n
+    pub fn read_columns_filtered_string_numeric_with_limit_to_arrow(
+        &self,
+        column_names: Option<&[&str]>,
+        string_column: &str,
+        string_value: &str,
+        numeric_column: &str,
+        numeric_op: &str,
+        numeric_value: f64,
+        limit: usize,
+        offset: usize,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
+        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use std::sync::Arc;
+
+        let (col_data, matching_indices) = self.storage.read_columns_filtered_string_numeric_with_limit(
+            column_names, string_column, string_value, numeric_column, numeric_op, numeric_value, limit, offset
+        )?;
+        
+        if col_data.is_empty() || matching_indices.is_empty() {
+            return self.read_columns_to_arrow(column_names, 0, Some(0));
+        }
+
+        let schema = self.schema.read();
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+
+        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        if include_id {
+            let filtered_ids = self.storage.read_ids_by_indices(&matching_indices)?;
+            fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            arrays.push(Arc::new(Int64Array::from(filtered_ids)));
+        }
+
+        let col_order: Vec<String> = if let Some(names) = column_names {
+            names.iter().filter(|&s| *s != "_id").map(|s| s.to_string()).collect()
+        } else {
+            schema.iter().map(|(n, _)| n.clone()).collect()
+        };
+
+        for col_name in &col_order {
+            if let Some(data) = col_data.get(col_name) {
+                let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
+                    ColumnData::Int64(values) => {
+                        (ArrowDataType::Int64, Arc::new(Int64Array::from_iter_values(values.iter().copied())))
+                    }
+                    ColumnData::Float64(values) => {
+                        (ArrowDataType::Float64, Arc::new(Float64Array::from_iter_values(values.iter().copied())))
+                    }
+                    ColumnData::String { offsets, data: bytes } => {
+                        let count = offsets.len().saturating_sub(1);
+                        let strings: Vec<Option<&str>> = (0..count)
+                            .map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                std::str::from_utf8(&bytes[start..end]).ok()
+                            })
+                            .collect();
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    }
+                    ColumnData::Bool { data: packed, len } => {
+                        let bools: Vec<Option<bool>> = (0..*len)
+                            .map(|i| {
+                                let byte_idx = i / 8;
+                                let bit_idx = i % 8;
+                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                            })
+                            .collect();
+                        (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
+                    }
+                    ColumnData::Binary { offsets, data: bytes } => {
+                        use arrow::array::BinaryArray;
+                        let count = offsets.len().saturating_sub(1);
+                        let binary_data: Vec<Option<&[u8]>> = (0..count)
+                            .map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                Some(&bytes[start..end])
+                            })
+                            .collect();
+                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    }
+                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                        // OPTIMIZED: Use Arrow DictionaryArray
+                        use arrow::array::{DictionaryArray, UInt32Array};
+                        use arrow::datatypes::UInt32Type;
+                        
+                        let dict_count = dict_offsets.len().saturating_sub(1);
+                        let dict_strings: Vec<Option<&str>> = (0..dict_count)
+                            .map(|i| {
+                                let start = dict_offsets[i] as usize;
+                                let end = dict_offsets[i + 1] as usize;
+                                std::str::from_utf8(&dict_data[start..end]).ok()
+                            })
+                            .collect();
+                        let values = StringArray::from(dict_strings);
+                        
+                        let keys: Vec<Option<u32>> = indices.iter()
+                            .map(|&idx| if idx == 0 { None } else { Some(idx - 1) })
+                            .collect();
+                        let keys_array = UInt32Array::from(keys);
+                        
+                        let dict_array = DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        
+                        (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)), 
+                         Arc::new(dict_array) as ArrayRef)
+                    }
+                };
+                fields.push(Field::new(col_name, arrow_dt, true));
+                arrays.push(array);
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 }
 

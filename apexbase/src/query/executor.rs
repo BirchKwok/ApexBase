@@ -427,8 +427,19 @@ impl ApexExecutor {
                             && !has_aggregation_check;
                         
                         if can_late_materialize_where {
-                            // Late materialization for SELECT * WHERE path
-                            Self::execute_with_late_materialization(&backend, &stmt, storage_path)?
+                            // FAST PATH 1: Try dictionary-based filter for simple string equality
+                            if let Some(result) = Self::try_fast_string_filter(&backend, &stmt)? {
+                                result
+                            // FAST PATH 2: Try numeric range filter for BETWEEN
+                            } else if let Some(result) = Self::try_fast_numeric_range_filter(&backend, &stmt)? {
+                                result
+                            // FAST PATH 3: Try combined string + numeric filter for multi-condition
+                            } else if let Some(result) = Self::try_fast_multi_condition_filter(&backend, &stmt)? {
+                                result
+                            } else {
+                                // Late materialization for SELECT * WHERE path
+                                Self::execute_with_late_materialization(&backend, &stmt, storage_path)?
+                            }
                         } else if can_late_materialize_order {
                             // Late materialization for ORDER BY + LIMIT path
                             Self::execute_with_order_late_materialization(&backend, &stmt)?
@@ -534,6 +545,303 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result))
     }
 
+    /// Fast path for simple string equality filters on dictionary-encoded columns
+    /// Uses storage-level early termination for LIMIT queries
+    /// Supports column projection pushdown (not limited to SELECT *)
+    fn try_fast_string_filter(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<RecordBatch>> {
+        // Only handle simple WHERE col = 'value' patterns
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        
+        // Must have LIMIT for early termination benefit
+        if stmt.limit.is_none() {
+            return Ok(None);
+        }
+        
+        // Extract column name and literal value from simple equality
+        let (col_name, filter_value) = match where_clause {
+            SqlExpr::BinaryOp { left, op, right } => {
+                use crate::query::sql_parser::BinaryOperator;
+                if *op != BinaryOperator::Eq {
+                    return Ok(None);
+                }
+                match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val))) => {
+                        (col.trim_matches('"').to_string(), val.clone())
+                    }
+                    (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
+                        (col.trim_matches('"').to_string(), val.clone())
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        
+        let limit = stmt.limit.unwrap_or(100);
+        let offset = stmt.offset.unwrap_or(0);
+        
+        // OPTIMIZATION: Column projection pushdown - only read required columns
+        let projected_cols: Option<Vec<String>> = if stmt.is_select_star() {
+            None // All columns
+        } else {
+            Some(stmt.required_columns().unwrap_or_default())
+        };
+        let col_refs: Option<Vec<&str>> = projected_cols.as_ref()
+            .map(|cols| cols.iter().map(|s| s.as_str()).collect());
+        
+        // Use storage-level filter with early termination
+        let result = backend.read_columns_filtered_string_with_limit_to_arrow(
+            col_refs.as_deref(),
+            &col_name,
+            &filter_value,
+            true, // filter_eq = true for equality
+            limit,
+            offset,
+        )?;
+        
+        Ok(Some(result))
+    }
+
+    /// Fast path for numeric range filters (BETWEEN)
+    /// Uses streaming scan with early termination for LIMIT queries
+    /// Supports column projection pushdown (not limited to SELECT *)
+    fn try_fast_numeric_range_filter(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<RecordBatch>> {
+        use crate::query::sql_parser::BinaryOperator;
+        
+        // Must have LIMIT for early termination benefit
+        if stmt.limit.is_none() {
+            return Ok(None);
+        }
+        
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        
+        // Extract BETWEEN pattern: col BETWEEN low AND high
+        let (col_name, low, high) = match where_clause {
+            SqlExpr::Between { column, low, high, negated } => {
+                if *negated {
+                    return Ok(None);
+                }
+                let low_val = Self::extract_numeric_value(low)?;
+                let high_val = Self::extract_numeric_value(high)?;
+                (column.trim_matches('"').to_string(), low_val, high_val)
+            }
+            // Also handle col >= low AND col <= high pattern
+            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                let (col1, op1, val1) = match Self::extract_comparison(left) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                };
+                let (col2, op2, val2) = match Self::extract_comparison(right) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                };
+                
+                if col1 != col2 {
+                    return Ok(None);
+                }
+                
+                // Determine low and high from the operators
+                let (low, high) = match (op1, op2) {
+                    (BinaryOperator::Ge, BinaryOperator::Le) => (val1, val2),
+                    (BinaryOperator::Le, BinaryOperator::Ge) => (val2, val1),
+                    (BinaryOperator::Gt, BinaryOperator::Lt) => (val1, val2),
+                    (BinaryOperator::Lt, BinaryOperator::Gt) => (val2, val1),
+                    _ => return Ok(None),
+                };
+                (col1, low, high)
+            }
+            _ => return Ok(None),
+        };
+        
+        let limit = stmt.limit.unwrap_or(100);
+        let offset = stmt.offset.unwrap_or(0);
+        
+        // Use storage-level numeric range filter with early termination
+        let result = backend.read_columns_filtered_range_with_limit_to_arrow(
+            None, // All columns (SELECT *)
+            &col_name,
+            low,
+            high,
+            limit,
+            offset,
+        )?;
+        
+        Ok(Some(result))
+    }
+    
+    /// Helper to extract numeric value from SqlExpr
+    fn extract_numeric_value(expr: &SqlExpr) -> io::Result<f64> {
+        match expr {
+            SqlExpr::Literal(Value::Int64(n)) => Ok(*n as f64),
+            SqlExpr::Literal(Value::Int32(n)) => Ok(*n as f64),
+            SqlExpr::Literal(Value::Float64(n)) => Ok(*n),
+            SqlExpr::Literal(Value::Float32(n)) => Ok(*n as f64),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "not a number")),
+        }
+    }
+    
+    /// Helper to extract comparison from binary op
+    fn extract_comparison(expr: &SqlExpr) -> io::Result<(String, crate::query::sql_parser::BinaryOperator, f64)> {
+        use crate::query::sql_parser::BinaryOperator;
+        match expr {
+            SqlExpr::BinaryOp { left, op, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(col), lit) => {
+                        let val = Self::extract_numeric_value(lit)?;
+                        Ok((col.trim_matches('"').to_string(), op.clone(), val))
+                    }
+                    (lit, SqlExpr::Column(col)) => {
+                        let val = Self::extract_numeric_value(lit)?;
+                        // Flip the operator
+                        let flipped_op = match op {
+                            BinaryOperator::Gt => BinaryOperator::Lt,
+                            BinaryOperator::Lt => BinaryOperator::Gt,
+                            BinaryOperator::Ge => BinaryOperator::Le,
+                            BinaryOperator::Le => BinaryOperator::Ge,
+                            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsupported op")),
+                        };
+                        Ok((col.trim_matches('"').to_string(), flipped_op, val))
+                    }
+                    _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "not a comparison")),
+                }
+            }
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "not a binary op")),
+        }
+    }
+
+    /// Fast path for multi-condition WHERE with string equality AND numeric comparison
+    /// Handles: SELECT * WHERE string_col = 'value' AND numeric_col > N LIMIT n
+    fn try_fast_multi_condition_filter(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<RecordBatch>> {
+        use crate::query::sql_parser::BinaryOperator;
+        
+        // Must be SELECT * with LIMIT
+        if !stmt.is_select_star() || stmt.limit.is_none() {
+            return Ok(None);
+        }
+        
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        
+        // Must be AND of two conditions
+        let (left_cond, right_cond) = match where_clause {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                (left.as_ref(), right.as_ref())
+            }
+            _ => return Ok(None),
+        };
+        
+        // Try to extract string equality and numeric comparison from either order
+        let (str_col, str_val, num_col, num_op, num_val) = 
+            if let (Some((sc, sv)), Some((nc, no, nv))) = (
+                Self::extract_string_equality(left_cond),
+                Self::extract_numeric_comparison(right_cond)
+            ) {
+                (sc, sv, nc, no, nv)
+            } else if let (Some((sc, sv)), Some((nc, no, nv))) = (
+                Self::extract_string_equality(right_cond),
+                Self::extract_numeric_comparison(left_cond)
+            ) {
+                (sc, sv, nc, no, nv)
+            } else {
+                return Ok(None);
+            };
+        
+        let limit = stmt.limit.unwrap_or(100);
+        let offset = stmt.offset.unwrap_or(0);
+        
+        // Use storage-level combined filter
+        let result = backend.read_columns_filtered_string_numeric_with_limit_to_arrow(
+            None, // All columns (SELECT *)
+            &str_col,
+            &str_val,
+            &num_col,
+            &num_op,
+            num_val,
+            limit,
+            offset,
+        )?;
+        
+        Ok(Some(result))
+    }
+    
+    /// Helper to extract string equality: col = 'value'
+    fn extract_string_equality(expr: &SqlExpr) -> Option<(String, String)> {
+        use crate::query::sql_parser::BinaryOperator;
+        match expr {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val))) |
+                    (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
+                        Some((col.trim_matches('"').to_string(), val.clone()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    
+    /// Helper to extract numeric comparison: col > N, col >= N, col < N, col <= N
+    fn extract_numeric_comparison(expr: &SqlExpr) -> Option<(String, String, f64)> {
+        use crate::query::sql_parser::BinaryOperator;
+        match expr {
+            SqlExpr::BinaryOp { left, op, right } => {
+                let op_str = match op {
+                    BinaryOperator::Gt => ">",
+                    BinaryOperator::Ge => ">=",
+                    BinaryOperator::Lt => "<",
+                    BinaryOperator::Le => "<=",
+                    BinaryOperator::Eq => "=",
+                    _ => return None,
+                };
+                
+                match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(col), lit) => {
+                        if let Ok(val) = Self::extract_numeric_value(lit) {
+                            Some((col.trim_matches('"').to_string(), op_str.to_string(), val))
+                        } else {
+                            None
+                        }
+                    }
+                    (lit, SqlExpr::Column(col)) => {
+                        if let Ok(val) = Self::extract_numeric_value(lit) {
+                            // Flip operator for reversed order
+                            let flipped = match op_str {
+                                ">" => "<",
+                                ">=" => "<=",
+                                "<" => ">",
+                                "<=" => ">=",
+                                _ => op_str,
+                            };
+                            Some((col.trim_matches('"').to_string(), flipped.to_string(), val))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Execute SELECT * with late materialization optimization
     /// 1. Read only WHERE columns first
     /// 2. Apply filter to get matching row indices
@@ -627,7 +935,7 @@ impl ApexExecutor {
 
     /// Execute SELECT * with ORDER BY + LIMIT late materialization
     /// 1. Read only ORDER BY columns first
-    /// 2. Find top-k row indices using partial sort
+    /// 2. Find top-k row indices using streaming top-k algorithm (no full index allocation)
     /// 3. Read all other columns only for those k rows
     fn execute_with_order_late_materialization(
         backend: &TableStorageBackend,
@@ -657,8 +965,127 @@ impl ApexExecutor {
             return backend.read_columns_to_arrow(None, 0, Some(0));
         }
 
-        // Step 2: Find top-k indices using partial sort
-        let sort_cols: Vec<(ArrayRef, bool)> = stmt.order_by.iter()
+        let k_actual = k.min(num_rows);
+        
+        // Step 2: Find top-k indices using optimized streaming algorithm
+        // OPTIMIZATION: For single-column numeric sort with small k, use streaming top-k
+        // This avoids allocating a full index vector and is O(n) instead of O(n log n)
+        let final_indices: Vec<usize> = if stmt.order_by.len() == 1 && k_actual <= 100 {
+            let clause = &stmt.order_by[0];
+            let col_name = clause.column.trim_matches('"');
+            let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+                &col_name[dot_pos + 1..]
+            } else {
+                col_name
+            };
+            
+            if let Some(col) = sort_batch.column_by_name(actual_col) {
+                // Fast path for Float64 DESC (most common case)
+                if let Some(float_arr) = col.as_any().downcast_ref::<Float64Array>() {
+                    let descending = clause.descending;
+                    
+                    // Streaming top-k: maintain sorted list of top k (value, index) pairs
+                    let mut top_k: Vec<(f64, usize)> = Vec::with_capacity(k_actual + 1);
+                    
+                    if descending {
+                        // DESC: keep k largest values
+                        for i in 0..num_rows {
+                            let val = if float_arr.is_null(i) { f64::NEG_INFINITY } else { float_arr.value(i) };
+                            
+                            if top_k.len() < k_actual {
+                                // Not full yet - insert in sorted position
+                                let pos = top_k.partition_point(|(v, _)| *v > val);
+                                top_k.insert(pos, (val, i));
+                            } else if val > top_k[k_actual - 1].0 {
+                                // Better than worst in top-k - insert and remove worst
+                                let pos = top_k.partition_point(|(v, _)| *v > val);
+                                top_k.insert(pos, (val, i));
+                                top_k.pop();
+                            }
+                        }
+                    } else {
+                        // ASC: keep k smallest values
+                        for i in 0..num_rows {
+                            let val = if float_arr.is_null(i) { f64::INFINITY } else { float_arr.value(i) };
+                            
+                            if top_k.len() < k_actual {
+                                let pos = top_k.partition_point(|(v, _)| *v < val);
+                                top_k.insert(pos, (val, i));
+                            } else if val < top_k[k_actual - 1].0 {
+                                let pos = top_k.partition_point(|(v, _)| *v < val);
+                                top_k.insert(pos, (val, i));
+                                top_k.pop();
+                            }
+                        }
+                    }
+                    
+                    // Apply offset and return indices
+                    let offset = stmt.offset.unwrap_or(0);
+                    top_k.into_iter().skip(offset).map(|(_, idx)| idx).collect()
+                } else if let Some(int_arr) = col.as_any().downcast_ref::<Int64Array>() {
+                    let descending = clause.descending;
+                    let mut top_k: Vec<(i64, usize)> = Vec::with_capacity(k_actual + 1);
+                    
+                    if descending {
+                        for i in 0..num_rows {
+                            let val = if int_arr.is_null(i) { i64::MIN } else { int_arr.value(i) };
+                            
+                            if top_k.len() < k_actual {
+                                let pos = top_k.partition_point(|(v, _)| *v > val);
+                                top_k.insert(pos, (val, i));
+                            } else if val > top_k[k_actual - 1].0 {
+                                let pos = top_k.partition_point(|(v, _)| *v > val);
+                                top_k.insert(pos, (val, i));
+                                top_k.pop();
+                            }
+                        }
+                    } else {
+                        for i in 0..num_rows {
+                            let val = if int_arr.is_null(i) { i64::MAX } else { int_arr.value(i) };
+                            
+                            if top_k.len() < k_actual {
+                                let pos = top_k.partition_point(|(v, _)| *v < val);
+                                top_k.insert(pos, (val, i));
+                            } else if val < top_k[k_actual - 1].0 {
+                                let pos = top_k.partition_point(|(v, _)| *v < val);
+                                top_k.insert(pos, (val, i));
+                                top_k.pop();
+                            }
+                        }
+                    }
+                    
+                    let offset = stmt.offset.unwrap_or(0);
+                    top_k.into_iter().skip(offset).map(|(_, idx)| idx).collect()
+                } else {
+                    // Fall back to generic approach for other types
+                    Self::compute_topk_indices_generic(&sort_batch, &stmt.order_by, k_actual, stmt.offset)
+                }
+            } else {
+                Self::compute_topk_indices_generic(&sort_batch, &stmt.order_by, k_actual, stmt.offset)
+            }
+        } else {
+            // Multi-column sort or large k - use generic approach
+            Self::compute_topk_indices_generic(&sort_batch, &stmt.order_by, k_actual, stmt.offset)
+        };
+
+        if final_indices.is_empty() {
+            return backend.read_columns_to_arrow(None, 0, Some(0));
+        }
+
+        // Step 3: Read ALL columns but only for top-k row indices
+        backend.read_columns_by_indices_to_arrow(&final_indices)
+    }
+    
+    /// Generic top-k computation using partial sort (fallback for complex cases)
+    fn compute_topk_indices_generic(
+        sort_batch: &RecordBatch,
+        order_by: &[crate::query::OrderByClause],
+        k: usize,
+        offset: Option<usize>,
+    ) -> Vec<usize> {
+        let num_rows = sort_batch.num_rows();
+        
+        let sort_cols: Vec<(ArrayRef, bool)> = order_by.iter()
             .filter_map(|clause| {
                 let col_name = clause.column.trim_matches('"');
                 let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
@@ -681,28 +1108,257 @@ impl ApexExecutor {
         };
 
         let mut indices: Vec<usize> = (0..num_rows).collect();
-        let k_actual = k.min(num_rows);
         
-        if k_actual < num_rows {
-            indices.select_nth_unstable_by(k_actual - 1, |&a, &b| compare_rows(a, b));
-            indices.truncate(k_actual);
+        if k < num_rows {
+            indices.select_nth_unstable_by(k - 1, |&a, &b| compare_rows(a, b));
+            indices.truncate(k);
         }
-        let sort_len = k_actual.min(indices.len());
-        indices[..sort_len].sort_by(|&a, &b| compare_rows(a, b));
+        indices.sort_by(|&a, &b| compare_rows(a, b));
 
-        // Apply offset
-        let final_indices: Vec<usize> = if let Some(offset) = stmt.offset {
-            indices.into_iter().skip(offset).collect()
+        if let Some(off) = offset {
+            indices.into_iter().skip(off).collect()
         } else {
             indices
-        };
-
-        if final_indices.is_empty() {
-            return backend.read_columns_to_arrow(None, 0, Some(0));
         }
-
-        // Step 3: Read ALL columns but only for top-k row indices
-        backend.read_columns_by_indices_to_arrow(&final_indices)
+    }
+    
+    /// Fast path for combined WHERE filter + GROUP BY on dictionary columns
+    /// Does filter and aggregation in a single pass without intermediate materialization
+    fn try_fast_filter_groupby(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<RecordBatch>> {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt32Type;
+        use crate::query::AggregateFunc;
+        
+        // Only handle simple patterns: WHERE col = 'value' with single-column GROUP BY
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        
+        if stmt.group_by.len() != 1 {
+            return Ok(None);
+        }
+        
+        // Extract filter column and value
+        let (filter_col, filter_value) = match where_clause {
+            SqlExpr::BinaryOp { left, op, right } => {
+                use crate::query::sql_parser::BinaryOperator;
+                if *op != BinaryOperator::Eq {
+                    return Ok(None);
+                }
+                match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val))) => {
+                        (col.trim_matches('"').to_string(), val.clone())
+                    }
+                    (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
+                        (col.trim_matches('"').to_string(), val.clone())
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        
+        let group_col = stmt.group_by[0].trim_matches('"').to_string();
+        
+        // Find aggregate column
+        let mut agg_col_name: Option<String> = None;
+        let mut agg_func: Option<AggregateFunc> = None;
+        let mut agg_alias: Option<String> = None;
+        
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate { func, column, alias, .. } = col {
+                if let Some(col_name) = column {
+                    let actual = col_name.trim_matches('"');
+                    if actual != "*" {
+                        agg_col_name = Some(actual.to_string());
+                        agg_func = Some(func.clone());
+                        agg_alias = alias.clone();
+                    }
+                }
+                break;
+            }
+        }
+        
+        let agg_col_name = match agg_col_name {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        
+        // Read only needed columns
+        let cols_to_read: Vec<&str> = vec![filter_col.as_str(), group_col.as_str(), agg_col_name.as_str()];
+        let batch = backend.read_columns_to_arrow(Some(&cols_to_read), 0, None)?;
+        
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        
+        let num_rows = batch.num_rows();
+        
+        // Get filter column as dictionary
+        let filter_arr = match batch.column_by_name(&filter_col) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        
+        let filter_dict = match filter_arr.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        
+        // Find filter key
+        let filter_keys = filter_dict.keys();
+        let filter_values = filter_dict.values();
+        let filter_str_values = match filter_values.as_any().downcast_ref::<StringArray>() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        
+        let mut target_filter_key: Option<u32> = None;
+        for i in 0..filter_str_values.len() {
+            if filter_str_values.value(i) == filter_value {
+                target_filter_key = Some(i as u32);
+                break;
+            }
+        }
+        
+        let target_filter_key = match target_filter_key {
+            Some(k) => k,
+            None => {
+                // Value not in dictionary - return empty result
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new(&group_col, ArrowDataType::Utf8, false),
+                ]));
+                return Ok(Some(RecordBatch::new_empty(schema)));
+            }
+        };
+        
+        // Get group column as dictionary
+        let group_arr = match batch.column_by_name(&group_col) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        
+        let group_dict = match group_arr.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        
+        let group_keys = group_dict.keys();
+        let group_values = group_dict.values();
+        let group_str_values = match group_values.as_any().downcast_ref::<StringArray>() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let group_dict_size = group_str_values.len() + 1;
+        
+        // Get aggregate column
+        let agg_arr = match batch.column_by_name(&agg_col_name) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        
+        let agg_float = agg_arr.as_any().downcast_ref::<Float64Array>();
+        let agg_int = agg_arr.as_any().downcast_ref::<Int64Array>();
+        
+        // Single-pass: filter + aggregate
+        let mut counts: Vec<i64> = vec![0; group_dict_size];
+        let mut sums: Vec<f64> = vec![0.0; group_dict_size];
+        
+        let filter_key_values = filter_keys.values();
+        let group_key_values = group_keys.values();
+        
+        if let Some(float_arr) = agg_float {
+            if filter_keys.null_count() == 0 && group_keys.null_count() == 0 && float_arr.null_count() == 0 {
+                let float_values = float_arr.values();
+                for i in 0..num_rows {
+                    if unsafe { *filter_key_values.get_unchecked(i) } == target_filter_key {
+                        let gk = unsafe { *group_key_values.get_unchecked(i) as usize + 1 };
+                        unsafe {
+                            *counts.get_unchecked_mut(gk) += 1;
+                            *sums.get_unchecked_mut(gk) += *float_values.get_unchecked(i);
+                        }
+                    }
+                }
+            } else {
+                for i in 0..num_rows {
+                    if !filter_keys.is_null(i) && filter_keys.value(i) == target_filter_key {
+                        let gk = if group_keys.is_null(i) { 0 } else { group_keys.value(i) as usize + 1 };
+                        counts[gk] += 1;
+                        if !float_arr.is_null(i) {
+                            sums[gk] += float_arr.value(i);
+                        }
+                    }
+                }
+            }
+        } else if let Some(int_arr) = agg_int {
+            for i in 0..num_rows {
+                if !filter_keys.is_null(i) && filter_keys.value(i) == target_filter_key {
+                    let gk = if group_keys.is_null(i) { 0 } else { group_keys.value(i) as usize + 1 };
+                    counts[gk] += 1;
+                    if !int_arr.is_null(i) {
+                        sums[gk] += int_arr.value(i) as f64;
+                    }
+                }
+            }
+        } else {
+            return Ok(None);
+        }
+        
+        // Collect results
+        let mut result_groups: Vec<&str> = Vec::new();
+        let mut result_values: Vec<f64> = Vec::new();
+        
+        for gk in 1..group_dict_size {
+            if counts[gk] > 0 {
+                result_groups.push(group_str_values.value(gk - 1));
+                let value = match agg_func {
+                    Some(AggregateFunc::Sum) => sums[gk],
+                    Some(AggregateFunc::Avg) => sums[gk] / counts[gk] as f64,
+                    Some(AggregateFunc::Count) => counts[gk] as f64,
+                    _ => sums[gk],
+                };
+                result_values.push(value);
+            }
+        }
+        
+        // Build result batch
+        let agg_field_name = agg_alias.unwrap_or_else(|| {
+            let func_name = match agg_func {
+                Some(AggregateFunc::Sum) => "SUM",
+                Some(AggregateFunc::Avg) => "AVG",
+                Some(AggregateFunc::Count) => "COUNT",
+                _ => "AGG",
+            };
+            format!("{}({})", func_name, agg_col_name)
+        });
+        
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(&group_col, ArrowDataType::Utf8, false),
+            Field::new(&agg_field_name, ArrowDataType::Float64, true),
+        ]));
+        
+        let mut result_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(result_groups)),
+                Arc::new(Float64Array::from(result_values)),
+            ],
+        ).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        
+        // Apply ORDER BY if present
+        if !stmt.order_by.is_empty() {
+            let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            result_batch = Self::apply_order_by_topk(&result_batch, &stmt.order_by, k)?;
+        }
+        
+        // Apply LIMIT/OFFSET
+        result_batch = Self::apply_limit_offset(&result_batch, stmt.limit, stmt.offset)?;
+        
+        Ok(Some(result_batch))
     }
 
     /// Execute GROUP BY with WHERE using late materialization
@@ -714,6 +1370,14 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         storage_path: &Path,
     ) -> io::Result<RecordBatch> {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt32Type;
+        
+        // FAST PATH: Try combined filter + GROUP BY on dictionary columns in single pass
+        if let Some(result) = Self::try_fast_filter_groupby(backend, stmt)? {
+            return Ok(result);
+        }
+        
         // Step 1: Read only columns needed for WHERE clause
         let where_cols = stmt.where_columns();
         let where_col_refs: Vec<&str> = where_cols.iter().map(|s| s.as_str()).collect();
