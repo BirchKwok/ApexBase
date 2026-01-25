@@ -3361,6 +3361,11 @@ impl OnDemandStorage {
     /// Save to file (full rewrite with V3 format)
     /// OPTIMIZATION: Automatically converts low-cardinality string columns to dictionary encoding
     pub fn save(&self) -> io::Result<()> {
+        // CRITICAL: On Windows, mmap must be released BEFORE opening file for writing
+        // Otherwise we get "os error 1224: user-mapped section open"
+        self.mmap_cache.write().invalidate();
+        *self.file.write() = None;  // Close file handle too
+        
         let file = OpenOptions::new()
             .write(true)
             .create(true)
