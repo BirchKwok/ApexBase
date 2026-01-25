@@ -3743,9 +3743,37 @@ impl OnDemandStorage {
         self.save()
     }
 
-    /// Close storage
+    /// Close storage and release all resources
+    /// IMPORTANT: On Windows, mmap must be released before temp directory cleanup
     pub fn close(&self) -> io::Result<()> {
-        self.save()
+        // Save any pending changes first
+        self.save()?;
+        
+        // Release mmap cache BEFORE closing file (critical for Windows)
+        self.mmap_cache.write().invalidate();
+        
+        // Close file handle
+        *self.file.write() = None;
+        
+        Ok(())
+    }
+    
+    /// Release mmap without saving (for cleanup scenarios)
+    pub fn release_mmap(&self) {
+        self.mmap_cache.write().invalidate();
+    }
+}
+
+/// Drop implementation to ensure mmap is released before file handle
+/// This is critical for Windows where mmap must be unmapped before file deletion
+impl Drop for OnDemandStorage {
+    fn drop(&mut self) {
+        // Release mmap first (critical for Windows)
+        // parking_lot's try_write returns Option, not Result
+        if let Some(mut cache) = self.mmap_cache.try_write() {
+            cache.invalidate();
+        }
+        // File handle will be dropped automatically after mmap is released
     }
 }
 

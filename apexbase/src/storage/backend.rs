@@ -500,12 +500,14 @@ impl TableStorageBackend {
         *self.dirty.read()
     }
 
-    /// Flush and close
+    /// Flush and close - releases mmap and file handle
+    /// IMPORTANT: On Windows, this must be called before temp directory cleanup
     pub fn close(&self) -> io::Result<()> {
         if self.is_dirty() {
             self.save()?;
         }
-        Ok(())
+        // Release mmap and file handle (critical for Windows)
+        self.storage.close()
     }
 
     // ========================================================================
