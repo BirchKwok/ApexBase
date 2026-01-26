@@ -676,6 +676,9 @@ impl ApexStorageImpl {
 
     /// Close storage
     fn close(&self) -> PyResult<()> {
+        // CRITICAL: Invalidate executor cache for all files in base directory
+        // This releases all mmaps on Windows so temp directories can be cleaned up
+        ApexExecutor::invalidate_cache_for_dir(&self.base_dir);
         Ok(())
     }
     

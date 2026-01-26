@@ -235,7 +235,6 @@ class TestApexClientInitialization:
     
     def test_edge_case_empty_string_dirpath(self):
         """Test empty string dirpath"""
-        original_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as temp_dir:
             os.chdir(temp_dir)
             try:
@@ -243,7 +242,7 @@ class TestApexClientInitialization:
                 assert client._dirpath == Path('.')
                 client.close()
             finally:
-                os.chdir(original_cwd)
+                os.chdir(os.getcwd())
     
     def test_edge_case_whitespace_dirpath(self):
         """Test whitespace-only dirpath"""

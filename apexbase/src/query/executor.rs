@@ -156,6 +156,14 @@ pub fn invalidate_storage_cache(path: &Path) {
     cache.remove(&canonical);
 }
 
+/// Invalidate all storage cache entries under a directory
+/// CRITICAL: Must be called when closing a client to release all mmaps on Windows
+pub fn invalidate_storage_cache_dir(dir: &Path) {
+    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut cache = STORAGE_CACHE.write();
+    cache.retain(|path, _| !path.starts_with(&canonical_dir));
+}
+
 /// Get or open a cached storage backend
 fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -232,6 +240,12 @@ impl ApexExecutor {
     /// CRITICAL: Must be called before any write operation to release mmap on Windows
     pub fn invalidate_cache_for_path(path: &Path) {
         invalidate_storage_cache(path);
+    }
+    
+    /// Invalidate all storage cache entries under a directory
+    /// CRITICAL: Must be called when closing a client to release all mmaps on Windows
+    pub fn invalidate_cache_for_dir(dir: &Path) {
+        invalidate_storage_cache_dir(dir);
     }
     
     /// Execute a SQL query on V3 storage (single table)
