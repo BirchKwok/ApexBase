@@ -3366,6 +3366,10 @@ impl OnDemandStorage {
         self.mmap_cache.write().invalidate();
         *self.file.write() = None;  // Close file handle too
         
+        // Also invalidate the global executor storage cache for this path
+        // This releases any mmap held by cached backends used for queries
+        crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
+        
         let file = OpenOptions::new()
             .write(true)
             .create(true)

@@ -148,6 +148,14 @@ impl ZoneMap {
     }
 }
 
+/// Invalidate the storage cache for a specific path
+/// CRITICAL: Must be called before any write operation to release mmap on Windows
+pub fn invalidate_storage_cache(path: &Path) {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut cache = STORAGE_CACHE.write();
+    cache.remove(&canonical);
+}
+
 /// Get or open a cached storage backend
 fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -220,6 +228,12 @@ impl ApexResult {
 }
 
 impl ApexExecutor {
+    /// Invalidate the storage cache for a specific path
+    /// CRITICAL: Must be called before any write operation to release mmap on Windows
+    pub fn invalidate_cache_for_path(path: &Path) {
+        invalidate_storage_cache(path);
+    }
+    
     /// Execute a SQL query on V3 storage (single table)
     pub fn execute(sql: &str, storage_path: &Path) -> io::Result<ApexResult> {
         let stmt = SqlParser::parse(sql)
