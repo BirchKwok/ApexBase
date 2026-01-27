@@ -9,13 +9,15 @@ use crate::storage::on_demand::ColumnValue;
 use crate::query::{ApexExecutor, ApexResult, SqlParser};
 use crate::fts::FtsManager;
 use crate::fts::FtsConfig;
+use fs2::FileExt;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use parking_lot::RwLock;
 use arrow::record_batch::RecordBatch;
 
@@ -124,18 +126,124 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
 /// - On-demand row range reading (only loads requested rows)
 /// - Soft delete with deleted bitmap
 /// - Full SQL query support via ApexExecutor
+/// - Cross-platform file locking for concurrent access safety
+///   - Read operations use shared locks (multiple readers allowed)
+///   - Write operations use exclusive locks (single writer)
 #[pyclass(name = "ApexStorage")]
 pub struct ApexStorageImpl {
     /// Base directory path
     base_dir: PathBuf,
     /// Table paths (table_name -> path)
     table_paths: RwLock<HashMap<String, PathBuf>>,
+    /// Cached storage backends per table (table_name -> backend)
+    /// Backends are opened once and reused for all operations
+    cached_backends: RwLock<HashMap<String, Arc<TableStorageBackend>>>,
     /// Current table name
     current_table: RwLock<String>,
     /// FTS Manager (optional)
     fts_manager: RwLock<Option<FtsManager>>,
     /// FTS index field names per table
     fts_index_fields: RwLock<HashMap<String, Vec<String>>>,
+}
+
+/// Internal Rust-only methods (not exposed to Python)
+impl ApexStorageImpl {
+    /// Get the lock file path for a table
+    fn get_lock_path(table_path: &Path) -> PathBuf {
+        table_path.with_extension("apex.lock")
+    }
+    
+    /// Acquire a shared (read) lock on the table
+    /// Multiple readers can hold shared locks simultaneously
+    fn acquire_read_lock(table_path: &Path) -> io::Result<File> {
+        let lock_path = Self::get_lock_path(table_path);
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        
+        // Use non-blocking shared lock
+        lock_file.try_lock_shared().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("Database is locked for writing: {}", e)
+            )
+        })?;
+        
+        Ok(lock_file)
+    }
+    
+    /// Acquire an exclusive (write) lock on the table
+    /// Only one writer can hold an exclusive lock
+    fn acquire_write_lock(table_path: &Path) -> io::Result<File> {
+        let lock_path = Self::get_lock_path(table_path);
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        
+        // Use non-blocking exclusive lock
+        lock_file.try_lock_exclusive().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("Database is locked by another process/thread: {}", e)
+            )
+        })?;
+        
+        Ok(lock_file)
+    }
+    
+    /// Release a lock (unlock and drop the file handle)
+    fn release_lock(lock_file: File) {
+        let _ = lock_file.unlock();
+        drop(lock_file);
+    }
+
+    /// Get the path for the current table
+    fn get_current_table_path(&self) -> PyResult<PathBuf> {
+        let table_name = self.current_table.read().clone();
+        let paths = self.table_paths.read();
+        paths.get(&table_name)
+            .cloned()
+            .ok_or_else(|| PyValueError::new_err(format!("Table not found: {}", table_name)))
+    }
+    
+    /// Get or create cached backend for current table
+    fn get_backend(&self) -> PyResult<Arc<TableStorageBackend>> {
+        let table_name = self.current_table.read().clone();
+        let table_path = self.get_current_table_path()?;
+        
+        // Check if backend is already cached
+        {
+            let backends = self.cached_backends.read();
+            if let Some(backend) = backends.get(&table_name) {
+                return Ok(backend.clone());
+            }
+        }
+        
+        // Create new backend and cache it
+        let backend = if table_path.exists() {
+            TableStorageBackend::open_for_write(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+        } else {
+            TableStorageBackend::create(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+        };
+        
+        let backend = Arc::new(backend);
+        self.cached_backends.write().insert(table_name, backend.clone());
+        
+        Ok(backend)
+    }
+    
+    /// Invalidate cached backend for a table (used when table is dropped or modified externally)
+    fn invalidate_backend(&self, table_name: &str) {
+        self.cached_backends.write().remove(table_name);
+    }
 }
 
 #[pymethods]
@@ -229,30 +337,25 @@ impl ApexStorageImpl {
         Ok(Self {
             base_dir,
             table_paths: RwLock::new(table_paths),
+            cached_backends: RwLock::new(HashMap::new()),
             current_table: RwLock::new(default_table_name.to_string()),
             fts_manager: RwLock::new(None),
             fts_index_fields: RwLock::new(HashMap::new()),
         })
     }
 
-    /// Get the path for the current table
-    fn get_current_table_path(&self) -> PyResult<PathBuf> {
-        let table_name = self.current_table.read().clone();
-        let paths = self.table_paths.read();
-        paths.get(&table_name)
-            .cloned()
-            .ok_or_else(|| PyValueError::new_err(format!("Table not found: {}", table_name)))
-    }
-
     /// Store a single record
     fn store(&self, py: Python<'_>, data: &Bound<'_, PyDict>) -> PyResult<i64> {
         let fields = dict_to_values(data)?;
         let table_path = self.get_current_table_path()?;
+        
+        // Acquire exclusive write lock
+        let lock_file = Self::acquire_write_lock(&table_path)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        
+        let backend = self.get_backend()?;
 
-        let id = py.allow_threads(|| {
-            let backend = TableStorageBackend::open_for_write(&table_path)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            
+        let result = py.allow_threads(|| {
             let ids = backend.insert_rows(&[fields])
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
             
@@ -260,7 +363,12 @@ impl ApexStorageImpl {
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
             
             Ok::<i64, PyErr>(ids.first().copied().unwrap_or(0) as i64)
-        })?;
+        });
+        
+        // Release lock before returning
+        Self::release_lock(lock_file);
+        
+        let id = result?;
 
         // Index in FTS if enabled
         self.index_for_fts(id, data)?;
@@ -284,11 +392,14 @@ impl ApexStorageImpl {
         }
 
         let table_path = self.get_current_table_path()?;
+        
+        // Acquire exclusive write lock
+        let lock_file = Self::acquire_write_lock(&table_path)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        
+        let backend = self.get_backend()?;
 
-        let ids = py.allow_threads(|| {
-            let backend = TableStorageBackend::open_for_write(&table_path)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            
+        let result = py.allow_threads(|| {
             let ids = backend.insert_rows(&rows)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
             
@@ -296,7 +407,12 @@ impl ApexStorageImpl {
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
             
             Ok::<Vec<u64>, PyErr>(ids)
-        })?;
+        });
+        
+        // Release lock before handling result
+        Self::release_lock(lock_file);
+        
+        let ids = result?;
 
         // Index in FTS if enabled (batch operation - only if FTS manager exists)
         {
@@ -391,15 +507,21 @@ impl ApexStorageImpl {
     fn delete(&self, id: i64) -> PyResult<bool> {
         let table_path = self.get_current_table_path()?;
         
-        // Use open_for_write to load all data before modifying
-        let backend = TableStorageBackend::open_for_write(&table_path)
+        // Acquire exclusive write lock
+        let lock_file = Self::acquire_write_lock(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        
+        let backend = self.get_backend()?;
         
         let result = backend.delete(id as u64);
         
         if result {
-            backend.save()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let save_result = backend.save()
+                .map_err(|e| PyIOError::new_err(e.to_string()));
+            Self::release_lock(lock_file);
+            save_result?;
+        } else {
+            Self::release_lock(lock_file);
         }
         
         Ok(result)
@@ -409,16 +531,22 @@ impl ApexStorageImpl {
     fn delete_batch(&self, ids: Vec<i64>) -> PyResult<bool> {
         let table_path = self.get_current_table_path()?;
         
-        // Use open_for_write to load all data before modifying
-        let backend = TableStorageBackend::open_for_write(&table_path)
+        // Acquire exclusive write lock
+        let lock_file = Self::acquire_write_lock(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        
+        let backend = self.get_backend()?;
         
         let ids_u64: Vec<u64> = ids.into_iter().map(|id| id as u64).collect();
         let result = backend.delete_batch(&ids_u64);
         
         if result {
-            backend.save()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let save_result = backend.save()
+                .map_err(|e| PyIOError::new_err(e.to_string()));
+            Self::release_lock(lock_file);
+            save_result?;
+        } else {
+            Self::release_lock(lock_file);
         }
         
         Ok(result)
@@ -625,6 +753,9 @@ impl ApexStorageImpl {
             return Err(PyValueError::new_err("Cannot drop default table"));
         }
 
+        // Invalidate cached backend first (releases file lock)
+        self.invalidate_backend(name);
+        
         let mut paths = self.table_paths.write();
         if let Some(path) = paths.remove(name) {
             fs::remove_file(&path)
@@ -652,9 +783,16 @@ impl ApexStorageImpl {
         if !table_path.exists() {
             return Ok(0);
         }
-        let backend = TableStorageBackend::open(&table_path)
+        
+        // Acquire shared read lock
+        let lock_file = Self::acquire_read_lock(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        Ok(backend.active_row_count())
+        
+        let backend = self.get_backend()?;
+        let count = backend.active_row_count();
+        
+        Self::release_lock(lock_file);
+        Ok(count)
     }
     
     /// Alias for row_count (compatibility)
@@ -676,6 +814,9 @@ impl ApexStorageImpl {
 
     /// Close storage
     fn close(&self) -> PyResult<()> {
+        // Clear all cached backends (releases file locks)
+        self.cached_backends.write().clear();
+        
         // CRITICAL: Invalidate executor cache for all files in base directory
         // This releases all mmaps on Windows so temp directories can be cleaned up
         ApexExecutor::invalidate_cache_for_dir(&self.base_dir);
@@ -688,10 +829,13 @@ impl ApexStorageImpl {
     fn retrieve(&self, py: Python<'_>, id: i64) -> PyResult<Option<PyObject>> {
         let table_path = self.get_current_table_path()?;
         
+        // Acquire shared read lock
+        let lock_file = Self::acquire_read_lock(&table_path)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        
+        let backend = self.get_backend()?;
+        
         let result = py.allow_threads(|| -> PyResult<Option<HashMap<String, Value>>> {
-            let backend = TableStorageBackend::open(&table_path)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            
             // Check if ID exists
             if !backend.exists(id as u64) {
                 return Ok(None);
@@ -720,7 +864,12 @@ impl ApexStorageImpl {
             }
             
             Ok(Some(row_data))
-        })?;
+        });
+        
+        // Release lock before handling result
+        Self::release_lock(lock_file);
+        
+        let result = result?;
         
         match result {
             None => Ok(None),
@@ -861,11 +1010,13 @@ impl ApexStorageImpl {
         let fields = dict_to_values(data)?;
         let table_path = self.get_current_table_path()?;
         
-        py.allow_threads(|| {
-            // Use open_for_write to load all data before modifying
-            let backend = TableStorageBackend::open_for_write(&table_path)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            
+        // Acquire exclusive write lock
+        let lock_file = Self::acquire_write_lock(&table_path)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        
+        let backend = self.get_backend()?;
+        
+        let result = py.allow_threads(|| {
             let result = backend.replace(id as u64, &fields)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
             
@@ -874,15 +1025,17 @@ impl ApexStorageImpl {
                     .map_err(|e| PyIOError::new_err(e.to_string()))?;
             }
             
-            Ok(result)
-        })
+            Ok::<bool, PyErr>(result)
+        });
+        
+        Self::release_lock(lock_file);
+        result
     }
     
     // ========== Schema Operations ==========
     
     /// Add a column to current table
     fn add_column(&self, column_name: &str, column_type: &str) -> PyResult<()> {
-        let table_path = self.get_current_table_path()?;
         let dtype = match column_type.to_lowercase().as_str() {
             "int" | "int64" | "i64" | "integer" => crate::data::DataType::Int64,
             "float" | "float64" | "f64" | "double" => crate::data::DataType::Float64,
@@ -892,71 +1045,86 @@ impl ApexStorageImpl {
             _ => crate::data::DataType::String,
         };
         
-        // Use open_for_write to properly load existing data before modifying schema
-        let backend = TableStorageBackend::open_for_write(&table_path)
+        let table_path = self.get_current_table_path()?;
+        
+        // Acquire exclusive write lock
+        let lock_file = Self::acquire_write_lock(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
-        backend.add_column(column_name, dtype)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let backend = self.get_backend()?;
         
-        backend.save()
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let result = backend.add_column(column_name, dtype)
+            .map_err(|e| PyIOError::new_err(e.to_string()))
+            .and_then(|_| backend.save().map_err(|e| PyIOError::new_err(e.to_string())));
         
-        Ok(())
+        Self::release_lock(lock_file);
+        result
     }
     
     /// Drop a column from current table
     fn drop_column(&self, column_name: &str) -> PyResult<()> {
         let table_path = self.get_current_table_path()?;
         
-        // Use open_for_write to properly load existing data before modifying schema
-        let backend = TableStorageBackend::open_for_write(&table_path)
+        // Acquire exclusive write lock
+        let lock_file = Self::acquire_write_lock(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
-        backend.drop_column(column_name)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let backend = self.get_backend()?;
         
-        backend.save()
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let result = backend.drop_column(column_name)
+            .map_err(|e| PyIOError::new_err(e.to_string()))
+            .and_then(|_| backend.save().map_err(|e| PyIOError::new_err(e.to_string())));
         
-        Ok(())
+        Self::release_lock(lock_file);
+        result
     }
     
     /// Rename a column
     fn rename_column(&self, old_name: &str, new_name: &str) -> PyResult<()> {
         let table_path = self.get_current_table_path()?;
         
-        // Use open_for_write to properly load existing data before modifying schema
-        let backend = TableStorageBackend::open_for_write(&table_path)
+        // Acquire exclusive write lock
+        let lock_file = Self::acquire_write_lock(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
-        backend.rename_column(old_name, new_name)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let backend = self.get_backend()?;
         
-        backend.save()
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let result = backend.rename_column(old_name, new_name)
+            .map_err(|e| PyIOError::new_err(e.to_string()))
+            .and_then(|_| backend.save().map_err(|e| PyIOError::new_err(e.to_string())));
         
-        Ok(())
+        Self::release_lock(lock_file);
+        result
     }
     
     /// List fields (columns) in current table
     fn list_fields(&self) -> PyResult<Vec<String>> {
         let table_path = self.get_current_table_path()?;
         
-        let backend = TableStorageBackend::open(&table_path)
+        // Acquire shared read lock
+        let lock_file = Self::acquire_read_lock(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
-        Ok(backend.list_columns())
+        let backend = self.get_backend()?;
+        let columns = backend.list_columns();
+        
+        Self::release_lock(lock_file);
+        Ok(columns)
     }
     
     /// Get column data type
     fn get_column_dtype(&self, column_name: &str) -> PyResult<Option<String>> {
         let table_path = self.get_current_table_path()?;
         
-        let backend = TableStorageBackend::open(&table_path)
+        // Acquire shared read lock
+        let lock_file = Self::acquire_read_lock(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
-        Ok(backend.get_column_type(column_name).map(|dt| format!("{:?}", dt)))
+        let backend = self.get_backend()?;
+        let dtype = backend.get_column_type(column_name).map(|dt| format!("{:?}", dt));
+        
+        Self::release_lock(lock_file);
+        Ok(dtype)
     }
     
     // ========== FTS Operations ==========

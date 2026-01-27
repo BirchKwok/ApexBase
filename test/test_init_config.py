@@ -124,14 +124,15 @@ class TestApexClientInitialization:
     def test_none_dirpath_uses_current_directory(self):
         """Test None dirpath uses current directory"""
         original_cwd = os.getcwd()
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
                 os.chdir(temp_dir)
                 client = ApexClient(dirpath=None)
                 assert client._dirpath == Path('.')
                 client.close()
-        finally:
-            os.chdir(original_cwd)
+            finally:
+                # Must change back BEFORE temp_dir cleanup on Windows
+                os.chdir(original_cwd)
     
     def test_relative_path(self):
         """Test relative path handling"""
@@ -235,14 +236,16 @@ class TestApexClientInitialization:
     
     def test_edge_case_empty_string_dirpath(self):
         """Test empty string dirpath"""
+        original_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as temp_dir:
-            os.chdir(temp_dir)
             try:
+                os.chdir(temp_dir)
                 client = ApexClient(dirpath="")
                 assert client._dirpath == Path('.')
                 client.close()
             finally:
-                os.chdir(os.getcwd())
+                # Must change back BEFORE temp_dir cleanup on Windows
+                os.chdir(original_cwd)
     
     def test_edge_case_whitespace_dirpath(self):
         """Test whitespace-only dirpath"""
