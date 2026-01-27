@@ -15,12 +15,12 @@ ApexBase 是一个基于 Rust 核心的高性能嵌入式数据库，提供简�
 ## 📦 安装
 
 ```bash
-# 从源码构建
-cd ApexBase
-maturin develop --release
+# 从 PyPI 安装
+pip install apexbase
 
-# 安装可选依赖
-pip install pandas pyarrow polars  # 数据框架支持
+# 从源码构建（推荐在 conda dev 环境中）
+# conda activate dev
+maturin develop --release
 ```
 
 ## 🚀 快速开始
@@ -32,18 +32,24 @@ from apexbase import ApexClient
 client = ApexClient("./data")
 
 # 存储数据
-id = client.store({"name": "Alice", "age": 30, "city": "Beijing"})
-ids = client.store([
+client.store({"name": "Alice", "age": 30, "city": "Beijing"})
+client.store([
     {"name": "Bob", "age": 25},
     {"name": "Charlie", "age": 35}
 ])
 
-# 查询数据
-results = client.query("age > 28")  # SQL 风格条件查询
-record = client.retrieve(id)         # 按 ID 检索
-all_data = client.retrieve_all()     # 获取所有记录
+# SQL 查询（推荐）
+results = client.execute("SELECT * FROM default WHERE age > 28")
+
+# 也支持传入过滤表达式（兼容用法）
+results2 = client.query("age > 28", limit=100)
+
+# 按 _id 检索（_id 为内部自增 ID）
+record = client.retrieve(0)
+all_data = client.retrieve_all()
 
 # 全文搜索
+client.init_fts(index_fields=["name", "city"], lazy_load=True)
 doc_ids = client.search_text("Alice")
 records = client.search_and_retrieve("Beijing")
 
@@ -95,8 +101,11 @@ ApexBase/
 client = ApexClient(
     dirpath="./data",           # 数据目录
     drop_if_exists=False,       # 是否删除已存在的数据
-    enable_fts=True,            # 启用全文搜索
-    enable_search_cache=True,   # 启用搜索缓存
+    batch_size=1000,
+    enable_cache=True,
+    cache_size=10000,
+    prefer_arrow_format=True,
+    durability="fast",         # fast | safe | max
 )
 
 # 表操作
@@ -106,20 +115,22 @@ client.drop_table("users")
 tables = client.list_tables()
 
 # CRUD 操作
-id = client.store({"key": "value"})
-ids = client.store([{...}, {...}])
-record = client.retrieve(id)
+client.store({"key": "value"})
+client.store([{...}, {...}])
+record = client.retrieve(0)
 records = client.retrieve_many([1, 2, 3])
-client.replace(id, {"new": "data"})
-client.delete(id)
+client.replace(0, {"new": "data"})
+client.delete(0)
 client.delete([1, 2, 3])
 
 # 查询
 results = client.query("age > 30")
 results = client.query("name LIKE 'A%'")
+results = client.execute("SELECT name, age FROM default ORDER BY age DESC LIMIT 10")
 count = client.count_rows()
 
 # 全文搜索
+client.init_fts(index_fields=["title", "content"], lazy_load=True)
 ids = client.search_text("keyword")
 ids = client.fuzzy_search_text("keywrd")  # 模糊搜索
 records = client.search_and_retrieve("keyword")
@@ -129,7 +140,31 @@ client.from_pandas(df)
 client.from_polars(df)
 results.to_pandas()
 results.to_polars()
+results.to_arrow()
 ```
+
+## 🧪 开发与测试
+
+```bash
+# 运行测试（conda dev 环境推荐）
+# conda activate dev
+python run_tests.py
+
+# 或直接 pytest
+pytest -q
+```
+
+## 📦 发布流程（GitHub Actions）
+
+当前仓库已提供基于 tag 的自动构建与发布流程：当推送 `v*` tag 时，会运行测试、构建 wheels/sdist 并使用 `twine` 发布到 PyPI。
+
+- **Workflow**: `.github/workflows/build_release.yml`
+- **Tag**: `v0.2.1` 这类格式
+- **Secret**: `PYPI_API_TOKEN`
+
+## 📚 文档
+
+项目文档入口：`docs/README.md`
 
 ## 📄 License
 
