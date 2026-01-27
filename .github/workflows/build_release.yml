@@ -31,32 +31,67 @@ jobs:
       run: |
         pytest
 
-  build-and-publish:
+  build-wheels:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - name: Build wheels (manylinux)
+      uses: PyO3/maturin-action@v1
+      with:
+        command: build
+        args: --release --out dist
+        manylinux: 2014
+        python-version: ${{ matrix.python-version }}
+    - name: Upload wheel artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-${{ matrix.python-version }}
+        path: dist/*.whl
+
+  build-sdist:
     needs: test
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
       with:
         fetch-depth: 0
+    - name: Build sdist
+      uses: PyO3/maturin-action@v1
+      with:
+        command: sdist
+        args: --out dist
+    - name: Upload sdist artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: sdist
+        path: dist/*.tar.gz
+
+  publish:
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    steps:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: "3.11"
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@stable
-    - name: Install dependencies
+    - name: Install twine
       run: |
         python -m pip install --upgrade pip
-        pip install "maturin>=1.4,<2.0" twine
-    - name: Clean old builds
-      run: |
-        rm -rf dist/ build/ *.egg-info/
-    - name: Build package
-      run: |
-        maturin build --release --sdist --out dist --manylinux 2014
+        pip install twine
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
     - name: Publish to PyPI
       env:
         TWINE_USERNAME: __token__
         TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
       run: |
-        python -m twine upload --verbose dist/*
+        python -m twine upload --verbose dist/**/*.whl dist/**/*.tar.gz
