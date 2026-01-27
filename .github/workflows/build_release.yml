@@ -46,9 +46,15 @@ jobs:
 
     - name: Set up Python ${{ matrix.python-version }}
       if: matrix.os != 'ubuntu-latest'
+      id: py
       uses: actions/setup-python@v4
       with:
         python-version: ${{ matrix.python-version }}
+
+    - name: Show Python
+      if: matrix.os != 'ubuntu-latest'
+      run: |
+        python -c "import sys; print(sys.executable); print(sys.version)"
     - name: Build wheels (manylinux)
       if: matrix.os == 'ubuntu-latest'
       uses: PyO3/maturin-action@v1
@@ -62,11 +68,11 @@ jobs:
       if: matrix.os != 'ubuntu-latest'
       uses: PyO3/maturin-action@v1
       env:
-        PYO3_PYTHON: python
-        PYTHON_SYS_EXECUTABLE: python
+        PYO3_PYTHON: ${{ steps.py.outputs.python-path }}
+        PYTHON_SYS_EXECUTABLE: ${{ steps.py.outputs.python-path }}
       with:
         command: build
-        args: --release --out dist --interpreter python
+        args: --release --out dist --interpreter ${{ steps.py.outputs.python-path }}
     - name: Upload wheel artifacts
       uses: actions/upload-artifact@v4
       with:
