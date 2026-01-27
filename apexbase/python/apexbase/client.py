@@ -66,8 +66,8 @@ class ApexClient:
             raise ValueError(f"durability must be 'fast', 'safe', or 'max', got '{durability}'")
         self._durability = durability
         
-        # Initialize V3 storage engine
-        self._storage = ApexStorage(str(self._db_path), drop_if_exists=drop_if_exists)
+        # Initialize V3 storage engine with durability level
+        self._storage = ApexStorage(str(self._db_path), drop_if_exists=drop_if_exists, durability=durability)
         self._connected = True
         self._lock = threading.RLock()
         
@@ -542,6 +542,36 @@ class ApexClient:
     
     def flush_cache(self):
         self.flush()
+    
+    def set_auto_flush(self, rows: int = 0, bytes: int = 0) -> None:
+        """Set auto-flush thresholds.
+        
+        When either threshold is exceeded during writes, data is automatically 
+        written to file. Set to 0 to disable the respective threshold.
+        
+        Args:
+            rows: Auto-flush when pending rows exceed this count (0 = disabled)
+            bytes: Auto-flush when estimated memory exceeds this size (0 = disabled)
+        """
+        self._check_connection()
+        with self._lock:
+            self._storage.set_auto_flush(rows=rows, bytes=bytes)
+    
+    def get_auto_flush(self) -> tuple:
+        """Get current auto-flush configuration.
+        
+        Returns:
+            Tuple of (rows_threshold, bytes_threshold)
+        """
+        self._check_connection()
+        with self._lock:
+            return self._storage.get_auto_flush()
+    
+    def estimate_memory_bytes(self) -> int:
+        """Get estimated memory usage in bytes."""
+        self._check_connection()
+        with self._lock:
+            return self._storage.estimate_memory_bytes()
 
     # ============ Column Operations ============
 

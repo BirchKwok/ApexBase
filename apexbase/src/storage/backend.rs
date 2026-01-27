@@ -201,6 +201,7 @@ pub struct TableMetadata {
 /// - Lazy loading: data is only loaded when requested
 /// - Column projection: only load specific columns
 /// - Memory release: unload columns when not needed
+/// - Configurable durability levels for ACID guarantees
 pub struct TableStorageBackend {
     path: PathBuf,
     storage: OnDemandStorage,
@@ -216,9 +217,14 @@ pub struct TableStorageBackend {
 }
 
 impl TableStorageBackend {
-    /// Create a new storage backend
+    /// Create a new storage backend with default durability (Fast)
     pub fn create(path: &Path) -> io::Result<Self> {
-        let storage = OnDemandStorage::create(path)?;
+        Self::create_with_durability(path, super::DurabilityLevel::Fast)
+    }
+    
+    /// Create a new storage backend with specified durability level
+    pub fn create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+        let storage = OnDemandStorage::create_with_durability(path, durability)?;
         Ok(Self {
             path: path.to_path_buf(),
             storage,
@@ -229,9 +235,14 @@ impl TableStorageBackend {
         })
     }
 
-    /// Open existing storage (lazy - only reads metadata)
+    /// Open existing storage with default durability (Fast)
     pub fn open(path: &Path) -> io::Result<Self> {
-        let storage = OnDemandStorage::open(path)?;
+        Self::open_with_durability(path, super::DurabilityLevel::Fast)
+    }
+    
+    /// Open existing storage with specified durability level
+    pub fn open_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+        let storage = OnDemandStorage::open_with_durability(path, durability)?;
         
         // Read schema from storage
         let storage_schema = storage.get_schema();
@@ -252,18 +263,28 @@ impl TableStorageBackend {
         })
     }
 
-    /// Open or create storage (for read-only or query operations)
+    /// Open or create storage with default durability (Fast)
     pub fn open_or_create(path: &Path) -> io::Result<Self> {
+        Self::open_or_create_with_durability(path, super::DurabilityLevel::Fast)
+    }
+    
+    /// Open or create storage with specified durability level
+    pub fn open_or_create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         if path.exists() {
-            Self::open(path)
+            Self::open_with_durability(path, durability)
         } else {
-            Self::create(path)
+            Self::create_with_durability(path, durability)
         }
     }
 
-    /// Open for write - loads all existing data for append operations
+    /// Open for write with default durability (Fast)
     pub fn open_for_write(path: &Path) -> io::Result<Self> {
-        let storage = OnDemandStorage::open_for_write(path)?;
+        Self::open_for_write_with_durability(path, super::DurabilityLevel::Fast)
+    }
+    
+    /// Open for write with specified durability level - loads all existing data for append operations
+    pub fn open_for_write_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+        let storage = OnDemandStorage::open_for_write_with_durability(path, durability)?;
         
         let storage_schema = storage.get_schema();
         let schema: Vec<(String, DataType)> = storage_schema
@@ -493,6 +514,38 @@ impl TableStorageBackend {
         self.storage.save()?;
         *self.dirty.write() = false;
         Ok(())
+    }
+    
+    /// Explicitly sync data to disk (fsync)
+    /// 
+    /// This ensures all buffered data is written to persistent storage.
+    /// For Safe/Max durability levels, save() automatically calls fsync.
+    /// For Fast durability, use this method when you need explicit durability.
+    pub fn sync(&self) -> io::Result<()> {
+        self.storage.sync()
+    }
+    
+    /// Get the current durability level
+    pub fn durability(&self) -> super::DurabilityLevel {
+        self.storage.durability()
+    }
+    
+    /// Set auto-flush thresholds
+    /// 
+    /// When either threshold is exceeded during writes, data is automatically 
+    /// written to file. Set to 0 to disable the respective threshold.
+    pub fn set_auto_flush(&self, rows: u64, bytes: u64) {
+        self.storage.set_auto_flush(rows, bytes);
+    }
+    
+    /// Get current auto-flush configuration
+    pub fn get_auto_flush(&self) -> (u64, u64) {
+        self.storage.get_auto_flush()
+    }
+    
+    /// Estimate current in-memory data size in bytes
+    pub fn estimate_memory_bytes(&self) -> u64 {
+        self.storage.estimate_memory_bytes()
     }
 
     /// Check if there are unsaved changes

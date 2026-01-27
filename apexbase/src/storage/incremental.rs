@@ -38,6 +38,7 @@ const WAL_HEADER_SIZE: usize = 24; // magic(8) + version(4) + next_id(8) + flags
 const RECORD_INSERT: u8 = 1;
 const RECORD_DELETE: u8 = 2;
 const RECORD_CHECKPOINT: u8 = 3;
+const RECORD_BATCH_INSERT: u8 = 4;
 
 // Compaction threshold (number of WAL records before auto-compact)
 const DEFAULT_COMPACTION_THRESHOLD: usize = 10000;
@@ -54,6 +55,11 @@ pub enum WalRecord {
     Insert {
         id: u64,
         data: HashMap<String, ColumnValue>,
+    },
+    /// Batch insert - more efficient for multiple rows (single WAL record, single I/O)
+    BatchInsert {
+        start_id: u64,
+        rows: Vec<HashMap<String, ColumnValue>>,
     },
     Delete {
         id: u64,
@@ -110,6 +116,54 @@ impl WalRecord {
                             data_buf.push(5);
                             data_buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
                             data_buf.extend_from_slice(v);
+                        }
+                    }
+                }
+                
+                buf.extend_from_slice(&(data_buf.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&data_buf);
+            }
+            WalRecord::BatchInsert { start_id, rows } => {
+                buf.push(RECORD_BATCH_INSERT);
+                buf.extend_from_slice(&timestamp.to_le_bytes());
+                
+                // Serialize batch: [start_id:u64][row_count:u32][rows...]
+                let mut data_buf = Vec::with_capacity(rows.len() * 64); // Pre-allocate
+                data_buf.extend_from_slice(&start_id.to_le_bytes());
+                data_buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+                
+                for row in rows {
+                    data_buf.extend_from_slice(&(row.len() as u32).to_le_bytes());
+                    for (name, value) in row {
+                        let name_bytes = name.as_bytes();
+                        data_buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+                        data_buf.extend_from_slice(name_bytes);
+                        
+                        match value {
+                            ColumnValue::Null => data_buf.push(0),
+                            ColumnValue::Bool(v) => {
+                                data_buf.push(1);
+                                data_buf.push(if *v { 1 } else { 0 });
+                            }
+                            ColumnValue::Int64(v) => {
+                                data_buf.push(2);
+                                data_buf.extend_from_slice(&v.to_le_bytes());
+                            }
+                            ColumnValue::Float64(v) => {
+                                data_buf.push(3);
+                                data_buf.extend_from_slice(&v.to_le_bytes());
+                            }
+                            ColumnValue::String(v) => {
+                                data_buf.push(4);
+                                let bytes = v.as_bytes();
+                                data_buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                                data_buf.extend_from_slice(bytes);
+                            }
+                            ColumnValue::Binary(v) => {
+                                data_buf.push(5);
+                                data_buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                                data_buf.extend_from_slice(v);
+                            }
                         }
                     }
                 }
@@ -204,6 +258,72 @@ impl WalRecord {
                 }
                 
                 WalRecord::Insert { id, data: row_data }
+            }
+            RECORD_BATCH_INSERT => {
+                let start_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let row_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+                
+                let mut pos = 12;
+                let mut rows = Vec::with_capacity(row_count);
+                
+                for _ in 0..row_count {
+                    let col_count = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                    pos += 4;
+                    let mut row_data = HashMap::new();
+                    
+                    for _ in 0..col_count {
+                        let name_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize;
+                        pos += 2;
+                        let name = std::str::from_utf8(&data[pos..pos+name_len])
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                            .to_string();
+                        pos += name_len;
+                        
+                        let value_type = data[pos];
+                        pos += 1;
+                        
+                        let value = match value_type {
+                            0 => ColumnValue::Null,
+                            1 => {
+                                let v = data[pos] != 0;
+                                pos += 1;
+                                ColumnValue::Bool(v)
+                            }
+                            2 => {
+                                let v = i64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
+                                pos += 8;
+                                ColumnValue::Int64(v)
+                            }
+                            3 => {
+                                let v = f64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
+                                pos += 8;
+                                ColumnValue::Float64(v)
+                            }
+                            4 => {
+                                let len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                                pos += 4;
+                                let s = std::str::from_utf8(&data[pos..pos+len])
+                                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                                    .to_string();
+                                pos += len;
+                                ColumnValue::String(s)
+                            }
+                            5 => {
+                                let len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                                pos += 4;
+                                let b = data[pos..pos+len].to_vec();
+                                pos += len;
+                                ColumnValue::Binary(b)
+                            }
+                            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid value type")),
+                        };
+                        
+                        row_data.insert(name, value);
+                    }
+                    rows.push(row_data);
+                }
+                
+                WalRecord::BatchInsert { start_id, rows }
             }
             RECORD_DELETE => {
                 let id = u64::from_le_bytes(data[0..8].try_into().unwrap());
@@ -300,9 +420,71 @@ impl WalWriter {
         Ok(())
     }
     
-    /// Flush WAL to disk
+    /// Append a single row directly without creating WalRecord (optimized for single inserts)
+    /// This avoids the overhead of cloning data into a WalRecord struct
+    pub fn append_row(&mut self, id: u64, data: &HashMap<String, ColumnValue>) -> io::Result<()> {
+        let timestamp = chrono::Utc::now().timestamp();
+        
+        // Serialize directly to buffer
+        let mut buf = Vec::with_capacity(128);
+        buf.push(RECORD_INSERT);
+        buf.extend_from_slice(&timestamp.to_le_bytes());
+        
+        // Data: [id:u64][col_count:u32][col_name_len:u16][col_name][type:u8][value_bytes]
+        let mut data_buf = Vec::with_capacity(64);
+        data_buf.extend_from_slice(&id.to_le_bytes());
+        data_buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        
+        for (name, value) in data {
+            let name_bytes = name.as_bytes();
+            data_buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            data_buf.extend_from_slice(name_bytes);
+            
+            match value {
+                ColumnValue::Null => data_buf.push(0),
+                ColumnValue::Bool(v) => {
+                    data_buf.push(1);
+                    data_buf.push(if *v { 1 } else { 0 });
+                }
+                ColumnValue::Int64(v) => {
+                    data_buf.push(2);
+                    data_buf.extend_from_slice(&v.to_le_bytes());
+                }
+                ColumnValue::Float64(v) => {
+                    data_buf.push(3);
+                    data_buf.extend_from_slice(&v.to_le_bytes());
+                }
+                ColumnValue::String(v) => {
+                    data_buf.push(4);
+                    let bytes = v.as_bytes();
+                    data_buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    data_buf.extend_from_slice(bytes);
+                }
+                ColumnValue::Binary(v) => {
+                    data_buf.push(5);
+                    data_buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    data_buf.extend_from_slice(v);
+                }
+            }
+        }
+        
+        buf.extend_from_slice(&(data_buf.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&data_buf);
+        
+        self.file.write_all(&buf)?;
+        self.record_count += 1;
+        Ok(())
+    }
+    
+    /// Flush WAL to disk (buffered write)
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
+    }
+    
+    /// Sync WAL to disk (fsync - ensures durability)
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.file.flush()?;
+        self.file.get_ref().sync_all()
     }
     
     /// Get record count

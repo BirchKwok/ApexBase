@@ -4,7 +4,7 @@
 //! enabling on-demand reading without loading entire tables into memory.
 
 use crate::data::Value;
-use crate::storage::{TableStorageBackend, StorageManager};
+use crate::storage::{TableStorageBackend, StorageManager, DurabilityLevel};
 use crate::storage::on_demand::ColumnValue;
 use crate::query::{ApexExecutor, ApexResult, SqlParser};
 use crate::fts::FtsManager;
@@ -144,6 +144,8 @@ pub struct ApexStorageImpl {
     fts_manager: RwLock<Option<FtsManager>>,
     /// FTS index field names per table
     fts_index_fields: RwLock<HashMap<String, Vec<String>>>,
+    /// Durability level for ACID guarantees
+    durability: DurabilityLevel,
 }
 
 /// Internal Rust-only methods (not exposed to Python)
@@ -225,12 +227,12 @@ impl ApexStorageImpl {
             }
         }
         
-        // Create new backend and cache it
+        // Create new backend with durability level and cache it
         let backend = if table_path.exists() {
-            TableStorageBackend::open_for_write(&table_path)
+            TableStorageBackend::open_for_write_with_durability(&table_path, self.durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
         } else {
-            TableStorageBackend::create(&table_path)
+            TableStorageBackend::create_with_durability(&table_path, self.durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
         };
         
@@ -253,9 +255,15 @@ impl ApexStorageImpl {
     /// Parameters:
     /// - path: Path to the storage file (will use .apex extension)
     /// - drop_if_exists: If true, delete existing database
+    /// - durability: Durability level ('fast', 'safe', or 'max')
     #[new]
-    #[pyo3(signature = (path, drop_if_exists = false))]
-    fn new(path: &str, drop_if_exists: bool) -> PyResult<Self> {
+    #[pyo3(signature = (path, drop_if_exists = false, durability = "fast"))]
+    fn new(path: &str, drop_if_exists: bool, durability: &str) -> PyResult<Self> {
+        // Parse durability level
+        let durability_level = DurabilityLevel::from_str(durability)
+            .ok_or_else(|| PyValueError::new_err(
+                format!("Invalid durability level '{}'. Must be 'fast', 'safe', or 'max'", durability)
+            ))?;
         // Convert to absolute path to avoid issues with relative paths
         let path_obj = PathBuf::from(path);
         let abs_path = if path_obj.is_absolute() {
@@ -341,6 +349,7 @@ impl ApexStorageImpl {
             current_table: RwLock::new(default_table_name.to_string()),
             fts_manager: RwLock::new(None),
             fts_index_fields: RwLock::new(HashMap::new()),
+            durability: durability_level,
         })
     }
 
@@ -806,10 +815,81 @@ impl ApexStorageImpl {
         Ok(())
     }
     
-    /// Flush changes to disk
+    /// Flush changes to disk with fsync
+    /// 
+    /// For 'safe' and 'max' durability levels, save() automatically calls fsync.
+    /// For 'fast' durability, call this method explicitly when you need durability guarantees.
     fn flush(&self) -> PyResult<()> {
-        // V3 storage auto-saves, flush is a no-op
+        let table_path = self.get_current_table_path()?;
+        
+        // Acquire shared read lock (sync doesn't modify data, just ensures it's on disk)
+        let lock_file = Self::acquire_read_lock(&table_path)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        
+        let result = {
+            let backends = self.cached_backends.read();
+            let table_name = self.current_table.read().clone();
+            if let Some(backend) = backends.get(&table_name) {
+                backend.sync()
+                    .map_err(|e| PyIOError::new_err(format!("Failed to sync: {}", e)))
+            } else {
+                Ok(()) // No backend means no data to sync
+            }
+        };
+        
+        Self::release_lock(lock_file);
+        result
+    }
+    
+    /// Get the current durability level
+    fn get_durability(&self) -> String {
+        self.durability.as_str().to_string()
+    }
+    
+    /// Set auto-flush thresholds
+    /// 
+    /// When either threshold is exceeded during writes, data is automatically 
+    /// written to file. Set to 0 to disable the respective threshold.
+    /// 
+    /// Parameters:
+    /// - rows: Auto-flush when pending rows exceed this count (0 = disabled)
+    /// - bytes: Auto-flush when estimated memory exceeds this size (0 = disabled)
+    #[pyo3(signature = (rows = 0, bytes = 0))]
+    fn set_auto_flush(&self, rows: u64, bytes: u64) -> PyResult<()> {
+        let mut backends = self.cached_backends.write();
+        let table_name = self.current_table.read().clone();
+        
+        if let Some(backend) = backends.get_mut(&table_name) {
+            backend.set_auto_flush(rows, bytes);
+        }
+        
         Ok(())
+    }
+    
+    /// Get current auto-flush configuration
+    /// 
+    /// Returns a tuple of (rows_threshold, bytes_threshold)
+    fn get_auto_flush(&self) -> PyResult<(u64, u64)> {
+        let backends = self.cached_backends.read();
+        let table_name = self.current_table.read().clone();
+        
+        if let Some(backend) = backends.get(&table_name) {
+            Ok(backend.get_auto_flush())
+        } else {
+            Ok((0, 0))
+        }
+    }
+    
+    /// Get estimated memory usage in bytes
+    fn estimate_memory_bytes(&self) -> PyResult<u64> {
+        let backends = self.cached_backends.read();
+        let table_name = self.current_table.read().clone();
+        
+        if let Some(backend) = backends.get(&table_name) {
+            Ok(backend.estimate_memory_bytes())
+        } else {
+            Ok(0)
+        }
     }
 
     /// Close storage

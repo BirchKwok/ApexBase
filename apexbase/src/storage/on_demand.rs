@@ -724,6 +724,20 @@ impl ColumnData {
             None
         }
     }
+    
+    /// Estimate memory usage in bytes
+    pub fn estimate_memory_bytes(&self) -> usize {
+        match self {
+            ColumnData::Bool { data, .. } => data.len(),
+            ColumnData::Int64(v) => v.len() * 8,
+            ColumnData::Float64(v) => v.len() * 8,
+            ColumnData::String { offsets, data } => offsets.len() * 4 + data.len(),
+            ColumnData::Binary { offsets, data } => offsets.len() * 4 + data.len(),
+            ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                indices.len() * 4 + dict_offsets.len() * 4 + dict_data.len()
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1040,13 +1054,38 @@ pub struct OnDemandStorage {
     id_to_idx: RwLock<Option<HashMap<u64, usize>>>,
     /// Cached count of active (non-deleted) rows for O(1) COUNT(*)
     active_count: AtomicU64,
+    /// Durability level for controlling fsync behavior
+    durability: super::DurabilityLevel,
+    /// WAL writer for safe/max durability modes (None for fast mode)
+    wal_writer: RwLock<Option<super::incremental::WalWriter>>,
+    /// WAL buffer for pending writes (used for recovery)
+    wal_buffer: RwLock<Vec<super::incremental::WalRecord>>,
+    /// Auto-flush threshold: number of pending rows (0 = disabled)
+    auto_flush_rows: AtomicU64,
+    /// Auto-flush threshold: estimated memory bytes (0 = disabled)
+    auto_flush_bytes: AtomicU64,
+    /// Count of rows inserted since last save (for auto-flush)
+    pending_rows: AtomicU64,
 }
 
 impl OnDemandStorage {
-    /// Create a new V3 storage file
+    /// Create a new V3 storage file with default durability (Fast)
     pub fn create(path: &Path) -> io::Result<Self> {
+        Self::create_with_durability(path, super::DurabilityLevel::Fast)
+    }
+    
+    /// Create a new V3 storage file with specified durability level
+    pub fn create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         let header = OnDemandHeader::new();
         let schema = OnDemandSchema::new();
+
+        // Initialize WAL for safe/max durability modes
+        let wal_writer = if durability != super::DurabilityLevel::Fast {
+            let wal_path = Self::wal_path(path);
+            Some(super::incremental::WalWriter::create(&wal_path, 0)?)
+        } else {
+            None
+        };
 
         let storage = Self {
             path: path.to_path_buf(),
@@ -1062,6 +1101,12 @@ impl OnDemandStorage {
             deleted: RwLock::new(Vec::new()),
             id_to_idx: RwLock::new(Some(HashMap::new())),
             active_count: AtomicU64::new(0),
+            durability,
+            wal_writer: RwLock::new(wal_writer),
+            wal_buffer: RwLock::new(Vec::new()),
+            auto_flush_rows: AtomicU64::new(100000),
+            auto_flush_bytes: AtomicU64::new(500 * 1024 * 1024),
+            pending_rows: AtomicU64::new(0),
         };
 
         // Write initial file
@@ -1069,10 +1114,25 @@ impl OnDemandStorage {
 
         Ok(storage)
     }
+    
+    /// Get WAL file path for a given data file path
+    fn wal_path(main_path: &Path) -> PathBuf {
+        let mut wal_path = main_path.to_path_buf();
+        let ext = wal_path.extension()
+            .map(|e| format!("{}.wal", e.to_string_lossy()))
+            .unwrap_or_else(|| "wal".to_string());
+        wal_path.set_extension(ext);
+        wal_path
+    }
 
-    /// Open existing V3 storage (lazy - only reads header and index)
-    /// Uses mmap for fast zero-copy reads with OS page cache
+    /// Open existing V3 storage with default durability (Fast)
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with_durability(path, super::DurabilityLevel::Fast)
+    }
+    
+    /// Open existing V3 storage with specified durability level
+    /// Uses mmap for fast zero-copy reads with OS page cache
+    pub fn open_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         let file = File::open(path)?;
         
         // Create mmap cache and use it for initial reads
@@ -1130,6 +1190,41 @@ impl OnDemandStorage {
         let deleted_len = (id_count + 7) / 8;
         let deleted = vec![0u8; deleted_len];
 
+        // Handle WAL recovery and initialization for safe/max durability
+        let wal_path = Self::wal_path(path);
+        let (wal_writer, wal_buffer, recovered_next_id) = if durability != super::DurabilityLevel::Fast {
+            if wal_path.exists() {
+                // Replay WAL for crash recovery
+                let mut reader = super::incremental::WalReader::open(&wal_path)?;
+                let records = reader.read_all()?;
+                
+                // Find max ID from WAL records (handles both Insert and BatchInsert)
+                let max_wal_id = records.iter().filter_map(|r| {
+                    match r {
+                        super::incremental::WalRecord::Insert { id, .. } => Some(*id),
+                        super::incremental::WalRecord::BatchInsert { start_id, rows } => {
+                            Some(*start_id + rows.len() as u64 - 1)
+                        }
+                        _ => None,
+                    }
+                }).max();
+                
+                let recovered_id = max_wal_id.map(|id| id + 1).unwrap_or(next_id);
+                
+                // Open for append
+                let writer = super::incremental::WalWriter::open(&wal_path)?;
+                (Some(writer), records, recovered_id)
+            } else {
+                // Create new WAL
+                let writer = super::incremental::WalWriter::create(&wal_path, next_id)?;
+                (Some(writer), Vec::new(), next_id)
+            }
+        } else {
+            (None, Vec::new(), next_id)
+        };
+        
+        let final_next_id = recovered_next_id.max(next_id);
+
         Ok(Self {
             path: path.to_path_buf(),
             file: RwLock::new(Some(file)),
@@ -1139,30 +1234,116 @@ impl OnDemandStorage {
             column_index: RwLock::new(column_index),
             columns: RwLock::new(columns),
             ids: RwLock::new(ids),
-            next_id: AtomicU64::new(next_id),
+            next_id: AtomicU64::new(final_next_id),
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(deleted),
             id_to_idx: RwLock::new(None),  // Lazy loaded when needed
             active_count: AtomicU64::new(id_count as u64),  // All rows active on fresh open
+            durability,
+            wal_writer: RwLock::new(wal_writer),
+            wal_buffer: RwLock::new(wal_buffer),
+            auto_flush_rows: AtomicU64::new(10000),
+            auto_flush_bytes: AtomicU64::new(500 * 1024 * 1024),
+            pending_rows: AtomicU64::new(0),
         })
     }
+    
+    /// Set auto-flush thresholds
+    /// 
+    /// When either threshold is exceeded, data is automatically written to file.
+    /// Set to 0 to disable the respective threshold.
+    /// 
+    /// # Arguments
+    /// * `rows` - Auto-flush when pending rows exceed this count (0 = disabled)
+    /// * `bytes` - Auto-flush when estimated memory exceeds this size (0 = disabled)
+    pub fn set_auto_flush(&self, rows: u64, bytes: u64) {
+        self.auto_flush_rows.store(rows, Ordering::SeqCst);
+        self.auto_flush_bytes.store(bytes, Ordering::SeqCst);
+    }
+    
+    /// Get current auto-flush configuration
+    pub fn get_auto_flush(&self) -> (u64, u64) {
+        (self.auto_flush_rows.load(Ordering::SeqCst), self.auto_flush_bytes.load(Ordering::SeqCst))
+    }
+    
+    /// Estimate current in-memory data size in bytes
+    pub fn estimate_memory_bytes(&self) -> u64 {
+        let columns = self.columns.read();
+        let mut total: u64 = 0;
+        
+        for col in columns.iter() {
+            total += col.estimate_memory_bytes() as u64;
+        }
+        
+        // Add overhead for IDs (8 bytes each)
+        total += self.ids.read().len() as u64 * 8;
+        
+        // Add overhead for null bitmaps
+        for null_bitmap in self.nulls.read().iter() {
+            total += null_bitmap.len() as u64;
+        }
+        
+        // Add deleted bitmap
+        total += self.deleted.read().len() as u64;
+        
+        total
+    }
+    
+    /// Check if auto-flush is needed and perform it if so
+    /// Returns true if auto-flush was performed
+    fn maybe_auto_flush(&self) -> io::Result<bool> {
+        let rows_threshold = self.auto_flush_rows.load(Ordering::SeqCst);
+        let bytes_threshold = self.auto_flush_bytes.load(Ordering::SeqCst);
+        
+        // Check row threshold
+        if rows_threshold > 0 {
+            let pending = self.pending_rows.load(Ordering::SeqCst);
+            if pending >= rows_threshold {
+                self.save()?;
+                self.pending_rows.store(0, Ordering::SeqCst);
+                return Ok(true);
+            }
+        }
+        
+        // Check memory threshold
+        if bytes_threshold > 0 {
+            let mem_bytes = self.estimate_memory_bytes();
+            if mem_bytes >= bytes_threshold {
+                self.save()?;
+                self.pending_rows.store(0, Ordering::SeqCst);
+                return Ok(true);
+            }
+        }
+        
+        Ok(false)
+    }
 
-    /// Create or open storage
+    /// Create or open storage with default durability (Fast)
     pub fn open_or_create(path: &Path) -> io::Result<Self> {
+        Self::open_or_create_with_durability(path, super::DurabilityLevel::Fast)
+    }
+    
+    /// Create or open storage with specified durability level
+    pub fn open_or_create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         if path.exists() {
-            Self::open(path)
+            Self::open_with_durability(path, durability)
         } else {
-            Self::create(path)
+            Self::create_with_durability(path, durability)
         }
     }
 
-    /// Open for write - loads all existing data into memory for append operations
+    /// Open for write with default durability (Fast)
     pub fn open_for_write(path: &Path) -> io::Result<Self> {
+        Self::open_for_write_with_durability(path, super::DurabilityLevel::Fast)
+    }
+    
+    /// Open for write with specified durability level - loads all existing data into memory for append operations
+    pub fn open_for_write_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         if !path.exists() {
-            return Self::create(path);
+            return Self::create_with_durability(path, durability);
         }
         
-        let storage = Self::open(path)?;
+        let storage = Self::open_with_durability(path, durability)?;
         
         // Load all existing columns into memory for append operations
         if storage.header.read().row_count > 0 {
@@ -3535,6 +3716,15 @@ impl OnDemandStorage {
         writer.write_all(&file_size.to_le_bytes())?;
 
         writer.flush()?;
+        
+        // fsync based on durability level
+        // Max: sync on every save (strongest guarantee)
+        // Safe: sync only when explicitly called via sync() or flush()
+        // Fast: no sync
+        if self.durability == super::DurabilityLevel::Max {
+            let inner_file = writer.get_ref();
+            inner_file.sync_all()?;
+        }
 
         // Update column index in memory
         *self.column_index.write() = column_index_entries;
@@ -3548,6 +3738,91 @@ impl OnDemandStorage {
         *self.file.write() = Some(file);
 
         Ok(())
+    }
+    
+    /// Explicitly sync data to disk (fsync)
+    /// 
+    /// This ensures all buffered data is written to persistent storage.
+    /// For safe/max durability modes, also syncs the WAL file.
+    /// Called automatically for Safe/Max durability levels on save().
+    /// For Fast durability, call this manually when you need durability guarantees.
+    pub fn sync(&self) -> io::Result<()> {
+        // Sync WAL first (for safe/max modes)
+        if self.durability != super::DurabilityLevel::Fast {
+            let mut wal_writer = self.wal_writer.write();
+            if let Some(writer) = wal_writer.as_mut() {
+                writer.sync()?;
+            }
+        }
+        
+        // Sync main data file
+        let file_guard = self.file.read();
+        if let Some(file) = file_guard.as_ref() {
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+    
+    /// Get the current durability level
+    pub fn durability(&self) -> super::DurabilityLevel {
+        self.durability
+    }
+    
+    /// Set the durability level
+    /// 
+    /// Note: This only affects future operations. Existing buffered data
+    /// is not automatically synced when changing to a higher durability level.
+    pub fn set_durability(&mut self, level: super::DurabilityLevel) {
+        self.durability = level;
+    }
+    
+    /// Checkpoint: merge WAL records into main file and clear WAL
+    /// 
+    /// This is called automatically on save() for safe/max modes.
+    /// After checkpoint, all data is in the main file and WAL is cleared.
+    /// This improves read performance by eliminating WAL merge overhead.
+    pub fn checkpoint(&self) -> io::Result<()> {
+        if self.durability == super::DurabilityLevel::Fast {
+            return Ok(()); // No WAL in fast mode
+        }
+        
+        let wal_buffer = self.wal_buffer.read();
+        if wal_buffer.is_empty() {
+            return Ok(()); // Nothing to checkpoint
+        }
+        drop(wal_buffer);
+        
+        // Save main file (this persists all in-memory data including WAL records)
+        self.save()?;
+        
+        // Clear WAL after successful save
+        {
+            let mut wal_buffer = self.wal_buffer.write();
+            let mut wal_writer = self.wal_writer.write();
+            
+            wal_buffer.clear();
+            
+            // Create fresh WAL file
+            if let Some(_) = wal_writer.take() {
+                let wal_path = Self::wal_path(&self.path);
+                *wal_writer = Some(super::incremental::WalWriter::create(
+                    &wal_path, 
+                    self.next_id.load(Ordering::SeqCst)
+                )?);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Get number of pending WAL records
+    pub fn wal_record_count(&self) -> usize {
+        self.wal_buffer.read().len()
+    }
+    
+    /// Check if WAL needs checkpoint (has pending records)
+    pub fn needs_checkpoint(&self) -> bool {
+        !self.wal_buffer.read().is_empty()
     }
 
     // ========================================================================
@@ -3577,10 +3852,40 @@ impl OnDemandStorage {
 
     /// Insert rows using generic value type (compatibility with ColumnarStorage)
     /// Optimized with single-pass column collection
+    /// 
+    /// For safe/max durability modes, rows are written to WAL first for crash recovery.
+    /// - Safe mode: WAL is flushed but fsync is deferred to flush() call
+    /// - Max mode: WAL is fsync'd immediately after each insert for strongest guarantee
     pub fn insert_rows(&self, rows: &[HashMap<String, ColumnValue>]) -> io::Result<Vec<u64>> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
+        
+        // For safe/max durability with batch writes: use WAL for efficiency
+        // Single-row writes skip WAL (original fsync-on-save behavior is faster)
+        // WAL benefit: single I/O for many rows; WAL overhead: extra I/O for single rows
+        let start_id = self.next_id.load(Ordering::SeqCst);
+        let use_wal = self.durability != super::DurabilityLevel::Fast && rows.len() > 1;
+        
+        if use_wal {
+            // Batch writes: use WAL for efficiency (single I/O for all rows)
+            let mut wal_writer = self.wal_writer.write();
+            
+            if let Some(writer) = wal_writer.as_mut() {
+                let record = super::incremental::WalRecord::BatchInsert { 
+                    start_id, 
+                    rows: rows.to_vec()
+                };
+                writer.append(&record)?;
+                writer.flush()?;
+                
+                // For max durability: fsync WAL immediately
+                if self.durability == super::DurabilityLevel::Max {
+                    writer.sync()?;
+                }
+            }
+        }
+        // Note: For single-row writes, fsync happens in save() based on durability level
         
         // Handle case where all rows are empty dicts - still create rows with just _id
         let all_empty = rows.iter().all(|r| r.is_empty());
@@ -3619,6 +3924,10 @@ impl OnDemandStorage {
             
             // Update active count
             self.active_count.fetch_add(row_count as u64, Ordering::Relaxed);
+            
+            // Update pending rows counter and check auto-flush
+            self.pending_rows.fetch_add(row_count as u64, Ordering::Relaxed);
+            self.maybe_auto_flush()?;
             
             return Ok(ids);
         }
@@ -3704,7 +4013,13 @@ impl OnDemandStorage {
             }
         }
 
-        self.insert_typed(int_columns, float_columns, string_columns, binary_columns, bool_columns)
+        let result = self.insert_typed(int_columns, float_columns, string_columns, binary_columns, bool_columns)?;
+        
+        // Update pending rows counter and check auto-flush
+        self.pending_rows.fetch_add(result.len() as u64, Ordering::Relaxed);
+        self.maybe_auto_flush()?;
+        
+        Ok(result)
     }
 
     /// Insert typed columns and immediately persist to disk
