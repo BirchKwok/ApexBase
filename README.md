@@ -2,105 +2,105 @@
 
 **High-performance embedded database with Rust core and Python API**
 
-ApexBase 是一个基于 Rust 核心的高性能嵌入式数据库，提供简洁的 Python API。
+ApexBase is a high-performance embedded database powered by a Rust core, with a clean and ergonomic Python API.
 
-## ✨ 特性
+## ✨ Features
 
-- 🚀 **高性能** - Rust 核心，批量写入速度可达 97万+ ops/s
-- 📦 **单文件存储** - 自定义 `.apex` 文件格式，无需外部依赖
-- 🔍 **全文搜索** - 集成 NanoFTS，支持中文和模糊搜索
-- 🐍 **Python 友好** - 简洁的 API，支持 Pandas/Polars/PyArrow
-- 💾 **紧凑存储** - 相比传统方案节省约 45% 存储空间
+- 🚀 **High performance** - Rust core with batch write throughput up to 970K+ ops/s
+- 📦 **Single-file storage** - custom `.apex` file format with no external dependencies
+- 🔍 **Full-text search** - NanoFTS integration with fuzzy search support
+- 🐍 **Python-friendly** - clean API with Pandas/Polars/PyArrow integrations
+- 💾 **Compact storage** - ~45% smaller on disk compared to traditional approaches
 
-## 📦 安装
+## 📦 Installation
 
 ```bash
-# 从 PyPI 安装
+# Install from PyPI
 pip install apexbase
 
-# 从源码构建（推荐在 conda dev 环境中）
+# Build from source (recommended in the conda dev environment)
 # conda activate dev
 maturin develop --release
 ```
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
 ```python
 from apexbase import ApexClient
 
-# 创建客户端
+# Create a client
 client = ApexClient("./data")
 
-# 存储数据
+# Store data
 client.store({"name": "Alice", "age": 30, "city": "Beijing"})
 client.store([
     {"name": "Bob", "age": 25},
     {"name": "Charlie", "age": 35}
 ])
 
-# SQL 查询（推荐）
+# SQL query (recommended)
 results = client.execute("SELECT * FROM default WHERE age > 28")
 
-# 也支持传入过滤表达式（兼容用法）
+# You can also pass a WHERE expression (compatibility mode)
 results2 = client.query("age > 28", limit=100)
 
-# 按 _id 检索（_id 为内部自增 ID）
+# Retrieve by _id (_id is an internal auto-increment ID)
 record = client.retrieve(0)
 all_data = client.retrieve_all()
 
-# 全文搜索
+# Full-text search
 client.init_fts(index_fields=["name", "city"], lazy_load=True)
 doc_ids = client.search_text("Alice")
 records = client.search_and_retrieve("Beijing")
 
-# 转换为 DataFrame
+# Convert to DataFrame
 df = results.to_pandas()
 pl_df = results.to_polars()
 
-# 关闭连接
+# Close
 client.close()
 ```
 
-## 📊 性能对比
+## 📊 Performance Comparison
 
-| 操作 | ApexBase (Rust) | 传统方案 | 提升 |
+| Operation | ApexBase (Rust) | Baseline | Speedup |
 |------|-----------------|----------|------|
-| 批量写入 (10K) | 17ms | 57ms | **3.3x** |
-| 单条检索 | 0.01ms | 0.4ms | **40x** |
-| 批量检索 (100) | 0.08ms | 1.1ms | **14x** |
-| 存储大小 | 2.1 MB | 3.9 MB | **1.8x 更小** |
+| Batch write (10K) | 17ms | 57ms | **3.3x** |
+| Single read | 0.01ms | 0.4ms | **40x** |
+| Batch read (100) | 0.08ms | 1.1ms | **14x** |
+| Storage size | 2.1 MB | 3.9 MB | **1.8x smaller** |
 
-## 📁 项目结构
+## 📁 Project Structure
 
 ```
 ApexBase/
-├── apexbase/                    # 主包目录
-│   ├── src/                     # Rust 源代码
-│   │   ├── storage/             # 存储引擎
-│   │   ├── table/               # 表管理
-│   │   ├── query/               # 查询执行器
-│   │   ├── index/               # B-tree 索引
-│   │   ├── cache/               # LRU 缓存
-│   │   ├── data/                # 数据类型
-│   │   └── python/              # PyO3 绑定
-│   ├── python/                  # Python 包装层
+├── apexbase/                    # main package
+│   ├── src/                     # Rust source
+│   │   ├── storage/             # storage engine
+│   │   ├── table/               # table management
+│   │   ├── query/               # query executor
+│   │   ├── index/               # B-tree index
+│   │   ├── cache/               # LRU cache
+│   │   ├── data/                # data types
+│   │   └── python/              # PyO3 bindings
+│   ├── python/                  # Python wrapper
 │   │   └── apexbase/
 │   │       └── __init__.py      # Python API
 │   ├── Cargo.toml
 │   └── pyproject.toml
-├── Cargo.toml                   # 工作区配置
-└── pyproject.toml               # 项目配置
+├── Cargo.toml                   # workspace config
+└── pyproject.toml               # project config
 ```
 
-## 🔧 API 参考
+## 🔧 API Reference
 
 ### ApexClient
 
 ```python
-# 初始化
+# Initialization
 client = ApexClient(
-    dirpath="./data",           # 数据目录
-    drop_if_exists=False,       # 是否删除已存在的数据
+    dirpath="./data",           # data directory
+    drop_if_exists=False,       # whether to delete existing data
     batch_size=1000,
     enable_cache=True,
     cache_size=10000,
@@ -108,13 +108,13 @@ client = ApexClient(
     durability="fast",         # fast | safe | max
 )
 
-# 表操作
+# Table operations
 client.create_table("users")
 client.use_table("users")
 client.drop_table("users")
 tables = client.list_tables()
 
-# CRUD 操作
+# CRUD operations
 client.store({"key": "value"})
 client.store([{...}, {...}])
 record = client.retrieve(0)
@@ -123,19 +123,19 @@ client.replace(0, {"new": "data"})
 client.delete(0)
 client.delete([1, 2, 3])
 
-# 查询
+# Query
 results = client.query("age > 30")
 results = client.query("name LIKE 'A%'")
 results = client.execute("SELECT name, age FROM default ORDER BY age DESC LIMIT 10")
 count = client.count_rows()
 
-# 全文搜索
+# Full-text search
 client.init_fts(index_fields=["title", "content"], lazy_load=True)
 ids = client.search_text("keyword")
-ids = client.fuzzy_search_text("keywrd")  # 模糊搜索
+ids = client.fuzzy_search_text("keywrd")  # fuzzy search
 records = client.search_and_retrieve("keyword")
 
-# 数据框架集成
+# DataFrame integrations
 client.from_pandas(df)
 client.from_polars(df)
 results.to_pandas()
@@ -143,28 +143,28 @@ results.to_polars()
 results.to_arrow()
 ```
 
-## 🧪 开发与测试
+## 🧪 Development & Testing
 
 ```bash
-# 运行测试（conda dev 环境推荐）
+# Run tests (recommended in the conda dev environment)
 # conda activate dev
 python run_tests.py
 
-# 或直接 pytest
+# Or run pytest directly
 pytest -q
 ```
 
-## 📦 发布流程（GitHub Actions）
+## 📦 Release Process (GitHub Actions)
 
-当前仓库已提供基于 tag 的自动构建与发布流程：当推送 `v*` tag 时，会运行测试、构建 wheels/sdist 并使用 `twine` 发布到 PyPI。
+This repository provides a tag-based automated build and release workflow. When you push a `v*` tag, CI runs tests, builds wheels/sdist, and publishes to PyPI via `twine`.
 
 - **Workflow**: `.github/workflows/build_release.yml`
-- **Tag**: `v0.2.3` 这类格式
+- **Tag**: format like `v0.2.3`
 - **Secret**: `PYPI_API_TOKEN`
 
-## 📚 文档
+## 📚 Documentation
 
-项目文档入口：`docs/README.md`
+Documentation entry point: `docs/README.md`
 
 ## 📄 License
 

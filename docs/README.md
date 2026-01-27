@@ -1,38 +1,38 @@
-# 文档索引
+# Documentation Index
 
-## 快速入口
+## Quick Links
 
-- 根 README：`../README.md`
-- Python API 入口：`../apexbase/python/apexbase/__init__.py`
-- 测试套件说明：`../test/README.md`
-- CI 发布流程：`../.github/workflows/build_release.yml`
+- Root README: `../README.md`
+- Python API entry: `../apexbase/python/apexbase/__init__.py`
+- Test suite notes: `../test/README.md`
+- CI release workflow: `../.github/workflows/build_release.yml`
 
-## 使用建议
+## Usage Notes
 
-- ApexBase 的主要对外接口是 `apexbase.ApexClient`。
-- 数据持久化文件为单文件 `apexbase.apex`，默认保存在 `ApexClient(dirpath=...)` 指定目录下。
-- 查询推荐使用 `execute(sql)`（完整 SQL），兼容场景可以使用 `query(where, limit=...)`（只传 WHERE 表达式）。
+- The primary public entry point is `apexbase.ApexClient`.
+- The persistence file is a single file `apexbase.apex`, stored by default under the directory specified by `ApexClient(dirpath=...)`.
+- For queries, prefer `execute(sql)` (full SQL). For compatibility, you can use `query(where, limit=...)` (WHERE expression only).
 
-## 本地开发（conda dev 环境）
+## Local Development (conda `dev` environment)
 
 ```bash
 # conda activate dev
 
-# 本地开发安装（Rust 扩展）
+# Local development install (Rust extension)
 maturin develop --release
 
-# 运行测试
+# Run tests
 python run_tests.py
 ```
 
-## 发布准备清单
+## Release Checklist
 
-- 版本号一致性：`pyproject.toml` 与 `Cargo.toml` 的 `version` 保持一致
-- 本地通过测试：`python run_tests.py`
-- 打 tag 触发 CI：推送 `v*` tag（例如 `v0.2.3`）
-- 配置 PyPI Token：GitHub Secrets 中设置 `PYPI_API_TOKEN`
+- Version consistency: keep `version` aligned between `pyproject.toml` and `Cargo.toml`
+- Tests pass locally: `python run_tests.py`
+- Tag to trigger CI: push a `v*` tag (e.g. `v0.2.3`)
+- Configure PyPI token: set `PYPI_API_TOKEN` in GitHub Secrets
 
-## 已知限制/注意事项
+## Known Limitations / Notes
 
-- 当前项目以 Python API 为主要用户入口；Rust crate 主要用于 PyO3 扩展和内部引擎复用。
-- 部分高级 SQL 能力（如复杂子查询、并发锁等）可能仍在演进中，建议以 `test/` 中覆盖的行为为准。
+- This project is primarily consumed via the Python API; the Rust crate is mainly for the PyO3 extension and internal engine reuse.
+- Some advanced SQL capabilities (e.g. complex subqueries, concurrency locks) are still evolving; treat the behavior covered in `test/` as the current source of truth.

@@ -1,124 +1,124 @@
-# ApexBase ACID 与性能权衡分析
+# ApexBase ACID vs Performance Trade-off Analysis
 
-## 当前架构：性能优先
+## Current Architecture: Performance First
 
-### 优势
-- **写入速度**：~0.3ms/10k 行（90M rows/s）
-- **内存效率**：列式存储，零拷贝优化
-- **简单性**：无事务管理开销
+### Advantages
+- **Write speed**: ~0.3ms / 10k rows (90M rows/s)
+- **Memory efficiency**: columnar storage with zero-copy optimizations
+- **Simplicity**: no transaction management overhead
 
-### 限制
-- **无事务支持**：无法回滚
-- **弱一致性**：可能数据丢失
-- **并发限制**：写操作需要全局锁
+### Limitations
+- **No transactions**: cannot roll back
+- **Weaker consistency**: data loss may be possible
+- **Concurrency limits**: write operations require a global lock
 
-## 改进方案
+## Improvement Options
 
-### 方案 1：可配置一致性级别
+### Option 1: Configurable Consistency Levels
 
 ```python
-# 高性能模式（当前）
+# High-performance mode (current)
 client = ApexClient("./db", consistency="eventual")
 
-# 强一致性模式
+# Strong consistency mode
 client = ApexClient("./db", consistency="strong")
 ```
 
-**实现复杂度**：中等
-**性能影响**：15-30%
-**适用场景**：需要灵活性的应用
+**Implementation complexity**: medium
+**Performance impact**: 15-30%
+**Use cases**: applications that need flexibility
 
-### 方案 2：轻量级事务
+### Option 2: Lightweight Transactions
 
 ```python
-# 批量事务
+# Batch transaction
 with client.transaction() as tx:
     tx.store({"user": "alice"})
     tx.store({"user": "bob"})
-    # 自动提交或回滚
+    # auto-commit or rollback
 ```
 
-**实现复杂度**：高
-**性能影响**：40-60%
-**适用场景**：需要原子性保证的场景
+**Implementation complexity**: high
+**Performance impact**: 40-60%
+**Use cases**: scenarios requiring atomicity guarantees
 
-### 方案 3：WAL + 检查点
+### Option 3: WAL + Checkpointing
 
 ```rust
-// WAL 模式
-wal.append(WalRecord::insert(...))  // 先写日志
-table.insert(record)                // 再更新内存
-background_checkpoint()             // 后台检查点
+// WAL mode
+wal.append(WalRecord::insert(...))  // write the log first
+table.insert(record)                // then update memory
+background_checkpoint()             // background checkpoint
 ```
 
-**实现复杂度**：高
-**性能影响**：20-40%
-**适用场景**：需要持久性保证的场景
+**Implementation complexity**: high
+**Performance impact**: 20-40%
+**Use cases**: scenarios requiring durability guarantees
 
-## 性能对比预估
+## Estimated Performance Comparison
 
-| 特性 | 当前 | 方案1 | 方案2 | 方案3 |
+| Feature | Current | Option 1 | Option 2 | Option 3 |
 |-----|------|-------|-------|-------|
-| 写入性能 | 100% | 85% | 60% | 75% |
-| 一致性 | 弱 | 可配置 | 强 | 中等 |
-| 持久性 | 中等 | 可配置 | 强 | 强 |
-| 实现成本 | - | 中 | 高 | 高 |
+| Write performance | 100% | 85% | 60% | 75% |
+| Consistency | weak | configurable | strong | medium |
+| Durability | medium | configurable | strong | strong |
+| Implementation cost | - | medium | high | high |
 
-## 推荐策略
+## Recommended Strategy
 
-### 短期（保持当前设计）
-- **专注性能**：保持 ApexBase 的高性能优势
-- **文档明确**：清楚说明一致性限制
-- **最佳实践**：提供使用指导
+### Short Term (keep current design)
+- **Focus on performance**: preserve ApexBase's high-performance advantage
+- **Clear documentation**: explicitly describe consistency limitations
+- **Best practices**: provide usage guidance
 
-### 中期（可选一致性）
-- **配置选项**：允许用户选择一致性级别
-- **渐进实现**：先支持简单的批量写入原子性
-- **性能测试**：确保性能影响可控
+### Mid Term (optional consistency)
+- **Configuration options**: allow users to choose consistency levels
+- **Incremental implementation**: start with basic batch-write atomicity
+- **Performance testing**: ensure performance impact remains acceptable
 
-### 长期（完整事务）
-- **WAL 集成**：添加写前日志支持
-- **MVCC**：多版本并发控制
-- **优化**：针对高频场景优化
+### Long Term (full transactions)
+- **WAL integration**: add write-ahead logging support
+- **MVCC**: multi-version concurrency control
+- **Optimization**: optimize for high-frequency scenarios
 
-## 现实世界的例子
+## Real-world Examples
 
 ### SQLite
 ```sql
--- 默认：FULL 同步（强一致性）
+-- Default: FULL sync (strong consistency)
 PRAGMA synchronous = FULL;
 
--- 性能模式：OFF（最快但可能丢数据）
+-- Performance mode: OFF (fastest, but data loss may occur)
 PRAGMA synchronous = OFF;
 ```
 
 ### Redis
 ```python
-# 默认：每秒刷新
+# Default: flush every second
 redis.set("key", "value")
 
-# 强一致性：立即刷新
+# Strong consistency: flush immediately
 redis.set("key", "value", sync=True)
 ```
 
 ### MongoDB
 ```python
-# 默认：acknowledged
+# Default: acknowledged
 collection.insert_one(doc)
 
-# 强一致性：majority
+# Strong consistency: majority
 collection.insert_one(doc, w="majority")
 ```
 
-## 结论
+## Conclusion
 
-**ACID 和性能不是绝对的二选一**，而是：
+**ACID and performance are not a strict either/or choice**. Instead:
 
-1. **设计权衡**：根据目标场景选择合适的平衡点
-2. **可配置性**：让用户根据需求选择
-3. **渐进实现**：从简单到复杂，逐步增强功能
+1. **Design trade-offs**: choose the right balance for the target workload
+2. **Configurability**: let users choose based on their needs
+3. **Incremental delivery**: evolve from simple to complex over time
 
-**ApexBase 当前的选择是正确的**：
-- 明确定位为高性能嵌入式数据库
-- 专注于分析、日志等性能敏感场景
-- 为未来的功能扩展留出空间
+**ApexBase's current choice can be a good fit**:
+- It is positioned as a high-performance embedded database
+- It targets performance-sensitive workloads such as analytics and logs
+- It leaves room for future feature expansion
