@@ -29,7 +29,7 @@ python run_tests.py
 
 - 版本号一致性：`pyproject.toml` 与 `Cargo.toml` 的 `version` 保持一致
 - 本地通过测试：`python run_tests.py`
-- 打 tag 触发 CI：推送 `v*` tag（例如 `v0.2.2`）
+- 打 tag 触发 CI：推送 `v*` tag（例如 `v0.2.3`）
 - 配置 PyPI Token：GitHub Secrets 中设置 `PYPI_API_TOKEN`
 
 ## 已知限制/注意事项

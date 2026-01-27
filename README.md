@@ -159,7 +159,7 @@ pytest -q
 当前仓库已提供基于 tag 的自动构建与发布流程：当推送 `v*` tag 时，会运行测试、构建 wheels/sdist 并使用 `twine` 发布到 PyPI。
 
 - **Workflow**: `.github/workflows/build_release.yml`
-- **Tag**: `v0.2.2` 这类格式
+- **Tag**: `v0.2.3` 这类格式
 - **Secret**: `PYPI_API_TOKEN`
 
 ## 📚 文档

@@ -1,6 +1,6 @@
 [package]
 name = "apexbase"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 authors = ["Birch Kwok <birchkwok@gmail.com>"]
 description = "High-performance embedded database with Rust core"
