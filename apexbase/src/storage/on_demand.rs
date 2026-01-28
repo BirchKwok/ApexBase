@@ -752,11 +752,48 @@ pub struct OnDemandHeader {
     pub column_count: u32,
     pub row_group_size: u32,
     pub schema_offset: u64,
-    pub column_index_offset: u64,
-    pub id_column_offset: u64,
+    pub column_index_offset: u64,  // Legacy: used for single-RG mode
+    pub id_column_offset: u64,      // Legacy: used for single-RG mode
+    pub row_group_count: u32,       // Number of row groups (0 = legacy single-RG mode)
+    pub row_group_index_offset: u64, // Offset to Row Group Index at file end
     pub created_at: i64,
     pub modified_at: i64,
     pub checksum: u32,
+}
+
+/// Row Group Index Entry (24 bytes per row group)
+/// Located at end of file, pointed to by header.row_group_index_offset
+#[derive(Debug, Clone, Copy)]
+pub struct RowGroupIndexEntry {
+    pub offset: u64,      // File offset where this RG starts
+    pub row_start: u64,   // First row ID in this RG
+    pub row_count: u32,   // Number of rows in this RG
+    pub _reserved: u32,   // Reserved for future use
+}
+
+impl RowGroupIndexEntry {
+    pub const SIZE: usize = 24;
+    
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..8].copy_from_slice(&self.offset.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.row_start.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.row_count.to_le_bytes());
+        buf[20..24].copy_from_slice(&self._reserved.to_le_bytes());
+        buf
+    }
+    
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() < Self::SIZE {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Row group index entry too short"));
+        }
+        Ok(Self {
+            offset: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            row_start: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            row_count: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            _reserved: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+        })
+    }
 }
 
 impl OnDemandHeader {
@@ -771,6 +808,8 @@ impl OnDemandHeader {
             schema_offset: HEADER_SIZE_V3 as u64,
             column_index_offset: 0,
             id_column_offset: 0,
+            row_group_count: 0,          // 0 = legacy single-RG mode
+            row_group_index_offset: 0,   // Set when using multi-RG mode
             created_at: now,
             modified_at: now,
             checksum: 0,
@@ -809,12 +848,20 @@ impl OnDemandHeader {
         buf[pos..pos + 8].copy_from_slice(&self.schema_offset.to_le_bytes());
         pos += 8;
 
-        // Column index offset (8 bytes)
+        // Column index offset (8 bytes) - legacy single-RG mode
         buf[pos..pos + 8].copy_from_slice(&self.column_index_offset.to_le_bytes());
         pos += 8;
 
-        // ID column offset (8 bytes)
+        // ID column offset (8 bytes) - legacy single-RG mode
         buf[pos..pos + 8].copy_from_slice(&self.id_column_offset.to_le_bytes());
+        pos += 8;
+
+        // Row group count (4 bytes) - NEW: 0 = legacy mode
+        buf[pos..pos + 4].copy_from_slice(&self.row_group_count.to_le_bytes());
+        pos += 4;
+
+        // Row group index offset (8 bytes) - NEW: offset to RG index at file end
+        buf[pos..pos + 8].copy_from_slice(&self.row_group_index_offset.to_le_bytes());
         pos += 8;
 
         // Created timestamp (8 bytes)
@@ -860,6 +907,15 @@ impl OnDemandHeader {
         pos += 8;
         let id_column_offset = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
         pos += 8;
+        
+        // Row group count (4 bytes) - NEW field, defaults to 0 for old files
+        let row_group_count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        
+        // Row group index offset (8 bytes) - NEW field
+        let row_group_index_offset = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        
         let created_at = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
         pos += 8;
         let modified_at = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
@@ -885,6 +941,8 @@ impl OnDemandHeader {
             schema_offset,
             column_index_offset,
             id_column_offset,
+            row_group_count,
+            row_group_index_offset,
             created_at,
             modified_at,
             checksum,
@@ -1023,7 +1081,7 @@ impl OnDemandSchema {
 // On-Demand Storage Engine
 // ============================================================================
 
-/// High-performance on-demand columnar storage
+/// High-performance on-demand columnar storage with Row Group append support
 /// 
 /// Key features:
 /// - Read only required columns (column projection)
@@ -1031,6 +1089,7 @@ impl OnDemandSchema {
 /// - Uses mmap for zero-copy reads with OS page cache (cross-platform)
 /// - Soft delete with deleted bitmap
 /// - Update via delete + insert
+/// - Row Group append: new data appends to file end without rewriting
 pub struct OnDemandStorage {
     path: PathBuf,
     file: RwLock<Option<File>>,
@@ -1039,10 +1098,13 @@ pub struct OnDemandStorage {
     header: RwLock<OnDemandHeader>,
     schema: RwLock<OnDemandSchema>,
     column_index: RwLock<Vec<ColumnIndexEntry>>,
-    /// In-memory column data (for writes)
+    /// In-memory column data (for writes / current row group buffer)
     columns: RwLock<Vec<ColumnData>>,
-    /// Row IDs
+    /// Row IDs - lazy loaded from file on first access
+    /// DuckDB-style: don't load all IDs on open, read on-demand
     ids: RwLock<Vec<u64>>,
+    /// Whether IDs have been loaded from file (lazy loading flag)
+    ids_loaded: std::sync::atomic::AtomicBool,
     /// Next row ID
     next_id: AtomicU64,
     /// Null bitmaps per column
@@ -1066,6 +1128,11 @@ pub struct OnDemandStorage {
     auto_flush_bytes: AtomicU64,
     /// Count of rows inserted since last save (for auto-flush)
     pending_rows: AtomicU64,
+    /// Row Group Index: metadata for each row group in the file
+    row_group_index: RwLock<Vec<RowGroupIndexEntry>>,
+    /// Pending rows buffer for current row group (not yet flushed to file)
+    /// These rows are kept in memory and written as a new RG when threshold reached
+    pending_rg_rows: AtomicU64,
 }
 
 impl OnDemandStorage {
@@ -1096,6 +1163,7 @@ impl OnDemandStorage {
             column_index: RwLock::new(Vec::new()),
             columns: RwLock::new(Vec::new()),
             ids: RwLock::new(Vec::new()),
+            ids_loaded: std::sync::atomic::AtomicBool::new(true), // New file, no IDs to load
             next_id: AtomicU64::new(0),
             nulls: RwLock::new(Vec::new()),
             deleted: RwLock::new(Vec::new()),
@@ -1105,8 +1173,10 @@ impl OnDemandStorage {
             wal_writer: RwLock::new(wal_writer),
             wal_buffer: RwLock::new(Vec::new()),
             auto_flush_rows: AtomicU64::new(100000),
-            auto_flush_bytes: AtomicU64::new(500 * 1024 * 1024),
+            auto_flush_bytes: AtomicU64::new(100 * 1024 * 1024), // 100MB default
             pending_rows: AtomicU64::new(0),
+            row_group_index: RwLock::new(Vec::new()),
+            pending_rg_rows: AtomicU64::new(0),
         };
 
         // Write initial file
@@ -1161,25 +1231,24 @@ impl OnDemandStorage {
             column_index.push(entry);
         }
 
-        // Read IDs into memory using mmap (needed for read_ids and row count)
+        // LAZY LOADING: Don't load all IDs at startup - saves ~8MB per 1M rows
+        // Only read the last ID to determine next_id (DuckDB-style optimization)
         let id_count = header.row_count as usize;
-        let mut id_bytes = vec![0u8; id_count * 8];
-        if id_count > 0 {
-            mmap_cache.read_at(&file, &mut id_bytes, header.id_column_offset)?;
-        }
-        let mut ids = Vec::with_capacity(id_count);
-        for i in 0..id_count {
-            let id = u64::from_le_bytes(id_bytes[i * 8..(i + 1) * 8].try_into().unwrap());
-            ids.push(id);
-        }
-        // NOTE: id_to_idx HashMap is NOT built here - lazy loaded when needed
-        // This saves ~200MB+ memory for 10M rows (only needed for delete/exists ops)
+        let ids = Vec::new();  // Empty - will be loaded on first access
+        let ids_loaded = false;
         
-        // If no rows exist, start from 0; otherwise start after max existing ID
-        let next_id = if ids.is_empty() {
+        // Determine next_id by reading only the last ID from file
+        // This avoids loading all IDs just to find the max
+        let next_id = if id_count == 0 {
             0
         } else {
-            ids.iter().max().copied().unwrap_or(0) + 1
+            // Read only the last 8 bytes (last ID) to find max
+            // IDs are sequential, so last ID is always the max
+            let last_id_offset = header.id_column_offset + ((id_count - 1) * 8) as u64;
+            let mut last_id_bytes = [0u8; 8];
+            mmap_cache.read_at(&file, &mut last_id_bytes, last_id_offset)?;
+            let last_id = u64::from_le_bytes(last_id_bytes);
+            last_id + 1
         };
 
         // NOTE: Column data is NOT loaded - will be read on-demand via mmap
@@ -1192,7 +1261,7 @@ impl OnDemandStorage {
 
         // Handle WAL recovery and initialization for safe/max durability
         let wal_path = Self::wal_path(path);
-        let (wal_writer, wal_buffer, recovered_next_id) = if durability != super::DurabilityLevel::Fast {
+        let (wal_writer, wal_buffer, recovered_next_id, wal_rows) = if durability != super::DurabilityLevel::Fast {
             if wal_path.exists() {
                 // Replay WAL for crash recovery
                 let mut reader = super::incremental::WalReader::open(&wal_path)?;
@@ -1211,21 +1280,60 @@ impl OnDemandStorage {
                 
                 let recovered_id = max_wal_id.map(|id| id + 1).unwrap_or(next_id);
                 
+                // Extract rows from WAL for replay into memory
+                let mut wal_rows: Vec<(u64, HashMap<String, super::on_demand::ColumnValue>)> = Vec::new();
+                for record in &records {
+                    match record {
+                        super::incremental::WalRecord::Insert { id, data } => {
+                            wal_rows.push((*id, data.clone()));
+                        }
+                        super::incremental::WalRecord::BatchInsert { start_id, rows } => {
+                            for (i, row) in rows.iter().enumerate() {
+                                wal_rows.push((*start_id + i as u64, row.clone()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                
                 // Open for append
                 let writer = super::incremental::WalWriter::open(&wal_path)?;
-                (Some(writer), records, recovered_id)
+                (Some(writer), records, recovered_id, wal_rows)
             } else {
                 // Create new WAL
                 let writer = super::incremental::WalWriter::create(&wal_path, next_id)?;
-                (Some(writer), Vec::new(), next_id)
+                (Some(writer), Vec::new(), next_id, Vec::new())
             }
         } else {
-            (None, Vec::new(), next_id)
+            (None, Vec::new(), next_id, Vec::new())
         };
         
         let final_next_id = recovered_next_id.max(next_id);
+        let wal_row_count = wal_rows.len();
 
-        Ok(Self {
+        // Read Row Group Index if present (row_group_count > 0)
+        let row_group_index = if header.row_group_count > 0 && header.row_group_index_offset > 0 {
+            let rg_index_size = header.row_group_count as usize * RowGroupIndexEntry::SIZE;
+            let mut rg_index_bytes = vec![0u8; rg_index_size];
+            let file_guard = file;
+            let mut temp_mmap = MmapCache::new();
+            temp_mmap.read_at(&file_guard, &mut rg_index_bytes, header.row_group_index_offset)?;
+            
+            let mut rg_index = Vec::with_capacity(header.row_group_count as usize);
+            for i in 0..header.row_group_count as usize {
+                let start = i * RowGroupIndexEntry::SIZE;
+                let entry = RowGroupIndexEntry::from_bytes(&rg_index_bytes[start..start + RowGroupIndexEntry::SIZE])?;
+                rg_index.push(entry);
+            }
+            // Re-open file since we moved it
+            let file = File::open(path)?;
+            (rg_index, file)
+        } else {
+            (Vec::new(), file)
+        };
+        let (rg_index, file) = row_group_index;
+
+        let mut storage = Self {
             path: path.to_path_buf(),
             file: RwLock::new(Some(file)),
             mmap_cache: RwLock::new(mmap_cache),
@@ -1234,18 +1342,30 @@ impl OnDemandStorage {
             column_index: RwLock::new(column_index),
             columns: RwLock::new(columns),
             ids: RwLock::new(ids),
+            ids_loaded: std::sync::atomic::AtomicBool::new(ids_loaded),
             next_id: AtomicU64::new(final_next_id),
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(deleted),
             id_to_idx: RwLock::new(None),  // Lazy loaded when needed
-            active_count: AtomicU64::new(id_count as u64),  // All rows active on fresh open
+            active_count: AtomicU64::new(id_count as u64),
             durability,
             wal_writer: RwLock::new(wal_writer),
             wal_buffer: RwLock::new(wal_buffer),
             auto_flush_rows: AtomicU64::new(10000),
-            auto_flush_bytes: AtomicU64::new(500 * 1024 * 1024),
+            auto_flush_bytes: AtomicU64::new(100 * 1024 * 1024), // 100MB default
             pending_rows: AtomicU64::new(0),
-        })
+            row_group_index: RwLock::new(rg_index),
+            pending_rg_rows: AtomicU64::new(0),
+        };
+        
+        // Replay WAL rows into memory (crash recovery)
+        // This ensures data written to WAL is visible after reopening
+        if !wal_rows.is_empty() {
+            storage.replay_wal_rows(wal_rows)?;
+            storage.active_count.fetch_add(wal_row_count as u64, Ordering::Relaxed);
+        }
+        
+        Ok(storage)
     }
     
     /// Set auto-flush thresholds
@@ -1299,7 +1419,8 @@ impl OnDemandStorage {
         if rows_threshold > 0 {
             let pending = self.pending_rows.load(Ordering::SeqCst);
             if pending >= rows_threshold {
-                self.save()?;
+                // Use append_row_group instead of save() to avoid rewriting entire file
+                self.append_row_group()?;
                 self.pending_rows.store(0, Ordering::SeqCst);
                 return Ok(true);
             }
@@ -1309,7 +1430,8 @@ impl OnDemandStorage {
         if bytes_threshold > 0 {
             let mem_bytes = self.estimate_memory_bytes();
             if mem_bytes >= bytes_threshold {
-                self.save()?;
+                // Use append_row_group instead of save() to avoid rewriting entire file
+                self.append_row_group()?;
                 self.pending_rows.store(0, Ordering::SeqCst);
                 return Ok(true);
             }
@@ -1377,9 +1499,10 @@ impl OnDemandStorage {
     /// Read specific columns for a row range
     /// 
     /// This is the core on-demand read function:
-    /// - Only reads the requested columns from disk
+    /// - Reads from in-memory columns (for pending data) OR from disk
+    /// - Only reads the requested columns
     /// - Only reads the requested row range
-    /// - Uses pread for efficient random access
+    /// - Uses mmap for efficient random access when reading from disk
     ///
     /// # Arguments
     /// * `column_names` - Columns to read (None = all columns)
@@ -1391,11 +1514,12 @@ impl OnDemandStorage {
         start_row: usize,
         row_count: Option<usize>,
     ) -> io::Result<HashMap<String, ColumnData>> {
-        let header = self.header.read();
         let schema = self.schema.read();
-        let column_index = self.column_index.read();
+        let columns = self.columns.read();
+        let ids = self.ids.read();
         
-        let total_rows = header.row_count as usize;
+        // Use in-memory row count (includes pending writes not yet saved to file)
+        let total_rows = ids.len();
         let actual_start = start_row.min(total_rows);
         let actual_count = row_count
             .map(|c| c.min(total_rows - actual_start))
@@ -1413,6 +1537,39 @@ impl OnDemandStorage {
                 .collect(),
             None => (0..schema.column_count()).collect(),
         };
+
+        // Check if we have in-memory data (pending writes)
+        let has_memory_data = !columns.is_empty() && columns.iter().any(|c| c.len() > 0);
+        
+        if has_memory_data {
+            // FAST PATH: Read from in-memory columns (includes pending writes)
+            // This enables Row Group append mode - no need to save() after each write
+            let mut result = HashMap::with_capacity(col_indices.len());
+            for &col_idx in &col_indices {
+                if col_idx < columns.len() {
+                    let (col_name, _) = &schema.columns[col_idx];
+                    let col = &columns[col_idx];
+                    
+                    // Extract range from in-memory column
+                    let col_data = col.slice(actual_start, actual_count);
+                    result.insert(col_name.clone(), col_data);
+                }
+            }
+            return Ok(result);
+        }
+
+        // SLOW PATH: Read from file using mmap (for freshly opened files)
+        let header = self.header.read();
+        let column_index = self.column_index.read();
+        let file_total_rows = header.row_count as usize;
+        
+        // Adjust for file-based row count
+        let file_start = actual_start.min(file_total_rows);
+        let file_count = actual_count.min(file_total_rows.saturating_sub(file_start));
+        
+        if file_count == 0 {
+            return Ok(HashMap::new());
+        }
 
         let file_guard = self.file.read();
         let file = file_guard.as_ref().ok_or_else(|| {
@@ -1433,9 +1590,9 @@ impl OnDemandStorage {
                 file,
                 index_entry,
                 *col_type,
-                actual_start,
-                actual_count,
-                total_rows,
+                file_start,
+                file_count,
+                file_total_rows,
             )?;
             
             result.insert(col_name.clone(), col_data);
@@ -2188,8 +2345,11 @@ impl OnDemandStorage {
         self.read_column_scattered_mmap(&mut mmap_cache, file, index_entry, *col_type, row_indices, total_rows)
     }
 
-    /// Read IDs for a row range
+    /// Read IDs for a row range (with lazy loading)
     pub fn read_ids(&self, start_row: usize, row_count: Option<usize>) -> io::Result<Vec<u64>> {
+        // Ensure IDs are loaded from file (DuckDB-style lazy loading)
+        self.ensure_ids_loaded()?;
+        
         let ids = self.ids.read();
         let total = ids.len();
         let start = start_row.min(total);
@@ -2199,6 +2359,9 @@ impl OnDemandStorage {
 
     /// Read IDs for specific row indices (optimized for scattered access)
     pub fn read_ids_by_indices(&self, row_indices: &[usize]) -> io::Result<Vec<i64>> {
+        // Ensure IDs are loaded from file (DuckDB-style lazy loading)
+        self.ensure_ids_loaded()?;
+        
         let ids = self.ids.read();
         let total = ids.len();
         Ok(row_indices.iter()
@@ -2210,9 +2373,52 @@ impl OnDemandStorage {
     // Internal helpers
     // ========================================================================
 
+    /// DuckDB-style lazy loading: Load IDs from file on first access
+    /// This saves ~80MB memory for 10M rows at startup
+    fn ensure_ids_loaded(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        
+        // Fast path: already loaded
+        if self.ids_loaded.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        
+        // Slow path: need to load from file
+        let mut ids = self.ids.write();
+        
+        // Double-check after acquiring write lock
+        if self.ids_loaded.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        
+        let header = self.header.read();
+        let id_count = header.row_count as usize;
+        
+        if id_count > 0 {
+            let file_guard = self.file.read();
+            if let Some(file) = file_guard.as_ref() {
+                let mut mmap_cache = self.mmap_cache.write();
+                let mut id_bytes = vec![0u8; id_count * 8];
+                mmap_cache.read_at(file, &mut id_bytes, header.id_column_offset)?;
+                
+                *ids = Vec::with_capacity(id_count);
+                for i in 0..id_count {
+                    let id = u64::from_le_bytes(id_bytes[i * 8..(i + 1) * 8].try_into().unwrap());
+                    ids.push(id);
+                }
+            }
+        }
+        
+        self.ids_loaded.store(true, Ordering::Release);
+        Ok(())
+    }
+    
     /// Ensure id_to_idx HashMap is built (lazy load)
     /// Called automatically by delete/exists/get_row_idx operations
     fn ensure_id_index(&self) {
+        // First ensure IDs are loaded
+        let _ = self.ensure_ids_loaded();
+        
         let mut id_to_idx = self.id_to_idx.write();
         if id_to_idx.is_none() {
             let ids = self.ids.read();
@@ -3271,6 +3477,117 @@ impl OnDemandStorage {
     pub fn active_row_count(&self) -> u64 {
         self.active_count.load(std::sync::atomic::Ordering::Relaxed)
     }
+    
+    /// Get a single row by ID from memory (returns None if not found or deleted)
+    /// This reads directly from in-memory columns, including WAL data
+    pub fn get_row_by_id(&self, id: u64) -> Option<HashMap<String, ColumnValue>> {
+        let row_idx = self.get_row_idx(id)?;
+        
+        let schema = self.schema.read();
+        let columns = self.columns.read();
+        
+        let mut row_data = HashMap::new();
+        row_data.insert("_id".to_string(), ColumnValue::Int64(id as i64));
+        
+        for (col_idx, (name, _col_type)) in schema.columns.iter().enumerate() {
+            if col_idx >= columns.len() {
+                continue;
+            }
+            
+            let value = match &columns[col_idx] {
+                ColumnData::Int64(data) => {
+                    if row_idx < data.len() {
+                        ColumnValue::Int64(data[row_idx])
+                    } else {
+                        ColumnValue::Null
+                    }
+                }
+                ColumnData::Float64(data) => {
+                    if row_idx < data.len() {
+                        ColumnValue::Float64(data[row_idx])
+                    } else {
+                        ColumnValue::Null
+                    }
+                }
+                ColumnData::String { data, offsets } => {
+                    // offsets format: [0, end1, end2, ...] where offsets.len() = row_count + 1
+                    if row_idx + 1 < offsets.len() {
+                        let start = offsets[row_idx] as usize;
+                        let end = offsets[row_idx + 1] as usize;
+                        if end > start && end <= data.len() {
+                            let s = String::from_utf8_lossy(&data[start..end]).to_string();
+                            if s == "\x00__NULL__\x00" {
+                                ColumnValue::Null
+                            } else {
+                                ColumnValue::String(s)
+                            }
+                        } else {
+                            ColumnValue::String(String::new())
+                        }
+                    } else {
+                        ColumnValue::Null
+                    }
+                }
+                ColumnData::Binary { data, offsets } => {
+                    // offsets format: [0, end1, end2, ...] where offsets.len() = row_count + 1
+                    if row_idx + 1 < offsets.len() {
+                        let start = offsets[row_idx] as usize;
+                        let end = offsets[row_idx + 1] as usize;
+                        if end > start && end <= data.len() {
+                            ColumnValue::Binary(data[start..end].to_vec())
+                        } else {
+                            ColumnValue::Binary(Vec::new())
+                        }
+                    } else {
+                        ColumnValue::Null
+                    }
+                }
+                ColumnData::Bool { data, len } => {
+                    if row_idx < *len {
+                        let byte_idx = row_idx / 8;
+                        let bit_idx = row_idx % 8;
+                        if byte_idx < data.len() {
+                            ColumnValue::Bool((data[byte_idx] >> bit_idx) & 1 == 1)
+                        } else {
+                            ColumnValue::Bool(false)
+                        }
+                    } else {
+                        ColumnValue::Null
+                    }
+                }
+                ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                    if row_idx < indices.len() {
+                        let dict_idx = indices[row_idx] as usize;
+                        if dict_idx > 0 && dict_idx < dict_offsets.len() {
+                            let start = dict_offsets[dict_idx - 1] as usize;
+                            let end = dict_offsets[dict_idx] as usize;
+                            if end > start && end <= dict_data.len() {
+                                let s = String::from_utf8_lossy(&dict_data[start..end]).to_string();
+                                if s == "\x00__NULL__\x00" {
+                                    ColumnValue::Null
+                                } else {
+                                    ColumnValue::String(s)
+                                }
+                            } else {
+                                ColumnValue::String(String::new())
+                            }
+                        } else if dict_idx == 0 {
+                            // Index 0 typically means NULL or empty in dictionary encoding
+                            ColumnValue::Null
+                        } else {
+                            ColumnValue::String(String::new())
+                        }
+                    } else {
+                        ColumnValue::Null
+                    }
+                }
+            };
+            
+            row_data.insert(name.clone(), value);
+        }
+        
+        Some(row_data)
+    }
 
     /// Add a new column to schema and storage with padding for existing rows
     pub fn add_column_with_padding(&self, name: &str, dtype: crate::data::DataType) -> io::Result<()> {
@@ -3718,13 +4035,14 @@ impl OnDemandStorage {
         writer.flush()?;
         
         // fsync based on durability level
-        // Max: sync on every save (strongest guarantee)
-        // Safe: sync only when explicitly called via sync() or flush()
-        // Fast: no sync
-        if self.durability == super::DurabilityLevel::Max {
-            let inner_file = writer.get_ref();
-            inner_file.sync_all()?;
-        }
+        // For safe/max modes with WAL: WAL already provides durability guarantee via fsync
+        // So we can skip fsync on main file - data is recoverable from WAL on crash
+        // For fast mode: no fsync (data may be lost on crash)
+        // 
+        // This optimization makes save() fast (just write to OS buffer) while
+        // maintaining ACID guarantees through WAL fsync in insert_rows()
+        //
+        // Note: Explicit sync() call will still fsync main file if needed
 
         // Update column index in memory
         *self.column_index.write() = column_index_entries;
@@ -3736,10 +4054,303 @@ impl OnDemandStorage {
         drop(writer);
         let file = File::open(&self.path)?;
         *self.file.write() = Some(file);
+        
+        // Clear WAL after successful save (data is now in main file)
+        // This prevents duplicate data on reopen
+        if self.durability != super::DurabilityLevel::Fast {
+            let mut wal_buffer = self.wal_buffer.write();
+            let mut wal_writer = self.wal_writer.write();
+            
+            wal_buffer.clear();
+            
+            // Create fresh WAL file
+            if let Some(_) = wal_writer.take() {
+                let wal_path = Self::wal_path(&self.path);
+                *wal_writer = Some(super::incremental::WalWriter::create(
+                    &wal_path, 
+                    self.next_id.load(Ordering::SeqCst)
+                )?);
+            }
+        }
+
+        // MEMORY OPTIMIZATION: Release in-memory columns after successful save
+        // Data is now persisted to file, subsequent queries will read from mmap
+        // This releases memory for large datasets instead of keeping data in RAM
+        // Note: Using Vec::new() instead of clear() to actually deallocate memory
+        {
+            let mut columns = self.columns.write();
+            let mut nulls = self.nulls.write();
+            // Replace with empty Vecs to force deallocation (clear() keeps capacity)
+            *columns = Vec::new();
+            *nulls = Vec::new();
+        }
+        
+        // Reset pending counters
+        self.pending_rows.store(0, Ordering::Relaxed);
+        self.pending_rg_rows.store(0, Ordering::Relaxed);
 
         Ok(())
     }
     
+    /// Append a new Row Group to the file (incremental write)
+    /// 
+    /// This is the core of the Row Group append optimization:
+    /// - New data is written as a self-contained Row Group at file end
+    /// - Only the new RG data + updated RG Index + Header are written
+    /// - No need to rewrite existing data
+    /// 
+    /// Complexity: O(new_rows) instead of O(total_rows)
+    pub fn append_row_group(&self) -> io::Result<()> {
+        let pending_count = self.pending_rg_rows.load(Ordering::SeqCst) as usize;
+        if pending_count == 0 {
+            return Ok(()); // Nothing to append
+        }
+        
+        // Release mmap before writing
+        self.mmap_cache.write().invalidate();
+        *self.file.write() = None;
+        crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
+        
+        let schema = self.schema.read();
+        let ids = self.ids.read();
+        let columns = self.columns.read();
+        let nulls = self.nulls.read();
+        let deleted = self.deleted.read();
+        let mut rg_index = self.row_group_index.write();
+        let header = self.header.read();
+        
+        // Determine which rows belong to this new RG (the pending ones)
+        let total_rows = ids.len();
+        let existing_rows = total_rows - pending_count;
+        let rg_row_start = if rg_index.is_empty() {
+            0
+        } else {
+            let last_rg = rg_index.last().unwrap();
+            last_rg.row_start + last_rg.row_count as u64
+        };
+        
+        // Filter rows for this RG (only the new pending rows, excluding deleted)
+        let rg_indices: Vec<usize> = (existing_rows..total_rows)
+            .filter(|&i| {
+                let byte_idx = i / 8;
+                let bit_idx = i % 8;
+                byte_idx >= deleted.len() || (deleted[byte_idx] >> bit_idx) & 1 == 0
+            })
+            .collect();
+        
+        if rg_indices.is_empty() {
+            self.pending_rg_rows.store(0, Ordering::SeqCst);
+            return Ok(());
+        }
+        
+        let rg_row_count = rg_indices.len();
+        let rg_ids: Vec<u64> = rg_indices.iter().map(|&i| ids[i]).collect();
+        
+        // Build filtered column data for this RG
+        let rg_columns: Vec<ColumnData> = columns.iter().enumerate().map(|(col_idx, col)| {
+            if col_idx < columns.len() {
+                let filtered = col.filter_by_indices(&rg_indices);
+                if Self::should_dict_encode(&filtered) {
+                    filtered.to_dict_encoded().unwrap_or(filtered)
+                } else {
+                    filtered
+                }
+            } else {
+                ColumnData::new(ColumnType::Int64)
+            }
+        }).collect();
+        
+        // Open file for append
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
+        
+        // Find where to write the new RG (after existing data, before old RG index)
+        let rg_data_offset = if rg_index.is_empty() {
+            // First RG append: write after the legacy single-RG data
+            file.seek(SeekFrom::End(-(FOOTER_SIZE_V3 as i64)))?
+        } else {
+            // Subsequent RG: write where old RG index was
+            file.seek(SeekFrom::Start(header.row_group_index_offset))?
+        };
+        
+        let mut writer = BufWriter::with_capacity(64 * 1024, &file);
+        let rg_start_offset = writer.stream_position()?;
+        
+        // Write RG Header: [row_start:u64, row_count:u32, col_count:u32]
+        writer.write_all(&rg_row_start.to_le_bytes())?;
+        writer.write_all(&(rg_row_count as u32).to_le_bytes())?;
+        writer.write_all(&(schema.column_count() as u32).to_le_bytes())?;
+        
+        // Calculate column data offsets within this RG
+        let mut col_index_entries = Vec::with_capacity(schema.column_count());
+        let col_index_start = writer.stream_position()?;
+        
+        // Reserve space for column index (will fill in later)
+        for _ in 0..schema.column_count() {
+            writer.write_all(&[0u8; COLUMN_INDEX_ENTRY_SIZE])?;
+        }
+        
+        // Write IDs for this RG
+        let id_offset = writer.stream_position()?;
+        for &id in &rg_ids {
+            writer.write_all(&id.to_le_bytes())?;
+        }
+        
+        // Write column data for this RG
+        let mut current_offset = writer.stream_position()?;
+        for (col_idx, _) in schema.columns.iter().enumerate() {
+            let null_bitmap_len = (rg_row_count + 7) / 8;
+            let mut rg_nulls = vec![0u8; null_bitmap_len];
+            
+            // Build null bitmap for this RG
+            let original_nulls = nulls.get(col_idx).map(|v| v.as_slice()).unwrap_or(&[]);
+            for (new_idx, &old_idx) in rg_indices.iter().enumerate() {
+                let old_byte = old_idx / 8;
+                let old_bit = old_idx % 8;
+                let is_null = old_byte < original_nulls.len() && (original_nulls[old_byte] >> old_bit) & 1 == 1;
+                if is_null {
+                    let new_byte = new_idx / 8;
+                    let new_bit = new_idx % 8;
+                    rg_nulls[new_byte] |= 1 << new_bit;
+                }
+            }
+            
+            let null_offset = current_offset;
+            writer.write_all(&rg_nulls)?;
+            
+            let data_offset = writer.stream_position()?;
+            let col_bytes = rg_columns[col_idx].to_bytes();
+            writer.write_all(&col_bytes)?;
+            
+            col_index_entries.push(ColumnIndexEntry {
+                data_offset,
+                data_length: col_bytes.len() as u64,
+                null_offset,
+                null_length: null_bitmap_len as u64,
+            });
+            
+            current_offset = writer.stream_position()?;
+        }
+        
+        // Write updated RG Index at current position
+        let new_rg_index_offset = writer.stream_position()?;
+        
+        // Add new RG entry
+        let new_rg_entry = RowGroupIndexEntry {
+            offset: rg_start_offset,
+            row_start: rg_row_start,
+            row_count: rg_row_count as u32,
+            _reserved: 0,
+        };
+        
+        // Write all RG index entries (existing + new)
+        for entry in rg_index.iter() {
+            writer.write_all(&entry.to_bytes())?;
+        }
+        writer.write_all(&new_rg_entry.to_bytes())?;
+        
+        // Write footer
+        writer.write_all(MAGIC_FOOTER_V3)?;
+        let checksum = 0u32;
+        writer.write_all(&checksum.to_le_bytes())?;
+        let file_size = writer.stream_position()?;
+        writer.write_all(&file_size.to_le_bytes())?;
+        
+        writer.flush()?;
+        drop(writer);
+        
+        // Go back and fill in the column index entries
+        file.seek(SeekFrom::Start(col_index_start))?;
+        for entry in &col_index_entries {
+            file.write_all(&entry.to_bytes())?;
+        }
+        
+        // Update header with new RG count and index offset
+        let new_rg_count = rg_index.len() as u32 + 1;
+        let new_total_rows = header.row_count + rg_row_count as u64;
+        
+        file.seek(SeekFrom::Start(0))?;
+        let mut new_header = header.clone();
+        new_header.row_count = new_total_rows;
+        new_header.row_group_count = new_rg_count;
+        new_header.row_group_index_offset = new_rg_index_offset;
+        new_header.modified_at = chrono::Utc::now().timestamp();
+        file.write_all(&new_header.to_bytes())?;
+        
+        file.sync_all()?;
+        drop(file);
+        
+        // Update in-memory state
+        drop(header);
+        {
+            let mut header = self.header.write();
+            header.row_count = new_total_rows;
+            header.row_group_count = new_rg_count;
+            header.row_group_index_offset = new_rg_index_offset;
+        }
+        rg_index.push(new_rg_entry);
+        
+        // Reset pending counter
+        self.pending_rg_rows.store(0, Ordering::SeqCst);
+        
+        // Reopen file for reading
+        let file = File::open(&self.path)?;
+        *self.file.write() = Some(file);
+        
+        // Clear WAL after successful append
+        if self.durability != super::DurabilityLevel::Fast {
+            let mut wal_buffer = self.wal_buffer.write();
+            let mut wal_writer = self.wal_writer.write();
+            wal_buffer.clear();
+            if let Some(_) = wal_writer.take() {
+                let wal_path = Self::wal_path(&self.path);
+                *wal_writer = Some(super::incremental::WalWriter::create(
+                    &wal_path,
+                    self.next_id.load(Ordering::SeqCst)
+                )?);
+            }
+        }
+        
+        // MEMORY OPTIMIZATION: Release in-memory columns after successful append
+        // Data is now persisted to file, subsequent queries will read from mmap
+        drop(columns);
+        drop(nulls);
+        {
+            let mut columns = self.columns.write();
+            let mut nulls = self.nulls.write();
+            *columns = Vec::new();
+            *nulls = Vec::new();
+        }
+        
+        // Reset pending rows counter
+        self.pending_rows.store(0, Ordering::Relaxed);
+        
+        Ok(())
+    }
+    
+    /// Check if we should flush a new Row Group based on thresholds
+    pub fn maybe_flush_row_group(&self) -> io::Result<()> {
+        let pending = self.pending_rg_rows.load(Ordering::SeqCst);
+        let rg_size = self.header.read().row_group_size as u64;
+        
+        if pending >= rg_size {
+            self.append_row_group()?;
+        }
+        Ok(())
+    }
+    
+    /// Get current Row Group count
+    pub fn row_group_count(&self) -> usize {
+        self.row_group_index.read().len()
+    }
+    
+    /// Get pending Row Group row count
+    pub fn pending_rg_rows(&self) -> u64 {
+        self.pending_rg_rows.load(Ordering::SeqCst)
+    }
+
     /// Explicitly sync data to disk (fsync)
     /// 
     /// This ensures all buffered data is written to persistent storage.
@@ -3824,6 +4435,171 @@ impl OnDemandStorage {
     pub fn needs_checkpoint(&self) -> bool {
         !self.wal_buffer.read().is_empty()
     }
+    
+    /// Replay WAL rows into memory (for crash recovery)
+    /// This restores data that was written to WAL but not yet merged into main file
+    fn replay_wal_rows(&mut self, rows: Vec<(u64, HashMap<String, ColumnValue>)>) -> io::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        
+        // Group rows by column for efficient batch insert
+        let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
+        let mut binary_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
+        let mut row_ids: Vec<u64> = Vec::with_capacity(rows.len());
+        
+        // First pass: determine column types from all rows
+        for (_, data) in &rows {
+            for (key, val) in data {
+                if !int_columns.contains_key(key) && !float_columns.contains_key(key)
+                    && !string_columns.contains_key(key) && !binary_columns.contains_key(key)
+                    && !bool_columns.contains_key(key) {
+                    match val {
+                        ColumnValue::Int64(_) => { int_columns.insert(key.clone(), Vec::new()); }
+                        ColumnValue::Float64(_) => { float_columns.insert(key.clone(), Vec::new()); }
+                        ColumnValue::String(_) => { string_columns.insert(key.clone(), Vec::new()); }
+                        ColumnValue::Binary(_) => { binary_columns.insert(key.clone(), Vec::new()); }
+                        ColumnValue::Bool(_) => { bool_columns.insert(key.clone(), Vec::new()); }
+                        ColumnValue::Null => { string_columns.insert(key.clone(), Vec::new()); }
+                    }
+                }
+            }
+        }
+        
+        // Second pass: collect values
+        for (id, data) in rows {
+            row_ids.push(id);
+            
+            for (key, col) in int_columns.iter_mut() {
+                col.push(match data.get(key) {
+                    Some(ColumnValue::Int64(v)) => *v,
+                    _ => 0,
+                });
+            }
+            for (key, col) in float_columns.iter_mut() {
+                col.push(match data.get(key) {
+                    Some(ColumnValue::Float64(v)) => *v,
+                    _ => 0.0,
+                });
+            }
+            for (key, col) in string_columns.iter_mut() {
+                col.push(match data.get(key) {
+                    Some(ColumnValue::String(v)) => v.clone(),
+                    Some(ColumnValue::Null) => "\x00__NULL__\x00".to_string(),
+                    _ => String::new(),
+                });
+            }
+            for (key, col) in binary_columns.iter_mut() {
+                col.push(match data.get(key) {
+                    Some(ColumnValue::Binary(v)) => v.clone(),
+                    _ => Vec::new(),
+                });
+            }
+            for (key, col) in bool_columns.iter_mut() {
+                col.push(match data.get(key) {
+                    Some(ColumnValue::Bool(v)) => *v,
+                    _ => false,
+                });
+            }
+        }
+        
+        // Ensure schema has all columns
+        {
+            let mut schema = self.schema.write();
+            let mut columns = self.columns.write();
+            let mut nulls = self.nulls.write();
+            
+            for name in int_columns.keys() {
+                let idx = schema.add_column(name, ColumnType::Int64);
+                while columns.len() <= idx {
+                    columns.push(ColumnData::new(ColumnType::Int64));
+                    nulls.push(Vec::new());
+                }
+            }
+            for name in float_columns.keys() {
+                let idx = schema.add_column(name, ColumnType::Float64);
+                while columns.len() <= idx {
+                    columns.push(ColumnData::new(ColumnType::Float64));
+                    nulls.push(Vec::new());
+                }
+            }
+            for name in string_columns.keys() {
+                let idx = schema.add_column(name, ColumnType::String);
+                while columns.len() <= idx {
+                    columns.push(ColumnData::new(ColumnType::String));
+                    nulls.push(Vec::new());
+                }
+            }
+            for name in binary_columns.keys() {
+                let idx = schema.add_column(name, ColumnType::Binary);
+                while columns.len() <= idx {
+                    columns.push(ColumnData::new(ColumnType::Binary));
+                    nulls.push(Vec::new());
+                }
+            }
+            for name in bool_columns.keys() {
+                let idx = schema.add_column(name, ColumnType::Bool);
+                while columns.len() <= idx {
+                    columns.push(ColumnData::new(ColumnType::Bool));
+                    nulls.push(Vec::new());
+                }
+            }
+        }
+        
+        // Append IDs
+        self.ids.write().extend_from_slice(&row_ids);
+        
+        // Append column data
+        {
+            let schema = self.schema.read();
+            let mut columns = self.columns.write();
+            
+            for (name, values) in int_columns {
+                if let Some(idx) = schema.get_index(&name) {
+                    columns[idx].extend_i64(&values);
+                }
+            }
+            for (name, values) in float_columns {
+                if let Some(idx) = schema.get_index(&name) {
+                    columns[idx].extend_f64(&values);
+                }
+            }
+            for (name, values) in string_columns {
+                if let Some(idx) = schema.get_index(&name) {
+                    columns[idx].extend_strings(&values);
+                }
+            }
+            for (name, values) in binary_columns {
+                if let Some(idx) = schema.get_index(&name) {
+                    columns[idx].extend_bytes(&values);
+                }
+            }
+            for (name, values) in bool_columns {
+                if let Some(idx) = schema.get_index(&name) {
+                    columns[idx].extend_bools(&values);
+                }
+            }
+        }
+        
+        // Update header
+        {
+            let mut header = self.header.write();
+            header.row_count += row_ids.len() as u64;
+            header.column_count = self.schema.read().column_count() as u32;
+        }
+        
+        // Extend deleted bitmap
+        {
+            let mut deleted = self.deleted.write();
+            let new_len = (self.ids.read().len() + 7) / 8;
+            deleted.resize(new_len, 0);
+        }
+        
+        Ok(())
+    }
 
     // ========================================================================
     // Query APIs
@@ -3861,22 +4637,28 @@ impl OnDemandStorage {
             return Ok(Vec::new());
         }
         
-        // For safe/max durability with batch writes: use WAL for efficiency
-        // Single-row writes skip WAL (original fsync-on-save behavior is faster)
-        // WAL benefit: single I/O for many rows; WAL overhead: extra I/O for single rows
+        // For safe/max durability: ALWAYS use WAL (including single-row writes)
+        // WAL append + fsync is MUCH faster than rewriting entire main file + fsync
+        // - Single row: WAL append ~100 bytes + fsync vs rewriting MB/GB main file + fsync
+        // - Batch rows: single WAL record for all rows (efficient)
         let start_id = self.next_id.load(Ordering::SeqCst);
-        let use_wal = self.durability != super::DurabilityLevel::Fast && rows.len() > 1;
+        let use_wal = self.durability != super::DurabilityLevel::Fast;
         
         if use_wal {
-            // Batch writes: use WAL for efficiency (single I/O for all rows)
             let mut wal_writer = self.wal_writer.write();
             
             if let Some(writer) = wal_writer.as_mut() {
-                let record = super::incremental::WalRecord::BatchInsert { 
-                    start_id, 
-                    rows: rows.to_vec()
-                };
-                writer.append(&record)?;
+                if rows.len() == 1 {
+                    // Single row: use optimized append_row (avoids WalRecord allocation)
+                    writer.append_row(start_id, &rows[0])?;
+                } else {
+                    // Batch: use BatchInsert record
+                    let record = super::incremental::WalRecord::BatchInsert { 
+                        start_id, 
+                        rows: rows.to_vec()
+                    };
+                    writer.append(&record)?;
+                }
                 writer.flush()?;
                 
                 // For max durability: fsync WAL immediately
@@ -3885,7 +4667,7 @@ impl OnDemandStorage {
                 }
             }
         }
-        // Note: For single-row writes, fsync happens in save() based on durability level
+        // Note: For Fast mode, no WAL - fsync happens in save() if durability requires it
         
         // Handle case where all rows are empty dicts - still create rows with just _id
         let all_empty = rows.iter().all(|r| r.is_empty());
@@ -3927,6 +4709,8 @@ impl OnDemandStorage {
             
             // Update pending rows counter and check auto-flush
             self.pending_rows.fetch_add(row_count as u64, Ordering::Relaxed);
+            // Track pending rows for Row Group append
+            self.pending_rg_rows.fetch_add(row_count as u64, Ordering::Relaxed);
             self.maybe_auto_flush()?;
             
             return Ok(ids);
@@ -4017,6 +4801,8 @@ impl OnDemandStorage {
         
         // Update pending rows counter and check auto-flush
         self.pending_rows.fetch_add(result.len() as u64, Ordering::Relaxed);
+        // Track pending rows for Row Group append
+        self.pending_rg_rows.fetch_add(result.len() as u64, Ordering::Relaxed);
         self.maybe_auto_flush()?;
         
         Ok(result)
@@ -4062,9 +4848,30 @@ impl OnDemandStorage {
         false
     }
 
-    /// Flush changes to disk
+    /// Flush changes to disk using incremental append (no full file rewrite)
     pub fn flush(&self) -> io::Result<()> {
-        self.save()
+        let pending = self.pending_rg_rows.load(Ordering::SeqCst);
+        if pending == 0 {
+            return Ok(()); // Nothing to flush
+        }
+        
+        // Check if file exists and has data (not just created)
+        // First write needs save() to create the base file structure
+        // Subsequent writes use append_row_group() for incremental append
+        let file_exists = self.path.exists();
+        let file_has_data = if file_exists {
+            std::fs::metadata(&self.path).map(|m| m.len() > 0).unwrap_or(false)
+        } else {
+            false
+        };
+        
+        if !file_has_data {
+            // First write: use save() to create base file
+            self.save()
+        } else {
+            // Subsequent writes: use append_row_group() for incremental append
+            self.append_row_group()
+        }
     }
 
     /// Close storage and release all resources

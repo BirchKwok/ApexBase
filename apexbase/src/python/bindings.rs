@@ -368,8 +368,13 @@ impl ApexStorageImpl {
             let ids = backend.insert_rows(&[fields])
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
             
-            backend.save()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            // Row Group append mode: skip save() for WAL-backed durability
+            // Data is readable from in-memory columns, persisted via WAL
+            // Only Fast mode (no WAL) requires immediate save
+            if !backend.uses_wal_persistence() {
+                backend.save()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
             
             Ok::<i64, PyErr>(ids.first().copied().unwrap_or(0) as i64)
         });
@@ -412,8 +417,12 @@ impl ApexStorageImpl {
             let ids = backend.insert_rows(&rows)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
             
-            backend.save()
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            // Row Group append mode: skip save() for WAL-backed durability
+            // Data is readable from in-memory columns, persisted via WAL
+            if !backend.uses_wal_persistence() {
+                backend.save()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
             
             Ok::<Vec<u64>, PyErr>(ids)
         });
@@ -915,35 +924,10 @@ impl ApexStorageImpl {
         
         let backend = self.get_backend()?;
         
+        // Read directly from memory (includes WAL data)
+        // This is faster and ensures newly written data is immediately visible
         let result = py.allow_threads(|| -> PyResult<Option<HashMap<String, Value>>> {
-            // Check if ID exists
-            if !backend.exists(id as u64) {
-                return Ok(None);
-            }
-            
-            // Query for this specific ID
-            let sql = format!("SELECT * FROM data WHERE _id = {}", id);
-            let result = ApexExecutor::execute(&sql, &table_path)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
-            let batch = result.to_record_batch()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
-            // If no columns or rows, but ID exists, return dict with just _id
-            if batch.num_rows() == 0 || batch.num_columns() == 0 {
-                let mut row_data = HashMap::new();
-                row_data.insert("_id".to_string(), Value::Int64(id));
-                return Ok(Some(row_data));
-            }
-            
-            // Convert first row to HashMap
-            let mut row_data = HashMap::new();
-            for (col_idx, field) in batch.schema().fields().iter().enumerate() {
-                let val = arrow_value_at(batch.column(col_idx), 0);
-                row_data.insert(field.name().clone(), val);
-            }
-            
-            Ok(Some(row_data))
+            Ok(backend.get_row_by_id(id as u64))
         });
         
         // Release lock before handling result

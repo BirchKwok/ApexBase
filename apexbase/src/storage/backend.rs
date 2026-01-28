@@ -516,6 +516,87 @@ impl TableStorageBackend {
         Ok(())
     }
     
+    /// Check if WAL-based persistence is active (safe/max durability)
+    /// When true, insert_rows already persists data via WAL fsync,
+    /// and save() can be deferred to checkpoint for better performance.
+    pub fn uses_wal_persistence(&self) -> bool {
+        self.storage.durability() != super::DurabilityLevel::Fast
+    }
+    
+    /// Auto-compaction: merge WAL into main file when thresholds exceeded
+    /// 
+    /// This is called automatically after each write operation.
+    /// Compaction triggers when:
+    /// - WAL record count exceeds threshold (default: 1000 records)
+    /// - Or pending memory exceeds threshold (default: 50MB)
+    /// 
+    /// For fast mode (no WAL), always saves immediately to ensure data visibility.
+    pub fn maybe_auto_compact(&self) -> io::Result<()> {
+        // Fast mode: no WAL, must save for data visibility
+        if !self.uses_wal_persistence() {
+            return self.save();
+        }
+        
+        // Check WAL record count threshold
+        let wal_count = self.storage.wal_record_count();
+        const WAL_COMPACT_THRESHOLD: usize = 1000;
+        
+        if wal_count >= WAL_COMPACT_THRESHOLD {
+            // Compact: merge WAL into main file
+            return self.save();
+        }
+        
+        // Check memory threshold (50MB default)
+        let memory_bytes = self.storage.estimate_memory_bytes();
+        let (_, auto_flush_bytes) = self.storage.get_auto_flush();
+        if auto_flush_bytes > 0 && memory_bytes >= auto_flush_bytes {
+            return self.save();
+        }
+        
+        // No compaction needed - data is safe in WAL
+        Ok(())
+    }
+    
+    /// Get current WAL record count (for monitoring)
+    pub fn wal_record_count(&self) -> usize {
+        self.storage.wal_record_count()
+    }
+    
+    /// Force compaction: merge all WAL records into main file
+    pub fn compact(&self) -> io::Result<()> {
+        if self.storage.wal_record_count() > 0 || self.is_dirty() {
+            self.save()?;
+        }
+        Ok(())
+    }
+    
+    /// Append a new Row Group to file (incremental write)
+    /// 
+    /// This is the core optimization for large datasets:
+    /// - New data is written as a self-contained Row Group at file end
+    /// - Only O(new_rows) complexity instead of O(total_rows)
+    /// - Existing data is not rewritten
+    pub fn append_row_group(&self) -> io::Result<()> {
+        self.storage.append_row_group()?;
+        *self.dirty.write() = false;
+        Ok(())
+    }
+    
+    /// Check and maybe flush a new Row Group based on thresholds
+    pub fn maybe_flush_row_group(&self) -> io::Result<()> {
+        self.storage.maybe_flush_row_group()
+    }
+    
+    /// Get current Row Group count
+    pub fn row_group_count(&self) -> usize {
+        self.storage.row_group_count()
+    }
+    
+    /// Get pending Row Group row count
+    pub fn pending_rg_rows(&self) -> u64 {
+        self.storage.pending_rg_rows()
+    }
+    
     /// Explicitly sync data to disk (fsync)
     /// 
     /// This ensures all buffered data is written to persistent storage.
@@ -556,7 +637,9 @@ impl TableStorageBackend {
     /// Flush and close - releases mmap and file handle
     /// IMPORTANT: On Windows, this must be called before temp directory cleanup
     pub fn close(&self) -> io::Result<()> {
-        if self.is_dirty() {
+        // Always compact on close to ensure all WAL data is merged into main file
+        // This is required for proper persistence across database reopens
+        if self.is_dirty() || self.storage.wal_record_count() > 0 {
             self.save()?;
         }
         // Release mmap and file handle (critical for Windows)
@@ -588,6 +671,31 @@ impl TableStorageBackend {
     /// Check if a row exists and is not deleted
     pub fn exists(&self, id: u64) -> bool {
         self.storage.exists(id)
+    }
+    
+    /// Get a single row by ID from memory (returns None if not found or deleted)
+    /// This reads directly from in-memory data, including uncommitted WAL records
+    pub fn get_row_by_id(&self, id: u64) -> Option<HashMap<String, Value>> {
+        use crate::storage::on_demand::ColumnValue;
+        
+        let row = self.storage.get_row_by_id(id)?;
+        
+        // Convert ColumnValue to Value
+        let result: HashMap<String, Value> = row.into_iter()
+            .map(|(k, cv)| {
+                let v = match cv {
+                    ColumnValue::Int64(i) => Value::Int64(i),
+                    ColumnValue::Float64(f) => Value::Float64(f),
+                    ColumnValue::String(s) => Value::String(s),
+                    ColumnValue::Binary(b) => Value::Binary(b),
+                    ColumnValue::Bool(b) => Value::Bool(b),
+                    ColumnValue::Null => Value::Null,
+                };
+                (k, v)
+            })
+            .collect();
+        
+        Some(result)
     }
 
     /// Get active (non-deleted) row count
