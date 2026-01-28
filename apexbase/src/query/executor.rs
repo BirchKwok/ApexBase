@@ -454,7 +454,39 @@ impl ApexExecutor {
                             && stmt.group_by.is_empty()
                             && !has_aggregation_check;
                         
-                        if can_late_materialize_where {
+                        // FAST PATH 0: Check for _id = X pattern (O(1) lookup)
+                        if let Some(where_clause) = &stmt.where_clause {
+                            if let Some(id) = Self::extract_id_equality_filter(where_clause) {
+                                if let Some(batch) = backend.read_row_by_id_to_arrow(id)? {
+                                    batch
+                                } else {
+                                    // ID not found - return empty batch with schema
+                                    backend.read_columns_to_arrow(None, 0, Some(0))?
+                                }
+                            } else if can_late_materialize_where {
+                                // FAST PATH 1: Try dictionary-based filter for simple string equality
+                                if let Some(result) = Self::try_fast_string_filter(&backend, &stmt)? {
+                                    result
+                                // FAST PATH 2: Try numeric range filter for BETWEEN
+                                } else if let Some(result) = Self::try_fast_numeric_range_filter(&backend, &stmt)? {
+                                    result
+                                // FAST PATH 3: Try combined string + numeric filter for multi-condition
+                                } else if let Some(result) = Self::try_fast_multi_condition_filter(&backend, &stmt)? {
+                                    result
+                                } else {
+                                    // Late materialization for SELECT * WHERE path
+                                    Self::execute_with_late_materialization(&backend, &stmt, storage_path)?
+                                }
+                            } else {
+                                // Standard path: read all required columns upfront
+                                let required_cols = stmt.required_columns();
+                                let col_refs: Option<Vec<&str>> = required_cols
+                                    .as_ref()
+                                    .filter(|cols| !cols.is_empty())
+                                    .map(|cols| cols.iter().map(|s| s.as_str()).collect());
+                                backend.read_columns_to_arrow(col_refs.as_deref(), 0, None)?
+                            }
+                        } else if can_late_materialize_where {
                             // FAST PATH 1: Try dictionary-based filter for simple string equality
                             if let Some(result) = Self::try_fast_string_filter(&backend, &stmt)? {
                                 result
@@ -6599,6 +6631,50 @@ impl ApexExecutor {
         }
 
         Ok((left, right))
+    }
+
+    /// OPTIMIZED: Extract _id = X pattern for O(1) lookup
+    /// Returns Some(id) if WHERE clause is simple `_id = literal` or `literal = _id`
+    #[inline]
+    fn extract_id_equality_filter(expr: &SqlExpr) -> Option<u64> {
+        use crate::query::sql_parser::BinaryOperator;
+        
+        if let SqlExpr::BinaryOp { left, op, right } = expr {
+            if !matches!(op, BinaryOperator::Eq) {
+                return None;
+            }
+            
+            // Check _id = literal pattern
+            if let SqlExpr::Column(col) = left.as_ref() {
+                let col_name = col.trim_matches('"');
+                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+                    &col_name[dot_pos + 1..]
+                } else {
+                    col_name
+                };
+                if actual_col == "_id" {
+                    if let SqlExpr::Literal(Value::Int64(id)) = right.as_ref() {
+                        return Some(*id as u64);
+                    }
+                }
+            }
+            
+            // Check literal = _id pattern
+            if let SqlExpr::Column(col) = right.as_ref() {
+                let col_name = col.trim_matches('"');
+                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+                    &col_name[dot_pos + 1..]
+                } else {
+                    col_name
+                };
+                if actual_col == "_id" {
+                    if let SqlExpr::Literal(Value::Int64(id)) = left.as_ref() {
+                        return Some(*id as u64);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Extract simple string equality filter: column = 'literal' or 'literal' = column

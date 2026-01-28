@@ -727,9 +727,12 @@ impl TableStorageBackend {
                 // Only _id requested - return batch with just _id column
                 let ids = self.storage.read_ids(start_row, row_count)?;
                 let fields = vec![Field::new("_id", ArrowDataType::Int64, false)];
-                let arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(
-                    ids.iter().map(|&id| id as i64).collect::<Vec<i64>>()
-                ))];
+                // OPTIMIZATION: Direct transmute from Vec<u64> to Vec<i64>
+                let ids_i64: Vec<i64> = unsafe {
+                    let mut ids = std::mem::ManuallyDrop::new(ids);
+                    Vec::from_raw_parts(ids.as_mut_ptr() as *mut i64, ids.len(), ids.capacity())
+                };
+                let arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(ids_i64))];
                 let schema = Arc::new(Schema::new(fields));
                 return arrow::record_batch::RecordBatch::try_new(schema, arrays)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
@@ -777,7 +780,12 @@ impl TableStorageBackend {
             let ids = self.storage.read_ids(start_row, row_count)?;
             expected_row_count = ids.len();
             fields.push(Field::new("_id", ArrowDataType::Int64, false));
-            arrays.push(Arc::new(Int64Array::from(ids.iter().map(|&id| id as i64).collect::<Vec<i64>>())));
+            // OPTIMIZATION: Direct transmute from Vec<u64> to Vec<i64> - same memory layout
+            let ids_i64: Vec<i64> = unsafe {
+                let mut ids = std::mem::ManuallyDrop::new(ids);
+                Vec::from_raw_parts(ids.as_mut_ptr() as *mut i64, ids.len(), ids.capacity())
+            };
+            arrays.push(Arc::new(Int64Array::from(ids_i64)));
         } else {
             // If no _id, get row count from any column
             expected_row_count = col_data.values().next().map(|d| d.len()).unwrap_or(0);
@@ -826,28 +834,43 @@ impl TableStorageBackend {
                         }
                     }
                     ColumnData::String { offsets, data: bytes } => {
-                        // Optimized: use &str references instead of allocating Strings
+                        // OPTIMIZATION: Build StringArray directly from offsets and data buffers
+                        // Avoids per-element iteration and String allocation
+                        use arrow::buffer::{Buffer, OffsetBuffer};
+                        use arrow::array::GenericStringArray;
+                        
                         let count = offsets.len().saturating_sub(1);
-                        let strings: Vec<Option<&str>> = (0..count)
-                            .map(|i| {
-                                let start = offsets[i] as usize;
-                                let end = offsets[i + 1] as usize;
-                                std::str::from_utf8(&bytes[start..end]).ok()
-                            })
-                            .collect();
-                        if strings.len() < expected_row_count {
-                            // Need to convert to owned for padding
-                            let mut owned: Vec<Option<String>> = strings.into_iter()
-                                .map(|s| s.map(|s| s.to_string()))
-                                .collect();
-                            owned.extend(std::iter::repeat(None).take(expected_row_count - owned.len()));
-                            (ArrowDataType::Utf8, Arc::new(StringArray::from(owned)))
-                        } else if strings.len() > expected_row_count {
-                            // Truncate to expected row count
-                            let truncated: Vec<Option<&str>> = strings.into_iter().take(expected_row_count).collect();
-                            (ArrowDataType::Utf8, Arc::new(StringArray::from(truncated)))
+                        
+                        if count == expected_row_count {
+                            // Fast path: direct buffer construction (zero-copy for offsets)
+                            // Convert u32 offsets to i32 for Arrow
+                            let arrow_offsets: Vec<i32> = offsets.iter().map(|&o| o as i32).collect();
+                            let offset_buffer = OffsetBuffer::new(arrow_offsets.into());
+                            let data_buffer = Buffer::from(bytes);
+                            
+                            // SAFETY: We trust the offsets are valid UTF-8 boundaries
+                            let string_array = unsafe {
+                                GenericStringArray::<i32>::new_unchecked(offset_buffer, data_buffer, None)
+                            };
+                            (ArrowDataType::Utf8, Arc::new(string_array) as ArrayRef)
                         } else {
-                            (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                            // Fallback: standard conversion for mismatched counts
+                            let strings: Vec<Option<&str>> = (0..count.min(expected_row_count))
+                                .map(|i| {
+                                    let start = offsets[i] as usize;
+                                    let end = offsets[i + 1] as usize;
+                                    std::str::from_utf8(&bytes[start..end]).ok()
+                                })
+                                .collect();
+                            if strings.len() < expected_row_count {
+                                let mut owned: Vec<Option<String>> = strings.into_iter()
+                                    .map(|s| s.map(|s| s.to_string()))
+                                    .collect();
+                                owned.extend(std::iter::repeat(None).take(expected_row_count - owned.len()));
+                                (ArrowDataType::Utf8, Arc::new(StringArray::from(owned)))
+                            } else {
+                                (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                            }
                         }
                     }
                     ColumnData::Bool { data: packed, len } => {
@@ -1182,6 +1205,106 @@ impl TableStorageBackend {
         let schema = Arc::new(Schema::new(fields));
         arrow::record_batch::RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// OPTIMIZED: Read a single row by ID using O(1) index lookup
+    /// Much faster than WHERE _id = X which scans all data
+    pub fn read_row_by_id_to_arrow(&self, id: u64) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
+        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray, NullArray};
+        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use std::sync::Arc;
+        use crate::data::DataType;
+
+        let row_data = match self.storage.read_row_by_id(id, None)? {
+            Some(data) => data,
+            None => return Ok(None),
+        };
+
+        let schema = self.schema.read();
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+
+        // Add _id column first
+        fields.push(Field::new("_id", ArrowDataType::Int64, false));
+        arrays.push(Arc::new(Int64Array::from(vec![id as i64])));
+
+        // Add other columns in schema order - ensure all have length 1
+        for (col_name, dt) in schema.iter() {
+            let (arrow_dt, array): (ArrowDataType, ArrayRef) = if let Some(col_data) = row_data.get(col_name) {
+                match col_data {
+                    ColumnData::Int64(values) if !values.is_empty() => {
+                        (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![values[0]])))
+                    }
+                    ColumnData::Float64(values) if !values.is_empty() => {
+                        (ArrowDataType::Float64, Arc::new(Float64Array::from(vec![values[0]])))
+                    }
+                    ColumnData::String { offsets, data: bytes } if offsets.len() > 1 => {
+                        let start = offsets[0] as usize;
+                        let end = offsets[1] as usize;
+                        let s = std::str::from_utf8(&bytes[start..end]).ok();
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![s])))
+                    }
+                    ColumnData::Bool { data: packed, len } if *len > 0 => {
+                        let val = !packed.is_empty() && (packed[0] & 1) == 1;
+                        (ArrowDataType::Boolean, Arc::new(BooleanArray::from(vec![Some(val)])))
+                    }
+                    ColumnData::Binary { offsets, data: bytes } if offsets.len() > 1 => {
+                        use arrow::array::BinaryArray;
+                        let start = offsets[0] as usize;
+                        let end = offsets[1] as usize;
+                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(vec![Some(&bytes[start..end] as &[u8])])))
+                    }
+                    ColumnData::StringDict { indices, dict_offsets, dict_data } if !indices.is_empty() => {
+                        let idx = indices[0];
+                        let s = if idx == 0 { None } else {
+                            let dict_idx = (idx - 1) as usize;
+                            if dict_idx + 1 < dict_offsets.len() {
+                                let start = dict_offsets[dict_idx] as usize;
+                                let end = dict_offsets[dict_idx + 1] as usize;
+                                std::str::from_utf8(&dict_data[start..end]).ok().map(|s| s.to_string())
+                            } else { None }
+                        };
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![s])))
+                    }
+                    // Empty column data - return typed null
+                    _ => Self::create_typed_null_array(dt),
+                }
+            } else {
+                // Column not in row_data - return typed null value
+                Self::create_typed_null_array(dt)
+            };
+            fields.push(Field::new(col_name, arrow_dt, true));
+            arrays.push(array);
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let batch = arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(Some(batch))
+    }
+
+    /// Create a typed null array with a single null value
+    fn create_typed_null_array(dt: &crate::data::DataType) -> (arrow::datatypes::DataType, arrow::array::ArrayRef) {
+        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
+        use arrow::datatypes::DataType as ArrowDataType;
+        use std::sync::Arc;
+        use crate::data::DataType;
+
+        match dt {
+            DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 |
+            DataType::UInt64 | DataType::UInt32 | DataType::UInt16 | DataType::UInt8 => {
+                (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![None as Option<i64>])) as ArrayRef)
+            }
+            DataType::Float64 | DataType::Float32 => {
+                (ArrowDataType::Float64, Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef)
+            }
+            DataType::Bool => {
+                (ArrowDataType::Boolean, Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef)
+            }
+            DataType::String | _ => {
+                (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef)
+            }
+        }
     }
 
     /// Read columns with STRING predicate pushdown to Arrow

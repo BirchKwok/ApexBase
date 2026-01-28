@@ -3316,6 +3316,156 @@ impl OnDemandStorage {
         }
     }
 
+    /// OPTIMIZED: Read a single row by ID using O(1) index lookup
+    /// Returns HashMap of column_name -> ColumnData (single element)
+    /// Much faster than WHERE _id = X which scans all data
+    pub fn read_row_by_id(&self, id: u64, column_names: Option<&[&str]>) -> io::Result<Option<HashMap<String, ColumnData>>> {
+        // O(1) lookup using id_to_idx index
+        let row_idx = match self.get_row_idx(id) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        
+        // Read only the single row using scattered read
+        let indices = vec![row_idx];
+        let schema = self.schema.read();
+        let column_index = self.column_index.read();
+        
+        // Get columns to read
+        let cols_to_read: Vec<(usize, &str, ColumnType)> = if let Some(names) = column_names {
+            names.iter()
+                .filter_map(|&name| {
+                    if name == "_id" {
+                        None // Handle _id separately
+                    } else {
+                        schema.get_index(name).map(|idx| {
+                            (idx, name, schema.columns[idx].1)
+                        })
+                    }
+                })
+                .collect()
+        } else {
+            schema.columns.iter().enumerate()
+                .map(|(idx, (name, dtype))| (idx, name.as_str(), *dtype))
+                .collect()
+        };
+        
+        let mut result = HashMap::new();
+        
+        // Add _id if requested or no column filter
+        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        if include_id {
+            result.insert("_id".to_string(), ColumnData::Int64(vec![id as i64]));
+        }
+        
+        // Read each requested column for the single row
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "File not open")
+        })?;
+        let mut mmap_cache = self.mmap_cache.write();
+        
+        let total_rows = self.header.read().row_count as usize;
+        for (col_idx, col_name, col_type) in cols_to_read {
+            if col_idx >= column_index.len() {
+                continue;
+            }
+            let index = &column_index[col_idx];
+            let col_data = self.read_column_scattered_mmap(&mut mmap_cache, file, index, col_type, &indices, total_rows)?;
+            result.insert(col_name.to_string(), col_data);
+        }
+        
+        Ok(Some(result))
+    }
+
+    /// OPTIMIZED: Read multiple rows by IDs using O(1) index lookups
+    /// Returns Vec of (id, row_data) for found rows
+    pub fn read_rows_by_ids(&self, ids: &[u64], column_names: Option<&[&str]>) -> io::Result<Vec<(u64, HashMap<String, ColumnData>)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // Build id_to_idx if needed
+        self.ensure_id_index();
+        let id_to_idx = self.id_to_idx.read();
+        let map = id_to_idx.as_ref().unwrap();
+        
+        // Collect valid row indices
+        let mut valid_ids_indices: Vec<(u64, usize)> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(&row_idx) = map.get(&id) {
+                if !self.is_deleted(row_idx) {
+                    valid_ids_indices.push((id, row_idx));
+                }
+            }
+        }
+        
+        if valid_ids_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        let indices: Vec<usize> = valid_ids_indices.iter().map(|(_, idx)| *idx).collect();
+        drop(id_to_idx);
+        
+        // Read columns using scattered read
+        let schema = self.schema.read();
+        let column_index = self.column_index.read();
+        
+        let cols_to_read: Vec<(usize, String, ColumnType)> = if let Some(names) = column_names {
+            names.iter()
+                .filter_map(|&name| {
+                    if name == "_id" {
+                        None
+                    } else {
+                        schema.get_index(name).map(|idx| {
+                            (idx, name.to_string(), schema.columns[idx].1)
+                        })
+                    }
+                })
+                .collect()
+        } else {
+            schema.columns.iter().enumerate()
+                .map(|(idx, (name, dtype))| (idx, name.clone(), *dtype))
+                .collect()
+        };
+        
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "File not open")
+        })?;
+        let mut mmap_cache = self.mmap_cache.write();
+        
+        // Read all columns for all indices
+        let mut column_data: HashMap<String, ColumnData> = HashMap::new();
+        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        
+        let total_rows = self.header.read().row_count as usize;
+        for (col_idx, col_name, col_type) in cols_to_read {
+            if col_idx >= column_index.len() {
+                continue;
+            }
+            let index = &column_index[col_idx];
+            let col_data = self.read_column_scattered_mmap(&mut mmap_cache, file, index, col_type, &indices, total_rows)?;
+            column_data.insert(col_name, col_data);
+        }
+        
+        // Split into per-row results
+        let mut results = Vec::with_capacity(valid_ids_indices.len());
+        for (i, (id, _)) in valid_ids_indices.iter().enumerate() {
+            let mut row_data = HashMap::new();
+            if include_id {
+                row_data.insert("_id".to_string(), ColumnData::Int64(vec![*id as i64]));
+            }
+            for (col_name, col_data) in &column_data {
+                let single_val = col_data.filter_by_indices(&[i]);
+                row_data.insert(col_name.clone(), single_val);
+            }
+            results.push((*id, row_data));
+        }
+        
+        Ok(results)
+    }
+
     /// Get the count of non-deleted rows - O(1) from cached value
     pub fn active_row_count(&self) -> u64 {
         self.active_count.load(std::sync::atomic::Ordering::Relaxed)
