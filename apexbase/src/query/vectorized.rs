@@ -23,7 +23,7 @@ use std::sync::Arc;
 pub const VECTOR_SIZE: usize = 2048;
 
 /// Pre-computed hash for a group key
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct GroupHash(u64);
 
 impl GroupHash {
