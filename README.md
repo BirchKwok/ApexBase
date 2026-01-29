@@ -159,7 +159,7 @@ pytest -q
 This repository provides a tag-based automated build and release workflow. When you push a `v*` tag, CI runs tests, builds wheels/sdist, and publishes to PyPI via `twine`.
 
 - **Workflow**: `.github/workflows/build_release.yml`
-- **Tag**: format like `v0.2.3`
+- **Tag**: format like `v0.3.0`
 - **Secret**: `PYPI_API_TOKEN`
 
 ## 📚 Documentation
