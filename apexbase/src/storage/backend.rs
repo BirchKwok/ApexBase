@@ -509,6 +509,65 @@ impl TableStorageBackend {
         Ok(ids)
     }
 
+    /// Insert typed columns directly - bypasses row-by-row conversion
+    /// Much faster for bulk inserts with homogeneous columnar data
+    pub fn insert_typed(
+        &self,
+        int_columns: HashMap<String, Vec<i64>>,
+        float_columns: HashMap<String, Vec<f64>>,
+        string_columns: HashMap<String, Vec<String>>,
+        binary_columns: HashMap<String, Vec<Vec<u8>>>,
+        bool_columns: HashMap<String, Vec<bool>>,
+    ) -> io::Result<Vec<u64>> {
+        // Delegate to storage
+        let ids = self.storage.insert_typed(
+            int_columns.clone(), 
+            float_columns.clone(), 
+            string_columns.clone(), 
+            binary_columns.clone(), 
+            bool_columns.clone()
+        )?;
+
+        // Update schema if new columns
+        {
+            let mut schema = self.schema.write();
+            for name in int_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Int64));
+                }
+            }
+            for name in float_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Float64));
+                }
+            }
+            for name in string_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::String));
+                }
+            }
+            for name in binary_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Binary));
+                }
+            }
+            for name in bool_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Bool));
+                }
+            }
+        }
+
+        // Update row count
+        *self.row_count.write() += ids.len() as u64;
+
+        // Invalidate cache (data changed)
+        self.cached_columns.write().clear();
+        *self.dirty.write() = true;
+
+        Ok(ids)
+    }
+
     /// Save changes to disk
     pub fn save(&self) -> io::Result<()> {
         self.storage.save()?;

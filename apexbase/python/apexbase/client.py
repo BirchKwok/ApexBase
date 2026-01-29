@@ -268,27 +268,18 @@ class ApexClient:
         if not columns:
             return
         
-        # Validate all columns have the same length
-        lengths = {name: len(col) if hasattr(col, '__len__') else 0 for name, col in columns.items()}
-        unique_lengths = set(lengths.values())
-        if len(unique_lengths) > 1:
-            raise ValueError(f"All columns must have the same length: {lengths}")
+        # Convert numpy arrays to Python lists for Rust binding
+        converted = {}
+        for name, values in columns.items():
+            if hasattr(values, 'tolist'):  # numpy array
+                converted[name] = values.tolist()
+            elif hasattr(values, 'to_list'):  # polars series
+                converted[name] = values.to_list()
+            else:
+                converted[name] = list(values) if not isinstance(values, list) else values
         
-        # Convert columnar to list of dicts
-        first_col = next(iter(columns.values()))
-        n_rows = len(first_col) if hasattr(first_col, '__len__') else 0
-        
-        records = []
-        for i in range(n_rows):
-            record = {}
-            for name, values in columns.items():
-                if hasattr(values, 'dtype'):  # numpy array
-                    record[name] = values[i].item() if hasattr(values[i], 'item') else values[i]
-                else:
-                    record[name] = values[i]
-            records.append(record)
-        
-        self._store_batch(records)
+        # Call native columnar storage - much faster than row-by-row
+        self._storage.store_columnar(converted)
 
     # ============ Query Operations ============
 

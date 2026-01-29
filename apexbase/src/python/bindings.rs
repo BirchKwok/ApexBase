@@ -464,6 +464,148 @@ impl ApexStorageImpl {
 
         Ok(ids.into_iter().map(|id| id as i64).collect())
     }
+
+    /// Store columnar data directly - bypasses row-by-row conversion
+    /// Much faster for bulk inserts with homogeneous data
+    /// 
+    /// Args:
+    ///     columns: Dict[str, list] - column name to list of values
+    ///     
+    /// Returns:
+    ///     List[int] - list of generated IDs
+    fn store_columnar(&self, py: Python<'_>, columns: &Bound<'_, PyDict>) -> PyResult<Vec<i64>> {
+        if columns.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // First pass: validate all columns have the same length
+        let mut col_lengths: Vec<(String, usize)> = Vec::new();
+        for (key, value) in columns.iter() {
+            let col_name: String = key.extract()?;
+            if col_name == "_id" { continue; }
+            
+            let list = value.downcast::<PyList>()
+                .map_err(|_| PyValueError::new_err(format!("Column '{}' must be a list", col_name)))?;
+            col_lengths.push((col_name, list.len()));
+        }
+        
+        if col_lengths.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // Check all columns have same length
+        let first_len = col_lengths[0].1;
+        for (name, len) in &col_lengths {
+            if *len != first_len {
+                return Err(PyValueError::new_err(format!(
+                    "All columns must have the same length: '{}' has {} rows, expected {}", 
+                    name, len, first_len
+                )));
+            }
+        }
+        
+        let num_rows = first_len;
+        if num_rows == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Separate columns by type
+        let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
+        let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
+
+        for (key, value) in columns.iter() {
+            let col_name: String = key.extract()?;
+            if col_name == "_id" { continue; }
+            
+            let list = value.downcast::<PyList>()
+                .map_err(|_| PyValueError::new_err(format!("Column '{}' must be a list", col_name)))?;
+            
+            let col_len = list.len();
+            if col_len == 0 { continue; }
+            
+            // Detect type from first non-None element
+            let mut col_type: Option<&str> = None;
+            for item in list.iter() {
+                if !item.is_none() {
+                    if item.extract::<i64>().is_ok() {
+                        col_type = Some("int");
+                    } else if item.extract::<f64>().is_ok() {
+                        col_type = Some("float");
+                    } else if item.extract::<bool>().is_ok() {
+                        col_type = Some("bool");
+                    } else if item.extract::<String>().is_ok() {
+                        col_type = Some("string");
+                    }
+                    break;
+                }
+            }
+            
+            match col_type {
+                Some("int") => {
+                    let mut vals = Vec::with_capacity(col_len);
+                    for item in list.iter() {
+                        vals.push(item.extract::<i64>().unwrap_or(0));
+                    }
+                    int_columns.insert(col_name, vals);
+                }
+                Some("float") => {
+                    let mut vals = Vec::with_capacity(col_len);
+                    for item in list.iter() {
+                        vals.push(item.extract::<f64>().unwrap_or(0.0));
+                    }
+                    float_columns.insert(col_name, vals);
+                }
+                Some("bool") => {
+                    let mut vals = Vec::with_capacity(col_len);
+                    for item in list.iter() {
+                        vals.push(item.extract::<bool>().unwrap_or(false));
+                    }
+                    bool_columns.insert(col_name, vals);
+                }
+                Some("string") | None => {
+                    let mut vals = Vec::with_capacity(col_len);
+                    for item in list.iter() {
+                        vals.push(item.extract::<String>().unwrap_or_default());
+                    }
+                    string_columns.insert(col_name, vals);
+                }
+                _ => {}
+            }
+        }
+
+        if num_rows == 0 {
+            return Ok(Vec::new());
+        }
+
+        let table_path = self.get_current_table_path()?;
+        
+        // Acquire exclusive write lock
+        let lock_file = Self::acquire_write_lock(&table_path)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        
+        let backend = self.get_backend()?;
+
+        let result = py.allow_threads(|| {
+            let ids = backend.insert_typed(
+                int_columns, float_columns, string_columns, 
+                HashMap::new(), // binary_columns 
+                bool_columns
+            ).map_err(|e| PyIOError::new_err(e.to_string()))?;
+            
+            backend.save()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            
+            Ok::<Vec<u64>, PyErr>(ids)
+        });
+        
+        // Release lock before handling result
+        Self::release_lock(lock_file);
+        
+        let ids = result?;
+        Ok(ids.into_iter().map(|id| id as i64).collect())
+    }
     
     /// Helper to index a document for FTS
     fn index_for_fts(&self, id: i64, data: &Bound<'_, PyDict>) -> PyResult<()> {

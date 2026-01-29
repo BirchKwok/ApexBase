@@ -4160,9 +4160,13 @@ impl OnDemandStorage {
             }
         }
 
+        // Pre-allocate NULL string to avoid repeated allocation
+        static NULL_MARKER: &str = "\x00__NULL__\x00";
+        
         // Single pass: collect all values
+        // Note: For homogeneous data (common case), new columns won't be discovered mid-stream
         for row in rows {
-            // Handle new columns discovered mid-stream (rare case)
+            // Handle new columns discovered mid-stream (rare case for heterogeneous data)
             for (key, val) in row {
                 if !int_columns.contains_key(key) && !float_columns.contains_key(key) 
                     && !string_columns.contains_key(key) && !binary_columns.contains_key(key)
@@ -4194,7 +4198,7 @@ impl OnDemandStorage {
             for (key, col) in string_columns.iter_mut() {
                 col.push(match row.get(key) {
                     Some(ColumnValue::String(v)) => v.clone(),
-                    Some(ColumnValue::Null) => "\x00__NULL__\x00".to_string(),
+                    Some(ColumnValue::Null) => NULL_MARKER.to_string(),
                     _ => String::new(),
                 });
             }

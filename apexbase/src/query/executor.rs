@@ -7542,7 +7542,7 @@ impl ApexExecutor {
         // Collect window specs: (func_name, args, partition_by, order_by, output_name)
         let mut window_specs: Vec<(String, Vec<String>, Vec<String>, Vec<crate::query::OrderByClause>, String)> = Vec::new();
         
-        let supported = ["ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "PERCENT_RANK", "CUME_DIST", "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "SUM", "AVG", "COUNT"];
+        let supported = ["ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "PERCENT_RANK", "CUME_DIST", "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE", "SUM", "AVG", "COUNT", "MIN", "MAX", "RUNNING_SUM"];
         
         for col in &stmt.columns {
             if let SelectColumn::WindowFunction { name, args, partition_by, order_by, alias } = col {
@@ -7797,6 +7797,70 @@ impl ApexExecutor {
                     let count = indices.len() as i64;
                     for &row_idx in &indices {
                         window_values[row_idx] = count;
+                    }
+                }
+                "MIN" => {
+                    // MIN(column) OVER - minimum in partition
+                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                    if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                            let min_val = indices.iter()
+                                .filter_map(|&i| if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) })
+                                .min()
+                                .unwrap_or(0);
+                            for &row_idx in &indices {
+                                window_values[row_idx] = min_val;
+                            }
+                        }
+                    }
+                }
+                "MAX" => {
+                    // MAX(column) OVER - maximum in partition
+                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                    if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                            let max_val = indices.iter()
+                                .filter_map(|&i| if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) })
+                                .max()
+                                .unwrap_or(0);
+                            for &row_idx in &indices {
+                                window_values[row_idx] = max_val;
+                            }
+                        }
+                    }
+                }
+                "RUNNING_SUM" => {
+                    // RUNNING_SUM(column) OVER - cumulative sum (rows unbounded preceding to current)
+                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                    if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                            let mut running = 0i64;
+                            for &row_idx in &indices {
+                                if !int_arr.is_null(row_idx) {
+                                    running += int_arr.value(row_idx);
+                                }
+                                window_values[row_idx] = running;
+                            }
+                        }
+                    }
+                }
+                "NTH_VALUE" => {
+                    // NTH_VALUE(column, n) - get nth value in partition
+                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                    let n = if func_args.len() > 1 {
+                        func_args[1].trim_start_matches("Int64(").trim_end_matches(')').parse().unwrap_or(1usize)
+                    } else { 1usize };
+                    
+                    if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                            let nth_val = if n > 0 && n <= indices.len() {
+                                let nth_row = indices[n - 1];
+                                if int_arr.is_null(nth_row) { 0 } else { int_arr.value(nth_row) }
+                            } else { 0 };
+                            for &row_idx in &indices {
+                                window_values[row_idx] = nth_val;
+                            }
+                        }
                     }
                 }
                 _ => {}

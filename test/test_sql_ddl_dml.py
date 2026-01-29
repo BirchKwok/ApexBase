@@ -1149,6 +1149,372 @@ class TestSQLWindowFunctions:
             assert "rank" in df.columns
             
             client.close()
+    
+    def test_rank_function(self):
+        """Test RANK() window function - same values get same rank, gaps in sequence"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            client.store([
+                {"id": 1, "name": "A", "score": 100},
+                {"id": 2, "name": "B", "score": 100},  # Same score as A
+                {"id": 3, "name": "C", "score": 90},
+                {"id": 4, "name": "D", "score": 80},
+            ])
+            
+            result = client.execute("""
+                SELECT name, score, RANK() OVER (ORDER BY score DESC) as rnk
+                FROM default
+            """)
+            df = result.to_pandas()
+            
+            assert len(df) == 4
+            # A and B should both have rank 1 (tied)
+            a_rank = df[df["name"] == "A"].iloc[0]["rnk"]
+            b_rank = df[df["name"] == "B"].iloc[0]["rnk"]
+            c_rank = df[df["name"] == "C"].iloc[0]["rnk"]
+            assert a_rank == 1
+            assert b_rank == 1
+            assert c_rank == 3  # Gap: skips rank 2
+            
+            client.close()
+    
+    def test_dense_rank_function(self):
+        """Test DENSE_RANK() window function - same values get same rank, no gaps"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            client.store([
+                {"id": 1, "name": "A", "score": 100},
+                {"id": 2, "name": "B", "score": 100},  # Same score as A
+                {"id": 3, "name": "C", "score": 90},
+                {"id": 4, "name": "D", "score": 80},
+            ])
+            
+            result = client.execute("""
+                SELECT name, score, DENSE_RANK() OVER (ORDER BY score DESC) as drnk
+                FROM default
+            """)
+            df = result.to_pandas()
+            
+            assert len(df) == 4
+            a_rank = df[df["name"] == "A"].iloc[0]["drnk"]
+            b_rank = df[df["name"] == "B"].iloc[0]["drnk"]
+            c_rank = df[df["name"] == "C"].iloc[0]["drnk"]
+            assert a_rank == 1
+            assert b_rank == 1
+            assert c_rank == 2  # No gap: consecutive rank
+            
+            client.close()
+    
+    def test_lag_function(self):
+        """Test LAG() window function - get previous row value"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            client.store([
+                {"id": 1, "month": 1, "sales": 100},
+                {"id": 2, "month": 2, "sales": 150},
+                {"id": 3, "month": 3, "sales": 120},
+                {"id": 4, "month": 4, "sales": 200},
+            ])
+            
+            result = client.execute("""
+                SELECT month, sales, LAG(sales) OVER (ORDER BY month) as prev_sales
+                FROM default
+            """)
+            df = result.to_pandas()
+            
+            assert len(df) == 4
+            # First row should have 0 (default) for prev_sales
+            first_row = df[df["month"] == 1].iloc[0]
+            assert first_row["prev_sales"] == 0
+            # Second row should have first row's value
+            second_row = df[df["month"] == 2].iloc[0]
+            assert second_row["prev_sales"] == 100
+            
+            client.close()
+    
+    def test_lead_function(self):
+        """Test LEAD() window function - get next row value"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            client.store([
+                {"id": 1, "month": 1, "sales": 100},
+                {"id": 2, "month": 2, "sales": 150},
+                {"id": 3, "month": 3, "sales": 120},
+                {"id": 4, "month": 4, "sales": 200},
+            ])
+            
+            result = client.execute("""
+                SELECT month, sales, LEAD(sales) OVER (ORDER BY month) as next_sales
+                FROM default
+            """)
+            df = result.to_pandas()
+            
+            assert len(df) == 4
+            # First row should have second row's value
+            first_row = df[df["month"] == 1].iloc[0]
+            assert first_row["next_sales"] == 150
+            # Last row should have 0 (default)
+            last_row = df[df["month"] == 4].iloc[0]
+            assert last_row["next_sales"] == 0
+            
+            client.close()
+    
+    def test_first_value_function(self):
+        """Test FIRST_VALUE() window function"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            client.store([
+                {"id": 1, "dept": "Sales", "employee": 1, "salary": 5000},
+                {"id": 2, "dept": "Sales", "employee": 2, "salary": 6000},
+                {"id": 3, "dept": "IT", "employee": 3, "salary": 7000},
+                {"id": 4, "dept": "IT", "employee": 4, "salary": 8000},
+            ])
+            
+            result = client.execute("""
+                SELECT dept, salary, FIRST_VALUE(salary) OVER (PARTITION BY dept ORDER BY salary) as first_sal
+                FROM default
+            """)
+            df = result.to_pandas()
+            
+            # All Sales rows should have 5000 as first value
+            sales_rows = df[df["dept"] == "Sales"]
+            assert all(sales_rows["first_sal"] == 5000)
+            # All IT rows should have 7000 as first value
+            it_rows = df[df["dept"] == "IT"]
+            assert all(it_rows["first_sal"] == 7000)
+            
+            client.close()
+    
+    def test_last_value_function(self):
+        """Test LAST_VALUE() window function"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            client.store([
+                {"id": 1, "dept": "Sales", "employee": 1, "salary": 5000},
+                {"id": 2, "dept": "Sales", "employee": 2, "salary": 6000},
+                {"id": 3, "dept": "IT", "employee": 3, "salary": 7000},
+                {"id": 4, "dept": "IT", "employee": 4, "salary": 8000},
+            ])
+            
+            result = client.execute("""
+                SELECT dept, salary, LAST_VALUE(salary) OVER (PARTITION BY dept ORDER BY salary) as last_sal
+                FROM default
+            """)
+            df = result.to_pandas()
+            
+            # All Sales rows should have 6000 as last value
+            sales_rows = df[df["dept"] == "Sales"]
+            assert all(sales_rows["last_sal"] == 6000)
+            # All IT rows should have 8000 as last value
+            it_rows = df[df["dept"] == "IT"]
+            assert all(it_rows["last_sal"] == 8000)
+            
+            client.close()
+    
+    def test_sum_over_partition(self):
+        """Test SUM() OVER with PARTITION BY"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            client.store([
+                {"id": 1, "region": "East", "sales": 100},
+                {"id": 2, "region": "East", "sales": 200},
+                {"id": 3, "region": "West", "sales": 150},
+                {"id": 4, "region": "West", "sales": 250},
+            ])
+            
+            result = client.execute("""
+                SELECT region, sales, SUM(sales) OVER (PARTITION BY region) as total
+                FROM default
+            """)
+            df = result.to_pandas()
+            
+            # East total: 100 + 200 = 300
+            east_rows = df[df["region"] == "East"]
+            assert all(east_rows["total"] == 300)
+            # West total: 150 + 250 = 400
+            west_rows = df[df["region"] == "West"]
+            assert all(west_rows["total"] == 400)
+            
+            client.close()
+    
+    def test_avg_over_partition(self):
+        """Test AVG() OVER with PARTITION BY"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            client.store([
+                {"id": 1, "dept": "Sales", "salary": 4000},
+                {"id": 2, "dept": "Sales", "salary": 6000},
+                {"id": 3, "dept": "IT", "salary": 7000},
+                {"id": 4, "dept": "IT", "salary": 9000},
+            ])
+            
+            result = client.execute("""
+                SELECT dept, salary, AVG(salary) OVER (PARTITION BY dept) as avg_sal
+                FROM default
+            """)
+            df = result.to_pandas()
+            
+            # Sales avg: (4000 + 6000) / 2 = 5000
+            sales_rows = df[df["dept"] == "Sales"]
+            assert all(sales_rows["avg_sal"] == 5000)
+            # IT avg: (7000 + 9000) / 2 = 8000
+            it_rows = df[df["dept"] == "IT"]
+            assert all(it_rows["avg_sal"] == 8000)
+            
+            client.close()
+    
+    def test_count_over_partition(self):
+        """Test COUNT() OVER with PARTITION BY"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            client.store([
+                {"id": 1, "category": "A", "value": 10},
+                {"id": 2, "category": "A", "value": 20},
+                {"id": 3, "category": "A", "value": 30},
+                {"id": 4, "category": "B", "value": 40},
+                {"id": 5, "category": "B", "value": 50},
+            ])
+            
+            result = client.execute("""
+                SELECT category, value, COUNT() OVER (PARTITION BY category) as cnt
+                FROM default
+            """)
+            df = result.to_pandas()
+            
+            # Category A has 3 rows
+            a_rows = df[df["category"] == "A"]
+            assert all(a_rows["cnt"] == 3)
+            # Category B has 2 rows
+            b_rows = df[df["category"] == "B"]
+            assert all(b_rows["cnt"] == 2)
+            
+            client.close()
+    
+    def test_min_max_over_partition(self):
+        """Test MIN() and MAX() OVER with PARTITION BY"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            client.store([
+                {"id": 1, "dept": "Sales", "salary": 4000},
+                {"id": 2, "dept": "Sales", "salary": 6000},
+                {"id": 3, "dept": "Sales", "salary": 5000},
+                {"id": 4, "dept": "IT", "salary": 7000},
+                {"id": 5, "dept": "IT", "salary": 9000},
+            ])
+            
+            # Test MIN
+            result = client.execute("""
+                SELECT dept, salary, MIN(salary) OVER (PARTITION BY dept) as min_sal
+                FROM default
+            """)
+            df = result.to_pandas()
+            sales_rows = df[df["dept"] == "Sales"]
+            assert all(sales_rows["min_sal"] == 4000)
+            it_rows = df[df["dept"] == "IT"]
+            assert all(it_rows["min_sal"] == 7000)
+            
+            # Test MAX
+            result = client.execute("""
+                SELECT dept, salary, MAX(salary) OVER (PARTITION BY dept) as max_sal
+                FROM default
+            """)
+            df = result.to_pandas()
+            sales_rows = df[df["dept"] == "Sales"]
+            assert all(sales_rows["max_sal"] == 6000)
+            it_rows = df[df["dept"] == "IT"]
+            assert all(it_rows["max_sal"] == 9000)
+            
+            client.close()
+    
+    def test_running_sum(self):
+        """Test RUNNING_SUM() window function for cumulative totals"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            client.store([
+                {"id": 1, "month": 1, "revenue": 100},
+                {"id": 2, "month": 2, "revenue": 150},
+                {"id": 3, "month": 3, "revenue": 200},
+                {"id": 4, "month": 4, "revenue": 250},
+            ])
+            
+            result = client.execute("""
+                SELECT month, revenue, RUNNING_SUM(revenue) OVER (ORDER BY month) as cumulative
+                FROM default
+            """)
+            df = result.to_pandas()
+            
+            # Cumulative: 100, 250, 450, 700
+            sorted_df = df.sort_values("month")
+            assert sorted_df.iloc[0]["cumulative"] == 100
+            assert sorted_df.iloc[1]["cumulative"] == 250
+            assert sorted_df.iloc[2]["cumulative"] == 450
+            assert sorted_df.iloc[3]["cumulative"] == 700
+            
+            client.close()
+    
+    def test_ntile_function(self):
+        """Test NTILE() window function for bucketing"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            client.store([
+                {"id": i, "value": i * 10} for i in range(1, 9)  # 8 rows
+            ])
+            
+            result = client.execute("""
+                SELECT id, value, NTILE() OVER (ORDER BY value) as bucket
+                FROM default
+            """)
+            df = result.to_pandas()
+            
+            # With 8 rows and default 4 buckets, each bucket gets 2 rows
+            assert len(df) == 8
+            # Check buckets are assigned
+            assert "bucket" in df.columns
+            
+            client.close()
+    
+    def test_window_function_performance(self):
+        """Test window function performance with larger dataset"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            
+            # Create 1000 rows with simple category (0-9)
+            import time
+            data = [{"id": i, "cat": i % 10, "value": i * 10} for i in range(1000)]
+            client.store(data)
+            
+            start = time.time()
+            result = client.execute("""
+                SELECT cat, value, 
+                    ROW_NUMBER() OVER (PARTITION BY cat ORDER BY value DESC) as rn
+                FROM default
+            """)
+            elapsed = time.time() - start
+            
+            df = result.to_pandas()
+            assert len(df) == 1000
+            # Each category should have 100 rows, ranked 1-100
+            for c in range(10):
+                cat_rows = df[df["cat"] == c]
+                assert len(cat_rows) == 100, f"Category {c} has {len(cat_rows)} rows"
+                assert cat_rows["rn"].max() == 100
+            
+            # Performance should be reasonable (< 1 second)
+            assert elapsed < 1.0, f"Window function took {elapsed:.2f}s, expected < 1s"
+            
+            client.close()
 
 
 # =============================================================================

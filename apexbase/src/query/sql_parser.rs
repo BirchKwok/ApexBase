@@ -1509,16 +1509,58 @@ impl SqlParser {
 
                 self.expect(Token::RParen)?;
 
-                let alias = if matches!(self.current(), Token::As) {
-                    self.advance();
-                    self.parse_alias_identifier()
+                // Check if this is a window function (has OVER clause)
+                if matches!(self.current(), Token::Over) {
+                    // Convert aggregate to window function
+                    let func_name = format!("{}", func);
+                    let args: Vec<String> = column.clone().into_iter().collect();
+                    
+                    self.advance(); // consume OVER
+                    self.expect(Token::LParen)?;
+                    
+                    let mut partition_by = Vec::new();
+                    if matches!(self.current(), Token::Partition) {
+                        self.advance();
+                        self.expect(Token::By)?;
+                        partition_by = self.parse_column_list()?;
+                    }
+                    
+                    let order_by = if matches!(self.current(), Token::Order) {
+                        self.advance();
+                        self.expect(Token::By)?;
+                        self.parse_order_by()?
+                    } else {
+                        Vec::new()
+                    };
+                    
+                    self.expect(Token::RParen)?;
+                    
+                    let alias = if matches!(self.current(), Token::As) {
+                        self.advance();
+                        self.parse_alias_identifier()
+                    } else {
+                        self.parse_alias_identifier()
+                    };
+                    
+                    columns.push(SelectColumn::WindowFunction {
+                        name: func_name,
+                        args,
+                        partition_by,
+                        order_by,
+                        alias,
+                    });
                 } else {
-                    // Allow implicit aliases: MIN(x) min_x
-                    // Also allow keyword aliases like COUNT(1) count
-                    self.parse_alias_identifier()
-                };
+                    let alias = if matches!(self.current(), Token::As) {
+                        self.advance();
+                        self.parse_alias_identifier()
+                    } else {
+                        // Allow implicit aliases: MIN(x) min_x
+                        // Also allow keyword aliases like COUNT(1) count
+                        self.parse_alias_identifier()
+                    };
 
-                columns.push(SelectColumn::Aggregate { func, column, distinct, alias });
+                    columns.push(SelectColumn::Aggregate { func, column, distinct, alias });
+                }
             }
             // Column or window function name
             else if matches!(self.current(), Token::Identifier(_)) {
