@@ -282,9 +282,21 @@ impl ApexExecutor {
         match stmt {
             SqlStatement::Select(select) => Self::execute_select(select, storage_path),
             SqlStatement::Union(union) => Self::execute_union(union, storage_path),
+            SqlStatement::Insert { values, columns, .. } => {
+                Self::execute_insert(storage_path, columns.as_deref(), &values)
+            }
+            SqlStatement::Delete { where_clause, .. } => {
+                Self::execute_delete(storage_path, where_clause.as_ref())
+            }
+            SqlStatement::Update { assignments, where_clause, .. } => {
+                Self::execute_update(storage_path, &assignments, where_clause.as_ref())
+            }
+            SqlStatement::TruncateTable { .. } => {
+                Self::execute_truncate(storage_path)
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Only SELECT/UNION statements supported",
+                "DDL statements require base_dir context - use execute_with_base_dir()",
             )),
         }
     }
@@ -302,9 +314,36 @@ impl ApexExecutor {
                 }
             }
             SqlStatement::Union(union) => Self::execute_union(union, default_table_path),
+            // DDL Statements
+            SqlStatement::CreateTable { table, columns, if_not_exists } => {
+                Self::execute_create_table(base_dir, &table, &columns, if_not_exists)
+            }
+            SqlStatement::DropTable { table, if_exists } => {
+                Self::execute_drop_table(base_dir, &table, if_exists)
+            }
+            SqlStatement::AlterTable { table, operation } => {
+                Self::execute_alter_table(base_dir, &table, &operation)
+            }
+            SqlStatement::TruncateTable { table } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                Self::execute_truncate(&table_path)
+            }
+            // DML Statements
+            SqlStatement::Insert { table, columns, values } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                Self::execute_insert(&table_path, columns.as_deref(), &values)
+            }
+            SqlStatement::Delete { table, where_clause } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                Self::execute_delete(&table_path, where_clause.as_ref())
+            }
+            SqlStatement::Update { table, assignments, where_clause } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                Self::execute_update(&table_path, &assignments, where_clause.as_ref())
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Only SELECT/UNION statements supported",
+                "Statement type not supported",
             )),
         }
     }
@@ -345,6 +384,10 @@ impl ApexExecutor {
                 }
                 SqlStatement::Union(union) => {
                     last_result = Some(Self::execute_union(union, default_table_path)?);
+                }
+                // DDL/DML statements - execute directly
+                other => {
+                    last_result = Some(Self::execute_parsed_multi(other, base_dir, default_table_path)?);
                 }
             }
         }
@@ -7824,6 +7867,390 @@ impl ApexExecutor {
             arr.value(a).cmp(arr.value(b))
         } else {
             Ordering::Equal
+        }
+    }
+
+    // ========== DDL Execution Methods ==========
+
+    /// Execute CREATE TABLE statement
+    /// High-performance: O(1) - just creates file header
+    fn execute_create_table(
+        base_dir: &Path,
+        table: &str,
+        columns: &[crate::query::sql_parser::ColumnDef],
+        if_not_exists: bool,
+    ) -> io::Result<ApexResult> {
+        let table_path = base_dir.join(format!("{}.apex", table));
+        
+        if table_path.exists() {
+            if if_not_exists {
+                // Return success without error
+                return Ok(ApexResult::Scalar(0));
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("Table '{}' already exists", table),
+                ));
+            }
+        }
+        
+        // Create empty storage file with schema
+        TableStorageBackend::create(&table_path)?;
+        let storage = TableStorageBackend::open_for_write(&table_path)?;
+        
+        // Add columns to schema (if provided)
+        for col_def in columns {
+            storage.add_column(&col_def.name, col_def.data_type.clone())?;
+        }
+        
+        storage.save()?;
+        
+        Ok(ApexResult::Scalar(0))
+    }
+
+    /// Execute DROP TABLE statement
+    /// High-performance: O(1) - just deletes file
+    fn execute_drop_table(base_dir: &Path, table: &str, if_exists: bool) -> io::Result<ApexResult> {
+        let table_path = base_dir.join(format!("{}.apex", table));
+        
+        // Invalidate cache first to release file handles
+        invalidate_storage_cache(&table_path);
+        
+        if !table_path.exists() {
+            if if_exists {
+                return Ok(ApexResult::Scalar(0));
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Table '{}' does not exist", table),
+                ));
+            }
+        }
+        
+        std::fs::remove_file(&table_path)?;
+        
+        Ok(ApexResult::Scalar(0))
+    }
+
+    /// Execute ALTER TABLE statement
+    fn execute_alter_table(
+        base_dir: &Path,
+        table: &str,
+        operation: &crate::query::sql_parser::AlterTableOp,
+    ) -> io::Result<ApexResult> {
+        use crate::query::sql_parser::AlterTableOp;
+        
+        let table_path = base_dir.join(format!("{}.apex", table));
+        
+        if !table_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Table '{}' does not exist", table),
+            ));
+        }
+        
+        // Invalidate cache before write
+        invalidate_storage_cache(&table_path);
+        
+        let storage = TableStorageBackend::open_for_write(&table_path)?;
+        
+        match operation {
+            AlterTableOp::AddColumn { name, data_type } => {
+                storage.add_column(name, data_type.clone())?;
+            }
+            AlterTableOp::DropColumn { name } => {
+                storage.drop_column(name)?;
+            }
+            AlterTableOp::RenameColumn { old_name, new_name } => {
+                storage.rename_column(old_name, new_name)?;
+            }
+        }
+        
+        storage.save()?;
+        
+        Ok(ApexResult::Scalar(0))
+    }
+
+    /// Execute TRUNCATE TABLE statement
+    /// High-performance: recreates empty file
+    fn execute_truncate(storage_path: &Path) -> io::Result<ApexResult> {
+        if !storage_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Table does not exist",
+            ));
+        }
+        
+        // Invalidate cache before write
+        invalidate_storage_cache(storage_path);
+        
+        // Get schema before truncate
+        let old_storage = TableStorageBackend::open(storage_path)?;
+        let schema = old_storage.get_schema();
+        drop(old_storage);
+        
+        // Recreate empty file with same schema
+        TableStorageBackend::create(storage_path)?;
+        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        for (name, dtype) in &schema {
+            storage.add_column(name, dtype.clone())?;
+        }
+        storage.save()?;
+        
+        Ok(ApexResult::Scalar(0))
+    }
+
+    // ========== DML Execution Methods ==========
+
+    /// Execute INSERT statement
+    /// High-performance: batch insert with minimal allocations
+    fn execute_insert(
+        storage_path: &Path,
+        columns: Option<&[String]>,
+        values: &[Vec<Value>],
+    ) -> io::Result<ApexResult> {
+        use std::collections::HashMap;
+        
+        if !storage_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Table does not exist",
+            ));
+        }
+        
+        // Invalidate cache before write
+        invalidate_storage_cache(storage_path);
+        
+        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        
+        // Get column names from schema or explicit list
+        let col_names: Vec<String> = if let Some(cols) = columns {
+            cols.to_vec()
+        } else {
+            storage.get_schema().iter().map(|(n, _)| n.clone()).collect()
+        };
+        
+        // Convert values to rows format for insert_rows
+        let mut rows: Vec<HashMap<String, Value>> = Vec::with_capacity(values.len());
+        
+        for row_values in values {
+            let mut row: HashMap<String, Value> = HashMap::new();
+            for (i, value) in row_values.iter().enumerate() {
+                if i < col_names.len() {
+                    row.insert(col_names[i].clone(), value.clone());
+                }
+            }
+            rows.push(row);
+        }
+        
+        let rows_inserted = rows.len() as i64;
+        storage.insert_rows(&rows)?;
+        storage.save()?;
+        
+        Ok(ApexResult::Scalar(rows_inserted))
+    }
+
+    /// Execute DELETE statement
+    fn execute_delete(storage_path: &Path, where_clause: Option<&SqlExpr>) -> io::Result<ApexResult> {
+        if !storage_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Table does not exist",
+            ));
+        }
+        
+        // Invalidate cache before write
+        invalidate_storage_cache(storage_path);
+        
+        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        
+        // If no WHERE clause, delete all rows
+        if where_clause.is_none() {
+            let count = storage.active_row_count() as i64;
+            // Read all IDs and delete them
+            let batch = storage.read_columns_to_arrow(Some(&["_id"]), 0, None)?;
+            if let Some(id_col) = batch.column_by_name("_id") {
+                if let Some(id_arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                    for i in 0..id_arr.len() {
+                        storage.delete(id_arr.value(i));
+                    }
+                } else if let Some(id_arr) = id_col.as_any().downcast_ref::<Int64Array>() {
+                    for i in 0..id_arr.len() {
+                        storage.delete(id_arr.value(i) as u64);
+                    }
+                }
+            }
+            storage.save()?;
+            return Ok(ApexResult::Scalar(count));
+        }
+        
+        // For DELETE with WHERE, find matching rows and soft-delete them
+        let batch = storage.read_columns_to_arrow(None, 0, None)?;
+        let filter_mask = Self::evaluate_predicate(&batch, where_clause.unwrap())?;
+        
+        // Count and delete matching rows
+        let mut deleted = 0i64;
+        for i in 0..filter_mask.len() {
+            if filter_mask.value(i) {
+                if let Some(id_col) = batch.column_by_name("_id") {
+                    if let Some(id_arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                        storage.delete(id_arr.value(i));
+                        deleted += 1;
+                    } else if let Some(id_arr) = id_col.as_any().downcast_ref::<Int64Array>() {
+                        storage.delete(id_arr.value(i) as u64);
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+        
+        storage.save()?;
+        
+        Ok(ApexResult::Scalar(deleted))
+    }
+
+    /// Execute UPDATE statement
+    /// Note: UPDATE is implemented as delete + insert for simplicity
+    fn execute_update(
+        storage_path: &Path,
+        assignments: &[(String, SqlExpr)],
+        where_clause: Option<&SqlExpr>,
+    ) -> io::Result<ApexResult> {
+        use std::collections::HashMap as StdHashMap;
+        
+        if !storage_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Table does not exist",
+            ));
+        }
+        
+        // Invalidate cache before write
+        invalidate_storage_cache(storage_path);
+        
+        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        
+        // Read all data
+        let batch = storage.read_columns_to_arrow(None, 0, None)?;
+        
+        // Find rows to update
+        let filter_mask = if let Some(where_expr) = where_clause {
+            Self::evaluate_predicate(&batch, where_expr)?
+        } else {
+            // Update all rows
+            BooleanArray::from(vec![true; batch.num_rows()])
+        };
+        
+        // Collect IDs and new values for matching rows
+        let mut updates: Vec<(u64, StdHashMap<String, Value>)> = Vec::new();
+        
+        for i in 0..filter_mask.len() {
+            if filter_mask.value(i) {
+                if let Some(id_col) = batch.column_by_name("_id") {
+                    let id = if let Some(id_arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                        id_arr.value(i)
+                    } else if let Some(id_arr) = id_col.as_any().downcast_ref::<Int64Array>() {
+                        id_arr.value(i) as u64
+                    } else {
+                        continue;
+                    };
+                    
+                    // Build update map
+                    let mut update_data: StdHashMap<String, Value> = StdHashMap::new();
+                    for (col_name, expr) in assignments {
+                        let value = Self::evaluate_expr_to_value(&batch, expr, i)?;
+                        update_data.insert(col_name.clone(), value);
+                    }
+                    
+                    updates.push((id, update_data));
+                }
+            }
+        }
+        
+        // Apply updates: for each row, build complete row with updates applied
+        let updated = updates.len() as i64;
+        
+        // Build lookup for existing row data from batch
+        let schema = batch.schema();
+        
+        for (row_idx, (_id, update_data)) in updates.into_iter().enumerate() {
+            // Get existing values from batch for this row
+            let mut row_data = update_data;
+            
+            // Add existing column values that weren't updated
+            for field in schema.fields() {
+                let col_name = field.name();
+                if col_name == "_id" || row_data.contains_key(col_name) {
+                    continue;
+                }
+                if let Some(col) = batch.column_by_name(col_name) {
+                    if let Some(val) = Self::get_value_at(col, row_idx) {
+                        row_data.insert(col_name.clone(), val);
+                    }
+                }
+            }
+            
+            // Insert the updated row (ID is auto-assigned, old row is soft-deleted)
+            storage.insert_rows(&[row_data])?;
+        }
+        
+        storage.save()?;
+        
+        Ok(ApexResult::Scalar(updated))
+    }
+
+    /// Get a value from an Arrow array at a specific row index
+    fn get_value_at(array: &ArrayRef, row: usize) -> Option<Value> {
+        if array.is_null(row) {
+            return Some(Value::Null);
+        }
+        if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+            Some(Value::Int64(arr.value(row)))
+        } else if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+            Some(Value::Float64(arr.value(row)))
+        } else if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+            Some(Value::String(arr.value(row).to_string()))
+        } else if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
+            Some(Value::Bool(arr.value(row)))
+        } else if let Some(arr) = array.as_any().downcast_ref::<UInt64Array>() {
+            Some(Value::Int64(arr.value(row) as i64))
+        } else {
+            None
+        }
+    }
+
+    /// Evaluate an expression to a Value for UPDATE
+    fn evaluate_expr_to_value(batch: &RecordBatch, expr: &SqlExpr, row: usize) -> io::Result<Value> {
+        match expr {
+            SqlExpr::Literal(v) => Ok(v.clone()),
+            SqlExpr::Column(name) => {
+                let col_name = name.trim_matches('"');
+                if let Some(col) = batch.column_by_name(col_name) {
+                    if col.is_null(row) {
+                        return Ok(Value::Null);
+                    }
+                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                        Ok(Value::Int64(arr.value(row)))
+                    } else if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+                        Ok(Value::Float64(arr.value(row)))
+                    } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                        Ok(Value::String(arr.value(row).to_string()))
+                    } else if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
+                        Ok(Value::Bool(arr.value(row)))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Column '{}' not found", col_name),
+                    ))
+                }
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Complex expressions in UPDATE not yet supported",
+            )),
         }
     }
 }

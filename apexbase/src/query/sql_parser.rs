@@ -15,6 +15,21 @@ use crate::ApexError;
 use crate::data::DataType;
 use crate::data::Value;
 
+/// Column definition for CREATE TABLE
+#[derive(Debug, Clone)]
+pub struct ColumnDef {
+    pub name: String,
+    pub data_type: DataType,
+}
+
+/// ALTER TABLE operation types
+#[derive(Debug, Clone)]
+pub enum AlterTableOp {
+    AddColumn { name: String, data_type: DataType },
+    DropColumn { name: String },
+    RenameColumn { old_name: String, new_name: String },
+}
+
 /// SQL Statement types
 #[derive(Debug, Clone)]
 pub enum SqlStatement {
@@ -22,6 +37,15 @@ pub enum SqlStatement {
     Union(UnionStatement),
     CreateView { name: String, stmt: SelectStatement },
     DropView { name: String },
+    // DDL Statements
+    CreateTable { table: String, columns: Vec<ColumnDef>, if_not_exists: bool },
+    DropTable { table: String, if_exists: bool },
+    AlterTable { table: String, operation: AlterTableOp },
+    TruncateTable { table: String },
+    // DML Statements
+    Insert { table: String, columns: Option<Vec<String>>, values: Vec<Vec<Value>> },
+    Delete { table: String, where_clause: Option<SqlExpr> },
+    Update { table: String, assignments: Vec<(String, SqlExpr)>, where_clause: Option<SqlExpr> },
 }
 
 #[derive(Debug, Clone)]
@@ -465,6 +489,10 @@ enum Token {
     Cast,
     Case, When, Then, Else, End,
     Create, Drop, View,
+    // DDL keywords
+    Table, Alter, Add, Column, Rename, To, If, Truncate,
+    // DML keywords
+    Insert, Into, Values, Delete, Update, Set,
     // Symbols
     Star,           // *
     Comma,          // ,
@@ -726,6 +754,22 @@ impl SqlParser {
                     "CREATE" => Token::Create,
                     "DROP" => Token::Drop,
                     "VIEW" => Token::View,
+                    // DDL keywords
+                    "TABLE" => Token::Table,
+                    "ALTER" => Token::Alter,
+                    "ADD" => Token::Add,
+                    "COLUMN" => Token::Column,
+                    "RENAME" => Token::Rename,
+                    "TO" => Token::To,
+                    "IF" => Token::If,
+                    "TRUNCATE" => Token::Truncate,
+                    // DML keywords
+                    "INSERT" => Token::Insert,
+                    "INTO" => Token::Into,
+                    "VALUES" => Token::Values,
+                    "DELETE" => Token::Delete,
+                    "UPDATE" => Token::Update,
+                    "SET" => Token::Set,
                     _ => Token::Identifier(word),
                 };
                 tokens.push(SpannedToken { token, start, end: i });
@@ -809,7 +853,7 @@ impl SqlParser {
             Token::Identifier(s) => {
                 let u = s.to_uppercase();
                 // Keep list small and stable; used only for human-friendly hints.
-                const KWS: [&str; 49] = [
+                const KWS: [&str; 61] = [
                     "SELECT",
                     "FROM",
                     "WHERE",
@@ -859,6 +903,20 @@ impl SqlParser {
                     "THEN",
                     "ELSE",
                     "END",
+                    // DDL keywords
+                    "TABLE",
+                    "ALTER",
+                    "ADD",
+                    "COLUMN",
+                    "RENAME",
+                    "TRUNCATE",
+                    // DML keywords
+                    "INSERT",
+                    "INTO",
+                    "VALUES",
+                    "DELETE",
+                    "UPDATE",
+                    "SET",
                 ];
 
                 // Fast path for common "plural" / extra trailing char typos: FROMs, WHEREs, LIKEs, LIMITs
@@ -1032,47 +1090,109 @@ impl SqlParser {
             }
             Token::Create => {
                 self.advance();
-                if !matches!(self.current(), Token::View) {
-                    let (start, _) = self.current_span();
-                    return Err(self.syntax_error(start, "Expected VIEW after CREATE".to_string()));
-                }
-                self.advance();
-                let name = match self.current().clone() {
-                    Token::Identifier(s) => {
+                match self.current() {
+                    Token::View => {
                         self.advance();
-                        s
+                        let name = self.parse_identifier()?;
+                        self.expect(Token::As)?;
+                        if !matches!(self.current(), Token::Select) {
+                            let (start, _) = self.current_span();
+                            return Err(self.syntax_error(start, "Expected SELECT after AS".to_string()));
+                        }
+                        let stmt = self.parse_select_internal(true)?;
+                        Ok(SqlStatement::CreateView { name, stmt })
+                    }
+                    Token::Table => {
+                        self.advance();
+                        // Check for IF NOT EXISTS
+                        let if_not_exists = self.parse_if_not_exists()?;
+                        let table = self.parse_identifier()?;
+                        self.expect(Token::LParen)?;
+                        let columns = self.parse_column_defs()?;
+                        self.expect(Token::RParen)?;
+                        Ok(SqlStatement::CreateTable { table, columns, if_not_exists })
                     }
                     _ => {
                         let (start, _) = self.current_span();
-                        return Err(self.syntax_error(start, "Expected view name".to_string()));
+                        Err(self.syntax_error(start, "Expected TABLE or VIEW after CREATE".to_string()))
                     }
-                };
-                self.expect(Token::As)?;
-                if !matches!(self.current(), Token::Select) {
-                    let (start, _) = self.current_span();
-                    return Err(self.syntax_error(start, "Expected SELECT after AS".to_string()));
                 }
-                let stmt = self.parse_select_internal(true)?;
-                Ok(SqlStatement::CreateView { name, stmt })
             }
             Token::Drop => {
                 self.advance();
-                if !matches!(self.current(), Token::View) {
-                    let (start, _) = self.current_span();
-                    return Err(self.syntax_error(start, "Expected VIEW after DROP".to_string()));
-                }
-                self.advance();
-                let name = match self.current().clone() {
-                    Token::Identifier(s) => {
+                match self.current() {
+                    Token::View => {
                         self.advance();
-                        s
+                        let name = self.parse_identifier()?;
+                        Ok(SqlStatement::DropView { name })
+                    }
+                    Token::Table => {
+                        self.advance();
+                        // Check for IF EXISTS
+                        let if_exists = self.parse_if_exists()?;
+                        let table = self.parse_identifier()?;
+                        Ok(SqlStatement::DropTable { table, if_exists })
                     }
                     _ => {
                         let (start, _) = self.current_span();
-                        return Err(self.syntax_error(start, "Expected view name".to_string()));
+                        Err(self.syntax_error(start, "Expected TABLE or VIEW after DROP".to_string()))
                     }
+                }
+            }
+            Token::Alter => {
+                self.advance();
+                self.expect(Token::Table)?;
+                let table = self.parse_identifier()?;
+                let operation = self.parse_alter_operation()?;
+                Ok(SqlStatement::AlterTable { table, operation })
+            }
+            Token::Truncate => {
+                self.advance();
+                self.expect(Token::Table)?;
+                let table = self.parse_identifier()?;
+                Ok(SqlStatement::TruncateTable { table })
+            }
+            Token::Insert => {
+                self.advance();
+                self.expect(Token::Into)?;
+                let table = self.parse_identifier()?;
+                // Optional column list
+                let columns = if matches!(self.current(), Token::LParen) {
+                    self.advance();
+                    let cols = self.parse_identifier_list()?;
+                    self.expect(Token::RParen)?;
+                    Some(cols)
+                } else {
+                    None
                 };
-                Ok(SqlStatement::DropView { name })
+                self.expect(Token::Values)?;
+                let values = self.parse_values_list()?;
+                Ok(SqlStatement::Insert { table, columns, values })
+            }
+            Token::Delete => {
+                self.advance();
+                self.expect(Token::From)?;
+                let table = self.parse_identifier()?;
+                let where_clause = if matches!(self.current(), Token::Where) {
+                    self.advance();
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                Ok(SqlStatement::Delete { table, where_clause })
+            }
+            Token::Update => {
+                self.advance();
+                let table = self.parse_identifier()?;
+                self.expect(Token::Set)?;
+                let assignments = self.parse_assignments()?;
+                let where_clause = if matches!(self.current(), Token::Where) {
+                    self.advance();
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                Ok(SqlStatement::Update { table, assignments, where_clause })
             }
             _ => {
                 let (start, _) = self.current_span();
@@ -2065,6 +2185,198 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                 format!("Unexpected token in expression: {:?}", self.current())
             )),
         }
+    }
+
+    // ========== DDL Helper Methods ==========
+
+    /// Parse an identifier (table name, column name, etc.)
+    fn parse_identifier(&mut self) -> Result<String, ApexError> {
+        match self.current().clone() {
+            Token::Identifier(s) => {
+                self.advance();
+                Ok(s)
+            }
+            _ => {
+                let (start, _) = self.current_span();
+                Err(self.syntax_error(start, "Expected identifier".to_string()))
+            }
+        }
+    }
+
+    /// Parse IF NOT EXISTS clause
+    fn parse_if_not_exists(&mut self) -> Result<bool, ApexError> {
+        if matches!(self.current(), Token::If) {
+            self.advance();
+            self.expect(Token::Not)?;
+            self.expect(Token::Exists)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Parse IF EXISTS clause
+    fn parse_if_exists(&mut self) -> Result<bool, ApexError> {
+        if matches!(self.current(), Token::If) {
+            self.advance();
+            self.expect(Token::Exists)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Parse column definitions for CREATE TABLE
+    fn parse_column_defs(&mut self) -> Result<Vec<ColumnDef>, ApexError> {
+        let mut columns = Vec::new();
+        
+        loop {
+            let name = self.parse_identifier()?;
+            let data_type = self.parse_data_type()?;
+            columns.push(ColumnDef { name, data_type });
+            
+            if matches!(self.current(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        
+        Ok(columns)
+    }
+
+    /// Parse data type for column definition
+    fn parse_data_type(&mut self) -> Result<DataType, ApexError> {
+        match self.current().clone() {
+            Token::Identifier(s) => {
+                self.advance();
+                match s.to_uppercase().as_str() {
+                    "INT" | "INT64" | "INTEGER" | "BIGINT" => Ok(DataType::Int64),
+                    "FLOAT" | "FLOAT64" | "DOUBLE" | "REAL" => Ok(DataType::Float64),
+                    "STRING" | "TEXT" | "VARCHAR" => Ok(DataType::String),
+                    "BOOL" | "BOOLEAN" => Ok(DataType::Bool),
+                    // Bytes type not supported yet, treat as String
+                    "BYTES" | "BLOB" | "BINARY" => Ok(DataType::String),
+                    _ => {
+                        let (start, _) = self.current_span();
+                        Err(self.syntax_error(start, format!("Unknown data type: {}", s)))
+                    }
+                }
+            }
+            _ => {
+                let (start, _) = self.current_span();
+                Err(self.syntax_error(start, "Expected data type".to_string()))
+            }
+        }
+    }
+
+    /// Parse ALTER TABLE operation
+    fn parse_alter_operation(&mut self) -> Result<AlterTableOp, ApexError> {
+        match self.current() {
+            Token::Add => {
+                self.advance();
+                // Optional COLUMN keyword
+                if matches!(self.current(), Token::Column) {
+                    self.advance();
+                }
+                let name = self.parse_identifier()?;
+                let data_type = self.parse_data_type()?;
+                Ok(AlterTableOp::AddColumn { name, data_type })
+            }
+            Token::Drop => {
+                self.advance();
+                // Optional COLUMN keyword
+                if matches!(self.current(), Token::Column) {
+                    self.advance();
+                }
+                let name = self.parse_identifier()?;
+                Ok(AlterTableOp::DropColumn { name })
+            }
+            Token::Rename => {
+                self.advance();
+                // Optional COLUMN keyword
+                if matches!(self.current(), Token::Column) {
+                    self.advance();
+                }
+                let old_name = self.parse_identifier()?;
+                self.expect(Token::To)?;
+                let new_name = self.parse_identifier()?;
+                Ok(AlterTableOp::RenameColumn { old_name, new_name })
+            }
+            _ => {
+                let (start, _) = self.current_span();
+                Err(self.syntax_error(start, "Expected ADD, DROP, or RENAME".to_string()))
+            }
+        }
+    }
+
+    /// Parse comma-separated list of identifiers
+    fn parse_identifier_list(&mut self) -> Result<Vec<String>, ApexError> {
+        let mut list = Vec::new();
+        
+        loop {
+            list.push(self.parse_identifier()?);
+            
+            if matches!(self.current(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        
+        Ok(list)
+    }
+
+    /// Parse VALUES clause for INSERT
+    fn parse_values_list(&mut self) -> Result<Vec<Vec<Value>>, ApexError> {
+        let mut rows = Vec::new();
+        
+        loop {
+            self.expect(Token::LParen)?;
+            let mut row = Vec::new();
+            
+            loop {
+                let value = self.parse_literal_value()?;
+                row.push(value);
+                
+                if matches!(self.current(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            
+            self.expect(Token::RParen)?;
+            rows.push(row);
+            
+            if matches!(self.current(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        
+        Ok(rows)
+    }
+
+    /// Parse SET clause for UPDATE (column = value pairs)
+    fn parse_assignments(&mut self) -> Result<Vec<(String, SqlExpr)>, ApexError> {
+        let mut assignments = Vec::new();
+        
+        loop {
+            let column = self.parse_identifier()?;
+            self.expect(Token::Eq)?;
+            let value = self.parse_expr()?;
+            assignments.push((column, value));
+            
+            if matches!(self.current(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        
+        Ok(assignments)
     }
 
 }

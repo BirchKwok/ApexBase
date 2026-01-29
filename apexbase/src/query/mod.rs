@@ -14,5 +14,7 @@ pub use filter::{Filter, CompareOp, LikeMatcher, RegexpMatcher};
 pub use sql_parser::{
     SqlParser, SqlStatement, SelectStatement, SelectColumn, SqlExpr, OrderByClause, AggregateFunc,
     FromItem, JoinClause, JoinType, UnionStatement,
+    // DDL types
+    ColumnDef, AlterTableOp,
 };
 pub use executor::{ApexExecutor, ApexResult};
