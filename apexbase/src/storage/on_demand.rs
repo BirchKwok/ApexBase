@@ -3955,8 +3955,15 @@ impl OnDemandStorage {
         }
         
         // Sync main data file
-        let file_guard = self.file.read();
-        if let Some(file) = file_guard.as_ref() {
+        // On Windows, sync_all() requires write access. Since save() already flushes
+        // data via BufWriter and does fsync for Max durability, we need to open
+        // the file with write access specifically for syncing.
+        if self.path.exists() {
+            // Open with write access for fsync (append mode to avoid truncation)
+            let file = OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(&self.path)?;
             file.sync_all()?;
         }
         Ok(())
