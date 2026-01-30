@@ -1413,6 +1413,24 @@ impl ApexStorageImpl {
             Err(PyRuntimeError::new_err("FTS not initialized"))
         }
     }
+
+    /// Remove FTS engine for current table (and optionally delete index files)
+    #[pyo3(name = "_fts_remove_engine")]
+    #[pyo3(signature = (delete_files=false))]
+    fn fts_remove_engine(&self, delete_files: bool) -> PyResult<()> {
+        let table_name = self.current_table.read().clone();
+
+        // Remove any cached index field configuration for this table
+        self.fts_index_fields.write().remove(&table_name);
+
+        let mut mgr = self.fts_manager.write();
+        if let Some(m) = mgr.as_ref() {
+            m.remove_engine(&table_name, delete_files)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        }
+
+        Ok(())
+    }
     
     /// FTS fuzzy search
     #[pyo3(signature = (query, limit=None, _max_distance=None))]

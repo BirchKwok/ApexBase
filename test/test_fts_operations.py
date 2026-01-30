@@ -18,6 +18,7 @@ import shutil
 from pathlib import Path
 import sys
 import os
+import json
 import numpy as np
 
 # Add the apexbase python module to path
@@ -156,6 +157,71 @@ class TestFTSInitialization:
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
                 client.init_fts()
+
+
+class TestFTSPersistenceLifecycle:
+    """Test persisted FTS config across client restarts and disable/drop semantics"""
+
+    def test_fts_persist_and_auto_enable_on_reopen(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.init_fts(index_fields=['content'])
+            client.store({"content": "Python programming language"})
+            client.close()
+
+            client2 = ApexClient(dirpath=temp_dir)
+            assert client2._is_fts_enabled()
+
+            # Should work without calling init_fts again (lazy init)
+            results = client2.search_text("python")
+            assert len(results) > 0
+            client2.close()
+
+    def test_disable_fts_persists_across_reopen(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.init_fts(index_fields=['content'])
+            client.store({"content": "Python programming language"})
+
+            client.disable_fts()
+            client.close()
+
+            client2 = ApexClient(dirpath=temp_dir)
+            assert not client2._is_fts_enabled()
+            with pytest.raises(ValueError, match="Full-text search is not enabled"):
+                client2.search_text("python")
+            client2.close()
+
+    def test_drop_fts_deletes_index_files_and_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.init_fts(index_fields=['content'])
+            client.store({"content": "Python programming language"})
+
+            # Force index file to be materialized
+            _ = client.search_text("python")
+            client.close()
+
+            index_path = Path(temp_dir) / "fts_indexes" / "default.nfts"
+            # Index file may not exist on some platforms until flushed, but drop_fts should try to remove it if present
+            client2 = ApexClient(dirpath=temp_dir)
+            client2.drop_fts()
+            client2.close()
+
+            cfg_path = Path(temp_dir) / "fts_config.json"
+            if cfg_path.exists():
+                data = json.loads(cfg_path.read_text(encoding='utf-8') or "{}")
+                assert isinstance(data, dict)
+                assert "default" not in data
+
+            # drop_fts should remove index files if present
+            assert not index_path.exists()
+
+            client3 = ApexClient(dirpath=temp_dir)
+            assert not client3._is_fts_enabled()
+            with pytest.raises(ValueError, match="Full-text search is not enabled"):
+                client3.search_text("python")
+            client3.close()
 
 
 class TestBasicTextSearch:
