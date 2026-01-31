@@ -564,15 +564,16 @@ impl ApexStorageImpl {
             if col_len == 0 { continue; }
             
             // Detect type from first non-None element
+            // NOTE: Check bool before int because in Python bool is a subclass of int
             let mut col_type: Option<&str> = None;
             for item in list.iter() {
                 if !item.is_none() {
-                    if item.extract::<i64>().is_ok() {
+                    if item.extract::<bool>().is_ok() {
+                        col_type = Some("bool");
+                    } else if item.extract::<i64>().is_ok() {
                         col_type = Some("int");
                     } else if item.extract::<f64>().is_ok() {
                         col_type = Some("float");
-                    } else if item.extract::<bool>().is_ok() {
-                        col_type = Some("bool");
                     } else if item.extract::<String>().is_ok() {
                         col_type = Some("string");
                     }
