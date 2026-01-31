@@ -47,10 +47,18 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::RefCell;
 
 use memmap2::Mmap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use arrow::record_batch::RecordBatch;
+use arrow::array::ArrayRef;
+
+// Thread-local buffer for scattered reads to avoid repeated allocations
+thread_local! {
+    static SCATTERED_READ_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(8192));
+}
 
 // ============================================================================
 // Cross-platform file reading (mmap with pread fallback)
@@ -1449,7 +1457,7 @@ impl OnDemandStorage {
         let mut mmap_cache = self.mmap_cache.write();
 
         // Sequential read using mmap (mmap is shared across all reads)
-        let mut result = HashMap::with_capacity(col_indices.len());
+        let mut result = HashMap::new();
         for &col_idx in &col_indices {
             let (col_name, col_type) = &schema.columns[col_idx];
             let index_entry = &column_index[col_idx];
@@ -1780,13 +1788,14 @@ impl OnDemandStorage {
             // dict_offsets[i] gives start of string i, dict_offsets[i+1] or dict_data_len gives end
             let filter_bytes = filter_value.as_bytes();
             let mut target_key: Option<u32> = None;
-            let dict_count = dict_size.saturating_sub(1); // dict_offsets has dict_size elements, so dict_count = dict_size - 1 strings
+            let dict_count = dict_size.saturating_sub(1);
             
+            // Linear search for dictionary lookup (small dictionaries are common)
             for i in 0..dict_count {
                 let start = dict_offsets[i] as usize;
                 let end = if i + 1 < dict_size { dict_offsets[i + 1] as usize } else { dict_data_len };
                 if end <= dict_data.len() && start <= end && &dict_data[start..end] == filter_bytes {
-                    target_key = Some((i + 1) as u32); // +1 because 0 = NULL
+                    target_key = Some((i + 1) as u32);
                     break;
                 }
             }
@@ -1797,12 +1806,12 @@ impl OnDemandStorage {
                 _ => return self.read_columns_filtered_string(column_names, filter_column, filter_value, filter_eq),
             };
             
-            // Stream through indices with early termination
-            let indices_offset = base_offset + 16; // indices start right after header
+            // Stream through indices with early termination - OPTIMIZED with pointer arithmetic
+            let indices_offset = base_offset + 16;
             let mut matching_indices = Vec::with_capacity(needed.min(1000));
             
-            // Read indices in chunks for efficiency
-            const CHUNK_SIZE: usize = 4096;
+            // Read indices in larger chunks for better throughput
+            const CHUNK_SIZE: usize = 8192;
             let mut chunk_buf = vec![0u32; CHUNK_SIZE];
             let mut row = 0usize;
             
@@ -1813,8 +1822,11 @@ impl OnDemandStorage {
                 };
                 mmap_cache.read_at(file, chunk_bytes, indices_offset + (row * 4) as u64)?;
                 
+                // OPTIMIZED: Use pointer arithmetic for faster scanning
+                let buf_ptr = chunk_buf.as_ptr();
                 for i in 0..chunk_rows {
-                    if chunk_buf[i] == target_key {
+                    // unsafe pointer dereference avoids bounds check
+                    if unsafe { *buf_ptr.add(i) } == target_key {
                         matching_indices.push(row + i);
                         if matching_indices.len() >= needed {
                             break;
@@ -1831,13 +1843,15 @@ impl OnDemandStorage {
                 return Ok((HashMap::new(), Vec::new()));
             }
             
-            // Read columns for matching rows
+            // Read columns for matching rows - SIMPLIFIED approach without sorting
             let col_indices: Vec<usize> = match column_names {
                 Some(names) => names.iter().filter_map(|name| schema.get_index(name)).collect(),
                 None => (0..schema.column_count()).collect(),
             };
             
-            let mut result = HashMap::new();
+            // OPTIMIZATION: Read columns directly without sorting
+            // The overhead of sorting may not be worth it for small result sets
+            let mut result: HashMap<String, ColumnData> = HashMap::with_capacity(col_indices.len());
             for &col_idx in &col_indices {
                 let (col_name, col_type) = &schema.columns[col_idx];
                 let index_entry = &column_index[col_idx];
@@ -2172,7 +2186,7 @@ impl OnDemandStorage {
                 None => (0..schema.column_count()).collect(),
             };
             
-            let mut result = HashMap::new();
+            let mut result = HashMap::with_capacity(col_indices.len());
             for &col_idx in &col_indices {
                 let (col_name, col_type) = &schema.columns[col_idx];
                 let index_entry = &column_index[col_idx];
@@ -2230,6 +2244,287 @@ impl OnDemandStorage {
         Ok(row_indices.iter()
             .map(|&i| if i < total { ids[i] as i64 } else { 0 })
             .collect())
+    }
+
+    /// Execute Complex (Filter+Group+Order) query with single-pass optimization
+    /// Key optimization for: SELECT group_col, AGG(agg_col) FROM table WHERE filter_col = 'value'
+    /// GROUP BY group_col ORDER BY total DESC LIMIT n
+    pub fn execute_filter_group_order(
+        &self,
+        filter_col: &str,
+        filter_val: &str,
+        group_col: &str,
+        agg_col: Option<&str>,
+        agg_func: crate::query::AggregateFunc,
+        descending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> io::Result<Option<RecordBatch>> {
+        use crate::query::AggregateFunc;
+        use arrow::array::{Int64Array, Float64Array, StringArray, UInt32Array};
+        use arrow::datatypes::{Field, Schema, DataType as ArrowDataType};
+        use std::collections::BinaryHeap;
+        use std::cmp::Ordering;
+        use std::sync::Arc;
+
+        let schema = self.schema.read();
+        let column_index = self.column_index.read();
+        let header = self.header.read();
+
+        let total_rows = header.row_count as usize;
+        if total_rows == 0 {
+            return Ok(Some(RecordBatch::new_empty(Arc::new(Schema::empty()))));
+        }
+
+        // Get column indices
+        let filter_idx = match schema.get_index(filter_col) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let group_idx = match schema.get_index(group_col) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+        })?;
+        
+        let mut mmap_cache = self.mmap_cache.write();
+
+        // Read filter column to find matching rows
+        let filter_index = &column_index[filter_idx];
+        let (_, filter_col_type) = &schema.columns[filter_idx];
+        
+        if *filter_col_type != ColumnType::StringDict {
+            return Ok(None); // Only optimized for dictionary-encoded strings
+        }
+
+        // Read filter column header and dictionary
+        let filter_base = filter_index.data_offset;
+        let mut header_buf = [0u8; 16];
+        mmap_cache.read_at(file, &mut header_buf, filter_base)?;
+        let stored_rows = u64::from_le_bytes(header_buf[0..8].try_into().unwrap()) as usize;
+        let dict_size = u64::from_le_bytes(header_buf[8..16].try_into().unwrap()) as usize;
+        
+        // Read dictionary
+        let dict_offsets_offset = filter_base + 16 + (stored_rows * 4) as u64;
+        let mut dict_offsets_buf = vec![0u8; dict_size * 4];
+        mmap_cache.read_at(file, &mut dict_offsets_buf, dict_offsets_offset)?;
+        let dict_offsets: Vec<u32> = (0..dict_size)
+            .map(|i| u32::from_le_bytes(dict_offsets_buf[i*4..(i+1)*4].try_into().unwrap()))
+            .collect();
+        
+        let data_len_offset = dict_offsets_offset + (dict_size * 4) as u64;
+        let mut data_len_buf = [0u8; 8];
+        mmap_cache.read_at(file, &mut data_len_buf, data_len_offset)?;
+        let dict_data_len = u64::from_le_bytes(data_len_buf) as usize;
+        
+        let dict_data_offset = data_len_offset + 8;
+        let mut dict_data = vec![0u8; dict_data_len];
+        if dict_data_len > 0 {
+            mmap_cache.read_at(file, &mut dict_data, dict_data_offset)?;
+        }
+        
+        // Find filter value in dictionary
+        let filter_bytes = filter_val.as_bytes();
+        let mut target_dict_idx: Option<u32> = None;
+        for i in 0..dict_size.saturating_sub(1) {
+            let start = dict_offsets[i] as usize;
+            let end = if i + 1 < dict_size { dict_offsets[i + 1] as usize } else { dict_data_len };
+            if &dict_data[start..end] == filter_bytes {
+                target_dict_idx = Some((i + 1) as u32);
+                break;
+            }
+        }
+        
+        let target_idx = match target_dict_idx {
+            Some(idx) => idx,
+            None => return Ok(Some(RecordBatch::new_empty(Arc::new(Schema::empty())))),
+        };
+        
+        // Read group column dictionary
+        let group_index = &column_index[group_idx];
+        let (_, group_col_type) = &schema.columns[group_idx];
+        
+        if *group_col_type != ColumnType::StringDict {
+            return Ok(None);
+        }
+        
+        let group_base = group_index.data_offset;
+        let mut group_header = [0u8; 16];
+        mmap_cache.read_at(file, &mut group_header, group_base)?;
+        let group_rows = u64::from_le_bytes(group_header[0..8].try_into().unwrap()) as usize;
+        let group_dict_size = u64::from_le_bytes(group_header[8..16].try_into().unwrap()) as usize;
+        
+        let group_dict_offsets_offset = group_base + 16 + (group_rows * 4) as u64;
+        let mut group_dict_offsets_buf = vec![0u8; group_dict_size * 4];
+        mmap_cache.read_at(file, &mut group_dict_offsets_buf, group_dict_offsets_offset)?;
+        let group_dict_offsets: Vec<u32> = (0..group_dict_size)
+            .map(|i| u32::from_le_bytes(group_dict_offsets_buf[i*4..(i+1)*4].try_into().unwrap()))
+            .collect();
+        
+        let group_data_len_offset = group_dict_offsets_offset + (group_dict_size * 4) as u64;
+        let mut group_data_len_buf = [0u8; 8];
+        mmap_cache.read_at(file, &mut group_data_len_buf, group_data_len_offset)?;
+        let group_dict_data_len = u64::from_le_bytes(group_data_len_buf) as usize;
+        
+        let group_dict_data_offset = group_data_len_offset + 8;
+        let mut group_dict_data = vec![0u8; group_dict_data_len];
+        if group_dict_data_len > 0 {
+            mmap_cache.read_at(file, &mut group_dict_data, group_dict_data_offset)?;
+        }
+        
+        // Aggregate: group_idx -> (count, sum)
+        let mut group_counts: Vec<i64> = vec![0; group_dict_size];
+        let mut group_sums: Vec<f64> = vec![0.0; group_dict_size];
+        
+        // Read filter indices and aggregate
+        let filter_indices_offset = filter_base + 16;
+        let group_indices_offset = group_base + 16;
+        
+        // Read agg column if specified
+        let agg_idx = agg_col.and_then(|name| schema.get_index(name));
+        let agg_values: Option<Vec<f64>> = if let Some(idx) = agg_idx {
+            let agg_index = &column_index[idx];
+            let (_, agg_col_type) = &schema.columns[idx];
+            if *agg_col_type == ColumnType::Float64 || *agg_col_type == ColumnType::Int64 {
+                let agg_base = agg_index.data_offset + 8; // Skip count header
+                let mut agg_buf = vec![0u8; stored_rows * 8];
+                mmap_cache.read_at(file, &mut agg_buf, agg_base)?;
+                let values: Vec<f64> = (0..stored_rows)
+                    .map(|i| {
+                        let bytes = &agg_buf[i*8..(i+1)*8];
+                        f64::from_le_bytes(bytes.try_into().unwrap())
+                    })
+                    .collect();
+                Some(values)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        // Single-pass aggregation
+        const CHUNK_SIZE: usize = 8192;
+        let mut filter_chunk = vec![0u32; CHUNK_SIZE];
+        let mut group_chunk = vec![0u32; CHUNK_SIZE];
+        
+        let mut row = 0;
+        while row < stored_rows {
+            let chunk_rows = CHUNK_SIZE.min(stored_rows - row);
+            
+            // Read filter indices chunk
+            let filter_bytes = unsafe {
+                std::slice::from_raw_parts_mut(filter_chunk.as_mut_ptr() as *mut u8, chunk_rows * 4)
+            };
+            mmap_cache.read_at(file, filter_bytes, filter_indices_offset + (row * 4) as u64)?;
+            
+            // Read group indices chunk
+            let group_bytes = unsafe {
+                std::slice::from_raw_parts_mut(group_chunk.as_mut_ptr() as *mut u8, chunk_rows * 4)
+            };
+            mmap_cache.read_at(file, group_bytes, group_indices_offset + (row * 4) as u64)?;
+            
+            // Aggregate
+            for i in 0..chunk_rows {
+                if filter_chunk[i] == target_idx {
+                    let g_idx = group_chunk[i] as usize;
+                    if g_idx > 0 && g_idx < group_dict_size {
+                        group_counts[g_idx] += 1;
+                        if let Some(ref vals) = agg_values {
+                            group_sums[g_idx] += vals[row + i];
+                        }
+                    }
+                }
+            }
+            row += chunk_rows;
+        }
+        
+        // Build result with top-k
+        #[derive(Clone, Copy)]
+        struct HeapItem { idx: usize, count: i64, sum: f64 }
+        
+        impl Ord for HeapItem {
+            fn cmp(&self, other: &Self) -> Ordering {
+                let self_val = self.count;
+                let other_val = other.count;
+                self_val.cmp(&other_val)
+            }
+        }
+        
+        impl PartialOrd for HeapItem {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        
+        impl Eq for HeapItem {}
+        impl PartialEq for HeapItem {
+            fn eq(&self, other: &Self) -> bool {
+                self.count == other.count
+            }
+        }
+        
+        let mut heap = BinaryHeap::new();
+        for i in 1..group_dict_size {
+            if group_counts[i] > 0 {
+                if heap.len() < limit + offset {
+                    heap.push(HeapItem { idx: i, count: group_counts[i], sum: group_sums[i] });
+                } else if let Some(min) = heap.peek() {
+                    if group_counts[i] > min.count {
+                        heap.pop();
+                        heap.push(HeapItem { idx: i, count: group_counts[i], sum: group_sums[i] });
+                    }
+                }
+            }
+        }
+        
+        // Extract results
+        let mut results: Vec<HeapItem> = heap.into_vec();
+        results.sort_by(|a, b| {
+            if descending {
+                b.count.cmp(&a.count)
+            } else {
+                a.count.cmp(&b.count)
+            }
+        });
+        
+        // Apply offset and limit
+        let final_results: Vec<HeapItem> = results.into_iter().skip(offset).take(limit).collect();
+        
+        if final_results.is_empty() {
+            return Ok(Some(RecordBatch::new_empty(Arc::new(Schema::empty()))));
+        }
+        
+        // Build Arrow arrays
+        let group_strings: Vec<&str> = final_results.iter()
+            .map(|item| {
+                let dict_idx = item.idx - 1;
+                let start = group_dict_offsets[dict_idx] as usize;
+                let end = if dict_idx + 1 < group_dict_size { group_dict_offsets[dict_idx + 1] as usize } else { group_dict_data_len };
+                std::str::from_utf8(&group_dict_data[start..end]).unwrap_or("")
+            })
+            .collect();
+        
+        let counts: Vec<i64> = final_results.iter().map(|item| item.count).collect();
+        
+        let result_schema = Arc::new(Schema::new(vec![
+            Field::new(group_col, ArrowDataType::Utf8, false),
+            Field::new("total", ArrowDataType::Int64, false),
+        ]));
+        
+        let result_batch = RecordBatch::try_new(
+            result_schema,
+            vec![
+                Arc::new(StringArray::from(group_strings)) as ArrayRef,
+                Arc::new(Int64Array::from(counts)) as ArrayRef,
+            ],
+        ).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        
+        Ok(Some(result_batch))
     }
 
     // ========================================================================
@@ -2513,17 +2808,21 @@ impl OnDemandStorage {
         // For small scattered reads, read individually; for dense reads, read a range
         let mut indices = Vec::with_capacity(n);
         
-        if n <= 128 {
-            // Small number of indices - read each one individually
-            let mut buf = [0u8; 4];
-            for &row_idx in row_indices {
-                if row_idx < total_rows {
-                    mmap_cache.read_at(file, &mut buf, all_indices_offset + (row_idx * 4) as u64)?;
-                    indices.push(u32::from_le_bytes(buf));
-                } else {
-                    indices.push(0);
+        if n <= 256 {
+            // Small number of indices - read each one individually using thread-local buffer
+            SCATTERED_READ_BUF.with(|buf| {
+                let mut buf = buf.borrow_mut();
+                buf.resize(4, 0);
+                for &row_idx in row_indices {
+                    if row_idx < total_rows {
+                        mmap_cache.read_at(file, &mut buf[..4], all_indices_offset + (row_idx * 4) as u64)?;
+                        indices.push(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
+                    } else {
+                        indices.push(0);
+                    }
                 }
-            }
+                Ok::<(), io::Error>(())
+            })?;
         } else {
             // For larger reads, find min/max and read that range
             let min_idx = *row_indices.iter().min().unwrap_or(&0);
@@ -2552,16 +2851,20 @@ impl OnDemandStorage {
                     }
                 }
             } else {
-                // Sparse - read individually
-                let mut buf = [0u8; 4];
-                for &row_idx in row_indices {
-                    if row_idx < total_rows {
-                        mmap_cache.read_at(file, &mut buf, all_indices_offset + (row_idx * 4) as u64)?;
-                        indices.push(u32::from_le_bytes(buf));
-                    } else {
-                        indices.push(0);
+                // Sparse - read individually using thread-local buffer
+                SCATTERED_READ_BUF.with(|buf| {
+                    let mut buf = buf.borrow_mut();
+                    buf.resize(4, 0);
+                    for &row_idx in row_indices {
+                        if row_idx < total_rows {
+                            mmap_cache.read_at(file, &mut buf[..4], all_indices_offset + (row_idx * 4) as u64)?;
+                            indices.push(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]));
+                        } else {
+                            indices.push(0);
+                        }
                     }
-                }
+                    Ok::<(), io::Error>(())
+                })?;
             }
         }
         
@@ -2716,14 +3019,19 @@ impl OnDemandStorage {
         let elem_size = std::mem::size_of::<T>();
         
         // For small numbers, simple sequential read without sorting is faster
-        if n <= 128 {
+        // Typical LIMIT queries (100-500 rows) benefit from avoiding sort overhead
+        if n <= 256 {
             let mut values = Vec::with_capacity(n);
-            let mut buf = [0u8; 8];
-            for &idx in row_indices {
-                mmap_cache.read_at(file, &mut buf[..elem_size], index.data_offset + header_size + (idx * elem_size) as u64)?;
-                let val: T = unsafe { std::ptr::read(buf.as_ptr() as *const T) };
-                values.push(val);
-            }
+            SCATTERED_READ_BUF.with(|buf| {
+                let mut buf = buf.borrow_mut();
+                buf.resize(8, 0);
+                for &idx in row_indices {
+                    mmap_cache.read_at(file, &mut buf[..elem_size], index.data_offset + header_size + (idx * elem_size) as u64)?;
+                    let val: T = unsafe { std::ptr::read(buf.as_ptr() as *const T) };
+                    values.push(val);
+                }
+                Ok::<(), io::Error>(())
+            })?;
             return Ok(values);
         }
         

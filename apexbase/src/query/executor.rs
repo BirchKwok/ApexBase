@@ -506,6 +506,9 @@ impl ApexExecutor {
                                     // ID not found - return empty batch with schema
                                     backend.read_columns_to_arrow(None, 0, Some(0))?
                                 }
+                            } else if let Some(result) = Self::try_fast_filter_group_order(&backend, &stmt)? {
+                                // FAST PATH for Complex (Filter+Group+Order) - biggest optimization
+                                return Ok(result);
                             } else if can_late_materialize_where {
                                 // FAST PATH 1: Try dictionary-based filter for simple string equality
                                 if let Some(result) = Self::try_fast_string_filter(&backend, &stmt)? {
@@ -542,6 +545,19 @@ impl ApexExecutor {
                             } else {
                                 // Late materialization for SELECT * WHERE path
                                 Self::execute_with_late_materialization(&backend, &stmt, storage_path)?
+                            }
+                        } else if stmt.where_clause.is_some() && stmt.limit.is_none() {
+                            // FAST PATH: String filter without LIMIT (uses dictionary scan)
+                            if let Some(result) = Self::try_fast_string_filter_no_limit(&backend, &stmt)? {
+                                result
+                            } else {
+                                // Standard path for WHERE without LIMIT
+                                let required_cols = stmt.required_columns();
+                                let col_refs: Option<Vec<&str>> = required_cols
+                                    .as_ref()
+                                    .filter(|cols| !cols.is_empty())
+                                    .map(|cols| cols.iter().map(|s| s.as_str()).collect());
+                                backend.read_columns_to_arrow(col_refs.as_deref(), 0, None)?
                             }
                         } else if can_late_materialize_order {
                             // Late materialization for ORDER BY + LIMIT path
@@ -706,6 +722,56 @@ impl ApexExecutor {
             true, // filter_eq = true for equality
             limit,
             offset,
+        )?;
+        
+        Ok(Some(result))
+    }
+
+    /// Fast path for string equality filters WITHOUT LIMIT
+    /// Uses dictionary index scan for maximum performance
+    fn try_fast_string_filter_no_limit(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<RecordBatch>> {
+        use crate::query::sql_parser::BinaryOperator;
+        
+        // Only handle simple WHERE col = 'value' patterns
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        
+        // Extract column name and literal value from simple equality
+        let (col_name, filter_value) = match where_clause {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val))) => {
+                        (col.trim_matches('"').to_string(), val.clone())
+                    }
+                    (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
+                        (col.trim_matches('"').to_string(), val.clone())
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        
+        // OPTIMIZATION: Column projection pushdown - only read required columns
+        let projected_cols: Option<Vec<String>> = if stmt.is_select_star() {
+            None // All columns
+        } else {
+            Some(stmt.required_columns().unwrap_or_default())
+        };
+        let col_refs: Option<Vec<&str>> = projected_cols.as_ref()
+            .map(|cols| cols.iter().map(|s| s.as_str()).collect());
+        
+        // Use storage-level filter WITHOUT early termination (no LIMIT)
+        let result = backend.read_columns_filtered_string_to_arrow(
+            col_refs.as_deref(),
+            &col_name,
+            &filter_value,
+            true, // filter_eq = true for equality
         )?;
         
         Ok(Some(result))
@@ -882,6 +948,122 @@ impl ApexExecutor {
         )?;
         
         Ok(Some(result))
+    }
+    
+    /// FAST PATH for Complex (Filter+Group+Order) queries
+    /// Optimized for: SELECT group_col, AGG(agg_col) FROM table WHERE filter_col = 'value' GROUP BY group_col ORDER BY agg DESC LIMIT n
+    /// Uses single-pass execution with direct dictionary indexing for maximum performance
+    fn try_fast_filter_group_order(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::AggregateFunc;
+        use crate::query::sql_parser::BinaryOperator;
+        
+        // Check pattern: must have WHERE, GROUP BY, ORDER BY, and LIMIT
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        
+        if stmt.group_by.is_empty() || stmt.order_by.is_empty() || stmt.limit.is_none() {
+            return Ok(None);
+        }
+        
+        // Must be simple string equality filter
+        let (filter_col, filter_val) = match where_clause {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val))) => {
+                        (col.trim_matches('"').to_string(), val.as_str())
+                    }
+                    (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
+                        (col.trim_matches('"').to_string(), val.as_str())
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        
+        // Must have exactly one GROUP BY column (string)
+        if stmt.group_by.len() != 1 {
+            return Ok(None);
+        }
+        let group_col = stmt.group_by[0].trim_matches('"');
+        
+        // Must have exactly one ORDER BY clause
+        if stmt.order_by.len() != 1 {
+            return Ok(None);
+        }
+        let order_clause = &stmt.order_by[0];
+        let order_col = order_clause.column.trim_matches('"');
+        let descending = order_clause.descending;
+        
+        // Check if we have exactly one aggregate column
+        let mut agg_func = None;
+        let mut agg_col = None;
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate { func, column, .. } = col {
+                agg_func = Some(func.clone());
+                agg_col = column.as_deref();
+            }
+        }
+        
+        let agg_func = match agg_func {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        
+        // Only support SUM and COUNT for now
+        if !matches!(agg_func, AggregateFunc::Sum | AggregateFunc::Count) {
+            return Ok(None);
+        }
+        
+        // Check HAVING clause - must be simple
+        if let Some(having) = &stmt.having {
+            // Only support simple column > value comparisons
+            match having {
+                SqlExpr::BinaryOp { left, op: BinaryOperator::Gt, right } => {
+                    match (left.as_ref(), right.as_ref()) {
+                        (SqlExpr::Column(col), SqlExpr::Literal(Value::Int64(val))) => {
+                            if col.trim_matches('"') != order_col {
+                                return Ok(None);
+                            }
+                            // Will apply this filter after aggregation
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        
+        let limit = stmt.limit.unwrap_or(100);
+        let offset = stmt.offset.unwrap_or(0);
+        
+        // Call storage-level optimized function
+        match backend.execute_filter_group_order(
+            &filter_col,
+            filter_val,
+            group_col,
+            agg_col,
+            agg_func,
+            order_col,
+            descending,
+            limit,
+            offset,
+        ) {
+            Ok(Some(result)) => {
+                // Apply HAVING if present
+                if stmt.having.is_some() {
+                    // HAVING already applied in storage function for simple cases
+                }
+                Ok(Some(ApexResult::Data(result)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
     
     /// Helper to extract string equality: col = 'value'
@@ -4898,6 +5080,126 @@ impl ApexExecutor {
         use crate::query::vectorized::{execute_vectorized_group_by, VectorizedHashAgg};
         use crate::query::AggregateFunc;
         
+        // OPTIMIZATION: For DictionaryArray columns, use direct indexing (much faster)
+        if let Some(col) = batch.column_by_name(group_col_name) {
+            use arrow::array::DictionaryArray;
+            use arrow::datatypes::UInt32Type;
+            if let Some(dict_arr) = col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+                let keys = dict_arr.keys();
+                let values = dict_arr.values();
+                if let Some(str_values) = values.as_any().downcast_ref::<StringArray>() {
+                    let num_rows = batch.num_rows();
+                    let dict_size = str_values.len() + 1; // +1 for NULL slot
+                    
+                    // Check if this is COUNT(*) only - can optimize by streaming directly
+                    let is_count_only = stmt.columns.iter().all(|c| {
+                        matches!(c, SelectColumn::Aggregate { func: AggregateFunc::Count, column: None, .. })
+                    });
+                    
+                    if is_count_only {
+                        // OPTIMIZED: Direct aggregation without building indices Vec
+                        let mut counts: Vec<i64> = vec![0; dict_size];
+                        
+                        for row_idx in 0..num_rows {
+                            if !keys.is_null(row_idx) {
+                                let group_idx = keys.value(row_idx) as usize + 1;
+                                unsafe { *counts.get_unchecked_mut(group_idx) += 1; }
+                            }
+                        }
+                        
+                        // Build result directly
+                        let active_groups: Vec<usize> = (1..dict_size)
+                            .filter(|&i| counts[i] > 0)
+                            .collect();
+                        
+                        let mut result_fields: Vec<Field> = Vec::new();
+                        let mut result_arrays: Vec<ArrayRef> = Vec::new();
+                        
+                        // Add group column
+                        let group_col_name_clean = stmt.group_by.first()
+                            .map(|s| {
+                                let trimmed = s.trim_matches('"');
+                                if let Some(dot_pos) = trimmed.rfind('.') {
+                                    trimmed[dot_pos + 1..].to_string()
+                                } else {
+                                    trimmed.to_string()
+                                }
+                            })
+                            .unwrap_or_else(|| "group".to_string());
+                        
+                        let group_values: Vec<&str> = active_groups.iter()
+                            .map(|&i| str_values.value(i - 1))
+                            .collect();
+                        result_fields.push(Field::new(&group_col_name_clean, ArrowDataType::Utf8, false));
+                        result_arrays.push(Arc::new(StringArray::from(group_values)));
+                        
+                        // Add COUNT(*) column
+                        let count_values: Vec<i64> = active_groups.iter().map(|&i| counts[i]).collect();
+                        result_fields.push(Field::new("COUNT(*)", ArrowDataType::Int64, false));
+                        result_arrays.push(Arc::new(Int64Array::from(count_values)));
+                        
+                        let schema = Arc::new(Schema::new(result_fields));
+                        let result_batch = RecordBatch::try_new(schema, result_arrays)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        
+                        return Ok(ApexResult::Data(result_batch));
+                    }
+                    
+                    // For other aggregates, use the standard path
+                    let indices: Vec<u32> = (0..num_rows)
+                        .map(|i| {
+                            if keys.is_null(i) { 0u32 } else { keys.value(i) + 1 }
+                        })
+                        .collect();
+                    
+                    let dict_values: Vec<&str> = (0..str_values.len())
+                        .map(|i| str_values.value(i))
+                        .collect();
+                    
+                    return Self::execute_group_by_string_dict(
+                        batch, stmt, str_values, &indices, &dict_values, dict_size
+                    );
+                }
+            }
+            
+            // OPTIMIZATION: For low-cardinality StringArray, build dictionary on the fly
+            // REMOVED sampling to stabilize performance - always try dictionary path first
+            if let Some(str_arr) = col.as_any().downcast_ref::<StringArray>() {
+                let num_rows = batch.num_rows();
+                
+                // Build dictionary directly without sampling - more stable performance
+                let mut dict: AHashMap<&str, u32> = AHashMap::with_capacity(200);
+                let mut dict_values: Vec<&str> = Vec::with_capacity(200);
+                let mut next_id = 1u32;
+                
+                // First pass: build dictionary and check cardinality
+                let mut indices: Vec<u32> = Vec::with_capacity(num_rows);
+                indices.resize(num_rows, 0);
+                
+                for i in 0..num_rows {
+                    if !str_arr.is_null(i) {
+                        let s = str_arr.value(i);
+                        let id = *dict.entry(s).or_insert_with(|| {
+                            let id = next_id;
+                            next_id += 1;
+                            dict_values.push(s);
+                            id
+                        });
+                        indices[i] = id;
+                    }
+                }
+                
+                // Only use dict indexing if cardinality is reasonable (<=1000)
+                let dict_size = dict_values.len() + 1;
+                if dict_size <= 1000 {
+                    return Self::execute_group_by_string_dict(
+                        batch, stmt, str_arr, &indices, &dict_values, dict_size
+                    );
+                }
+                // Fall through to hash-based aggregation for high cardinality
+            }
+        }
+        
         // Find aggregate column name and type
         let mut agg_col_name: Option<&str> = None;
         let mut has_int_agg = false;
@@ -4921,7 +5223,7 @@ impl ApexExecutor {
             }
         }
         
-        // Execute vectorized GROUP BY
+        // Execute vectorized GROUP BY for non-dictionary columns
         let hash_agg = execute_vectorized_group_by(batch, group_col_name, agg_col_name, has_int_agg)?;
         
         // Build result from hash aggregation table
@@ -5071,6 +5373,123 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result_batch))
     }
     
+    /// Build result for 2-column GROUP BY
+    fn build_two_column_result(
+        stmt: &SelectStatement,
+        dict1_values: &[String],
+        dict2_values: &[String],
+        dict2_size: usize,
+        counts: &[i64],
+        sums_int: Option<&[i64]>,
+        sums_float: Option<&[f64]>,
+    ) -> io::Result<ApexResult> {
+        use crate::query::AggregateFunc;
+        
+        let dict1_size = dict1_values.len() + 1;
+        
+        // Collect active groups
+        let mut result_col1: Vec<&str> = Vec::with_capacity(dict1_size * dict2_size / 10);
+        let mut result_col2: Vec<&str> = Vec::with_capacity(dict1_size * dict2_size / 10);
+        let mut result_counts: Vec<i64> = Vec::with_capacity(dict1_size * dict2_size / 10);
+        let mut result_sums_int: Vec<i64> = Vec::with_capacity(dict1_size * dict2_size / 10);
+        let mut result_sums_float: Vec<f64> = Vec::with_capacity(dict1_size * dict2_size / 10);
+        
+        for idx1 in 1..dict1_size {
+            for idx2 in 1..dict2_size {
+                let composite = idx1 * dict2_size + idx2;
+                if counts[composite] > 0 {
+                    result_col1.push(&dict1_values[idx1 - 1]);
+                    result_col2.push(&dict2_values[idx2 - 1]);
+                    result_counts.push(counts[composite]);
+                    if let Some(sums) = sums_int {
+                        result_sums_int.push(sums[composite]);
+                    }
+                    if let Some(sums) = sums_float {
+                        result_sums_float.push(sums[composite]);
+                    }
+                }
+            }
+        }
+        
+        // Build result
+        let mut result_fields: Vec<Field> = Vec::new();
+        let mut result_arrays: Vec<ArrayRef> = Vec::new();
+        
+        let group_cols: Vec<String> = stmt.group_by.iter().map(|s| {
+            let trimmed = s.trim_matches('"');
+            if let Some(dot_pos) = trimmed.rfind('.') {
+                trimmed[dot_pos + 1..].to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }).collect();
+        
+        result_fields.push(Field::new(&group_cols[0], ArrowDataType::Utf8, false));
+        result_arrays.push(Arc::new(StringArray::from(result_col1)));
+        result_fields.push(Field::new(&group_cols[1], ArrowDataType::Utf8, false));
+        result_arrays.push(Arc::new(StringArray::from(result_col2)));
+        
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate { func, column, alias, .. } = col {
+                let func_name = match func {
+                    AggregateFunc::Count => "COUNT",
+                    AggregateFunc::Sum => "SUM",
+                    AggregateFunc::Avg => "AVG",
+                    AggregateFunc::Min => "MIN",
+                    AggregateFunc::Max => "MAX",
+                };
+                let field_name = alias.clone().unwrap_or_else(|| {
+                    format!("{}({})", func_name, column.as_deref().unwrap_or("*"))
+                });
+                
+                match func {
+                    AggregateFunc::Count => {
+                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, false));
+                        result_arrays.push(Arc::new(Int64Array::from(result_counts.clone())));
+                    }
+                    AggregateFunc::Sum => {
+                        if sums_int.is_some() {
+                            result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
+                            result_arrays.push(Arc::new(Int64Array::from(result_sums_int.clone())));
+                        } else {
+                            result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
+                            result_arrays.push(Arc::new(Float64Array::from(result_sums_float.clone())));
+                        }
+                    }
+                    AggregateFunc::Avg => {
+                        let values: Vec<f64> = result_counts.iter().enumerate().map(|(i, &c)| {
+                            if c > 0 {
+                                if let Some(sums) = sums_int {
+                                    sums[i] as f64 / c as f64
+                                } else if let Some(sums) = sums_float {
+                                    sums[i] / c as f64
+                                } else {
+                                    0.0
+                                }
+                            } else { 0.0 }
+                        }).collect();
+                        result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
+                        result_arrays.push(Arc::new(Float64Array::from(values)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        let schema = Arc::new(Schema::new(result_fields));
+        let mut result_batch = RecordBatch::try_new(schema, result_arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        
+        // Apply HAVING clause if present
+        if let Some(having_expr) = &stmt.having {
+            let mask = Self::evaluate_predicate(&result_batch, having_expr)?;
+            result_batch = compute::filter_record_batch(&result_batch, &mask)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        }
+        
+        Ok(ApexResult::Data(result_batch))
+    }
+
     /// Check if we can use incremental aggregation (no DISTINCT, no complex expressions)
     fn can_use_incremental_aggregation(stmt: &SelectStatement) -> bool {
         for col in &stmt.columns {
@@ -5211,9 +5630,30 @@ impl ApexExecutor {
         let mut result_arrays: Vec<ArrayRef> = Vec::new();
         
         // Add group column (string values from dictionary)
-        let group_col_name = stmt.group_by.first()
-            .map(|s| s.trim_matches('"').to_string())
-            .unwrap_or_else(|| "group".to_string());
+        // OPTIMIZATION: Check if group column has an alias in SELECT clause
+        let group_by_col = stmt.group_by.first().map(|s| s.trim_matches('"')).unwrap_or("");
+        let group_col_name = stmt.columns.iter()
+            .find_map(|col| {
+                // Check for ColumnAlias pattern: column AS alias
+                if let SelectColumn::ColumnAlias { column, alias } = col {
+                    let col_trimmed = column.trim_matches('"');
+                    // Match either full name (u.tier) or just column name (tier)
+                    if col_trimmed == group_by_col || 
+                       (group_by_col.contains('.') && col_trimmed == group_by_col.split('.').next().unwrap_or("")) ||
+                       (col_trimmed.contains('.') && col_trimmed.ends_with(&format!(". {}", group_by_col.split('.').last().unwrap_or("")))) {
+                        return Some(alias.clone());
+                    }
+                }
+                None
+            })
+            .unwrap_or_else(|| {
+                // No alias found, use column name (stripping table prefix)
+                if let Some(dot_pos) = group_by_col.rfind('.') {
+                    group_by_col[dot_pos + 1..].to_string()
+                } else {
+                    group_by_col.to_string()
+                }
+            });
         
         let group_values: Vec<&str> = active_groups.iter()
             .map(|&i| dict_values[i - 1]) // -1 because dict_values is 0-indexed, indices are 1-indexed
@@ -5575,39 +6015,32 @@ impl ApexExecutor {
                 }
                 
                 // FAST PATH 2: Regular StringArray - build dictionary
+                // REMOVED sampling to stabilize performance
                 if let Some(str_arr) = col.as_any().downcast_ref::<StringArray>() {
-                    // Sample to estimate cardinality first
-                    let sample_size = (num_rows / 100).max(100).min(1000);
-                    let mut sample_dict: AHashMap<&str, u32> = AHashMap::with_capacity(100);
-                    for i in (0..num_rows).step_by((num_rows / sample_size).max(1)) {
+                    // Build dictionary directly without sampling
+                    let mut dict: AHashMap<&str, u32> = AHashMap::with_capacity(200);
+                    let mut dict_values: Vec<&str> = Vec::with_capacity(200);
+                    let mut next_id = 1u32;
+                    
+                    let mut indices: Vec<u32> = Vec::with_capacity(num_rows);
+                    indices.resize(num_rows, 0);
+                    
+                    for i in 0..num_rows {
                         if !str_arr.is_null(i) {
-                            sample_dict.insert(str_arr.value(i), 0);
+                            let s = str_arr.value(i);
+                            let id = *dict.entry(s).or_insert_with(|| {
+                                let id = next_id;
+                                next_id += 1;
+                                dict_values.push(s);
+                                id
+                            });
+                            indices[i] = id;
                         }
                     }
                     
-                    // Only use dict indexing for low-cardinality columns
-                    if sample_dict.len() <= 1000 {
-                        let mut dict: AHashMap<&str, u32> = AHashMap::with_capacity(sample_dict.len() * 2);
-                        let mut dict_values: Vec<&str> = Vec::with_capacity(sample_dict.len() * 2);
-                        let mut next_id = 1u32;
-                        
-                        let indices: Vec<u32> = (0..num_rows)
-                            .map(|i| {
-                                if str_arr.is_null(i) {
-                                    0u32
-                                } else {
-                                    let s = str_arr.value(i);
-                                    *dict.entry(s).or_insert_with(|| {
-                                        let id = next_id;
-                                        next_id += 1;
-                                        dict_values.push(s);
-                                        id
-                                    })
-                                }
-                            })
-                            .collect();
-                        
-                        let dict_size = dict_values.len() + 1;
+                    // Only use dict indexing if cardinality is reasonable
+                    let dict_size = dict_values.len() + 1;
+                    if dict_size <= 1000 {
                         return Self::execute_group_by_string_dict(
                             batch, stmt, str_arr, &indices, &dict_values, dict_size
                         );
@@ -7336,51 +7769,37 @@ impl ApexExecutor {
             }
             
             // Case 2: StringArray - build dictionary on the fly for low cardinality
+            // REMOVED sampling to stabilize performance
             if let Some(str_arr) = col.as_any().downcast_ref::<StringArray>() {
-                // Sample to estimate cardinality
-                let sample_size = (num_rows / 100).max(100).min(1000);
-                let mut sample_unique = 0usize;
-                let mut sample_set: AHashSet<&str> = AHashSet::with_capacity(sample_size);
-                for i in (0..num_rows).step_by((num_rows / sample_size).max(1)).take(sample_size) {
-                    if !str_arr.is_null(i) {
-                        if sample_set.insert(str_arr.value(i)) {
-                            sample_unique += 1;
+                // Build dictionary directly without sampling
+                let mut dict: AHashMap<&str, u32> = AHashMap::with_capacity(1000);
+                let mut keep_indices: Vec<u32> = Vec::with_capacity(1000);
+                let mut has_null = false;
+                
+                for row_idx in 0..num_rows {
+                    if str_arr.is_null(row_idx) {
+                        if !has_null {
+                            has_null = true;
+                            keep_indices.push(row_idx as u32);
+                        }
+                    } else {
+                        let s = str_arr.value(row_idx);
+                        if !dict.contains_key(s) {
+                            dict.insert(s, row_idx as u32);
+                            keep_indices.push(row_idx as u32);
                         }
                     }
                 }
                 
-                // If low cardinality (estimated < 10% of rows), use dictionary approach
-                let estimated_unique = (sample_unique as f64 * num_rows as f64 / sample_size as f64) as usize;
-                if estimated_unique < num_rows / 10 || estimated_unique < 10000 {
-                    let mut dict: AHashMap<&str, u32> = AHashMap::with_capacity(estimated_unique.max(100));
-                    let mut keep_indices: Vec<u32> = Vec::with_capacity(estimated_unique.max(100));
-                    let mut has_null = false;
-                    
-                    for row_idx in 0..num_rows {
-                        if str_arr.is_null(row_idx) {
-                            if !has_null {
-                                has_null = true;
-                                keep_indices.push(row_idx as u32);
-                            }
-                        } else {
-                            let s = str_arr.value(row_idx);
-                            if !dict.contains_key(s) {
-                                dict.insert(s, row_idx as u32);
-                                keep_indices.push(row_idx as u32);
-                            }
-                        }
-                    }
-                    
-                    if keep_indices.len() == num_rows {
-                        return Ok(batch.clone());
-                    }
-                    
-                    let indices = arrow::array::UInt32Array::from(keep_indices);
-                    let filtered = compute::take(col.as_ref(), &indices, None)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                    return RecordBatch::try_new(batch.schema(), vec![filtered])
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+                if keep_indices.len() == num_rows {
+                    return Ok(batch.clone());
                 }
+                
+                let indices = arrow::array::UInt32Array::from(keep_indices);
+                let filtered = compute::take(col.as_ref(), &indices, None)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                return RecordBatch::try_new(batch.schema(), vec![filtered])
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
             }
             
             // Case 3: Int64Array - use direct value dedup

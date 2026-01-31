@@ -29,9 +29,9 @@ pub struct GroupHash(u64);
 impl GroupHash {
     #[inline(always)]
     pub fn from_i64(val: i64) -> Self {
-        let mut hasher = AHasher::default();
-        val.hash(&mut hasher);
-        GroupHash(hasher.finish())
+        // OPTIMIZATION: Use direct bit pattern as hash for integers
+        // This avoids AHasher creation overhead for integer keys
+        GroupHash(val as u64)
     }
     
     #[inline(always)]
@@ -142,8 +142,10 @@ pub struct VectorizedHashAgg {
 
 impl VectorizedHashAgg {
     pub fn new(is_int_key: bool, estimated_groups: usize) -> Self {
+        // OPTIMIZATION: Pre-allocate with 2x estimated capacity to reduce rehashing
+        let capacity = (estimated_groups * 2).max(64);
         Self {
-            hash_table: AHashMap::with_capacity(estimated_groups),
+            hash_table: AHashMap::with_capacity_and_hasher(capacity, Default::default()),
             states: Vec::with_capacity(estimated_groups),
             group_keys_int: if is_int_key { Vec::with_capacity(estimated_groups) } else { Vec::new() },
             group_keys_str: if !is_int_key { Vec::with_capacity(estimated_groups) } else { Vec::new() },
@@ -362,6 +364,15 @@ pub fn execute_vectorized_group_by(
     // Get aggregate column if specified
     let agg_col = agg_col_name.and_then(|name| batch.column_by_name(name));
     
+    // Extract aggregate column data first (needed for all paths)
+    let agg_col_int: Option<&[i64]> = agg_col.and_then(|c| {
+        c.as_any().downcast_ref::<Int64Array>().map(|a| a.values().as_ref())
+    });
+    let agg_col_float: Option<&[f64]> = agg_col.and_then(|c| {
+        c.as_any().downcast_ref::<Float64Array>().map(|a| a.values().as_ref())
+    });
+    let count_only = agg_col_int.is_none() && agg_col_float.is_none();
+    
     // Determine group column type and extract data
     let group_col_int: Option<&[i64]>;
     let group_col_str: Option<&StringArray>;
@@ -403,15 +414,6 @@ pub fn execute_vectorized_group_by(
     } else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsupported group column type"));
     }
-    
-    // Extract aggregate column data
-    let agg_col_int: Option<&[i64]> = agg_col.and_then(|c| {
-        c.as_any().downcast_ref::<Int64Array>().map(|a| a.values().as_ref())
-    });
-    let agg_col_float: Option<&[f64]> = agg_col.and_then(|c| {
-        c.as_any().downcast_ref::<Float64Array>().map(|a| a.values().as_ref())
-    });
-    let count_only = agg_col_int.is_none() && agg_col_float.is_none();
     
     // Create hash aggregation table
     let mut hash_agg = VectorizedHashAgg::new(is_int_key, estimated_groups);

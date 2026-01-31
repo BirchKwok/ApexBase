@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use arrow::record_batch::RecordBatch;
+
 use crate::data::{DataType, Value};
 use crate::storage::on_demand::{ColumnData, ColumnType, OnDemandStorage};
 use crate::table::column_table::{BitVec, TypedColumn};
@@ -1846,6 +1848,52 @@ impl TableStorageBackend {
         let schema = Arc::new(Schema::new(fields));
         arrow::record_batch::RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// Execute Complex (Filter+Group+Order) query with single-pass optimization
+    /// This is the key optimization for queries like:
+    /// SELECT region, SUM(value) FROM table WHERE status = 'active' GROUP BY region ORDER BY total DESC LIMIT 5
+    pub fn execute_filter_group_order(
+        &self,
+        filter_col: &str,
+        filter_val: &str,
+        group_col: &str,
+        agg_col: Option<&str>,
+        agg_func: crate::query::AggregateFunc,
+        _order_col: &str,
+        descending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> io::Result<Option<RecordBatch>> {
+        use crate::query::AggregateFunc;
+        use arrow::array::{Int64Array, Float64Array, StringArray, DictionaryArray, UInt32Array};
+        use arrow::datatypes::UInt32Type;
+        use std::collections::BinaryHeap;
+        use std::cmp::Ordering;
+
+        // This optimization requires dictionary-encoded columns for maximum performance
+        // Get filter column info
+        let schema_guard = self.schema.read();
+        let filter_idx = schema_guard.iter().position(|(name, _)| name == filter_col);
+        let group_idx = schema_guard.iter().position(|(name, _)| name == group_col);
+        
+        if filter_idx.is_none() || group_idx.is_none() {
+            return Ok(None);
+        }
+
+        // For now, delegate to the OnDemandStorage implementation
+        let result = self.storage.execute_filter_group_order(
+            filter_col,
+            filter_val,
+            group_col,
+            agg_col,
+            agg_func,
+            descending,
+            limit,
+            offset,
+        )?;
+
+        Ok(result)
     }
 }
 
