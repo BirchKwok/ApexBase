@@ -4,16 +4,15 @@ ApexBase - High-performance embedded database based on Rust core
 Uses custom single-file storage format (.apex) to provide efficient data storage and query functionality.
 """
 
-import shutil
+
 import weakref
 import atexit
-from typing import List, Dict, Union, Optional, Literal
-from pathlib import Path
+from typing import List, Optional, Literal
+
 import numpy as np
-import re
 
 # Import Rust core
-from apexbase._core import ApexStorage, __version__ as _core_version
+from apexbase._core import ApexStorage, __version__
 
 # FTS is now directly implemented in Rust layer, no need for Python nanofts package
 # But keep compatibility flag

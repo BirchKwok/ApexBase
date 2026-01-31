@@ -424,6 +424,7 @@ impl ApexStorageImpl {
         let ids = result?;
 
         // Index in FTS if enabled (batch operation - only if FTS manager exists)
+        // OPTIMIZED: Use add_documents_columnar for best performance (no HashMap overhead)
         {
             let mgr = self.fts_manager.read();
             if mgr.is_some() {
@@ -432,29 +433,66 @@ impl ApexStorageImpl {
                 
                 if let Some(m) = mgr.as_ref() {
                     if let Ok(engine) = m.get_engine(&table_name) {
-                        for (i, item) in data.iter().enumerate() {
-                            if let Ok(dict) = item.downcast::<PyDict>() {
-                                if i < ids.len() {
-                                    // Build fields map inline
-                                    let mut fields = HashMap::new();
-                                    for (key, value) in dict.iter() {
-                                        if let Ok(key_str) = key.extract::<String>() {
-                                            if key_str == "_id" { continue; }
-                                            let should_index = match &index_fields {
-                                                Some(idx_fields) => idx_fields.contains(&key_str),
-                                                None => value.extract::<String>().is_ok(),
-                                            };
-                                            if should_index {
-                                                if let Ok(s) = value.extract::<String>() {
-                                                    fields.insert(key_str, s);
+                        // Determine which fields to index
+                        let fields_to_index: Vec<String> = match &index_fields {
+                            Some(fields) => fields.clone(),
+                            None => {
+                                // Auto-detect string fields from first document
+                                let mut auto_fields = Vec::new();
+                                if let Some(first_item) = data.iter().next() {
+                                    if let Ok(dict) = first_item.downcast::<PyDict>() {
+                                        for (key, value) in dict.iter() {
+                                            if let Ok(key_str) = key.extract::<String>() {
+                                                if key_str != "_id" && value.extract::<String>().is_ok() {
+                                                    auto_fields.push(key_str);
                                                 }
                                             }
                                         }
                                     }
-                                    if !fields.is_empty() {
-                                        let _ = engine.add_document(ids[i], fields);
+                                }
+                                auto_fields
+                            }
+                        };
+                        
+                        if !fields_to_index.is_empty() {
+                            // Collect columnar data for each field
+                            let num_docs = ids.len();
+                            let mut columns: Vec<(String, Vec<String>)> = fields_to_index
+                                .iter()
+                                .map(|f| (f.clone(), Vec::with_capacity(num_docs)))
+                                .collect();
+                            
+                            // Build columnar data (while GIL is held)
+                            for (i, item) in data.iter().enumerate() {
+                                if i >= ids.len() { break; }
+                                
+                                if let Ok(dict) = item.downcast::<PyDict>() {
+                                    // Create a map of field -> value for this document
+                                    let mut field_values: HashMap<String, String> = HashMap::new();
+                                    for (key, value) in dict.iter() {
+                                        if let Ok(key_str) = key.extract::<String>() {
+                                            if key_str != "_id" {
+                                                if let Ok(s) = value.extract::<String>() {
+                                                    field_values.insert(key_str, s);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Add value for each indexed field
+                                    for (field_idx, field_name) in fields_to_index.iter().enumerate() {
+                                        let value = field_values.get(field_name).cloned().unwrap_or_default();
+                                        columns[field_idx].1.push(value);
                                     }
                                 }
+                            }
+                            
+                            // Use add_documents_columnar for best performance (release GIL)
+                            if !columns.is_empty() && columns[0].1.len() > 0 {
+                                let doc_ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
+                                let _ = py.allow_threads(|| {
+                                    engine.add_documents_columnar(doc_ids_u64, columns)
+                                });
                             }
                         }
                     }
@@ -586,6 +624,9 @@ impl ApexStorageImpl {
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
         let backend = self.get_backend()?;
+        
+        // Save a copy of string_columns for FTS indexing (before insert_typed consumes it)
+        let string_columns_for_fts = string_columns.clone();
 
         let result = py.allow_threads(|| {
             let ids = backend.insert_typed(
@@ -604,10 +645,48 @@ impl ApexStorageImpl {
         Self::release_lock(lock_file);
         
         let ids = result?;
+        
+        // Index in FTS if enabled - OPTIMIZED: Use add_documents_columnar
+        {
+            let mgr = self.fts_manager.read();
+            if mgr.is_some() {
+                let table_name = self.current_table.read().clone();
+                let index_fields = self.fts_index_fields.read().get(&table_name).cloned();
+                
+                if let Some(m) = mgr.as_ref() {
+                    if let Ok(engine) = m.get_engine(&table_name) {
+                        // Determine which string fields to index
+                        let string_field_names: Vec<String> = match &index_fields {
+                            Some(fields) => fields.iter().cloned().filter(|f| string_columns_for_fts.contains_key(f)).collect(),
+                            None => string_columns_for_fts.keys().cloned().collect(),
+                        };
+                        
+                        if !string_field_names.is_empty() {
+                            // Build columns for FTS
+                            let mut fts_columns: Vec<(String, Vec<String>)> = Vec::new();
+                            for field_name in &string_field_names {
+                                if let Some(values) = string_columns_for_fts.get(field_name) {
+                                    fts_columns.push((field_name.clone(), values.clone()));
+                                }
+                            }
+                            
+                            // Use add_documents_columnar for best performance
+                            if !fts_columns.is_empty() {
+                                let doc_ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
+                                let _ = py.allow_threads(|| {
+                                    engine.add_documents_columnar(doc_ids_u64, fts_columns)
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
         Ok(ids.into_iter().map(|id| id as i64).collect())
     }
     
-    /// Helper to index a document for FTS
+    /// Helper to index a document for FTS (single document - uses slower path)
     fn index_for_fts(&self, id: i64, data: &Bound<'_, PyDict>) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
@@ -1398,15 +1477,18 @@ impl ApexStorageImpl {
     
     /// FTS search
     #[pyo3(signature = (query, limit=None))]
-    fn search_text(&self, query: &str, limit: Option<usize>) -> PyResult<Vec<(i64, f32)>> {
+    fn search_text(&self, py: Python<'_>, query: &str, limit: Option<usize>) -> PyResult<Vec<(i64, f32)>> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
         
         if let Some(m) = mgr.as_ref() {
             let engine = m.get_engine(&table_name)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let results = engine.search_top_n(query, limit.unwrap_or(100))
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // Release GIL during search for better concurrency
+            let results = py.allow_threads(|| {
+                engine.search_top_n(query, limit.unwrap_or(100))
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })?;
             // Return with score=1.0 for each result (nanofts doesn't return scores directly)
             Ok(results.into_iter().map(|id| (id as i64, 1.0f32)).collect())
         } else {
@@ -1417,7 +1499,7 @@ impl ApexStorageImpl {
     /// Remove FTS engine for current table (and optionally delete index files)
     #[pyo3(name = "_fts_remove_engine")]
     #[pyo3(signature = (delete_files=false))]
-    fn fts_remove_engine(&self, delete_files: bool) -> PyResult<()> {
+    fn fts_remove_engine(&self, py: Python<'_>, delete_files: bool) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
 
         // Remove any cached index field configuration for this table
@@ -1425,8 +1507,11 @@ impl ApexStorageImpl {
 
         let mut mgr = self.fts_manager.write();
         if let Some(m) = mgr.as_ref() {
-            m.remove_engine(&table_name, delete_files)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // Release GIL during engine removal (I/O operation)
+            py.allow_threads(|| {
+                m.remove_engine(&table_name, delete_files)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })?;
         }
 
         Ok(())
@@ -1434,17 +1519,20 @@ impl ApexStorageImpl {
     
     /// FTS fuzzy search
     #[pyo3(signature = (query, limit=None, _max_distance=None))]
-    fn fuzzy_search_text(&self, query: &str, limit: Option<usize>, _max_distance: Option<u8>) -> PyResult<Vec<(i64, f32)>> {
+    fn fuzzy_search_text(&self, py: Python<'_>, query: &str, limit: Option<usize>, _max_distance: Option<u8>) -> PyResult<Vec<(i64, f32)>> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
         
         if let Some(m) = mgr.as_ref() {
             let engine = m.get_engine(&table_name)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let result = engine.fuzzy_search(query, limit.unwrap_or(100))
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            // Convert result handle to Vec<(i64, f32)>
-            let ids: Vec<u64> = result.page(0, limit.unwrap_or(100)).into_iter().map(|id| id as u64).collect();
+            // Release GIL during fuzzy search for better concurrency
+            let ids: Vec<u64> = py.allow_threads(|| -> PyResult<Vec<u64>> {
+                let result = engine.fuzzy_search(query, limit.unwrap_or(100))
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                // Convert result handle to Vec<u64>
+                Ok(result.page(0, limit.unwrap_or(100)).into_iter().map(|id| id as u64).collect())
+            })?;
             Ok(ids.into_iter().map(|id| (id as i64, 1.0f32)).collect())
         } else {
             Err(PyRuntimeError::new_err("FTS not initialized"))
@@ -1454,14 +1542,14 @@ impl ApexStorageImpl {
     /// Search and retrieve records
     #[pyo3(signature = (query, limit=None))]
     fn search_and_retrieve(&self, py: Python<'_>, query: &str, limit: Option<usize>) -> PyResult<Vec<PyObject>> {
-        let results = self.search_text(query, limit)?;
+        let results = self.search_text(py, query, limit)?;
         let ids: Vec<i64> = results.into_iter().map(|(id, _)| id).collect();
         self.retrieve_many(py, ids)
     }
     
     /// Index a document for FTS
     #[pyo3(name = "_fts_index")]
-    fn fts_index(&self, id: i64, text: &str) -> PyResult<()> {
+    fn fts_index(&self, py: Python<'_>, id: i64, text: &str) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
         
@@ -1470,8 +1558,11 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let mut fields = HashMap::new();
             fields.insert("content".to_string(), text.to_string());
-            engine.add_document(id as u64, fields)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // Release GIL during indexing operation
+            py.allow_threads(|| {
+                engine.add_document(id as u64, fields)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })?;
         }
         
         Ok(())
@@ -1479,15 +1570,18 @@ impl ApexStorageImpl {
     
     /// Remove a document from FTS index
     #[pyo3(name = "_fts_remove")]
-    fn fts_remove(&self, id: i64) -> PyResult<()> {
+    fn fts_remove(&self, py: Python<'_>, id: i64) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
         
         if let Some(m) = mgr.as_ref() {
             let engine = m.get_engine(&table_name)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            engine.remove_document(id as u64)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // Release GIL during remove operation
+            py.allow_threads(|| {
+                engine.remove_document(id as u64)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })?;
         }
         
         Ok(())
@@ -1495,15 +1589,18 @@ impl ApexStorageImpl {
     
     /// Flush FTS index
     #[pyo3(name = "_fts_flush")]
-    fn fts_flush(&self) -> PyResult<()> {
+    fn fts_flush(&self, py: Python<'_>) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
         
         if let Some(m) = mgr.as_ref() {
             let engine = m.get_engine(&table_name)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            engine.flush()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // Release GIL during flush (I/O operation)
+            py.allow_threads(|| {
+                engine.flush()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })?;
         }
         
         Ok(())
