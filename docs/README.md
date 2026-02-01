@@ -29,7 +29,7 @@ python run_tests.py
 
 - Version consistency: keep `version` aligned between `pyproject.toml` and `Cargo.toml`
 - Tests pass locally: `python run_tests.py`
-- Tag to trigger CI: push a `v*` tag (e.g. `v0.3.0`)
+- Tag to trigger CI: push a `v*` tag (e.g. `v0.4.0`)
 - Configure PyPI token: set `PYPI_API_TOKEN` in GitHub Secrets
 
 ## Known Limitations / Notes
