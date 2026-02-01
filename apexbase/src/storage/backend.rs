@@ -333,6 +333,35 @@ impl TableStorageBackend {
         })
     }
     
+    /// Open for SCHEMA changes only - MOST memory efficient!
+    /// Only loads header, schema, and column index. Does NOT load IDs or column data.
+    /// Use for: ALTER TABLE ADD/DROP/RENAME COLUMN, TRUNCATE
+    pub fn open_for_schema_change(path: &Path) -> io::Result<Self> {
+        Self::open_for_schema_change_with_durability(path, super::DurabilityLevel::Fast)
+    }
+    
+    /// Open for SCHEMA changes with specified durability - MOST memory efficient!
+    pub fn open_for_schema_change_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+        let storage = OnDemandStorage::open_for_schema_change_with_durability(path, durability)?;
+        
+        let storage_schema = storage.get_schema();
+        let schema: Vec<(String, DataType)> = storage_schema
+            .into_iter()
+            .map(|(name, ct)| (name, column_type_to_datatype(ct)))
+            .collect();
+        
+        let row_count = storage.row_count();
+        
+        Ok(Self {
+            path: path.to_path_buf(),
+            storage,
+            cached_columns: RwLock::new(HashMap::new()),
+            schema: RwLock::new(schema),
+            row_count: RwLock::new(row_count),
+            dirty: RwLock::new(false),
+        })
+    }
+    
     /// Insert rows to delta file (memory efficient - doesn't load existing column data)
     /// Auto-compacts when delta exceeds threshold
     pub fn insert_rows_to_delta(&self, rows: &[HashMap<String, Value>]) -> io::Result<Vec<u64>> {

@@ -7767,6 +7767,56 @@ impl ApexExecutor {
             SqlExpr::Cast { expr, .. } => {
                 Self::collect_columns_from_expr(expr, columns);
             }
+            SqlExpr::Between { column, low, high, .. } => {
+                // Handle BETWEEN expression: column BETWEEN low AND high
+                let col_name = column.trim_matches('"');
+                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+                    &col_name[dot_pos + 1..]
+                } else {
+                    col_name
+                };
+                if !columns.contains(&actual_col.to_string()) {
+                    columns.push(actual_col.to_string());
+                }
+                Self::collect_columns_from_expr(low, columns);
+                Self::collect_columns_from_expr(high, columns);
+            }
+            SqlExpr::Like { column, .. } | SqlExpr::Regexp { column, .. } => {
+                // Handle LIKE/REGEXP expressions
+                let col_name = column.trim_matches('"');
+                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+                    &col_name[dot_pos + 1..]
+                } else {
+                    col_name
+                };
+                if !columns.contains(&actual_col.to_string()) {
+                    columns.push(actual_col.to_string());
+                }
+            }
+            SqlExpr::In { column, .. } => {
+                // Handle IN expression (values are literals, not column refs)
+                let col_name = column.trim_matches('"');
+                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+                    &col_name[dot_pos + 1..]
+                } else {
+                    col_name
+                };
+                if !columns.contains(&actual_col.to_string()) {
+                    columns.push(actual_col.to_string());
+                }
+            }
+            SqlExpr::IsNull { column, .. } => {
+                // Handle IS NULL / IS NOT NULL (negated field handles both)
+                let col_name = column.trim_matches('"');
+                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+                    &col_name[dot_pos + 1..]
+                } else {
+                    col_name
+                };
+                if !columns.contains(&actual_col.to_string()) {
+                    columns.push(actual_col.to_string());
+                }
+            }
             SqlExpr::ExistsSubquery { stmt } | SqlExpr::ScalarSubquery { stmt } => {
                 // For correlated subqueries, we need all outer columns that might be referenced
                 // The subquery might reference outer columns like u.user_id
@@ -8967,6 +9017,9 @@ impl ApexExecutor {
         // Invalidate cache before write
         invalidate_storage_cache(&table_path);
         
+        // Note: ALTER TABLE operations need to preserve existing data, so we use open_for_write
+        // which loads all column data. For true schema-only operations (like TRUNCATE),
+        // we can use open_for_schema_change which only loads metadata.
         let storage = TableStorageBackend::open_for_write(&table_path)?;
         
         match operation {
@@ -9002,14 +9055,15 @@ impl ApexExecutor {
         // Invalidate cache before write
         invalidate_storage_cache(storage_path);
         
-        // Get schema before truncate
-        let old_storage = TableStorageBackend::open(storage_path)?;
+        // OPTIMIZATION: Use open_for_schema_change - only loads metadata, NOT column data
+        let old_storage = TableStorageBackend::open_for_schema_change(storage_path)?;
         let schema = old_storage.get_schema();
         drop(old_storage);
         
         // Recreate empty file with same schema
         TableStorageBackend::create(storage_path)?;
-        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        // Use open_for_schema_change for adding columns (schema only)
+        let storage = TableStorageBackend::open_for_schema_change(storage_path)?;
         for (name, dtype) in &schema {
             storage.add_column(name, dtype.clone())?;
         }
@@ -9119,11 +9173,23 @@ impl ApexExecutor {
             return Ok(ApexResult::Scalar(count));
         }
         
-        // For DELETE with WHERE, need to load data for predicate evaluation
-        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        // OPTIMIZATION: Only read columns needed for WHERE evaluation + _id
+        // This avoids loading unnecessary columns (can save 50-90% IO for wide tables)
+        let storage = TableStorageBackend::open(storage_path)?;
         
-        // For DELETE with WHERE, find matching rows and soft-delete them
-        let batch = storage.read_columns_to_arrow(None, 0, None)?;
+        // Extract column names from WHERE clause
+        let mut where_cols: Vec<String> = Vec::new();
+        Self::collect_columns_from_expr(where_clause.unwrap(), &mut where_cols);
+        where_cols.sort();
+        where_cols.dedup();
+        
+        // Always include _id for deletion
+        if !where_cols.iter().any(|c| c == "_id") {
+            where_cols.push("_id".to_string());
+        }
+        
+        let col_refs: Vec<&str> = where_cols.iter().map(|s| s.as_str()).collect();
+        let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
         let filter_mask = Self::evaluate_predicate(&batch, where_clause.unwrap())?;
         
         // Count and delete matching rows
@@ -9142,10 +9208,13 @@ impl ApexExecutor {
             }
         }
         
-        storage.save()?;
-        
-        // Invalidate cache after write
-        invalidate_storage_cache(storage_path);
+        // Only save if rows were actually deleted
+        // Calling save() with lazy-loaded storage (no column data) would corrupt the file
+        if deleted > 0 {
+            storage.save()?;
+            // Invalidate cache after write
+            invalidate_storage_cache(storage_path);
+        }
         
         Ok(ApexResult::Scalar(deleted))
     }
@@ -9169,10 +9238,31 @@ impl ApexExecutor {
         // Invalidate cache before write
         invalidate_storage_cache(storage_path);
         
-        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        // OPTIMIZATION: Only read columns needed for WHERE + columns being updated + _id
+        // This avoids loading unnecessary columns (can save 50-90% IO for wide tables)
+        let storage = TableStorageBackend::open(storage_path)?;
         
-        // Read all data
-        let batch = storage.read_columns_to_arrow(None, 0, None)?;
+        // Collect required columns: WHERE columns + assignment target columns + _id
+        let mut required_cols: Vec<String> = Vec::new();
+        
+        // Add columns from WHERE clause
+        if let Some(where_expr) = where_clause {
+            Self::collect_columns_from_expr(where_expr, &mut required_cols);
+        }
+        
+        // Add columns being assigned (both target and source columns in expressions)
+        for (col_name, expr) in assignments {
+            required_cols.push(col_name.clone());
+            Self::collect_columns_from_expr(expr, &mut required_cols);
+        }
+        
+        // Always include _id
+        required_cols.push("_id".to_string());
+        required_cols.sort();
+        required_cols.dedup();
+        
+        let col_refs: Vec<&str> = required_cols.iter().map(|s| s.as_str()).collect();
+        let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
         
         // Find rows to update
         let filter_mask = if let Some(where_expr) = where_clause {

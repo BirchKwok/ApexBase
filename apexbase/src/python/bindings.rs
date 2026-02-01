@@ -215,7 +215,8 @@ impl ApexStorageImpl {
             .ok_or_else(|| PyValueError::new_err(format!("Table not found: {}", table_name)))
     }
     
-    /// Get or create cached backend for current table (lazy loading - no column data loaded)
+    /// Get or create cached backend for current table
+    /// Uses open_for_write to ensure existing data is loaded for write operations
     fn get_backend(&self) -> PyResult<Arc<TableStorageBackend>> {
         let table_name = self.current_table.read().clone();
         let table_path = self.get_current_table_path()?;
@@ -229,11 +230,10 @@ impl ApexStorageImpl {
         }
         
         // Create new backend with durability level and cache it
-        // OPTIMIZATION: Use open_with_durability (lazy loading) instead of open_for_write
-        // This avoids loading all column data into memory upfront
-        // Reads use on-demand column projection, writes use delta files
+        // Use open_for_write to ensure existing column data is loaded
+        // This is necessary because save() rewrites the entire file from in-memory columns
         let backend = if table_path.exists() {
-            TableStorageBackend::open_with_durability(&table_path, self.durability)
+            TableStorageBackend::open_for_write_with_durability(&table_path, self.durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
         } else {
             TableStorageBackend::create_with_durability(&table_path, self.durability)
