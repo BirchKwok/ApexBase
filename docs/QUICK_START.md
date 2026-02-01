@@ -1,0 +1,273 @@
+# Quick Start Guide
+
+Get started with ApexBase in 5 minutes.
+
+## Installation
+
+```bash
+pip install apexbase
+```
+
+Or from source:
+```bash
+git clone https://github.com/BirchKwok/ApexBase.git
+pip install maturin
+maturin develop --release
+```
+
+## Basic Example
+
+```python
+from apexbase import ApexClient
+
+# 1. Create client
+client = ApexClient("./my_data")
+
+# 2. Store data
+client.store({"name": "Alice", "age": 30, "city": "NYC"})
+
+# 3. Query
+results = client.execute("SELECT * FROM default WHERE age > 25")
+
+# 4. Use results
+df = results.to_pandas()
+print(df)
+
+# 5. Close
+client.close()
+```
+
+## Working with Tables
+
+```python
+client = ApexClient("./data")
+
+# Create tables
+client.create_table("users")
+client.create_table("orders")
+
+# Switch between tables
+client.use_table("users")
+client.store({"name": "Bob", "email": "bob@example.com"})
+
+client.use_table("orders")
+client.store({"user_id": 0, "amount": 100.0})
+
+# List tables
+print(client.list_tables())  # ['default', 'users', 'orders']
+
+client.close()
+```
+
+## SQL DDL (Data Definition Language)
+
+ApexBase supports full SQL DDL operations:
+
+```python
+client = ApexClient("./data")
+
+# CREATE TABLE
+client.execute("CREATE TABLE employees")
+client.execute("CREATE TABLE IF NOT EXISTS departments")  # No error if exists
+
+# ALTER TABLE
+client.execute("ALTER TABLE employees ADD COLUMN name STRING")
+client.execute("ALTER TABLE employees ADD COLUMN age INT")
+
+# INSERT
+client.execute("INSERT INTO employees (name, age) VALUES ('Alice', 30)")
+client.execute("INSERT INTO employees (name, age) VALUES ('Bob', 25), ('Charlie', 35)")
+
+# Query
+results = client.execute("SELECT * FROM employees WHERE age > 25")
+
+# DROP TABLE
+client.execute("DROP TABLE employees")
+client.execute("DROP TABLE IF EXISTS departments")  # No error if not exists
+
+# Check tables
+print(client.list_tables())
+
+client.close()
+```
+
+**Supported DDL Statements:**
+- `CREATE TABLE [IF NOT EXISTS] table_name`
+- `ALTER TABLE ... ADD COLUMN column_name TYPE`
+- `INSERT INTO ... VALUES ...`
+- `DROP TABLE [IF EXISTS] table_name`
+
+## Bulk Data Import
+
+```python
+import pandas as pd
+
+client = ApexClient("./data")
+
+# From pandas
+df = pd.DataFrame({
+    "name": ["Alice", "Bob", "Charlie"],
+    "age": [25, 30, 35]
+})
+client.from_pandas(df)
+
+# From columnar dict (fastest)
+client.store({
+    "product": ["A", "B", "C"],
+    "price": [10.5, 20.0, 15.0],
+    "quantity": [100, 200, 150]
+})
+
+client.close()
+```
+
+## SQL Queries
+
+```python
+client = ApexClient("./data")
+
+# Insert test data
+for i in range(100):
+    client.store({"id": i, "value": i * 10})
+
+# Basic query
+results = client.execute("SELECT * FROM default WHERE value > 500")
+
+# Aggregation
+count = client.execute("SELECT COUNT(*) FROM default").scalar()
+avg = client.execute("SELECT AVG(value) FROM default").scalar()
+
+# GROUP BY
+results = client.execute("""
+    SELECT category, COUNT(*), AVG(price)
+    FROM products
+    GROUP BY category
+""")
+
+# ORDER BY with LIMIT
+results = client.execute("""
+    SELECT * FROM default
+    ORDER BY value DESC
+    LIMIT 10
+""")
+
+client.close()
+```
+
+## Full-Text Search
+
+```python
+client = ApexClient("./data")
+
+# Add documents
+client.store([
+    {"title": "Python Guide", "content": "Learn Python programming"},
+    {"title": "Rust Tutorial", "content": "Systems programming with Rust"},
+    {"title": "Database Design", "content": "Designing efficient databases"}
+])
+
+# Initialize FTS
+client.init_fts(index_fields=["title", "content"])
+
+# Search
+ids = client.search_text("Python")
+print(f"Found {len(ids)} documents")
+
+# Search and retrieve records
+results = client.search_and_retrieve("programming")
+for row in results:
+    print(row["title"])
+
+# Fuzzy search (handles typos)
+ids = client.fuzzy_search_text("progamming")  # Note the typo
+
+client.close()
+```
+
+## Column Operations
+
+```python
+client = ApexClient("./data")
+client.store({"name": "Alice", "age": 30})
+
+# Add column
+client.add_column("email", "String")
+
+# Rename column
+client.rename_column("email", "contact_email")
+
+# Get column type
+dtype = client.get_column_dtype("age")
+print(f"age is {dtype}")  # Int64
+
+# Drop column
+client.drop_column("contact_email")
+
+# List fields
+fields = client.list_fields()
+print(fields)  # ['_id', 'name', 'age']
+
+client.close()
+```
+
+## Context Manager (Recommended)
+
+```python
+# Automatic cleanup
+with ApexClient("./data") as client:
+    client.store({"key": "value"})
+    results = client.execute("SELECT * FROM default")
+    df = results.to_pandas()
+    # Client automatically closed
+
+# With clean slate
+with ApexClient.create_clean("./fresh_data") as client:
+    client.store({"fresh": "start"})
+```
+
+## Durability Options
+
+```python
+# Fast (default) - async writes, best performance
+client = ApexClient("./data", durability="fast")
+
+# Safe - sync writes, data safety
+client = ApexClient("./data", durability="safe")
+
+# Max - fsync every write, maximum durability
+client = ApexClient("./data", durability="max")
+```
+
+## ResultView Operations
+
+```python
+results = client.execute("SELECT * FROM default")
+
+# Different formats
+df = results.to_pandas()
+pl_df = results.to_polars()
+arrow = results.to_arrow()
+dicts = results.to_dict()
+
+# Properties
+print(results.shape)      # (rows, columns)
+print(results.columns)    # ['_id', 'name', 'age']
+print(len(results))       # row count
+
+# Access
+first = results.first()
+ids = results.get_ids()   # numpy array
+
+# Iteration
+for row in results:
+    print(row)
+
+# Indexing
+row = results[0]
+```
+
+## Next Steps
+
+- [API Reference](API_REFERENCE.md) - Complete API documentation
+- [Examples](EXAMPLES.md) - More usage examples
+- [Root README](../README.md) - Project information

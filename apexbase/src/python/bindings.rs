@@ -1038,7 +1038,21 @@ impl ApexStorageImpl {
 
     /// List all tables
     fn list_tables(&self) -> Vec<String> {
-        self.table_paths.read().keys().cloned().collect()
+        // Scan directory for .apex files to ensure we catch tables created via SQL
+        let mut tables = Vec::new();
+        if let Ok(entries) = fs::read_dir(&self.base_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()).map(|s| s == "apex").unwrap_or(false) {
+                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                        tables.push(stem.to_string());
+                    }
+                }
+            }
+        }
+        tables.sort();
+        tables.dedup();
+        tables
     }
 
     /// Get row count for current table (excluding deleted rows)

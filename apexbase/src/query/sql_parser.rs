@@ -1107,9 +1107,15 @@ impl SqlParser {
                         // Check for IF NOT EXISTS
                         let if_not_exists = self.parse_if_not_exists()?;
                         let table = self.parse_identifier()?;
-                        self.expect(Token::LParen)?;
-                        let columns = self.parse_column_defs()?;
-                        self.expect(Token::RParen)?;
+                        // Column definitions are optional: CREATE TABLE t OR CREATE TABLE t (col INT)
+                        let columns = if matches!(self.current(), Token::LParen) {
+                            self.advance();
+                            let cols = self.parse_column_defs()?;
+                            self.expect(Token::RParen)?;
+                            cols
+                        } else {
+                            Vec::new()
+                        };
                         Ok(SqlStatement::CreateTable { table, columns, if_not_exists })
                     }
                     _ => {

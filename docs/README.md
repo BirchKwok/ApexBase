@@ -1,38 +1,110 @@
-# Documentation Index
+# ApexBase Documentation
+
+Complete documentation for ApexBase high-performance embedded database.
 
 ## Quick Links
 
-- Root README: `../README.md`
-- Python API entry: `../apexbase/python/apexbase/__init__.py`
-- Test suite notes: `../test/README.md`
-- CI release workflow: `../.github/workflows/build_release.yml`
+| Document | Description |
+|----------|-------------|
+| [Quick Start](QUICK_START.md) | Get started in 5 minutes |
+| [API Reference](API_REFERENCE.md) | Complete API documentation (100% coverage) |
+| [Examples](EXAMPLES.md) | Code examples and use cases |
+| [Root README](../README.md) | Project overview and installation |
 
-## Usage Notes
-
-- The primary public entry point is `apexbase.ApexClient`.
-- The persistence file is a single file `apexbase.apex`, stored by default under the directory specified by `ApexClient(dirpath=...)`.
-- For queries, prefer `execute(sql)` (full SQL). For compatibility, you can use `query(where, limit=...)` (WHERE expression only).
-
-## Local Development (conda `dev` environment)
+## Installation
 
 ```bash
-# conda activate dev
+pip install apexbase
+```
 
-# Local development install (Rust extension)
+Or build from source:
+
+```bash
+# Using conda dev environment
+conda activate dev
 maturin develop --release
+```
+
+## Usage Overview
+
+```python
+from apexbase import ApexClient
+
+# Create client (single .apex file storage)
+client = ApexClient("./data")
+
+# Store data
+client.store({"name": "Alice", "age": 30})
+client.store([{"name": "Bob", "age": 25}, {"name": "Charlie", "age": 35}])
+
+# SQL query
+results = client.execute("SELECT * FROM default WHERE age > 25")
+
+# Convert to DataFrame
+df = results.to_pandas()
+
+# Close
+client.close()
+```
+
+## Key Features
+
+- **Single-file storage** - Custom `.apex` format, no external dependencies
+- **SQL support** - Full SQL query with aggregations, GROUP BY, JOINs
+- **DataFrame integration** - Native pandas, polars, PyArrow support
+- **Full-text search** - Built-in FTS with fuzzy matching
+- **High performance** - Rust core with zero-copy Python API
+
+## API Coverage
+
+This documentation covers 100% of the public Python API:
+
+- **ApexClient** - All 50+ public methods
+- **ResultView** - All conversion and access methods
+- **Constants** - Module-level exports
+- **SQL syntax** - Supported SQL operations
+
+See [API_REFERENCE.md](API_REFERENCE.md) for complete details.
+
+## Documentation Structure
+
+```
+docs/
+├── README.md           # This file - documentation index
+├── QUICK_START.md      # 5-minute quick start guide
+├── API_REFERENCE.md    # Complete API reference (100% coverage)
+└── EXAMPLES.md         # Real-world usage examples
+```
+
+## Development
+
+```bash
+# Activate environment
+conda activate dev
 
 # Run tests
 python run_tests.py
+
+# Or use pytest directly
+pytest -q
 ```
 
-## Release Checklist
+## Version Info
 
-- Version consistency: keep `version` aligned between `pyproject.toml` and `Cargo.toml`
-- Tests pass locally: `python run_tests.py`
-- Tag to trigger CI: push a `v*` tag (e.g. `v0.4.0`)
-- Configure PyPI token: set `PYPI_API_TOKEN` in GitHub Secrets
+| Component | Requirement |
+|-----------|-------------|
+| Python | 3.8+ |
+| PyArrow | 14.0+ |
+| pandas | 2.0+ (recommended) |
+| polars | 0.20+ |
 
-## Known Limitations / Notes
+## Notes
 
-- This project is primarily consumed via the Python API; the Rust crate is mainly for the PyO3 extension and internal engine reuse.
-- Some advanced SQL capabilities (e.g. complex subqueries, concurrency locks) are still evolving; treat the behavior covered in `test/` as the current source of truth.
+- Primary API entry: `apexbase.ApexClient`
+- Data persistence: Single `.apex` file per database directory
+- Internal ID: Records have auto-increment `_id` field
+- Query preference: Use `execute(sql)` for full SQL, `query(where)` for simple filters
+
+## License
+
+Apache-2.0
