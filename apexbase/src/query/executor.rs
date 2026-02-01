@@ -8948,6 +8948,9 @@ impl ApexExecutor {
         
         storage.save()?;
         
+        // Invalidate cache after write to ensure subsequent reads get fresh data
+        invalidate_storage_cache(&table_path);
+        
         Ok(ApexResult::Scalar(0))
     }
 
@@ -8976,6 +8979,9 @@ impl ApexExecutor {
             storage.add_column(name, dtype.clone())?;
         }
         storage.save()?;
+        
+        // Invalidate cache after write to ensure subsequent reads get fresh data
+        invalidate_storage_cache(storage_path);
         
         Ok(ApexResult::Scalar(0))
     }
@@ -9027,6 +9033,9 @@ impl ApexExecutor {
         storage.insert_rows(&rows)?;
         storage.save()?;
         
+        // Invalidate cache after write to ensure subsequent reads get fresh data
+        invalidate_storage_cache(storage_path);
+        
         Ok(ApexResult::Scalar(rows_inserted))
     }
 
@@ -9061,6 +9070,8 @@ impl ApexExecutor {
                 }
             }
             storage.save()?;
+            // Invalidate cache after write
+            invalidate_storage_cache(storage_path);
             return Ok(ApexResult::Scalar(count));
         }
         
@@ -9085,6 +9096,9 @@ impl ApexExecutor {
         }
         
         storage.save()?;
+        
+        // Invalidate cache after write
+        invalidate_storage_cache(storage_path);
         
         Ok(ApexResult::Scalar(deleted))
     }
@@ -9175,6 +9189,9 @@ impl ApexExecutor {
         }
         
         storage.save()?;
+        
+        // Invalidate cache after write
+        invalidate_storage_cache(storage_path);
         
         Ok(ApexResult::Scalar(updated))
     }

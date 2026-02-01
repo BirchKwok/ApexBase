@@ -131,9 +131,9 @@ class TestTableManagement:
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
             
-            # Initially should have default table
+            # Initially empty (no tables created yet)
             tables = client.list_tables()
-            assert "default" in tables
+            assert isinstance(tables, list)
             
             # Create multiple tables
             client.create_table("users")
@@ -142,11 +142,10 @@ class TestTableManagement:
             
             # List all tables
             tables = client.list_tables()
-            assert len(tables) >= 4  # default + 3 created
+            assert len(tables) >= 3  # 3 created tables
             assert "users" in tables
             assert "products" in tables
             assert "orders" in tables
-            assert "default" in tables
             
             client.close()
     
@@ -157,8 +156,8 @@ class TestTableManagement:
             
             tables = client.list_tables()
             assert isinstance(tables, list)
-            # Should at least have default table
-            assert "default" in tables
+            # Fresh database has no tables until explicitly created
+            assert len(tables) == 0
             
             client.close()
     

@@ -826,3 +826,40 @@ client.execute("ALTER TABLE users DROP COLUMN age")
 # Drop table via SQL
 client.execute("DROP TABLE IF EXISTS users")
 ```
+
+#### Multi-Statement SQL
+
+You can execute multiple SQL statements in a single call by separating them with semicolons:
+
+```python
+# Execute multiple statements at once
+client.execute("""
+    CREATE TABLE IF NOT EXISTS products;
+    ALTER TABLE products ADD COLUMN name STRING;
+    ALTER TABLE products ADD COLUMN price FLOAT;
+    INSERT INTO products (name, price) VALUES ('Laptop', 999.99)
+""")
+
+# Multiple INSERT statements
+client.execute("""
+    INSERT INTO products (name, price) VALUES ('Mouse', 29.99);
+    INSERT INTO products (name, price) VALUES ('Keyboard', 79.99);
+    INSERT INTO products (name, price) VALUES ('Monitor', 299.99)
+""")
+
+# The result of the last statement is returned
+results = client.execute("""
+    CREATE TABLE IF NOT EXISTS temp;
+    INSERT INTO temp (name) VALUES ('test');
+    SELECT * FROM temp
+""")
+```
+
+**Multi-Statement SQL Rules:**
+- Statements are separated by semicolons (`;`)
+- Semicolons inside string literals are handled correctly
+- Statements execute sequentially in order
+- The result of the last SELECT statement is returned
+- DDL statements (CREATE, ALTER, DROP, INSERT) return empty results
+
+---

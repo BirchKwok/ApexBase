@@ -165,6 +165,31 @@ client.execute("DROP TABLE employees")
 client.execute("DROP TABLE IF EXISTS departments")  # No error if not exists
 ```
 
+#### Multi-Statement SQL
+
+You can execute multiple SQL statements in a single call by separating them with semicolons:
+
+```python
+# Execute multiple DDL statements at once
+client.execute("""
+    CREATE TABLE IF NOT EXISTS products;
+    ALTER TABLE products ADD COLUMN name STRING;
+    ALTER TABLE products ADD COLUMN price FLOAT;
+    INSERT INTO products (name, price) VALUES ('Laptop', 999.99)
+""")
+
+# Execute multiple INSERT statements
+client.execute("""
+    INSERT INTO products (name, price) VALUES ('Mouse', 29.99);
+    INSERT INTO products (name, price) VALUES ('Keyboard', 79.99);
+    INSERT INTO products (name, price) VALUES ('Monitor', 299.99)
+""")
+
+# Query results
+results = client.execute("SELECT * FROM products ORDER BY price DESC")
+print(results.to_pandas())
+```
+
 ### Full-Text Search
 
 ```python

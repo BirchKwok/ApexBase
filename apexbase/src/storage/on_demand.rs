@@ -1372,16 +1372,84 @@ impl OnDemandStorage {
     }
     
     /// Open for write with specified durability level
-    /// Uses on-demand loading - does NOT load all existing data into memory
-    /// Data is loaded lazily when needed for specific operations
+    /// IMPORTANT: Loads existing column data into memory to enable append operations.
+    /// This is required because save() rewrites the entire file from in-memory data.
     pub fn open_for_write_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         if !path.exists() {
             return Self::create_with_durability(path, durability);
         }
         
-        // Simply open the storage - no pre-loading of column data
-        // The on-demand read APIs will fetch data from disk when needed
-        Self::open_with_durability(path, durability)
+        // Open the storage first
+        let storage = Self::open_with_durability(path, durability)?;
+        
+        // If there are existing rows, load all column data into memory
+        // This is required because save() rewrites the entire file from self.columns
+        let row_count = storage.header.read().row_count as usize;
+        if row_count > 0 {
+            storage.load_all_columns_into_memory()?;
+        }
+        
+        Ok(storage)
+    }
+    
+    /// Load all column data from disk into memory
+    /// This is needed before write operations to preserve existing data
+    fn load_all_columns_into_memory(&self) -> io::Result<()> {
+        let header = self.header.read();
+        let schema = self.schema.read();
+        let column_index = self.column_index.read();
+        let total_rows = header.row_count as usize;
+        
+        if total_rows == 0 {
+            return Ok(());
+        }
+        
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+        })?;
+        
+        let mut mmap_cache = self.mmap_cache.write();
+        let mut columns = self.columns.write();
+        let mut nulls = self.nulls.write();
+        
+        // Load each column from disk
+        for col_idx in 0..schema.column_count() {
+            let (_, col_type) = &schema.columns[col_idx];
+            let index_entry = &column_index[col_idx];
+            
+            // Read column data
+            let col_data = self.read_column_range_mmap(
+                &mut mmap_cache,
+                file,
+                index_entry,
+                *col_type,
+                0,
+                total_rows,
+                total_rows,
+            )?;
+            
+            // Store in columns array
+            if col_idx < columns.len() {
+                columns[col_idx] = col_data;
+            } else {
+                columns.push(col_data);
+            }
+            
+            // Read null bitmap for this column
+            let null_len = index_entry.null_length as usize;
+            if null_len > 0 {
+                let mut null_bitmap = vec![0u8; null_len];
+                mmap_cache.read_at(file, &mut null_bitmap, index_entry.null_offset)?;
+                if col_idx < nulls.len() {
+                    nulls[col_idx] = null_bitmap;
+                } else {
+                    nulls.push(null_bitmap);
+                }
+            }
+        }
+        
+        Ok(())
     }
 
     // ========================================================================

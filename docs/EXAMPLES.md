@@ -223,6 +223,54 @@ client.close()
 | `FLOAT` | `DOUBLE`, `FLOAT64` | Floating-point numbers |
 | `BOOL` | `BOOLEAN` | True/false values |
 
+### Multi-Statement SQL
+
+Execute multiple SQL statements separated by semicolons:
+
+```python
+client = ApexClient("./data")
+
+# Setup entire schema in one call
+client.execute("""
+    CREATE TABLE IF NOT EXISTS products;
+    ALTER TABLE products ADD COLUMN name STRING;
+    ALTER TABLE products ADD COLUMN price FLOAT;
+    ALTER TABLE products ADD COLUMN category STRING;
+    INSERT INTO products (name, price, category) VALUES ('Laptop', 999.99, 'Electronics')
+""")
+
+# Insert multiple rows efficiently
+client.execute("""
+    INSERT INTO products (name, price, category) VALUES ('Mouse', 29.99, 'Electronics');
+    INSERT INTO products (name, price, category) VALUES ('Keyboard', 79.99, 'Electronics');
+    INSERT INTO products (name, price, category) VALUES ('Monitor', 299.99, 'Electronics');
+    INSERT INTO products (name, price, category) VALUES ('Desk', 199.99, 'Furniture')
+""")
+
+# Query and analyze
+results = client.execute("""
+    SELECT category, COUNT(*) as count, AVG(price) as avg_price 
+    FROM products 
+    GROUP BY category
+""")
+print(results.to_pandas())
+
+# Clean up multiple tables
+client.execute("""
+    DROP TABLE IF EXISTS products;
+    DROP TABLE IF EXISTS temp_table
+""")
+
+client.close()
+```
+
+**Notes on Multi-Statement SQL:**
+- Statements are separated by semicolons (`;`)
+- Semicolons inside string literals are handled correctly
+- Statements execute sequentially
+- The result of the last statement is returned
+- Useful for schema setup and batch operations
+
 ---
 
 ## Data Import

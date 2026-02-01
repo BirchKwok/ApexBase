@@ -91,11 +91,45 @@ print(client.list_tables())
 client.close()
 ```
 
+### Multi-Statement SQL
+
+Execute multiple SQL statements in a single call using semicolons:
+
+```python
+client = ApexClient("./data")
+
+# Execute multiple DDL statements at once
+client.execute("""
+    CREATE TABLE IF NOT EXISTS products;
+    ALTER TABLE products ADD COLUMN name STRING;
+    ALTER TABLE products ADD COLUMN price FLOAT;
+    INSERT INTO products (name, price) VALUES ('Laptop', 999.99)
+""")
+
+# Execute multiple INSERT statements
+client.execute("""
+    INSERT INTO products (name, price) VALUES ('Mouse', 29.99);
+    INSERT INTO products (name, price) VALUES ('Keyboard', 79.99);
+    INSERT INTO products (name, price) VALUES ('Monitor', 299.99)
+""")
+
+# Query results
+results = client.execute("SELECT * FROM products ORDER BY price DESC")
+print(results.to_pandas())
+
+client.close()
+```
+
 **Supported DDL Statements:**
 - `CREATE TABLE [IF NOT EXISTS] table_name`
 - `ALTER TABLE ... ADD COLUMN column_name TYPE`
 - `INSERT INTO ... VALUES ...`
 - `DROP TABLE [IF EXISTS] table_name`
+
+**Multi-Statement SQL:**
+- Separate statements with semicolons (`;`)
+- Statements are executed sequentially
+- The result of the last statement is returned
 
 ## Bulk Data Import
 

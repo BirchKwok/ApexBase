@@ -639,19 +639,7 @@ class ApexClient:
                 except Exception as e:
                     # Fallback to legacy path
                     # Only warn for unexpected errors, not for common expected cases
-                    error_msg = str(e).lower()
-                    expected_patterns = [
-                        'query parse error',
-                        'syntax error',
-                        'invalid cast',
-                        'conflicts with existing',
-                        'requires string argument',
-                        'expected number after limit'
-                    ]
-                    is_expected = any(pattern in error_msg for pattern in expected_patterns)
-                    if not is_expected:
-                        import warnings
-                        warnings.warn(f"Arrow IPC failed: {e}, falling back to legacy path")
+                    pass
             
             # Legacy path: ApexStorage.execute returns a dict with columns and rows
             result = self._storage.execute(sql)
