@@ -19,8 +19,7 @@ ApexBase is a high-performance embedded database powered by a Rust core, with a 
 # Install from PyPI
 pip install apexbase
 
-# Build from source (recommended in the conda dev environment)
-# conda activate dev
+# Build from source
 maturin develop --release
 ```
 
