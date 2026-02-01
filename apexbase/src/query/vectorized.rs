@@ -136,8 +136,6 @@ pub struct VectorizedHashAgg {
     /// Group keys (for result building)
     group_keys_int: Vec<i64>,
     group_keys_str: Vec<String>,
-    /// Whether grouping by int or string
-    is_int_key: bool,
 }
 
 impl VectorizedHashAgg {
@@ -149,7 +147,6 @@ impl VectorizedHashAgg {
             states: Vec::with_capacity(estimated_groups),
             group_keys_int: if is_int_key { Vec::with_capacity(estimated_groups) } else { Vec::new() },
             group_keys_str: if !is_int_key { Vec::with_capacity(estimated_groups) } else { Vec::new() },
-            is_int_key,
         }
     }
     

@@ -4413,11 +4413,13 @@ impl ApexExecutor {
     }
 
     /// Apply ORDER BY clause
+    /// OPTIMIZATION: Use parallel sort for large datasets (>100K rows) using Rayon
     fn apply_order_by(
         batch: &RecordBatch,
         order_by: &[crate::query::OrderByClause],
     ) -> io::Result<RecordBatch> {
         use arrow::compute::SortColumn;
+        use rayon::prelude::*;
 
         let sort_columns: Vec<SortColumn> = order_by
             .iter()
@@ -4443,18 +4445,209 @@ impl ApexExecutor {
             return Ok(batch.clone());
         }
 
-        let indices = compute::lexsort_to_indices(&sort_columns, None)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let num_rows = batch.num_rows();
+        
+        // For large datasets (>50K rows), use parallel sort with Rayon
+        let indices = if num_rows > 50_000 && sort_columns.len() == 1 {
+            // Single column sort - use parallel sort for better performance
+            Self::parallel_sort_indices(batch, order_by)?
+        } else {
+            // Multi-column or small dataset - use Arrow's lexsort
+            compute::lexsort_to_indices(&sort_columns, None)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+        };
 
-        let columns: Vec<ArrayRef> = batch
-            .columns()
-            .iter()
-            .map(|col| compute::take(col, &indices, None))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        // OPTIMIZATION: Use SIMD-accelerated take for better performance
+        let indices_array = &indices;
+        let columns: Vec<ArrayRef> = if num_rows > 100_000 {
+            use rayon::prelude::*;
+            use crate::query::simd_take::optimized_take;
+            batch
+                .columns()
+                .par_iter()
+                .map(|col| Arc::new(optimized_take(col, indices_array)) as ArrayRef)
+                .collect()
+        } else {
+            use crate::query::simd_take::optimized_take;
+            batch
+                .columns()
+                .iter()
+                .map(|col| Arc::new(optimized_take(col, indices_array)) as ArrayRef)
+                .collect()
+        };
 
         RecordBatch::try_new(batch.schema(), columns)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+    
+    /// Parallel sort for single-column ORDER BY using Rayon
+    /// Uses indices with custom comparator for better memory efficiency
+    fn parallel_sort_indices(
+        batch: &RecordBatch,
+        order_by: &[crate::query::OrderByClause],
+    ) -> io::Result<arrow::array::UInt32Array> {
+        use rayon::prelude::*;
+        
+        let clause = &order_by[0];
+        let col_name = clause.column.trim_matches('"');
+        let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+            &col_name[dot_pos + 1..]
+        } else {
+            col_name
+        };
+        
+        let col = batch.column_by_name(actual_col)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column {} not found", actual_col)))?;
+        
+        let num_rows = batch.num_rows();
+        
+        // For Int64 - use fast parallel sort with custom comparator
+        if let Some(int_arr) = col.as_any().downcast_ref::<Int64Array>() {
+            let descending = clause.descending;
+            
+            // Check if we can use counting sort (range is limited)
+            if !descending {
+                let (min_val, max_val) = {
+                    let mut min = i64::MAX;
+                    let mut max = i64::MIN;
+                    for i in 0..num_rows {
+                        if !int_arr.is_null(i) {
+                            let v = int_arr.value(i);
+                            min = min.min(v);
+                            max = max.max(v);
+                        }
+                    }
+                    (min, max)
+                };
+                
+                let range = (max_val - min_val + 1) as usize;
+                // Use counting sort if range is reasonable (< 5M values)
+                if range <= 5_000_000 && range > 0 {
+                    return Self::counting_sort_indices(int_arr, min_val, max_val, num_rows);
+                }
+            }
+            
+            // Create (value, index) pairs and sort in parallel
+            let mut pairs: Vec<(i64, usize)> = (0..num_rows)
+                .map(|i| {
+                    let val = if int_arr.is_null(i) { 
+                        if descending { i64::MIN } else { i64::MAX }
+                    } else { 
+                        int_arr.value(i) 
+                    };
+                    (val, i)
+                })
+                .collect();
+            
+            // Parallel sort using unstable sort for better performance
+            if descending {
+                pairs.par_sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            } else {
+                pairs.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            }
+            
+            let sorted_indices: Vec<u32> = pairs.iter().map(|(_, idx)| *idx as u32).collect();
+            return Ok(arrow::array::UInt32Array::from(sorted_indices));
+        }
+        
+        // For Float64 - use parallel sort
+        if let Some(float_arr) = col.as_any().downcast_ref::<Float64Array>() {
+            let descending = clause.descending;
+            
+            let mut pairs: Vec<(f64, usize)> = (0..num_rows)
+                .map(|i| {
+                    let val = if float_arr.is_null(i) { 
+                        if descending { f64::NEG_INFINITY } else { f64::INFINITY }
+                    } else { 
+                        float_arr.value(i) 
+                    };
+                    (val, i)
+                })
+                .collect();
+            
+            if descending {
+                pairs.par_sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            } else {
+                pairs.par_sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            
+            let sorted_indices: Vec<u32> = pairs.iter().map(|(_, idx)| *idx as u32).collect();
+            return Ok(arrow::array::UInt32Array::from(sorted_indices));
+        }
+        
+        // Fallback to Arrow's lexsort for other types
+        use arrow::compute::{SortColumn, SortOptions};
+        let sort_columns: Vec<_> = order_by
+            .iter()
+            .filter_map(|clause| {
+                let col_name = clause.column.trim_matches('"');
+                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+                    &col_name[dot_pos + 1..]
+                } else {
+                    col_name
+                };
+                batch.column_by_name(actual_col).map(|col| SortColumn {
+                    values: col.clone(),
+                    options: Some(SortOptions {
+                        descending: clause.descending,
+                        nulls_first: clause.nulls_first.unwrap_or(clause.descending),
+                    }),
+                })
+            })
+            .collect();
+        
+        compute::lexsort_to_indices(&sort_columns, None)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+    
+    /// Counting sort for integer arrays with limited range
+    /// O(n + range) complexity, much faster than comparison sort for small ranges
+    fn counting_sort_indices(
+        arr: &Int64Array,
+        min_val: i64,
+        max_val: i64,
+        num_rows: usize,
+    ) -> io::Result<arrow::array::UInt32Array> {
+        let range = (max_val - min_val + 1) as usize;
+        let mut counts: Vec<usize> = vec![0; range + 1]; // +1 for nulls
+        
+        // Count occurrences
+        for i in 0..num_rows {
+            if arr.is_null(i) {
+                counts[range] += 1;
+            } else {
+                let idx = (arr.value(i) - min_val) as usize;
+                counts[idx] += 1;
+            }
+        }
+        
+        // Compute prefix sums for output positions
+        let mut positions: Vec<usize> = vec![0; range + 1];
+        let mut total = 0;
+        for i in 0..range {
+            positions[i] = total;
+            total += counts[i];
+        }
+        positions[range] = total; // nulls at the end
+        
+        // Build result indices
+        let mut result: Vec<u32> = vec![0; num_rows];
+        for i in 0..num_rows {
+            let pos = if arr.is_null(i) {
+                positions[range]
+            } else {
+                let idx = (arr.value(i) - min_val) as usize;
+                positions[idx]
+            };
+            result[pos] = i as u32;
+            if arr.is_null(i) {
+                positions[range] += 1;
+            } else {
+                positions[(arr.value(i) - min_val) as usize] += 1;
+            }
+        }
+        
+        Ok(arrow::array::UInt32Array::from(result))
     }
 
     /// Apply ORDER BY with top-k optimization (heap sort for LIMIT queries)
@@ -5381,122 +5574,6 @@ impl ApexExecutor {
             result_batch = Self::apply_order_by(&result_batch, &stmt.order_by)?;
         }
         
-        Ok(ApexResult::Data(result_batch))
-    }
-    
-    /// Build result for 2-column GROUP BY
-    fn build_two_column_result(
-        stmt: &SelectStatement,
-        dict1_values: &[String],
-        dict2_values: &[String],
-        dict2_size: usize,
-        counts: &[i64],
-        sums_int: Option<&[i64]>,
-        sums_float: Option<&[f64]>,
-    ) -> io::Result<ApexResult> {
-        use crate::query::AggregateFunc;
-        
-        let dict1_size = dict1_values.len() + 1;
-        
-        // Collect active groups
-        let mut result_col1: Vec<&str> = Vec::with_capacity(dict1_size * dict2_size / 10);
-        let mut result_col2: Vec<&str> = Vec::with_capacity(dict1_size * dict2_size / 10);
-        let mut result_counts: Vec<i64> = Vec::with_capacity(dict1_size * dict2_size / 10);
-        let mut result_sums_int: Vec<i64> = Vec::with_capacity(dict1_size * dict2_size / 10);
-        let mut result_sums_float: Vec<f64> = Vec::with_capacity(dict1_size * dict2_size / 10);
-        
-        for idx1 in 1..dict1_size {
-            for idx2 in 1..dict2_size {
-                let composite = idx1 * dict2_size + idx2;
-                if counts[composite] > 0 {
-                    result_col1.push(&dict1_values[idx1 - 1]);
-                    result_col2.push(&dict2_values[idx2 - 1]);
-                    result_counts.push(counts[composite]);
-                    if let Some(sums) = sums_int {
-                        result_sums_int.push(sums[composite]);
-                    }
-                    if let Some(sums) = sums_float {
-                        result_sums_float.push(sums[composite]);
-                    }
-                }
-            }
-        }
-        
-        // Build result
-        let mut result_fields: Vec<Field> = Vec::new();
-        let mut result_arrays: Vec<ArrayRef> = Vec::new();
-        
-        let group_cols: Vec<String> = stmt.group_by.iter().map(|s| {
-            let trimmed = s.trim_matches('"');
-            if let Some(dot_pos) = trimmed.rfind('.') {
-                trimmed[dot_pos + 1..].to_string()
-            } else {
-                trimmed.to_string()
-            }
-        }).collect();
-        
-        result_fields.push(Field::new(&group_cols[0], ArrowDataType::Utf8, false));
-        result_arrays.push(Arc::new(StringArray::from(result_col1)));
-        result_fields.push(Field::new(&group_cols[1], ArrowDataType::Utf8, false));
-        result_arrays.push(Arc::new(StringArray::from(result_col2)));
-        
-        for col in &stmt.columns {
-            if let SelectColumn::Aggregate { func, column, alias, .. } = col {
-                let func_name = match func {
-                    AggregateFunc::Count => "COUNT",
-                    AggregateFunc::Sum => "SUM",
-                    AggregateFunc::Avg => "AVG",
-                    AggregateFunc::Min => "MIN",
-                    AggregateFunc::Max => "MAX",
-                };
-                let field_name = alias.clone().unwrap_or_else(|| {
-                    format!("{}({})", func_name, column.as_deref().unwrap_or("*"))
-                });
-                
-                match func {
-                    AggregateFunc::Count => {
-                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, false));
-                        result_arrays.push(Arc::new(Int64Array::from(result_counts.clone())));
-                    }
-                    AggregateFunc::Sum => {
-                        if sums_int.is_some() {
-                            result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
-                            result_arrays.push(Arc::new(Int64Array::from(result_sums_int.clone())));
-                        } else {
-                            result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
-                            result_arrays.push(Arc::new(Float64Array::from(result_sums_float.clone())));
-                        }
-                    }
-                    AggregateFunc::Avg => {
-                        let values: Vec<f64> = result_counts.iter().enumerate().map(|(i, &c)| {
-                            if c > 0 {
-                                if let Some(sums) = sums_int {
-                                    sums[i] as f64 / c as f64
-                                } else if let Some(sums) = sums_float {
-                                    sums[i] / c as f64
-                                } else {
-                                    0.0
-                                }
-                            } else { 0.0 }
-                        }).collect();
-                        result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
-                        result_arrays.push(Arc::new(Float64Array::from(values)));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        
-        let schema = Arc::new(Schema::new(result_fields));
-        let mut result_batch = RecordBatch::try_new(schema, result_arrays)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        
-        // Apply HAVING clause if present
-        if let Some(having_expr) = &stmt.having {
-            let mask = Self::evaluate_predicate(&result_batch, having_expr)?;
-            result_batch = compute::filter_record_batch(&result_batch, &mask)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        }
         
         Ok(ApexResult::Data(result_batch))
     }
@@ -6080,7 +6157,9 @@ impl ApexExecutor {
                             let dict_size = str_values.len() + 1;
                             if dict_size <= 1000 {
                                 let indices: Vec<u32> = (0..n_rows)
-                                    .map(|i| if keys.is_null(i) { 0u32 } else { keys.value(i) + 1 })
+                                    .map(|i| {
+                                        if keys.is_null(i) { 0u32 } else { keys.value(i) + 1 }
+                                    })
                                     .collect();
                                 let dict_values: Vec<String> = (0..str_values.len())
                                     .map(|i| str_values.value(i).to_string())
@@ -6088,10 +6167,9 @@ impl ApexExecutor {
                                 return Some((indices, dict_values, dict_size));
                             }
                         }
-                        return None;
                     }
                     
-                    // Case 2: StringArray - build dictionary on the fly
+                    // Case 2: StringArray - build dictionary
                     if let Some(str_arr) = col.as_any().downcast_ref::<StringArray>() {
                         let mut dict: AHashMap<&str, u32> = AHashMap::with_capacity(200);
                         let mut dict_values: Vec<String> = Vec::with_capacity(200);
@@ -6118,6 +6196,64 @@ impl ApexExecutor {
                             return Some((indices, dict_values, dict_size));
                         }
                     }
+                    
+                    // Case 3: LargeStringArray - build dictionary
+                    if let Some(str_arr) = col.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+                        let mut dict: AHashMap<String, u32> = AHashMap::with_capacity(200);
+                        let mut dict_values: Vec<String> = Vec::with_capacity(200);
+                        let mut next_id = 1u32;
+                        
+                        let indices: Vec<u32> = (0..n_rows)
+                            .map(|i| {
+                                if str_arr.is_null(i) {
+                                    0u32
+                                } else {
+                                    let s = str_arr.value(i);
+                                    *dict.entry(s.to_string()).or_insert_with(|| {
+                                        let id = next_id;
+                                        next_id += 1;
+                                        dict_values.push(s.to_string());
+                                        id
+                                    })
+                                }
+                            })
+                            .collect();
+                        
+                        let dict_size = dict_values.len() + 1;
+                        if dict_size <= 1000 {
+                            return Some((indices, dict_values, dict_size));
+                        }
+                    }
+                    
+                    // Case 4: BinaryArray - build dictionary
+                    if let Some(bin_arr) = col.as_any().downcast_ref::<arrow::array::BinaryArray>() {
+                        let mut dict: AHashMap<String, u32> = AHashMap::with_capacity(200);
+                        let mut dict_values: Vec<String> = Vec::with_capacity(200);
+                        let mut next_id = 1u32;
+                        
+                        let indices: Vec<u32> = (0..n_rows)
+                            .map(|i| {
+                                if bin_arr.is_null(i) {
+                                    0u32
+                                } else {
+                                    let s = bin_arr.value(i);
+                                    let s_str = String::from_utf8_lossy(s);
+                                    *dict.entry(s_str.to_string()).or_insert_with(|| {
+                                        let id = next_id;
+                                        next_id += 1;
+                                        dict_values.push(s_str.to_string());
+                                        id
+                                    })
+                                }
+                            })
+                            .collect();
+                        
+                        let dict_size = dict_values.len() + 1;
+                        if dict_size <= 1000 {
+                            return Some((indices, dict_values, dict_size));
+                        }
+                    }
+                    
                     None
                 };
                 
@@ -6319,6 +6455,356 @@ impl ApexExecutor {
                         
                         return Ok(ApexResult::Data(result_batch));
                     }
+                }
+            }
+        }
+        
+        // FAST PATH: String + Int64 2-column GROUP BY (common case: category + numeric id)
+        // Uses composite key: (string_dict_id * int_range + int_value_offset) for direct array indexing
+        if group_cols.len() == 2 {
+            let col1 = batch.column_by_name(&group_cols[0]);
+            let col2 = batch.column_by_name(&group_cols[1]);
+            
+            if let (Some(c1), Some(c2)) = (col1, col2) {
+                // Try to build dictionary for string column and get int range for int column
+                let string_dict_result: Option<(Vec<u32>, Vec<String>, usize)> = {
+                    use arrow::array::DictionaryArray;
+                    use arrow::datatypes::UInt32Type;
+                    
+                    // Case 1: DictionaryArray
+                    if let Some(dict_arr) = c1.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+                        let keys = dict_arr.keys();
+                        let values = dict_arr.values();
+                        if let Some(str_values) = values.as_any().downcast_ref::<StringArray>() {
+                            let dict_size = str_values.len() + 1;
+                            if dict_size <= 1000 {
+                                let indices: Vec<u32> = (0..num_rows)
+                                    .map(|i| if keys.is_null(i) { 0u32 } else { keys.value(i) + 1 })
+                                    .collect();
+                                let dict_values: Vec<String> = (0..str_values.len())
+                                    .map(|i| str_values.value(i).to_string())
+                                    .collect();
+                                Some((indices, dict_values, dict_size))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    // Case 2: StringArray - build dictionary
+                    else if let Some(str_arr) = c1.as_any().downcast_ref::<StringArray>() {
+                        let mut dict: AHashMap<&str, u32> = AHashMap::with_capacity(200);
+                        let mut dict_values: Vec<String> = Vec::with_capacity(200);
+                        let mut next_id = 1u32;
+                        
+                        let indices: Vec<u32> = (0..num_rows)
+                            .map(|i| {
+                                if str_arr.is_null(i) {
+                                    0u32
+                                } else {
+                                    let s = str_arr.value(i);
+                                    *dict.entry(s).or_insert_with(|| {
+                                        let id = next_id;
+                                        next_id += 1;
+                                        dict_values.push(s.to_string());
+                                        id
+                                    })
+                                }
+                            })
+                            .collect();
+                        
+                        let dict_size = dict_values.len() + 1;
+                        if dict_size <= 1000 {
+                            Some((indices, dict_values, dict_size))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                
+                // Get int column range
+                let int_range_result: Option<(Vec<u32>, i64, usize)> = if let Some(int_arr) = c2.as_any().downcast_ref::<Int64Array>() {
+                    let (min_val, max_val) = {
+                        let mut min = i64::MAX;
+                        let mut max = i64::MIN;
+                        for i in 0..num_rows {
+                            if !int_arr.is_null(i) {
+                                let v = int_arr.value(i);
+                                min = min.min(v);
+                                max = max.max(v);
+                            }
+                        }
+                        (min, max)
+                    };
+                    
+                    let range = (max_val - min_val + 1) as usize;
+                    if min_val >= 0 && range <= 1000 && range > 0 {
+                        let indices: Vec<u32> = (0..num_rows)
+                            .map(|i| {
+                                if int_arr.is_null(i) {
+                                    0u32
+                                } else {
+                                    (int_arr.value(i) - min_val + 1) as u32
+                                }
+                            })
+                            .collect();
+                        Some((indices, min_val, range))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                
+                // If both columns can use dictionary indexing
+                if let (Some((str_indices, str_values, str_size)), Some((int_indices, int_min, int_range))) = 
+                    (string_dict_result, int_range_result) 
+                {
+                    let total_size = str_size * (int_range + 1);
+                    if total_size <= 100_000 {
+                        // Find aggregate column
+                        let mut agg_col_int: Option<&Int64Array> = None;
+                        let mut agg_col_float: Option<&Float64Array> = None;
+                        for col in &stmt.columns {
+                            if let SelectColumn::Aggregate { column: Some(col_name), .. } = col {
+                                let actual_col = col_name.trim_matches('"');
+                                let actual_col = if let Some(dot_pos) = actual_col.rfind('.') {
+                                    &actual_col[dot_pos + 1..]
+                                } else {
+                                    actual_col
+                                };
+                                if actual_col != "*" {
+                                    if let Some(arr) = batch.column_by_name(actual_col) {
+                                        if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
+                                            agg_col_float = Some(float_arr);
+                                        } else if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+                                            agg_col_int = Some(int_arr);
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        
+                        // Direct-indexed aggregation
+                        let mut counts: Vec<i64> = vec![0; total_size];
+                        let mut sums_int: Vec<i64> = vec![0; total_size];
+                        let mut sums_float: Vec<f64> = vec![0.0; total_size];
+                        
+                        if let Some(int_arr) = agg_col_int {
+                            if int_arr.null_count() == 0 {
+                                let values = int_arr.values();
+                                for row_idx in 0..num_rows {
+                                    let str_idx = unsafe { *str_indices.get_unchecked(row_idx) as usize };
+                                    let int_idx = unsafe { *int_indices.get_unchecked(row_idx) as usize };
+                                    if str_idx != 0 && int_idx != 0 {
+                                        let composite = str_idx * (int_range + 1) + int_idx;
+                                        unsafe {
+                                            *counts.get_unchecked_mut(composite) += 1;
+                                            *sums_int.get_unchecked_mut(composite) += *values.get_unchecked(row_idx);
+                                        }
+                                    }
+                                }
+                            } else {
+                                for row_idx in 0..num_rows {
+                                    let str_idx = str_indices[row_idx] as usize;
+                                    let int_idx = int_indices[row_idx] as usize;
+                                    if str_idx == 0 || int_idx == 0 { continue; }
+                                    let composite = str_idx * (int_range + 1) + int_idx;
+                                    counts[composite] += 1;
+                                    if !int_arr.is_null(row_idx) {
+                                        sums_int[composite] += int_arr.value(row_idx);
+                                    }
+                                }
+                            }
+                        } else if let Some(float_arr) = agg_col_float {
+                            if float_arr.null_count() == 0 {
+                                let values = float_arr.values();
+                                for row_idx in 0..num_rows {
+                                    let str_idx = unsafe { *str_indices.get_unchecked(row_idx) as usize };
+                                    let int_idx = unsafe { *int_indices.get_unchecked(row_idx) as usize };
+                                    if str_idx != 0 && int_idx != 0 {
+                                        let composite = str_idx * (int_range + 1) + int_idx;
+                                        unsafe {
+                                            *counts.get_unchecked_mut(composite) += 1;
+                                            *sums_float.get_unchecked_mut(composite) += *values.get_unchecked(row_idx);
+                                        }
+                                    }
+                                }
+                            } else {
+                                for row_idx in 0..num_rows {
+                                    let str_idx = str_indices[row_idx] as usize;
+                                    let int_idx = int_indices[row_idx] as usize;
+                                    if str_idx == 0 || int_idx == 0 { continue; }
+                                    let composite = str_idx * (int_range + 1) + int_idx;
+                                    counts[composite] += 1;
+                                    if !float_arr.is_null(row_idx) {
+                                        sums_float[composite] += float_arr.value(row_idx);
+                                    }
+                                }
+                            }
+                        } else {
+                            // COUNT(*) only
+                            for row_idx in 0..num_rows {
+                                let str_idx = unsafe { *str_indices.get_unchecked(row_idx) as usize };
+                                let int_idx = unsafe { *int_indices.get_unchecked(row_idx) as usize };
+                                if str_idx != 0 && int_idx != 0 {
+                                    let composite = str_idx * (int_range + 1) + int_idx;
+                                    unsafe { *counts.get_unchecked_mut(composite) += 1; }
+                                }
+                            }
+                        }
+                        
+                        // Collect active groups
+                        let mut result_col1: Vec<&str> = Vec::with_capacity(total_size / 10);
+                        let mut result_col2: Vec<i64> = Vec::with_capacity(total_size / 10);
+                        let mut result_counts: Vec<i64> = Vec::with_capacity(total_size / 10);
+                        let mut result_sums_int: Vec<i64> = Vec::with_capacity(total_size / 10);
+                        let mut result_sums_float: Vec<f64> = Vec::with_capacity(total_size / 10);
+                        
+                        for str_idx in 1..str_size {
+                            for int_offset in 1..=int_range {
+                                let composite = str_idx * (int_range + 1) + int_offset;
+                                if counts[composite] > 0 {
+                                    result_col1.push(&str_values[str_idx - 1]);
+                                    result_col2.push(int_min + (int_offset - 1) as i64);
+                                    result_counts.push(counts[composite]);
+                                    result_sums_int.push(sums_int[composite]);
+                                    result_sums_float.push(sums_float[composite]);
+                                }
+                            }
+                        }
+                        
+                        // Build result
+                        use crate::query::AggregateFunc;
+                        let mut result_fields: Vec<Field> = Vec::new();
+                        let mut result_arrays: Vec<ArrayRef> = Vec::new();
+                        
+                        result_fields.push(Field::new(group_cols[0].trim_matches('"'), ArrowDataType::Utf8, false));
+                        result_arrays.push(Arc::new(StringArray::from(result_col1)));
+                        result_fields.push(Field::new(group_cols[1].trim_matches('"'), ArrowDataType::Int64, false));
+                        result_arrays.push(Arc::new(Int64Array::from(result_col2)));
+                        
+                        let has_int_agg = agg_col_int.is_some();
+                        
+                        for col in &stmt.columns {
+                            if let SelectColumn::Aggregate { func, column, alias, .. } = col {
+                                let func_name = match func {
+                                    AggregateFunc::Count => "COUNT",
+                                    AggregateFunc::Sum => "SUM",
+                                    AggregateFunc::Avg => "AVG",
+                                    AggregateFunc::Min => "MIN",
+                                    AggregateFunc::Max => "MAX",
+                                };
+                                let field_name = alias.clone().unwrap_or_else(|| {
+                                    format!("{}({})", func_name, column.as_deref().unwrap_or("*"))
+                                });
+                                
+                                match func {
+                                    AggregateFunc::Count => {
+                                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, false));
+                                        result_arrays.push(Arc::new(Int64Array::from(result_counts.clone())));
+                                    }
+                                    AggregateFunc::Sum => {
+                                        if has_int_agg {
+                                            result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
+                                            result_arrays.push(Arc::new(Int64Array::from(result_sums_int.clone())));
+                                        } else {
+                                            result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
+                                            result_arrays.push(Arc::new(Float64Array::from(result_sums_float.clone())));
+                                        }
+                                    }
+                                    AggregateFunc::Avg => {
+                                        let avgs: Vec<f64> = if has_int_agg {
+                                            result_counts.iter().zip(result_sums_int.iter())
+                                                .map(|(&c, &s)| if c > 0 { s as f64 / c as f64 } else { 0.0 })
+                                                .collect()
+                                        } else {
+                                            result_counts.iter().zip(result_sums_float.iter())
+                                                .map(|(&c, &s)| if c > 0 { s / c as f64 } else { 0.0 })
+                                                .collect()
+                                        };
+                                        result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
+                                        result_arrays.push(Arc::new(Float64Array::from(avgs)));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        
+                        let schema = Arc::new(Schema::new(result_fields));
+                        let mut result_batch = RecordBatch::try_new(schema, result_arrays)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        
+                        // Apply HAVING/ORDER BY/LIMIT
+                        if let Some(ref having) = stmt.having {
+                            let mask = Self::evaluate_predicate(&result_batch, having)?;
+                            result_batch = compute::filter_record_batch(&result_batch, &mask)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        }
+                        
+                        if !stmt.order_by.is_empty() {
+                            let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+                            result_batch = Self::apply_order_by_topk(&result_batch, &stmt.order_by, k)?;
+                        }
+                        
+                        result_batch = Self::apply_limit_offset(&result_batch, stmt.limit, stmt.offset)?;
+                        
+                        return Ok(ApexResult::Data(result_batch));
+                    }
+                }
+            }
+        }
+        
+        // FAST PATH: Multi-column GROUP BY (3+ columns) using vectorized execution
+        // This is faster than the general path because it uses pre-typed columns and batch processing
+        if group_cols.len() >= 3 {
+            use crate::query::multi_column::{execute_multi_column_group_by, build_multi_column_result};
+            
+            // Extract aggregate function info
+            let (agg_func, agg_col_name) = stmt.columns.iter()
+                .find_map(|col| {
+                    if let SelectColumn::Aggregate { func, column, .. } = col {
+                        Some((func.clone(), column.as_deref()))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or((crate::query::AggregateFunc::Count, None));
+            
+            // Execute optimized multi-column group by
+            match execute_multi_column_group_by(batch, group_cols, agg_col_name) {
+                Ok(hash_agg) => {
+                    let result_batch = build_multi_column_result(
+                        &hash_agg, batch, group_cols, Some(agg_func), agg_col_name
+                    )?;
+                    
+                    // Apply HAVING if present
+                    let mut result = result_batch;
+                    if let Some(having_expr) = &stmt.having {
+                        let mask = Self::evaluate_predicate(&result, having_expr)?;
+                        result = compute::filter_record_batch(&result, &mask)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    }
+                    
+                    // Apply ORDER BY with top-k optimization
+                    if !stmt.order_by.is_empty() {
+                        let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+                        result = Self::apply_order_by_topk(&result, &stmt.order_by, k)?;
+                    }
+                    
+                    // Apply LIMIT + OFFSET
+                    if stmt.limit.is_some() || stmt.offset.is_some() {
+                        result = Self::apply_limit_offset(&result, stmt.limit, stmt.offset)?;
+                    }
+                    
+                    return Ok(ApexResult::Data(result));
+                }
+                Err(_) => {
+                    // Fall through to general path
                 }
             }
         }

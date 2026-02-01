@@ -614,7 +614,46 @@ class ApexClient:
             if show_internal_id is None:
                 show_internal_id = self._should_show_internal_id(sql)
             
-            # ApexStorage.execute returns a dict with columns and rows
+            # OPTIMIZATION: Use Arrow IPC for efficient bulk transfer
+            if hasattr(self._storage, '_execute_arrow_ipc'):
+                try:
+                    ipc_bytes = self._storage._execute_arrow_ipc(sql)
+                    
+                    # Deserialize IPC bytes to Arrow table
+                    import io
+                    reader = pa.ipc.open_stream(io.BytesIO(ipc_bytes))
+                    batches = list(reader)
+                    
+                    if batches:
+                        table = pa.Table.from_batches(batches)
+                        # Check if table has 0 rows - treat as empty result
+                        if table.num_rows == 0:
+                            table = None
+                    else:
+                        # Empty result - create empty table with 0 columns
+                        table = None
+                    
+                    rv = ResultView(arrow_table=table, data=None)
+                    rv._show_internal_id = show_internal_id
+                    return rv
+                except Exception as e:
+                    # Fallback to legacy path
+                    # Only warn for unexpected errors, not for common expected cases
+                    error_msg = str(e).lower()
+                    expected_patterns = [
+                        'query parse error',
+                        'syntax error',
+                        'invalid cast',
+                        'conflicts with existing',
+                        'requires string argument',
+                        'expected number after limit'
+                    ]
+                    is_expected = any(pattern in error_msg for pattern in expected_patterns)
+                    if not is_expected:
+                        import warnings
+                        warnings.warn(f"Arrow IPC failed: {e}, falling back to legacy path")
+            
+            # Legacy path: ApexStorage.execute returns a dict with columns and rows
             result = self._storage.execute(sql)
             
             if result is None:

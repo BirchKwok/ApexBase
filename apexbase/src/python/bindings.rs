@@ -76,6 +76,7 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
 }
 
 /// Convert ColumnValue to Python object
+#[allow(dead_code)]
 fn column_value_to_py(py: Python<'_>, val: &ColumnValue) -> PyResult<PyObject> {
     match val {
         ColumnValue::Null => Ok(py.None()),
@@ -889,6 +890,39 @@ impl ApexStorageImpl {
             }
         }
         Ok(())
+    }
+    
+    /// Execute SQL and return Arrow IPC bytes for efficient transfer
+    fn _execute_arrow_ipc(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+        use arrow::ipc::writer::StreamWriter;
+        use pyo3::types::PyBytes;
+        
+        let sql = sql.to_string();
+        let table_path = self.get_current_table_path()?;
+        let base_dir = self.base_dir.clone();
+
+        // Execute query
+        let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
+            let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            
+            result.to_record_batch()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        
+        // Serialize to IPC format
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
+                .map_err(|e| PyRuntimeError::new_err(format!("IPC writer error: {}", e)))?;
+            writer.write(&batch)
+                .map_err(|e| PyRuntimeError::new_err(format!("IPC write error: {}", e)))?;
+            writer.finish()
+                .map_err(|e| PyRuntimeError::new_err(format!("IPC finish error: {}", e)))?;
+        }
+        
+        // Return as Python bytes
+        Ok(PyBytes::new_bound(py, &buf).into())
     }
     
     /// Query with Arrow FFI (zero-copy transfer)

@@ -219,10 +219,8 @@ class ResultView:
     def shape(self):
         if self._arrow_table is not None:
             return (self._arrow_table.num_rows, self._arrow_table.num_columns)
-        data = self._ensure_data()
-        if not data:
-            return (0, 0)
-        return (len(data), len(data[0]) if data else 0)
+        # When arrow_table is None (empty result), return (0, 0)
+        return (0, 0)
     
     @property
     def columns(self):
@@ -308,7 +306,10 @@ class ResultView:
 
 
 def _empty_result_view() -> ResultView:
-    return ResultView(arrow_table=pa.table({}), data=[])
+    # Create empty ResultView with no columns
+    # Use a special marker to indicate truly empty result
+    rv = ResultView(arrow_table=None, data=[])
+    return rv
 
 
 # Durability level type
