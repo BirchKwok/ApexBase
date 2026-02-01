@@ -165,15 +165,36 @@ pub fn invalidate_storage_cache_dir(dir: &Path) {
 }
 
 /// Get or open a cached storage backend
+/// Auto-compacts delta files before reading to ensure data consistency
 fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     
-    // Check file modification time
-    let metadata = std::fs::metadata(path)?;
-    let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    // Check for delta file - if exists, compact before reading
+    let delta_path = {
+        let mut dp = canonical.clone();
+        let name = dp.file_name().unwrap_or_default().to_string_lossy();
+        dp.set_file_name(format!("{}.delta", name));
+        dp
+    };
     
-    // Try read from cache first
-    {
+    let has_delta = delta_path.exists();
+    
+    // Check file modification time (include delta file if exists)
+    let metadata = std::fs::metadata(path)?;
+    let mut modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    
+    if has_delta {
+        if let Ok(delta_meta) = std::fs::metadata(&delta_path) {
+            if let Ok(delta_modified) = delta_meta.modified() {
+                if delta_modified > modified {
+                    modified = delta_modified;
+                }
+            }
+        }
+    }
+    
+    // Try read from cache first (only if no delta file pending)
+    if !has_delta {
         let cache = STORAGE_CACHE.read();
         if let Some((backend, cached_time)) = cache.get(&canonical) {
             if *cached_time >= modified {
@@ -182,13 +203,27 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         }
     }
     
-    // Cache miss or stale - open new backend
+    // Cache miss, stale, or delta exists - need to open fresh
+    // If delta exists, compact it first
+    if has_delta {
+        // Open for write to trigger compaction
+        let storage = TableStorageBackend::open_for_write(path)?;
+        storage.compact()?;
+        // Delta is now merged, invalidate cache
+        invalidate_storage_cache(path);
+    }
+    
+    // Open backend (now with compacted data)
     let backend = Arc::new(TableStorageBackend::open(path)?);
     
-    // Update cache
+    // Update cache with fresh modification time
+    let new_modified = std::fs::metadata(path)?
+        .modified()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    
     {
         let mut cache = STORAGE_CACHE.write();
-        cache.insert(canonical, (Arc::clone(&backend), modified));
+        cache.insert(canonical, (Arc::clone(&backend), new_modified));
     }
     
     Ok(backend)
@@ -8989,7 +9024,7 @@ impl ApexExecutor {
     // ========== DML Execution Methods ==========
 
     /// Execute INSERT statement
-    /// High-performance: batch insert with minimal allocations
+    /// High-performance: uses delta file for memory efficiency (doesn't load existing data)
     fn execute_insert(
         storage_path: &Path,
         columns: Option<&[String]>,
@@ -9007,7 +9042,8 @@ impl ApexExecutor {
         // Invalidate cache before write
         invalidate_storage_cache(storage_path);
         
-        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        // Use memory-efficient open_for_insert (doesn't load column data)
+        let storage = TableStorageBackend::open_for_insert(storage_path)?;
         
         // Get column names from schema or explicit list
         let col_names: Vec<String> = if let Some(cols) = columns {
@@ -9016,11 +9052,11 @@ impl ApexExecutor {
             storage.get_schema().iter().map(|(n, _)| n.clone()).collect()
         };
         
-        // Convert values to rows format for insert_rows
+        // Convert values to rows format - optimized batch allocation
         let mut rows: Vec<HashMap<String, Value>> = Vec::with_capacity(values.len());
         
         for row_values in values {
-            let mut row: HashMap<String, Value> = HashMap::new();
+            let mut row: HashMap<String, Value> = HashMap::with_capacity(col_names.len());
             for (i, value) in row_values.iter().enumerate() {
                 if i < col_names.len() {
                     row.insert(col_names[i].clone(), value.clone());
@@ -9030,8 +9066,14 @@ impl ApexExecutor {
         }
         
         let rows_inserted = rows.len() as i64;
-        storage.insert_rows(&rows)?;
-        storage.save()?;
+        
+        // Use delta file for memory-efficient insert
+        storage.insert_rows_to_delta(&rows)?;
+        
+        // Auto-compact if needed (threshold check inside insert_rows_to_delta)
+        if storage.needs_compaction() {
+            storage.compact()?;
+        }
         
         // Invalidate cache after write to ensure subsequent reads get fresh data
         invalidate_storage_cache(storage_path);
@@ -9039,7 +9081,7 @@ impl ApexExecutor {
         Ok(ApexResult::Scalar(rows_inserted))
     }
 
-    /// Execute DELETE statement
+    /// Execute DELETE statement (soft delete - marks rows as deleted without physical removal)
     fn execute_delete(storage_path: &Path, where_clause: Option<&SqlExpr>) -> io::Result<ApexResult> {
         if !storage_path.exists() {
             return Err(io::Error::new(
@@ -9051,12 +9093,13 @@ impl ApexExecutor {
         // Invalidate cache before write
         invalidate_storage_cache(storage_path);
         
-        let storage = TableStorageBackend::open_for_write(storage_path)?;
-        
-        // If no WHERE clause, delete all rows
+        // For DELETE without WHERE, only need to read _id column (memory efficient)
         if where_clause.is_none() {
+            // Use lazy open - only load metadata, not column data
+            let storage = TableStorageBackend::open(storage_path)?;
             let count = storage.active_row_count() as i64;
-            // Read all IDs and delete them
+            
+            // Only read _id column for soft deletion (not all columns)
             let batch = storage.read_columns_to_arrow(Some(&["_id"]), 0, None)?;
             if let Some(id_col) = batch.column_by_name("_id") {
                 if let Some(id_arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
@@ -9070,10 +9113,14 @@ impl ApexExecutor {
                 }
             }
             storage.save()?;
+            
             // Invalidate cache after write
             invalidate_storage_cache(storage_path);
             return Ok(ApexResult::Scalar(count));
         }
+        
+        // For DELETE with WHERE, need to load data for predicate evaluation
+        let storage = TableStorageBackend::open_for_write(storage_path)?;
         
         // For DELETE with WHERE, find matching rows and soft-delete them
         let batch = storage.read_columns_to_arrow(None, 0, None)?;

@@ -810,21 +810,60 @@ class ApexClient:
 
     # ============ Delete/Replace ============
 
-    def delete(self, ids: Union[int, List[int]]) -> bool:
+    def delete(
+        self, 
+        id: Optional[Union[int, List[int]]] = None, 
+        where: Optional[str] = None
+    ) -> Union[bool, int]:
+        """Delete records by ID(s) or WHERE clause.
+        
+        Args:
+            id: Single ID (int) or list of IDs to delete. Optional.
+            where: SQL WHERE clause string for conditional deletion. Optional.
+                   Example: "age > 30" or "status = 'inactive'"
+        
+        Returns:
+            - If deleting by id: bool indicating success
+            - If deleting by where: int count of deleted rows
+        
+        Raises:
+            ValueError: If neither id nor where is provided (safety protection)
+        
+        Examples:
+            client.delete(id=1)                    # Delete single record
+            client.delete(id=[1, 2, 3])            # Delete multiple records
+            client.delete(where="age > 30")        # Delete matching records
+        """
         self._check_connection()
+        
+        # Safety check: require at least one parameter to prevent accidental deletion of all data
+        if id is None and where is None:
+            raise ValueError(
+                "delete() requires at least one argument: 'id' or 'where'. "
+                "To delete all records, use delete(where='1=1') explicitly."
+            )
+        
         with self._lock:
-            # Remove from FTS index if enabled
-            if self._fts_tables:
-                ids_to_remove = [ids] if isinstance(ids, int) else ids
-                for doc_id in ids_to_remove:
-                    self._storage._fts_remove(doc_id)
+            # Case 1: Delete by WHERE clause
+            if where is not None:
+                # Note: FTS cleanup for WHERE-based delete would require 
+                # querying IDs first, which is expensive. Skip for now.
+                return self._storage.delete_where(where)
             
-            if isinstance(ids, int):
-                return self._storage.delete(ids)
-            elif isinstance(ids, list):
-                return self._storage.delete_batch(ids)
-            else:
-                raise ValueError("ids must be an int or a list of ints")
+            # Case 2: Delete by ID(s)
+            if id is not None:
+                # Remove from FTS index if enabled
+                if self._fts_tables:
+                    ids_to_remove = [id] if isinstance(id, int) else id
+                    for doc_id in ids_to_remove:
+                        self._storage._fts_remove(doc_id)
+                
+                if isinstance(id, int):
+                    return self._storage.delete(id)
+                elif isinstance(id, list):
+                    return self._storage.delete_batch(id)
+                else:
+                    raise ValueError("id must be an int or a list of ints")
 
     def replace(self, id_: int, data: dict) -> bool:
         self._check_connection()

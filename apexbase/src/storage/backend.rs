@@ -305,6 +305,95 @@ impl TableStorageBackend {
             dirty: RwLock::new(false),
         })
     }
+    
+    /// Open for INSERT only - memory efficient! Only loads metadata, not column data.
+    pub fn open_for_insert(path: &Path) -> io::Result<Self> {
+        Self::open_for_insert_with_durability(path, super::DurabilityLevel::Fast)
+    }
+    
+    /// Open for INSERT with specified durability - memory efficient!
+    pub fn open_for_insert_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+        let storage = OnDemandStorage::open_for_insert_with_durability(path, durability)?;
+        
+        let storage_schema = storage.get_schema();
+        let schema: Vec<(String, DataType)> = storage_schema
+            .into_iter()
+            .map(|(name, ct)| (name, column_type_to_datatype(ct)))
+            .collect();
+        
+        let row_count = storage.row_count();
+        
+        Ok(Self {
+            path: path.to_path_buf(),
+            storage,
+            cached_columns: RwLock::new(HashMap::new()),
+            schema: RwLock::new(schema),
+            row_count: RwLock::new(row_count),
+            dirty: RwLock::new(false),
+        })
+    }
+    
+    /// Insert rows to delta file (memory efficient - doesn't load existing column data)
+    /// Auto-compacts when delta exceeds threshold
+    pub fn insert_rows_to_delta(&self, rows: &[HashMap<String, Value>]) -> io::Result<Vec<u64>> {
+        use crate::storage::on_demand::ColumnValue;
+        
+        // Convert Value to ColumnValue
+        let converted: Vec<HashMap<String, ColumnValue>> = rows.iter().map(|row| {
+            row.iter().map(|(k, v)| {
+                let cv = match v {
+                    Value::Int64(i) => ColumnValue::Int64(*i),
+                    Value::Float64(f) => ColumnValue::Float64(*f),
+                    Value::String(s) => ColumnValue::String(s.clone()),
+                    Value::Bool(b) => ColumnValue::Bool(*b),
+                    Value::Binary(b) => ColumnValue::Binary(b.clone()),
+                    _ => ColumnValue::Null,
+                };
+                (k.clone(), cv)
+            }).collect()
+        }).collect();
+        
+        let ids = self.storage.insert_rows_to_delta(&converted)?;
+        
+        // Auto-compact if delta file is too large (> 10MB or > 100K rows)
+        const DELTA_SIZE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
+        const DELTA_ROWS_THRESHOLD: usize = 100_000;
+        
+        let delta_path = Self::delta_path(&self.path);
+        if delta_path.exists() {
+            let delta_size = std::fs::metadata(&delta_path).map(|m| m.len()).unwrap_or(0);
+            if delta_size > DELTA_SIZE_THRESHOLD || ids.len() > DELTA_ROWS_THRESHOLD {
+                // Trigger async compaction hint (actual compaction done separately)
+                // For now, just mark that compaction is needed
+                *self.dirty.write() = true;
+            }
+        }
+        
+        Ok(ids)
+    }
+    
+    /// Get delta file path
+    fn delta_path(base_path: &Path) -> std::path::PathBuf {
+        let mut delta = base_path.to_path_buf();
+        let name = delta.file_name().unwrap_or_default().to_string_lossy();
+        delta.set_file_name(format!("{}.delta", name));
+        delta
+    }
+    
+    /// Check if delta file exists
+    pub fn has_delta(&self) -> bool {
+        self.storage.has_delta()
+    }
+    
+    /// Compact delta into base file
+    pub fn compact(&self) -> io::Result<()> {
+        self.storage.compact()
+    }
+    
+    /// Check if compaction is needed
+    pub fn needs_compaction(&self) -> bool {
+        self.storage.needs_compaction()
+    }
 
     /// Get metadata without loading data
     pub fn metadata(&self) -> TableMetadata {

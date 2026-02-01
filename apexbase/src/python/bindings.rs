@@ -215,7 +215,7 @@ impl ApexStorageImpl {
             .ok_or_else(|| PyValueError::new_err(format!("Table not found: {}", table_name)))
     }
     
-    /// Get or create cached backend for current table
+    /// Get or create cached backend for current table (lazy loading - no column data loaded)
     fn get_backend(&self) -> PyResult<Arc<TableStorageBackend>> {
         let table_name = self.current_table.read().clone();
         let table_path = self.get_current_table_path()?;
@@ -229,8 +229,11 @@ impl ApexStorageImpl {
         }
         
         // Create new backend with durability level and cache it
+        // OPTIMIZATION: Use open_with_durability (lazy loading) instead of open_for_write
+        // This avoids loading all column data into memory upfront
+        // Reads use on-demand column projection, writes use delta files
         let backend = if table_path.exists() {
-            TableStorageBackend::open_for_write_with_durability(&table_path, self.durability)
+            TableStorageBackend::open_with_durability(&table_path, self.durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
         } else {
             TableStorageBackend::create_with_durability(&table_path, self.durability)
@@ -782,6 +785,52 @@ impl ApexStorageImpl {
         }
         
         Ok(result)
+    }
+    
+    /// Delete records matching a WHERE clause
+    /// Returns the number of deleted rows
+    fn delete_where(&self, where_clause: &str) -> PyResult<i64> {
+        let table_path = self.get_current_table_path()?;
+        let table_name = self.current_table.read().clone();
+        
+        // Build DELETE SQL statement
+        let sql = format!("DELETE FROM {} WHERE {}", table_name, where_clause);
+        
+        // Execute using ApexExecutor
+        let result = ApexExecutor::execute_with_base_dir(&sql, &self.base_dir, &table_path)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        
+        // Invalidate cached backend since data changed
+        self.invalidate_backend(&table_name);
+        
+        // Extract scalar result (number of deleted rows)
+        match result {
+            ApexResult::Scalar(count) => Ok(count),
+            _ => Ok(0),
+        }
+    }
+    
+    /// Delete all records (no WHERE clause)
+    /// Returns the number of deleted rows
+    fn delete_all(&self) -> PyResult<i64> {
+        let table_path = self.get_current_table_path()?;
+        let table_name = self.current_table.read().clone();
+        
+        // Build DELETE SQL statement without WHERE
+        let sql = format!("DELETE FROM {}", table_name);
+        
+        // Execute using ApexExecutor
+        let result = ApexExecutor::execute_with_base_dir(&sql, &self.base_dir, &table_path)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        
+        // Invalidate cached backend since data changed
+        self.invalidate_backend(&table_name);
+        
+        // Extract scalar result (number of deleted rows)
+        match result {
+            ApexResult::Scalar(count) => Ok(count),
+            _ => Ok(0),
+        }
     }
 
     /// Execute SQL query
