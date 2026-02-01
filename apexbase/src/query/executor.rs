@@ -41,9 +41,34 @@ use ahash::AHasher;
 use std::hash::{Hash, Hasher};
 
 // Global storage cache to avoid repeated open() calls which load all IDs
-// Key: canonical path, Value: (backend, last_modified_time)
-static STORAGE_CACHE: Lazy<RwLock<AHashMap<PathBuf, (Arc<TableStorageBackend>, std::time::SystemTime)>>> = 
-    Lazy::new(|| RwLock::new(AHashMap::new()));
+// Key: canonical path, Value: (backend, last_modified_time, last_access_time)
+// Uses LRU eviction when cache exceeds MAX_CACHE_ENTRIES
+const MAX_CACHE_ENTRIES: usize = 64;  // Limit cache to 64 tables
+
+static STORAGE_CACHE: Lazy<RwLock<AHashMap<PathBuf, (Arc<TableStorageBackend>, std::time::SystemTime, std::time::Instant)>>> = 
+    Lazy::new(|| RwLock::new(AHashMap::with_capacity(MAX_CACHE_ENTRIES)));
+
+/// Evict least recently used entries from cache if over limit
+fn evict_lru_cache_entries(cache: &mut AHashMap<PathBuf, (Arc<TableStorageBackend>, std::time::SystemTime, std::time::Instant)>) {
+    if cache.len() <= MAX_CACHE_ENTRIES {
+        return;
+    }
+    
+    // Find the entry with oldest access time
+    let entries_to_remove = cache.len() - MAX_CACHE_ENTRIES + 1; // Remove a few extra to avoid frequent eviction
+    let mut access_times: Vec<(PathBuf, std::time::Instant)> = cache
+        .iter()
+        .map(|(k, (_, _, access))| (k.clone(), *access))
+        .collect();
+    
+    // Sort by access time (oldest first)
+    access_times.sort_by_key(|(_, t)| *t);
+    
+    // Remove oldest entries
+    for (path, _) in access_times.into_iter().take(entries_to_remove) {
+        cache.remove(&path);
+    }
+}
 
 /// Zone Map (min-max index) for a column
 /// Used to skip filtering when conditions can't match
@@ -195,10 +220,16 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     
     // Try read from cache first (only if no delta file pending)
     if !has_delta {
-        let cache = STORAGE_CACHE.read();
-        if let Some((backend, cached_time)) = cache.get(&canonical) {
+        // Check cache and update access time if found
+        let mut cache = STORAGE_CACHE.write();
+        if let Some((backend, cached_time, _)) = cache.get(&canonical) {
             if *cached_time >= modified {
-                return Ok(Arc::clone(backend));
+                let backend_clone = Arc::clone(backend);
+                // Update access time for LRU tracking
+                if let Some(entry) = cache.get_mut(&canonical) {
+                    entry.2 = std::time::Instant::now();
+                }
+                return Ok(backend_clone);
             }
         }
     }
@@ -223,7 +254,9 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     
     {
         let mut cache = STORAGE_CACHE.write();
-        cache.insert(canonical, (Arc::clone(&backend), new_modified));
+        // Evict LRU entries if cache is full
+        evict_lru_cache_entries(&mut cache);
+        cache.insert(canonical, (Arc::clone(&backend), new_modified, std::time::Instant::now()));
     }
     
     Ok(backend)
@@ -1639,9 +1672,10 @@ impl ApexExecutor {
             return Ok(None);
         }
         
-        // Collect results
-        let mut result_groups: Vec<&str> = Vec::new();
-        let mut result_values: Vec<f64> = Vec::new();
+        // Collect results - pre-allocate with estimated group count
+        let estimated_groups = (group_dict_size / 4).max(16);
+        let mut result_groups: Vec<&str> = Vec::with_capacity(estimated_groups);
+        let mut result_values: Vec<f64> = Vec::with_capacity(estimated_groups);
         
         for gk in 1..group_dict_size {
             if counts[gk] > 0 {
@@ -2181,8 +2215,8 @@ impl ApexExecutor {
         }
         let result_schema = Arc::new(Schema::new(fields));
 
-        // Build result columns
-        let mut columns: Vec<ArrayRef> = Vec::new();
+        // Build result columns - pre-allocate for all columns
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(left.num_columns() + right.num_columns());
 
         // Take from left - avoid clone by creating array directly
         let left_indices_array = arrow::array::UInt32Array::from(left_indices);
@@ -2744,7 +2778,7 @@ impl ApexExecutor {
     
     /// Find column references in subquery that refer to outer query columns
     fn find_outer_column_refs(stmt: &SelectStatement, outer_batch: &RecordBatch) -> Vec<String> {
-        let mut outer_refs = Vec::new();
+        let mut outer_refs = Vec::with_capacity(4); // Most subqueries have few outer refs
         let outer_cols: Vec<String> = outer_batch.schema().fields().iter()
             .map(|f| f.name().clone())
             .collect();

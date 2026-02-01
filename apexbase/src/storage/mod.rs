@@ -9,6 +9,7 @@
 pub mod on_demand;
 pub mod backend;
 pub mod incremental;
+pub mod bloom;
 
 // ============================================================================
 // Durability Level - Controls fsync behavior for ACID guarantees
@@ -93,6 +94,14 @@ pub use incremental::{
     WalRecord,
     WalWriter,
     WalReader,
+};
+
+// Re-export bloom filter types
+pub use bloom::{
+    RowGroupBloomFilter,
+    ColumnBloomIndex,
+    BLOOM_ROW_GROUP_SIZE,
+    BLOOM_FP_RATE,
 };
 
 // Type alias for backward compatibility

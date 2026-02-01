@@ -1,6 +1,6 @@
 [package]
 name = "apexbase"
-version = "0.4.0"
+version = "0.4.2"
 edition = "2021"
 authors = ["Birch Kwok <birchkwok@gmail.com>"]
 description = "High-performance embedded database with Rust core"
@@ -69,6 +69,9 @@ memchr = "2.7"
 
 # Fast non-cryptographic hashing
 ahash = "0.8"
+
+# Bloom filter for fast membership testing
+bloomfilter = "1.0"
 
 # Cross-platform file locking
 fs2 = "0.4"

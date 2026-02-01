@@ -702,6 +702,41 @@ impl ColumnData {
         }
     }
     
+    /// Check if dictionary encoding would be beneficial for this column
+    /// Returns true if cardinality is low relative to row count
+    pub fn should_dict_encode(&self) -> bool {
+        if let ColumnData::String { offsets, data } = self {
+            use ahash::AHashSet;
+            
+            let row_count = offsets.len().saturating_sub(1);
+            if row_count < 100 {
+                return false; // Too few rows to benefit
+            }
+            
+            // Sample up to 1000 rows to estimate cardinality
+            let sample_size = row_count.min(1000);
+            let mut unique_strings: AHashSet<&[u8]> = AHashSet::with_capacity(sample_size / 10);
+            
+            let step = if row_count > sample_size { row_count / sample_size } else { 1 };
+            let mut i = 0;
+            while i < row_count && unique_strings.len() < sample_size / 5 {
+                let start = offsets[i] as usize;
+                let end = offsets[i + 1] as usize;
+                if end <= data.len() {
+                    unique_strings.insert(&data[start..end]);
+                }
+                i += step;
+            }
+            
+            // Dictionary encoding is beneficial if cardinality < 20% of sampled rows
+            // or if there are fewer than 10000 unique values
+            let estimated_cardinality = unique_strings.len();
+            estimated_cardinality < sample_size / 5 || estimated_cardinality < 10000
+        } else {
+            false
+        }
+    }
+    
     /// Convert regular String column to dictionary-encoded StringDict
     /// This is beneficial for low-cardinality columns (e.g., category, status)
     pub fn to_dict_encoded(&self) -> Option<Self> {
@@ -746,6 +781,15 @@ impl ColumnData {
             })
         } else {
             None
+        }
+    }
+    
+    /// Try to convert to dictionary encoding if beneficial, otherwise return self
+    pub fn maybe_dict_encode(self) -> Self {
+        if self.should_dict_encode() {
+            self.to_dict_encoded().unwrap_or(self)
+        } else {
+            self
         }
     }
     
@@ -2157,6 +2201,7 @@ impl OnDemandStorage {
 
     /// Read columns with STRING predicate pushdown - filter rows at storage level
     /// This is optimized for string equality filters (column = 'value')
+    /// Uses bloom filters to skip row groups that definitely don't contain the value
     pub fn read_columns_filtered_string(
         &self,
         column_names: Option<&[&str]>,
@@ -2196,64 +2241,166 @@ impl OnDemandStorage {
         // Read filter column data using mmap
         let filter_data = self.read_column_range_mmap(&mut mmap_cache, file, filter_index, *filter_col_type, 0, total_rows, total_rows)?;
         
+        // OPTIMIZATION: Build and use bloom filter for large datasets
+        // Build bloom filter on-the-fly and use it to identify candidate row groups
+        let filter_bytes = filter_value.as_bytes();
+        let use_bloom = filter_eq && total_rows > 10000; // Only use bloom for equality on large datasets
+        
         // Apply string filter
         let matching_indices: Vec<usize> = match filter_data {
             ColumnData::String { offsets, data } => {
                 let count = offsets.len().saturating_sub(1);
-                let filter_bytes = filter_value.as_bytes();
-                (0..count)
-                    .filter(|&i| {
-                        let start = offsets[i] as usize;
-                        let end = offsets[i + 1] as usize;
-                        let matches = &data[start..end] == filter_bytes;
-                        if filter_eq { matches } else { !matches }
-                    })
-                    .collect()
+                let filter_len = filter_bytes.len() as u32;
+                
+                // OPTIMIZATION: Pre-compute first byte and length for fast rejection
+                let first_byte = filter_bytes.first().copied();
+                
+                // Pre-allocate with estimated capacity (assume ~10% match rate)
+                let mut result = Vec::with_capacity(count / 10 + 1);
+                
+                // OPTIMIZATION: Use bloom filter to skip row groups for large datasets
+                const ROW_GROUP_SIZE: usize = 8192;  // 8K rows per group for bloom filter
+                
+                if use_bloom && count > ROW_GROUP_SIZE {
+                    // Build bloom filter index and identify candidate groups
+                    use crate::storage::bloom::{ColumnBloomIndex, BLOOM_FP_RATE};
+                    let bloom_index = ColumnBloomIndex::build_from_strings(
+                        filter_column,
+                        &offsets,
+                        &data,
+                        ROW_GROUP_SIZE,
+                        BLOOM_FP_RATE,
+                    );
+                    
+                    // Get row ranges that might contain the value
+                    let scan_ranges = bloom_index.get_scan_ranges(filter_bytes);
+                    
+                    // Only scan candidate row groups
+                    for (group_start, group_end) in scan_ranges {
+                        for i in group_start..group_end.min(count) {
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            let str_len = (end - start) as u32;
+                            
+                            // Fast path: length mismatch rejection
+                            if str_len != filter_len {
+                                continue;
+                            }
+                            
+                            // Fast path: first byte mismatch
+                            if let Some(fb) = first_byte {
+                                if start < data.len() && data[start] != fb {
+                                    continue;
+                                }
+                            }
+                            
+                            // Full comparison
+                            let matches = end <= data.len() && &data[start..end] == filter_bytes;
+                            if matches {
+                                result.push(i);
+                            }
+                        }
+                    }
+                } else {
+                    // Standard chunked processing for small datasets or != filter
+                    const CHUNK_SIZE: usize = 1024;
+                    for chunk_start in (0..count).step_by(CHUNK_SIZE) {
+                        let chunk_end = (chunk_start + CHUNK_SIZE).min(count);
+                        
+                        for i in chunk_start..chunk_end {
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            let str_len = (end - start) as u32;
+                            
+                            // Fast path: length mismatch rejection (most common case)
+                            if str_len != filter_len {
+                                if !filter_eq {
+                                    result.push(i);
+                                }
+                                continue;
+                            }
+                            
+                            // Fast path: first byte mismatch (catches ~255/256 of remaining)
+                            if let Some(fb) = first_byte {
+                                if start < data.len() && data[start] != fb {
+                                    if !filter_eq {
+                                        result.push(i);
+                                    }
+                                    continue;
+                                }
+                            }
+                            
+                            // Full comparison only when length and first byte match
+                            let matches = end <= data.len() && &data[start..end] == filter_bytes;
+                            if filter_eq == matches {
+                                result.push(i);
+                            }
+                        }
+                    }
+                }
+                result
             }
             ColumnData::StringDict { indices, dict_offsets, dict_data } => {
                 // OPTIMIZATION: Find matching dictionary index first, then scan indices
                 // This is O(dict_size + row_count) vs O(row_count * string_len)
                 let filter_bytes = filter_value.as_bytes();
+                let filter_len = filter_bytes.len();
                 let mut matching_dict_idx: Option<u32> = None;
                 
-                // Find which dictionary entry matches the filter value
-                for i in 0..dict_offsets.len().saturating_sub(1) {
+                // Find which dictionary entry matches the filter value (with fast rejection)
+                let dict_count = dict_offsets.len().saturating_sub(1);
+                for i in 0..dict_count {
                     let start = dict_offsets[i] as usize;
-                    let end = dict_offsets[i + 1] as usize;
-                    if &dict_data[start..end] == filter_bytes {
+                    let end = if i + 1 < dict_offsets.len() { dict_offsets[i + 1] as usize } else { dict_data.len() };
+                    // Fast rejection by length
+                    if end - start != filter_len {
+                        continue;
+                    }
+                    if end <= dict_data.len() && &dict_data[start..end] == filter_bytes {
                         matching_dict_idx = Some((i + 1) as u32); // +1 because 0 = NULL
                         break;
                     }
                 }
                 
-                // Now scan indices array (fast integer comparison)
+                // OPTIMIZATION: Pre-allocate and use pointer-based scan for speed
+                let count = indices.len();
+                let mut result = Vec::with_capacity(count / 10 + 1);
+                
                 match (matching_dict_idx, filter_eq) {
                     (Some(target_idx), true) => {
-                        // Equality: find rows where index == target
-                        indices.iter().enumerate()
-                            .filter(|(_, &idx)| idx == target_idx)
-                            .map(|(i, _)| i)
-                            .collect()
+                        // SIMD-friendly: scan in chunks with pointer arithmetic
+                        let ptr = indices.as_ptr();
+                        for i in 0..count {
+                            // Pointer dereference avoids bounds checking
+                            if unsafe { *ptr.add(i) } == target_idx {
+                                result.push(i);
+                            }
+                        }
                     }
                     (Some(target_idx), false) => {
-                        // Not equal: find rows where index != target and index != 0 (not NULL)
-                        indices.iter().enumerate()
-                            .filter(|(_, &idx)| idx != target_idx && idx != 0)
-                            .map(|(i, _)| i)
-                            .collect()
+                        let ptr = indices.as_ptr();
+                        for i in 0..count {
+                            let idx = unsafe { *ptr.add(i) };
+                            if idx != target_idx && idx != 0 {
+                                result.push(i);
+                            }
+                        }
                     }
                     (None, true) => {
                         // Value not in dictionary, no matches for equality
-                        Vec::new()
+                        // result stays empty
                     }
                     (None, false) => {
-                        // Value not in dictionary, all non-NULL rows match for not-equal
-                        indices.iter().enumerate()
-                            .filter(|(_, &idx)| idx != 0)
-                            .map(|(i, _)| i)
-                            .collect()
+                        // Value not in dictionary, all non-NULL rows match
+                        let ptr = indices.as_ptr();
+                        for i in 0..count {
+                            if unsafe { *ptr.add(i) } != 0 {
+                                result.push(i);
+                            }
+                        }
                     }
                 }
+                result
             }
             _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Expected string column")),
         };

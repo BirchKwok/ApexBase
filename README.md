@@ -245,14 +245,7 @@ with ApexClient("./data") as client:
 
 ## 📊 Performance Comparison
 
-| Operation | ApexBase (Rust) | Baseline | Speedup |
-|------|-----------------|----------|------|
-| Batch write (10K) | 17ms | 57ms | **3.3x** |
-| Single read | 0.01ms | 0.4ms | **40x** |
-| Batch read (100) | 0.08ms | 1.1ms | **14x** |
-| Storage size | 2.1 MB | 3.9 MB | **1.8x smaller** |
-
-### Benchmark: ApexBase vs DuckDB
+### ApexBase vs DuckDB
 
 Comparison with [DuckDB](https://duckdb.org/) (v1.1.3), a popular embedded analytical database.
 
@@ -264,7 +257,7 @@ Comparison with [DuckDB](https://duckdb.org/) (v1.1.3), a popular embedded analy
 | **CPU** | Apple M1 Pro |
 | **Memory** | 32.0 GB |
 | **Python** | 3.11.10 |
-| **ApexBase** | v0.4.0 |
+| **ApexBase** | v0.4.2 |
 | **DuckDB** | v1.1.3 |
 | **PyArrow** | 19.0.0 |
 

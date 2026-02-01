@@ -138,6 +138,99 @@ pub struct VectorizedHashAgg {
     group_keys_str: Vec<String>,
 }
 
+/// Fast counting aggregation for low-cardinality integer keys
+/// Uses direct array indexing instead of hash table (O(1) vs O(1) but lower constant)
+/// Optimized for GROUP BY with small integer ranges (e.g., category IDs 0-1000)
+pub struct DirectCountAgg {
+    /// Direct count array indexed by (value - min_val)
+    counts: Vec<i64>,
+    /// Sum values for SUM/AVG
+    sums_int: Vec<i64>,
+    sums_float: Vec<f64>,
+    /// Min value offset
+    min_val: i64,
+    /// Track which indices have data
+    has_data: Vec<bool>,
+}
+
+impl DirectCountAgg {
+    /// Create with known value range [min_val, max_val]
+    pub fn new(min_val: i64, max_val: i64) -> Self {
+        let range = (max_val - min_val + 1) as usize;
+        Self {
+            counts: vec![0; range],
+            sums_int: vec![0; range],
+            sums_float: vec![0.0; range],
+            min_val,
+            has_data: vec![false; range],
+        }
+    }
+    
+    #[inline(always)]
+    pub fn update_count(&mut self, key: i64) {
+        let idx = (key - self.min_val) as usize;
+        if idx < self.counts.len() {
+            unsafe {
+                *self.counts.get_unchecked_mut(idx) += 1;
+                *self.has_data.get_unchecked_mut(idx) = true;
+            }
+        }
+    }
+    
+    #[inline(always)]
+    pub fn update_int(&mut self, key: i64, val: i64) {
+        let idx = (key - self.min_val) as usize;
+        if idx < self.counts.len() {
+            unsafe {
+                *self.counts.get_unchecked_mut(idx) += 1;
+                *self.sums_int.get_unchecked_mut(idx) += val;
+                *self.has_data.get_unchecked_mut(idx) = true;
+            }
+        }
+    }
+    
+    #[inline(always)]
+    pub fn update_float(&mut self, key: i64, val: f64) {
+        let idx = (key - self.min_val) as usize;
+        if idx < self.counts.len() {
+            unsafe {
+                *self.counts.get_unchecked_mut(idx) += 1;
+                *self.sums_float.get_unchecked_mut(idx) += val;
+                *self.has_data.get_unchecked_mut(idx) = true;
+            }
+        }
+    }
+    
+    /// Convert to vectors of (key, count, sum_int, sum_float)
+    pub fn to_results(&self) -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<f64>) {
+        let mut keys = Vec::new();
+        let mut counts = Vec::new();
+        let mut sums_int = Vec::new();
+        let mut sums_float = Vec::new();
+        
+        for (i, &has) in self.has_data.iter().enumerate() {
+            if has {
+                keys.push(self.min_val + i as i64);
+                counts.push(self.counts[i]);
+                sums_int.push(self.sums_int[i]);
+                sums_float.push(self.sums_float[i]);
+            }
+        }
+        
+        (keys, counts, sums_int, sums_float)
+    }
+    
+    /// Check if direct counting is beneficial for given min/max range
+    /// Returns true if range is small enough to fit in L2 cache
+    #[inline]
+    pub fn is_beneficial(min_val: i64, max_val: i64) -> bool {
+        let range = max_val.saturating_sub(min_val) + 1;
+        // Use direct counting if range fits in ~256KB (L2 cache friendly)
+        // Each entry uses ~25 bytes (count + sum_int + sum_float + has_data)
+        range <= 10000 && range > 0
+    }
+}
+
 impl VectorizedHashAgg {
     pub fn new(is_int_key: bool, estimated_groups: usize) -> Self {
         // OPTIMIZATION: Pre-allocate with 2x estimated capacity to reduce rehashing
@@ -341,6 +434,150 @@ pub fn process_vector_group_by(
             }
         }
     }
+}
+
+/// Fast counting aggregation for dictionary-encoded string GROUP BY
+/// Uses dictionary index as direct array index (O(1) lookup)
+pub struct DictCountAgg {
+    /// Count per dictionary index
+    counts: Vec<i64>,
+    /// Sum values per dictionary index (for int aggregates)
+    sums_int: Vec<i64>,
+    /// Sum values per dictionary index (for float aggregates)
+    sums_float: Vec<f64>,
+    /// Dictionary size
+    dict_size: usize,
+}
+
+impl DictCountAgg {
+    pub fn new(dict_size: usize) -> Self {
+        Self {
+            counts: vec![0; dict_size + 1],  // +1 for null handling
+            sums_int: vec![0; dict_size + 1],
+            sums_float: vec![0.0; dict_size + 1],
+            dict_size,
+        }
+    }
+    
+    #[inline(always)]
+    pub fn update_count(&mut self, dict_idx: u32) {
+        let idx = dict_idx as usize;
+        if idx <= self.dict_size {
+            unsafe {
+                *self.counts.get_unchecked_mut(idx) += 1;
+            }
+        }
+    }
+    
+    #[inline(always)]
+    pub fn update_int(&mut self, dict_idx: u32, val: i64) {
+        let idx = dict_idx as usize;
+        if idx <= self.dict_size {
+            unsafe {
+                *self.counts.get_unchecked_mut(idx) += 1;
+                *self.sums_int.get_unchecked_mut(idx) += val;
+            }
+        }
+    }
+    
+    #[inline(always)]
+    pub fn update_float(&mut self, dict_idx: u32, val: f64) {
+        let idx = dict_idx as usize;
+        if idx <= self.dict_size {
+            unsafe {
+                *self.counts.get_unchecked_mut(idx) += 1;
+                *self.sums_float.get_unchecked_mut(idx) += val;
+            }
+        }
+    }
+    
+    /// Get results as (indices with data, counts, sums_int, sums_float)
+    pub fn to_results(&self) -> (Vec<u32>, Vec<i64>, Vec<i64>, Vec<f64>) {
+        let mut indices = Vec::new();
+        let mut counts = Vec::new();
+        let mut sums_int = Vec::new();
+        let mut sums_float = Vec::new();
+        
+        for i in 1..=self.dict_size {  // Skip 0 (NULL)
+            if self.counts[i] > 0 {
+                indices.push(i as u32);
+                counts.push(self.counts[i]);
+                sums_int.push(self.sums_int[i]);
+                sums_float.push(self.sums_float[i]);
+            }
+        }
+        
+        (indices, counts, sums_int, sums_float)
+    }
+}
+
+/// Fast GROUP BY for low-cardinality integer keys using direct counting
+/// Returns None if not applicable (key range too large or not integer column)
+pub fn try_direct_count_group_by(
+    batch: &RecordBatch,
+    group_col_name: &str,
+    agg_col_name: Option<&str>,
+) -> Option<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<f64>)> {
+    // Get group column - must be Int64
+    let group_col = batch.column_by_name(group_col_name)?;
+    let int_arr = group_col.as_any().downcast_ref::<Int64Array>()?;
+    
+    if int_arr.is_empty() {
+        return Some((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+    }
+    
+    // Compute min/max to check if direct counting is beneficial
+    let values = int_arr.values();
+    let mut min_val = i64::MAX;
+    let mut max_val = i64::MIN;
+    
+    // OPTIMIZATION: Use pointer-based min/max scan
+    let ptr = values.as_ptr();
+    let len = values.len();
+    for i in 0..len {
+        let v = unsafe { *ptr.add(i) };
+        if v < min_val { min_val = v; }
+        if v > max_val { max_val = v; }
+    }
+    
+    // Check if direct counting is beneficial
+    if !DirectCountAgg::is_beneficial(min_val, max_val) {
+        return None;
+    }
+    
+    let mut agg = DirectCountAgg::new(min_val, max_val);
+    
+    // Get aggregate column if specified
+    let agg_col = agg_col_name.and_then(|name| batch.column_by_name(name));
+    let agg_col_int: Option<&[i64]> = agg_col.as_ref().and_then(|c| {
+        c.as_any().downcast_ref::<Int64Array>().map(|a| a.values().as_ref())
+    });
+    let agg_col_float: Option<&[f64]> = agg_col.as_ref().and_then(|c| {
+        c.as_any().downcast_ref::<Float64Array>().map(|a| a.values().as_ref())
+    });
+    
+    // Process all rows with direct counting
+    if let Some(vals) = agg_col_int {
+        for i in 0..len {
+            let key = unsafe { *ptr.add(i) };
+            let val = unsafe { *vals.as_ptr().add(i) };
+            agg.update_int(key, val);
+        }
+    } else if let Some(vals) = agg_col_float {
+        for i in 0..len {
+            let key = unsafe { *ptr.add(i) };
+            let val = unsafe { *vals.as_ptr().add(i) };
+            agg.update_float(key, val);
+        }
+    } else {
+        // COUNT only
+        for i in 0..len {
+            let key = unsafe { *ptr.add(i) };
+            agg.update_count(key);
+        }
+    }
+    
+    Some(agg.to_results())
 }
 
 /// Execute vectorized GROUP BY on a RecordBatch
