@@ -1371,37 +1371,17 @@ impl OnDemandStorage {
         Self::open_for_write_with_durability(path, super::DurabilityLevel::Fast)
     }
     
-    /// Open for write with specified durability level - loads all existing data into memory for append operations
+    /// Open for write with specified durability level
+    /// Uses on-demand loading - does NOT load all existing data into memory
+    /// Data is loaded lazily when needed for specific operations
     pub fn open_for_write_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         if !path.exists() {
             return Self::create_with_durability(path, durability);
         }
         
-        let storage = Self::open_with_durability(path, durability)?;
-        
-        // Load all existing columns into memory for append operations
-        if storage.header.read().row_count > 0 {
-            let column_data = storage.read_columns(None, 0, None)?;
-            let schema = storage.schema.read();
-            let mut columns = storage.columns.write();
-            
-            for (col_idx, (col_name, col_type)) in schema.columns.iter().enumerate() {
-                if let Some(data) = column_data.get(col_name) {
-                    if col_idx < columns.len() {
-                        columns[col_idx] = data.clone();
-                    } else {
-                        columns.push(data.clone());
-                    }
-                } else {
-                    // Initialize empty column of correct type
-                    while columns.len() <= col_idx {
-                        columns.push(ColumnData::new(*col_type));
-                    }
-                }
-            }
-        }
-        
-        Ok(storage)
+        // Simply open the storage - no pre-loading of column data
+        // The on-demand read APIs will fetch data from disk when needed
+        Self::open_with_durability(path, durability)
     }
 
     // ========================================================================

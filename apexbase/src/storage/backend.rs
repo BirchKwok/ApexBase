@@ -1088,10 +1088,8 @@ impl TableStorageBackend {
         // Include _id column with filtered indices
         let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
         if include_id {
-            let all_ids = self.storage.read_ids(0, None)?;
-            let filtered_ids: Vec<i64> = matching_indices.iter()
-                .map(|&i| all_ids.get(i).copied().unwrap_or(0) as i64)
-                .collect();
+            // OPTIMIZED: Read only the IDs we need instead of all IDs
+            let filtered_ids = self.storage.read_ids_by_indices(&matching_indices)?;
             fields.push(Field::new("_id", ArrowDataType::Int64, false));
             arrays.push(Arc::new(Int64Array::from(filtered_ids)));
         }
@@ -1191,10 +1189,8 @@ impl TableStorageBackend {
         let mut arrays: Vec<ArrayRef> = Vec::new();
 
         // Include _id column
-        let all_ids = self.storage.read_ids(0, None)?;
-        let filtered_ids: Vec<i64> = row_indices.iter()
-            .map(|&i| all_ids.get(i).copied().unwrap_or(0) as i64)
-            .collect();
+        // OPTIMIZED: Read only the IDs we need instead of all IDs
+        let filtered_ids = self.storage.read_ids_by_indices(row_indices)?;
         fields.push(Field::new("_id", ArrowDataType::Int64, false));
         arrays.push(Arc::new(Int64Array::from(filtered_ids)));
 
@@ -1397,10 +1393,8 @@ impl TableStorageBackend {
         // Include _id column with filtered indices
         let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
         if include_id {
-            let all_ids = self.storage.read_ids(0, None)?;
-            let filtered_ids: Vec<i64> = matching_indices.iter()
-                .map(|&i| all_ids.get(i).copied().unwrap_or(0) as i64)
-                .collect();
+            // OPTIMIZED: Read only the IDs we need instead of all IDs
+            let filtered_ids = self.storage.read_ids_by_indices(&matching_indices)?;
             fields.push(Field::new("_id", ArrowDataType::Int64, false));
             arrays.push(Arc::new(Int64Array::from(filtered_ids)));
         }

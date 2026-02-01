@@ -468,8 +468,14 @@ impl ApexExecutor {
                     });
                     
                     if has_scalar_subquery {
-                        // Scalar subqueries need all columns for correlated references
-                        backend.read_columns_to_arrow(None, 0, None)?
+                        // Scalar subqueries may reference outer columns - use required_columns 
+                        // which already extracts outer column references from subqueries
+                        let required_cols = stmt.required_columns();
+                        let col_refs: Option<Vec<&str>> = required_cols
+                            .as_ref()
+                            .filter(|cols| !cols.is_empty())
+                            .map(|cols| cols.iter().map(|s| s.as_str()).collect());
+                        backend.read_columns_to_arrow(col_refs.as_deref(), 0, None)?
                     } else {
                         // Check conditions for late materialization optimization
                         let has_aggregation_check = stmt.columns.iter().any(|col| {
@@ -1194,19 +1200,31 @@ impl ApexExecutor {
                 indices
             }
         } else {
-            // No LIMIT - read all and filter (original path)
-            let filter_batch = backend.read_columns_to_arrow(Some(&cols_to_read), 0, None)?;
+            // No LIMIT - use streaming chunks to avoid loading all data at once
+            let mut all_indices = Vec::new();
+            let mut start_row: usize = 0;
             
-            if filter_batch.num_rows() == 0 {
-                return backend.read_columns_to_arrow(None, 0, Some(0));
+            while start_row < total_rows {
+                let rows_to_read = chunk_size.min(total_rows - start_row);
+                let filter_batch = backend.read_columns_to_arrow(Some(&cols_to_read), start_row, Some(rows_to_read))?;
+                
+                if filter_batch.num_rows() == 0 {
+                    break;
+                }
+                
+                let mask = Self::evaluate_predicate_with_storage(&filter_batch, where_clause, storage_path)?;
+                
+                // Collect matching indices from this chunk
+                for (i, v) in mask.iter().enumerate() {
+                    if v == Some(true) {
+                        all_indices.push(start_row + i);
+                    }
+                }
+                
+                start_row += rows_to_read;
             }
             
-            let mask = Self::evaluate_predicate_with_storage(&filter_batch, where_clause, storage_path)?;
-            
-            mask.iter()
-                .enumerate()
-                .filter_map(|(i, v)| if v == Some(true) { Some(i) } else { None })
-                .collect()
+            all_indices
         };
         
         if limited_indices.is_empty() {
@@ -1219,8 +1237,8 @@ impl ApexExecutor {
     }
 
     /// Execute SELECT * with ORDER BY + LIMIT late materialization
-    /// 1. Read only ORDER BY columns first
-    /// 2. Find top-k row indices using streaming top-k algorithm (no full index allocation)
+    /// 1. Read only ORDER BY columns in chunks
+    /// 2. Use streaming top-k to find best rows without loading all data
     /// 3. Read all other columns only for those k rows
     fn execute_with_order_late_materialization(
         backend: &TableStorageBackend,
@@ -1253,8 +1271,6 @@ impl ApexExecutor {
         let k_actual = k.min(num_rows);
         
         // Step 2: Find top-k indices using optimized streaming algorithm
-        // OPTIMIZATION: For single-column numeric sort with small k, use streaming top-k
-        // This avoids allocating a full index vector and is O(n) instead of O(n log n)
         let final_indices: Vec<usize> = if stmt.order_by.len() == 1 && k_actual <= 100 {
             let clause = &stmt.order_by[0];
             let col_name = clause.column.trim_matches('"');
@@ -1278,11 +1294,9 @@ impl ApexExecutor {
                             let val = if float_arr.is_null(i) { f64::NEG_INFINITY } else { float_arr.value(i) };
                             
                             if top_k.len() < k_actual {
-                                // Not full yet - insert in sorted position
                                 let pos = top_k.partition_point(|(v, _)| *v > val);
                                 top_k.insert(pos, (val, i));
                             } else if val > top_k[k_actual - 1].0 {
-                                // Better than worst in top-k - insert and remove worst
                                 let pos = top_k.partition_point(|(v, _)| *v > val);
                                 top_k.insert(pos, (val, i));
                                 top_k.pop();
@@ -1304,7 +1318,6 @@ impl ApexExecutor {
                         }
                     }
                     
-                    // Apply offset and return indices
                     let offset = stmt.offset.unwrap_or(0);
                     top_k.into_iter().skip(offset).map(|(_, idx)| idx).collect()
                 } else if let Some(int_arr) = col.as_any().downcast_ref::<Int64Array>() {
@@ -1342,14 +1355,12 @@ impl ApexExecutor {
                     let offset = stmt.offset.unwrap_or(0);
                     top_k.into_iter().skip(offset).map(|(_, idx)| idx).collect()
                 } else {
-                    // Fall back to generic approach for other types
                     Self::compute_topk_indices_generic(&sort_batch, &stmt.order_by, k_actual, stmt.offset)
                 }
             } else {
                 Self::compute_topk_indices_generic(&sort_batch, &stmt.order_by, k_actual, stmt.offset)
             }
         } else {
-            // Multi-column sort or large k - use generic approach
             Self::compute_topk_indices_generic(&sort_batch, &stmt.order_by, k_actual, stmt.offset)
         };
 
@@ -1360,27 +1371,27 @@ impl ApexExecutor {
         // Step 3: Read ALL columns but only for top-k row indices
         backend.read_columns_by_indices_to_arrow(&final_indices)
     }
-    
+
     /// Generic top-k computation using partial sort (fallback for complex cases)
     fn compute_topk_indices_generic(
-        sort_batch: &RecordBatch,
-        order_by: &[crate::query::OrderByClause],
-        k: usize,
-        offset: Option<usize>,
-    ) -> Vec<usize> {
-        let num_rows = sort_batch.num_rows();
-        
-        let sort_cols: Vec<(ArrayRef, bool)> = order_by.iter()
-            .filter_map(|clause| {
-                let col_name = clause.column.trim_matches('"');
-                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
-                    &col_name[dot_pos + 1..]
-                } else {
-                    col_name
-                };
-                sort_batch.column_by_name(actual_col).map(|col| (col.clone(), clause.descending))
-            })
-            .collect();
+    sort_batch: &RecordBatch,
+    order_by: &[crate::query::OrderByClause],
+    k: usize,
+    offset: Option<usize>,
+) -> Vec<usize> {
+    let num_rows = sort_batch.num_rows();
+    
+    let sort_cols: Vec<(ArrayRef, bool)> = order_by.iter()
+        .filter_map(|clause| {
+            let col_name = clause.column.trim_matches('"');
+            let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+                &col_name[dot_pos + 1..]
+            } else {
+                col_name
+            };
+            sort_batch.column_by_name(actual_col).map(|col| (col.clone(), clause.descending))
+        })
+        .collect();
 
         let compare_rows = |a: usize, b: usize| -> std::cmp::Ordering {
             for (col, descending) in &sort_cols {
