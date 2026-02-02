@@ -1422,6 +1422,19 @@ impl OnDemandStorage {
         let row_count = storage.header.read().row_count as usize;
         if row_count > 0 {
             storage.load_all_columns_into_memory()?;
+        } else {
+            // Even with 0 rows, initialize empty columns based on schema
+            // This is needed for INSERT after ALTER TABLE (columns defined but no data)
+            let schema = storage.schema.read();
+            let mut columns = storage.columns.write();
+            let mut nulls = storage.nulls.write();
+            
+            if columns.is_empty() && schema.column_count() > 0 {
+                for (_name, col_type) in schema.columns.iter() {
+                    columns.push(ColumnData::new(*col_type));
+                    nulls.push(Vec::new());
+                }
+            }
         }
         
         Ok(storage)
@@ -1965,7 +1978,8 @@ impl OnDemandStorage {
                     let str_len = u32::from_le_bytes(str_len_buf) as usize;
                     let mut str_buf = vec![0u8; str_len];
                     file.read_exact(&mut str_buf)?;
-                    values.push(String::from_utf8_lossy(&str_buf).to_string());
+                    let val = String::from_utf8_lossy(&str_buf).to_string();
+                    values.push(val);
                 }
                 string_columns.insert(name, values);
             }
@@ -3966,80 +3980,51 @@ impl OnDemandStorage {
             let mut nulls = self.nulls.write();
             let existing_row_count = self.ids.read().len();
 
+            // First, add any new columns to schema
             for name in int_columns.keys() {
-                let is_new = schema.get_index(name).is_none();
-                let idx = schema.add_column(name, ColumnType::Int64);
-                while columns.len() <= idx {
-                    let mut col = ColumnData::new(ColumnType::Int64);
-                    // Pad with defaults for existing rows if this is a new column
-                    if is_new && existing_row_count > 0 {
-                        if let ColumnData::Int64(v) = &mut col {
-                            v.resize(existing_row_count, 0);
-                        }
-                    }
-                    columns.push(col);
-                    nulls.push(Vec::new());
-                }
+                schema.add_column(name, ColumnType::Int64);
             }
             for name in float_columns.keys() {
-                let is_new = schema.get_index(name).is_none();
-                let idx = schema.add_column(name, ColumnType::Float64);
-                while columns.len() <= idx {
-                    let mut col = ColumnData::new(ColumnType::Float64);
-                    if is_new && existing_row_count > 0 {
-                        if let ColumnData::Float64(v) = &mut col {
-                            v.resize(existing_row_count, 0.0);
-                        }
-                    }
-                    columns.push(col);
-                    nulls.push(Vec::new());
-                }
+                schema.add_column(name, ColumnType::Float64);
             }
             for name in string_columns.keys() {
-                let is_new = schema.get_index(name).is_none();
-                let idx = schema.add_column(name, ColumnType::String);
-                while columns.len() <= idx {
-                    let mut col = ColumnData::new(ColumnType::String);
-                    if is_new && existing_row_count > 0 {
-                        if let ColumnData::String { offsets, .. } = &mut col {
-                            for _ in 0..existing_row_count {
-                                offsets.push(0); // Empty string offset
-                            }
-                        }
-                    }
-                    columns.push(col);
-                    nulls.push(Vec::new());
-                }
+                schema.add_column(name, ColumnType::String);
             }
             for name in binary_columns.keys() {
-                let is_new = schema.get_index(name).is_none();
-                let idx = schema.add_column(name, ColumnType::Binary);
-                while columns.len() <= idx {
-                    let mut col = ColumnData::new(ColumnType::Binary);
-                    if is_new && existing_row_count > 0 {
-                        if let ColumnData::Binary { offsets, .. } = &mut col {
+                schema.add_column(name, ColumnType::Binary);
+            }
+            for name in bool_columns.keys() {
+                schema.add_column(name, ColumnType::Bool);
+            }
+
+            // Then, ensure columns vector matches schema (using correct types from schema)
+            while columns.len() < schema.column_count() {
+                let col_idx = columns.len();
+                let (_, col_type) = &schema.columns[col_idx];
+                let mut col = ColumnData::new(*col_type);
+                // Pad with defaults for existing rows
+                if existing_row_count > 0 {
+                    match &mut col {
+                        ColumnData::Int64(v) => v.resize(existing_row_count, 0),
+                        ColumnData::Float64(v) => v.resize(existing_row_count, 0.0),
+                        ColumnData::String { offsets, .. } => {
                             for _ in 0..existing_row_count {
                                 offsets.push(0);
                             }
                         }
-                    }
-                    columns.push(col);
-                    nulls.push(Vec::new());
-                }
-            }
-            for name in bool_columns.keys() {
-                let is_new = schema.get_index(name).is_none();
-                let idx = schema.add_column(name, ColumnType::Bool);
-                while columns.len() <= idx {
-                    let mut col = ColumnData::new(ColumnType::Bool);
-                    if is_new && existing_row_count > 0 {
-                        if let ColumnData::Bool { len, .. } = &mut col {
+                        ColumnData::Binary { offsets, .. } => {
+                            for _ in 0..existing_row_count {
+                                offsets.push(0);
+                            }
+                        }
+                        ColumnData::Bool { len, .. } => {
                             *len = existing_row_count;
                         }
+                        _ => {}
                     }
-                    columns.push(col);
-                    nulls.push(Vec::new());
                 }
+                columns.push(col);
+                nulls.push(Vec::new());
             }
         }
 
@@ -4063,7 +4048,13 @@ impl OnDemandStorage {
             }
             for (name, values) in string_columns {
                 if let Some(idx) = schema.get_index(&name) {
-                    columns[idx].extend_strings(&values);
+                    if idx < columns.len() {
+                        // Fix type mismatch: if schema says String but column isn't, recreate it
+                        if !matches!(&columns[idx], ColumnData::String { .. }) {
+                            columns[idx] = ColumnData::new(ColumnType::String);
+                        }
+                        columns[idx].extend_strings(&values);
+                    }
                 }
             }
             for (name, values) in binary_columns {

@@ -666,8 +666,13 @@ class ApexClient:
             return rv
     
     def _validate_table_in_sql(self, sql: str) -> None:
-        """Validate that table names in SQL exist"""
+        """Validate that table names in SQL exist (skip for multi-statement SQL)"""
         import re
+        
+        # Skip validation for multi-statement SQL (contains CREATE TABLE/VIEW)
+        # Let Rust backend handle validation for these cases
+        if re.search(r"\bcreate\s+(table|view)\b", sql, flags=re.IGNORECASE):
+            return
         
         # Extract table name from FROM clause
         m = re.search(r"\bfrom\s+(\w+)", sql, flags=re.IGNORECASE)

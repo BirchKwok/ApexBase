@@ -376,7 +376,7 @@ impl ApexExecutor {
                 if select.joins.is_empty() {
                     // Resolve the actual table path from FROM clause for non-join queries
                     let actual_path = Self::resolve_from_table_path(&select, base_dir, default_table_path);
-                    Self::execute_select(select, &actual_path)
+                    Self::execute_select_with_base_dir(select, &actual_path, base_dir, default_table_path)
                 } else {
                     Self::execute_select_with_joins(select, base_dir, default_table_path)
                 }
@@ -464,6 +464,7 @@ impl ApexExecutor {
     }
 
     fn rewrite_select_views(mut select: SelectStatement, views: &AHashMap<String, SelectStatement>) -> SelectStatement {
+        // Rewrite FROM clause if it references a VIEW
         if let Some(from) = &select.from {
             match from {
                 FromItem::Table { table, alias } => {
@@ -480,21 +481,43 @@ impl ApexExecutor {
             }
         }
 
+        // Rewrite JOIN clauses if they reference VIEWs
+        let mut new_joins = Vec::with_capacity(select.joins.len());
+        for mut join in select.joins {
+            if let FromItem::Table { table, alias } = &join.right {
+                let table_name = table.trim_matches('"');
+                if let Some(view_stmt) = views.get(table_name) {
+                    let alias_name = alias.clone().unwrap_or_else(|| table_name.to_string());
+                    join.right = FromItem::Subquery {
+                        stmt: Box::new(view_stmt.clone()),
+                        alias: alias_name,
+                    };
+                }
+            }
+            new_joins.push(join);
+        }
+        select.joins = new_joins;
+
         select
     }
 
-    /// Execute SELECT statement
+    /// Execute SELECT statement (legacy - uses storage_path for subqueries too)
     fn execute_select(stmt: SelectStatement, storage_path: &Path) -> io::Result<ApexResult> {
+        // Delegate to the base_dir version, using storage_path's parent as base_dir
+        let base_dir = storage_path.parent().unwrap_or(storage_path);
+        Self::execute_select_with_base_dir(stmt, storage_path, base_dir, storage_path)
+    }
+
+    /// Execute SELECT statement with base_dir for proper subquery table resolution
+    fn execute_select_with_base_dir(stmt: SelectStatement, storage_path: &Path, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
         // FAST PATH: Pure COUNT(*) without WHERE/GROUP BY - O(1) from metadata
         if Self::is_pure_count_star(&stmt) {
             if !storage_path.exists() {
                 return Ok(ApexResult::Scalar(0));
             }
             let backend = get_cached_backend(storage_path)?;
-            // Use active_row_count() to exclude soft-deleted rows
             let count = backend.active_row_count() as i64;
             
-            // Build result with proper column name
             let output_name = if let Some(SelectColumn::Aggregate { alias, .. }) = stmt.columns.first() {
                 alias.clone().unwrap_or_else(|| "COUNT(*)".to_string())
             } else {
@@ -509,11 +532,12 @@ impl ApexExecutor {
             return Ok(ApexResult::Data(batch));
         }
         
-        // Check for derived table (FROM subquery)
+        // Check for derived table (FROM subquery) - resolve table path from subquery's FROM clause
         let batch = match &stmt.from {
             Some(FromItem::Subquery { stmt: sub_stmt, .. }) => {
-                // Execute subquery first to get source data
-                let sub_result = Self::execute_select(*sub_stmt.clone(), storage_path)?;
+                // Resolve the actual table path from the subquery's FROM clause
+                let sub_path = Self::resolve_from_table_path(sub_stmt, base_dir, default_table_path);
+                let sub_result = Self::execute_select_with_base_dir(*sub_stmt.clone(), &sub_path, base_dir, default_table_path)?;
                 sub_result.to_record_batch()?
             }
             _ => {
@@ -1838,39 +1862,40 @@ impl ApexExecutor {
 
     /// Execute SELECT statement with JOINs
     fn execute_select_with_joins(stmt: SelectStatement, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
-        // Get the left (base) table
-        let left_table_name = match &stmt.from {
-            Some(FromItem::Table { table, .. }) => table.clone(),
-            Some(FromItem::Subquery { .. }) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "Subquery in FROM clause not yet supported",
-                ));
+        // Get the left (base) table - supports both Table and Subquery (VIEW)
+        let mut result_batch = match &stmt.from {
+            Some(FromItem::Table { table, .. }) => {
+                let left_path = Self::resolve_table_path(table, base_dir, default_table_path);
+                let left_backend = get_cached_backend(&left_path)?;
+                left_backend.read_columns_to_arrow(None, 0, None)?
             }
-            None => "default".to_string(),
+            Some(FromItem::Subquery { stmt: sub_stmt, .. }) => {
+                // Execute subquery (VIEW) to get source data
+                let sub_path = Self::resolve_from_table_path(sub_stmt, base_dir, default_table_path);
+                let sub_result = Self::execute_select_with_base_dir(*sub_stmt.clone(), &sub_path, base_dir, default_table_path)?;
+                sub_result.to_record_batch()?
+            }
+            None => {
+                let left_backend = get_cached_backend(default_table_path)?;
+                left_backend.read_columns_to_arrow(None, 0, None)?
+            }
         };
 
-        // Load left table
-        let left_path = Self::resolve_table_path(&left_table_name, base_dir, default_table_path);
-        let left_backend = get_cached_backend(&left_path)?;
-        let mut result_batch = left_backend.read_columns_to_arrow(None, 0, None)?;
-
-        // Process each JOIN clause
+        // Process each JOIN clause - supports both Table and Subquery (VIEW)
         for join_clause in &stmt.joins {
-            let right_table_name = match &join_clause.right {
-                FromItem::Table { table, .. } => table.clone(),
-                FromItem::Subquery { .. } => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "Subquery in JOIN not yet supported",
-                    ));
+            let right_batch = match &join_clause.right {
+                FromItem::Table { table, .. } => {
+                    let right_path = Self::resolve_table_path(table, base_dir, default_table_path);
+                    let right_backend = get_cached_backend(&right_path)?;
+                    right_backend.read_columns_to_arrow(None, 0, None)?
+                }
+                FromItem::Subquery { stmt: sub_stmt, .. } => {
+                    // Execute subquery (VIEW) to get source data
+                    let sub_path = Self::resolve_from_table_path(sub_stmt, base_dir, default_table_path);
+                    let sub_result = Self::execute_select_with_base_dir(*sub_stmt.clone(), &sub_path, base_dir, default_table_path)?;
+                    sub_result.to_record_batch()?
                 }
             };
-
-            // Load right table
-            let right_path = Self::resolve_table_path(&right_table_name, base_dir, default_table_path);
-            let right_backend = get_cached_backend(&right_path)?;
-            let right_batch = right_backend.read_columns_to_arrow(None, 0, None)?;
 
             // Extract join keys from ON condition
             let (left_key, right_key) = Self::extract_join_keys(&join_clause.on)?;
@@ -9112,7 +9137,6 @@ impl ApexExecutor {
     // ========== DML Execution Methods ==========
 
     /// Execute INSERT statement
-    /// High-performance: uses delta file for memory efficiency (doesn't load existing data)
     fn execute_insert(
         storage_path: &Path,
         columns: Option<&[String]>,
@@ -9130,8 +9154,8 @@ impl ApexExecutor {
         // Invalidate cache before write
         invalidate_storage_cache(storage_path);
         
-        // Use memory-efficient open_for_insert (doesn't load column data)
-        let storage = TableStorageBackend::open_for_insert(storage_path)?;
+        // Use open_for_write to load all data (needed for correct column alignment)
+        let storage = TableStorageBackend::open_for_write(storage_path)?;
         
         // Get column names from schema or explicit list
         let col_names: Vec<String> = if let Some(cols) = columns {
@@ -9140,28 +9164,34 @@ impl ApexExecutor {
             storage.get_schema().iter().map(|(n, _)| n.clone()).collect()
         };
         
-        // Convert values to rows format - optimized batch allocation
-        let mut rows: Vec<HashMap<String, Value>> = Vec::with_capacity(values.len());
+        // Build typed column data from values
+        let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
+        let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
         
         for row_values in values {
-            let mut row: HashMap<String, Value> = HashMap::with_capacity(col_names.len());
             for (i, value) in row_values.iter().enumerate() {
                 if i < col_names.len() {
-                    row.insert(col_names[i].clone(), value.clone());
+                    let col_name = &col_names[i];
+                    match value {
+                        Value::Int64(v) => int_columns.entry(col_name.clone()).or_default().push(*v),
+                        Value::Int32(v) => int_columns.entry(col_name.clone()).or_default().push(*v as i64),
+                        Value::Float64(v) => float_columns.entry(col_name.clone()).or_default().push(*v),
+                        Value::Float32(v) => float_columns.entry(col_name.clone()).or_default().push(*v as f64),
+                        Value::String(v) => string_columns.entry(col_name.clone()).or_default().push(v.clone()),
+                        Value::Bool(v) => bool_columns.entry(col_name.clone()).or_default().push(*v),
+                        _ => {}
+                    }
                 }
             }
-            rows.push(row);
         }
         
-        let rows_inserted = rows.len() as i64;
+        let rows_inserted = values.len() as i64;
         
-        // Use delta file for memory-efficient insert
-        storage.insert_rows_to_delta(&rows)?;
-        
-        // Auto-compact if needed (threshold check inside insert_rows_to_delta)
-        if storage.needs_compaction() {
-            storage.compact()?;
-        }
+        // Use insert_typed + save for reliable writes
+        storage.insert_typed(int_columns, float_columns, string_columns, HashMap::new(), bool_columns)?;
+        storage.save()?;
         
         // Invalidate cache after write to ensure subsequent reads get fresh data
         invalidate_storage_cache(storage_path);
