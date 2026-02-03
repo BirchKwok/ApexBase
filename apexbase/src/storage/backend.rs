@@ -219,12 +219,29 @@ pub struct TableStorageBackend {
 }
 
 impl TableStorageBackend {
-    /// Create a new storage backend with default durability (Fast)
+    /// Helper to build Self from storage (reduces code duplication)
+    #[inline]
+    fn from_storage(path: &Path, storage: OnDemandStorage) -> Self {
+        let storage_schema = storage.get_schema();
+        let schema: Vec<(String, DataType)> = storage_schema
+            .into_iter()
+            .map(|(name, ct)| (name, column_type_to_datatype(ct)))
+            .collect();
+        let row_count = storage.row_count();
+        Self {
+            path: path.to_path_buf(),
+            storage,
+            cached_columns: RwLock::new(HashMap::new()),
+            schema: RwLock::new(schema),
+            row_count: RwLock::new(row_count),
+            dirty: RwLock::new(false),
+        }
+    }
+
     pub fn create(path: &Path) -> io::Result<Self> {
         Self::create_with_durability(path, super::DurabilityLevel::Fast)
     }
     
-    /// Create a new storage backend with specified durability level
     pub fn create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         let storage = OnDemandStorage::create_with_durability(path, durability)?;
         Ok(Self {
@@ -237,40 +254,19 @@ impl TableStorageBackend {
         })
     }
 
-    /// Open existing storage with default durability (Fast)
     pub fn open(path: &Path) -> io::Result<Self> {
         Self::open_with_durability(path, super::DurabilityLevel::Fast)
     }
     
-    /// Open existing storage with specified durability level
     pub fn open_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         let storage = OnDemandStorage::open_with_durability(path, durability)?;
-        
-        // Read schema from storage
-        let storage_schema = storage.get_schema();
-        let schema: Vec<(String, DataType)> = storage_schema
-            .into_iter()
-            .map(|(name, ct)| (name, column_type_to_datatype(ct)))
-            .collect();
-        
-        let row_count = storage.row_count();
-        
-        Ok(Self {
-            path: path.to_path_buf(),
-            storage,
-            cached_columns: RwLock::new(HashMap::new()),
-            schema: RwLock::new(schema),
-            row_count: RwLock::new(row_count),
-            dirty: RwLock::new(false),
-        })
+        Ok(Self::from_storage(path, storage))
     }
 
-    /// Open or create storage with default durability (Fast)
     pub fn open_or_create(path: &Path) -> io::Result<Self> {
         Self::open_or_create_with_durability(path, super::DurabilityLevel::Fast)
     }
     
-    /// Open or create storage with specified durability level
     pub fn open_or_create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         if path.exists() {
             Self::open_with_durability(path, durability)
@@ -279,87 +275,31 @@ impl TableStorageBackend {
         }
     }
 
-    /// Open for write with default durability (Fast)
     pub fn open_for_write(path: &Path) -> io::Result<Self> {
         Self::open_for_write_with_durability(path, super::DurabilityLevel::Fast)
     }
     
-    /// Open for write with specified durability level - loads all existing data for append operations
     pub fn open_for_write_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         let storage = OnDemandStorage::open_for_write_with_durability(path, durability)?;
-        
-        let storage_schema = storage.get_schema();
-        let schema: Vec<(String, DataType)> = storage_schema
-            .into_iter()
-            .map(|(name, ct)| (name, column_type_to_datatype(ct)))
-            .collect();
-        
-        let row_count = storage.row_count();
-        
-        Ok(Self {
-            path: path.to_path_buf(),
-            storage,
-            cached_columns: RwLock::new(HashMap::new()),
-            schema: RwLock::new(schema),
-            row_count: RwLock::new(row_count),
-            dirty: RwLock::new(false),
-        })
+        Ok(Self::from_storage(path, storage))
     }
     
-    /// Open for INSERT only - memory efficient! Only loads metadata, not column data.
     pub fn open_for_insert(path: &Path) -> io::Result<Self> {
         Self::open_for_insert_with_durability(path, super::DurabilityLevel::Fast)
     }
     
-    /// Open for INSERT with specified durability - memory efficient!
     pub fn open_for_insert_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         let storage = OnDemandStorage::open_for_insert_with_durability(path, durability)?;
-        
-        let storage_schema = storage.get_schema();
-        let schema: Vec<(String, DataType)> = storage_schema
-            .into_iter()
-            .map(|(name, ct)| (name, column_type_to_datatype(ct)))
-            .collect();
-        
-        let row_count = storage.row_count();
-        
-        Ok(Self {
-            path: path.to_path_buf(),
-            storage,
-            cached_columns: RwLock::new(HashMap::new()),
-            schema: RwLock::new(schema),
-            row_count: RwLock::new(row_count),
-            dirty: RwLock::new(false),
-        })
+        Ok(Self::from_storage(path, storage))
     }
     
-    /// Open for SCHEMA changes only - MOST memory efficient!
-    /// Only loads header, schema, and column index. Does NOT load IDs or column data.
-    /// Use for: ALTER TABLE ADD/DROP/RENAME COLUMN, TRUNCATE
     pub fn open_for_schema_change(path: &Path) -> io::Result<Self> {
         Self::open_for_schema_change_with_durability(path, super::DurabilityLevel::Fast)
     }
     
-    /// Open for SCHEMA changes with specified durability - MOST memory efficient!
     pub fn open_for_schema_change_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         let storage = OnDemandStorage::open_for_schema_change_with_durability(path, durability)?;
-        
-        let storage_schema = storage.get_schema();
-        let schema: Vec<(String, DataType)> = storage_schema
-            .into_iter()
-            .map(|(name, ct)| (name, column_type_to_datatype(ct)))
-            .collect();
-        
-        let row_count = storage.row_count();
-        
-        Ok(Self {
-            path: path.to_path_buf(),
-            storage,
-            cached_columns: RwLock::new(HashMap::new()),
-            schema: RwLock::new(schema),
-            row_count: RwLock::new(row_count),
-            dirty: RwLock::new(false),
-        })
+        Ok(Self::from_storage(path, storage))
     }
     
     /// Insert rows to delta file (memory efficient - doesn't load existing column data)
@@ -688,6 +628,66 @@ impl TableStorageBackend {
         Ok(ids)
     }
 
+    /// Insert typed columns with null tracking - supports NULL values
+    pub fn insert_typed_with_nulls(
+        &self,
+        int_columns: HashMap<String, Vec<i64>>,
+        float_columns: HashMap<String, Vec<f64>>,
+        string_columns: HashMap<String, Vec<String>>,
+        binary_columns: HashMap<String, Vec<Vec<u8>>>,
+        bool_columns: HashMap<String, Vec<bool>>,
+        null_positions: HashMap<String, Vec<bool>>,
+    ) -> io::Result<Vec<u64>> {
+        // Delegate to storage with null tracking
+        let ids = self.storage.insert_typed_with_nulls(
+            int_columns.clone(), 
+            float_columns.clone(), 
+            string_columns.clone(), 
+            binary_columns.clone(), 
+            bool_columns.clone(),
+            null_positions
+        )?;
+
+        // Update schema if new columns
+        {
+            let mut schema = self.schema.write();
+            for name in int_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Int64));
+                }
+            }
+            for name in float_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Float64));
+                }
+            }
+            for name in string_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::String));
+                }
+            }
+            for name in binary_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Binary));
+                }
+            }
+            for name in bool_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Bool));
+                }
+            }
+        }
+
+        // Update row count
+        *self.row_count.write() += ids.len() as u64;
+
+        // Invalidate cache (data changed)
+        self.cached_columns.write().clear();
+        *self.dirty.write() = true;
+
+        Ok(ids)
+    }
+
     /// Save changes to disk
     pub fn save(&self) -> io::Result<()> {
         self.storage.save()?;
@@ -831,17 +831,20 @@ impl TableStorageBackend {
         Ok(())
     }
 
-    /// Drop a column from the schema
+    /// Drop a column from the schema and storage
     pub fn drop_column(&self, name: &str) -> io::Result<()> {
+        // Drop from underlying storage (removes schema, data, nulls, index)
+        self.storage.drop_column(name)?;
+        
+        // Also update the cached schema
         let mut schema = self.schema.write();
         let pos = schema.iter().position(|(n, _)| n == name);
         if let Some(idx) = pos {
             schema.remove(idx);
-            *self.dirty.write() = true;
-            Ok(())
-        } else {
-            Err(io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", name)))
         }
+        
+        *self.dirty.write() = true;
+        Ok(())
     }
 
     /// Rename a column
@@ -980,32 +983,49 @@ impl TableStorageBackend {
             schema.iter().map(|(n, _)| n.clone()).collect()
         };
 
+        // Get actual start_row and row_count for null mask lookup
+        let actual_start = start_row;
+        let actual_count = expected_row_count;
+        
         for col_name in &col_order {
+            // Get null mask for this column
+            let null_mask = self.storage.get_null_mask(col_name, actual_start, actual_count);
+            let has_nulls = null_mask.iter().any(|&is_null| is_null);
+            
             // Use remove() to take ownership and avoid clone
             if let Some(data) = col_data.remove(col_name) {
                 let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
                     ColumnData::Int64(values) => {
-                        // Zero-copy: take ownership of the Vec directly
-                        if values.len() < expected_row_count {
+                        // Apply null mask if there are any nulls
+                        if has_nulls {
+                            let with_nulls: Vec<Option<i64>> = values.into_iter()
+                                .enumerate()
+                                .map(|(i, v)| if i < null_mask.len() && null_mask[i] { None } else { Some(v) })
+                                .collect();
+                            (ArrowDataType::Int64, Arc::new(Int64Array::from(with_nulls)))
+                        } else if values.len() < expected_row_count {
                             let mut padded: Vec<Option<i64>> = values.into_iter().map(Some).collect();
                             padded.extend(std::iter::repeat(None).take(expected_row_count - padded.len()));
                             (ArrowDataType::Int64, Arc::new(Int64Array::from(padded)))
                         } else if values.len() > expected_row_count {
-                            // Truncate to expected row count
                             let truncated: Vec<i64> = values.into_iter().take(expected_row_count).collect();
                             (ArrowDataType::Int64, Arc::new(Int64Array::from(truncated)))
                         } else {
-                            // Direct conversion without clone
                             (ArrowDataType::Int64, Arc::new(Int64Array::from(values)))
                         }
                     }
                     ColumnData::Float64(values) => {
-                        if values.len() < expected_row_count {
+                        if has_nulls {
+                            let with_nulls: Vec<Option<f64>> = values.into_iter()
+                                .enumerate()
+                                .map(|(i, v)| if i < null_mask.len() && null_mask[i] { None } else { Some(v) })
+                                .collect();
+                            (ArrowDataType::Float64, Arc::new(Float64Array::from(with_nulls)))
+                        } else if values.len() < expected_row_count {
                             let mut padded: Vec<Option<f64>> = values.into_iter().map(Some).collect();
                             padded.extend(std::iter::repeat(None).take(expected_row_count - padded.len()));
                             (ArrowDataType::Float64, Arc::new(Float64Array::from(padded)))
                         } else if values.len() > expected_row_count {
-                            // Truncate to expected row count
                             let truncated: Vec<f64> = values.into_iter().take(expected_row_count).collect();
                             (ArrowDataType::Float64, Arc::new(Float64Array::from(truncated)))
                         } else {
@@ -1013,48 +1033,39 @@ impl TableStorageBackend {
                         }
                     }
                     ColumnData::String { offsets, data: bytes } => {
-                        // OPTIMIZATION: Build StringArray directly from offsets and data buffers
-                        // Avoids per-element iteration and String allocation
-                        use arrow::buffer::{Buffer, OffsetBuffer};
-                        use arrow::array::GenericStringArray;
-                        
+                        // Build StringArray with null mask support
                         let count = offsets.len().saturating_sub(1);
                         
-                        if count == expected_row_count {
-                            // Fast path: direct buffer construction (zero-copy for offsets)
-                            // Convert u32 offsets to i32 for Arrow
-                            let arrow_offsets: Vec<i32> = offsets.iter().map(|&o| o as i32).collect();
-                            let offset_buffer = OffsetBuffer::new(arrow_offsets.into());
-                            let data_buffer = Buffer::from(bytes);
-                            
-                            // SAFETY: We trust the offsets are valid UTF-8 boundaries
-                            let string_array = unsafe {
-                                GenericStringArray::<i32>::new_unchecked(offset_buffer, data_buffer, None)
-                            };
-                            (ArrowDataType::Utf8, Arc::new(string_array) as ArrayRef)
+                        // Always use the path that supports nulls when has_nulls is true
+                        let strings: Vec<Option<String>> = (0..count.min(expected_row_count))
+                            .map(|i| {
+                                // Check null mask first
+                                if has_nulls && i < null_mask.len() && null_mask[i] {
+                                    return None;
+                                }
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                std::str::from_utf8(&bytes[start..end])
+                                    .ok()
+                                    .map(|s| s.to_string())
+                            })
+                            .collect();
+                        
+                        if strings.len() < expected_row_count {
+                            let mut owned = strings;
+                            owned.extend(std::iter::repeat(None).take(expected_row_count - owned.len()));
+                            (ArrowDataType::Utf8, Arc::new(StringArray::from(owned)))
                         } else {
-                            // Fallback: standard conversion for mismatched counts
-                            let strings: Vec<Option<&str>> = (0..count.min(expected_row_count))
-                                .map(|i| {
-                                    let start = offsets[i] as usize;
-                                    let end = offsets[i + 1] as usize;
-                                    std::str::from_utf8(&bytes[start..end]).ok()
-                                })
-                                .collect();
-                            if strings.len() < expected_row_count {
-                                let mut owned: Vec<Option<String>> = strings.into_iter()
-                                    .map(|s| s.map(|s| s.to_string()))
-                                    .collect();
-                                owned.extend(std::iter::repeat(None).take(expected_row_count - owned.len()));
-                                (ArrowDataType::Utf8, Arc::new(StringArray::from(owned)))
-                            } else {
-                                (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
-                            }
+                            (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
                         }
                     }
                     ColumnData::Bool { data: packed, len } => {
                         let mut bools: Vec<Option<bool>> = (0..len)
                             .map(|i| {
+                                // Check null mask first
+                                if has_nulls && i < null_mask.len() && null_mask[i] {
+                                    return None;
+                                }
                                 let byte_idx = i / 8;
                                 let bit_idx = i % 8;
                                 Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
@@ -2248,6 +2259,54 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn test_backend_bool_null() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_bool_null.apex");
+
+        // Create and insert with NULL boolean - mimics Python client flow
+        {
+            let backend = TableStorageBackend::create(&path).unwrap();
+            
+            let mut row1 = HashMap::new();
+            row1.insert("id".to_string(), Value::Int64(1));
+            row1.insert("flag".to_string(), Value::Bool(true));
+            
+            let mut row2 = HashMap::new();
+            row2.insert("id".to_string(), Value::Int64(2));
+            row2.insert("flag".to_string(), Value::Bool(false));
+            
+            let mut row3 = HashMap::new();
+            row3.insert("id".to_string(), Value::Int64(3));
+            row3.insert("flag".to_string(), Value::Null);  // NULL boolean
+            
+            let ids = backend.insert_rows(&[row1, row2, row3]).unwrap();
+            assert_eq!(ids.len(), 3);
+            
+            backend.save().unwrap();
+        }
+
+        // Reopen and check null mask
+        {
+            let backend = TableStorageBackend::open(&path).unwrap();
+            
+            // Check null mask via storage
+            let null_mask = backend.storage.get_null_mask("flag", 0, 3);
+            println!("Null mask via backend: {:?}", null_mask);
+            assert_eq!(null_mask, vec![false, false, true], "Row 2 should be NULL");
+            
+            // Check via Arrow conversion
+            let batch = backend.read_columns_to_arrow(None, 0, None).unwrap();
+            println!("Arrow batch schema: {:?}", batch.schema());
+            
+            // Find flag column and check nulls
+            let flag_idx = batch.schema().index_of("flag").unwrap();
+            let flag_col = batch.column(flag_idx);
+            println!("Flag column null count: {}", flag_col.null_count());
+            assert_eq!(flag_col.null_count(), 1, "Should have 1 null value");
+        }
+    }
+
+    #[test]
     fn test_backend_create_and_open() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.apex");
@@ -2484,6 +2543,147 @@ mod tests {
             // Read last 2 rows
             let batch3 = backend.read_columns_to_arrow(None, 8, Some(10)).unwrap();
             assert_eq!(batch3.num_rows(), 2); // Only 2 rows left
+        }
+    }
+
+    #[test]
+    fn test_progressive_schema() {
+        use crate::data::Value;
+        use arrow::array::StringArray;
+        
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_progressive.apex");
+
+        // Step 1: Create table and insert first row with column 'a'
+        {
+            let backend = TableStorageBackend::create(&path).unwrap();
+            let mut row = HashMap::new();
+            row.insert("a".to_string(), Value::Int64(1));
+            backend.insert_rows(&[row]).unwrap();
+            backend.save().unwrap();
+            
+            println!("After first insert:");
+            let batch = backend.read_columns_to_arrow(None, 0, None).unwrap();
+            println!("  num_rows: {}", batch.num_rows());
+            println!("  schema: {:?}", batch.schema().fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+        }
+
+        // Step 2: Reopen and insert second row with columns 'a' and 'b'
+        {
+            let backend = TableStorageBackend::open_for_write(&path).unwrap();
+            
+            println!("After reopen, before second insert:");
+            
+            let mut row = HashMap::new();
+            row.insert("a".to_string(), Value::Int64(2));
+            row.insert("b".to_string(), Value::String("hello".to_string()));
+            backend.insert_rows(&[row]).unwrap();
+            backend.save().unwrap();
+        }
+
+        // Step 3: Read back and verify
+        {
+            let backend = TableStorageBackend::open(&path).unwrap();
+            let batch = backend.read_columns_to_arrow(None, 0, None).unwrap();
+            
+            println!("Final result:");
+            println!("  num_rows: {}", batch.num_rows());
+            
+            // Check each row
+            let a_col = batch.column_by_name("a").unwrap();
+            let a_arr = a_col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+            
+            let b_col = batch.column_by_name("b");
+            
+            for i in 0..batch.num_rows() {
+                let a_val = a_arr.value(i);
+                let b_val = if let Some(col) = b_col {
+                    let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                    arr.value(i).to_string()
+                } else {
+                    "N/A".to_string()
+                };
+                println!("  Row {}: a={}, b={}", i, a_val, b_val);
+            }
+            
+            // Row 0 should be a=1, b=NULL/empty
+            assert_eq!(a_arr.value(0), 1);
+            if let Some(col) = b_col {
+                let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                assert!(arr.value(0).is_empty(), "Row 0 should have empty b");
+            }
+            
+            // Row 1 should be a=2, b='hello'
+            assert_eq!(a_arr.value(1), 2);
+            if let Some(col) = b_col {
+                let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                assert_eq!(arr.value(1), "hello", "Row 1 should have b='hello'");
+            }
+        }
+    }
+
+    #[test]
+    fn test_alter_then_insert() {
+        use crate::data::{DataType, Value};
+        use arrow::array::StringArray;
+        
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_alter_insert.apex");
+
+        // Step 1: Create empty table and add columns via add_column_with_padding
+        {
+            let backend = TableStorageBackend::create(&path).unwrap();
+            
+            // Add columns to empty table (simulates ALTER TABLE ADD COLUMN)
+            backend.add_column("name", DataType::String).unwrap();
+            backend.add_column("value", DataType::Int64).unwrap();
+            
+            println!("After add_column:");
+            println!("  Schema: {:?}", backend.list_columns());
+            
+            backend.save().unwrap();
+        }
+
+        // Step 2: Reopen and insert data
+        {
+            let backend = TableStorageBackend::open_for_write(&path).unwrap();
+            
+            println!("After reopen:");
+            println!("  Schema: {:?}", backend.list_columns());
+            
+            // Insert a row
+            let mut row = HashMap::new();
+            row.insert("name".to_string(), Value::String("Test".to_string()));
+            row.insert("value".to_string(), Value::Int64(100));
+            
+            backend.insert_rows(&[row]).unwrap();
+            backend.save().unwrap();
+        }
+
+        // Step 3: Read back and verify
+        {
+            let backend = TableStorageBackend::open(&path).unwrap();
+            let batch = backend.read_columns_to_arrow(None, 0, None).unwrap();
+            
+            println!("Result batch:");
+            println!("  num_rows: {}", batch.num_rows());
+            println!("  schema: {:?}", batch.schema());
+            
+            // Check name column
+            if let Some(name_col) = batch.column_by_name("name") {
+                let arr = name_col.as_any().downcast_ref::<StringArray>().unwrap();
+                println!("  name[0]: {:?}", arr.value(0));
+                assert_eq!(arr.value(0), "Test", "Name should be 'Test'");
+            } else {
+                panic!("Name column not found");
+            }
+            
+            // Check value column
+            if let Some(value_col) = batch.column_by_name("value") {
+                let arr = value_col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+                println!("  value[0]: {:?}", arr.value(0));
+                assert_eq!(arr.value(0), 100, "Value should be 100");
+            }
         }
     }
 }

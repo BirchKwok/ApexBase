@@ -156,48 +156,36 @@ impl ApexStorageImpl {
         table_path.with_extension("apex.lock")
     }
     
-    /// Acquire a shared (read) lock on the table
-    /// Multiple readers can hold shared locks simultaneously
-    fn acquire_read_lock(table_path: &Path) -> io::Result<File> {
+    /// Acquire a lock on the table (shared for read, exclusive for write)
+    fn acquire_lock(table_path: &Path, exclusive: bool) -> io::Result<File> {
         let lock_path = Self::get_lock_path(table_path);
         let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
+            .read(true).write(true).create(true).truncate(false)
             .open(&lock_path)?;
         
-        // Use non-blocking shared lock
-        lock_file.try_lock_shared().map_err(|e| {
-            io::Error::new(
+        if exclusive {
+            lock_file.try_lock_exclusive().map_err(|e| io::Error::new(
                 io::ErrorKind::WouldBlock,
-                format!("Database is locked for writing: {}", e)
-            )
-        })?;
+                format!("Database is locked: {}", e)
+            ))?;
+        } else {
+            lock_file.try_lock_shared().map_err(|e| io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("Database is locked: {}", e)
+            ))?;
+        }
         
         Ok(lock_file)
     }
     
-    /// Acquire an exclusive (write) lock on the table
-    /// Only one writer can hold an exclusive lock
+    #[inline]
+    fn acquire_read_lock(table_path: &Path) -> io::Result<File> {
+        Self::acquire_lock(table_path, false)
+    }
+    
+    #[inline]
     fn acquire_write_lock(table_path: &Path) -> io::Result<File> {
-        let lock_path = Self::get_lock_path(table_path);
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        
-        // Use non-blocking exclusive lock
-        lock_file.try_lock_exclusive().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!("Database is locked by another process/thread: {}", e)
-            )
-        })?;
-        
-        Ok(lock_file)
+        Self::acquire_lock(table_path, true)
     }
     
     /// Release a lock (unlock and drop the file handle)
@@ -381,6 +369,9 @@ impl ApexStorageImpl {
         // Release lock before returning
         Self::release_lock(lock_file);
         
+        // Invalidate executor cache after write to ensure fresh reads
+        ApexExecutor::invalidate_cache_for_path(&table_path);
+        
         let id = result?;
 
         // Index in FTS if enabled
@@ -424,6 +415,9 @@ impl ApexStorageImpl {
         
         // Release lock before handling result
         Self::release_lock(lock_file);
+        
+        // Invalidate executor cache after write to ensure fresh reads
+        ApexExecutor::invalidate_cache_for_path(&table_path);
         
         let ids = result?;
 
@@ -551,11 +545,12 @@ impl ApexStorageImpl {
             return Ok(Vec::new());
         }
 
-        // Separate columns by type
+        // Separate columns by type with NULL tracking
         let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
         let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
         let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
         let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
+        let mut null_positions: HashMap<String, Vec<bool>> = HashMap::new();
 
         for (key, value) in columns.iter() {
             let col_name: String = key.extract()?;
@@ -588,31 +583,47 @@ impl ApexStorageImpl {
             match col_type {
                 Some("int") => {
                     let mut vals = Vec::with_capacity(col_len);
+                    let mut nulls = Vec::with_capacity(col_len);
                     for item in list.iter() {
-                        vals.push(item.extract::<i64>().unwrap_or(0));
+                        let is_null = item.is_none();
+                        nulls.push(is_null);
+                        vals.push(if is_null { 0 } else { item.extract::<i64>().unwrap_or(0) });
                     }
-                    int_columns.insert(col_name, vals);
+                    int_columns.insert(col_name.clone(), vals);
+                    null_positions.insert(col_name, nulls);
                 }
                 Some("float") => {
                     let mut vals = Vec::with_capacity(col_len);
+                    let mut nulls = Vec::with_capacity(col_len);
                     for item in list.iter() {
-                        vals.push(item.extract::<f64>().unwrap_or(0.0));
+                        let is_null = item.is_none();
+                        nulls.push(is_null);
+                        vals.push(if is_null { 0.0 } else { item.extract::<f64>().unwrap_or(0.0) });
                     }
-                    float_columns.insert(col_name, vals);
+                    float_columns.insert(col_name.clone(), vals);
+                    null_positions.insert(col_name, nulls);
                 }
                 Some("bool") => {
                     let mut vals = Vec::with_capacity(col_len);
+                    let mut nulls = Vec::with_capacity(col_len);
                     for item in list.iter() {
-                        vals.push(item.extract::<bool>().unwrap_or(false));
+                        let is_null = item.is_none();
+                        nulls.push(is_null);
+                        vals.push(if is_null { false } else { item.extract::<bool>().unwrap_or(false) });
                     }
-                    bool_columns.insert(col_name, vals);
+                    bool_columns.insert(col_name.clone(), vals);
+                    null_positions.insert(col_name, nulls);
                 }
                 Some("string") | None => {
                     let mut vals = Vec::with_capacity(col_len);
+                    let mut nulls = Vec::with_capacity(col_len);
                     for item in list.iter() {
-                        vals.push(item.extract::<String>().unwrap_or_default());
+                        let is_null = item.is_none();
+                        nulls.push(is_null);
+                        vals.push(if is_null { String::new() } else { item.extract::<String>().unwrap_or_default() });
                     }
-                    string_columns.insert(col_name, vals);
+                    string_columns.insert(col_name.clone(), vals);
+                    null_positions.insert(col_name, nulls);
                 }
                 _ => {}
             }
@@ -634,10 +645,11 @@ impl ApexStorageImpl {
         let string_columns_for_fts = string_columns.clone();
 
         let result = py.allow_threads(|| {
-            let ids = backend.insert_typed(
+            let ids = backend.insert_typed_with_nulls(
                 int_columns, float_columns, string_columns, 
                 HashMap::new(), // binary_columns 
-                bool_columns
+                bool_columns,
+                null_positions
             ).map_err(|e| PyIOError::new_err(e.to_string()))?;
             
             backend.save()
@@ -648,6 +660,9 @@ impl ApexStorageImpl {
         
         // Release lock before handling result
         Self::release_lock(lock_file);
+        
+        // Invalidate executor cache after write to ensure fresh reads
+        ApexExecutor::invalidate_cache_for_path(&table_path);
         
         let ids = result?;
         
@@ -835,6 +850,20 @@ impl ApexStorageImpl {
 
     /// Execute SQL query
     fn execute(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+        let sql_upper = sql.trim().to_uppercase();
+        let is_write_op = sql_upper.starts_with("DELETE") 
+            || sql_upper.starts_with("TRUNCATE") 
+            || sql_upper.starts_with("UPDATE")
+            || sql_upper.starts_with("INSERT")
+            || sql_upper.starts_with("ALTER")
+            || sql_upper.starts_with("DROP");
+        
+        // Invalidate cached backend before write operations to avoid stale data
+        let table_name = self.current_table.read().clone();
+        if is_write_op {
+            self.invalidate_backend(&table_name);
+        }
+        
         let sql = sql.to_string();
         let table_path = self.get_current_table_path()?;
         let base_dir = self.base_dir.clone();
@@ -881,6 +910,11 @@ impl ApexStorageImpl {
         }
         out.set_item("rows", py_rows)?;
         out.set_item("rows_affected", 0)?;
+        
+        // Invalidate cached backend AFTER write operations to ensure fresh data on next access
+        if is_write_op {
+            self.invalidate_backend(&table_name);
+        }
         
         Ok(out.into())
     }
@@ -946,6 +980,19 @@ impl ApexStorageImpl {
         use arrow::ipc::writer::StreamWriter;
         use pyo3::types::PyBytes;
         
+        // Invalidate cached backend before write operations
+        let sql_upper = sql.trim().to_uppercase();
+        let is_write_op = sql_upper.starts_with("DELETE") 
+            || sql_upper.starts_with("TRUNCATE") 
+            || sql_upper.starts_with("UPDATE")
+            || sql_upper.starts_with("INSERT")
+            || sql_upper.starts_with("ALTER")
+            || sql_upper.starts_with("DROP");
+        let table_name = self.current_table.read().clone();
+        if is_write_op {
+            self.invalidate_backend(&table_name);
+        }
+        
         let sql = sql.to_string();
         let table_path = self.get_current_table_path()?;
         let base_dir = self.base_dir.clone();
@@ -968,6 +1015,11 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(format!("IPC write error: {}", e)))?;
             writer.finish()
                 .map_err(|e| PyRuntimeError::new_err(format!("IPC finish error: {}", e)))?;
+        }
+        
+        // Invalidate cached backend AFTER write operations
+        if is_write_op {
+            self.invalidate_backend(&table_name);
         }
         
         // Return as Python bytes
@@ -1464,10 +1516,18 @@ impl ApexStorageImpl {
     fn drop_column(&self, column_name: &str) -> PyResult<()> {
         let table_path = self.get_current_table_path()?;
         
+        // Invalidate executor cache before write (releases mmap for file access)
+        ApexExecutor::invalidate_cache_for_path(&table_path);
+        
+        // Invalidate our cached backend BEFORE operation to force fresh open
+        let table_name = self.current_table.read().clone();
+        self.invalidate_backend(&table_name);
+        
         // Acquire exclusive write lock
         let lock_file = Self::acquire_write_lock(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
+        // Get fresh backend (will reload from file with all columns loaded)
         let backend = self.get_backend()?;
         
         let result = backend.drop_column(column_name)
@@ -1475,6 +1535,11 @@ impl ApexStorageImpl {
             .and_then(|_| backend.save().map_err(|e| PyIOError::new_err(e.to_string())));
         
         Self::release_lock(lock_file);
+        
+        // Invalidate caches after write to ensure fresh reads
+        ApexExecutor::invalidate_cache_for_path(&table_path);
+        self.invalidate_backend(&table_name);
+        
         result
     }
     

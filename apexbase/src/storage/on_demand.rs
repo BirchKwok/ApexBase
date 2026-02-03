@@ -10,19 +10,19 @@
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │ Header (256 bytes)                                          │
-//! │   - Magic: "APEXV3\0\0" (8 bytes)                          │
+//! │   - Magic: "APEXV3\0\0" (8 bytes)                           │
 //! │   - Version: u32                                            │
 //! │   - Flags: u32                                              │
 //! │   - Row count: u64                                          │
 //! │   - Column count: u32                                       │
-//! │   - Row group size: u32 (rows per group, default 65536)    │
+//! │   - Row group size: u32 (rows per group, default 65536)     │
 //! │   - Schema offset: u64                                      │
 //! │   - Column index offset: u64                                │
 //! │   - ID column offset: u64                                   │
 //! │   - Timestamps, checksum, reserved                          │
 //! ├─────────────────────────────────────────────────────────────┤
 //! │ Schema Block                                                │
-//! │   - For each column: [name_len:u16][name:bytes][type:u8]   │
+//! │   - For each column: [name_len:u16][name:bytes][type:u8]    │
 //! ├─────────────────────────────────────────────────────────────┤
 //! │ Column Index (32 bytes per column)                          │
 //! │   - data_offset: u64                                        │
@@ -36,7 +36,7 @@
 //! │   Per column: [null_bitmap][column_data]                    │
 //! ├─────────────────────────────────────────────────────────────┤
 //! │ Footer (24 bytes)                                           │
-//! │   - Magic: "APEXEND\0"                                     │
+//! │   - Magic: "APEXEND\0"                                      │
 //! │   - Checksum: u32                                           │
 //! │   - File size: u64                                          │
 //! └─────────────────────────────────────────────────────────────┘
@@ -54,6 +54,15 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use arrow::record_batch::RecordBatch;
 use arrow::array::ArrayRef;
+
+/// Helper for InvalidData errors
+#[inline] fn err_data(msg: impl Into<String>) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, msg.into()) }
+/// Helper for NotFound errors  
+#[inline] fn err_not_found(msg: impl Into<String>) -> io::Error { io::Error::new(io::ErrorKind::NotFound, msg.into()) }
+/// Helper for NotConnected errors
+#[inline] fn err_not_conn(msg: &str) -> io::Error { io::Error::new(io::ErrorKind::NotConnected, msg) }
+/// Helper for InvalidInput errors
+#[inline] fn err_input(msg: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidInput, msg) }
 
 // Thread-local buffer for scattered reads to avoid repeated allocations
 thread_local! {
@@ -84,7 +93,7 @@ impl MmapCache {
         // Invalidate cache if file size changed
         if self.mmap.is_none() || self.file_size != current_size {
             if current_size == 0 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty file"));
+                return Err(err_data("Empty file"));
             }
             // SAFETY: File must remain open while mmap is in use
             // We ensure this by keeping mmap in the same struct as file
@@ -150,7 +159,7 @@ fn pread_fallback(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     while total_read < buf.len() {
         let n = file.seek_read(&mut buf[total_read..], offset + total_read as u64)?;
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected EOF"));
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
         }
         total_read += n;
     }
@@ -614,13 +623,7 @@ impl ColumnData {
             (ColumnData::Float64(v), ColumnData::Float64(other_v)) => {
                 v.extend_from_slice(other_v);
             }
-            (ColumnData::String { offsets, data }, ColumnData::String { offsets: other_offsets, data: other_data }) => {
-                let base_offset = *offsets.last().unwrap_or(&0);
-                for i in 1..other_offsets.len() {
-                    offsets.push(base_offset + other_offsets[i]);
-                }
-                data.extend_from_slice(other_data);
-            }
+            (ColumnData::String { offsets, data }, ColumnData::String { offsets: other_offsets, data: other_data }) |
             (ColumnData::Binary { offsets, data }, ColumnData::Binary { offsets: other_offsets, data: other_data }) => {
                 let base_offset = *offsets.last().unwrap_or(&0);
                 for i in 1..other_offsets.len() {
@@ -662,7 +665,7 @@ impl ColumnData {
             ColumnData::Float64(v) => {
                 ColumnData::Float64(indices.iter().filter_map(|&i| v.get(i).copied()).collect())
             }
-            ColumnData::String { offsets, data } => {
+            ColumnData::String { offsets, data } | ColumnData::Binary { offsets, data } => {
                 let mut new_offsets = vec![0u32];
                 let mut new_data = Vec::new();
                 for &idx in indices {
@@ -673,20 +676,11 @@ impl ColumnData {
                         new_offsets.push(new_data.len() as u32);
                     }
                 }
-                ColumnData::String { offsets: new_offsets, data: new_data }
-            }
-            ColumnData::Binary { offsets, data } => {
-                let mut new_offsets = vec![0u32];
-                let mut new_data = Vec::new();
-                for &idx in indices {
-                    if idx + 1 < offsets.len() {
-                        let start = offsets[idx] as usize;
-                        let end = offsets[idx + 1] as usize;
-                        new_data.extend_from_slice(&data[start..end]);
-                        new_offsets.push(new_data.len() as u32);
-                    }
+                if matches!(self, ColumnData::String { .. }) {
+                    ColumnData::String { offsets: new_offsets, data: new_data }
+                } else {
+                    ColumnData::Binary { offsets: new_offsets, data: new_data }
                 }
-                ColumnData::Binary { offsets: new_offsets, data: new_data }
             }
             ColumnData::StringDict { indices: row_indices, dict_offsets, dict_data } => {
                 // Just filter the indices array, dictionary stays the same
@@ -1061,7 +1055,7 @@ impl OnDemandSchema {
         let mut pos = 0;
         
         if bytes.len() < 4 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Schema too short"));
+            return Err(err_data("Schema too short"));
         }
         
         let column_count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
@@ -1071,23 +1065,23 @@ impl OnDemandSchema {
         
         for _ in 0..column_count {
             if pos + 2 > bytes.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Truncated schema"));
+                return Err(err_data("Truncated schema"));
             }
             
             let name_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
             
             if pos + name_len + 1 > bytes.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Truncated column name"));
+                return Err(err_data("Truncated column"));
             }
             
             let name = std::str::from_utf8(&bytes[pos..pos + name_len])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                .map_err(|e| err_data(e.to_string()))?
                 .to_string();
             pos += name_len;
             
             let dtype = ColumnType::from_u8(bytes[pos])
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid column type"))?;
+                .ok_or_else(|| err_data("Invalid column type"))?;
             pos += 1;
             
             schema.add_column(&name, dtype);
@@ -1386,6 +1380,17 @@ impl OnDemandStorage {
         Ok(false)
     }
 
+    /// Helper: Get file reference or return NotConnected error
+    /// Reduces boilerplate in read methods
+    #[inline]
+    fn get_file_ref(&self) -> io::Result<parking_lot::RwLockReadGuard<'_, Option<File>>> {
+        let guard = self.file.read();
+        if guard.is_none() {
+            return Err(err_not_conn("File not open"));
+        }
+        Ok(guard)
+    }
+
     /// Create or open storage with default durability (Fast)
     pub fn open_or_create(path: &Path) -> io::Result<Self> {
         Self::open_or_create_with_durability(path, super::DurabilityLevel::Fast)
@@ -1429,7 +1434,11 @@ impl OnDemandStorage {
             let mut columns = storage.columns.write();
             let mut nulls = storage.nulls.write();
             
-            if columns.is_empty() && schema.column_count() > 0 {
+            // Always reinitialize columns with correct types from schema
+            // The initial columns vector may have placeholder Int64 types
+            if schema.column_count() > 0 {
+                columns.clear();
+                nulls.clear();
                 for (_name, col_type) in schema.columns.iter() {
                     columns.push(ColumnData::new(*col_type));
                     nulls.push(Vec::new());
@@ -1673,7 +1682,7 @@ impl OnDemandStorage {
         
         let file_guard = self.file.read();
         let file = file_guard.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+            err_not_conn("File not open")
         })?;
         
         let mut mmap_cache = self.mmap_cache.write();
@@ -2066,7 +2075,7 @@ impl OnDemandStorage {
 
         let file_guard = self.file.read();
         let file = file_guard.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+            err_not_conn("File not open")
         })?;
         
         // Use mmap for efficient reads with OS page cache
@@ -2091,6 +2100,73 @@ impl OnDemandStorage {
             result.insert(col_name.clone(), col_data);
         }
         Ok(result)
+    }
+
+    /// Check if a specific row/column is NULL
+    /// Returns true if the value at (row_idx, col_name) is NULL
+    pub fn is_null(&self, row_idx: usize, col_name: &str) -> bool {
+        let schema = self.schema.read();
+        if let Some(col_idx) = schema.get_index(col_name) {
+            let nulls = self.nulls.read();
+            if col_idx < nulls.len() {
+                let null_bitmap = &nulls[col_idx];
+                let byte_idx = row_idx / 8;
+                let bit_idx = row_idx % 8;
+                if byte_idx < null_bitmap.len() {
+                    return (null_bitmap[byte_idx] & (1 << bit_idx)) != 0;
+                }
+            }
+        }
+        false
+    }
+
+    /// Get null bitmap for a column (for Arrow conversion)
+    /// Returns a Vec<bool> where true means the value is NULL
+    /// Reads from file via mmap if not loaded in memory
+    pub fn get_null_mask(&self, col_name: &str, start_row: usize, row_count: usize) -> Vec<bool> {
+        let schema = self.schema.read();
+        let mut result = vec![false; row_count];
+        
+        if let Some(col_idx) = schema.get_index(col_name) {
+            // First check in-memory nulls
+            let nulls = self.nulls.read();
+            if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                let null_bitmap = &nulls[col_idx];
+                for i in 0..row_count {
+                    let row_idx = start_row + i;
+                    let byte_idx = row_idx / 8;
+                    let bit_idx = row_idx % 8;
+                    if byte_idx < null_bitmap.len() {
+                        result[i] = (null_bitmap[byte_idx] & (1 << bit_idx)) != 0;
+                    }
+                }
+            } else {
+                // Read null bitmap from file via mmap
+                drop(nulls);
+                let column_index = self.column_index.read();
+                if col_idx < column_index.len() {
+                    let index_entry = &column_index[col_idx];
+                    let null_len = index_entry.null_length as usize;
+                    if null_len > 0 {
+                        if let Some(file) = self.file.read().as_ref() {
+                            let mut mmap_cache = self.mmap_cache.write();
+                            let mut null_bitmap = vec![0u8; null_len];
+                            if mmap_cache.read_at(file, &mut null_bitmap, index_entry.null_offset).is_ok() {
+                                for i in 0..row_count {
+                                    let row_idx = start_row + i;
+                                    let byte_idx = row_idx / 8;
+                                    let bit_idx = row_idx % 8;
+                                    if byte_idx < null_bitmap.len() {
+                                        result[i] = (null_bitmap[byte_idx] & (1 << bit_idx)) != 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result
     }
 
     /// Read columns with predicate pushdown - filter rows at storage level
@@ -2119,7 +2195,7 @@ impl OnDemandStorage {
 
         // First, read the filter column to determine matching rows
         let filter_col_idx = schema.get_index(filter_column).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Filter column not found: {}", filter_column))
+            err_not_found(format!("Filter column: {}", filter_column))
         })?;
         
         let (_, filter_col_type) = &schema.columns[filter_col_idx];
@@ -2127,7 +2203,7 @@ impl OnDemandStorage {
         
         let file_guard = self.file.read();
         let file = file_guard.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+            err_not_conn("File not open")
         })?;
         
         let mut mmap_cache = self.mmap_cache.write();
@@ -2234,7 +2310,7 @@ impl OnDemandStorage {
 
         // Find filter column
         let filter_col_idx = schema.get_index(filter_column).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Filter column not found: {}", filter_column))
+            err_not_found(format!("Filter column: {}", filter_column))
         })?;
         
         let (_, filter_col_type) = &schema.columns[filter_col_idx];
@@ -2242,12 +2318,12 @@ impl OnDemandStorage {
         
         // Only works for string columns (including dictionary-encoded)
         if !matches!(filter_col_type, ColumnType::String | ColumnType::StringDict) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "String filter requires string column"));
+            return Err(err_input("String filter requires string column"));
         }
         
         let file_guard = self.file.read();
         let file = file_guard.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+            err_not_conn("File not open")
         })?;
         
         let mut mmap_cache = self.mmap_cache.write();
@@ -2416,7 +2492,7 @@ impl OnDemandStorage {
                 }
                 result
             }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Expected string column")),
+            _ => return Err(err_input("Expected string column")),
         };
 
         if matching_indices.is_empty() {
@@ -2469,19 +2545,19 @@ impl OnDemandStorage {
         }
 
         let filter_col_idx = schema.get_index(filter_column).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Filter column not found: {}", filter_column))
+            err_not_found(format!("Filter column: {}", filter_column))
         })?;
         
         let (_, filter_col_type) = &schema.columns[filter_col_idx];
         let filter_index = &column_index[filter_col_idx];
         
         if !matches!(filter_col_type, ColumnType::String | ColumnType::StringDict) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "String filter requires string column"));
+            return Err(err_input("String filter requires string column"));
         }
         
         let file_guard = self.file.read();
         let file = file_guard.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+            err_not_conn("File not open")
         })?;
         
         let mut mmap_cache = self.mmap_cache.write();
@@ -2623,7 +2699,7 @@ impl OnDemandStorage {
         let deleted = self.deleted.read();
         
         let filter_col_idx = schema.get_index(filter_column).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Column not found: {}", filter_column))
+            err_not_found(format!("Column: {}", filter_column))
         })?;
         
         let (_, filter_col_type) = &schema.columns[filter_col_idx];
@@ -2632,7 +2708,7 @@ impl OnDemandStorage {
         
         let file_guard = self.file.read();
         let file = file_guard.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+            err_not_conn("File not open")
         })?;
         
         let mut mmap_cache = self.mmap_cache.write();
@@ -2643,7 +2719,7 @@ impl OnDemandStorage {
                      ColumnType::Int32 | ColumnType::Int16 | ColumnType::Int8 |
                      ColumnType::UInt64 | ColumnType::UInt32 | ColumnType::UInt16 | ColumnType::UInt8 |
                      ColumnType::Float32) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Range filter only works on numeric columns"));
+            return Err(err_input("Range filter needs numeric columns"));
         }
         
         // Stream through the filter column in chunks with early termination
@@ -2751,32 +2827,32 @@ impl OnDemandStorage {
 
         // Get string column info
         let str_col_idx = schema.get_index(string_column).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("String column not found: {}", string_column))
+            err_not_found(format!("String column: {}", string_column))
         })?;
         let (_, str_col_type) = &schema.columns[str_col_idx];
         let str_index = &column_index[str_col_idx];
         
         // Get numeric column info
         let num_col_idx = schema.get_index(numeric_column).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Numeric column not found: {}", numeric_column))
+            err_not_found(format!("Numeric column: {}", numeric_column))
         })?;
         let (_, num_col_type) = &schema.columns[num_col_idx];
         let num_index = &column_index[num_col_idx];
         
         // Validate column types
         if !matches!(str_col_type, ColumnType::String | ColumnType::StringDict) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "String filter requires string column"));
+            return Err(err_input("String filter requires string column"));
         }
         if !matches!(num_col_type, ColumnType::Int64 | ColumnType::Float64 | 
                      ColumnType::Int32 | ColumnType::Int16 | ColumnType::Int8 |
                      ColumnType::UInt64 | ColumnType::UInt32 | ColumnType::UInt16 | ColumnType::UInt8 |
                      ColumnType::Float32) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Numeric filter requires numeric column"));
+            return Err(err_input("Numeric filter needs numeric column"));
         }
         
         let file_guard = self.file.read();
         let file = file_guard.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+            err_not_conn("File not open")
         })?;
         
         let mut mmap_cache = self.mmap_cache.write();
@@ -2938,7 +3014,7 @@ impl OnDemandStorage {
         }
         
         // Fallback for non-dictionary strings
-        Err(io::Error::new(io::ErrorKind::InvalidInput, "Combined filter requires dictionary-encoded string column"))
+        Err(err_input("Needs dictionary-encoded string"))
     }
 
     /// Read a single column for specific row indices
@@ -2952,7 +3028,7 @@ impl OnDemandStorage {
         let header = self.header.read();
         
         let col_idx = schema.get_index(column_name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Column not found: {}", column_name))
+            err_not_found(format!("Column: {}", column_name))
         })?;
         
         let (_, col_type) = &schema.columns[col_idx];
@@ -2961,7 +3037,7 @@ impl OnDemandStorage {
 
         let file_guard = self.file.read();
         let file = file_guard.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+            err_not_conn("File not open")
         })?;
         
         let mut mmap_cache = self.mmap_cache.write();
@@ -2985,7 +3061,7 @@ impl OnDemandStorage {
         
         let file_guard = self.file.read();
         let file = file_guard.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+            err_not_conn("File not open")
         })?;
         
         let mut mmap_cache = self.mmap_cache.write();
@@ -3075,7 +3151,7 @@ impl OnDemandStorage {
 
         let file_guard = self.file.read();
         let file = file_guard.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "File not open")
+            err_not_conn("File not open")
         })?;
         
         let mut mmap_cache = self.mmap_cache.write();
@@ -4128,17 +4204,25 @@ impl OnDemandStorage {
         let ids: Vec<u64> = (start_id..start_id + row_count as u64).collect();
 
         // Ensure schema has all columns and track column indices
+        // For new columns, pad existing rows with defaults (NULL-like values)
         let mut col_name_to_idx: HashMap<String, usize> = HashMap::new();
         {
             let mut schema = self.schema.write();
             let mut columns = self.columns.write();
             let mut nulls = self.nulls.write();
+            let existing_row_count = self.ids.read().len();
 
             for name in int_columns.keys() {
                 let idx = schema.add_column(name, ColumnType::Int64);
                 col_name_to_idx.insert(name.clone(), idx);
                 while columns.len() <= idx {
-                    columns.push(ColumnData::new(ColumnType::Int64));
+                    let mut col = ColumnData::new(ColumnType::Int64);
+                    // Pad with defaults for existing rows
+                    if let ColumnData::Int64(v) = &mut col {
+                        v.resize(existing_row_count, 0);
+                    }
+                    columns.push(col);
+                    // Mark all existing rows as NULL for new column
                     nulls.push(Vec::new());
                 }
             }
@@ -4146,7 +4230,11 @@ impl OnDemandStorage {
                 let idx = schema.add_column(name, ColumnType::Float64);
                 col_name_to_idx.insert(name.clone(), idx);
                 while columns.len() <= idx {
-                    columns.push(ColumnData::new(ColumnType::Float64));
+                    let mut col = ColumnData::new(ColumnType::Float64);
+                    if let ColumnData::Float64(v) = &mut col {
+                        v.resize(existing_row_count, 0.0);
+                    }
+                    columns.push(col);
                     nulls.push(Vec::new());
                 }
             }
@@ -4154,7 +4242,14 @@ impl OnDemandStorage {
                 let idx = schema.add_column(name, ColumnType::String);
                 col_name_to_idx.insert(name.clone(), idx);
                 while columns.len() <= idx {
-                    columns.push(ColumnData::new(ColumnType::String));
+                    let mut col = ColumnData::new(ColumnType::String);
+                    // Pad with empty strings for existing rows
+                    if let ColumnData::String { offsets, .. } = &mut col {
+                        for _ in 0..existing_row_count {
+                            offsets.push(0);
+                        }
+                    }
+                    columns.push(col);
                     nulls.push(Vec::new());
                 }
             }
@@ -4162,7 +4257,13 @@ impl OnDemandStorage {
                 let idx = schema.add_column(name, ColumnType::Binary);
                 col_name_to_idx.insert(name.clone(), idx);
                 while columns.len() <= idx {
-                    columns.push(ColumnData::new(ColumnType::Binary));
+                    let mut col = ColumnData::new(ColumnType::Binary);
+                    if let ColumnData::Binary { offsets, .. } = &mut col {
+                        for _ in 0..existing_row_count {
+                            offsets.push(0);
+                        }
+                    }
+                    columns.push(col);
                     nulls.push(Vec::new());
                 }
             }
@@ -4170,7 +4271,11 @@ impl OnDemandStorage {
                 let idx = schema.add_column(name, ColumnType::Bool);
                 col_name_to_idx.insert(name.clone(), idx);
                 while columns.len() <= idx {
-                    columns.push(ColumnData::new(ColumnType::Bool));
+                    let mut col = ColumnData::new(ColumnType::Bool);
+                    if let ColumnData::Bool { len, .. } = &mut col {
+                        *len = existing_row_count;
+                    }
+                    columns.push(col);
                     nulls.push(Vec::new());
                 }
             }
@@ -4544,6 +4649,56 @@ impl OnDemandStorage {
     /// Get the count of non-deleted rows - O(1) from cached value
     pub fn active_row_count(&self) -> u64 {
         self.active_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Drop a column from schema (logical delete - data stays but column is removed from schema)
+    /// When save() is called, only columns in schema will be written to file
+    pub fn drop_column(&self, name: &str) -> io::Result<()> {
+        let mut schema = self.schema.write();
+        
+        // Find column index
+        let idx = match schema.get_index(name) {
+            Some(idx) => idx,
+            None => return Err(io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", name))),
+        };
+        
+        // Remove from schema (logical delete)
+        schema.columns.remove(idx);
+        schema.name_to_idx.remove(name);
+        
+        // Rebuild name_to_idx with updated indices
+        // Collect names first to avoid borrow conflict
+        let names: Vec<String> = schema.columns.iter().map(|(n, _)| n.clone()).collect();
+        schema.name_to_idx.clear();
+        for (i, n) in names.into_iter().enumerate() {
+            schema.name_to_idx.insert(n, i);
+        }
+        
+        // Also remove from in-memory structures to keep them in sync with schema
+        // This ensures save() writes correct data
+        {
+            let mut columns = self.columns.write();
+            let mut nulls = self.nulls.write();
+            let mut column_index = self.column_index.write();
+            
+            if idx < columns.len() {
+                columns.remove(idx);
+            }
+            if idx < nulls.len() {
+                nulls.remove(idx);
+            }
+            if idx < column_index.len() {
+                column_index.remove(idx);
+            }
+        }
+        
+        // Update header column count
+        {
+            let mut header = self.header.write();
+            header.column_count = schema.column_count() as u32;
+        }
+        
+        Ok(())
     }
 
     /// Add a new column to schema and storage with padding for existing rows
@@ -5221,6 +5376,7 @@ impl OnDemandStorage {
         let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
         let mut binary_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
+        let mut null_positions: HashMap<String, Vec<bool>> = HashMap::new();
 
         // Determine schema from first few rows (most data is homogeneous)
         let sample_size = std::cmp::min(10, num_rows);
@@ -5239,13 +5395,14 @@ impl OnDemandStorage {
                     ColumnValue::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     ColumnValue::Null => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                 }
+                null_positions.insert(key.clone(), Vec::with_capacity(num_rows));
             }
         }
 
         // Pre-allocate NULL string to avoid repeated allocation
         static NULL_MARKER: &str = "\x00__NULL__\x00";
         
-        // Single pass: collect all values
+        // Single pass: collect all values and track NULLs
         // Note: For homogeneous data (common case), new columns won't be discovered mid-stream
         for row in rows {
             // Handle new columns discovered mid-stream (rare case for heterogeneous data)
@@ -5261,44 +5418,60 @@ impl OnDemandStorage {
                         ColumnValue::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                         ColumnValue::Null => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     }
+                    null_positions.insert(key.clone(), Vec::with_capacity(num_rows));
                 }
             }
             
-            // Collect values for all columns
+            // Collect values for all columns and track NULL positions
             for (key, col) in int_columns.iter_mut() {
-                col.push(match row.get(key) {
-                    Some(ColumnValue::Int64(v)) => *v,
-                    _ => 0,
-                });
+                let (val, is_null) = match row.get(key) {
+                    Some(ColumnValue::Int64(v)) => (*v, false),
+                    Some(ColumnValue::Null) | None => (0, true),
+                    _ => (0, true),
+                };
+                col.push(val);
+                null_positions.entry(key.clone()).or_default().push(is_null);
             }
             for (key, col) in float_columns.iter_mut() {
-                col.push(match row.get(key) {
-                    Some(ColumnValue::Float64(v)) => *v,
-                    _ => 0.0,
-                });
+                let (val, is_null) = match row.get(key) {
+                    Some(ColumnValue::Float64(v)) => (*v, false),
+                    Some(ColumnValue::Null) | None => (0.0, true),
+                    _ => (0.0, true),
+                };
+                col.push(val);
+                null_positions.entry(key.clone()).or_default().push(is_null);
             }
             for (key, col) in string_columns.iter_mut() {
-                col.push(match row.get(key) {
-                    Some(ColumnValue::String(v)) => v.clone(),
-                    Some(ColumnValue::Null) => NULL_MARKER.to_string(),
-                    _ => String::new(),
-                });
+                let (val, is_null) = match row.get(key) {
+                    Some(ColumnValue::String(v)) => (v.clone(), false),
+                    Some(ColumnValue::Null) => (NULL_MARKER.to_string(), true),
+                    None => (String::new(), true),
+                    _ => (String::new(), true),
+                };
+                col.push(val);
+                null_positions.entry(key.clone()).or_default().push(is_null);
             }
             for (key, col) in binary_columns.iter_mut() {
-                col.push(match row.get(key) {
-                    Some(ColumnValue::Binary(v)) => v.clone(),
-                    _ => Vec::new(),
-                });
+                let (val, is_null) = match row.get(key) {
+                    Some(ColumnValue::Binary(v)) => (v.clone(), false),
+                    Some(ColumnValue::Null) | None => (Vec::new(), true),
+                    _ => (Vec::new(), true),
+                };
+                col.push(val);
+                null_positions.entry(key.clone()).or_default().push(is_null);
             }
             for (key, col) in bool_columns.iter_mut() {
-                col.push(match row.get(key) {
-                    Some(ColumnValue::Bool(v)) => *v,
-                    _ => false,
-                });
+                let (val, is_null) = match row.get(key) {
+                    Some(ColumnValue::Bool(v)) => (*v, false),
+                    Some(ColumnValue::Null) | None => (false, true),
+                    _ => (false, true),
+                };
+                col.push(val);
+                null_positions.entry(key.clone()).or_default().push(is_null);
             }
         }
 
-        let result = self.insert_typed(int_columns, float_columns, string_columns, binary_columns, bool_columns)?;
+        let result = self.insert_typed_with_nulls(int_columns, float_columns, string_columns, binary_columns, bool_columns, null_positions)?;
         
         // Update pending rows counter and check auto-flush
         self.pending_rows.fetch_add(result.len() as u64, Ordering::Relaxed);
@@ -5593,6 +5766,60 @@ mod tests {
         if let ColumnData::Int64(vals) = &result["id"] {
             assert_eq!(vals, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         }
+    }
+
+    #[test]
+    fn test_bool_null_bitmap() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_bool_null.apex");
+
+        let storage = OnDemandStorage::create(&path).unwrap();
+
+        // Insert with NULL boolean
+        let mut rows = Vec::new();
+        
+        let mut row1 = HashMap::new();
+        row1.insert("id".to_string(), ColumnValue::Int64(1));
+        row1.insert("flag".to_string(), ColumnValue::Bool(true));
+        rows.push(row1);
+        
+        let mut row2 = HashMap::new();
+        row2.insert("id".to_string(), ColumnValue::Int64(2));
+        row2.insert("flag".to_string(), ColumnValue::Bool(false));
+        rows.push(row2);
+        
+        let mut row3 = HashMap::new();
+        row3.insert("id".to_string(), ColumnValue::Int64(3));
+        row3.insert("flag".to_string(), ColumnValue::Null);  // NULL boolean
+        rows.push(row3);
+
+        storage.insert_rows(&rows).unwrap();
+        
+        // Check null bitmap in memory BEFORE save
+        {
+            let nulls = storage.nulls.read();
+            let schema = storage.schema.read();
+            let flag_idx = schema.get_index("flag").unwrap();
+            println!("Flag column index: {}", flag_idx);
+            println!("Nulls len: {}", nulls.len());
+            if flag_idx < nulls.len() {
+                println!("Null bitmap for flag: {:?}", nulls[flag_idx]);
+                // Row 3 (index 2) should be marked as NULL
+                // Byte 0, bit 2 should be set
+                assert!(!nulls[flag_idx].is_empty(), "Null bitmap should not be empty");
+                assert_eq!(nulls[flag_idx][0] & (1 << 2), 1 << 2, "Row 2 should be marked as NULL");
+            }
+        }
+        
+        storage.save().unwrap();
+
+        // Reopen and verify null bitmap is persisted
+        let storage2 = OnDemandStorage::open(&path).unwrap();
+        
+        // Check null mask via get_null_mask
+        let null_mask = storage2.get_null_mask("flag", 0, 3);
+        println!("Null mask after reopen: {:?}", null_mask);
+        assert_eq!(null_mask, vec![false, false, true], "Row 2 should be NULL");
     }
 
     #[test]

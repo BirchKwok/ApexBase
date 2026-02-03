@@ -40,6 +40,120 @@ use std::collections::HashSet;
 use ahash::AHasher;
 use std::hash::{Hash, Hasher};
 
+// ============================================================================
+// Helper functions to reduce code duplication
+// ============================================================================
+
+/// Create an InvalidInput error with message
+#[inline]
+fn err_input(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg.into())
+}
+
+/// Create an InvalidData error with message  
+#[inline]
+fn err_data(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+/// Create an Unsupported error with message
+#[inline]
+fn err_unsupported(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, msg.into())
+}
+
+/// Create a NotFound error with message
+#[inline]
+fn err_not_found(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, msg.into())
+}
+
+/// Helper to apply a unary function on numeric arrays
+#[inline]
+fn map_numeric_unary<F1, F2>(arr: &ArrayRef, batch_rows: usize, int_fn: F1, float_fn: F2, func_name: &str) -> io::Result<ArrayRef>
+where
+    F1: Fn(i64) -> i64,
+    F2: Fn(f64) -> f64,
+{
+    if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+        let result: Vec<Option<i64>> = (0..batch_rows).map(|i| {
+            if int_arr.is_null(i) { None } else { Some(int_fn(int_arr.value(i))) }
+        }).collect();
+        Ok(Arc::new(Int64Array::from(result)))
+    } else if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
+        let result: Vec<Option<f64>> = (0..batch_rows).map(|i| {
+            if float_arr.is_null(i) { None } else { Some(float_fn(float_arr.value(i))) }
+        }).collect();
+        Ok(Arc::new(Float64Array::from(result)))
+    } else {
+        Err(err_data(format!("{} requires numeric argument", func_name)))
+    }
+}
+
+/// Helper to apply a unary string function
+#[inline]
+fn map_string_unary<F>(arr: &ArrayRef, batch_rows: usize, f: F, func_name: &str) -> io::Result<ArrayRef>
+where
+    F: Fn(&str) -> String,
+{
+    if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+        let result: Vec<Option<String>> = (0..batch_rows).map(|i| {
+            if str_arr.is_null(i) { None } else { Some(f(str_arr.value(i))) }
+        }).collect();
+        Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+    } else {
+        Err(err_data(format!("{} requires string argument", func_name)))
+    }
+}
+
+/// Helper to apply a unary string function returning &str (no allocation)
+#[inline]
+fn map_string_unary_ref<'a, F>(arr: &'a ArrayRef, batch_rows: usize, f: F, func_name: &str) -> io::Result<ArrayRef>
+where
+    F: Fn(&'a str) -> &'a str,
+{
+    if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+        let result: Vec<Option<&str>> = (0..batch_rows).map(|i| {
+            if str_arr.is_null(i) { None } else { Some(f(str_arr.value(i))) }
+        }).collect();
+        Ok(Arc::new(StringArray::from(result)))
+    } else {
+        Err(err_data(format!("{} requires string argument", func_name)))
+    }
+}
+
+/// Helper to apply a string-to-int function
+#[inline]
+fn map_string_to_int<F>(arr: &ArrayRef, batch_rows: usize, f: F, func_name: &str) -> io::Result<ArrayRef>
+where
+    F: Fn(&str) -> i64,
+{
+    if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+        let result: Vec<Option<i64>> = (0..batch_rows).map(|i| {
+            if str_arr.is_null(i) { None } else { Some(f(str_arr.value(i))) }
+        }).collect();
+        Ok(Arc::new(Int64Array::from(result)))
+    } else {
+        Err(err_data(format!("{} requires string argument", func_name)))
+    }
+}
+
+/// Helper to apply an int-to-string function
+#[inline]
+fn map_int_to_string<F>(arr: &ArrayRef, batch_rows: usize, f: F, func_name: &str) -> io::Result<ArrayRef>
+where
+    F: Fn(i64) -> Option<String>,
+{
+    if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+        let result: Vec<Option<String>> = (0..batch_rows).map(|i| {
+            if int_arr.is_null(i) { None } else { f(int_arr.value(i)) }
+        }).collect();
+        Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+    } else {
+        Err(err_data(format!("{} requires int argument", func_name)))
+    }
+}
+
 // Global storage cache to avoid repeated open() calls which load all IDs
 // Key: canonical path, Value: (backend, last_modified_time, last_access_time)
 // Uses LRU eviction when cache exceeds MAX_CACHE_ENTRIES
@@ -289,7 +403,7 @@ impl ApexResult {
                 ]));
                 let array: ArrayRef = Arc::new(Int64Array::from(vec![val]));
                 RecordBatch::try_new(schema, vec![array])
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                    .map_err(|e| err_data( e.to_string()))
             }
         }
     }
@@ -305,21 +419,25 @@ impl ApexResult {
 
 impl ApexExecutor {
     /// Invalidate the storage cache for a specific path
-    /// CRITICAL: Must be called before any write operation to release mmap on Windows
     pub fn invalidate_cache_for_path(path: &Path) {
         invalidate_storage_cache(path);
     }
     
     /// Invalidate all storage cache entries under a directory
-    /// CRITICAL: Must be called when closing a client to release all mmaps on Windows
     pub fn invalidate_cache_for_dir(dir: &Path) {
         invalidate_storage_cache_dir(dir);
+    }
+    
+    /// Helper to get column refs from statement's required columns
+    #[inline]
+    fn get_col_refs(stmt: &SelectStatement) -> Option<Vec<String>> {
+        stmt.required_columns().filter(|cols| !cols.is_empty())
     }
     
     /// Execute a SQL query on V3 storage (single table)
     pub fn execute(sql: &str, storage_path: &Path) -> io::Result<ApexResult> {
         let stmt = SqlParser::parse(sql)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            .map_err(|e| err_input( e.to_string()))?;
 
         Self::execute_parsed(stmt, storage_path)
     }
@@ -329,7 +447,7 @@ impl ApexExecutor {
         // Support multi-statement execution (e.g., CREATE VIEW; SELECT ...; DROP VIEW;)
         // Parse as multi-statement unconditionally to avoid relying on string heuristics.
         let stmts = SqlParser::parse_multi(sql)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            .map_err(|e| err_input( e.to_string()))?;
 
         if stmts.len() > 1
             || matches!(stmts.first(), Some(SqlStatement::CreateView { .. } | SqlStatement::DropView { .. }))
@@ -340,7 +458,7 @@ impl ApexExecutor {
         let stmt = stmts
             .into_iter()
             .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No statement to execute"))?;
+            .ok_or_else(|| err_input( "No statement to execute"))?;
 
         Self::execute_parsed_multi(stmt, base_dir, default_table_path)
     }
@@ -431,13 +549,13 @@ impl ApexExecutor {
                 SqlStatement::CreateView { name, stmt } => {
                     let view_name = name.trim_matches('"').to_string();
                     if view_name.eq_ignore_ascii_case("default") {
-                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "View name conflicts with default table"));
+                        return Err(err_input( "View name conflicts with default table"));
                     }
 
                     // Disallow conflict with existing table file
                     let table_path = Self::resolve_table_path(&view_name, base_dir, default_table_path);
                     if table_path.exists() {
-                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "View name conflicts with existing table"));
+                        return Err(err_input( "View name conflicts with existing table"));
                     }
 
                     views.insert(view_name, stmt);
@@ -460,7 +578,7 @@ impl ApexExecutor {
             }
         }
 
-        last_result.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No query to execute"))
+        last_result.ok_or_else(|| err_input( "No query to execute"))
     }
 
     fn rewrite_select_views(mut select: SelectStatement, views: &AHashMap<String, SelectStatement>) -> SelectStatement {
@@ -528,7 +646,7 @@ impl ApexExecutor {
             ]));
             let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
             let batch = RecordBatch::try_new(schema, vec![array])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
             return Ok(ApexResult::Data(batch));
         }
         
@@ -560,14 +678,8 @@ impl ApexExecutor {
                     });
                     
                     if has_scalar_subquery {
-                        // Scalar subqueries may reference outer columns - use required_columns 
-                        // which already extracts outer column references from subqueries
-                        let required_cols = stmt.required_columns();
-                        let col_refs: Option<Vec<&str>> = required_cols
-                            .as_ref()
-                            .filter(|cols| !cols.is_empty())
-                            .map(|cols| cols.iter().map(|s| s.as_str()).collect());
-                        backend.read_columns_to_arrow(col_refs.as_deref(), 0, None)?
+                        let col_refs = Self::get_col_refs(&stmt);
+                        backend.read_columns_to_arrow(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref(), 0, None)?
                     } else {
                         // Check conditions for late materialization optimization
                         let has_aggregation_check = stmt.columns.iter().any(|col| {
@@ -619,16 +731,16 @@ impl ApexExecutor {
                                     result
                                 } else {
                                     // Late materialization for SELECT * WHERE path
-                                    Self::execute_with_late_materialization(&backend, &stmt, storage_path)?
+                                    // Return directly to avoid applying WHERE filter twice
+                                    let filtered = Self::execute_with_late_materialization(&backend, &stmt, storage_path)?;
+                                    if filtered.num_rows() == 0 {
+                                        return Ok(ApexResult::Empty(filtered.schema()));
+                                    }
+                                    return Ok(ApexResult::Data(filtered));
                                 }
                             } else {
-                                // Standard path: read all required columns upfront
-                                let required_cols = stmt.required_columns();
-                                let col_refs: Option<Vec<&str>> = required_cols
-                                    .as_ref()
-                                    .filter(|cols| !cols.is_empty())
-                                    .map(|cols| cols.iter().map(|s| s.as_str()).collect());
-                                backend.read_columns_to_arrow(col_refs.as_deref(), 0, None)?
+                                let col_refs = Self::get_col_refs(&stmt);
+                                backend.read_columns_to_arrow(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref(), 0, None)?
                             }
                         } else if can_late_materialize_where {
                             // FAST PATH 1: Try dictionary-based filter for simple string equality
@@ -649,38 +761,25 @@ impl ApexExecutor {
                             if let Some(result) = Self::try_fast_string_filter_no_limit(&backend, &stmt)? {
                                 result
                             } else {
-                                // Standard path for WHERE without LIMIT
-                                let required_cols = stmt.required_columns();
-                                let col_refs: Option<Vec<&str>> = required_cols
-                                    .as_ref()
-                                    .filter(|cols| !cols.is_empty())
-                                    .map(|cols| cols.iter().map(|s| s.as_str()).collect());
-                                backend.read_columns_to_arrow(col_refs.as_deref(), 0, None)?
+                                let col_refs = Self::get_col_refs(&stmt);
+                                backend.read_columns_to_arrow(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref(), 0, None)?
                             }
                         } else if can_late_materialize_order {
                             // Late materialization for ORDER BY + LIMIT path
                             Self::execute_with_order_late_materialization(&backend, &stmt)?
                         } else {
-                            // Standard path: read all required columns upfront
-                            let required_cols = stmt.required_columns();
-                            let col_refs: Option<Vec<&str>> = required_cols
-                                .as_ref()
-                                .filter(|cols| !cols.is_empty())
-                                .map(|cols| cols.iter().map(|s| s.as_str()).collect());
-                            
-                            // LIMIT pushdown: only read limited rows if safe
+                            let col_refs = Self::get_col_refs(&stmt);
+                            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
                             let can_pushdown_limit = stmt.where_clause.is_none()
                                 && stmt.order_by.is_empty()
                                 && stmt.group_by.is_empty()
                                 && !has_aggregation_check;
-                            
-                            let row_limit = if can_pushdown_limit {
+                            let _row_limit = if can_pushdown_limit {
                                 stmt.limit.map(|l| l + stmt.offset.unwrap_or(0))
                             } else {
                                 None
                             };
-                            
-                            backend.read_columns_to_arrow(col_refs.as_deref(), 0, row_limit)?
+                            backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, _row_limit)?
                         }
                     }
                 }
@@ -763,114 +862,69 @@ impl ApexExecutor {
     }
 
     /// Fast path for simple string equality filters on dictionary-encoded columns
-    /// Uses storage-level early termination for LIMIT queries
+    /// Uses storage-level early termination for LIMIT queries when limit is Some
     /// Supports column projection pushdown (not limited to SELECT *)
     fn try_fast_string_filter(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
-        // Only handle simple WHERE col = 'value' patterns
-        let where_clause = match &stmt.where_clause {
-            Some(w) => w,
-            None => return Ok(None),
-        };
-        
         // Must have LIMIT for early termination benefit
         if stmt.limit.is_none() {
             return Ok(None);
         }
-        
-        // Extract column name and literal value from simple equality
-        let (col_name, filter_value) = match where_clause {
-            SqlExpr::BinaryOp { left, op, right } => {
-                use crate::query::sql_parser::BinaryOperator;
-                if *op != BinaryOperator::Eq {
-                    return Ok(None);
-                }
-                match (left.as_ref(), right.as_ref()) {
-                    (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val))) => {
-                        (col.trim_matches('"').to_string(), val.clone())
-                    }
-                    (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
-                        (col.trim_matches('"').to_string(), val.clone())
-                    }
-                    _ => return Ok(None),
-                }
-            }
-            _ => return Ok(None),
-        };
-        
-        let limit = stmt.limit.unwrap_or(100);
-        let offset = stmt.offset.unwrap_or(0);
-        
-        // OPTIMIZATION: Column projection pushdown - only read required columns
-        let projected_cols: Option<Vec<String>> = if stmt.is_select_star() {
-            None // All columns
-        } else {
-            Some(stmt.required_columns().unwrap_or_default())
-        };
-        let col_refs: Option<Vec<&str>> = projected_cols.as_ref()
-            .map(|cols| cols.iter().map(|s| s.as_str()).collect());
-        
-        // Use storage-level filter with early termination
-        let result = backend.read_columns_filtered_string_with_limit_to_arrow(
-            col_refs.as_deref(),
-            &col_name,
-            &filter_value,
-            true, // filter_eq = true for equality
-            limit,
-            offset,
-        )?;
-        
-        Ok(Some(result))
+        Self::try_fast_string_filter_impl(backend, stmt, stmt.limit)
     }
 
     /// Fast path for string equality filters WITHOUT LIMIT
-    /// Uses dictionary index scan for maximum performance
     fn try_fast_string_filter_no_limit(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
-        use crate::query::sql_parser::BinaryOperator;
-        
-        // Only handle simple WHERE col = 'value' patterns
+        Self::try_fast_string_filter_impl(backend, stmt, None)
+    }
+    
+    /// Unified implementation for string equality filter fast path
+    fn try_fast_string_filter_impl(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+        limit: Option<usize>,
+    ) -> io::Result<Option<RecordBatch>> {
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
         };
         
-        // Extract column name and literal value from simple equality
-        let (col_name, filter_value) = match where_clause {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                match (left.as_ref(), right.as_ref()) {
-                    (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val))) => {
-                        (col.trim_matches('"').to_string(), val.clone())
-                    }
-                    (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
-                        (col.trim_matches('"').to_string(), val.clone())
-                    }
-                    _ => return Ok(None),
-                }
-            }
-            _ => return Ok(None),
+        let (col_name, filter_value) = match Self::extract_string_equality(where_clause) {
+            Some(v) => v,
+            None => return Ok(None),
         };
         
-        // OPTIMIZATION: Column projection pushdown - only read required columns
+        // Column projection pushdown
         let projected_cols: Option<Vec<String>> = if stmt.is_select_star() {
-            None // All columns
+            None
         } else {
             Some(stmt.required_columns().unwrap_or_default())
         };
         let col_refs: Option<Vec<&str>> = projected_cols.as_ref()
             .map(|cols| cols.iter().map(|s| s.as_str()).collect());
         
-        // Use storage-level filter WITHOUT early termination (no LIMIT)
-        let result = backend.read_columns_filtered_string_to_arrow(
-            col_refs.as_deref(),
-            &col_name,
-            &filter_value,
-            true, // filter_eq = true for equality
-        )?;
+        let result = if let Some(lim) = limit {
+            backend.read_columns_filtered_string_with_limit_to_arrow(
+                col_refs.as_deref(),
+                &col_name,
+                &filter_value,
+                true,
+                lim,
+                stmt.offset.unwrap_or(0),
+            )?
+        } else {
+            backend.read_columns_filtered_string_to_arrow(
+                col_refs.as_deref(),
+                &col_name,
+                &filter_value,
+                true,
+            )?
+        };
         
         Ok(Some(result))
     }
@@ -955,7 +1009,7 @@ impl ApexExecutor {
             SqlExpr::Literal(Value::Int32(n)) => Ok(*n as f64),
             SqlExpr::Literal(Value::Float64(n)) => Ok(*n),
             SqlExpr::Literal(Value::Float32(n)) => Ok(*n as f64),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "not a number")),
+            _ => Err(err_input( "not a number")),
         }
     }
     
@@ -977,14 +1031,14 @@ impl ApexExecutor {
                             BinaryOperator::Lt => BinaryOperator::Gt,
                             BinaryOperator::Ge => BinaryOperator::Le,
                             BinaryOperator::Le => BinaryOperator::Ge,
-                            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsupported op")),
+                            _ => return Err(err_input( "unsupported op")),
                         };
                         Ok((col.trim_matches('"').to_string(), flipped_op, val))
                     }
-                    _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "not a comparison")),
+                    _ => Err(err_input( "not a comparison")),
                 }
             }
-            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "not a binary op")),
+            _ => Err(err_input( "not a binary op")),
         }
     }
 
@@ -1271,6 +1325,12 @@ impl ApexExecutor {
                 }
                 
                 let mask = Self::evaluate_predicate_with_storage(&filter_batch, where_clause, storage_path)?;
+                
+                #[cfg(test)]
+                {
+                    let true_count = mask.iter().filter(|v| *v == Some(true)).count();
+                    eprintln!("DEBUG late_mat chunk: mask true_count={}", true_count);
+                }
                 
                 // Collect matching indices from this chunk
                 for (i, v) in mask.iter().enumerate() {
@@ -1736,7 +1796,7 @@ impl ApexExecutor {
                 Arc::new(StringArray::from(result_groups)),
                 Arc::new(Float64Array::from(result_values)),
             ],
-        ).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        ).map_err(|e| err_data( e.to_string()))?;
         
         // Apply ORDER BY if present
         if !stmt.order_by.is_empty() {
@@ -1774,13 +1834,9 @@ impl ApexExecutor {
         let filter_batch = backend.read_columns_to_arrow(Some(&where_col_refs), 0, None)?;
         
         if filter_batch.num_rows() == 0 {
-            // Return empty batch - get required columns for schema
-            let required_cols = stmt.required_columns();
-            let col_refs: Option<Vec<&str>> = required_cols
-                .as_ref()
-                .filter(|cols| !cols.is_empty())
-                .map(|cols| cols.iter().map(|s| s.as_str()).collect());
-            return backend.read_columns_to_arrow(col_refs.as_deref(), 0, Some(0));
+            let col_refs = Self::get_col_refs(stmt);
+            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+            return backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, Some(0));
         }
         
         // Step 2: Apply WHERE filter to get matching row indices
@@ -1794,12 +1850,9 @@ impl ApexExecutor {
             .collect();
         
         if indices.is_empty() {
-            let required_cols = stmt.required_columns();
-            let col_refs: Option<Vec<&str>> = required_cols
-                .as_ref()
-                .filter(|cols| !cols.is_empty())
-                .map(|cols| cols.iter().map(|s| s.as_str()).collect());
-            return backend.read_columns_to_arrow(col_refs.as_deref(), 0, Some(0));
+            let col_refs = Self::get_col_refs(stmt);
+            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+            return backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, Some(0));
         }
         
         // Step 3: Read only required columns (GROUP BY + aggregates) for matching rows
@@ -1824,9 +1877,9 @@ impl ApexExecutor {
                 .iter()
                 .map(|col| compute::take(col, &indices_array, None))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
             RecordBatch::try_new(filter_batch.schema(), columns)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                .map_err(|e| err_data( e.to_string()))
         } else {
             // Need to read additional columns for matching rows
             let other_batch = backend.read_columns_by_indices_to_arrow(&indices)?;
@@ -1840,7 +1893,7 @@ impl ApexExecutor {
                 .iter()
                 .map(|col| compute::take(col, &indices_array, None))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
             
             // Merge: use other_batch as base (has _id and other columns)
             // Add WHERE columns that aren't already present
@@ -1856,7 +1909,7 @@ impl ApexExecutor {
             
             let schema = Arc::new(Schema::new(fields));
             RecordBatch::try_new(schema, arrays)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                .map_err(|e| err_data( e.to_string()))
         }
     }
 
@@ -2247,7 +2300,7 @@ impl ApexExecutor {
         let left_indices_array = arrow::array::UInt32Array::from(left_indices);
         for col in left.columns() {
             let taken = compute::take(col.as_ref(), &left_indices_array, None)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
             columns.push(taken);
         }
 
@@ -2259,7 +2312,7 @@ impl ApexExecutor {
                 if field.name() != right_key {
                     let right_col = right.column(col_idx);
                     let taken = compute::take(right_col.as_ref(), &right_indices_array, None)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        .map_err(|e| err_data( e.to_string()))?;
                     columns.push(taken);
                 }
             }
@@ -2275,7 +2328,7 @@ impl ApexExecutor {
         }
 
         RecordBatch::try_new(result_schema, columns)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+            .map_err(|e| err_data( e.to_string()))
     }
 
     /// Hash a value at given index in an array (legacy, uses DefaultHasher)
@@ -2396,28 +2449,32 @@ impl ApexExecutor {
     }
 
     /// Apply WHERE clause filter using Arrow compute
-    fn apply_filter(batch: &RecordBatch, expr: &SqlExpr) -> io::Result<RecordBatch> {
-        let mask = Self::evaluate_predicate(batch, expr)?;
-        compute::filter_record_batch(batch, &mask)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
-    }
-
-    /// Apply WHERE clause filter with storage path (for subquery support)
-    /// Uses Zone Maps optimization to potentially skip filtering entirely
-    fn apply_filter_with_storage(batch: &RecordBatch, expr: &SqlExpr, storage_path: &Path) -> io::Result<RecordBatch> {
-        // Zone Map optimization: check if filter can possibly match
+    /// When storage_path is provided, enables Zone Map optimization and subquery support
+    fn apply_filter_impl(batch: &RecordBatch, expr: &SqlExpr, storage_path: Option<&Path>) -> io::Result<RecordBatch> {
+        // Zone Map optimization (always try, regardless of storage_path)
         if let Some(result) = Self::try_zone_map_filter(batch, expr) {
             if result == ZoneMapResult::NoMatch {
-                // Filter definitely won't match any rows - return empty batch
                 return Ok(RecordBatch::new_empty(batch.schema()));
             }
-            // ZoneMapResult::AllMatch would mean all rows match, but we still need to evaluate
-            // to handle nulls correctly, so we fall through
         }
         
-        let mask = Self::evaluate_predicate_with_storage(batch, expr, storage_path)?;
+        let mask = if let Some(path) = storage_path {
+            Self::evaluate_predicate_with_storage(batch, expr, path)?
+        } else {
+            Self::evaluate_predicate(batch, expr)?
+        };
         compute::filter_record_batch(batch, &mask)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+            .map_err(|e| err_data( e.to_string()))
+    }
+
+    #[inline]
+    fn apply_filter(batch: &RecordBatch, expr: &SqlExpr) -> io::Result<RecordBatch> {
+        Self::apply_filter_impl(batch, expr, None)
+    }
+
+    #[inline]
+    fn apply_filter_with_storage(batch: &RecordBatch, expr: &SqlExpr, storage_path: &Path) -> io::Result<RecordBatch> {
+        Self::apply_filter_impl(batch, expr, Some(storage_path))
     }
     
     
@@ -2471,49 +2528,31 @@ impl ApexExecutor {
         }
     }
     
+    /// Create ZoneMap from a column (helper to avoid duplication)
+    #[inline]
+    fn create_zone_map(col: &ArrayRef) -> Option<ZoneMap> {
+        if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+            Some(ZoneMap::from_int64_array(arr))
+        } else if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+            Some(ZoneMap::from_float64_array(arr))
+        } else {
+            None
+        }
+    }
+
     /// Check Zone Map for a simple comparison
     fn check_zone_map_comparison(batch: &RecordBatch, col_name: &str, op: &BinaryOperator, lit: &Value) -> Option<ZoneMapResult> {
-        let col_name = col_name.trim_matches('"');
-        let col = batch.column_by_name(col_name)?;
-        
-        let zone_map = if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            ZoneMap::from_int64_array(arr)
-        } else if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-            ZoneMap::from_float64_array(arr)
-        } else {
-            return None; // Can't optimize string columns without dictionary encoding
-        };
-        
-        if zone_map.can_match(op, lit) {
-            Some(ZoneMapResult::MayMatch)
-        } else {
-            Some(ZoneMapResult::NoMatch)
-        }
+        let col = batch.column_by_name(col_name.trim_matches('"'))?;
+        let zone_map = Self::create_zone_map(col)?;
+        Some(if zone_map.can_match(op, lit) { ZoneMapResult::MayMatch } else { ZoneMapResult::NoMatch })
     }
     
     /// Check Zone Map for BETWEEN
     fn check_zone_map_between(batch: &RecordBatch, col_name: &str, low: &Value, high: &Value) -> Option<ZoneMapResult> {
-        let col_name = col_name.trim_matches('"');
-        let col = batch.column_by_name(col_name)?;
-        
-        let zone_map = if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-            ZoneMap::from_int64_array(arr)
-        } else if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-            ZoneMap::from_float64_array(arr)
-        } else {
-            return None;
-        };
-        
-        // BETWEEN low AND high: col >= low AND col <= high
-        // NoMatch if: max < low OR min > high
-        let can_match_low = zone_map.can_match(&BinaryOperator::Ge, low);
-        let can_match_high = zone_map.can_match(&BinaryOperator::Le, high);
-        
-        if can_match_low && can_match_high {
-            Some(ZoneMapResult::MayMatch)
-        } else {
-            Some(ZoneMapResult::NoMatch)
-        }
+        let col = batch.column_by_name(col_name.trim_matches('"'))?;
+        let zone_map = Self::create_zone_map(col)?;
+        let can_match = zone_map.can_match(&BinaryOperator::Ge, low) && zone_map.can_match(&BinaryOperator::Le, high);
+        Some(if can_match { ZoneMapResult::MayMatch } else { ZoneMapResult::NoMatch })
     }
 
     /// Evaluate a predicate expression to a boolean mask
@@ -2528,13 +2567,13 @@ impl ApexExecutor {
                         let left_mask = Self::evaluate_predicate(batch, left)?;
                         let right_mask = Self::evaluate_predicate(batch, right)?;
                         compute::and(&left_mask, &right_mask)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                            .map_err(|e| err_data( e.to_string()))
                     }
                     BinaryOperator::Or => {
                         let left_mask = Self::evaluate_predicate(batch, left)?;
                         let right_mask = Self::evaluate_predicate(batch, right)?;
                         compute::or(&left_mask, &right_mask)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                            .map_err(|e| err_data( e.to_string()))
                     }
                     // Comparison operators
                     _ => Self::evaluate_comparison(batch, left, op, right)
@@ -2545,7 +2584,7 @@ impl ApexExecutor {
                     UnaryOperator::Not => {
                         let inner_mask = Self::evaluate_predicate(batch, expr)?;
                         compute::not(&inner_mask)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                            .map_err(|e| err_data( e.to_string()))
                     }
                     _ => Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -2556,12 +2595,12 @@ impl ApexExecutor {
             SqlExpr::IsNull { column, negated } => {
                 let col_name = column.trim_matches('"');
                 let array = Self::get_column_by_name(batch, col_name)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+                    .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
                 let null_mask = compute::is_null(array)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    .map_err(|e| err_data( e.to_string()))?;
                 if *negated {
                     compute::not(&null_mask)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                        .map_err(|e| err_data( e.to_string()))
                 } else {
                     Ok(null_mask)
                 }
@@ -2569,7 +2608,7 @@ impl ApexExecutor {
             SqlExpr::Between { column, low, high, negated } => {
                 let col_name = column.trim_matches('"');
                 let val = Self::get_column_by_name(batch, col_name)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+                    .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
                 let low_val = Self::evaluate_expr_to_array(batch, low)?;
                 let high_val = Self::evaluate_expr_to_array(batch, high)?;
 
@@ -2577,16 +2616,16 @@ impl ApexExecutor {
                 let (val_for_cmp2, high_for_cmp) = Self::coerce_numeric_for_comparison(val.clone(), high_val)?;
                 
                 let ge_low = cmp::gt_eq(&val_for_cmp, &low_for_cmp)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    .map_err(|e| err_data( e.to_string()))?;
                 let le_high = cmp::lt_eq(&val_for_cmp2, &high_for_cmp)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    .map_err(|e| err_data( e.to_string()))?;
                 
                 let result = compute::and(&ge_low, &le_high)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    .map_err(|e| err_data( e.to_string()))?;
                 
                 if *negated {
                     compute::not(&result)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                        .map_err(|e| err_data( e.to_string()))
                 } else {
                     Ok(result)
                 }
@@ -2630,13 +2669,13 @@ impl ApexExecutor {
                         let left_mask = Self::evaluate_predicate_with_storage(batch, left, storage_path)?;
                         let right_mask = Self::evaluate_predicate_with_storage(batch, right, storage_path)?;
                         compute::and(&left_mask, &right_mask)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                            .map_err(|e| err_data( e.to_string()))
                     }
                     BinaryOperator::Or => {
                         let left_mask = Self::evaluate_predicate_with_storage(batch, left, storage_path)?;
                         let right_mask = Self::evaluate_predicate_with_storage(batch, right, storage_path)?;
                         compute::or(&left_mask, &right_mask)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                            .map_err(|e| err_data( e.to_string()))
                     }
                     _ => Self::evaluate_comparison_with_storage(batch, left, op, right, storage_path)
                 }
@@ -2646,7 +2685,7 @@ impl ApexExecutor {
                     UnaryOperator::Not => {
                         let inner_mask = Self::evaluate_predicate_with_storage(batch, expr, storage_path)?;
                         compute::not(&inner_mask)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                            .map_err(|e| err_data( e.to_string()))
                     }
                     _ => Err(io::Error::new(io::ErrorKind::Unsupported, "Unsupported unary operator"))
                 }
@@ -2696,7 +2735,7 @@ impl ApexExecutor {
             col_name
         };
         let main_col = batch.column_by_name(lookup_name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+            .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
         
         if outer_cols.is_empty() {
             // Non-correlated: execute once
@@ -2708,7 +2747,7 @@ impl ApexExecutor {
             }
             
             if sub_batch.num_columns() == 0 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Subquery must return at least one column"));
+                return Err(err_data( "Subquery must return at least one column"));
             }
             let sub_col = sub_batch.column(0);
             
@@ -2793,7 +2832,7 @@ impl ApexExecutor {
         // Get table name from subquery's FROM clause
         if let Some(FromItem::Table { table, .. }) = &stmt.from {
             let base_dir = main_storage_path.parent()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Cannot determine base directory"))?;
+                .ok_or_else(|| err_input( "Cannot determine base directory"))?;
             Ok(Self::resolve_table_path(table, base_dir, main_storage_path))
         } else {
             // No FROM or derived table - use main storage path
@@ -2961,7 +3000,7 @@ impl ApexExecutor {
             )),
         };
 
-        result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+        result.map_err(|e| err_data( e.to_string()))
     }
     
     /// Try to use scalar comparison for column vs literal (faster than array vs array)
@@ -3078,7 +3117,7 @@ impl ApexExecutor {
                     (BinaryOperator::Ge, false) | (BinaryOperator::Le, true) => cmp::gt_eq(str_arr, &scalar),
                     _ => return Ok(None),
                 };
-                return result.map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+                return result.map(Some).map_err(|e| err_data( e.to_string()));
             }
         }
         
@@ -3108,7 +3147,7 @@ impl ApexExecutor {
                 (BinaryOperator::Ge, false) | (BinaryOperator::Le, true) => cmp::gt_eq(int_arr, &scalar),
                 _ => return Ok(None),
             };
-            return result.map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+            return result.map(Some).map_err(|e| err_data( e.to_string()));
         }
         
         // Float64 scalar comparison
@@ -3128,7 +3167,7 @@ impl ApexExecutor {
                 (BinaryOperator::Ge, false) | (BinaryOperator::Le, true) => cmp::gt_eq(float_arr, &scalar),
                 _ => return Ok(None),
             };
-            return result.map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+            return result.map(Some).map_err(|e| err_data( e.to_string()));
         }
         
         Ok(None)
@@ -3164,7 +3203,7 @@ impl ApexExecutor {
             }
         };
 
-        result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+        result.map_err(|e| err_data( e.to_string()))
     }
 
     /// Try to use JIT compilation for integer filter (for large arrays)
@@ -3246,6 +3285,9 @@ impl ApexExecutor {
             SqlExpr::Paren(inner) => {
                 Self::evaluate_expr_to_array(batch, inner)
             }
+            SqlExpr::ArrayIndex { array, index } => {
+                Self::evaluate_array_index(batch, array, index)
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported expression type: {:?}", expr),
@@ -3288,7 +3330,7 @@ impl ApexExecutor {
             }
             
             if sub_batch.num_rows() > 1 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Scalar subquery returned more than one row"));
+                return Err(err_data( "Scalar subquery returned more than one row"));
             }
             
             let sub_col = sub_batch.column(0);
@@ -3306,7 +3348,7 @@ impl ApexExecutor {
             if sub_batch.num_rows() == 0 || sub_batch.num_columns() == 0 {
                 results.push(None);
             } else if sub_batch.num_rows() > 1 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Scalar subquery returned more than one row"));
+                return Err(err_data( "Scalar subquery returned more than one row"));
             } else {
                 let sub_col = sub_batch.column(0);
                 if sub_col.is_null(0) {
@@ -3384,21 +3426,21 @@ impl ApexExecutor {
         
         let result: ArrayRef = match op {
             BinaryOperator::Add => Arc::new(numeric::add(
-                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Expected Int64"))?,
-                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Expected Int64"))?
-            ).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?),
+                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?,
+                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?
+            ).map_err(|e| err_data( e.to_string()))?),
             BinaryOperator::Sub => Arc::new(numeric::sub(
-                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Expected Int64"))?,
-                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Expected Int64"))?
-            ).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?),
+                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?,
+                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?
+            ).map_err(|e| err_data( e.to_string()))?),
             BinaryOperator::Mul => Arc::new(numeric::mul(
-                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Expected Int64"))?,
-                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Expected Int64"))?
-            ).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?),
+                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?,
+                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?
+            ).map_err(|e| err_data( e.to_string()))?),
             BinaryOperator::Div => Arc::new(numeric::div(
-                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Expected Int64"))?,
-                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Expected Int64"))?
-            ).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?),
+                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?,
+                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?
+            ).map_err(|e| err_data( e.to_string()))?),
             _ => return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Unsupported arithmetic operator: {:?}", op),
@@ -3462,13 +3504,13 @@ impl ApexExecutor {
                     right_array.as_any().downcast_ref::<Int64Array>(),
                 ) {
                     Arc::new(arith::add(l, r)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?)
+                        .map_err(|e| err_data( e.to_string()))?)
                 } else if let (Some(l), Some(r)) = (
                     left_array.as_any().downcast_ref::<Float64Array>(),
                     right_array.as_any().downcast_ref::<Float64Array>(),
                 ) {
                     Arc::new(arith::add(l, r)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?)
+                        .map_err(|e| err_data( e.to_string()))?)
                 } else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -3482,13 +3524,13 @@ impl ApexExecutor {
                     right_array.as_any().downcast_ref::<Int64Array>(),
                 ) {
                     Arc::new(arith::sub(l, r)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?)
+                        .map_err(|e| err_data( e.to_string()))?)
                 } else if let (Some(l), Some(r)) = (
                     left_array.as_any().downcast_ref::<Float64Array>(),
                     right_array.as_any().downcast_ref::<Float64Array>(),
                 ) {
                     Arc::new(arith::sub(l, r)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?)
+                        .map_err(|e| err_data( e.to_string()))?)
                 } else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -3502,13 +3544,13 @@ impl ApexExecutor {
                     right_array.as_any().downcast_ref::<Int64Array>(),
                 ) {
                     Arc::new(arith::mul(l, r)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?)
+                        .map_err(|e| err_data( e.to_string()))?)
                 } else if let (Some(l), Some(r)) = (
                     left_array.as_any().downcast_ref::<Float64Array>(),
                     right_array.as_any().downcast_ref::<Float64Array>(),
                 ) {
                     Arc::new(arith::mul(l, r)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?)
+                        .map_err(|e| err_data( e.to_string()))?)
                 } else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -3522,18 +3564,55 @@ impl ApexExecutor {
                     right_array.as_any().downcast_ref::<Int64Array>(),
                 ) {
                     Arc::new(arith::div(l, r)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?)
+                        .map_err(|e| err_data( e.to_string()))?)
                 } else if let (Some(l), Some(r)) = (
                     left_array.as_any().downcast_ref::<Float64Array>(),
                     right_array.as_any().downcast_ref::<Float64Array>(),
                 ) {
                     Arc::new(arith::div(l, r)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?)
+                        .map_err(|e| err_data( e.to_string()))?)
                 } else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "Cannot divide non-numeric types",
                     ));
+                }
+            }
+            // Comparison operators - return BooleanArray
+            BinaryOperator::Gt | BinaryOperator::Ge | BinaryOperator::Lt | BinaryOperator::Le | BinaryOperator::Eq | BinaryOperator::NotEq => {
+                use arrow::compute::kernels::cmp;
+                if let (Some(l), Some(r)) = (left_array.as_any().downcast_ref::<Int64Array>(), right_array.as_any().downcast_ref::<Int64Array>()) {
+                    match op {
+                        BinaryOperator::Gt => Arc::new(cmp::gt(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::Ge => Arc::new(cmp::gt_eq(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::Lt => Arc::new(cmp::lt(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::Le => Arc::new(cmp::lt_eq(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::Eq => Arc::new(cmp::eq(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::NotEq => Arc::new(cmp::neq(l, r).map_err(|e| err_data( e.to_string()))?),
+                        _ => unreachable!(),
+                    }
+                } else if let (Some(l), Some(r)) = (left_array.as_any().downcast_ref::<Float64Array>(), right_array.as_any().downcast_ref::<Float64Array>()) {
+                    match op {
+                        BinaryOperator::Gt => Arc::new(cmp::gt(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::Ge => Arc::new(cmp::gt_eq(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::Lt => Arc::new(cmp::lt(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::Le => Arc::new(cmp::lt_eq(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::Eq => Arc::new(cmp::eq(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::NotEq => Arc::new(cmp::neq(l, r).map_err(|e| err_data( e.to_string()))?),
+                        _ => unreachable!(),
+                    }
+                } else if let (Some(l), Some(r)) = (left_array.as_any().downcast_ref::<StringArray>(), right_array.as_any().downcast_ref::<StringArray>()) {
+                    match op {
+                        BinaryOperator::Gt => Arc::new(cmp::gt(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::Ge => Arc::new(cmp::gt_eq(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::Lt => Arc::new(cmp::lt(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::Le => Arc::new(cmp::lt_eq(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::Eq => Arc::new(cmp::eq(l, r).map_err(|e| err_data( e.to_string()))?),
+                        BinaryOperator::NotEq => Arc::new(cmp::neq(l, r).map_err(|e| err_data( e.to_string()))?),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    return Err(err_data( "Cannot compare incompatible types"));
                 }
             }
             _ => {
@@ -3585,7 +3664,7 @@ impl ApexExecutor {
                     }
                     Ok(Arc::new(Int64Array::from(result)))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "Cannot cast to INT64"))
+                    Err(err_data( "Cannot cast to INT64"))
                 }
             }
             DataType::Float64 => {
@@ -3616,7 +3695,7 @@ impl ApexExecutor {
                     }
                     Ok(Arc::new(Float64Array::from(result)))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "Cannot cast to FLOAT64"))
+                    Err(err_data( "Cannot cast to FLOAT64"))
                 }
             }
             DataType::String => {
@@ -3633,7 +3712,7 @@ impl ApexExecutor {
                     }).collect();
                     Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "Cannot cast to STRING"))
+                    Err(err_data( "Cannot cast to STRING"))
                 }
             }
             DataType::Bool => {
@@ -3654,7 +3733,7 @@ impl ApexExecutor {
                     }).collect();
                     Ok(Arc::new(BooleanArray::from(result)))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "Cannot cast to BOOL"))
+                    Err(err_data( "Cannot cast to BOOL"))
                 }
             }
             DataType::Int32 => {
@@ -3686,7 +3765,7 @@ impl ApexExecutor {
                     }
                     Ok(Arc::new(Int64Array::from(result)))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "Cannot cast to INT32"))
+                    Err(err_data( "Cannot cast to INT32"))
                 }
             }
             _ => Err(io::Error::new(io::ErrorKind::Unsupported, format!("CAST to {:?} not supported", target_type))),
@@ -3853,7 +3932,7 @@ impl ApexExecutor {
         match upper.as_str() {
             "COALESCE" => {
                 if args.is_empty() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "COALESCE requires at least one argument"));
+                    return Err(err_input( "COALESCE requires at least one argument"));
                 }
                 
                 let num_rows = batch.num_rows();
@@ -3927,7 +4006,7 @@ impl ApexExecutor {
             }
             "IFNULL" | "NVL" | "ISNULL" => {
                 if args.len() != 2 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} requires exactly 2 arguments", upper)));
+                    return Err(err_input( format!("{} requires exactly 2 arguments", upper)));
                 }
                 
                 let arr1 = Self::evaluate_expr_to_array(batch, &args[0])?;
@@ -3974,124 +4053,42 @@ impl ApexExecutor {
                 if arr1_all_null {
                     return Ok(arr2);
                 }
-                Err(io::Error::new(io::ErrorKind::InvalidData, "IFNULL/NVL argument types must match"))
+                Err(err_data( "IFNULL/NVL argument types must match"))
             }
             "ABS" => {
-                if args.len() != 1 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "ABS requires exactly 1 argument"));
-                }
+                if args.len() != 1 { return Err(err_input("ABS requires exactly 1 argument")); }
                 let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
-                if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-                    let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| {
-                        if int_arr.is_null(i) { None } else { Some(int_arr.value(i).abs()) }
-                    }).collect();
-                    Ok(Arc::new(Int64Array::from(result)))
-                } else if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-                    let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| {
-                        if float_arr.is_null(i) { None } else { Some(float_arr.value(i).abs()) }
-                    }).collect();
-                    Ok(Arc::new(Float64Array::from(result)))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "ABS requires numeric argument"))
-                }
+                map_numeric_unary(&arr, batch.num_rows(), |x| x.abs(), |x| x.abs(), "ABS")
             }
             "NULLIF" => {
-                if args.len() != 2 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "NULLIF requires exactly 2 arguments"));
-                }
+                if args.len() != 2 { return Err(err_input("NULLIF requires 2 arguments")); }
                 let arr1 = Self::evaluate_expr_to_array(batch, &args[0])?;
                 let arr2 = Self::evaluate_expr_to_array(batch, &args[1])?;
-                let num_rows = batch.num_rows();
-                
-                if let (Some(int1), Some(int2)) = (
-                    arr1.as_any().downcast_ref::<Int64Array>(),
-                    arr2.as_any().downcast_ref::<Int64Array>(),
-                ) {
-                    let result: Vec<Option<i64>> = (0..num_rows).map(|i| {
-                        if int1.is_null(i) { None }
-                        else if !int2.is_null(i) && int1.value(i) == int2.value(i) { None }
-                        else { Some(int1.value(i)) }
-                    }).collect();
+                let n = batch.num_rows();
+                if let (Some(i1), Some(i2)) = (arr1.as_any().downcast_ref::<Int64Array>(), arr2.as_any().downcast_ref::<Int64Array>()) {
+                    let result: Vec<Option<i64>> = (0..n).map(|i| if i1.is_null(i) || (!i2.is_null(i) && i1.value(i) == i2.value(i)) { None } else { Some(i1.value(i)) }).collect();
                     Ok(Arc::new(Int64Array::from(result)))
-                } else if let (Some(str1), Some(str2)) = (
-                    arr1.as_any().downcast_ref::<StringArray>(),
-                    arr2.as_any().downcast_ref::<StringArray>(),
-                ) {
-                    let result: Vec<Option<&str>> = (0..num_rows).map(|i| {
-                        if str1.is_null(i) { None }
-                        else if !str2.is_null(i) && str1.value(i) == str2.value(i) { None }
-                        else { Some(str1.value(i)) }
-                    }).collect();
+                } else if let (Some(s1), Some(s2)) = (arr1.as_any().downcast_ref::<StringArray>(), arr2.as_any().downcast_ref::<StringArray>()) {
+                    let result: Vec<Option<&str>> = (0..n).map(|i| if s1.is_null(i) || (!s2.is_null(i) && s1.value(i) == s2.value(i)) { None } else { Some(s1.value(i)) }).collect();
                     Ok(Arc::new(StringArray::from(result)))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "NULLIF type mismatch"))
-                }
+                } else { Err(err_data("NULLIF type mismatch")) }
             }
-            "UPPER" | "UCASE" => {
-                if args.len() != 1 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "UPPER requires exactly 1 argument"));
-                }
+            "UPPER" | "UCASE" | "LOWER" | "LCASE" => {
+                let is_upper = upper == "UPPER" || upper == "UCASE";
+                if args.len() != 1 { return Err(err_input(format!("{} requires 1 argument", upper))); }
                 let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
-                // Handle all-null input or NULL literal
-                if (0..arr.len()).all(|i| arr.is_null(i)) {
-                    let result: Vec<Option<&str>> = vec![None; batch.num_rows()];
-                    return Ok(Arc::new(StringArray::from(result)));
-                }
-                if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| {
-                        if str_arr.is_null(i) { None } else { Some(str_arr.value(i).to_uppercase()) }
-                    }).collect();
-                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "UPPER requires string argument"))
-                }
-            }
-            "LOWER" | "LCASE" => {
-                if args.len() != 1 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "LOWER requires exactly 1 argument"));
-                }
-                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
-                // Handle all-null input or NULL literal
-                if (0..arr.len()).all(|i| arr.is_null(i)) {
-                    let result: Vec<Option<&str>> = vec![None; batch.num_rows()];
-                    return Ok(Arc::new(StringArray::from(result)));
-                }
-                if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| {
-                        if str_arr.is_null(i) { None } else { Some(str_arr.value(i).to_lowercase()) }
-                    }).collect();
-                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "LOWER requires string argument"))
-                }
+                if (0..arr.len()).all(|i| arr.is_null(i)) { return Ok(Arc::new(StringArray::from(vec![None::<&str>; batch.num_rows()]))); }
+                map_string_unary(&arr, batch.num_rows(), |s| if is_upper { s.to_uppercase() } else { s.to_lowercase() }, &upper)
             }
             "LENGTH" | "LEN" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
-                if args.len() != 1 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "LENGTH requires exactly 1 argument"));
-                }
+                if args.len() != 1 { return Err(err_input("LENGTH requires 1 argument")); }
                 let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
-                if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                    let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| {
-                        if str_arr.is_null(i) { None } else { Some(str_arr.value(i).chars().count() as i64) }
-                    }).collect();
-                    Ok(Arc::new(Int64Array::from(result)))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "LENGTH requires string argument"))
-                }
+                map_string_to_int(&arr, batch.num_rows(), |s| s.chars().count() as i64, "LENGTH")
             }
             "TRIM" => {
-                if args.len() != 1 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "TRIM requires exactly 1 argument"));
-                }
+                if args.len() != 1 { return Err(err_input("TRIM requires exactly 1 argument")); }
                 let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
-                if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| {
-                        if str_arr.is_null(i) { None } else { Some(str_arr.value(i).trim().to_string()) }
-                    }).collect();
-                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "TRIM requires string argument"))
-                }
+                map_string_unary(&arr, batch.num_rows(), |s| s.trim().to_string(), "TRIM")
             }
             "CONCAT" => {
                 if args.is_empty() {
@@ -4119,7 +4116,7 @@ impl ApexExecutor {
             }
             "SUBSTR" | "SUBSTRING" => {
                 if args.len() < 2 || args.len() > 3 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "SUBSTR requires 2 or 3 arguments"));
+                    return Err(err_input( "SUBSTR requires 2 or 3 arguments"));
                 }
                 let str_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
                 let start_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
@@ -4143,171 +4140,72 @@ impl ApexExecutor {
                     }).collect();
                     Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "SUBSTR type mismatch"))
+                    Err(err_data( "SUBSTR type mismatch"))
                 }
             }
             "REPLACE" => {
-                if args.len() != 3 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "REPLACE requires exactly 3 arguments"));
-                }
+                if args.len() != 3 { return Err(err_input("REPLACE requires 3 arguments")); }
                 let str_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
                 let from_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
                 let to_arr = Self::evaluate_expr_to_array(batch, &args[2])?;
-                
-                if let (Some(strs), Some(froms), Some(tos)) = (
-                    str_arr.as_any().downcast_ref::<StringArray>(),
-                    from_arr.as_any().downcast_ref::<StringArray>(),
-                    to_arr.as_any().downcast_ref::<StringArray>(),
-                ) {
+                if let (Some(strs), Some(froms), Some(tos)) = (str_arr.as_any().downcast_ref::<StringArray>(), from_arr.as_any().downcast_ref::<StringArray>(), to_arr.as_any().downcast_ref::<StringArray>()) {
                     let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| {
-                        if strs.is_null(i) { None }
-                        else {
-                            let from = if froms.is_null(i) { "" } else { froms.value(i) };
-                            let to = if tos.is_null(i) { "" } else { tos.value(i) };
-                            Some(strs.value(i).replace(from, to))
-                        }
+                        if strs.is_null(i) { None } else { Some(strs.value(i).replace(if froms.is_null(i) { "" } else { froms.value(i) }, if tos.is_null(i) { "" } else { tos.value(i) })) }
                     }).collect();
                     Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "REPLACE requires string arguments"))
-                }
+                } else { Err(err_data("REPLACE requires string arguments")) }
             }
             "ROUND" => {
-                if args.is_empty() || args.len() > 2 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "ROUND requires 1 or 2 arguments"));
-                }
+                if args.is_empty() || args.len() > 2 { return Err(err_input("ROUND requires 1-2 arguments")); }
                 let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
-                let decimals = if args.len() == 2 {
-                    let d = Self::evaluate_expr_to_array(batch, &args[1])?;
-                    if let Some(da) = d.as_any().downcast_ref::<Int64Array>() {
-                        if da.len() > 0 && !da.is_null(0) { da.value(0) as i32 } else { 0 }
-                    } else { 0 }
-                } else { 0 };
-                
-                if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-                    let factor = 10f64.powi(decimals);
-                    let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| {
-                        if float_arr.is_null(i) { None } else { Some((float_arr.value(i) * factor).round() / factor) }
-                    }).collect();
+                let dec = if args.len() == 2 { Self::evaluate_expr_to_array(batch, &args[1])?.as_any().downcast_ref::<Int64Array>().map_or(0, |a| if a.len() > 0 && !a.is_null(0) { a.value(0) as i32 } else { 0 }) } else { 0 };
+                if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() { return Ok(Arc::new(int_arr.clone())); }
+                if let Some(fa) = arr.as_any().downcast_ref::<Float64Array>() {
+                    let f = 10f64.powi(dec);
+                    let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| if fa.is_null(i) { None } else { Some((fa.value(i) * f).round() / f) }).collect();
                     Ok(Arc::new(Float64Array::from(result)))
-                } else if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-                    Ok(Arc::new(int_arr.clone()))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "ROUND requires numeric argument"))
-                }
+                } else { Err(err_data("ROUND requires numeric argument")) }
             }
-            "FLOOR" => {
-                if args.len() != 1 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "FLOOR requires exactly 1 argument"));
-                }
+            "FLOOR" | "CEIL" | "CEILING" => {
+                let is_floor = upper == "FLOOR";
+                if args.len() != 1 { return Err(err_input(format!("{} requires 1 argument", upper))); }
                 let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
-                if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-                    let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| {
-                        if float_arr.is_null(i) { None } else { Some(float_arr.value(i).floor()) }
-                    }).collect();
-                    Ok(Arc::new(Float64Array::from(result)))
-                } else if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-                    Ok(Arc::new(int_arr.clone()))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "FLOOR requires numeric argument"))
-                }
-            }
-            "CEIL" | "CEILING" => {
-                if args.len() != 1 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "CEIL requires exactly 1 argument"));
-                }
-                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
-                if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-                    let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| {
-                        if float_arr.is_null(i) { None } else { Some(float_arr.value(i).ceil()) }
-                    }).collect();
-                    Ok(Arc::new(Float64Array::from(result)))
-                } else if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-                    Ok(Arc::new(int_arr.clone()))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "CEIL requires numeric argument"))
-                }
+                if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() { return Ok(Arc::new(int_arr.clone())); }
+                map_numeric_unary(&arr, batch.num_rows(), |x| x, |x| if is_floor { x.floor() } else { x.ceil() }, &upper)
             }
             "MOD" => {
-                if args.len() != 2 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "MOD requires exactly 2 arguments"));
-                }
+                if args.len() != 2 { return Err(err_input("MOD requires 2 arguments")); }
                 let arr1 = Self::evaluate_expr_to_array(batch, &args[0])?;
                 let arr2 = Self::evaluate_expr_to_array(batch, &args[1])?;
-                if let (Some(int1), Some(int2)) = (
-                    arr1.as_any().downcast_ref::<Int64Array>(),
-                    arr2.as_any().downcast_ref::<Int64Array>(),
-                ) {
-                    let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| {
-                        if int1.is_null(i) || int2.is_null(i) || int2.value(i) == 0 { None }
-                        else { Some(int1.value(i) % int2.value(i)) }
-                    }).collect();
+                if let (Some(i1), Some(i2)) = (arr1.as_any().downcast_ref::<Int64Array>(), arr2.as_any().downcast_ref::<Int64Array>()) {
+                    let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| if i1.is_null(i) || i2.is_null(i) || i2.value(i) == 0 { None } else { Some(i1.value(i) % i2.value(i)) }).collect();
                     Ok(Arc::new(Int64Array::from(result)))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "MOD requires integer arguments"))
-                }
+                } else { Err(err_data("MOD requires integer arguments")) }
             }
             "SQRT" => {
-                if args.len() != 1 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "SQRT requires exactly 1 argument"));
-                }
+                if args.len() != 1 { return Err(err_input("SQRT requires 1 argument")); }
                 let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
-                if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-                    let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| {
-                        if float_arr.is_null(i) || float_arr.value(i) < 0.0 { None } 
-                        else { Some(float_arr.value(i).sqrt()) }
-                    }).collect();
-                    Ok(Arc::new(Float64Array::from(result)))
-                } else if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-                    let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| {
-                        if int_arr.is_null(i) || int_arr.value(i) < 0 { None }
-                        else { Some((int_arr.value(i) as f64).sqrt()) }
-                    }).collect();
-                    Ok(Arc::new(Float64Array::from(result)))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "SQRT requires numeric argument"))
-                }
+                map_numeric_unary(&arr, batch.num_rows(), |x| if x < 0 { 0 } else { ((x as f64).sqrt()) as i64 }, |x| if x < 0.0 { f64::NAN } else { x.sqrt() }, "SQRT")
             }
             "MID" | "SUBSTR" | "SUBSTRING" => {
-                if args.len() < 2 || args.len() > 3 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "MID/SUBSTR requires 2 or 3 arguments"));
-                }
+                if args.len() < 2 || args.len() > 3 { return Err(err_input("SUBSTR requires 2-3 arguments")); }
                 let str_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
                 let start_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
-                let len_arr = if args.len() == 3 {
-                    Some(Self::evaluate_expr_to_array(batch, &args[2])?)
-                } else { None };
-                
-                if let (Some(strs), Some(starts)) = (
-                    str_arr.as_any().downcast_ref::<StringArray>(),
-                    start_arr.as_any().downcast_ref::<Int64Array>(),
-                ) {
+                let len_arr = if args.len() == 3 { Some(Self::evaluate_expr_to_array(batch, &args[2])?) } else { None };
+                if let (Some(strs), Some(starts)) = (str_arr.as_any().downcast_ref::<StringArray>(), start_arr.as_any().downcast_ref::<Int64Array>()) {
                     let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| {
                         if strs.is_null(i) || starts.is_null(i) { return None; }
-                        let s = strs.value(i);
-                        let start = (starts.value(i).max(1) - 1) as usize; // 1-indexed
-                        let len = if let Some(ref la) = len_arr {
-                            if let Some(ia) = la.as_any().downcast_ref::<Int64Array>() {
-                                if ia.is_null(i) { s.len() } else { ia.value(i).max(0) as usize }
-                            } else { s.len() }
-                        } else { s.len() };
+                        let s = strs.value(i); let start = (starts.value(i).max(1) - 1) as usize;
+                        let len = len_arr.as_ref().and_then(|la| la.as_any().downcast_ref::<Int64Array>()).map_or(s.len(), |ia| if ia.is_null(i) { s.len() } else { ia.value(i).max(0) as usize });
                         let chars: Vec<char> = s.chars().collect();
-                        if start >= chars.len() { Some(String::new()) }
-                        else { Some(chars[start..].iter().take(len).collect()) }
+                        Some(if start >= chars.len() { String::new() } else { chars[start..].iter().take(len).collect() })
                     }).collect();
                     Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "MID requires string and integer arguments"))
-                }
+                } else { Err(err_data("SUBSTR requires string and integer arguments")) }
             }
             "NOW" | "CURRENT_TIMESTAMP" => {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                // Format as ISO 8601 string
-                let dt = chrono::DateTime::from_timestamp(secs as i64, 0).unwrap_or_default();
-                let now_str = dt.format("%Y-%m-%d %H:%M:%S").to_string();
-                let result = vec![Some(now_str.as_str()); batch.num_rows()];
-                Ok(Arc::new(StringArray::from(result)))
+                let now_str = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                Ok(Arc::new(StringArray::from(vec![Some(now_str.as_str()); batch.num_rows()])))
             }
             "RAND" | "RANDOM" => {
                 use std::time::{SystemTime, UNIX_EPOCH};
@@ -4323,10 +4221,401 @@ impl ApexExecutor {
                 }).collect();
                 Ok(Arc::new(Float64Array::from(result)))
             }
+            // ============== Hive String Functions ==============
+            "INSTR" => {
+                if args.len() != 2 { return Err(err_input("INSTR requires 2 arguments")); }
+                let str_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let substr_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                if let (Some(strs), Some(substrs)) = (str_arr.as_any().downcast_ref::<StringArray>(), substr_arr.as_any().downcast_ref::<StringArray>()) {
+                    let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| {
+                        if strs.is_null(i) || substrs.is_null(i) { None } 
+                        else { let s = strs.value(i); let sub = substrs.value(i); s.char_indices().enumerate().find(|(_, (idx, _))| s[*idx..].starts_with(sub)).map_or(Some(0), |(pos, _)| Some((pos + 1) as i64)) }
+                    }).collect();
+                    Ok(Arc::new(Int64Array::from(result)))
+                } else { Err(err_data("INSTR requires string arguments")) }
+            }
+            "LOCATE" => {
+                if args.len() < 2 || args.len() > 3 { return Err(err_input( "LOCATE requires 2 or 3 arguments")); }
+                let substr_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let str_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                let start_arr = if args.len() == 3 { Some(Self::evaluate_expr_to_array(batch, &args[2])?) } else { None };
+                if let (Some(substrs), Some(strs)) = (substr_arr.as_any().downcast_ref::<StringArray>(), str_arr.as_any().downcast_ref::<StringArray>()) {
+                    let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| {
+                        if strs.is_null(i) || substrs.is_null(i) { return None; }
+                        let s = strs.value(i); let sub = substrs.value(i);
+                        let start = start_arr.as_ref().and_then(|sa| sa.as_any().downcast_ref::<Int64Array>()).map_or(1, |ia| if ia.is_null(i) { 1 } else { ia.value(i).max(1) });
+                        let offset = (start - 1) as usize;
+                        if offset >= s.len() { Some(0) } else { Some(s[offset..].find(sub).map_or(0, |p| (p + offset + 1) as i64)) }
+                    }).collect();
+                    Ok(Arc::new(Int64Array::from(result)))
+                } else { Err(err_data( "LOCATE requires string arguments")) }
+            }
+            "LPAD" | "RPAD" => {
+                let is_lpad = upper == "LPAD";
+                if args.len() != 3 { return Err(err_input( format!("{} requires 3 arguments", upper))); }
+                let str_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let len_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                let pad_arr = Self::evaluate_expr_to_array(batch, &args[2])?;
+                if let (Some(strs), Some(lens), Some(pads)) = (str_arr.as_any().downcast_ref::<StringArray>(), len_arr.as_any().downcast_ref::<Int64Array>(), pad_arr.as_any().downcast_ref::<StringArray>()) {
+                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| {
+                        if strs.is_null(i) || lens.is_null(i) { return None; }
+                        let s = strs.value(i); let tlen = lens.value(i) as usize; let pad = if pads.is_null(i) { " " } else { pads.value(i) };
+                        if s.chars().count() >= tlen { Some(s.chars().take(tlen).collect()) }
+                        else { 
+                            let pc: Vec<char> = pad.chars().collect(); 
+                            if pc.is_empty() { Some(s.to_string()) } 
+                            else if is_lpad { let mut r = String::new(); for j in 0..(tlen - s.chars().count()) { r.push(pc[j % pc.len()]); } r.push_str(s); Some(r) }
+                            else { let mut r = s.to_string(); for j in 0..(tlen - s.chars().count()) { r.push(pc[j % pc.len()]); } Some(r) }
+                        }
+                    }).collect();
+                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+                } else { Err(err_data( format!("{} type error", upper))) }
+            }
+            "LTRIM" | "RTRIM" => {
+                let is_ltrim = upper == "LTRIM";
+                if args.len() != 1 { return Err(err_input(format!("{} requires 1 argument", upper))); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                map_string_unary(&arr, batch.num_rows(), |s| if is_ltrim { s.trim_start().to_string() } else { s.trim_end().to_string() }, &upper)
+            }
+            "REVERSE" => {
+                if args.len() != 1 { return Err(err_input("REVERSE requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                map_string_unary(&arr, batch.num_rows(), |s| s.chars().rev().collect(), "REVERSE")
+            }
+            "INITCAP" => {
+                if args.len() != 1 { return Err(err_input("INITCAP requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                map_string_unary(&arr, batch.num_rows(), |s| {
+                    let mut r = String::new(); let mut cap = true;
+                    for c in s.chars() { if c.is_whitespace() || !c.is_alphanumeric() { r.push(c); cap = true; } else if cap { r.extend(c.to_uppercase()); cap = false; } else { r.extend(c.to_lowercase()); } }
+                    r
+                }, "INITCAP")
+            }
+            "CONCAT_WS" => {
+                if args.len() < 2 { return Err(err_input("CONCAT_WS requires 2+ arguments")); }
+                let sep = Self::evaluate_expr_to_array(batch, &args[0])?.as_any().downcast_ref::<StringArray>().map_or(String::new(), |sa| if sa.len() > 0 && !sa.is_null(0) { sa.value(0).to_string() } else { String::new() });
+                let (num_rows, mut result, mut first) = (batch.num_rows(), vec![String::new(); batch.num_rows()], vec![true; batch.num_rows()]);
+                for arg in &args[1..] { if let Ok(arr) = Self::evaluate_expr_to_array(batch, arg) { if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() { for i in 0..num_rows { if !sa.is_null(i) { if !first[i] { result[i].push_str(&sep); } result[i].push_str(sa.value(i)); first[i] = false; } } } } }
+                Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_str()).collect::<Vec<_>>())))
+            }
+            "REPEAT" => {
+                if args.len() != 2 { return Err(err_input( "REPEAT requires 2 arguments")); }
+                let str_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let n_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                if let (Some(strs), Some(ns)) = (str_arr.as_any().downcast_ref::<StringArray>(), n_arr.as_any().downcast_ref::<Int64Array>()) {
+                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| if strs.is_null(i) || ns.is_null(i) { None } else { Some(strs.value(i).repeat(ns.value(i).max(0) as usize)) }).collect();
+                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+                } else { Err(err_data( "REPEAT type error")) }
+            }
+            "SPACE" => {
+                if args.len() != 1 { return Err(err_input("SPACE requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                map_int_to_string(&arr, batch.num_rows(), |v| Some(" ".repeat(v.max(0) as usize)), "SPACE")
+            }
+            "ASCII" => {
+                if args.len() != 1 { return Err(err_input("ASCII requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                map_string_to_int(&arr, batch.num_rows(), |s| s.chars().next().map_or(0, |c| c as i64), "ASCII")
+            }
+            "CHR" | "CHAR" => {
+                if args.len() != 1 { return Err(err_input("CHR requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                map_int_to_string(&arr, batch.num_rows(), |v| char::from_u32(v as u32).map(|c| c.to_string()), "CHR")
+            }
+            "LEFT" | "RIGHT" => {
+                let is_left = upper == "LEFT";
+                if args.len() != 2 { return Err(err_input(format!("{} requires 2 arguments", upper))); }
+                let str_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let n_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                if let (Some(strs), Some(ns)) = (str_arr.as_any().downcast_ref::<StringArray>(), n_arr.as_any().downcast_ref::<Int64Array>()) {
+                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| {
+                        if strs.is_null(i) || ns.is_null(i) { None } 
+                        else { let c: Vec<char> = strs.value(i).chars().collect(); let n = ns.value(i).max(0) as usize;
+                            Some(if is_left { c.iter().take(n).collect() } else { c[c.len().saturating_sub(n)..].iter().collect() }) }
+                    }).collect();
+                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+                } else { Err(err_data(format!("{} type error", upper))) }
+            }
+            "REGEXP_REPLACE" => {
+                if args.len() != 3 { return Err(err_input( "REGEXP_REPLACE requires 3 arguments")); }
+                let str_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let pat_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                let rep_arr = Self::evaluate_expr_to_array(batch, &args[2])?;
+                if let (Some(strs), Some(pats), Some(reps)) = (str_arr.as_any().downcast_ref::<StringArray>(), pat_arr.as_any().downcast_ref::<StringArray>(), rep_arr.as_any().downcast_ref::<StringArray>()) {
+                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| { if strs.is_null(i) { None } else { let s = strs.value(i); let p = if pats.is_null(i) { "" } else { pats.value(i) }; let r = if reps.is_null(i) { "" } else { reps.value(i) }; regex::Regex::new(p).ok().map(|re| re.replace_all(s, r).to_string()).or(Some(s.to_string())) } }).collect();
+                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+                } else { Err(err_data( "REGEXP_REPLACE type error")) }
+            }
+            "REGEXP_EXTRACT" => {
+                if args.len() < 2 || args.len() > 3 { return Err(err_input( "REGEXP_EXTRACT requires 2-3 arguments")); }
+                let str_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let pat_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                let grp_arr = if args.len() == 3 { Some(Self::evaluate_expr_to_array(batch, &args[2])?) } else { None };
+                if let (Some(strs), Some(pats)) = (str_arr.as_any().downcast_ref::<StringArray>(), pat_arr.as_any().downcast_ref::<StringArray>()) {
+                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| { if strs.is_null(i) || pats.is_null(i) { return None; } let gi = grp_arr.as_ref().and_then(|g| g.as_any().downcast_ref::<Int64Array>()).map_or(0, |ia| if ia.is_null(i) { 0 } else { ia.value(i) as usize }); regex::Regex::new(pats.value(i)).ok().and_then(|re| re.captures(strs.value(i)).and_then(|c| c.get(gi).map(|m| m.as_str().to_string()))) }).collect();
+                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+                } else { Err(err_data( "REGEXP_EXTRACT type error")) }
+            }
+            "SPLIT" => {
+                if args.len() != 2 { return Err(err_input("SPLIT requires 2 arguments")); }
+                let str_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let delim_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                if let (Some(strs), Some(delims)) = (str_arr.as_any().downcast_ref::<StringArray>(), delim_arr.as_any().downcast_ref::<StringArray>()) {
+                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| if strs.is_null(i) || delims.is_null(i) { None } else { Some(strs.value(i).split(delims.value(i)).collect::<Vec<_>>().join("\x00")) }).collect();
+                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+                } else { Err(err_data("SPLIT requires string arguments")) }
+            }
+            // ============== Hive Math Functions ==============
+            "POWER" | "POW" => {
+                if args.len() != 2 { return Err(err_input( "POWER requires 2 arguments")); }
+                let b_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let e_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| {
+                    let b = b_arr.as_any().downcast_ref::<Int64Array>().filter(|a| !a.is_null(i)).map(|a| a.value(i) as f64).or_else(|| b_arr.as_any().downcast_ref::<Float64Array>().filter(|a| !a.is_null(i)).map(|a| a.value(i)))?;
+                    let e = e_arr.as_any().downcast_ref::<Int64Array>().filter(|a| !a.is_null(i)).map(|a| a.value(i) as f64).or_else(|| e_arr.as_any().downcast_ref::<Float64Array>().filter(|a| !a.is_null(i)).map(|a| a.value(i)))?;
+                    Some(b.powf(e))
+                }).collect();
+                Ok(Arc::new(Float64Array::from(result)))
+            }
+            "EXP" => { Self::unary_float_fn(batch, &args[0], |x| x.exp()) }
+            "LN" => { Self::unary_float_fn(batch, &args[0], |x| if x > 0.0 { x.ln() } else { f64::NAN }) }
+            "LOG" => {
+                if args.len() == 1 { Self::unary_float_fn(batch, &args[0], |x| if x > 0.0 { x.ln() } else { f64::NAN }) }
+                else if args.len() == 2 {
+                    let b_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                    let x_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                    let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| {
+                        let b = b_arr.as_any().downcast_ref::<Int64Array>().filter(|a| !a.is_null(i)).map(|a| a.value(i) as f64).or_else(|| b_arr.as_any().downcast_ref::<Float64Array>().filter(|a| !a.is_null(i)).map(|a| a.value(i)))?;
+                        let x = x_arr.as_any().downcast_ref::<Int64Array>().filter(|a| !a.is_null(i)).map(|a| a.value(i) as f64).or_else(|| x_arr.as_any().downcast_ref::<Float64Array>().filter(|a| !a.is_null(i)).map(|a| a.value(i)))?;
+                        if b <= 0.0 || b == 1.0 || x <= 0.0 { None } else { Some(x.log(b)) }
+                    }).collect();
+                    Ok(Arc::new(Float64Array::from(result)))
+                } else { Err(err_input( "LOG requires 1 or 2 arguments")) }
+            }
+            "LOG10" => { Self::unary_float_fn(batch, &args[0], |x| if x > 0.0 { x.log10() } else { f64::NAN }) }
+            "LOG2" => { Self::unary_float_fn(batch, &args[0], |x| if x > 0.0 { x.log2() } else { f64::NAN }) }
+            "SIN" => { Self::unary_float_fn(batch, &args[0], |x| x.sin()) }
+            "COS" => { Self::unary_float_fn(batch, &args[0], |x| x.cos()) }
+            "TAN" => { Self::unary_float_fn(batch, &args[0], |x| x.tan()) }
+            "ASIN" => { Self::unary_float_fn(batch, &args[0], |x| x.asin()) }
+            "ACOS" => { Self::unary_float_fn(batch, &args[0], |x| x.acos()) }
+            "ATAN" => { Self::unary_float_fn(batch, &args[0], |x| x.atan()) }
+            "SIGN" => {
+                if args.len() != 1 { return Err(err_input("SIGN requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| {
+                    arr.as_any().downcast_ref::<Int64Array>().filter(|a| !a.is_null(i)).map(|a| a.value(i).signum())
+                    .or_else(|| arr.as_any().downcast_ref::<Float64Array>().filter(|a| !a.is_null(i)).map(|a| if a.value(i) > 0.0 { 1 } else if a.value(i) < 0.0 { -1 } else { 0 }))
+                }).collect();
+                Ok(Arc::new(Int64Array::from(result)))
+            }
+            "GREATEST" | "LEAST" => {
+                let is_greatest = upper == "GREATEST";
+                if args.is_empty() { return Err(err_input(format!("{} requires at least 1 argument", upper))); }
+                let arrays: Vec<ArrayRef> = args.iter().map(|a| Self::evaluate_expr_to_array(batch, a)).collect::<io::Result<_>>()?;
+                let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| {
+                    let mut agg: Option<f64> = None;
+                    for arr in &arrays {
+                        let v = arr.as_any().downcast_ref::<Int64Array>().filter(|a| !a.is_null(i)).map(|a| a.value(i) as f64).or_else(|| arr.as_any().downcast_ref::<Float64Array>().filter(|a| !a.is_null(i)).map(|a| a.value(i)));
+                        if let Some(vv) = v { agg = Some(agg.map_or(vv, |m| if is_greatest { m.max(vv) } else { m.min(vv) })); }
+                    }
+                    agg
+                }).collect();
+                Ok(Arc::new(Float64Array::from(result)))
+            }
+            "TRUNCATE" | "TRUNC" => {
+                if args.is_empty() || args.len() > 2 { return Err(err_input( "TRUNCATE requires 1-2 arguments")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let dec = if args.len() == 2 { Self::evaluate_expr_to_array(batch, &args[1])?.as_any().downcast_ref::<Int64Array>().map_or(0, |a| if a.len() > 0 && !a.is_null(0) { a.value(0) as i32 } else { 0 }) } else { 0 };
+                if let Some(fa) = arr.as_any().downcast_ref::<Float64Array>() {
+                    let f = 10f64.powi(dec);
+                    let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| if fa.is_null(i) { None } else { Some((fa.value(i) * f).trunc() / f) }).collect();
+                    Ok(Arc::new(Float64Array::from(result)))
+                } else if let Some(ia) = arr.as_any().downcast_ref::<Int64Array>() { Ok(Arc::new(ia.clone())) }
+                else { Err(err_data( "TRUNCATE requires numeric")) }
+            }
+            "PI" => { Ok(Arc::new(Float64Array::from(vec![Some(std::f64::consts::PI); batch.num_rows()]))) }
+            "E" => { Ok(Arc::new(Float64Array::from(vec![Some(std::f64::consts::E); batch.num_rows()]))) }
+            // ============== Hive Date Functions ==============
+            "YEAR" => { Self::extract_date_part(batch, &args[0], |s| s.get(0..4).and_then(|p| p.parse().ok())) }
+            "MONTH" => { Self::extract_date_part(batch, &args[0], |s| s.get(5..7).and_then(|p| p.parse().ok())) }
+            "DAY" | "DAYOFMONTH" => { Self::extract_date_part(batch, &args[0], |s| s.get(8..10).and_then(|p| p.parse().ok())) }
+            "HOUR" => { Self::extract_date_part(batch, &args[0], |s| s.get(11..13).and_then(|p| p.parse().ok())) }
+            "MINUTE" => { Self::extract_date_part(batch, &args[0], |s| s.get(14..16).and_then(|p| p.parse().ok())) }
+            "SECOND" => { Self::extract_date_part(batch, &args[0], |s| s.get(17..19).and_then(|p| p.parse().ok())) }
+            "CURRENT_DATE" => {
+                let ds = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                Ok(Arc::new(StringArray::from(vec![Some(ds.as_str()); batch.num_rows()])))
+            }
+            "DATE_ADD" | "DATE_SUB" => {
+                if args.len() != 2 { return Err(err_input( "DATE_ADD/DATE_SUB requires 2 arguments")); }
+                let date_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let days_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                let is_sub = upper == "DATE_SUB";
+                if let (Some(dates), Some(days)) = (date_arr.as_any().downcast_ref::<StringArray>(), days_arr.as_any().downcast_ref::<Int64Array>()) {
+                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| {
+                        if dates.is_null(i) || days.is_null(i) { return None; }
+                        let ds = dates.value(i); let d = days.value(i);
+                        chrono::NaiveDate::parse_from_str(&ds[0..10.min(ds.len())], "%Y-%m-%d").ok().map(|dt| (dt + chrono::Duration::days(if is_sub { -d } else { d })).format("%Y-%m-%d").to_string())
+                    }).collect();
+                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+                } else { Err(err_data( "DATE_ADD type error")) }
+            }
+            "DATEDIFF" => {
+                if args.len() != 2 { return Err(err_input( "DATEDIFF requires 2 arguments")); }
+                let d1_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let d2_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                if let (Some(d1s), Some(d2s)) = (d1_arr.as_any().downcast_ref::<StringArray>(), d2_arr.as_any().downcast_ref::<StringArray>()) {
+                    let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| {
+                        if d1s.is_null(i) || d2s.is_null(i) { return None; }
+                        let s1 = d1s.value(i); let s2 = d2s.value(i);
+                        let dt1 = chrono::NaiveDate::parse_from_str(&s1[0..10.min(s1.len())], "%Y-%m-%d").ok()?;
+                        let dt2 = chrono::NaiveDate::parse_from_str(&s2[0..10.min(s2.len())], "%Y-%m-%d").ok()?;
+                        Some((dt1 - dt2).num_days())
+                    }).collect();
+                    Ok(Arc::new(Int64Array::from(result)))
+                } else { Err(err_data( "DATEDIFF type error")) }
+            }
+            "DATE_FORMAT" => {
+                if args.len() != 2 { return Err(err_input( "DATE_FORMAT requires 2 arguments")); }
+                let date_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let fmt_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                if let (Some(dates), Some(fmts)) = (date_arr.as_any().downcast_ref::<StringArray>(), fmt_arr.as_any().downcast_ref::<StringArray>()) {
+                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| {
+                        if dates.is_null(i) || fmts.is_null(i) { return None; }
+                        let ds = dates.value(i); let fmt = fmts.value(i);
+                        chrono::NaiveDate::parse_from_str(&ds[0..10.min(ds.len())], "%Y-%m-%d").ok().map(|dt| dt.format(fmt).to_string())
+                    }).collect();
+                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+                } else { Err(err_data( "DATE_FORMAT type error")) }
+            }
+            "TO_DATE" => {
+                if args.len() != 1 { return Err(err_input("TO_DATE requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                map_string_unary(&arr, batch.num_rows(), |s| s[0..10.min(s.len())].to_string(), "TO_DATE")
+            }
+            "UNIX_TIMESTAMP" => {
+                if args.is_empty() {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+                    Ok(Arc::new(Int64Array::from(vec![Some(ts); batch.num_rows()])))
+                } else {
+                    let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                    if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() {
+                        let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| {
+                            if sa.is_null(i) { return None; }
+                            let s = sa.value(i);
+                            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok().or_else(|| chrono::NaiveDate::parse_from_str(&s[0..10.min(s.len())], "%Y-%m-%d").ok().map(|d| d.and_hms_opt(0,0,0).unwrap())).map(|dt| dt.and_utc().timestamp())
+                        }).collect();
+                        Ok(Arc::new(Int64Array::from(result)))
+                    } else { Err(err_data( "UNIX_TIMESTAMP type error")) }
+                }
+            }
+            "FROM_UNIXTIME" => {
+                if args.len() != 1 { return Err(err_input("FROM_UNIXTIME requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                map_int_to_string(&arr, batch.num_rows(), |v| chrono::DateTime::from_timestamp(v, 0).map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()), "FROM_UNIXTIME")
+            }
+            // ============== Hive Conditional Functions ==============
+            "IF" => {
+                if args.len() != 3 { return Err(err_input("IF requires 3 arguments")); }
+                let (cond_arr, then_arr, else_arr) = (Self::evaluate_expr_to_array(batch, &args[0])?, Self::evaluate_expr_to_array(batch, &args[1])?, Self::evaluate_expr_to_array(batch, &args[2])?);
+                let get_cond = |i: usize| cond_arr.as_any().downcast_ref::<BooleanArray>().map_or(false, |b| !b.is_null(i) && b.value(i));
+                if then_arr.as_any().downcast_ref::<StringArray>().is_some() || else_arr.as_any().downcast_ref::<StringArray>().is_some() {
+                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| { let src = if get_cond(i) { &then_arr } else { &else_arr }; src.as_any().downcast_ref::<StringArray>().and_then(|sa| if sa.is_null(i) { None } else { Some(sa.value(i).to_string()) }) }).collect();
+                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+                } else {
+                    let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| { let src = if get_cond(i) { &then_arr } else { &else_arr }; src.as_any().downcast_ref::<Int64Array>().and_then(|ia| if ia.is_null(i) { None } else { Some(ia.value(i)) }) }).collect();
+                    Ok(Arc::new(Int64Array::from(result)))
+                }
+            }
+            "NVL2" => {
+                if args.len() != 3 { return Err(err_input("NVL2 requires 3 arguments")); }
+                let (chk, nn, nl) = (Self::evaluate_expr_to_array(batch, &args[0])?, Self::evaluate_expr_to_array(batch, &args[1])?, Self::evaluate_expr_to_array(batch, &args[2])?);
+                let is_null = |i: usize| chk.is_null(i) || chk.as_any().downcast_ref::<StringArray>().map_or(false, |sa| sa.is_null(i));
+                if nn.as_any().downcast_ref::<StringArray>().is_some() || nl.as_any().downcast_ref::<StringArray>().is_some() {
+                    let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| { let src = if is_null(i) { &nl } else { &nn }; src.as_any().downcast_ref::<StringArray>().and_then(|sa| if sa.is_null(i) { None } else { Some(sa.value(i).to_string()) }) }).collect();
+                    Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+                } else {
+                    let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| { let src = if chk.is_null(i) { &nl } else { &nn }; src.as_any().downcast_ref::<Int64Array>().and_then(|ia| if ia.is_null(i) { None } else { Some(ia.value(i)) }) }).collect();
+                    Ok(Arc::new(Int64Array::from(result)))
+                }
+            }
+            "DECODE" => {
+                if args.len() < 3 { return Err(err_input("DECODE requires 3+ arguments")); }
+                let expr_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let (has_def, pairs) = ((args.len() - 1) % 2 == 1, (args.len() - 1 - if (args.len() - 1) % 2 == 1 { 1 } else { 0 }) / 2);
+                let (search_arrs, result_arrs): (Vec<_>, Vec<_>) = (0..pairs).map(|p| (Self::evaluate_expr_to_array(batch, &args[1 + p * 2]), Self::evaluate_expr_to_array(batch, &args[2 + p * 2]))).map(|(s, r)| (s.ok(), r.ok())).filter(|(s, r)| s.is_some() && r.is_some()).map(|(s, r)| (s.unwrap(), r.unwrap())).unzip();
+                let def = if has_def { Self::evaluate_expr_to_array(batch, args.last().unwrap()).ok() } else { None };
+                let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| {
+                    for (sa, ra) in search_arrs.iter().zip(result_arrs.iter()) {
+                        let m = expr_arr.as_any().downcast_ref::<Int64Array>().and_then(|ea| sa.as_any().downcast_ref::<Int64Array>().map(|saa| !ea.is_null(i) && !saa.is_null(i) && ea.value(i) == saa.value(i))).or_else(|| expr_arr.as_any().downcast_ref::<StringArray>().and_then(|ea| sa.as_any().downcast_ref::<StringArray>().map(|saa| !ea.is_null(i) && !saa.is_null(i) && ea.value(i) == saa.value(i)))).unwrap_or(false);
+                        if m { return ra.as_any().downcast_ref::<StringArray>().and_then(|r| if r.is_null(i) { None } else { Some(r.value(i).to_string()) }); }
+                    }
+                    def.as_ref().and_then(|d| d.as_any().downcast_ref::<StringArray>().and_then(|r| if r.is_null(i) { None } else { Some(r.value(i).to_string()) }))
+                }).collect();
+                Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+            }
+            "GROUP_CONCAT" | "LISTAGG" => {
+                if args.is_empty() { return Err(err_input("GROUP_CONCAT requires 1+ argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() {
+                    let sep = if args.len() > 1 { Self::evaluate_expr_to_array(batch, &args[1])?.as_any().downcast_ref::<StringArray>().map_or(",".to_string(), |s| if s.len() > 0 && !s.is_null(0) { s.value(0).to_string() } else { ",".to_string() }) } else { ",".to_string() };
+                    let joined = (0..batch.num_rows()).filter(|&i| !sa.is_null(i)).map(|i| sa.value(i)).collect::<Vec<_>>().join(&sep);
+                    Ok(Arc::new(StringArray::from(vec![Some(joined.as_str()); batch.num_rows()])))
+                } else { Err(err_data("GROUP_CONCAT requires string")) }
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported function: {}", name),
             )),
+        }
+    }
+
+    /// Helper for unary float functions (EXP, LN, SIN, COS, etc.)
+    fn unary_float_fn<F: Fn(f64) -> f64>(batch: &RecordBatch, arg: &SqlExpr, f: F) -> io::Result<ArrayRef> {
+        let arr = Self::evaluate_expr_to_array(batch, arg)?;
+        let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| {
+            arr.as_any().downcast_ref::<Float64Array>().filter(|a| !a.is_null(i)).map(|a| f(a.value(i)))
+            .or_else(|| arr.as_any().downcast_ref::<Int64Array>().filter(|a| !a.is_null(i)).map(|a| f(a.value(i) as f64)))
+        }).collect();
+        Ok(Arc::new(Float64Array::from(result)))
+    }
+
+    /// Helper for extracting date parts (YEAR, MONTH, DAY, etc.)
+    fn extract_date_part<F: Fn(&str) -> Option<i64>>(batch: &RecordBatch, arg: &SqlExpr, extractor: F) -> io::Result<ArrayRef> {
+        let arr = Self::evaluate_expr_to_array(batch, arg)?;
+        if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() {
+            let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| {
+                if sa.is_null(i) { None } else { extractor(sa.value(i)) }
+            }).collect();
+            Ok(Arc::new(Int64Array::from(result)))
+        } else {
+            Err(err_data( "Date function requires string argument"))
+        }
+    }
+
+    /// Evaluate array index expression: array[index]
+    fn evaluate_array_index(batch: &RecordBatch, array_expr: &SqlExpr, index_expr: &SqlExpr) -> io::Result<ArrayRef> {
+        // The array expression should be a SPLIT function that returns pipe-separated values
+        // We'll evaluate the array expr and treat it as a string with delimiter
+        let array_arr = Self::evaluate_expr_to_array(batch, array_expr)?;
+        let index_arr = Self::evaluate_expr_to_array(batch, index_expr)?;
+        
+        if let Some(str_arr) = array_arr.as_any().downcast_ref::<StringArray>() {
+            let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| {
+                if str_arr.is_null(i) { return None; }
+                let s = str_arr.value(i);
+                // The array is stored as pipe-separated values from SPLIT function
+                let parts: Vec<&str> = s.split('\x00').collect(); // Use null char as internal delimiter
+                let idx = index_arr.as_any().downcast_ref::<Int64Array>()
+                    .map(|ia| if ia.is_null(i) { 0 } else { ia.value(i) as usize })
+                    .unwrap_or(0);
+                parts.get(idx).map(|s| s.to_string())
+            }).collect();
+            Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+        } else {
+            Err(err_data( "Array index requires array expression"))
         }
     }
 
@@ -4339,7 +4628,7 @@ impl ApexExecutor {
     ) -> io::Result<BooleanArray> {
         let col_name = column.trim_matches('"');
         let target = Self::get_column_by_name(batch, col_name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+            .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
         let num_rows = batch.num_rows();
         
         // Start with all false
@@ -4348,14 +4637,14 @@ impl ApexExecutor {
         for val in values {
             let val_array = Self::value_to_array(val, num_rows)?;
             let eq_mask = cmp::eq(target, &val_array)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
             result = compute::or(&result, &eq_mask)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
         }
         
         if negated {
             compute::not(&result)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                .map_err(|e| err_data( e.to_string()))
         } else {
             Ok(result)
         }
@@ -4370,12 +4659,12 @@ impl ApexExecutor {
     ) -> io::Result<BooleanArray> {
         let col_name = column.trim_matches('"');
         let array = Self::get_column_by_name(batch, col_name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+            .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
         
         // Convert SQL LIKE pattern to regex
         let regex_pattern = Self::like_to_regex(pattern);
         let regex = regex::Regex::new(&regex_pattern)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            .map_err(|e| err_input( e.to_string()))?;
         
         // Handle both StringArray and DictionaryArray
         use arrow::array::DictionaryArray;
@@ -4390,7 +4679,7 @@ impl ApexExecutor {
             // Handle dictionary-encoded string columns
             let values = dict_array.values();
             let str_values = values.as_any().downcast_ref::<StringArray>()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Dictionary values must be strings"))?;
+                .ok_or_else(|| err_data( "Dictionary values must be strings"))?;
             let keys = dict_array.keys();
             
             (0..dict_array.len())
@@ -4408,12 +4697,12 @@ impl ApexExecutor {
                 })
                 .collect()
         } else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "LIKE requires string column"));
+            return Err(err_data( "LIKE requires string column"));
         };
         
         if negated {
             compute::not(&result)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                .map_err(|e| err_data( e.to_string()))
         } else {
             Ok(result)
         }
@@ -4428,12 +4717,12 @@ impl ApexExecutor {
     ) -> io::Result<BooleanArray> {
         let col_name = column.trim_matches('"');
         let array = Self::get_column_by_name(batch, col_name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+            .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
         
         // Use pattern directly as regex (convert glob-style * to regex .*)
         let regex_pattern = pattern.replace("*", ".*");
         let regex = regex::Regex::new(&regex_pattern)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            .map_err(|e| err_input( e.to_string()))?;
         
         // Handle both StringArray and DictionaryArray
         use arrow::array::DictionaryArray;
@@ -4447,7 +4736,7 @@ impl ApexExecutor {
         } else if let Some(dict_array) = array.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
             let values = dict_array.values();
             let str_values = values.as_any().downcast_ref::<StringArray>()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Dictionary values must be strings"))?;
+                .ok_or_else(|| err_data( "Dictionary values must be strings"))?;
             let keys = dict_array.keys();
             
             (0..dict_array.len())
@@ -4465,12 +4754,12 @@ impl ApexExecutor {
                 })
                 .collect()
         } else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "REGEXP requires string column"));
+            return Err(err_data( "REGEXP requires string column"));
         };
         
         if negated {
             compute::not(&result)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                .map_err(|e| err_data( e.to_string()))
         } else {
             Ok(result)
         }
@@ -4548,7 +4837,7 @@ impl ApexExecutor {
         } else {
             // Multi-column or small dataset - use Arrow's lexsort
             compute::lexsort_to_indices(&sort_columns, None)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+                .map_err(|e| err_data( e.to_string()))?
         };
 
         // OPTIMIZATION: Use SIMD-accelerated take for better performance
@@ -4571,7 +4860,7 @@ impl ApexExecutor {
         };
 
         RecordBatch::try_new(batch.schema(), columns)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+            .map_err(|e| err_data( e.to_string()))
     }
     
     /// Parallel sort for single-column ORDER BY using Rayon
@@ -4691,7 +4980,7 @@ impl ApexExecutor {
             .collect();
         
         compute::lexsort_to_indices(&sort_columns, None)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+            .map_err(|e| err_data( e.to_string()))
     }
     
     /// Counting sort for integer arrays with limited range
@@ -4962,10 +5251,10 @@ impl ApexExecutor {
             .iter()
             .map(|col| compute::take(col, &indices_array, None))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| err_data( e.to_string()))?;
 
         RecordBatch::try_new(batch.schema(), columns)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+            .map_err(|e| err_data( e.to_string()))
     }
 
     /// Apply LIMIT and OFFSET
@@ -5096,7 +5385,7 @@ impl ApexExecutor {
 
         let schema = Arc::new(Schema::new(fields));
         RecordBatch::try_new(schema, arrays)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+            .map_err(|e| err_data( e.to_string()))
     }
 
     /// Execute aggregation query
@@ -5121,7 +5410,7 @@ impl ApexExecutor {
 
         let schema = Arc::new(Schema::new(fields));
         let result = RecordBatch::try_new(schema, arrays)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| err_data( e.to_string()))?;
 
         Ok(ApexResult::Data(result))
     }
@@ -5137,21 +5426,8 @@ impl ApexExecutor {
         use crate::query::AggregateFunc;
         use std::collections::HashSet;
         
-        let func_name = match func {
-            AggregateFunc::Count => "COUNT",
-            AggregateFunc::Sum => "SUM",
-            AggregateFunc::Avg => "AVG",
-            AggregateFunc::Min => "MIN",
-            AggregateFunc::Max => "MAX",
-        };
-        
-        let output_name = alias.clone().unwrap_or_else(|| {
-            if let Some(col) = column {
-                format!("{}({})", func_name, col)
-            } else {
-                format!("{}(*)", func_name)
-            }
-        });
+        let fn_name = match func { AggregateFunc::Count => "COUNT", AggregateFunc::Sum => "SUM", AggregateFunc::Avg => "AVG", AggregateFunc::Min => "MIN", AggregateFunc::Max => "MAX" };
+        let output_name = alias.clone().unwrap_or_else(|| if let Some(col) = column { format!("{}({})", fn_name, col) } else { format!("{}(*)", fn_name) });
 
         match func {
             AggregateFunc::Count => {
@@ -5195,9 +5471,9 @@ impl ApexExecutor {
             }
             AggregateFunc::Sum => {
                 let col_name = column.as_ref()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "SUM requires column"))?;
+                    .ok_or_else(|| err_input( "SUM requires column"))?;
                 let array = batch.column_by_name(col_name)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+                    .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     // SIMD-optimized sum for non-null arrays
@@ -5228,14 +5504,14 @@ impl ApexExecutor {
                         Arc::new(Float64Array::from(vec![sum])),
                     ))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "SUM requires numeric column"))
+                    Err(err_data( "SUM requires numeric column"))
                 }
             }
             AggregateFunc::Avg => {
                 let col_name = column.as_ref()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "AVG requires column"))?;
+                    .ok_or_else(|| err_input( "AVG requires column"))?;
                 let array = batch.column_by_name(col_name)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+                    .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     // SIMD-optimized AVG for non-null arrays
@@ -5271,63 +5547,28 @@ impl ApexExecutor {
                         Arc::new(Float64Array::from(vec![avg])),
                     ))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "AVG requires numeric column"))
+                    Err(err_data( "AVG requires numeric column"))
                 }
             }
-            AggregateFunc::Min => {
+            AggregateFunc::Min | AggregateFunc::Max => {
+                let is_min = matches!(func, AggregateFunc::Min);
+                let fn_name = if is_min { "MIN" } else { "MAX" };
                 let col_name = column.as_ref()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "MIN requires column"))?;
+                    .ok_or_else(|| err_input( format!("{} requires column", fn_name)))?;
                 let array = batch.column_by_name(col_name)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+                    .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
-                    let min = compute::min(int_array);
-                    Ok((
-                        Field::new(&output_name, ArrowDataType::Int64, true),
-                        Arc::new(Int64Array::from(vec![min])),
-                    ))
+                    let val = if is_min { compute::min(int_array) } else { compute::max(int_array) };
+                    Ok((Field::new(&output_name, ArrowDataType::Int64, true), Arc::new(Int64Array::from(vec![val]))))
                 } else if let Some(uint_array) = array.as_any().downcast_ref::<UInt64Array>() {
-                    let min = compute::min(uint_array).map(|v| v as i64);
-                    Ok((
-                        Field::new(&output_name, ArrowDataType::Int64, true),
-                        Arc::new(Int64Array::from(vec![min])),
-                    ))
+                    let val = if is_min { compute::min(uint_array) } else { compute::max(uint_array) }.map(|v| v as i64);
+                    Ok((Field::new(&output_name, ArrowDataType::Int64, true), Arc::new(Int64Array::from(vec![val]))))
                 } else if let Some(float_array) = array.as_any().downcast_ref::<Float64Array>() {
-                    let min = compute::min(float_array);
-                    Ok((
-                        Field::new(&output_name, ArrowDataType::Float64, true),
-                        Arc::new(Float64Array::from(vec![min])),
-                    ))
+                    let val = if is_min { compute::min(float_array) } else { compute::max(float_array) };
+                    Ok((Field::new(&output_name, ArrowDataType::Float64, true), Arc::new(Float64Array::from(vec![val]))))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "MIN requires numeric column"))
-                }
-            }
-            AggregateFunc::Max => {
-                let col_name = column.as_ref()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "MAX requires column"))?;
-                let array = batch.column_by_name(col_name)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
-
-                if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
-                    let max = compute::max(int_array);
-                    Ok((
-                        Field::new(&output_name, ArrowDataType::Int64, true),
-                        Arc::new(Int64Array::from(vec![max])),
-                    ))
-                } else if let Some(uint_array) = array.as_any().downcast_ref::<UInt64Array>() {
-                    let max = compute::max(uint_array).map(|v| v as i64);
-                    Ok((
-                        Field::new(&output_name, ArrowDataType::Int64, true),
-                        Arc::new(Int64Array::from(vec![max])),
-                    ))
-                } else if let Some(float_array) = array.as_any().downcast_ref::<Float64Array>() {
-                    let max = compute::max(float_array);
-                    Ok((
-                        Field::new(&output_name, ArrowDataType::Float64, true),
-                        Arc::new(Float64Array::from(vec![max])),
-                    ))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "MAX requires numeric column"))
+                    Err(err_data( format!("{} requires numeric column", fn_name)))
                 }
             }
         }
@@ -5337,7 +5578,7 @@ impl ApexExecutor {
     /// OPTIMIZATION: Uses vectorized execution engine for maximum performance
     fn execute_group_by(batch: &RecordBatch, stmt: &SelectStatement) -> io::Result<ApexResult> {
         if stmt.group_by.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "GROUP BY requires at least one column"));
+            return Err(err_input( "GROUP BY requires at least one column"));
         }
 
         // Build group keys - strip table prefix if present (e.g., "u.tier" -> "tier")
@@ -5438,7 +5679,7 @@ impl ApexExecutor {
                         
                         let schema = Arc::new(Schema::new(result_fields));
                         let result_batch = RecordBatch::try_new(schema, result_arrays)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                            .map_err(|e| err_data( e.to_string()))?;
                         
                         return Ok(ApexResult::Data(result_batch));
                     }
@@ -5597,56 +5838,19 @@ impl ApexExecutor {
                 });
                 
                 match func {
-                    AggregateFunc::Count => {
-                        let values: Vec<i64> = states.iter().map(|s| s.count).collect();
-                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, false));
-                        result_arrays.push(Arc::new(Int64Array::from(values)));
-                    }
+                    AggregateFunc::Count => { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, false)); result_arrays.push(Arc::new(Int64Array::from(states.iter().map(|s| s.count).collect::<Vec<_>>()))); }
                     AggregateFunc::Sum => {
-                        if has_int_agg {
-                            let values: Vec<i64> = states.iter().map(|s| s.sum_int).collect();
-                            result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
-                            result_arrays.push(Arc::new(Int64Array::from(values)));
-                        } else {
-                            let values: Vec<f64> = states.iter().map(|s| s.sum_float).collect();
-                            result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
-                            result_arrays.push(Arc::new(Float64Array::from(values)));
-                        }
+                        if has_int_agg { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true)); result_arrays.push(Arc::new(Int64Array::from(states.iter().map(|s| s.sum_int).collect::<Vec<_>>()))); }
+                        else { result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(states.iter().map(|s| s.sum_float).collect::<Vec<_>>()))); }
                     }
-                    AggregateFunc::Avg => {
-                        let values: Vec<f64> = states.iter().map(|s| {
-                            if s.count > 0 {
-                                if has_int_agg {
-                                    s.sum_int as f64 / s.count as f64
-                                } else {
-                                    s.sum_float / s.count as f64
-                                }
-                            } else { 0.0 }
-                        }).collect();
-                        result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
-                        result_arrays.push(Arc::new(Float64Array::from(values)));
-                    }
+                    AggregateFunc::Avg => { result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(states.iter().map(|s| if s.count > 0 { if has_int_agg { s.sum_int as f64 / s.count as f64 } else { s.sum_float / s.count as f64 } } else { 0.0 }).collect::<Vec<_>>()))); }
                     AggregateFunc::Min => {
-                        if has_int_agg {
-                            let values: Vec<Option<i64>> = states.iter().map(|s| s.min_int).collect();
-                            result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
-                            result_arrays.push(Arc::new(Int64Array::from(values)));
-                        } else {
-                            let values: Vec<Option<f64>> = states.iter().map(|s| s.min_float).collect();
-                            result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
-                            result_arrays.push(Arc::new(Float64Array::from(values)));
-                        }
+                        if has_int_agg { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true)); result_arrays.push(Arc::new(Int64Array::from(states.iter().map(|s| s.min_int).collect::<Vec<_>>()))); }
+                        else { result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(states.iter().map(|s| s.min_float).collect::<Vec<_>>()))); }
                     }
                     AggregateFunc::Max => {
-                        if has_int_agg {
-                            let values: Vec<Option<i64>> = states.iter().map(|s| s.max_int).collect();
-                            result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
-                            result_arrays.push(Arc::new(Int64Array::from(values)));
-                        } else {
-                            let values: Vec<Option<f64>> = states.iter().map(|s| s.max_float).collect();
-                            result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
-                            result_arrays.push(Arc::new(Float64Array::from(values)));
-                        }
+                        if has_int_agg { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true)); result_arrays.push(Arc::new(Int64Array::from(states.iter().map(|s| s.max_int).collect::<Vec<_>>()))); }
+                        else { result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(states.iter().map(|s| s.max_float).collect::<Vec<_>>()))); }
                     }
                 }
             }
@@ -5654,13 +5858,13 @@ impl ApexExecutor {
         
         let schema = Arc::new(Schema::new(result_fields));
         let mut result_batch = RecordBatch::try_new(schema, result_arrays)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| err_data( e.to_string()))?;
         
         // Apply HAVING clause if present
         if let Some(having_expr) = &stmt.having {
             let mask = Self::evaluate_predicate(&result_batch, having_expr)?;
             result_batch = compute::filter_record_batch(&result_batch, &mask)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
         }
         
         // Apply ORDER BY if present
@@ -5903,13 +6107,13 @@ impl ApexExecutor {
         
         let schema = Arc::new(Schema::new(result_fields));
         let mut result_batch = RecordBatch::try_new(schema, result_arrays)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| err_data( e.to_string()))?;
         
         // Apply HAVING clause if present
         if let Some(having_expr) = &stmt.having {
             let mask = Self::evaluate_predicate(&result_batch, having_expr)?;
             result_batch = compute::filter_record_batch(&result_batch, &mask)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
         }
         
         // Apply ORDER BY if present
@@ -6014,70 +6218,21 @@ impl ApexExecutor {
         // Add aggregate columns
         for col in &stmt.columns {
             if let SelectColumn::Aggregate { func, column, alias, .. } = col {
-                let field_name = alias.clone().unwrap_or_else(|| {
-                    format!("{}({})", func.to_string(), column.as_deref().unwrap_or("*"))
-                });
-                
+                let field_name = alias.clone().unwrap_or_else(|| format!("{}({})", func.to_string(), column.as_deref().unwrap_or("*")));
                 match func {
-                    AggregateFunc::Count => {
-                        let values: Vec<i64> = active_groups.iter().map(|&i| counts[i]).collect();
-                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, false));
-                        result_arrays.push(Arc::new(Int64Array::from(values)));
-                    }
-                    AggregateFunc::Sum => {
-                        if agg_col_int.is_some() {
-                            let values: Vec<i64> = active_groups.iter().map(|&i| sums_int[i]).collect();
-                            result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
-                            result_arrays.push(Arc::new(Int64Array::from(values)));
-                        } else {
-                            let values: Vec<f64> = active_groups.iter().map(|&i| sums_float[i]).collect();
-                            result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
-                            result_arrays.push(Arc::new(Float64Array::from(values)));
-                        }
-                    }
-                    AggregateFunc::Avg => {
-                        let values: Vec<f64> = active_groups.iter().map(|&i| {
-                            if counts[i] > 0 {
-                                if agg_col_int.is_some() {
-                                    sums_int[i] as f64 / counts[i] as f64
-                                } else {
-                                    sums_float[i] / counts[i] as f64
-                                }
-                            } else { 0.0 }
-                        }).collect();
-                        result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
-                        result_arrays.push(Arc::new(Float64Array::from(values)));
-                    }
-                    AggregateFunc::Min => {
-                        let values: Vec<Option<i64>> = active_groups.iter().map(|&i| mins_int[i]).collect();
-                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
-                        result_arrays.push(Arc::new(Int64Array::from(values)));
-                    }
-                    AggregateFunc::Max => {
-                        let values: Vec<Option<i64>> = active_groups.iter().map(|&i| maxs_int[i]).collect();
-                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
-                        result_arrays.push(Arc::new(Int64Array::from(values)));
-                    }
+                    AggregateFunc::Count => { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, false)); result_arrays.push(Arc::new(Int64Array::from(active_groups.iter().map(|&i| counts[i]).collect::<Vec<_>>()))); }
+                    AggregateFunc::Sum => { if agg_col_int.is_some() { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true)); result_arrays.push(Arc::new(Int64Array::from(active_groups.iter().map(|&i| sums_int[i]).collect::<Vec<_>>()))); } else { result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(active_groups.iter().map(|&i| sums_float[i]).collect::<Vec<_>>()))); } }
+                    AggregateFunc::Avg => { result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(active_groups.iter().map(|&i| if counts[i] > 0 { if agg_col_int.is_some() { sums_int[i] as f64 / counts[i] as f64 } else { sums_float[i] / counts[i] as f64 } } else { 0.0 }).collect::<Vec<_>>()))); }
+                    AggregateFunc::Min => { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true)); result_arrays.push(Arc::new(Int64Array::from(active_groups.iter().map(|&i| mins_int[i]).collect::<Vec<_>>()))); }
+                    AggregateFunc::Max => { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true)); result_arrays.push(Arc::new(Int64Array::from(active_groups.iter().map(|&i| maxs_int[i]).collect::<Vec<_>>()))); }
                 }
             }
         }
         
         let schema = Arc::new(Schema::new(result_fields));
-        let mut result_batch = RecordBatch::try_new(schema, result_arrays)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        
-        // Apply HAVING clause if present
-        if let Some(having_expr) = &stmt.having {
-            let mask = Self::evaluate_predicate(&result_batch, having_expr)?;
-            result_batch = compute::filter_record_batch(&result_batch, &mask)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        }
-        
-        // Apply ORDER BY if present
-        if !stmt.order_by.is_empty() {
-            result_batch = Self::apply_order_by(&result_batch, &stmt.order_by)?;
-        }
-        
+        let mut result_batch = RecordBatch::try_new(schema, result_arrays).map_err(|e| err_data(e.to_string()))?;
+        if let Some(having_expr) = &stmt.having { let mask = Self::evaluate_predicate(&result_batch, having_expr)?; result_batch = compute::filter_record_batch(&result_batch, &mask).map_err(|e| err_data(e.to_string()))?; }
+        if !stmt.order_by.is_empty() { result_batch = Self::apply_order_by(&result_batch, &stmt.order_by)?; }
         Ok(ApexResult::Data(result_batch))
     }
     
@@ -6476,68 +6631,31 @@ impl ApexExecutor {
                         use crate::query::AggregateFunc;
                         let mut result_fields: Vec<Field> = Vec::new();
                         let mut result_arrays: Vec<ArrayRef> = Vec::new();
-                        
                         result_fields.push(Field::new(group_cols[0].trim_matches('"'), ArrowDataType::Utf8, false));
                         result_arrays.push(Arc::new(StringArray::from(result_col1)));
                         result_fields.push(Field::new(group_cols[1].trim_matches('"'), ArrowDataType::Utf8, false));
                         result_arrays.push(Arc::new(StringArray::from(result_col2)));
-                        
                         let has_int_agg = agg_col_int.is_some();
-                        
                         for col in &stmt.columns {
                             if let SelectColumn::Aggregate { func, column, alias, .. } = col {
-                                let func_name = match func {
-                                    AggregateFunc::Count => "COUNT",
-                                    AggregateFunc::Sum => "SUM",
-                                    AggregateFunc::Avg => "AVG",
-                                    AggregateFunc::Min => "MIN",
-                                    AggregateFunc::Max => "MAX",
-                                };
-                                let field_name = alias.clone().unwrap_or_else(|| {
-                                    format!("{}({})", func_name, column.as_deref().unwrap_or("*"))
-                                });
-                                
+                                let fn_name = match func { AggregateFunc::Count => "COUNT", AggregateFunc::Sum => "SUM", AggregateFunc::Avg => "AVG", AggregateFunc::Min => "MIN", AggregateFunc::Max => "MAX" };
+                                let field_name = alias.clone().unwrap_or_else(|| format!("{}({})", fn_name, column.as_deref().unwrap_or("*")));
                                 match func {
-                                    AggregateFunc::Count => {
-                                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, false));
-                                        result_arrays.push(Arc::new(Int64Array::from(result_counts.clone())));
-                                    }
-                                    AggregateFunc::Sum => {
-                                        if has_int_agg {
-                                            result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
-                                            result_arrays.push(Arc::new(Int64Array::from(result_sums_int.clone())));
-                                        } else {
-                                            result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
-                                            result_arrays.push(Arc::new(Float64Array::from(result_sums_float.clone())));
-                                        }
-                                    }
-                                    AggregateFunc::Avg => {
-                                        let avgs: Vec<f64> = if has_int_agg {
-                                            result_counts.iter().zip(result_sums_int.iter())
-                                                .map(|(&c, &s)| if c > 0 { s as f64 / c as f64 } else { 0.0 })
-                                                .collect()
-                                        } else {
-                                            result_counts.iter().zip(result_sums_float.iter())
-                                                .map(|(&c, &s)| if c > 0 { s / c as f64 } else { 0.0 })
-                                                .collect()
-                                        };
-                                        result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
-                                        result_arrays.push(Arc::new(Float64Array::from(avgs)));
-                                    }
+                                    AggregateFunc::Count => { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, false)); result_arrays.push(Arc::new(Int64Array::from(result_counts.clone()))); }
+                                    AggregateFunc::Sum => { if has_int_agg { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true)); result_arrays.push(Arc::new(Int64Array::from(result_sums_int.clone()))); } else { result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(result_sums_float.clone()))); } }
+                                    AggregateFunc::Avg => { let avgs: Vec<f64> = if has_int_agg { result_counts.iter().zip(result_sums_int.iter()).map(|(&c, &s)| if c > 0 { s as f64 / c as f64 } else { 0.0 }).collect() } else { result_counts.iter().zip(result_sums_float.iter()).map(|(&c, &s)| if c > 0 { s / c as f64 } else { 0.0 }).collect() }; result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(avgs))); }
                                     _ => {}
                                 }
                             }
                         }
-                        
                         let schema = Arc::new(Schema::new(result_fields));
-                        let mut result_batch = RecordBatch::try_new(schema, result_arrays)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        let mut result_batch = RecordBatch::try_new(schema, result_arrays).map_err(|e| err_data(e.to_string()))?;
                         
                         // Apply HAVING/ORDER BY/LIMIT
                         if let Some(ref having) = stmt.having {
                             let mask = Self::evaluate_predicate(&result_batch, having)?;
                             result_batch = compute::filter_record_batch(&result_batch, &mask)
-                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                                .map_err(|e| err_data( e.to_string()))?;
                         }
                         
                         if !stmt.order_by.is_empty() {
@@ -6831,13 +6949,13 @@ impl ApexExecutor {
                         
                         let schema = Arc::new(Schema::new(result_fields));
                         let mut result_batch = RecordBatch::try_new(schema, result_arrays)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                            .map_err(|e| err_data( e.to_string()))?;
                         
                         // Apply HAVING/ORDER BY/LIMIT
                         if let Some(ref having) = stmt.having {
                             let mask = Self::evaluate_predicate(&result_batch, having)?;
                             result_batch = compute::filter_record_batch(&result_batch, &mask)
-                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                                .map_err(|e| err_data( e.to_string()))?;
                         }
                         
                         if !stmt.order_by.is_empty() {
@@ -6881,7 +6999,7 @@ impl ApexExecutor {
                     if let Some(having_expr) = &stmt.having {
                         let mask = Self::evaluate_predicate(&result, having_expr)?;
                         result = compute::filter_record_batch(&result, &mask)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                            .map_err(|e| err_data( e.to_string()))?;
                     }
                     
                     // Apply ORDER BY with top-k optimization
@@ -7176,77 +7294,21 @@ impl ApexExecutor {
                         let first_indices: Vec<usize> = states.iter().map(|s| s.first_row).collect();
                         let indices_arr = arrow::array::UInt32Array::from(first_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
                         let taken = compute::take(src_col.as_ref(), &indices_arr, None)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                            .map_err(|e| err_data( e.to_string()))?;
                         result_fields.push(Field::new(output_name, taken.data_type().clone(), true));
                         result_arrays.push(taken);
                     }
                 }
                 SelectColumn::Aggregate { func, column, alias, .. } => {
-                    let func_name = match func {
-                        AggregateFunc::Count => "COUNT",
-                        AggregateFunc::Sum => "SUM",
-                        AggregateFunc::Avg => "AVG",
-                        AggregateFunc::Min => "MIN",
-                        AggregateFunc::Max => "MAX",
-                    };
-                    let output_name = alias.clone().unwrap_or_else(|| {
-                        if let Some(c) = column { format!("{}({})", func_name, c) } else { format!("{}(*)", func_name) }
-                    });
-                    
+                    let fn_name = match func { AggregateFunc::Count => "COUNT", AggregateFunc::Sum => "SUM", AggregateFunc::Avg => "AVG", AggregateFunc::Min => "MIN", AggregateFunc::Max => "MAX" };
+                    let output_name = alias.clone().unwrap_or_else(|| if let Some(c) = column { format!("{}({})", fn_name, c) } else { format!("{}(*)", fn_name) });
+                    let has_int = agg_col_int.is_some();
                     match func {
-                        AggregateFunc::Count => {
-                            let counts: Vec<i64> = states.iter().map(|s| s.count).collect();
-                            result_fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
-                            result_arrays.push(Arc::new(Int64Array::from(counts)));
-                        }
-                        AggregateFunc::Sum => {
-                            if agg_col_int.is_some() {
-                                let sums: Vec<i64> = states.iter().map(|s| s.sum_int).collect();
-                                result_fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
-                                result_arrays.push(Arc::new(Int64Array::from(sums)));
-                            } else {
-                                let sums: Vec<f64> = states.iter().map(|s| s.sum_float).collect();
-                                result_fields.push(Field::new(&output_name, ArrowDataType::Float64, false));
-                                result_arrays.push(Arc::new(Float64Array::from(sums)));
-                            }
-                        }
-                        AggregateFunc::Avg => {
-                            if agg_col_int.is_some() {
-                                let avgs: Vec<Option<f64>> = states.iter().map(|s| {
-                                    if s.count > 0 { Some(s.sum_int as f64 / s.count as f64) } else { None }
-                                }).collect();
-                                result_fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
-                                result_arrays.push(Arc::new(Float64Array::from(avgs)));
-                            } else {
-                                let avgs: Vec<Option<f64>> = states.iter().map(|s| {
-                                    if s.count > 0 { Some(s.sum_float / s.count as f64) } else { None }
-                                }).collect();
-                                result_fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
-                                result_arrays.push(Arc::new(Float64Array::from(avgs)));
-                            }
-                        }
-                        AggregateFunc::Min => {
-                            if agg_col_int.is_some() {
-                                let mins: Vec<Option<i64>> = states.iter().map(|s| s.min_int).collect();
-                                result_fields.push(Field::new(&output_name, ArrowDataType::Int64, true));
-                                result_arrays.push(Arc::new(Int64Array::from(mins)));
-                            } else {
-                                let mins: Vec<Option<f64>> = states.iter().map(|s| s.min_float).collect();
-                                result_fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
-                                result_arrays.push(Arc::new(Float64Array::from(mins)));
-                            }
-                        }
-                        AggregateFunc::Max => {
-                            if agg_col_int.is_some() {
-                                let maxs: Vec<Option<i64>> = states.iter().map(|s| s.max_int).collect();
-                                result_fields.push(Field::new(&output_name, ArrowDataType::Int64, true));
-                                result_arrays.push(Arc::new(Int64Array::from(maxs)));
-                            } else {
-                                let maxs: Vec<Option<f64>> = states.iter().map(|s| s.max_float).collect();
-                                result_fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
-                                result_arrays.push(Arc::new(Float64Array::from(maxs)));
-                            }
-                        }
+                        AggregateFunc::Count => { result_fields.push(Field::new(&output_name, ArrowDataType::Int64, false)); result_arrays.push(Arc::new(Int64Array::from(states.iter().map(|s| s.count).collect::<Vec<_>>()))); }
+                        AggregateFunc::Sum => { if has_int { result_fields.push(Field::new(&output_name, ArrowDataType::Int64, false)); result_arrays.push(Arc::new(Int64Array::from(states.iter().map(|s| s.sum_int).collect::<Vec<_>>()))); } else { result_fields.push(Field::new(&output_name, ArrowDataType::Float64, false)); result_arrays.push(Arc::new(Float64Array::from(states.iter().map(|s| s.sum_float).collect::<Vec<_>>()))); } }
+                        AggregateFunc::Avg => { let avgs: Vec<Option<f64>> = states.iter().map(|s| if s.count > 0 { Some(if has_int { s.sum_int as f64 / s.count as f64 } else { s.sum_float / s.count as f64 }) } else { None }).collect(); result_fields.push(Field::new(&output_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(avgs))); }
+                        AggregateFunc::Min => { if has_int { result_fields.push(Field::new(&output_name, ArrowDataType::Int64, true)); result_arrays.push(Arc::new(Int64Array::from(states.iter().map(|s| s.min_int).collect::<Vec<_>>()))); } else { result_fields.push(Field::new(&output_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(states.iter().map(|s| s.min_float).collect::<Vec<_>>()))); } }
+                        AggregateFunc::Max => { if has_int { result_fields.push(Field::new(&output_name, ArrowDataType::Int64, true)); result_arrays.push(Arc::new(Int64Array::from(states.iter().map(|s| s.max_int).collect::<Vec<_>>()))); } else { result_fields.push(Field::new(&output_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(states.iter().map(|s| s.max_float).collect::<Vec<_>>()))); } }
                     }
                 }
                 _ => {}
@@ -7259,13 +7321,13 @@ impl ApexExecutor {
         
         let schema = Arc::new(Schema::new(result_fields));
         let mut result = RecordBatch::try_new(schema, result_arrays)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| err_data( e.to_string()))?;
         
         // Apply HAVING clause if present
         if let Some(having_expr) = &stmt.having {
             let mask = Self::evaluate_predicate(&result, having_expr)?;
             result = compute::filter_record_batch(&result, &mask)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
         }
         
         // Apply ORDER BY with top-k optimization if LIMIT is present
@@ -7423,13 +7485,13 @@ impl ApexExecutor {
 
         let schema = Arc::new(Schema::new(result_fields));
         let mut result = RecordBatch::try_new(schema, result_arrays)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| err_data( e.to_string()))?;
 
         // Apply HAVING clause if present
         if let Some(having_expr) = &stmt.having {
             let mask = Self::evaluate_predicate(&result, having_expr)?;
             result = compute::filter_record_batch(&result, &mask)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
         }
 
         // Apply ORDER BY if present
@@ -7554,7 +7616,7 @@ impl ApexExecutor {
                     let result = Arc::new(Int64Array::from(values)) as ArrayRef;
                     Ok((Field::new(output_name, arrow::datatypes::DataType::Int64, true), result))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "Unsupported expression type"))
+                    Err(err_data( "Unsupported expression type"))
                 }
             }
         }
@@ -7564,7 +7626,7 @@ impl ApexExecutor {
     fn create_group_batch(batch: &RecordBatch, indices: &[usize]) -> io::Result<RecordBatch> {
         let indices_array = arrow::array::UInt64Array::from(indices.iter().map(|&i| i as u64).collect::<Vec<_>>());
         compute::take_record_batch(batch, &indices_array)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+            .map_err(|e| err_data( e.to_string()))
     }
 
     /// Evaluate condition that may contain aggregate functions
@@ -7688,12 +7750,12 @@ impl ApexExecutor {
 
         if (l_is_f && r_is_i) {
             let r2 = cast(&right, &DataType::Float64)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
             return Ok((left, r2));
         }
         if (l_is_i && r_is_f) {
             let l2 = cast(&left, &DataType::Float64)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
             return Ok((l2, right));
         }
 
@@ -7897,6 +7959,10 @@ impl ApexExecutor {
                     Self::collect_columns_from_expr(where_clause, columns);
                 }
             }
+            SqlExpr::ArrayIndex { array, index } => {
+                Self::collect_columns_from_expr(array, columns);
+                Self::collect_columns_from_expr(index, columns);
+            }
             _ => {}
         }
     }
@@ -7954,35 +8020,10 @@ impl ApexExecutor {
     /// Check if an expression contains an aggregate function (SUM, COUNT, AVG, MIN, MAX)
     fn expr_contains_aggregate(expr: &SqlExpr) -> bool {
         match expr {
-            SqlExpr::Function { name, args } => {
-                let func_upper = name.to_uppercase();
-                if matches!(func_upper.as_str(), "SUM" | "COUNT" | "AVG" | "MIN" | "MAX") {
-                    return true;
-                }
-                // Check arguments recursively
-                args.iter().any(Self::expr_contains_aggregate)
-            }
-            SqlExpr::Case { when_then, else_expr } => {
-                // Check all WHEN conditions and THEN expressions
-                for (cond, then_expr) in when_then {
-                    if Self::expr_contains_aggregate(cond) || Self::expr_contains_aggregate(then_expr) {
-                        return true;
-                    }
-                }
-                // Check ELSE expression
-                if let Some(else_e) = else_expr {
-                    if Self::expr_contains_aggregate(else_e) {
-                        return true;
-                    }
-                }
-                false
-            }
-            SqlExpr::BinaryOp { left, right, .. } => {
-                Self::expr_contains_aggregate(left) || Self::expr_contains_aggregate(right)
-            }
-            SqlExpr::UnaryOp { expr, .. } => Self::expr_contains_aggregate(expr),
-            SqlExpr::Paren(inner) => Self::expr_contains_aggregate(inner),
-            SqlExpr::Cast { expr, .. } => Self::expr_contains_aggregate(expr),
+            SqlExpr::Function { name, args } => matches!(name.to_uppercase().as_str(), "SUM" | "COUNT" | "AVG" | "MIN" | "MAX") || args.iter().any(Self::expr_contains_aggregate),
+            SqlExpr::Case { when_then, else_expr } => when_then.iter().any(|(c, t)| Self::expr_contains_aggregate(c) || Self::expr_contains_aggregate(t)) || else_expr.as_ref().map_or(false, |e| Self::expr_contains_aggregate(e)),
+            SqlExpr::BinaryOp { left, right, .. } => Self::expr_contains_aggregate(left) || Self::expr_contains_aggregate(right),
+            SqlExpr::UnaryOp { expr, .. } | SqlExpr::Paren(expr) | SqlExpr::Cast { expr, .. } => Self::expr_contains_aggregate(expr),
             _ => false,
         }
     }
@@ -7991,25 +8032,9 @@ impl ApexExecutor {
     fn expr_contains_scalar_subquery(expr: &SqlExpr) -> bool {
         match expr {
             SqlExpr::ScalarSubquery { .. } => true,
-            SqlExpr::BinaryOp { left, right, .. } => {
-                Self::expr_contains_scalar_subquery(left) || Self::expr_contains_scalar_subquery(right)
-            }
-            SqlExpr::UnaryOp { expr, .. } => Self::expr_contains_scalar_subquery(expr),
-            SqlExpr::Paren(inner) => Self::expr_contains_scalar_subquery(inner),
-            SqlExpr::Cast { expr, .. } => Self::expr_contains_scalar_subquery(expr),
-            SqlExpr::Case { when_then, else_expr } => {
-                for (cond, then_expr) in when_then {
-                    if Self::expr_contains_scalar_subquery(cond) || Self::expr_contains_scalar_subquery(then_expr) {
-                        return true;
-                    }
-                }
-                if let Some(else_e) = else_expr {
-                    if Self::expr_contains_scalar_subquery(else_e) {
-                        return true;
-                    }
-                }
-                false
-            }
+            SqlExpr::BinaryOp { left, right, .. } => Self::expr_contains_scalar_subquery(left) || Self::expr_contains_scalar_subquery(right),
+            SqlExpr::UnaryOp { expr, .. } | SqlExpr::Paren(expr) | SqlExpr::Cast { expr, .. } => Self::expr_contains_scalar_subquery(expr),
+            SqlExpr::Case { when_then, else_expr } => when_then.iter().any(|(c, t)| Self::expr_contains_scalar_subquery(c) || Self::expr_contains_scalar_subquery(t)) || else_expr.as_ref().map_or(false, |e| Self::expr_contains_scalar_subquery(e)),
             _ => false,
         }
     }
@@ -8017,38 +8042,12 @@ impl ApexExecutor {
     /// Take first value from each group
     fn take_first_from_groups(array: &ArrayRef, group_indices: &[Vec<usize>], output_name: &str) -> io::Result<(Field, ArrayRef)> {
         use arrow::datatypes::DataType;
-        
         let first_indices: Vec<usize> = group_indices.iter().map(|g| g[0]).collect();
-        
         match array.data_type() {
-            DataType::Int64 => {
-                let src = array.as_any().downcast_ref::<Int64Array>().unwrap();
-                let values: Vec<Option<i64>> = first_indices.iter().map(|&i| {
-                    if src.is_null(i) { None } else { Some(src.value(i)) }
-                }).collect();
-                Ok((Field::new(output_name, DataType::Int64, true), Arc::new(Int64Array::from(values))))
-            }
-            DataType::Float64 => {
-                let src = array.as_any().downcast_ref::<Float64Array>().unwrap();
-                let values: Vec<Option<f64>> = first_indices.iter().map(|&i| {
-                    if src.is_null(i) { None } else { Some(src.value(i)) }
-                }).collect();
-                Ok((Field::new(output_name, DataType::Float64, true), Arc::new(Float64Array::from(values))))
-            }
-            DataType::Utf8 => {
-                let src = array.as_any().downcast_ref::<StringArray>().unwrap();
-                let values: Vec<Option<&str>> = first_indices.iter().map(|&i| {
-                    if src.is_null(i) { None } else { Some(src.value(i)) }
-                }).collect();
-                Ok((Field::new(output_name, DataType::Utf8, true), Arc::new(StringArray::from(values))))
-            }
-            DataType::Boolean => {
-                let src = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-                let values: Vec<Option<bool>> = first_indices.iter().map(|&i| {
-                    if src.is_null(i) { None } else { Some(src.value(i)) }
-                }).collect();
-                Ok((Field::new(output_name, DataType::Boolean, true), Arc::new(BooleanArray::from(values))))
-            }
+            DataType::Int64 => { let src = array.as_any().downcast_ref::<Int64Array>().unwrap(); Ok((Field::new(output_name, DataType::Int64, true), Arc::new(Int64Array::from(first_indices.iter().map(|&i| if src.is_null(i) { None } else { Some(src.value(i)) }).collect::<Vec<_>>())))) }
+            DataType::Float64 => { let src = array.as_any().downcast_ref::<Float64Array>().unwrap(); Ok((Field::new(output_name, DataType::Float64, true), Arc::new(Float64Array::from(first_indices.iter().map(|&i| if src.is_null(i) { None } else { Some(src.value(i)) }).collect::<Vec<_>>())))) }
+            DataType::Utf8 => { let src = array.as_any().downcast_ref::<StringArray>().unwrap(); Ok((Field::new(output_name, DataType::Utf8, true), Arc::new(StringArray::from(first_indices.iter().map(|&i| if src.is_null(i) { None } else { Some(src.value(i)) }).collect::<Vec<_>>())))) }
+            DataType::Boolean => { let src = array.as_any().downcast_ref::<BooleanArray>().unwrap(); Ok((Field::new(output_name, DataType::Boolean, true), Arc::new(BooleanArray::from(first_indices.iter().map(|&i| if src.is_null(i) { None } else { Some(src.value(i)) }).collect::<Vec<_>>())))) }
             _ => Ok((Field::new(output_name, DataType::Int64, true), Arc::new(Int64Array::from(vec![None::<i64>; group_indices.len()]))))
         }
     }
@@ -8164,8 +8163,8 @@ impl ApexExecutor {
                 Ok((Field::new(&output_name, ArrowDataType::Int64, false), Arc::new(Int64Array::from(counts))))
             }
             AggregateFunc::Sum => {
-                let col_name = actual_column.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "SUM requires column"))?;
-                let array = batch.column_by_name(col_name).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+                let col_name = actual_column.as_ref().ok_or_else(|| err_input( "SUM requires column"))?;
+                let array = batch.column_by_name(col_name).ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
                 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     // Fast path: direct slice access with loop unrolling
@@ -8225,12 +8224,12 @@ impl ApexExecutor {
                     };
                     Ok((Field::new(&output_name, ArrowDataType::Float64, false), Arc::new(Float64Array::from(sums))))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "SUM requires numeric column"))
+                    Err(err_data( "SUM requires numeric column"))
                 }
             }
             AggregateFunc::Avg => {
-                let col_name = actual_column.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "AVG requires column"))?;
-                let array = batch.column_by_name(col_name).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+                let col_name = actual_column.as_ref().ok_or_else(|| err_input( "AVG requires column"))?;
+                let array = batch.column_by_name(col_name).ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
                 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     // Fast path: direct slice access, compute sum and count together
@@ -8256,12 +8255,12 @@ impl ApexExecutor {
                     }).collect();
                     Ok((Field::new(&output_name, ArrowDataType::Float64, false), Arc::new(Float64Array::from(avgs))))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "AVG requires numeric column"))
+                    Err(err_data( "AVG requires numeric column"))
                 }
             }
             AggregateFunc::Min => {
-                let col_name = actual_column.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "MIN requires column"))?;
-                let array = batch.column_by_name(col_name).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+                let col_name = actual_column.as_ref().ok_or_else(|| err_input( "MIN requires column"))?;
+                let array = batch.column_by_name(col_name).ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
                 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     let mins: Vec<Option<i64>> = group_indices.iter().map(|g| {
@@ -8274,12 +8273,12 @@ impl ApexExecutor {
                     }).collect();
                     Ok((Field::new(&output_name, ArrowDataType::Float64, true), Arc::new(Float64Array::from(mins))))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "MIN requires numeric column"))
+                    Err(err_data( "MIN requires numeric column"))
                 }
             }
             AggregateFunc::Max => {
-                let col_name = actual_column.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "MAX requires column"))?;
-                let array = batch.column_by_name(col_name).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", col_name)))?;
+                let col_name = actual_column.as_ref().ok_or_else(|| err_input( "MAX requires column"))?;
+                let array = batch.column_by_name(col_name).ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
                 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     let maxs: Vec<Option<i64>> = group_indices.iter().map(|g| {
@@ -8292,7 +8291,7 @@ impl ApexExecutor {
                     }).collect();
                     Ok((Field::new(&output_name, ArrowDataType::Float64, true), Arc::new(Float64Array::from(maxs))))
                 } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "MAX requires numeric column"))
+                    Err(err_data( "MAX requires numeric column"))
                 }
             }
         }
@@ -8356,12 +8355,12 @@ impl ApexExecutor {
             let right_col = right.column(i);
             
             let concatenated = compute::concat(&[left_col.as_ref(), right_col.as_ref()])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
             columns.push(concatenated);
         }
 
         RecordBatch::try_new(left.schema(), columns)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+            .map_err(|e| err_data( e.to_string()))
     }
 
     /// Deduplicate rows in a record batch (for UNION without ALL)
@@ -8404,9 +8403,9 @@ impl ApexExecutor {
                 
                 let indices = arrow::array::UInt32Array::from(keep_indices);
                 let filtered = compute::take(col.as_ref(), &indices, None)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    .map_err(|e| err_data( e.to_string()))?;
                 return RecordBatch::try_new(batch.schema(), vec![filtered])
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+                    .map_err(|e| err_data( e.to_string()));
             }
             
             // Case 2: StringArray - build dictionary on the fly for low cardinality
@@ -8438,9 +8437,9 @@ impl ApexExecutor {
                 
                 let indices = arrow::array::UInt32Array::from(keep_indices);
                 let filtered = compute::take(col.as_ref(), &indices, None)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    .map_err(|e| err_data( e.to_string()))?;
                 return RecordBatch::try_new(batch.schema(), vec![filtered])
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+                    .map_err(|e| err_data( e.to_string()));
             }
             
             // Case 3: Int64Array - use direct value dedup
@@ -8466,9 +8465,9 @@ impl ApexExecutor {
                 
                 let indices = arrow::array::UInt32Array::from(keep_indices);
                 let filtered = compute::take(col.as_ref(), &indices, None)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    .map_err(|e| err_data( e.to_string()))?;
                 return RecordBatch::try_new(batch.schema(), vec![filtered])
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+                    .map_err(|e| err_data( e.to_string()));
             }
         }
         
@@ -8566,12 +8565,12 @@ impl ApexExecutor {
         
         for col in batch.columns() {
             let filtered = compute::take(col.as_ref(), &indices, None)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                .map_err(|e| err_data( e.to_string()))?;
             result_columns.push(filtered);
         }
 
         RecordBatch::try_new(batch.schema(), result_columns)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+            .map_err(|e| err_data( e.to_string()))
     }
 
     /// Append value signature for deduplication
@@ -8608,7 +8607,7 @@ impl ApexExecutor {
             if let SelectColumn::WindowFunction { name, args, partition_by, order_by, alias } = col {
                 let upper = name.to_uppercase();
                 if !supported.contains(&upper.as_str()) {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, 
+                    return Err(err_input( 
                         format!("Unsupported window function: {}", name)));
                 }
                 let out_name = alias.clone().unwrap_or_else(|| name.to_lowercase());
@@ -8617,7 +8616,7 @@ impl ApexExecutor {
         }
 
         if window_specs.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "No window function found"));
+            return Err(err_input( "No window function found"));
         }
 
         let (func_name, func_args, partition_by, order_by, _) = &window_specs[0];
@@ -8964,7 +8963,7 @@ impl ApexExecutor {
 
         let schema = Arc::new(Schema::new(result_fields));
         let result = RecordBatch::try_new(schema, result_arrays)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| err_data( e.to_string()))?;
 
         Ok(ApexResult::Data(result))
     }
@@ -9211,9 +9210,9 @@ impl ApexExecutor {
         // Invalidate cache before write
         invalidate_storage_cache(storage_path);
         
-        // For DELETE without WHERE, only need to read _id column (memory efficient)
+        // For DELETE without WHERE, delete all rows (soft delete)
         if where_clause.is_none() {
-            // Use lazy open - only load metadata, not column data
+            // Soft delete only marks rows in bitmap - no need to load all column data
             let storage = TableStorageBackend::open(storage_path)?;
             let count = storage.active_row_count() as i64;
             
@@ -9237,8 +9236,7 @@ impl ApexExecutor {
             return Ok(ApexResult::Scalar(count));
         }
         
-        // OPTIMIZATION: Only read columns needed for WHERE evaluation + _id
-        // This avoids loading unnecessary columns (can save 50-90% IO for wide tables)
+        // Soft delete only marks rows in bitmap
         let storage = TableStorageBackend::open(storage_path)?;
         
         // Extract column names from WHERE clause
@@ -9553,5 +9551,133 @@ mod tests {
             .as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(age_array.value(0), 45);
         assert_eq!(age_array.value(1), 40);
+    }
+
+    #[test]
+    fn test_is_null_query() {
+        use crate::storage::backend::TableStorageBackend;
+        use crate::data::Value;
+        use std::collections::HashMap;
+        
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_null.apex");
+        
+        // Create storage with NULL boolean
+        {
+            let backend = TableStorageBackend::create(&path).unwrap();
+            
+            let mut row1 = HashMap::new();
+            row1.insert("id".to_string(), Value::Int64(1));
+            row1.insert("flag".to_string(), Value::Bool(true));
+            
+            let mut row2 = HashMap::new();
+            row2.insert("id".to_string(), Value::Int64(2));
+            row2.insert("flag".to_string(), Value::Bool(false));
+            
+            let mut row3 = HashMap::new();
+            row3.insert("id".to_string(), Value::Int64(3));
+            row3.insert("flag".to_string(), Value::Null);  // NULL boolean
+            
+            backend.insert_rows(&[row1, row2, row3]).unwrap();
+            backend.save().unwrap();
+        }
+        
+        // Clear any cached backend
+        invalidate_storage_cache(&path);
+        
+        // First check SELECT * to verify data is correctly read
+        let result_all = ApexExecutor::execute("SELECT id, flag FROM test_null ORDER BY id", &path).unwrap();
+        let batch_all = result_all.to_record_batch().unwrap();
+        
+        println!("SELECT all rows: {} rows", batch_all.num_rows());
+        if let Some(flag_col) = batch_all.column_by_name("flag") {
+            println!("Flag column null_count in SELECT *: {}", flag_col.null_count());
+            let bool_arr = flag_col.as_any().downcast_ref::<BooleanArray>().unwrap();
+            for i in 0..bool_arr.len() {
+                println!("  Row {}: is_null={}, value={:?}", i, bool_arr.is_null(i), 
+                    if bool_arr.is_null(i) { None } else { Some(bool_arr.value(i)) });
+            }
+        }
+        
+        // Clear cache again before IS NULL query
+        invalidate_storage_cache(&path);
+        
+        // Test reading just the flag column for WHERE evaluation
+        let backend = get_cached_backend(&path).unwrap();
+        let where_batch = backend.read_columns_to_arrow(Some(&["flag"]), 0, None).unwrap();
+        println!("WHERE batch (flag only): {} rows", where_batch.num_rows());
+        if let Some(flag_col) = where_batch.column_by_name("flag") {
+            println!("  null_count: {}", flag_col.null_count());
+            let bool_arr = flag_col.as_any().downcast_ref::<BooleanArray>().unwrap();
+            for i in 0..bool_arr.len() {
+                println!("    Row {}: is_null={}", i, bool_arr.is_null(i));
+            }
+            // Test is_null compute
+            let is_null_mask = arrow::compute::is_null(flag_col).unwrap();
+            println!("  is_null mask: {:?}", is_null_mask);
+        }
+        
+        // Clear cache again
+        invalidate_storage_cache(&path);
+        
+        // Manually test the predicate evaluation path
+        let backend2 = get_cached_backend(&path).unwrap();
+        let full_batch = backend2.read_columns_to_arrow(None, 0, None).unwrap();
+        println!("Full batch before filter: {} rows", full_batch.num_rows());
+        
+        // Check flag column null status in full batch
+        if let Some(flag_col) = full_batch.column_by_name("flag") {
+            println!("  flag null_count in full batch: {}", flag_col.null_count());
+            // Compute is_null mask
+            let is_null_mask = arrow::compute::is_null(flag_col).unwrap();
+            println!("  is_null mask: {:?}", is_null_mask);
+            let true_count = is_null_mask.iter().filter(|v| *v == Some(true)).count();
+            println!("  True count in is_null mask: {}", true_count);
+            
+            // Manually apply filter
+            let filtered_batch = arrow::compute::filter_record_batch(&full_batch, &is_null_mask).unwrap();
+            println!("  Manually filtered batch: {} rows", filtered_batch.num_rows());
+        }
+        
+        // Clear cache again
+        invalidate_storage_cache(&path);
+        
+        // Check what the parser produces for the IS NULL query
+        let parsed = SqlParser::parse("SELECT * FROM test_null WHERE flag IS NULL").unwrap();
+        if let SqlStatement::Select(stmt) = parsed {
+            println!("Parsed statement:");
+            println!("  is_select_star: {}", stmt.is_select_star());
+            println!("  where_clause: {:?}", stmt.where_clause);
+            println!("  where_columns: {:?}", stmt.where_columns());
+            println!("  order_by: {:?}", stmt.order_by);
+        }
+        
+        // Test IS NULL query
+        let result = ApexExecutor::execute("SELECT * FROM test_null WHERE flag IS NULL", &path).unwrap();
+        let batch = result.to_record_batch().unwrap();
+        
+        println!("IS NULL query result: {} rows", batch.num_rows());
+        println!("Schema: {:?}", batch.schema());
+        
+        // Check the flag column for nulls
+        if let Some(flag_col) = batch.column_by_name("flag") {
+            println!("Flag column null_count: {}", flag_col.null_count());
+        }
+        
+        assert_eq!(batch.num_rows(), 1, "IS NULL should return 1 row");
+        
+        // Also test that SELECT * returns correct data
+        let result2 = ApexExecutor::execute("SELECT id, flag FROM test_null ORDER BY id", &path).unwrap();
+        let batch2 = result2.to_record_batch().unwrap();
+        
+        println!("SELECT all rows: {} rows", batch2.num_rows());
+        if let Some(flag_col) = batch2.column_by_name("flag") {
+            println!("Flag column null_count in SELECT *: {}", flag_col.null_count());
+            let bool_arr = flag_col.as_any().downcast_ref::<BooleanArray>().unwrap();
+            for i in 0..bool_arr.len() {
+                println!("  Row {}: is_null={}, value={:?}", i, bool_arr.is_null(i), 
+                    if bool_arr.is_null(i) { None } else { Some(bool_arr.value(i)) });
+            }
+        }
     }
 }

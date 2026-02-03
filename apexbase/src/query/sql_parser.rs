@@ -190,6 +190,8 @@ pub enum SqlExpr {
     Cast { expr: Box<SqlExpr>, data_type: DataType },
     /// Parenthesized expression
     Paren(Box<SqlExpr>),
+    /// Array index: expr[index]
+    ArrayIndex { array: Box<SqlExpr>, index: Box<SqlExpr> },
 }
 
 /// Binary operators
@@ -426,6 +428,10 @@ impl SelectStatement {
                     Self::extract_outer_refs_from_subquery(where_clause, columns);
                 }
             }
+            SqlExpr::ArrayIndex { array, index } => {
+                Self::extract_columns_from_expr(array, columns);
+                Self::extract_columns_from_expr(index, columns);
+            }
             _ => {}
         }
     }
@@ -510,6 +516,8 @@ enum Token {
     Minus,          // -
     Slash,          // /
     Percent,        // %
+    LBracket,       // [
+    RBracket,       // ]
     // Literals
     Identifier(String),
     StringLit(String),
@@ -593,6 +601,8 @@ impl SqlParser {
                 '-' => { tokens.push(SpannedToken { token: Token::Minus, start: i, end: i + 1 }); i += 1; continue; }
                 '/' => { tokens.push(SpannedToken { token: Token::Slash, start: i, end: i + 1 }); i += 1; continue; }
                 '%' => { tokens.push(SpannedToken { token: Token::Percent, start: i, end: i + 1 }); i += 1; continue; }
+                '[' => { tokens.push(SpannedToken { token: Token::LBracket, start: i, end: i + 1 }); i += 1; continue; }
+                ']' => { tokens.push(SpannedToken { token: Token::RBracket, start: i, end: i + 1 }); i += 1; continue; }
                 _ => {}
             }
 
@@ -1654,6 +1664,30 @@ impl SqlParser {
                         }
                     }
                 }
+            }
+            // Handle keywords that can also be function names: LEFT, RIGHT, IF, TRUNCATE
+            else if matches!(self.current(), Token::Left | Token::Right | Token::If | Token::Truncate) {
+                let name = match self.current() {
+                    Token::Left => "LEFT",
+                    Token::Right => "RIGHT",
+                    Token::If => "IF",
+                    Token::Truncate => "TRUNCATE",
+                    _ => unreachable!(),
+                }.to_string();
+                self.advance();
+                if matches!(self.current(), Token::LParen) {
+                    let func_expr = self.parse_function_call_from_name(name)?;
+                    let alias = if matches!(self.current(), Token::As) {
+                        self.advance();
+                        self.parse_alias_identifier()
+                    } else {
+                        self.parse_alias_identifier()
+                    };
+                    columns.push(SelectColumn::Expression { expr: func_expr, alias });
+                } else {
+                    let (start, _) = self.current_span();
+                    return Err(self.syntax_error(start, format!("Expected '(' after function name")));
+                }
             } else {
                 // Fallback: allow expression/literal select items like `SELECT 1`.
                 // This is commonly used in EXISTS subqueries.
@@ -1861,7 +1895,25 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
             }
         }
         self.expect(Token::RParen)?;
-        Ok(SqlExpr::Function { name, args })
+        let mut result = SqlExpr::Function { name, args };
+        
+        // Check for array indexing: func(...)[index]
+        result = self.parse_array_index(result)?;
+        Ok(result)
+    }
+    
+    /// Parse array index suffix: expr[index]
+    fn parse_array_index(&mut self, mut expr: SqlExpr) -> Result<SqlExpr, ApexError> {
+        while matches!(self.current(), Token::LBracket) {
+            self.advance(); // consume [
+            let index = self.parse_expr()?;
+            self.expect(Token::RBracket)?;
+            expr = SqlExpr::ArrayIndex {
+                array: Box::new(expr),
+                index: Box::new(index),
+            };
+        }
+        Ok(expr)
     }
 
     fn parse_and(&mut self) -> Result<SqlExpr, ApexError> {

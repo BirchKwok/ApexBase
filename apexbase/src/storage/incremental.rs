@@ -70,6 +70,40 @@ pub enum WalRecord {
 }
 
 impl WalRecord {
+    /// Helper: serialize a single ColumnValue to buffer
+    #[inline]
+    fn write_column_value(buf: &mut Vec<u8>, value: &ColumnValue) {
+        match value {
+            ColumnValue::Null => buf.push(0),
+            ColumnValue::Bool(v) => { buf.push(1); buf.push(if *v { 1 } else { 0 }); }
+            ColumnValue::Int64(v) => { buf.push(2); buf.extend_from_slice(&v.to_le_bytes()); }
+            ColumnValue::Float64(v) => { buf.push(3); buf.extend_from_slice(&v.to_le_bytes()); }
+            ColumnValue::String(v) => {
+                buf.push(4);
+                let bytes = v.as_bytes();
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            ColumnValue::Binary(v) => {
+                buf.push(5);
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                buf.extend_from_slice(v);
+            }
+        }
+    }
+
+    /// Helper: serialize a row (name-value pairs) to buffer
+    #[inline]
+    fn write_row(buf: &mut Vec<u8>, row: &HashMap<String, ColumnValue>) {
+        buf.extend_from_slice(&(row.len() as u32).to_le_bytes());
+        for (name, value) in row {
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            Self::write_column_value(buf, value);
+        }
+    }
+
     /// Serialize record to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -80,45 +114,9 @@ impl WalRecord {
                 buf.push(RECORD_INSERT);
                 buf.extend_from_slice(&timestamp.to_le_bytes());
                 
-                // Serialize data as: [id:u64][col_count:u32][col_name_len:u16][col_name][type:u8][value_bytes]
                 let mut data_buf = Vec::new();
                 data_buf.extend_from_slice(&id.to_le_bytes());
-                data_buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                
-                for (name, value) in data {
-                    let name_bytes = name.as_bytes();
-                    data_buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-                    data_buf.extend_from_slice(name_bytes);
-                    
-                    match value {
-                        ColumnValue::Null => {
-                            data_buf.push(0);
-                        }
-                        ColumnValue::Bool(v) => {
-                            data_buf.push(1);
-                            data_buf.push(if *v { 1 } else { 0 });
-                        }
-                        ColumnValue::Int64(v) => {
-                            data_buf.push(2);
-                            data_buf.extend_from_slice(&v.to_le_bytes());
-                        }
-                        ColumnValue::Float64(v) => {
-                            data_buf.push(3);
-                            data_buf.extend_from_slice(&v.to_le_bytes());
-                        }
-                        ColumnValue::String(v) => {
-                            data_buf.push(4);
-                            let bytes = v.as_bytes();
-                            data_buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                            data_buf.extend_from_slice(bytes);
-                        }
-                        ColumnValue::Binary(v) => {
-                            data_buf.push(5);
-                            data_buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                            data_buf.extend_from_slice(v);
-                        }
-                    }
-                }
+                Self::write_row(&mut data_buf, data);
                 
                 buf.extend_from_slice(&(data_buf.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&data_buf);
@@ -127,47 +125,12 @@ impl WalRecord {
                 buf.push(RECORD_BATCH_INSERT);
                 buf.extend_from_slice(&timestamp.to_le_bytes());
                 
-                // Serialize batch: [start_id:u64][row_count:u32][rows...]
-                let mut data_buf = Vec::with_capacity(rows.len() * 64); // Pre-allocate
+                let mut data_buf = Vec::with_capacity(rows.len() * 64);
                 data_buf.extend_from_slice(&start_id.to_le_bytes());
                 data_buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-                
                 for row in rows {
-                    data_buf.extend_from_slice(&(row.len() as u32).to_le_bytes());
-                    for (name, value) in row {
-                        let name_bytes = name.as_bytes();
-                        data_buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-                        data_buf.extend_from_slice(name_bytes);
-                        
-                        match value {
-                            ColumnValue::Null => data_buf.push(0),
-                            ColumnValue::Bool(v) => {
-                                data_buf.push(1);
-                                data_buf.push(if *v { 1 } else { 0 });
-                            }
-                            ColumnValue::Int64(v) => {
-                                data_buf.push(2);
-                                data_buf.extend_from_slice(&v.to_le_bytes());
-                            }
-                            ColumnValue::Float64(v) => {
-                                data_buf.push(3);
-                                data_buf.extend_from_slice(&v.to_le_bytes());
-                            }
-                            ColumnValue::String(v) => {
-                                data_buf.push(4);
-                                let bytes = v.as_bytes();
-                                data_buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                                data_buf.extend_from_slice(bytes);
-                            }
-                            ColumnValue::Binary(v) => {
-                                data_buf.push(5);
-                                data_buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                                data_buf.extend_from_slice(v);
-                            }
-                        }
-                    }
+                    Self::write_row(&mut data_buf, row);
                 }
-                
                 buf.extend_from_slice(&(data_buf.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&data_buf);
             }
