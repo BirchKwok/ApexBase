@@ -257,7 +257,7 @@ Comparison with [DuckDB](https://duckdb.org/) (v1.1.3), a popular embedded analy
 | **CPU** | Apple M1 Pro |
 | **Memory** | 32.0 GB |
 | **Python** | 3.11.10 |
-| **ApexBase** | v0.4.2 |
+| **ApexBase** | v0.5.0 |
 | **DuckDB** | v1.1.3 |
 | **PyArrow** | 19.0.0 |
 
