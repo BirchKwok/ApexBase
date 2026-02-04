@@ -416,7 +416,7 @@ impl ApexStorageImpl {
         
         let id = result?;
 
-        // Index in FTS if enabled (fast return if not)
+        // Index in FTS if enabled
         self.index_for_fts(id, data)?;
 
         Ok(id)
@@ -1337,52 +1337,14 @@ impl ApexStorageImpl {
     
     /// Retrieve a single record by ID
     fn retrieve(&self, py: Python<'_>, id: i64) -> PyResult<Option<PyObject>> {
-        let (table_path, table_name) = self.get_current_table_info()?;
-        let base_dir = self.base_dir.clone();
+        let table_path = self.get_current_table_path()?;
         
-        // FAST PATH: Try cache lookup without lock first (optimistic)
-        {
-            let cache = STORAGE_CACHE.read();
-            if cache.get(&table_path).is_some() {
-                let result = py.allow_threads(|| -> PyResult<Option<HashMap<String, Value>>> {
-                    if id < 0 {
-                        return Ok(None);
-                    }
-                    let sql = format!("SELECT * FROM \"{}\" WHERE _id = {}", table_name, id);
-                    let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    
-                    let batch = result.to_record_batch()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    
-                    if batch.num_rows() == 0 {
-                        return Ok(None);
-                    }
-                    
-                    let mut row_data = HashMap::new();
-                    for (col_idx, field) in batch.schema().fields().iter().enumerate() {
-                        let val = arrow_value_at(batch.column(col_idx), 0);
-                        row_data.insert(field.name().clone(), val);
-                    }
-                    Ok(Some(row_data))
-                })?;
-                
-                return match result {
-                    None => Ok(None),
-                    Some(row_data) => {
-                        let dict = PyDict::new_bound(py);
-                        for (k, v) in row_data {
-                            dict.set_item(k, value_to_py(py, &v)?)?;
-                        }
-                        Ok(Some(dict.into()))
-                    }
-                };
-            }
-        }
-        
-        // SLOW PATH: Acquire shared read lock
+        // Acquire shared read lock
         let lock_file = Self::acquire_read_lock(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        
+        let base_dir = self.base_dir.clone();
+        let table_name = self.current_table.read().clone();
         
         let result = py.allow_threads(|| -> PyResult<Option<HashMap<String, Value>>> {
             // Invalid IDs (negative) cannot exist
@@ -1510,53 +1472,8 @@ impl ApexStorageImpl {
     /// Query with WHERE clause
     #[pyo3(signature = (where_clause, limit=None))]
     fn query(&self, py: Python<'_>, where_clause: &str, limit: Option<usize>) -> PyResult<Vec<PyObject>> {
-        let (table_path, _table_name) = self.get_current_table_info()?;
+        let table_path = self.get_current_table_path()?;
         
-        // FAST PATH: Try cache lookup without lock first (optimistic)
-        // If cache hit, avoid lock overhead entirely
-        {
-            let cache = STORAGE_CACHE.read();
-            if let Some((backend, _cached_time, _)) = cache.get(&table_path) {
-                // Have cached backend - use it without lock (may be slightly stale but consistent)
-                let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
-                    let sql = if let Some(lim) = limit {
-                        format!("SELECT * FROM data WHERE {} LIMIT {}", where_clause, lim)
-                    } else {
-                        format!("SELECT * FROM data WHERE {}", where_clause)
-                    };
-                    
-                    let result = ApexExecutor::execute(&sql, &table_path)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    
-                    let batch = result.to_record_batch()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    
-                    let mut rows = Vec::with_capacity(batch.num_rows());
-                    for row_idx in 0..batch.num_rows() {
-                        let mut row_data = HashMap::new();
-                        for (col_idx, field) in batch.schema().fields().iter().enumerate() {
-                            let val = arrow_value_at(batch.column(col_idx), row_idx);
-                            row_data.insert(field.name().clone(), val);
-                        }
-                        rows.push(row_data);
-                    }
-                    
-                    Ok(rows)
-                })?;
-                
-                let mut result = Vec::with_capacity(rows.len());
-                for row_data in rows {
-                    let dict = PyDict::new_bound(py);
-                    for (k, v) in row_data {
-                        dict.set_item(k, value_to_py(py, &v)?)?;
-                    }
-                    result.push(dict.into());
-                }
-                return Ok(result);
-            }
-        }
-        
-        // SLOW PATH: Acquire lock and query
         let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
             let sql = if let Some(lim) = limit {
                 format!("SELECT * FROM data WHERE {} LIMIT {}", where_clause, lim)
@@ -1598,7 +1515,8 @@ impl ApexStorageImpl {
     /// Replace a record by ID using StorageEngine
     fn replace(&self, py: Python<'_>, id: i64, data: &Bound<'_, PyDict>) -> PyResult<bool> {
         let fields = dict_to_values(data)?;
-        let (table_path, table_name) = self.get_current_table_info()?;
+        let table_path = self.get_current_table_path()?;
+        let table_name = self.current_table.read().clone();
         let durability = self.durability;
         
         // Acquire exclusive write lock
@@ -1633,7 +1551,8 @@ impl ApexStorageImpl {
             _ => crate::data::DataType::String,
         };
         
-        let (table_path, table_name) = self.get_current_table_info()?;
+        let table_path = self.get_current_table_path()?;
+        let table_name = self.current_table.read().clone();
         let durability = self.durability;
         
         // Invalidate local backend cache before operation
@@ -1658,7 +1577,8 @@ impl ApexStorageImpl {
     
     /// Drop a column from current table using StorageEngine
     fn drop_column(&self, column_name: &str) -> PyResult<()> {
-        let (table_path, table_name) = self.get_current_table_info()?;
+        let table_path = self.get_current_table_path()?;
+        let table_name = self.current_table.read().clone();
         let durability = self.durability;
         
         // Invalidate local backend cache before operation
@@ -1683,7 +1603,8 @@ impl ApexStorageImpl {
     
     /// Rename a column using StorageEngine
     fn rename_column(&self, old_name: &str, new_name: &str) -> PyResult<()> {
-        let (table_path, table_name) = self.get_current_table_info()?;
+        let table_path = self.get_current_table_path()?;
+        let table_name = self.current_table.read().clone();
         let durability = self.durability;
         
         // Acquire exclusive write lock
@@ -1705,7 +1626,7 @@ impl ApexStorageImpl {
     
     /// List fields (columns) in current table using StorageEngine
     fn list_fields(&self) -> PyResult<Vec<String>> {
-        let (table_path, _table_name) = self.get_current_table_info()?;
+        let table_path = self.get_current_table_path()?;
         
         // Acquire shared read lock
         let lock_file = Self::acquire_read_lock(&table_path)
@@ -1722,7 +1643,7 @@ impl ApexStorageImpl {
     
     /// Get column data type using StorageEngine
     fn get_column_dtype(&self, column_name: &str) -> PyResult<Option<String>> {
-        let (table_path, _table_name) = self.get_current_table_info()?;
+        let table_path = self.get_current_table_path()?;
         
         // Acquire shared read lock
         let lock_file = Self::acquire_read_lock(&table_path)

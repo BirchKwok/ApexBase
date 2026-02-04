@@ -23,12 +23,6 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use once_cell::sync::Lazy;
 
-// SQL Parse Cache - caches parsed statements to avoid re-parsing repeated queries
-// Limited to 128 entries to prevent unbounded memory growth
-static SQL_PARSE_CACHE: Lazy<RwLock<AHashMap<String, SqlStatement>>> = Lazy::new(|| {
-    RwLock::new(AHashMap::with_capacity(128))
-});
-
 use crate::query::{SqlParser, SqlStatement, SelectStatement, SqlExpr, SelectColumn, JoinType, JoinClause, UnionStatement, AggregateFunc};
 use crate::query::sql_parser::BinaryOperator;
 use crate::query::sql_parser::FromItem;
@@ -444,51 +438,19 @@ impl ApexExecutor {
     }
     
     /// Execute a SQL query on V3 storage (single table)
-    /// Uses parse cache to avoid re-parsing repeated queries
     pub fn execute(sql: &str, storage_path: &Path) -> io::Result<ApexResult> {
-        // Check parse cache first
-        {
-            let cache = SQL_PARSE_CACHE.read();
-            if let Some(stmt) = cache.get(sql) {
-                return Self::execute_parsed(stmt.clone(), storage_path);
-            }
-        }
-        
-        // Parse and cache
         let stmt = SqlParser::parse(sql)
-            .map_err(|e| err_input(e.to_string()))?;
-        
-        // Store in cache (evict if too many entries)
-        {
-            let mut cache = SQL_PARSE_CACHE.write();
-            if cache.len() >= 128 {
-                // Simple eviction: clear half the cache
-                let keys_to_remove: Vec<String> = cache.keys().take(64).cloned().collect();
-                for key in keys_to_remove {
-                    cache.remove(&key);
-                }
-            }
-            cache.insert(sql.to_string(), stmt.clone());
-        }
-        
+            .map_err(|e| err_input( e.to_string()))?;
+
         Self::execute_parsed(stmt, storage_path)
     }
 
     /// Execute a SQL query with multi-table support (for JOINs)
-    /// Uses parse cache for single statements
     pub fn execute_with_base_dir(sql: &str, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
-        // Check parse cache first
-        {
-            let cache = SQL_PARSE_CACHE.read();
-            if let Some(stmt) = cache.get(sql) {
-                return Self::execute_parsed_multi(stmt.clone(), base_dir, default_table_path);
-            }
-        }
-        
         // Support multi-statement execution (e.g., CREATE VIEW; SELECT ...; DROP VIEW;)
         // Parse as multi-statement unconditionally to avoid relying on string heuristics.
         let stmts = SqlParser::parse_multi(sql)
-            .map_err(|e| err_input(e.to_string()))?;
+            .map_err(|e| err_input( e.to_string()))?;
 
         if stmts.len() > 1
             || matches!(stmts.first(), Some(SqlStatement::CreateView { .. } | SqlStatement::DropView { .. }))
@@ -499,20 +461,7 @@ impl ApexExecutor {
         let stmt = stmts
             .into_iter()
             .next()
-            .ok_or_else(|| err_input("No statement to execute"))?;
-
-        // Store in cache (evict if too many entries)
-        {
-            let mut cache = SQL_PARSE_CACHE.write();
-            if cache.len() >= 128 {
-                // Simple eviction: clear half the cache
-                let keys_to_remove: Vec<String> = cache.keys().take(64).cloned().collect();
-                for key in keys_to_remove {
-                    cache.remove(&key);
-                }
-            }
-            cache.insert(sql.to_string(), stmt.clone());
-        }
+            .ok_or_else(|| err_input( "No statement to execute"))?;
 
         Self::execute_parsed_multi(stmt, base_dir, default_table_path)
     }
