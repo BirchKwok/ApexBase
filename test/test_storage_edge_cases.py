@@ -599,7 +599,7 @@ class TestColumnOrderEdgeCases:
             client.close()
     
     def test_partial_columns_insert(self):
-        """Test inserting with partial columns"""
+        """Test inserting with partial columns - missing columns are NULL"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
             client.create_table("test")
@@ -608,19 +608,30 @@ class TestColumnOrderEdgeCases:
             # Insert full row
             client.store([{"a": 1, "b": 2, "c": 3}])
             
-            # Insert partial rows
-            client.store([{"a": 4, "c": 6}])  # missing b
-            client.store([{"b": 8}])  # missing a, c
+            # Insert partial rows - missing columns will be NULL
+            client.store([{"a": 4, "c": 6}])  # missing b -> b=NULL
+            client.store([{"b": 8}])  # missing a, c -> a=NULL, c=NULL
             
             client.flush()
             
-            result = client.execute("SELECT * FROM test ORDER BY a").to_dict()
+            # Use ORDER BY _id to get insertion order
+            result = client.execute("SELECT * FROM test ORDER BY _id").to_dict()
             assert len(result) == 3
             
-            # First row: complete
+            # First row: complete {a:1, b:2, c:3}
             assert result[0]["a"] == 1
             assert result[0]["b"] == 2
             assert result[0]["c"] == 3
+            
+            # Second row: partial {a:4, b:NULL, c:6}
+            assert result[1]["a"] == 4
+            assert result[1]["b"] is None  # NULL
+            assert result[1]["c"] == 6
+            
+            # Third row: partial {a:NULL, b:8, c:NULL}
+            assert result[2]["a"] is None  # NULL
+            assert result[2]["b"] == 8
+            assert result[2]["c"] is None  # NULL
             
             client.close()
 

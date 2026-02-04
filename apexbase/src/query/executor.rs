@@ -23,6 +23,12 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use once_cell::sync::Lazy;
 
+// SQL Parse Cache - caches parsed statements to avoid re-parsing repeated queries
+// Limited to 128 entries to prevent unbounded memory growth
+static SQL_PARSE_CACHE: Lazy<RwLock<AHashMap<String, SqlStatement>>> = Lazy::new(|| {
+    RwLock::new(AHashMap::with_capacity(128))
+});
+
 use crate::query::{SqlParser, SqlStatement, SelectStatement, SqlExpr, SelectColumn, JoinType, JoinClause, UnionStatement, AggregateFunc};
 use crate::query::sql_parser::BinaryOperator;
 use crate::query::sql_parser::FromItem;
@@ -289,58 +295,59 @@ impl ZoneMap {
 
 /// Invalidate the storage cache for a specific path
 /// CRITICAL: Must be called before any write operation to release mmap on Windows
+#[inline]
 pub fn invalidate_storage_cache(path: &Path) {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Use path directly - avoid expensive canonicalize (already absolute in most cases)
     let mut cache = STORAGE_CACHE.write();
-    cache.remove(&canonical);
+    cache.remove(path);
 }
 
 /// Invalidate all storage cache entries under a directory
 /// CRITICAL: Must be called when closing a client to release all mmaps on Windows
+#[inline]
 pub fn invalidate_storage_cache_dir(dir: &Path) {
-    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    // Use path directly - avoid expensive canonicalize
     let mut cache = STORAGE_CACHE.write();
-    cache.retain(|path, _| !path.starts_with(&canonical_dir));
+    cache.retain(|path, _| !path.starts_with(dir));
 }
 
 /// Get or open a cached storage backend
 /// Auto-compacts delta files before reading to ensure data consistency
+#[inline]
 fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Use path directly - avoid expensive canonicalize (already absolute)
+    let cache_key = path.to_path_buf();
     
-    // Check for delta file - if exists, compact before reading
+    // Get main file metadata (single syscall for existence + modified time)
+    let metadata = std::fs::metadata(path)?;
+    let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    
+    // Check for delta file - combine path construction with existence check
     let delta_path = {
-        let mut dp = canonical.clone();
+        let mut dp = cache_key.clone();
         let name = dp.file_name().unwrap_or_default().to_string_lossy();
         dp.set_file_name(format!("{}.delta", name));
         dp
     };
     
-    let has_delta = delta_path.exists();
-    
-    // Check file modification time (include delta file if exists)
-    let metadata = std::fs::metadata(path)?;
-    let mut modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    
-    if has_delta {
-        if let Ok(delta_meta) = std::fs::metadata(&delta_path) {
-            if let Ok(delta_modified) = delta_meta.modified() {
-                if delta_modified > modified {
-                    modified = delta_modified;
-                }
-            }
+    // Check delta metadata (also gets modified time if exists)
+    let (has_delta, effective_modified) = match std::fs::metadata(&delta_path) {
+        Ok(delta_meta) => {
+            let delta_modified = delta_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            (true, if delta_modified > modified { delta_modified } else { modified })
         }
-    }
+        Err(_) => (false, modified),
+    };
     
     // Try read from cache first (only if no delta file pending)
     if !has_delta {
         // Check cache and update access time if found
         let mut cache = STORAGE_CACHE.write();
-        if let Some((backend, cached_time, _)) = cache.get(&canonical) {
-            if *cached_time >= modified {
+        if let Some((backend, cached_time, _)) = cache.get(&cache_key) {
+            if *cached_time >= effective_modified {
                 let backend_clone = Arc::clone(backend);
                 // Update access time for LRU tracking
-                if let Some(entry) = cache.get_mut(&canonical) {
+                if let Some(entry) = cache.get_mut(&cache_key) {
                     entry.2 = std::time::Instant::now();
                 }
                 return Ok(backend_clone);
@@ -361,16 +368,18 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     // Open backend (now with compacted data)
     let backend = Arc::new(TableStorageBackend::open(path)?);
     
-    // Update cache with fresh modification time
-    let new_modified = std::fs::metadata(path)?
-        .modified()
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    // Use current time as modified (avoid extra metadata call after compaction)
+    let new_modified = if has_delta {
+        std::time::SystemTime::now() // Just compacted, use current time
+    } else {
+        effective_modified // No change, reuse
+    };
     
     {
         let mut cache = STORAGE_CACHE.write();
         // Evict LRU entries if cache is full
         evict_lru_cache_entries(&mut cache);
-        cache.insert(canonical, (Arc::clone(&backend), new_modified, std::time::Instant::now()));
+        cache.insert(cache_key, (Arc::clone(&backend), new_modified, std::time::Instant::now()));
     }
     
     Ok(backend)
@@ -435,19 +444,51 @@ impl ApexExecutor {
     }
     
     /// Execute a SQL query on V3 storage (single table)
+    /// Uses parse cache to avoid re-parsing repeated queries
     pub fn execute(sql: &str, storage_path: &Path) -> io::Result<ApexResult> {
+        // Check parse cache first
+        {
+            let cache = SQL_PARSE_CACHE.read();
+            if let Some(stmt) = cache.get(sql) {
+                return Self::execute_parsed(stmt.clone(), storage_path);
+            }
+        }
+        
+        // Parse and cache
         let stmt = SqlParser::parse(sql)
-            .map_err(|e| err_input( e.to_string()))?;
-
+            .map_err(|e| err_input(e.to_string()))?;
+        
+        // Store in cache (evict if too many entries)
+        {
+            let mut cache = SQL_PARSE_CACHE.write();
+            if cache.len() >= 128 {
+                // Simple eviction: clear half the cache
+                let keys_to_remove: Vec<String> = cache.keys().take(64).cloned().collect();
+                for key in keys_to_remove {
+                    cache.remove(&key);
+                }
+            }
+            cache.insert(sql.to_string(), stmt.clone());
+        }
+        
         Self::execute_parsed(stmt, storage_path)
     }
 
     /// Execute a SQL query with multi-table support (for JOINs)
+    /// Uses parse cache for single statements
     pub fn execute_with_base_dir(sql: &str, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+        // Check parse cache first
+        {
+            let cache = SQL_PARSE_CACHE.read();
+            if let Some(stmt) = cache.get(sql) {
+                return Self::execute_parsed_multi(stmt.clone(), base_dir, default_table_path);
+            }
+        }
+        
         // Support multi-statement execution (e.g., CREATE VIEW; SELECT ...; DROP VIEW;)
         // Parse as multi-statement unconditionally to avoid relying on string heuristics.
         let stmts = SqlParser::parse_multi(sql)
-            .map_err(|e| err_input( e.to_string()))?;
+            .map_err(|e| err_input(e.to_string()))?;
 
         if stmts.len() > 1
             || matches!(stmts.first(), Some(SqlStatement::CreateView { .. } | SqlStatement::DropView { .. }))
@@ -458,7 +499,20 @@ impl ApexExecutor {
         let stmt = stmts
             .into_iter()
             .next()
-            .ok_or_else(|| err_input( "No statement to execute"))?;
+            .ok_or_else(|| err_input("No statement to execute"))?;
+
+        // Store in cache (evict if too many entries)
+        {
+            let mut cache = SQL_PARSE_CACHE.write();
+            if cache.len() >= 128 {
+                // Simple eviction: clear half the cache
+                let keys_to_remove: Vec<String> = cache.keys().take(64).cloned().collect();
+                for key in keys_to_remove {
+                    cache.remove(&key);
+                }
+            }
+            cache.insert(sql.to_string(), stmt.clone());
+        }
 
         Self::execute_parsed_multi(stmt, base_dir, default_table_path)
     }
@@ -9072,8 +9126,9 @@ impl ApexExecutor {
             ));
         }
         
-        // Invalidate cache before write
+        // Invalidate all caches before write (executor + StorageEngine)
         invalidate_storage_cache(&table_path);
+        crate::storage::engine::engine().invalidate(&table_path);
         
         // Note: ALTER TABLE operations need to preserve existing data, so we use open_for_write
         // which loads all column data. For true schema-only operations (like TRUNCATE),
@@ -9094,8 +9149,9 @@ impl ApexExecutor {
         
         storage.save()?;
         
-        // Invalidate cache after write to ensure subsequent reads get fresh data
+        // Invalidate all caches after write to ensure subsequent reads get fresh data
         invalidate_storage_cache(&table_path);
+        crate::storage::engine::engine().invalidate(&table_path);
         
         Ok(ApexResult::Scalar(0))
     }

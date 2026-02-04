@@ -1,0 +1,784 @@
+//! StorageEngine - Unified storage interface
+//!
+//! This module provides a single entry point for all storage operations,
+//! handling complexity like caching, delta writes, and data merging internally.
+//!
+//! # Architecture
+//! ```text
+//! ┌─────────────────────────────────────────────┐
+//! │            Python Bindings                   │
+//! │  store() / retrieve() / execute() / ...     │
+//! └─────────────────┬───────────────────────────┘
+//!                   │ Simple API
+//!                   ▼
+//! ┌─────────────────────────────────────────────┐
+//! │           StorageEngine                      │
+//! │  - Unified cache management                  │
+//! │  - Automatic write routing (full/delta)     │
+//! │  - Automatic read merging (base+delta)      │
+//! └─────────────────┬───────────────────────────┘
+//!                   │
+//!                   ▼
+//! ┌─────────────────────────────────────────────┐
+//! │     Low-level storage (OnDemandStorage)     │
+//! └─────────────────────────────────────────────┘
+//! ```
+
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Instant, SystemTime};
+
+use ahash::AHashMap;
+use arrow::record_batch::RecordBatch;
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+
+use super::DurabilityLevel;
+use super::backend::TableStorageBackend;
+use crate::data::Value;
+use crate::query::ApexExecutor;
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+/// Maximum number of cached table backends
+const MAX_CACHE_ENTRIES: usize = 64;
+
+/// Delta file size threshold for auto-compaction (10MB)
+const DELTA_COMPACT_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Delta row count threshold for auto-compaction
+const DELTA_COMPACT_ROWS: usize = 100_000;
+
+// ============================================================================
+// Cache Entry
+// ============================================================================
+
+/// Cached table entry with metadata for LRU eviction
+struct CacheEntry {
+    /// The storage backend
+    backend: Arc<TableStorageBackend>,
+    /// File modification time when cached
+    modified_time: SystemTime,
+    /// Last access time for LRU eviction
+    last_access: Instant,
+    /// Whether there's a pending delta file
+    has_delta: bool,
+}
+
+/// Lightweight schema cache entry (for fast should_use_delta checks)
+struct SchemaCache {
+    /// Column names in schema order
+    columns: std::collections::HashSet<String>,
+    /// Row count (0 means empty table, use full write)
+    row_count: u64,
+    /// File modification time when cached
+    modified_time: SystemTime,
+}
+
+// ============================================================================
+// Global Engine Instance
+// ============================================================================
+
+/// Global storage engine instance (singleton pattern)
+static ENGINE: Lazy<StorageEngine> = Lazy::new(StorageEngine::new);
+
+// ============================================================================
+// StorageEngine
+// ============================================================================
+
+/// Unified storage engine that handles all read/write operations
+/// 
+/// # Features
+/// - **Unified caching**: Single cache for all table backends
+/// - **Automatic write routing**: Chooses full write or delta write based on conditions
+/// - **Automatic read merging**: Transparently merges base and delta data
+/// - **Simple API**: Hides all complexity from callers
+pub struct StorageEngine {
+    /// Unified cache for all table backends
+    cache: RwLock<AHashMap<PathBuf, CacheEntry>>,
+    /// Lightweight schema cache for fast should_use_delta checks
+    schema_cache: RwLock<AHashMap<PathBuf, SchemaCache>>,
+    /// Cache for insert-mode backends (for delta writes) - avoids repeated file I/O
+    insert_cache: RwLock<AHashMap<PathBuf, Arc<TableStorageBackend>>>,
+}
+
+impl StorageEngine {
+    /// Create a new storage engine
+    fn new() -> Self {
+        Self {
+            cache: RwLock::new(AHashMap::with_capacity(MAX_CACHE_ENTRIES)),
+            schema_cache: RwLock::new(AHashMap::with_capacity(MAX_CACHE_ENTRIES * 2)),
+            insert_cache: RwLock::new(AHashMap::with_capacity(MAX_CACHE_ENTRIES)),
+        }
+    }
+    
+    /// Get the global engine instance
+    pub fn global() -> &'static StorageEngine {
+        &ENGINE
+    }
+    
+    // ========================================================================
+    // Cache Management
+    // ========================================================================
+    
+    /// Evict least recently used entries if cache is full
+    fn evict_lru_if_needed(cache: &mut AHashMap<PathBuf, CacheEntry>) {
+        while cache.len() >= MAX_CACHE_ENTRIES {
+            // Find LRU entry
+            let lru_key = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(k, _)| k.clone());
+            
+            if let Some(key) = lru_key {
+                cache.remove(&key);
+            } else {
+                break;
+            }
+        }
+    }
+    
+    /// Check if delta file exists for a table
+    fn has_delta_file(table_path: &Path) -> bool {
+        let delta_path = Self::delta_path(table_path);
+        delta_path.exists()
+    }
+    
+    /// Get delta file path for a table
+    fn delta_path(table_path: &Path) -> PathBuf {
+        let mut delta = table_path.to_path_buf();
+        let name = delta.file_name().unwrap_or_default().to_string_lossy();
+        delta.set_file_name(format!("{}.delta", name));
+        delta
+    }
+    
+    /// Get file modification time
+    fn get_modified_time(path: &Path) -> SystemTime {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+    
+    /// Invalidate cache for a specific table
+    pub fn invalidate(&self, table_path: &Path) {
+        // Use path directly without canonicalize for speed (already absolute in most cases)
+        self.cache.write().remove(table_path);
+        self.schema_cache.write().remove(table_path);
+        self.insert_cache.write().remove(table_path);
+        
+        // Also invalidate executor cache
+        ApexExecutor::invalidate_cache_for_path(table_path);
+    }
+    
+    /// Invalidate all caches under a directory
+    pub fn invalidate_dir(&self, dir: &Path) {
+        // Use path directly without canonicalize for speed
+        self.cache.write().retain(|path, _| !path.starts_with(dir));
+        self.schema_cache.write().retain(|path, _| !path.starts_with(dir));
+        self.insert_cache.write().retain(|path, _| !path.starts_with(dir));
+        
+        // Also invalidate executor cache
+        ApexExecutor::invalidate_cache_for_dir(dir);
+    }
+    
+    // ========================================================================
+    // Backend Access
+    // ========================================================================
+    
+    /// Get or create a backend for writing (loads existing data)
+    /// 
+    /// This method:
+    /// 1. Checks cache for existing backend
+    /// 2. If cached and fresh, returns it
+    /// 3. If delta exists, compacts it first
+    /// 4. Opens fresh backend and caches it
+    pub fn get_write_backend(
+        &self,
+        table_path: &Path,
+        durability: DurabilityLevel,
+    ) -> io::Result<Arc<TableStorageBackend>> {
+        // Use path directly - avoid expensive canonicalize
+        let cache_key = table_path.to_path_buf();
+        let has_delta = Self::has_delta_file(table_path);
+        let modified = Self::get_modified_time(table_path);
+        
+        // Check cache first (only if no delta pending)
+        if !has_delta {
+            let mut cache = self.cache.write();
+            if let Some(entry) = cache.get_mut(&cache_key) {
+                if entry.modified_time >= modified && !entry.has_delta {
+                    entry.last_access = Instant::now();
+                    return Ok(entry.backend.clone());
+                }
+            }
+        }
+        
+        // If delta exists, compact it first
+        if has_delta {
+            let storage = TableStorageBackend::open_for_write(table_path)?;
+            storage.compact()?;
+            // Invalidate after compaction
+            self.cache.write().remove(&cache_key);
+            self.schema_cache.write().remove(&cache_key);
+        }
+        
+        // Open fresh backend
+        let backend = if table_path.exists() {
+            TableStorageBackend::open_for_write_with_durability(table_path, durability)?
+        } else {
+            TableStorageBackend::create_with_durability(table_path, durability)?
+        };
+        
+        let backend = Arc::new(backend);
+        let new_modified = Self::get_modified_time(table_path);
+        
+        // Cache the backend and update schema cache
+        {
+            let mut cache = self.cache.write();
+            Self::evict_lru_if_needed(&mut cache);
+            cache.insert(cache_key.clone(), CacheEntry {
+                backend: backend.clone(),
+                modified_time: new_modified,
+                last_access: Instant::now(),
+                has_delta: false,
+            });
+        }
+        
+        // Update schema cache
+        {
+            let schema_cols: std::collections::HashSet<String> = backend.get_schema()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            let row_count = backend.row_count();
+            let mut schema_cache = self.schema_cache.write();
+            schema_cache.insert(cache_key, SchemaCache {
+                columns: schema_cols,
+                row_count,
+                modified_time: new_modified,
+            });
+        }
+        
+        Ok(backend)
+    }
+    
+    /// Get backend for read-only operations (may use cached version)
+    pub fn get_read_backend(&self, table_path: &Path) -> io::Result<Arc<TableStorageBackend>> {
+        // Use path directly - avoid expensive canonicalize
+        let cache_key = table_path.to_path_buf();
+        let has_delta = Self::has_delta_file(table_path);
+        let modified = Self::get_modified_time(table_path);
+        
+        // If delta exists, compact first for consistent reads
+        if has_delta {
+            let storage = TableStorageBackend::open_for_write(table_path)?;
+            storage.compact()?;
+            self.cache.write().remove(&cache_key);
+            self.schema_cache.write().remove(&cache_key);
+        }
+        
+        // Check cache
+        {
+            let mut cache = self.cache.write();
+            if let Some(entry) = cache.get_mut(&cache_key) {
+                if entry.modified_time >= modified {
+                    entry.last_access = Instant::now();
+                    return Ok(entry.backend.clone());
+                }
+            }
+        }
+        
+        // Open fresh backend (read-only mode)
+        let backend = Arc::new(TableStorageBackend::open(table_path)?);
+        let new_modified = Self::get_modified_time(table_path);
+        
+        // Cache it
+        {
+            let mut cache = self.cache.write();
+            Self::evict_lru_if_needed(&mut cache);
+            cache.insert(cache_key.clone(), CacheEntry {
+                backend: backend.clone(),
+                modified_time: new_modified,
+                last_access: Instant::now(),
+                has_delta: false,
+            });
+        }
+        
+        // Update schema cache
+        {
+            let schema_cols: std::collections::HashSet<String> = backend.get_schema()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            let row_count = backend.row_count();
+            let mut schema_cache = self.schema_cache.write();
+            schema_cache.insert(cache_key, SchemaCache {
+                columns: schema_cols,
+                row_count,
+                modified_time: new_modified,
+            });
+        }
+        
+        Ok(backend)
+    }
+    
+    /// Get or create a cached insert backend (for delta writes)
+    /// This avoids repeated file I/O when doing many small writes
+    fn get_insert_backend(
+        &self,
+        table_path: &Path,
+        durability: DurabilityLevel,
+    ) -> io::Result<Arc<TableStorageBackend>> {
+        let cache_key = table_path.to_path_buf();
+        
+        // Check insert cache first
+        {
+            let cache = self.insert_cache.read();
+            if let Some(backend) = cache.get(&cache_key) {
+                return Ok(backend.clone());
+            }
+        }
+        
+        // Open new insert backend
+        let backend = Arc::new(TableStorageBackend::open_for_insert_with_durability(table_path, durability)?);
+        
+        // Cache it
+        {
+            let mut cache = self.insert_cache.write();
+            // Evict if too many entries
+            if cache.len() >= MAX_CACHE_ENTRIES {
+                if let Some(key) = cache.keys().next().cloned() {
+                    cache.remove(&key);
+                }
+            }
+            cache.insert(cache_key, backend.clone());
+        }
+        
+        Ok(backend)
+    }
+    
+    // ========================================================================
+    // Write Operations
+    // ========================================================================
+    
+    /// Write rows to a table with smart routing
+    /// 
+    /// Automatically chooses the optimal write strategy:
+    /// - **Delta write**: When table exists with data AND columns match exactly
+    /// - **Full write**: For new tables, schema evolution, or partial columns
+    pub fn write(
+        &self,
+        table_path: &Path,
+        rows: &[HashMap<String, Value>],
+        durability: DurabilityLevel,
+    ) -> io::Result<Vec<u64>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // Determine write strategy
+        let use_delta = self.should_use_delta(table_path, rows);
+        
+        let ids = if use_delta {
+            // Delta write: memory efficient, schema unchanged
+            // Use cached insert backend to avoid repeated file I/O
+            let backend = self.get_insert_backend(table_path, durability)?;
+            let ids = backend.insert_rows_to_delta(rows)?;
+            
+            // For delta writes, only invalidate backend cache (not schema cache)
+            // Schema doesn't change, so schema cache remains valid
+            self.cache.write().remove(table_path);
+            ApexExecutor::invalidate_cache_for_path(table_path);
+            
+            ids
+        } else {
+            // Full write: for new tables, schema evolution, or partial columns
+            let backend = self.get_write_backend(table_path, durability)?;
+            let ids = backend.insert_rows(rows)?;
+            backend.save()?;
+            
+            // Full invalidation for schema changes
+            self.invalidate(table_path);
+            
+            ids
+        };
+        
+        Ok(ids)
+    }
+    
+    /// Determine if delta write should be used
+    /// 
+    /// OPTIMIZED: Uses schema cache to avoid opening backend for every write
+    /// Single metadata() call instead of exists() + metadata() + modified()
+    #[inline]
+    fn should_use_delta(&self, table_path: &Path, rows: &[HashMap<String, Value>]) -> bool {
+        if rows.is_empty() {
+            return false;
+        }
+        
+        // Single metadata call for existence, size, and modified time
+        let meta = match std::fs::metadata(table_path) {
+            Ok(m) => m,
+            Err(_) => return false, // File doesn't exist
+        };
+        
+        // Fast path: check file size (empty files should use full write)
+        if meta.len() < 256 { // Header is 256 bytes, so smaller means empty/invalid
+            return false;
+        }
+        
+        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let cache_key = table_path.to_path_buf();
+        
+        // Try to use schema cache first (FAST PATH)
+        {
+            let schema_cache = self.schema_cache.read();
+            if let Some(cached) = schema_cache.get(&cache_key) {
+                if cached.modified_time >= modified && cached.row_count > 0 {
+                    // Use cached schema for comparison
+                    return rows.iter().all(|row| {
+                        let data_cols: std::collections::HashSet<_> = row.keys().cloned().collect();
+                        cached.columns == data_cols
+                    });
+                }
+            }
+        }
+        
+        // Cache miss - need to open backend (SLOW PATH)
+        let backend = match TableStorageBackend::open(table_path) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        
+        let row_count = backend.row_count();
+        if row_count == 0 {
+            return false;
+        }
+        
+        // Get schema columns
+        let schema_cols: std::collections::HashSet<_> = backend.get_schema()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        
+        // Update schema cache for future calls
+        {
+            let mut schema_cache = self.schema_cache.write();
+            schema_cache.insert(cache_key, SchemaCache {
+                columns: schema_cols.clone(),
+                row_count,
+                modified_time: modified,
+            });
+        }
+        
+        // All rows must have exact same columns as schema (no new, no missing)
+        rows.iter().all(|row| {
+            let data_cols: std::collections::HashSet<_> = row.keys().cloned().collect();
+            schema_cols == data_cols
+        })
+    }
+    
+    /// Write a single row to a table
+    pub fn write_one(
+        &self,
+        table_path: &Path,
+        row: HashMap<String, Value>,
+        durability: DurabilityLevel,
+    ) -> io::Result<u64> {
+        let ids = self.write(table_path, &[row], durability)?;
+        Ok(ids.into_iter().next().unwrap_or(0))
+    }
+    
+    // ========================================================================
+    // Read Operations
+    // ========================================================================
+    
+    /// Execute a SQL query and return results
+    /// 
+    /// This method automatically:
+    /// 1. Compacts delta files if needed
+    /// 2. Executes the query
+    /// 
+    /// # Arguments
+    /// * `sql` - SQL query string
+    /// * `base_dir` - Base directory for table resolution
+    /// * `default_table_path` - Default table path for unqualified table names
+    pub fn query(
+        &self,
+        sql: &str,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<RecordBatch> {
+        // Compact delta if exists
+        if Self::has_delta_file(default_table_path) {
+            let storage = TableStorageBackend::open_for_write(default_table_path)?;
+            storage.compact()?;
+            self.invalidate(default_table_path);
+        }
+        
+        // Execute query
+        let result = ApexExecutor::execute_with_base_dir(sql, base_dir, default_table_path)?;
+        result.to_record_batch()
+    }
+    
+    /// Check if a record with given ID exists
+    pub fn exists(&self, table_path: &Path, id: u64) -> io::Result<bool> {
+        let backend = self.get_read_backend(table_path)?;
+        Ok(backend.exists(id))
+    }
+    
+    /// Get row count for a table
+    pub fn row_count(&self, table_path: &Path) -> io::Result<u64> {
+        let backend = self.get_read_backend(table_path)?;
+        Ok(backend.row_count())
+    }
+    
+    /// Retrieve a single record by ID
+    pub fn retrieve(
+        &self,
+        table_path: &Path,
+        base_dir: &Path,
+        table_name: &str,
+        id: u64,
+    ) -> io::Result<Option<RecordBatch>> {
+        // Use SQL query which handles delta merging
+        let sql = format!("SELECT * FROM \"{}\" WHERE _id = {}", table_name, id);
+        let batch = self.query(&sql, base_dir, table_path)?;
+        
+        if batch.num_rows() == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(batch))
+        }
+    }
+    
+    // ========================================================================
+    // Delete Operations
+    // ========================================================================
+    
+    /// Delete records matching a filter
+    pub fn delete(
+        &self,
+        table_path: &Path,
+        ids: &[u64],
+        durability: DurabilityLevel,
+    ) -> io::Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        
+        // Invalidate before delete
+        self.invalidate(table_path);
+        
+        let backend = self.get_write_backend(table_path, durability)?;
+        
+        let mut deleted = 0;
+        for &id in ids {
+            if backend.delete(id) {
+                deleted += 1;
+            }
+        }
+        
+        backend.save()?;
+        
+        // Invalidate after delete
+        self.invalidate(table_path);
+        
+        Ok(deleted)
+    }
+    
+    // ========================================================================
+    // Schema Operations
+    // ========================================================================
+    
+    /// Get schema for a table
+    pub fn get_schema(&self, table_path: &Path) -> io::Result<Vec<(String, crate::data::DataType)>> {
+        let backend = self.get_read_backend(table_path)?;
+        Ok(backend.get_schema())
+    }
+    
+    /// Create a new table
+    pub fn create_table(
+        &self,
+        table_path: &Path,
+        durability: DurabilityLevel,
+    ) -> io::Result<()> {
+        let _backend = TableStorageBackend::create_with_durability(table_path, durability)?;
+        Ok(())
+    }
+    
+    /// Delete a single record by ID
+    pub fn delete_one(
+        &self,
+        table_path: &Path,
+        id: u64,
+        durability: DurabilityLevel,
+    ) -> io::Result<bool> {
+        self.invalidate(table_path);
+        let backend = self.get_write_backend(table_path, durability)?;
+        let result = backend.delete(id);
+        backend.save()?;
+        self.invalidate(table_path);
+        Ok(result)
+    }
+    
+    /// Replace a record by ID
+    pub fn replace(
+        &self,
+        table_path: &Path,
+        id: u64,
+        fields: &HashMap<String, Value>,
+        durability: DurabilityLevel,
+    ) -> io::Result<bool> {
+        self.invalidate(table_path);
+        let backend = self.get_write_backend(table_path, durability)?;
+        let result = backend.replace(id, fields)?;
+        backend.save()?;
+        self.invalidate(table_path);
+        Ok(result)
+    }
+    
+    /// Get active row count (excluding deleted)
+    pub fn active_row_count(&self, table_path: &Path) -> io::Result<u64> {
+        let backend = self.get_read_backend(table_path)?;
+        Ok(backend.active_row_count())
+    }
+    
+    // ========================================================================
+    // Schema Modification Operations
+    // ========================================================================
+    
+    /// Add a column to the table
+    pub fn add_column(
+        &self,
+        table_path: &Path,
+        column_name: &str,
+        dtype: crate::data::DataType,
+        durability: DurabilityLevel,
+    ) -> io::Result<()> {
+        self.invalidate(table_path);
+        let backend = self.get_write_backend(table_path, durability)?;
+        backend.add_column(column_name, dtype)?;
+        backend.save()?;
+        self.invalidate(table_path);
+        Ok(())
+    }
+    
+    /// Drop a column from the table
+    pub fn drop_column(
+        &self,
+        table_path: &Path,
+        column_name: &str,
+        durability: DurabilityLevel,
+    ) -> io::Result<()> {
+        self.invalidate(table_path);
+        let backend = self.get_write_backend(table_path, durability)?;
+        backend.drop_column(column_name)?;
+        backend.save()?;
+        self.invalidate(table_path);
+        Ok(())
+    }
+    
+    /// Rename a column
+    pub fn rename_column(
+        &self,
+        table_path: &Path,
+        old_name: &str,
+        new_name: &str,
+        durability: DurabilityLevel,
+    ) -> io::Result<()> {
+        self.invalidate(table_path);
+        let backend = self.get_write_backend(table_path, durability)?;
+        backend.rename_column(old_name, new_name)?;
+        backend.save()?;
+        self.invalidate(table_path);
+        Ok(())
+    }
+    
+    /// List all columns
+    pub fn list_columns(&self, table_path: &Path) -> io::Result<Vec<String>> {
+        let backend = self.get_read_backend(table_path)?;
+        Ok(backend.list_columns())
+    }
+    
+    /// Get column type
+    pub fn get_column_type(&self, table_path: &Path, column_name: &str) -> io::Result<Option<crate::data::DataType>> {
+        let backend = self.get_read_backend(table_path)?;
+        Ok(backend.get_column_type(column_name))
+    }
+    
+    /// Write typed columns (for store_columnar)
+    pub fn write_typed(
+        &self,
+        table_path: &Path,
+        int_columns: HashMap<String, Vec<i64>>,
+        float_columns: HashMap<String, Vec<f64>>,
+        string_columns: HashMap<String, Vec<String>>,
+        binary_columns: HashMap<String, Vec<Vec<u8>>>,
+        bool_columns: HashMap<String, Vec<bool>>,
+        null_positions: HashMap<String, Vec<bool>>,
+        durability: DurabilityLevel,
+    ) -> io::Result<Vec<u64>> {
+        self.invalidate(table_path);
+        let backend = self.get_write_backend(table_path, durability)?;
+        let ids = backend.insert_typed_with_nulls(
+            int_columns,
+            float_columns,
+            string_columns,
+            binary_columns,
+            bool_columns,
+            null_positions,
+        )?;
+        backend.save()?;
+        self.invalidate(table_path);
+        Ok(ids)
+    }
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+/// Get the global storage engine
+pub fn engine() -> &'static StorageEngine {
+    StorageEngine::global()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    
+    #[test]
+    fn test_engine_write_read() {
+        let dir = tempdir().unwrap();
+        let table_path = dir.path().join("test.apex");
+        
+        let engine = StorageEngine::global();
+        
+        // Write some rows
+        let mut row1 = HashMap::new();
+        row1.insert("name".to_string(), Value::String("Alice".to_string()));
+        row1.insert("age".to_string(), Value::Int64(30));
+        
+        let mut row2 = HashMap::new();
+        row2.insert("name".to_string(), Value::String("Bob".to_string()));
+        row2.insert("age".to_string(), Value::Int64(25));
+        
+        let ids = engine.write(&table_path, &[row1, row2], DurabilityLevel::Fast).unwrap();
+        assert_eq!(ids.len(), 2);
+        
+        // Check row count
+        let count = engine.row_count(&table_path).unwrap();
+        assert_eq!(count, 2);
+        
+        // Check exists
+        assert!(engine.exists(&table_path, 0).unwrap());
+        assert!(engine.exists(&table_path, 1).unwrap());
+        assert!(!engine.exists(&table_path, 999).unwrap());
+    }
+}

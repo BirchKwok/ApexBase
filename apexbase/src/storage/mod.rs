@@ -10,6 +10,7 @@ pub mod on_demand;
 pub mod backend;
 pub mod incremental;
 pub mod bloom;
+pub mod engine;
 
 // ============================================================================
 // Durability Level - Controls fsync behavior for ACID guarantees
@@ -103,6 +104,9 @@ pub use bloom::{
     BLOOM_ROW_GROUP_SIZE,
     BLOOM_FP_RATE,
 };
+
+// Re-export storage engine
+pub use engine::{StorageEngine, engine};
 
 // Type alias for backward compatibility
 pub type ColumnarStorage = OnDemandStorage;

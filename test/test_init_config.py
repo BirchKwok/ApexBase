@@ -540,12 +540,11 @@ class TestDurabilityExceptionScenarios:
             
             assert client.count_rows() == 2
             
-            # Verify data integrity
-            result0 = client.retrieve(0)
-            assert result0["status"] == "before_error"
-            
-            result1 = client.retrieve(1)
-            assert result1["status"] == "after_error"
+            # Verify data integrity using execute (handles both base and delta data)
+            results = client.execute("SELECT * FROM default ORDER BY _id").to_dict()
+            assert len(results) == 2
+            assert results[0]["status"] == "before_error"
+            assert results[1]["status"] == "after_error"
             
             client.close()
             
