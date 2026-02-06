@@ -884,6 +884,22 @@ impl TableStorageBackend {
     // True On-Demand Column Projection APIs
     // ========================================================================
 
+    /// Read columns to Arrow with dictionary encoding for low-cardinality string columns.
+    /// Use this for GROUP BY queries where DictionaryArray accelerates aggregation.
+    pub fn read_columns_to_arrow_dict(
+        &self,
+        column_names: Option<&[&str]>,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        if let Ok(batch) = self.storage.to_arrow_batch_dict(column_names,
+            column_names.map(|c| c.contains(&"_id")).unwrap_or(true)) {
+            if batch.num_rows() > 0 || batch.num_columns() > 0 {
+                return Ok(batch);
+            }
+        }
+        // Fallback to normal path
+        self.read_columns_to_arrow(column_names, 0, None)
+    }
+
     /// Read specific columns directly to Arrow RecordBatch (TRUE on-demand read)
     /// 
     /// This method bypasses ColumnTable and reads only the requested columns
@@ -910,6 +926,17 @@ impl TableStorageBackend {
 
         // For full column reads (start_row=0, row_count=None), check cache first
         let use_cache = start_row == 0 && row_count.is_none();
+        
+        // OPTIMIZATION: V4 fast path — build Arrow directly from in-memory columns
+        // Bypasses read_columns→HashMap→get_null_mask→Vec<bool> pipeline entirely
+        if use_cache {
+            if let Ok(batch) = self.storage.to_arrow_batch(column_names, 
+                column_names.map(|c| c.contains(&"_id")).unwrap_or(true)) {
+                if batch.num_rows() > 0 || batch.num_columns() > 0 {
+                    return Ok(batch);
+                }
+            }
+        }
         
         // Handle SELECT _id ONLY case FIRST (before reading columns)
         if let Some(cols) = column_names {

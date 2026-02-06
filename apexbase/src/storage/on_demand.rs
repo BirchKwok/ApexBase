@@ -507,16 +507,18 @@ impl ColumnData {
     }
 
     /// Batch extend bools
+    /// OPTIMIZATION: pre-allocate all needed bytes upfront, skip branch on data.len()
     #[inline]
     pub fn extend_bools(&mut self, values: &[bool]) {
         if let ColumnData::Bool { data, len } = self {
+            if values.is_empty() { return; }
+            let new_len = *len + values.len();
+            let needed_bytes = (new_len + 7) / 8;
+            data.resize(needed_bytes, 0);
             for &value in values {
-                let byte_idx = *len / 8;
-                let bit_idx = *len % 8;
-                if byte_idx >= data.len() {
-                    data.push(0);
-                }
                 if value {
+                    let byte_idx = *len / 8;
+                    let bit_idx = *len % 8;
                     data[byte_idx] |= 1 << bit_idx;
                 }
                 *len += 1;
@@ -529,9 +531,16 @@ impl ColumnData {
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             ColumnData::Bool { data, len } => {
-                let mut buf = Vec::with_capacity(8 + data.len());
+                // Write exactly (len + 7) / 8 bytes — data.len() may exceed this
+                // from push_bool's incremental Vec growth
+                let byte_len = (*len + 7) / 8;
+                let mut buf = Vec::with_capacity(8 + byte_len);
                 buf.extend_from_slice(&(*len as u64).to_le_bytes());
-                buf.extend_from_slice(data);
+                buf.extend_from_slice(&data[..byte_len.min(data.len())]);
+                // Pad if data is shorter than expected (shouldn't happen normally)
+                if data.len() < byte_len {
+                    buf.resize(8 + byte_len, 0);
+                }
                 buf
             }
             ColumnData::Int64(v) => {
@@ -594,6 +603,64 @@ impl ColumnData {
                 buf
             }
         }
+    }
+
+    /// Write serialized bytes directly to a writer, avoiding intermediate Vec<u8> allocation.
+    /// Produces the same byte format as to_bytes().
+    /// For large columns, this avoids allocating a temporary buffer (e.g., 80MB for 10M i64 rows).
+    #[inline]
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        match self {
+            ColumnData::Bool { data, len } => {
+                let byte_len = (*len + 7) / 8;
+                writer.write_all(&(*len as u64).to_le_bytes())?;
+                writer.write_all(&data[..byte_len.min(data.len())])?;
+                // Pad if data is shorter than expected
+                if data.len() < byte_len {
+                    let pad = byte_len - data.len();
+                    writer.write_all(&vec![0u8; pad])?;
+                }
+            }
+            ColumnData::Int64(v) => {
+                writer.write_all(&(v.len() as u64).to_le_bytes())?;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8)
+                };
+                writer.write_all(bytes)?;
+            }
+            ColumnData::Float64(v) => {
+                writer.write_all(&(v.len() as u64).to_le_bytes())?;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8)
+                };
+                writer.write_all(bytes)?;
+            }
+            ColumnData::String { offsets, data } | ColumnData::Binary { offsets, data } => {
+                let count = offsets.len().saturating_sub(1);
+                writer.write_all(&(count as u64).to_le_bytes())?;
+                let offset_bytes = unsafe {
+                    std::slice::from_raw_parts(offsets.as_ptr() as *const u8, offsets.len() * 4)
+                };
+                writer.write_all(offset_bytes)?;
+                writer.write_all(&(data.len() as u64).to_le_bytes())?;
+                writer.write_all(data)?;
+            }
+            ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                writer.write_all(&(indices.len() as u64).to_le_bytes())?;
+                writer.write_all(&(dict_offsets.len() as u64).to_le_bytes())?;
+                let indices_bytes = unsafe {
+                    std::slice::from_raw_parts(indices.as_ptr() as *const u8, indices.len() * 4)
+                };
+                writer.write_all(indices_bytes)?;
+                let offsets_bytes = unsafe {
+                    std::slice::from_raw_parts(dict_offsets.as_ptr() as *const u8, dict_offsets.len() * 4)
+                };
+                writer.write_all(offsets_bytes)?;
+                writer.write_all(&(dict_data.len() as u64).to_le_bytes())?;
+                writer.write_all(dict_data)?;
+            }
+        }
+        Ok(())
     }
 
     /// Deserialize from to_bytes() output, given the known column type.
@@ -754,25 +821,36 @@ impl ColumnData {
         }
     }
     
-    /// Append another column's data to this column
+    /// Append another column's data to this column.
+    /// OPTIMIZATION: bulk copy for byte-aligned Bool, pre-allocated offsets for String/Binary.
     pub fn append(&mut self, other: &Self) {
         match (self, other) {
             (ColumnData::Bool { data, len }, ColumnData::Bool { data: other_data, len: other_len }) => {
-                // Append bits from other
-                for i in 0..*other_len {
-                    let byte_idx = i / 8;
-                    let bit_idx = i % 8;
-                    let val = byte_idx < other_data.len() && (other_data[byte_idx] >> bit_idx) & 1 == 1;
-                    
-                    let new_byte = *len / 8;
-                    let new_bit = *len % 8;
-                    if new_byte >= data.len() {
-                        data.push(0);
+                if *other_len == 0 { return; }
+                // OPTIMIZATION: byte-aligned → bulk copy
+                if *len % 8 == 0 {
+                    let other_byte_len = (*other_len + 7) / 8;
+                    let copy_len = other_byte_len.min(other_data.len());
+                    data.extend_from_slice(&other_data[..copy_len]);
+                    if copy_len < other_byte_len {
+                        data.resize(data.len() + (other_byte_len - copy_len), 0);
                     }
-                    if val {
-                        data[new_byte] |= 1 << new_bit;
+                    *len += *other_len;
+                } else {
+                    for i in 0..*other_len {
+                        let byte_idx = i / 8;
+                        let bit_idx = i % 8;
+                        let val = byte_idx < other_data.len() && (other_data[byte_idx] >> bit_idx) & 1 == 1;
+                        let new_byte = *len / 8;
+                        let new_bit = *len % 8;
+                        if new_byte >= data.len() {
+                            data.push(0);
+                        }
+                        if val {
+                            data[new_byte] |= 1 << new_bit;
+                        }
+                        *len += 1;
                     }
-                    *len += 1;
                 }
             }
             (ColumnData::Int64(v), ColumnData::Int64(other_v)) => {
@@ -784,6 +862,8 @@ impl ColumnData {
             (ColumnData::String { offsets, data }, ColumnData::String { offsets: other_offsets, data: other_data }) |
             (ColumnData::Binary { offsets, data }, ColumnData::Binary { offsets: other_offsets, data: other_data }) => {
                 let base_offset = *offsets.last().unwrap_or(&0);
+                // OPTIMIZATION: pre-allocate and batch push
+                offsets.reserve(other_offsets.len() - 1);
                 for i in 1..other_offsets.len() {
                     offsets.push(base_offset + other_offsets[i]);
                 }
@@ -791,16 +871,15 @@ impl ColumnData {
             }
             (ColumnData::StringDict { indices, dict_offsets, dict_data },
              ColumnData::StringDict { indices: other_indices, dict_offsets: other_offsets, dict_data: other_data }) => {
-                // Merge dictionaries: remap other's indices to point into merged dict
                 let existing_dict_size = dict_offsets.len();
-                // Append other's dictionary entries
                 let base = *dict_offsets.last().unwrap_or(&0);
+                dict_offsets.reserve(other_offsets.len() - 1);
                 for i in 1..other_offsets.len() {
                     dict_offsets.push(base + other_offsets[i]);
                 }
                 dict_data.extend_from_slice(other_data);
-                // Remap and append indices
                 let offset = if existing_dict_size > 0 { existing_dict_size as u32 - 1 } else { 0 };
+                indices.reserve(other_indices.len());
                 for &idx in other_indices {
                     indices.push(idx + offset);
                 }
@@ -809,39 +888,48 @@ impl ColumnData {
         }
     }
 
-    /// Filter column data to only include rows at specified indices
+    /// Filter column data to only include rows at specified indices.
+    /// OPTIMIZATION: uses pre-allocation and unchecked indexing for hot paths.
     pub fn filter_by_indices(&self, indices: &[usize]) -> Self {
         match self {
             ColumnData::Bool { data, len } => {
-                let mut new_data = Vec::new();
-                let mut new_len = 0usize;
-                for &idx in indices {
+                let new_len = indices.len();
+                let mut new_data = vec![0u8; (new_len + 7) / 8];
+                for (new_idx, &idx) in indices.iter().enumerate() {
                     if idx < *len {
                         let old_byte = idx / 8;
                         let old_bit = idx % 8;
-                        let val = old_byte < data.len() && (data[old_byte] >> old_bit) & 1 == 1;
-                        let new_byte = new_len / 8;
-                        let new_bit = new_len % 8;
-                        if new_byte >= new_data.len() {
-                            new_data.push(0);
+                        if old_byte < data.len() && (data[old_byte] >> old_bit) & 1 == 1 {
+                            new_data[new_idx / 8] |= 1 << (new_idx % 8);
                         }
-                        if val {
-                            new_data[new_byte] |= 1 << new_bit;
-                        }
-                        new_len += 1;
                     }
                 }
                 ColumnData::Bool { data: new_data, len: new_len }
             }
             ColumnData::Int64(v) => {
-                ColumnData::Int64(indices.iter().filter_map(|&i| v.get(i).copied()).collect())
+                // OPTIMIZATION: pre-allocate exact size, use unchecked indexing
+                let mut result = Vec::with_capacity(indices.len());
+                for &i in indices {
+                    // Safety: caller guarantees indices are in-range (built from 0..ids.len())
+                    result.push(if i < v.len() { unsafe { *v.get_unchecked(i) } } else { 0 });
+                }
+                ColumnData::Int64(result)
             }
             ColumnData::Float64(v) => {
-                ColumnData::Float64(indices.iter().filter_map(|&i| v.get(i).copied()).collect())
+                let mut result = Vec::with_capacity(indices.len());
+                for &i in indices {
+                    result.push(if i < v.len() { unsafe { *v.get_unchecked(i) } } else { 0.0 });
+                }
+                ColumnData::Float64(result)
             }
             ColumnData::String { offsets, data } | ColumnData::Binary { offsets, data } => {
-                let mut new_offsets = vec![0u32];
-                let mut new_data = Vec::new();
+                let mut new_offsets = Vec::with_capacity(indices.len() + 1);
+                new_offsets.push(0u32);
+                // Estimate average string length for pre-allocation
+                let avg_len = if offsets.len() > 1 {
+                    data.len() / (offsets.len() - 1)
+                } else { 0 };
+                let mut new_data = Vec::with_capacity(indices.len() * avg_len);
                 for &idx in indices {
                     if idx + 1 < offsets.len() {
                         let start = offsets[idx] as usize;
@@ -858,9 +946,12 @@ impl ColumnData {
             }
             ColumnData::StringDict { indices: row_indices, dict_offsets, dict_data } => {
                 // Just filter the indices array, dictionary stays the same
-                let new_indices: Vec<u32> = indices.iter()
-                    .filter_map(|&i| row_indices.get(i).copied())
-                    .collect();
+                let mut new_indices = Vec::with_capacity(indices.len());
+                for &i in indices {
+                    if i < row_indices.len() {
+                        new_indices.push(unsafe { *row_indices.get_unchecked(i) });
+                    }
+                }
                 ColumnData::StringDict { 
                     indices: new_indices, 
                     dict_offsets: dict_offsets.clone(), 
@@ -1551,7 +1642,8 @@ pub struct OnDemandStorage {
     deleted: RwLock<Vec<u8>>,
     /// ID to row index mapping for fast lookups (lazy-loaded)
     /// Only built when needed for delete/exists operations
-    id_to_idx: RwLock<Option<HashMap<u64, usize>>>,
+    /// Uses AHashMap for faster hash computation on u64 keys
+    id_to_idx: RwLock<Option<ahash::AHashMap<u64, usize>>>,
     /// Cached count of active (non-deleted) rows for O(1) COUNT(*)
     active_count: AtomicU64,
     /// Durability level for controlling fsync behavior
@@ -1599,7 +1691,7 @@ impl OnDemandStorage {
             next_id: AtomicU64::new(0),
             nulls: RwLock::new(Vec::new()),
             deleted: RwLock::new(Vec::new()),
-            id_to_idx: RwLock::new(Some(HashMap::new())),
+            id_to_idx: RwLock::new(Some(ahash::AHashMap::new())),
             active_count: AtomicU64::new(0),
             durability,
             wal_writer: RwLock::new(wal_writer),
@@ -2962,6 +3054,356 @@ impl OnDemandStorage {
     }
 
     // ========================================================================
+    // Direct Arrow Conversion (bypasses HashMap/clone pipeline)
+    // ========================================================================
+
+    /// Build Arrow RecordBatch directly from in-memory V4 columns.
+    /// OPTIMIZATION: bypasses read_columns→HashMap→get_null_mask→Vec<bool> pipeline.
+    /// - Int64/Float64 without nulls: single memcpy (no per-element Option wrapping)
+    /// - String: builds from &str references (no per-element String allocation)
+    /// - Null bitmaps: read packed bytes directly (no Vec<bool> expansion)
+    pub fn to_arrow_batch(
+        &self,
+        column_names: Option<&[&str]>,
+        include_id: bool,
+    ) -> io::Result<RecordBatch> {
+        self.to_arrow_batch_inner(column_names, include_id, false)
+    }
+
+    /// Build Arrow RecordBatch with optional dictionary encoding for string columns.
+    /// When dict_encode_strings=true, low-cardinality string columns produce DictionaryArray
+    /// which accelerates GROUP BY and WHERE filters.
+    pub fn to_arrow_batch_dict(
+        &self,
+        column_names: Option<&[&str]>,
+        include_id: bool,
+    ) -> io::Result<RecordBatch> {
+        self.to_arrow_batch_inner(column_names, include_id, true)
+    }
+
+    fn to_arrow_batch_inner(
+        &self,
+        column_names: Option<&[&str]>,
+        include_id: bool,
+        dict_encode_strings: bool,
+    ) -> io::Result<RecordBatch> {
+        use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray, PrimitiveArray};
+        use arrow::buffer::{Buffer, NullBuffer, BooleanBuffer, ScalarBuffer};
+        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType, Int64Type, Float64Type};
+        use std::sync::Arc;
+
+        self.ensure_v4_loaded()?;
+
+        let schema = self.schema.read();
+        let ids = self.ids.read();
+        let columns = self.columns.read();
+        let nulls = self.nulls.read();
+        let deleted = self.deleted.read();
+
+        let total_rows = ids.len();
+        let col_count = schema.column_count();
+
+        // Check for deleted rows
+        let has_deleted = deleted.iter().any(|&b| b != 0);
+
+        // Determine active row indices (skip deleted)
+        let active_indices: Option<Vec<usize>> = if has_deleted {
+            Some((0..total_rows)
+                .filter(|&i| {
+                    let byte_idx = i / 8;
+                    let bit_idx = i % 8;
+                    byte_idx >= deleted.len() || (deleted[byte_idx] >> bit_idx) & 1 == 0
+                })
+                .collect())
+        } else {
+            None
+        };
+        let active_count = active_indices.as_ref().map(|v| v.len()).unwrap_or(total_rows);
+
+        // Determine which columns to read
+        let col_indices: Vec<usize> = if let Some(names) = column_names {
+            names.iter()
+                .filter(|&&n| n != "_id")
+                .filter_map(|&name| schema.get_index(name))
+                .collect()
+        } else {
+            (0..col_count).collect()
+        };
+
+        let mut fields: Vec<Field> = Vec::with_capacity(col_indices.len() + 1);
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_indices.len() + 1);
+
+        // _id column
+        if include_id {
+            fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            if let Some(ref indices) = active_indices {
+                let active_ids: Vec<i64> = indices.iter().map(|&i| ids[i] as i64).collect();
+                arrays.push(Arc::new(Int64Array::from(active_ids)));
+            } else {
+                // Zero-copy: reinterpret u64 slice as i64 slice, copy once to Arrow buffer
+                let mut ids_copy: Vec<i64> = Vec::with_capacity(total_rows);
+                // SAFETY: u64 and i64 have identical memory layout
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        ids.as_ptr() as *const i64,
+                        ids_copy.as_mut_ptr(),
+                        total_rows,
+                    );
+                    ids_copy.set_len(total_rows);
+                }
+                arrays.push(Arc::new(Int64Array::from(ids_copy)));
+            }
+        }
+
+        // Data columns
+        for &col_idx in &col_indices {
+            let (col_name, _col_type) = &schema.columns[col_idx];
+            let col_data = if col_idx < columns.len() { Some(&columns[col_idx]) } else { None };
+
+            // Build Arrow null buffer from packed bitmap
+            let null_buf: Option<NullBuffer> = if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                let null_bitmap = &nulls[col_idx];
+                let has_any_null = null_bitmap.iter().any(|&b| b != 0);
+                if has_any_null {
+                    if active_indices.is_none() {
+                        // No deletes: Arrow validity = inverted null bitmap
+                        // null_bitmap bit=1 means NULL, Arrow validity bit=1 means VALID
+                        let mut validity_bytes = vec![0xFFu8; (active_count + 7) / 8];
+                        for byte_idx in 0..null_bitmap.len().min(validity_bytes.len()) {
+                            validity_bytes[byte_idx] = !null_bitmap[byte_idx];
+                        }
+                        // Mask trailing bits
+                        let tail = active_count % 8;
+                        if tail > 0 {
+                            let last = validity_bytes.len() - 1;
+                            validity_bytes[last] &= (1u8 << tail) - 1;
+                        }
+                        Some(NullBuffer::new(BooleanBuffer::new(Buffer::from(validity_bytes), 0, active_count)))
+                    } else {
+                        // Has deletes: build validity for active rows only
+                        let indices = active_indices.as_ref().unwrap();
+                        let mut validity_bytes = vec![0xFFu8; (active_count + 7) / 8];
+                        for (new_idx, &old_idx) in indices.iter().enumerate() {
+                            let ob = old_idx / 8;
+                            let obit = old_idx % 8;
+                            if ob < null_bitmap.len() && (null_bitmap[ob] >> obit) & 1 == 1 {
+                                // This row is NULL → clear validity bit
+                                validity_bytes[new_idx / 8] &= !(1u8 << (new_idx % 8));
+                            }
+                        }
+                        Some(NullBuffer::new(BooleanBuffer::new(Buffer::from(validity_bytes), 0, active_count)))
+                    }
+                } else {
+                    None // All valid
+                }
+            } else {
+                None // No null info
+            };
+
+            let (arrow_dt, array): (ArrowDataType, ArrayRef) = match col_data {
+                Some(ColumnData::Int64(values)) => {
+                    let data_vec = if let Some(ref indices) = active_indices {
+                        indices.iter().map(|&i| if i < values.len() { values[i] } else { 0 }).collect()
+                    } else {
+                        values.clone()
+                    };
+                    let arr = PrimitiveArray::<Int64Type>::new(
+                        ScalarBuffer::from(data_vec), null_buf,
+                    );
+                    (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                }
+                Some(ColumnData::Float64(values)) => {
+                    let data_vec = if let Some(ref indices) = active_indices {
+                        indices.iter().map(|&i| if i < values.len() { values[i] } else { 0.0 }).collect()
+                    } else {
+                        values.clone()
+                    };
+                    let arr = PrimitiveArray::<Float64Type>::new(
+                        ScalarBuffer::from(data_vec), null_buf,
+                    );
+                    (ArrowDataType::Float64, Arc::new(arr) as ArrayRef)
+                }
+                Some(ColumnData::String { offsets, data }) => {
+                    // OPTIMIZATION: build StringArray from &str refs (no per-element String alloc)
+                    let count = offsets.len().saturating_sub(1);
+                    if let Some(ref indices) = active_indices {
+                        let strings: Vec<Option<&str>> = indices.iter().map(|&i| {
+                            if i < count {
+                                // Check null
+                                if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                                    let ob = i / 8;
+                                    let obit = i % 8;
+                                    if ob < nulls[col_idx].len() && (nulls[col_idx][ob] >> obit) & 1 == 1 {
+                                        return None;
+                                    }
+                                }
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                std::str::from_utf8(&data[start..end]).ok()
+                            } else {
+                                None
+                            }
+                        }).collect();
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    } else if null_buf.is_some() {
+                        let null_bitmap = &nulls[col_idx];
+                        let strings: Vec<Option<&str>> = (0..count.min(active_count)).map(|i| {
+                            let ob = i / 8;
+                            let obit = i % 8;
+                            if ob < null_bitmap.len() && (null_bitmap[ob] >> obit) & 1 == 1 {
+                                None
+                            } else {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                std::str::from_utf8(&data[start..end]).ok()
+                            }
+                        }).collect();
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    } else {
+                        // No nulls, no deletes: fastest path
+                        let row_count = count.min(active_count);
+                        
+                        // OPTIMIZATION: Try to build DictionaryArray for low-cardinality columns
+                        // Only when dict_encode_strings=true (GROUP BY queries)
+                        let try_dict = dict_encode_strings && row_count >= 100;
+                        if try_dict {
+                            // Sample first 1000 rows to estimate cardinality
+                            let sample_size = row_count.min(1000);
+                            let mut sample_unique = ahash::AHashSet::with_capacity(100);
+                            let step = if row_count > sample_size { row_count / sample_size } else { 1 };
+                            let mut si = 0;
+                            while si < row_count && sample_unique.len() <= 1000 {
+                                let start = offsets[si] as usize;
+                                let end = offsets[si + 1] as usize;
+                                sample_unique.insert(&data[start..end]);
+                                si += step;
+                            }
+                            
+                            if sample_unique.len() <= 1000 {
+                                // Low cardinality → build DictionaryArray<UInt32Type>
+                                use arrow::array::{UInt32Array, DictionaryArray};
+                                use arrow::datatypes::UInt32Type;
+                                
+                                let mut dict_map: ahash::AHashMap<&[u8], u32> = ahash::AHashMap::with_capacity(sample_unique.len());
+                                let mut dict_strings: Vec<&str> = Vec::with_capacity(sample_unique.len());
+                                let mut next_id = 0u32;
+                                let mut keys: Vec<u32> = Vec::with_capacity(row_count);
+                                
+                                for i in 0..row_count {
+                                    let start = offsets[i] as usize;
+                                    let end = offsets[i + 1] as usize;
+                                    let bytes = &data[start..end];
+                                    let id = *dict_map.entry(bytes).or_insert_with(|| {
+                                        let id = next_id;
+                                        next_id += 1;
+                                        dict_strings.push(std::str::from_utf8(bytes).unwrap_or(""));
+                                        id
+                                    });
+                                    keys.push(id);
+                                }
+                                
+                                let keys_array = UInt32Array::from(keys);
+                                let values_array = StringArray::from_iter_values(dict_strings);
+                                let dict_array = DictionaryArray::<UInt32Type>::try_new(
+                                    keys_array, Arc::new(values_array),
+                                ).map_err(|e| err_data(e.to_string()))?;
+                                let arr_ref: ArrayRef = Arc::new(dict_array);
+                                (arr_ref.data_type().clone(), arr_ref)
+                            } else {
+                                // High cardinality → plain StringArray
+                                let strings: Vec<&str> = (0..row_count).map(|i| {
+                                    let start = offsets[i] as usize;
+                                    let end = offsets[i + 1] as usize;
+                                    std::str::from_utf8(&data[start..end]).unwrap_or("")
+                                }).collect();
+                                (ArrowDataType::Utf8, Arc::new(StringArray::from_iter_values(strings)))
+                            }
+                        } else {
+                            let strings: Vec<&str> = (0..row_count).map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                std::str::from_utf8(&data[start..end]).unwrap_or("")
+                            }).collect();
+                            (ArrowDataType::Utf8, Arc::new(StringArray::from_iter_values(strings)))
+                        }
+                    }
+                }
+                Some(ColumnData::Bool { data: packed, len }) => {
+                    if let Some(ref indices) = active_indices {
+                        let bools: Vec<Option<bool>> = indices.iter().map(|&i| {
+                            if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                                let ob = i / 8;
+                                let obit = i % 8;
+                                if ob < nulls[col_idx].len() && (nulls[col_idx][ob] >> obit) & 1 == 1 {
+                                    return None;
+                                }
+                            }
+                            if i < *len {
+                                let byte_idx = i / 8;
+                                let bit_idx = i % 8;
+                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                            } else {
+                                None
+                            }
+                        }).collect();
+                        (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
+                    } else {
+                        let bools: Vec<Option<bool>> = (0..*len).map(|i| {
+                            if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                                let ob = i / 8;
+                                let obit = i % 8;
+                                if ob < nulls[col_idx].len() && (nulls[col_idx][ob] >> obit) & 1 == 1 {
+                                    return None;
+                                }
+                            }
+                            let byte_idx = i / 8;
+                            let bit_idx = i % 8;
+                            Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                        }).collect();
+                        (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
+                    }
+                }
+                Some(ColumnData::Binary { offsets, data }) => {
+                    use arrow::array::BinaryArray;
+                    let count = offsets.len().saturating_sub(1);
+                    let binary_data: Vec<Option<&[u8]>> = if let Some(ref indices) = active_indices {
+                        indices.iter().map(|&i| {
+                            if i < count {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                Some(&data[start..end] as &[u8])
+                            } else { None }
+                        }).collect()
+                    } else {
+                        (0..count.min(active_count)).map(|i| {
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            Some(&data[start..end] as &[u8])
+                        }).collect()
+                    };
+                    (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                }
+                Some(ColumnData::StringDict { .. }) => {
+                    // StringDict should have been decoded to String in open_v4_data
+                    // Fallback: create empty string array
+                    (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![""; active_count])))
+                }
+                None => {
+                    // Column doesn't exist, create default
+                    (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![0i64; active_count])))
+                }
+            };
+
+            fields.push(Field::new(col_name, arrow_dt, true));
+            arrays.push(array);
+        }
+
+        let arrow_schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(arrow_schema, arrays)
+            .map_err(|e| err_data(e.to_string()))
+    }
+
+    // ========================================================================
     // On-Demand Read APIs (the key feature)
     // ========================================================================
 
@@ -3593,11 +4035,96 @@ impl OnDemandStorage {
         limit: usize,
         offset: usize,
     ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
-        // V4: delegate to base method (StringDict mmap fast path is V3-specific)
+        // V4: scan in-memory columns directly with early termination
         {
             let header = self.header.read();
             if header.footer_offset > 0 {
-                return self.read_columns_filtered_string(column_names, filter_column, filter_value, filter_eq);
+                drop(header);
+                self.ensure_v4_loaded()?;
+                
+                let schema = self.schema.read();
+                let columns = self.columns.read();
+                let deleted = self.deleted.read();
+                let total_rows = self.ids.read().len();
+                
+                let filter_col_idx = match schema.get_index(filter_column) {
+                    Some(idx) => idx,
+                    None => return Ok((HashMap::new(), Vec::new())),
+                };
+                
+                let filter_bytes = filter_value.as_bytes();
+                let filter_len = filter_bytes.len();
+                let needed = offset + limit;
+                let has_deleted = deleted.iter().any(|&b| b != 0);
+                
+                // Scan filter column with early termination
+                let mut matching_indices: Vec<usize> = Vec::with_capacity(needed.min(1024));
+                
+                if filter_col_idx < columns.len() {
+                    if let ColumnData::String { offsets, data } = &columns[filter_col_idx] {
+                        let count = offsets.len().saturating_sub(1).min(total_rows);
+                        for i in 0..count {
+                            if matching_indices.len() >= needed { break; }
+                            
+                            // Skip deleted rows
+                            if has_deleted {
+                                let byte_idx = i / 8;
+                                let bit_idx = i % 8;
+                                if byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 != 0 {
+                                    continue;
+                                }
+                            }
+                            
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            let str_len = end - start;
+                            
+                            // Fast rejection by length
+                            if str_len != filter_len { 
+                                if filter_eq { continue; } 
+                                else { matching_indices.push(i); continue; }
+                            }
+                            
+                            let matches = end <= data.len() && &data[start..end] == filter_bytes;
+                            if (filter_eq && matches) || (!filter_eq && !matches) {
+                                matching_indices.push(i);
+                            }
+                        }
+                    }
+                }
+                
+                // Apply offset
+                if offset > 0 && offset < matching_indices.len() {
+                    matching_indices = matching_indices[offset..].to_vec();
+                } else if offset >= matching_indices.len() {
+                    matching_indices.clear();
+                }
+                if matching_indices.len() > limit {
+                    matching_indices.truncate(limit);
+                }
+                
+                if matching_indices.is_empty() {
+                    return Ok((HashMap::new(), Vec::new()));
+                }
+                
+                // Read only needed columns for matching indices
+                let col_indices: Vec<usize> = match column_names {
+                    Some(names) => names.iter()
+                        .filter(|&&n| n != "_id")
+                        .filter_map(|&name| schema.get_index(name))
+                        .collect(),
+                    None => (0..schema.column_count()).collect(),
+                };
+                
+                let mut result = HashMap::new();
+                for &col_idx in &col_indices {
+                    let (col_name, _) = &schema.columns[col_idx];
+                    if col_idx < columns.len() {
+                        result.insert(col_name.clone(), columns[col_idx].filter_by_indices(&matching_indices));
+                    }
+                }
+                
+                return Ok((result, matching_indices));
             }
         }
         
@@ -3759,11 +4286,96 @@ impl OnDemandStorage {
         limit: usize,
         offset: usize,
     ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
-        // V4: delegate to read_columns_filtered (mmap chunked scan is V3-specific)
+        // V4: scan in-memory columns directly with early termination
         {
             let header = self.header.read();
             if header.footer_offset > 0 {
-                return self.read_columns_filtered(column_names, filter_column, ">=", low);
+                drop(header);
+                self.ensure_v4_loaded()?;
+                
+                let schema = self.schema.read();
+                let columns = self.columns.read();
+                let deleted = self.deleted.read();
+                let total_rows = self.ids.read().len();
+                let needed = offset + limit;
+                
+                let filter_col_idx = match schema.get_index(filter_column) {
+                    Some(idx) => idx,
+                    None => return Ok((HashMap::new(), Vec::new())),
+                };
+                
+                let has_deleted = deleted.iter().any(|&b| b != 0);
+                let mut matching_indices: Vec<usize> = Vec::with_capacity(needed.min(1024));
+                
+                if filter_col_idx < columns.len() {
+                    match &columns[filter_col_idx] {
+                        ColumnData::Int64(values) => {
+                            let low_i = low as i64;
+                            let high_i = high as i64;
+                            let count = values.len().min(total_rows);
+                            for i in 0..count {
+                                if matching_indices.len() >= needed { break; }
+                                if has_deleted {
+                                    let byte_idx = i / 8;
+                                    let bit_idx = i % 8;
+                                    if byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 != 0 { continue; }
+                                }
+                                let v = unsafe { *values.get_unchecked(i) };
+                                if v >= low_i && v <= high_i {
+                                    matching_indices.push(i);
+                                }
+                            }
+                        }
+                        ColumnData::Float64(values) => {
+                            let count = values.len().min(total_rows);
+                            for i in 0..count {
+                                if matching_indices.len() >= needed { break; }
+                                if has_deleted {
+                                    let byte_idx = i / 8;
+                                    let bit_idx = i % 8;
+                                    if byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 != 0 { continue; }
+                                }
+                                let v = unsafe { *values.get_unchecked(i) };
+                                if v >= low && v <= high {
+                                    matching_indices.push(i);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                
+                // Apply offset + limit
+                if offset > 0 && offset < matching_indices.len() {
+                    matching_indices = matching_indices[offset..].to_vec();
+                } else if offset >= matching_indices.len() {
+                    matching_indices.clear();
+                }
+                if matching_indices.len() > limit {
+                    matching_indices.truncate(limit);
+                }
+                
+                if matching_indices.is_empty() {
+                    return Ok((HashMap::new(), Vec::new()));
+                }
+                
+                let col_indices: Vec<usize> = match column_names {
+                    Some(names) => names.iter()
+                        .filter(|&&n| n != "_id")
+                        .filter_map(|&name| schema.get_index(name))
+                        .collect(),
+                    None => (0..schema.column_count()).collect(),
+                };
+                
+                let mut result = HashMap::new();
+                for &col_idx in &col_indices {
+                    let (col_name, _) = &schema.columns[col_idx];
+                    if col_idx < columns.len() {
+                        result.insert(col_name.clone(), columns[col_idx].filter_by_indices(&matching_indices));
+                    }
+                }
+                
+                return Ok((result, matching_indices));
             }
         }
         
@@ -3889,11 +4501,120 @@ impl OnDemandStorage {
         limit: usize,
         offset: usize,
     ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
-        // V4: delegate to base string filter (mmap dict fast path is V3-specific)
+        // V4: scan in-memory columns directly with early termination
         {
             let header = self.header.read();
             if header.footer_offset > 0 {
-                return self.read_columns_filtered_string(column_names, string_column, string_value, true);
+                drop(header);
+                self.ensure_v4_loaded()?;
+                
+                let schema = self.schema.read();
+                let columns = self.columns.read();
+                let deleted = self.deleted.read();
+                let total_rows = self.ids.read().len();
+                let needed = offset + limit;
+                
+                let str_col_idx = match schema.get_index(string_column) {
+                    Some(idx) => idx,
+                    None => return Ok((HashMap::new(), Vec::new())),
+                };
+                let num_col_idx = match schema.get_index(numeric_column) {
+                    Some(idx) => idx,
+                    None => return Ok((HashMap::new(), Vec::new())),
+                };
+                
+                let filter_bytes = string_value.as_bytes();
+                let filter_len = filter_bytes.len();
+                let has_deleted = deleted.iter().any(|&b| b != 0);
+                let mut matching_indices: Vec<usize> = Vec::with_capacity(needed.min(1024));
+                
+                // Get string and numeric column references
+                if str_col_idx < columns.len() && num_col_idx < columns.len() {
+                    if let ColumnData::String { offsets: str_offsets, data: str_data } = &columns[str_col_idx] {
+                        let count = str_offsets.len().saturating_sub(1).min(total_rows);
+                        
+                        let num_compare = |idx: usize| -> bool {
+                            match &columns[num_col_idx] {
+                                ColumnData::Int64(vals) if idx < vals.len() => {
+                                    let v = vals[idx] as f64;
+                                    match numeric_op {
+                                        ">" => v > numeric_value,
+                                        ">=" => v >= numeric_value,
+                                        "<" => v < numeric_value,
+                                        "<=" => v <= numeric_value,
+                                        "=" => (v - numeric_value).abs() < f64::EPSILON,
+                                        _ => false,
+                                    }
+                                }
+                                ColumnData::Float64(vals) if idx < vals.len() => {
+                                    let v = vals[idx];
+                                    match numeric_op {
+                                        ">" => v > numeric_value,
+                                        ">=" => v >= numeric_value,
+                                        "<" => v < numeric_value,
+                                        "<=" => v <= numeric_value,
+                                        "=" => (v - numeric_value).abs() < f64::EPSILON,
+                                        _ => false,
+                                    }
+                                }
+                                _ => false,
+                            }
+                        };
+                        
+                        for i in 0..count {
+                            if matching_indices.len() >= needed { break; }
+                            
+                            if has_deleted {
+                                let byte_idx = i / 8;
+                                let bit_idx = i % 8;
+                                if byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 != 0 { continue; }
+                            }
+                            
+                            // String equality check first (usually more selective)
+                            let start = str_offsets[i] as usize;
+                            let end = str_offsets[i + 1] as usize;
+                            if end - start != filter_len { continue; }
+                            if end > str_data.len() || &str_data[start..end] != filter_bytes { continue; }
+                            
+                            // Then numeric check
+                            if num_compare(i) {
+                                matching_indices.push(i);
+                            }
+                        }
+                    }
+                }
+                
+                // Apply offset + limit
+                if offset > 0 && offset < matching_indices.len() {
+                    matching_indices = matching_indices[offset..].to_vec();
+                } else if offset >= matching_indices.len() {
+                    matching_indices.clear();
+                }
+                if matching_indices.len() > limit {
+                    matching_indices.truncate(limit);
+                }
+                
+                if matching_indices.is_empty() {
+                    return Ok((HashMap::new(), Vec::new()));
+                }
+                
+                let col_indices: Vec<usize> = match column_names {
+                    Some(names) => names.iter()
+                        .filter(|&&n| n != "_id")
+                        .filter_map(|&name| schema.get_index(name))
+                        .collect(),
+                    None => (0..schema.column_count()).collect(),
+                };
+                
+                let mut result = HashMap::new();
+                for &col_idx in &col_indices {
+                    let (col_name, _) = &schema.columns[col_idx];
+                    if col_idx < columns.len() {
+                        result.insert(col_name.clone(), columns[col_idx].filter_by_indices(&matching_indices));
+                    }
+                }
+                
+                return Ok((result, matching_indices));
             }
         }
         
@@ -4574,7 +5295,7 @@ impl OnDemandStorage {
     // Internal helpers
     // ========================================================================
 
-    /// Ensure id_to_idx HashMap is built (lazy load)
+    /// Ensure id_to_idx AHashMap is built (lazy load)
     /// Called automatically by delete/exists/get_row_idx operations
     fn ensure_id_index(&self) {
         // First ensure IDs are loaded (since we lazy-load them now)
@@ -4583,7 +5304,7 @@ impl OnDemandStorage {
         let mut id_to_idx = self.id_to_idx.write();
         if id_to_idx.is_none() {
             let ids = self.ids.read();
-            let mut map = HashMap::with_capacity(ids.len());
+            let mut map = ahash::AHashMap::with_capacity(ids.len());
             for (idx, &id) in ids.iter().enumerate() {
                 map.insert(id, idx);
             }
@@ -5284,14 +6005,20 @@ impl OnDemandStorage {
             }
         }
 
-        // Append IDs
-        self.ids.write().extend_from_slice(&ids);
-
-        // Append column data
+        // OPTIMIZATION: combine ID append + column append + metadata updates
+        // to minimize lock acquire/release overhead
+        let col_count_for_header;
         {
             let schema = self.schema.read();
-            let mut columns = self.columns.write();
+            col_count_for_header = schema.column_count() as u32;
+            let mut ids_guard = self.ids.write();
+            let start_idx = ids_guard.len();
+            ids_guard.extend_from_slice(&ids);
+            let total_rows_after = ids_guard.len();
+            drop(ids_guard);
 
+            // Append column data (schema read lock still held)
+            let mut columns = self.columns.write();
             for (name, values) in int_columns {
                 if let Some(idx) = schema.get_index(&name) {
                     columns[idx].extend_i64(&values);
@@ -5305,23 +6032,15 @@ impl OnDemandStorage {
             for (name, values) in string_columns {
                 if let Some(idx) = schema.get_index(&name) {
                     if idx < columns.len() {
-                        // Handle both String and StringDict variants
-                        // StringDict may be loaded from disk after dictionary encoding optimization
                         match &columns[idx] {
                             ColumnData::String { .. } => {
-                                // Regular string column - extend directly
                                 columns[idx].extend_strings(&values);
                             }
                             ColumnData::StringDict { indices, dict_offsets, dict_data } => {
-                                // Dictionary-encoded column - convert back to regular String first
-                                // to maintain compatibility, then extend
                                 let mut new_offsets = vec![0u32];
                                 let mut new_data = Vec::new();
-                                
-                                // Convert existing StringDict data to String format
                                 for &dict_idx in indices {
                                     if dict_idx == 0 {
-                                        // NULL value - empty string
                                         new_offsets.push(new_data.len() as u32);
                                     } else {
                                         let actual_idx = (dict_idx - 1) as usize;
@@ -5333,17 +6052,13 @@ impl OnDemandStorage {
                                         new_offsets.push(new_data.len() as u32);
                                     }
                                 }
-                                
-                                // Replace with regular String column containing existing data
                                 columns[idx] = ColumnData::String { 
                                     offsets: new_offsets, 
                                     data: new_data 
                                 };
-                                // Now extend with new values
                                 columns[idx].extend_strings(&values);
                             }
                             _ => {
-                                // Type mismatch - recreate as String (only if truly incompatible)
                                 columns[idx] = ColumnData::new(ColumnType::String);
                                 columns[idx].extend_strings(&values);
                             }
@@ -5361,33 +6076,33 @@ impl OnDemandStorage {
                     columns[idx].extend_bools(&values);
                 }
             }
+            drop(columns);
+            drop(schema);
+
+            // Update id_to_idx if already built (avoid rebuilding)
+            {
+                let mut id_to_idx = self.id_to_idx.write();
+                if let Some(map) = id_to_idx.as_mut() {
+                    for (i, &id) in ids.iter().enumerate() {
+                        map.insert(id, start_idx + i);
+                    }
+                }
+            }
+
+            // Extend deleted bitmap
+            {
+                let mut deleted = self.deleted.write();
+                let new_len = (total_rows_after + 7) / 8;
+                deleted.resize(new_len, 0);
+            }
         }
 
         // Update header
         {
             let mut header = self.header.write();
             header.row_count += row_count as u64;
-            header.column_count = self.schema.read().column_count() as u32;
+            header.column_count = col_count_for_header;
             header.modified_at = chrono::Utc::now().timestamp();
-        }
-        
-        // Update id_to_idx mapping only if it's already built
-        {
-            let ids_guard = self.ids.read();
-            let mut id_to_idx = self.id_to_idx.write();
-            if let Some(map) = id_to_idx.as_mut() {
-                let start_idx = ids_guard.len() - ids.len();
-                for (i, &id) in ids.iter().enumerate() {
-                    map.insert(id, start_idx + i);
-                }
-            }
-        }
-        
-        // Extend deleted bitmap with zeros for new rows
-        {
-            let mut deleted = self.deleted.write();
-            let new_len = (self.ids.read().len() + 7) / 8;
-            deleted.resize(new_len, 0);
         }
         
         // Update active count (new rows are not deleted)
@@ -6404,12 +7119,27 @@ impl OnDemandStorage {
     // ========================================================================
     
     /// Slice a null bitmap for a contiguous row range [start, end).
+    /// OPTIMIZATION: uses bulk memcpy when start is byte-aligned.
     fn slice_null_bitmap(nulls: &[u8], start: usize, end: usize) -> Vec<u8> {
         let count = end.saturating_sub(start);
         if count == 0 || nulls.is_empty() {
             return vec![0u8; (count + 7) / 8];
         }
-        let mut result = vec![0u8; (count + 7) / 8];
+        let result_len = (count + 7) / 8;
+        if start % 8 == 0 {
+            let src_byte = start / 8;
+            let copy_len = result_len.min(nulls.len().saturating_sub(src_byte));
+            let mut result = vec![0u8; result_len];
+            if copy_len > 0 {
+                result[..copy_len].copy_from_slice(&nulls[src_byte..src_byte + copy_len]);
+            }
+            let tail_bits = count % 8;
+            if tail_bits > 0 && result_len > 0 {
+                result[result_len - 1] &= (1u8 << tail_bits) - 1;
+            }
+            return result;
+        }
+        let mut result = vec![0u8; result_len];
         for i in 0..count {
             let ob = (start + i) / 8;
             let obit = (start + i) % 8;
@@ -6554,30 +7284,41 @@ impl OnDemandStorage {
             writer.write_all(&max_id.to_le_bytes())?;
             writer.write_all(&[0u8; 4])?;
             
-            // IDs
-            for &id in chunk_ids {
-                writer.write_all(&id.to_le_bytes())?;
-            }
+            // IDs — bulk write via unsafe slice cast (avoids per-element loop)
+            let id_bytes = unsafe {
+                std::slice::from_raw_parts(chunk_ids.as_ptr() as *const u8, chunk_ids.len() * 8)
+            };
+            writer.write_all(id_bytes)?;
             
             // Deletion vector (all zeros — fresh save, no deletes)
             let del_vec_len = (chunk_rows + 7) / 8;
             writer.write_all(&vec![0u8; del_vec_len])?;
             
-            // Columns — slice from pre-filtered active data
+            // Columns — use direct reference for single-RG, slice for multi-RG
+            let is_single_rg = chunk_start == 0 && chunk_end == active_count;
             let null_bitmap_len = (chunk_rows + 7) / 8;
             for col_idx in 0..col_count {
-                let chunk_col = active_columns[col_idx].slice_range(chunk_start, chunk_end);
+                // OPTIMIZATION: skip slice_range when chunk covers entire column (single-RG)
+                let chunk_col_owned;
+                let chunk_col_ref: &ColumnData = if is_single_rg {
+                    &active_columns[col_idx]
+                } else {
+                    chunk_col_owned = active_columns[col_idx].slice_range(chunk_start, chunk_end);
+                    &chunk_col_owned
+                };
                 
                 // Dict-encode low-cardinality string columns for disk
-                let processed = if Self::should_dict_encode(&chunk_col) {
-                    chunk_col.to_dict_encoded().unwrap_or(chunk_col)
+                let dict_encoded;
+                let processed: &ColumnData = if Self::should_dict_encode(chunk_col_ref) {
+                    dict_encoded = chunk_col_ref.to_dict_encoded().unwrap_or_else(|| chunk_col_ref.clone());
+                    &dict_encoded
                 } else {
-                    chunk_col
+                    chunk_col_ref
                 };
                 
                 // Track actual type for footer schema
                 if rg_metas.is_empty() {
-                    let actual_type = match &processed {
+                    let actual_type = match processed {
                         ColumnData::StringDict { .. } => ColumnType::StringDict,
                         _ => schema_clone.columns[col_idx].1,
                     };
@@ -6585,12 +7326,16 @@ impl OnDemandStorage {
                 }
                 
                 // Null bitmap
-                let chunk_nulls = Self::slice_null_bitmap(
-                    &active_nulls[col_idx], chunk_start, chunk_end,
-                );
-                
-                writer.write_all(&chunk_nulls)?;
-                writer.write_all(&processed.to_bytes())?;
+                if is_single_rg && active_nulls[col_idx].len() == null_bitmap_len {
+                    writer.write_all(&active_nulls[col_idx])?;
+                } else {
+                    let chunk_nulls = Self::slice_null_bitmap(
+                        &active_nulls[col_idx], chunk_start, chunk_end,
+                    );
+                    writer.write_all(&chunk_nulls)?;
+                }
+                // OPTIMIZATION: write_to avoids intermediate Vec<u8> allocation
+                processed.write_to(&mut writer)?;
             }
             
             let rg_end = writer.stream_position()?;
@@ -6648,6 +7393,9 @@ impl OnDemandStorage {
         drop(header);
         drop(writer);
         
+        // OPTIMIZATION: compute max_id BEFORE moving active_ids (avoids re-reading after write)
+        let max_active_id = active_ids.iter().max().copied().unwrap_or(0);
+        
         *self.column_index.write() = Vec::new();
         *self.ids.write() = active_ids;
         *self.columns.write() = active_columns;
@@ -6658,7 +7406,6 @@ impl OnDemandStorage {
         self.mmap_cache.write().invalidate();
         
         self.active_count.store(active_count as u64, Ordering::SeqCst);
-        let max_active_id = self.ids.read().iter().max().copied().unwrap_or(0);
         let candidate = max_active_id + 1;
         let current = self.next_id.load(Ordering::SeqCst);
         if candidate > current {
@@ -6707,6 +7454,7 @@ impl OnDemandStorage {
         let mut all_nulls: Vec<Vec<u8>> = vec![Vec::new(); col_count];
         
         // Read each Row Group as a byte buffer, parse sequentially
+        let mut max_id_seen: u64 = 0;
         for rg_meta in &footer.row_groups {
             if rg_meta.row_count == 0 {
                 continue;
@@ -6720,13 +7468,21 @@ impl OnDemandStorage {
             
             let mut pos = 32; // skip RG header (32 bytes)
             
-            // Parse IDs
+            // Parse IDs — OPTIMIZATION: bulk memcpy instead of per-element loop
             let ids_before = all_ids.len();
-            for i in 0..rg_rows {
-                let off = pos + i * 8;
-                all_ids.push(u64::from_le_bytes(rg_buf[off..off + 8].try_into().unwrap()));
+            let id_byte_len = rg_rows * 8;
+            all_ids.resize(ids_before + rg_rows, 0);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    rg_buf[pos..].as_ptr(),
+                    all_ids[ids_before..].as_mut_ptr() as *mut u8,
+                    id_byte_len,
+                );
             }
-            pos += rg_rows * 8;
+            if rg_meta.max_id > max_id_seen {
+                max_id_seen = rg_meta.max_id;
+            }
+            pos += id_byte_len;
             
             // Skip deletion vector
             let del_vec_len = (rg_rows + 7) / 8;
@@ -6744,10 +7500,18 @@ impl OnDemandStorage {
                 if all_nulls[col_idx].len() < needed_len {
                     all_nulls[col_idx].resize(needed_len, 0);
                 }
-                for i in 0..rg_rows {
-                    if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 {
-                        let flat_idx = flat_start + i;
-                        all_nulls[col_idx][flat_idx / 8] |= 1 << (flat_idx % 8);
+                // OPTIMIZATION: bulk copy when flat_start is byte-aligned
+                if flat_start % 8 == 0 {
+                    let dest_byte = flat_start / 8;
+                    let copy_len = null_bitmap_len.min(all_nulls[col_idx].len() - dest_byte);
+                    all_nulls[col_idx][dest_byte..dest_byte + copy_len]
+                        .copy_from_slice(&null_bytes[..copy_len]);
+                } else {
+                    for i in 0..rg_rows {
+                        if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                            let flat_idx = flat_start + i;
+                            all_nulls[col_idx][flat_idx / 8] |= 1 << (flat_idx % 8);
+                        }
                     }
                 }
                 pos += null_bitmap_len;
@@ -6784,6 +7548,13 @@ impl OnDemandStorage {
             }
         }
         
+        // OPTIMIZATION: compute next_id from tracked max before moving all_ids
+        let next_id = if max_id_seen > 0 {
+            max_id_seen + 1
+        } else {
+            all_ids.iter().max().map(|&id| id + 1).unwrap_or(0)
+        };
+        
         // Store flat data
         *self.ids.write() = all_ids;
         *self.columns.write() = all_columns;
@@ -6792,7 +7563,6 @@ impl OnDemandStorage {
         let deleted_len = (total_rows + 7) / 8;
         *self.deleted.write() = vec![0u8; deleted_len];
         
-        let next_id = self.ids.read().iter().max().map(|&id| id + 1).unwrap_or(0);
         self.next_id.store(next_id, Ordering::SeqCst);
         self.active_count.store(total_rows as u64, Ordering::SeqCst);
         *self.id_to_idx.write() = None;

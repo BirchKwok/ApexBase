@@ -1901,6 +1901,34 @@ fn arrow_value_at(array: &arrow::array::ArrayRef, idx: usize) -> Value {
             let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
             Value::Binary(arr.value(idx).to_vec())
         }
+        ArrowDataType::Dictionary(_, _) => {
+            // Handle DictionaryArray<UInt32Type> with Utf8 values
+            use arrow::datatypes::UInt32Type;
+            if let Some(dict_arr) = array.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+                if dict_arr.is_null(idx) {
+                    Value::Null
+                } else {
+                    let key = dict_arr.keys().value(idx) as usize;
+                    let values = dict_arr.values();
+                    if let Some(str_values) = values.as_any().downcast_ref::<StringArray>() {
+                        if key < str_values.len() {
+                            let s = str_values.value(key);
+                            if s == "\x00__NULL__\x00" {
+                                Value::Null
+                            } else {
+                                Value::String(s.to_string())
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    } else {
+                        Value::Null
+                    }
+                }
+            } else {
+                Value::Null
+            }
+        }
         _ => Value::Null,
     }
 }

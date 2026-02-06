@@ -1,0 +1,334 @@
+"""
+OLAP Test Suite for ApexBase
+
+Tests analytical workloads:
+- Full table scan
+- COUNT(*) / SUM / AVG / MIN / MAX aggregations
+- GROUP BY single column
+- GROUP BY multiple columns
+- GROUP BY with HAVING
+- ORDER BY ASC/DESC with LIMIT
+- WHERE with BETWEEN
+- WHERE with IN list
+- WHERE with LIKE pattern
+- WHERE with AND/OR conditions
+- Column projection
+- COUNT(DISTINCT)
+- Boolean filter
+- Empty result handling
+- Query to pandas/polars
+"""
+
+import pytest
+import tempfile
+import shutil
+from pathlib import Path
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'apexbase', 'python'))
+
+try:
+    from apexbase import ApexClient
+except ImportError as e:
+    pytest.skip(f"ApexBase not available: {e}", allow_module_level=True)
+
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
+
+@pytest.fixture
+def olap_client():
+    """Create a client with 5000 rows of OLAP-style data."""
+    tmp = tempfile.mkdtemp()
+    client = ApexClient(os.path.join(tmp, "olap_test"))
+    cities = ["Beijing", "Shanghai", "Shenzhen", "Guangzhou", "Hangzhou",
+              "Chengdu", "Wuhan", "Nanjing", "Tianjin", "Xian"]
+    depts = ["Engineering", "Sales", "Marketing", "HR", "Finance"]
+    rows = []
+    for i in range(5000):
+        rows.append({
+            "emp_id": i + 1,
+            "age": 22 + (i % 40),
+            "years": i % 20,
+            "salary": 50000.0 + (i % 100) * 1000.0,
+            "city": cities[i % 10],
+            "dept": depts[i % 5],
+            "is_manager": i % 10 == 0,
+        })
+    client.store(rows)
+    yield client
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestOlapFullScan:
+    def test_select_star(self, olap_client):
+        result = olap_client.execute("SELECT * FROM default")
+        assert len(result) == 5000
+
+    def test_schema_columns(self, olap_client):
+        result = olap_client.execute("SELECT * FROM default LIMIT 1")
+        assert len(result) == 1
+        row = result[0]
+        assert "emp_id" in row
+        assert "salary" in row
+        assert "city" in row
+        assert "dept" in row
+
+    def test_row_count(self, olap_client):
+        result = olap_client.execute("SELECT COUNT(*) as cnt FROM default")
+        assert result[0]["cnt"] == 5000
+
+
+class TestOlapAggregation:
+    def test_count_star(self, olap_client):
+        result = olap_client.execute("SELECT COUNT(*) as cnt FROM default")
+        assert result[0]["cnt"] == 5000
+
+    def test_sum(self, olap_client):
+        result = olap_client.execute("SELECT SUM(salary) as total FROM default")
+        # salary = 50000 + (i%100)*1000; 50 cycles of 100
+        # Each cycle sum = 100*50000 + (0+1+...+99)*1000 = 5000000+4950000 = 9950000
+        expected = 50 * 9950000.0
+        assert abs(result[0]["total"] - expected) < 1.0
+
+    def test_avg(self, olap_client):
+        result = olap_client.execute("SELECT AVG(salary) as avg_sal FROM default")
+        assert abs(result[0]["avg_sal"] - 99500.0) < 1.0
+
+    def test_min(self, olap_client):
+        result = olap_client.execute("SELECT MIN(salary) as min_sal FROM default")
+        assert abs(result[0]["min_sal"] - 50000.0) < 1.0
+
+    def test_max(self, olap_client):
+        result = olap_client.execute("SELECT MAX(salary) as max_sal FROM default")
+        assert abs(result[0]["max_sal"] - 149000.0) < 1.0
+
+    def test_count_distinct(self, olap_client):
+        result = olap_client.execute("SELECT COUNT(DISTINCT city) as n FROM default")
+        assert result[0]["n"] == 10
+
+    def test_count_distinct_dept(self, olap_client):
+        result = olap_client.execute("SELECT COUNT(DISTINCT dept) as n FROM default")
+        assert result[0]["n"] == 5
+
+
+class TestOlapGroupBy:
+    def test_group_by_single_col(self, olap_client):
+        result = olap_client.execute(
+            "SELECT dept, COUNT(*) as cnt FROM default GROUP BY dept"
+        )
+        assert len(result) == 5
+        for row in result:
+            assert row["cnt"] == 1000  # 5000 / 5 depts
+
+    def test_group_by_with_avg(self, olap_client):
+        result = olap_client.execute(
+            "SELECT city, AVG(salary) as avg_sal FROM default GROUP BY city"
+        )
+        assert len(result) == 10
+        for row in result:
+            assert row["avg_sal"] > 0
+
+    def test_group_by_two_cols(self, olap_client):
+        result = olap_client.execute(
+            "SELECT city, dept, COUNT(*) as cnt FROM default GROUP BY city, dept"
+        )
+        # 10 cities * 5 depts — not all combos may be uniform but should exist
+        total = sum(r["cnt"] for r in result)
+        assert total == 5000
+
+    def test_group_by_with_sum(self, olap_client):
+        result = olap_client.execute(
+            "SELECT dept, SUM(salary) as total FROM default GROUP BY dept ORDER BY total DESC"
+        )
+        assert len(result) == 5
+        # Verify descending order
+        totals = [r["total"] for r in result]
+        for i in range(1, len(totals)):
+            assert totals[i - 1] >= totals[i]
+
+
+class TestOlapHaving:
+    def test_having_avg(self, olap_client):
+        result = olap_client.execute(
+            "SELECT city, AVG(salary) as avg_sal FROM default GROUP BY city "
+            "HAVING AVG(salary) > 99000"
+        )
+        assert len(result) > 0
+        for row in result:
+            assert row["avg_sal"] > 99000
+
+    def test_having_count(self, olap_client):
+        result = olap_client.execute(
+            "SELECT dept, COUNT(*) as cnt FROM default GROUP BY dept HAVING COUNT(*) >= 1000"
+        )
+        assert len(result) == 5  # all depts have 1000
+
+
+class TestOlapOrderBy:
+    def test_order_by_desc_limit(self, olap_client):
+        result = olap_client.execute(
+            "SELECT * FROM default ORDER BY salary DESC LIMIT 10"
+        )
+        assert len(result) == 10
+        salaries = [r["salary"] for r in result]
+        for i in range(1, len(salaries)):
+            assert salaries[i - 1] >= salaries[i]
+        assert abs(salaries[0] - 149000.0) < 1.0
+
+    def test_order_by_asc_limit(self, olap_client):
+        result = olap_client.execute(
+            "SELECT * FROM default ORDER BY age ASC LIMIT 5"
+        )
+        assert len(result) == 5
+        for row in result:
+            assert row["age"] == 22  # min age
+
+
+class TestOlapWhereFilter:
+    def test_between(self, olap_client):
+        result = olap_client.execute(
+            "SELECT * FROM default WHERE age BETWEEN 30 AND 35 LIMIT 100"
+        )
+        assert 0 < len(result) <= 100
+        for row in result:
+            assert 30 <= row["age"] <= 35
+
+    def test_in_list(self, olap_client):
+        result = olap_client.execute(
+            "SELECT * FROM default WHERE city IN ('Beijing', 'Shanghai')"
+        )
+        assert len(result) == 1000  # 500 each
+        for row in result:
+            assert row["city"] in ("Beijing", "Shanghai")
+
+    def test_like_pattern(self, olap_client):
+        result = olap_client.execute(
+            "SELECT * FROM default WHERE city LIKE 'Sh%'"
+        )
+        assert len(result) == 1000  # Shanghai + Shenzhen
+        for row in result:
+            assert row["city"].startswith("Sh")
+
+    def test_string_eq(self, olap_client):
+        result = olap_client.execute(
+            "SELECT * FROM default WHERE city = 'Beijing'"
+        )
+        assert len(result) == 500
+
+    def test_string_eq_with_limit(self, olap_client):
+        result = olap_client.execute(
+            "SELECT * FROM default WHERE city = 'Beijing' LIMIT 10"
+        )
+        assert len(result) == 10
+        for row in result:
+            assert row["city"] == "Beijing"
+
+    def test_boolean_filter_true(self, olap_client):
+        result = olap_client.execute(
+            "SELECT COUNT(*) as cnt FROM default WHERE is_manager = true"
+        )
+        assert result[0]["cnt"] == 500  # every 10th
+
+    def test_boolean_filter_false(self, olap_client):
+        result = olap_client.execute(
+            "SELECT COUNT(*) as cnt FROM default WHERE is_manager = false"
+        )
+        assert result[0]["cnt"] == 4500
+
+
+class TestOlapMultiCondition:
+    def test_and_condition(self, olap_client):
+        result = olap_client.execute(
+            "SELECT * FROM default WHERE city = 'Beijing' AND age > 50"
+        )
+        assert len(result) > 0
+        for row in result:
+            assert row["city"] == "Beijing"
+            assert row["age"] > 50
+
+    def test_or_condition(self, olap_client):
+        result = olap_client.execute(
+            "SELECT * FROM default WHERE age < 23 OR age > 60"
+        )
+        assert len(result) > 0
+        for row in result:
+            assert row["age"] < 23 or row["age"] > 60
+
+
+class TestOlapProjection:
+    def test_select_specific_columns(self, olap_client):
+        result = olap_client.execute(
+            "SELECT emp_id, salary FROM default LIMIT 10"
+        )
+        assert len(result) == 10
+        for row in result:
+            assert "emp_id" in row
+            assert "salary" in row
+            # Other columns may or may not be present depending on impl
+
+    @pytest.mark.skipif(not PANDAS_AVAILABLE, reason="pandas not available")
+    def test_to_pandas(self, olap_client):
+        result = olap_client.execute("SELECT * FROM default")
+        df = result.to_pandas()
+        assert len(df) == 5000
+        assert "salary" in df.columns
+        assert "city" in df.columns
+
+    @pytest.mark.skipif(not PANDAS_AVAILABLE, reason="pandas not available")
+    def test_to_pandas_with_filter(self, olap_client):
+        result = olap_client.execute(
+            "SELECT * FROM default WHERE city = 'Shanghai'"
+        )
+        df = result.to_pandas()
+        assert len(df) == 500
+        assert all(df["city"] == "Shanghai")
+
+
+class TestOlapComplexQuery:
+    def test_filter_group_order(self, olap_client):
+        result = olap_client.execute(
+            "SELECT dept, COUNT(*) as cnt, AVG(salary) as avg_sal FROM default "
+            "WHERE city = 'Beijing' GROUP BY dept ORDER BY avg_sal DESC"
+        )
+        assert len(result) >= 1
+        total = sum(r["cnt"] for r in result)
+        assert total == 500  # Beijing has 500 rows
+
+    def test_group_by_order_by_limit(self, olap_client):
+        result = olap_client.execute(
+            "SELECT dept, SUM(salary) as total FROM default "
+            "GROUP BY dept ORDER BY total DESC"
+        )
+        assert len(result) == 5
+        totals = [r["total"] for r in result]
+        for i in range(1, len(totals)):
+            assert totals[i - 1] >= totals[i]
+
+
+class TestOlapEdgeCases:
+    def test_empty_result(self, olap_client):
+        result = olap_client.execute(
+            "SELECT * FROM default WHERE city = 'NonExistent'"
+        )
+        assert len(result) == 0
+
+    def test_count_empty_result(self, olap_client):
+        result = olap_client.execute(
+            "SELECT COUNT(*) as cnt FROM default WHERE city = 'NonExistent'"
+        )
+        assert result[0]["cnt"] == 0
+
+    def test_limit_larger_than_data(self, olap_client):
+        result = olap_client.execute(
+            "SELECT * FROM default LIMIT 99999"
+        )
+        assert len(result) == 5000
+
+    def test_retrieve_all(self, olap_client):
+        all_rows = olap_client.retrieve_all()
+        assert len(all_rows) == 5000
