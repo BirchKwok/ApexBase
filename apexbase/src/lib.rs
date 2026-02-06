@@ -9,6 +9,8 @@ pub mod query;
 pub mod data;
 pub mod python;
 pub mod fts;
+pub mod txn;
+pub mod scaling;
 
 // Re-export main types
 pub use storage::{ColumnarStorage, ColumnType, ColumnValue, FileSchema};

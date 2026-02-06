@@ -284,6 +284,14 @@ impl TableStorageBackend {
         Ok(Self::from_storage(path, storage))
     }
     
+    /// Open for compaction only — loads metadata, NOT column data.
+    /// The streaming compact reads columns one at a time from mmap.
+    pub fn open_for_compact(path: &Path) -> io::Result<Self> {
+        let storage = OnDemandStorage::open_for_insert_with_durability(
+            path, super::DurabilityLevel::Fast)?;
+        Ok(Self::from_storage(path, storage))
+    }
+    
     pub fn open_for_insert(path: &Path) -> io::Result<Self> {
         Self::open_for_insert_with_durability(path, super::DurabilityLevel::Fast)
     }
@@ -2447,10 +2455,10 @@ mod tests {
         {
             let backend = TableStorageBackend::open(&path).unwrap();
             
-            // Read all columns
+            // Read all columns (age, score, name + auto-generated _id = 4)
             let batch = backend.read_columns_to_arrow(None, 0, None).unwrap();
             assert_eq!(batch.num_rows(), 3);
-            assert_eq!(batch.num_columns(), 3);
+            assert_eq!(batch.num_columns(), 4);
             
             // Read specific columns (column projection)
             let batch2 = backend.read_columns_to_arrow(Some(&["name", "age"]), 0, None).unwrap();

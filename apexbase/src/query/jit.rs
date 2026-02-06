@@ -113,18 +113,21 @@ impl ExprJIT {
         let loop_body = builder.create_block();
         let loop_exit = builder.create_block();
         
+        // Declare block params upfront (before any branches target them)
+        builder.append_block_param(loop_header, types::I64); // i
+        builder.append_block_param(loop_header, types::I64); // match_count
+        builder.append_block_param(loop_exit, types::I64);   // final match_count
+        
         // Jump to loop with initial counter and match_count
         builder.ins().jump(loop_header, &[zero, zero]);
         
         // Loop header: i, match_count
         builder.switch_to_block(loop_header);
-        builder.append_block_param(loop_header, types::I64); // i
-        builder.append_block_param(loop_header, types::I64); // match_count
         let i = builder.block_params(loop_header)[0];
         let match_count = builder.block_params(loop_header)[1];
         
         let cond = builder.ins().icmp(IntCC::UnsignedLessThan, i, count);
-        builder.ins().brif(cond, loop_body, &[], loop_exit, &[]);
+        builder.ins().brif(cond, loop_body, &[], loop_exit, &[match_count]);
         
         // Loop body
         builder.switch_to_block(loop_body);
@@ -145,10 +148,9 @@ impl ExprJIT {
             _ => return Err(format!("Unsupported operator: {:?}", op)),
         };
         
-        // Store result byte
-        let result_byte = builder.ins().uextend(types::I8, cmp_result);
+        // Store result byte (icmp returns I8, use directly)
         let result_addr = builder.ins().iadd(result_ptr, i);
-        builder.ins().store(MemFlags::new(), result_byte, result_addr, 0);
+        builder.ins().store(MemFlags::new(), cmp_result, result_addr, 0);
         
         // Update match count: match_count += cmp_result ? 1 : 0
         let inc = builder.ins().uextend(types::I64, cmp_result);
@@ -160,7 +162,7 @@ impl ExprJIT {
         
         // Exit
         builder.switch_to_block(loop_exit);
-        let final_count = builder.block_params(loop_header)[1];
+        let final_count = builder.block_params(loop_exit)[0];
         builder.ins().return_(&[final_count]);
         
         builder.seal_block(loop_header);

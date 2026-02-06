@@ -536,7 +536,21 @@ impl SqlParser {
             tokens,
             pos: 0,
         };
-        parser.parse_statement()
+        let stmt = parser.parse_statement()?;
+        // Skip trailing semicolons
+        while matches!(parser.current(), Token::Semicolon) {
+            parser.advance();
+        }
+        // Ensure all tokens are consumed
+        if !matches!(parser.current(), Token::Eof) {
+            let (start, _) = parser.current_span();
+            let mut msg = format!("Unexpected token {:?} after statement", parser.current());
+            if let Some(kw) = parser.keyword_suggestion() {
+                msg = format!("{} (did you mean {}?)", msg, kw);
+            }
+            return Err(parser.syntax_error(start, msg));
+        }
+        Ok(stmt)
     }
 
     /// Parse multiple SQL statements separated by semicolons.
@@ -957,6 +971,26 @@ impl SqlParser {
         }
     }
 
+    /// Stricter check than keyword_suggestion: only returns true if the
+    /// identifier is very likely a misspelled keyword (edit distance <= 1).
+    /// Used to prevent misspelled keywords from being consumed as table aliases.
+    fn is_likely_misspelled_keyword(&self, ident: &str) -> bool {
+        let u = ident.to_uppercase();
+        const KWS: [&str; 15] = [
+            "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER",
+            "ORDER", "GROUP", "HAVING", "LIMIT", "OFFSET", "UNION",
+            "INSERT", "DELETE",
+        ];
+        for kw in KWS {
+            // Length must be similar (differ by at most 1)
+            let len_diff = (u.len() as isize - kw.len() as isize).unsigned_abs();
+            if len_diff <= 1 && Self::edit_distance(&u, kw) <= 1 {
+                return true;
+            }
+        }
+        false
+    }
+
     fn edit_distance(a: &str, b: &str) -> usize {
         // Classic DP Levenshtein distance. Inputs are short keywords; performance is irrelevant.
         let a: Vec<char> = a.chars().collect();
@@ -1212,7 +1246,11 @@ impl SqlParser {
             }
             _ => {
                 let (start, _) = self.current_span();
-                Err(self.syntax_error(start, "Expected SQL statement".to_string()))
+                let mut msg = "Expected SQL statement".to_string();
+                if let Some(kw) = self.keyword_suggestion() {
+                    msg = format!("{} (did you mean {}?)", msg, kw);
+                }
+                Err(self.syntax_error(start, msg))
             }
         }
     }
@@ -1251,9 +1289,17 @@ impl SqlParser {
             match self.current().clone() {
                 Token::Identifier(table) => {
                     self.advance();
+                    // Only consume an identifier as alias if it doesn't look like
+                    // a misspelled keyword (e.g., "joinn" should NOT be an alias).
+                    // Only apply this heuristic for identifiers >= 4 chars with
+                    // edit distance <= 1, to avoid rejecting short aliases like "u", "t1".
                     let alias = if let Token::Identifier(a) = self.current().clone() {
-                        self.advance();
-                        Some(a)
+                        if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) {
+                            None
+                        } else {
+                            self.advance();
+                            Some(a)
+                        }
                     } else {
                         None
                     };

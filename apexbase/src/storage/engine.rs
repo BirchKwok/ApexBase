@@ -217,9 +217,9 @@ impl StorageEngine {
             }
         }
         
-        // If delta exists, compact it first
+        // If delta exists, compact it first using lightweight open (metadata only)
         if has_delta {
-            let storage = TableStorageBackend::open_for_write(table_path)?;
+            let storage = TableStorageBackend::open_for_compact(table_path)?;
             storage.compact()?;
             // Invalidate after compaction
             self.cache.write().remove(&cache_key);
@@ -273,9 +273,9 @@ impl StorageEngine {
         let has_delta = Self::has_delta_file(table_path);
         let modified = Self::get_modified_time(table_path);
         
-        // If delta exists, compact first for consistent reads
+        // If delta exists, compact first for consistent reads (metadata-only open)
         if has_delta {
-            let storage = TableStorageBackend::open_for_write(table_path)?;
+            let storage = TableStorageBackend::open_for_compact(table_path)?;
             storage.compact()?;
             self.cache.write().remove(&cache_key);
             self.schema_cache.write().remove(&cache_key);
@@ -776,9 +776,10 @@ mod tests {
         let count = engine.row_count(&table_path).unwrap();
         assert_eq!(count, 2);
         
-        // Check exists
-        assert!(engine.exists(&table_path, 0).unwrap());
-        assert!(engine.exists(&table_path, 1).unwrap());
+        // Check exists — use actual returned IDs (not hardcoded 0/1)
+        // because StorageEngine::global() is shared and next_id may not start at 0
+        assert!(engine.exists(&table_path, ids[0]).unwrap());
+        assert!(engine.exists(&table_path, ids[1]).unwrap());
         assert!(!engine.exists(&table_path, 999).unwrap());
     }
 }

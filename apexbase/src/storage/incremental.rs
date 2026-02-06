@@ -900,12 +900,13 @@ impl IncrementalStorage {
         Ok(result)
     }
     
-    /// Get row count (main + memory buffer)
+    /// Get row count (main + memory buffer - deleted)
     pub fn row_count(&self) -> u64 {
         let main_count = self.main_storage.read().row_count();
         let memory_count = self.memory_ids.read().len() as u64;
+        let deleted_count = self.deleted_ids.read().len() as u64;
         
-        main_count + memory_count
+        (main_count + memory_count).saturating_sub(deleted_count)
     }
     
     /// Get schema

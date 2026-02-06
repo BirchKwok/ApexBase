@@ -11,6 +11,9 @@ pub mod backend;
 pub mod incremental;
 pub mod bloom;
 pub mod engine;
+pub mod index;
+pub mod delta;
+pub mod mvcc;
 
 // ============================================================================
 // Durability Level - Controls fsync behavior for ACID guarantees
@@ -107,6 +110,15 @@ pub use bloom::{
 
 // Re-export storage engine
 pub use engine::{StorageEngine, engine};
+
+// Re-export index types
+pub use index::{BTreeIndex, HashIndex, IndexManager, IndexType, IndexMeta};
+
+// Re-export delta store types
+pub use delta::{DeltaStore, DeltaRecord, DeleteBitmap, DeltaMerger};
+
+// Re-export MVCC types
+pub use mvcc::{VersionStore, RowVersion, VersionChain, SnapshotManager, Snapshot, GarbageCollector};
 
 // Type alias for backward compatibility
 pub type ColumnarStorage = OnDemandStorage;

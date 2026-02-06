@@ -52,16 +52,22 @@ impl RowGroupBloomFilter {
         let bitmap = self.filter.bitmap();
         let num_bits = self.filter.number_of_bits();
         let num_hashes = self.filter.number_of_hash_functions();
+        let sip_keys = self.filter.sip_keys();
         
-        let mut bytes = Vec::with_capacity(24 + bitmap.len());
+        let mut bytes = Vec::with_capacity(72 + bitmap.len());
         
-        // Header: item_count(8) + start_row(8) + end_row(8) + num_bits(8) + num_hashes(4) + bitmap_len(4)
+        // Header: item_count(8) + start_row(8) + end_row(8) + num_bits(8) + num_hashes(4) + bitmap_len(4) + sip_keys(32)
         bytes.extend_from_slice(&(self.item_count as u64).to_le_bytes());
         bytes.extend_from_slice(&(self.start_row as u64).to_le_bytes());
         bytes.extend_from_slice(&(self.end_row as u64).to_le_bytes());
         bytes.extend_from_slice(&(num_bits as u64).to_le_bytes());
         bytes.extend_from_slice(&(num_hashes as u32).to_le_bytes());
         bytes.extend_from_slice(&(bitmap.len() as u32).to_le_bytes());
+        // SIP keys: 4 x u64 = 32 bytes
+        bytes.extend_from_slice(&sip_keys[0].0.to_le_bytes());
+        bytes.extend_from_slice(&sip_keys[0].1.to_le_bytes());
+        bytes.extend_from_slice(&sip_keys[1].0.to_le_bytes());
+        bytes.extend_from_slice(&sip_keys[1].1.to_le_bytes());
         bytes.extend_from_slice(&bitmap);
         
         bytes
@@ -69,7 +75,7 @@ impl RowGroupBloomFilter {
     
     /// Deserialize bloom filter from bytes
     pub fn from_bytes(data: &[u8]) -> io::Result<Self> {
-        if data.len() < 40 {
+        if data.len() < 72 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Bloom filter data too short"));
         }
         
@@ -79,15 +85,18 @@ impl RowGroupBloomFilter {
         let num_bits = u64::from_le_bytes(data[24..32].try_into().unwrap()) as usize;
         let num_hashes = u32::from_le_bytes(data[32..36].try_into().unwrap()) as u32;
         let bitmap_len = u32::from_le_bytes(data[36..40].try_into().unwrap()) as usize;
+        // Read SIP keys
+        let sk0_0 = u64::from_le_bytes(data[40..48].try_into().unwrap());
+        let sk0_1 = u64::from_le_bytes(data[48..56].try_into().unwrap());
+        let sk1_0 = u64::from_le_bytes(data[56..64].try_into().unwrap());
+        let sk1_1 = u64::from_le_bytes(data[64..72].try_into().unwrap());
+        let sip_keys = [(sk0_0, sk0_1), (sk1_0, sk1_1)];
         
-        if data.len() < 40 + bitmap_len {
+        if data.len() < 72 + bitmap_len {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Bloom filter bitmap incomplete"));
         }
         
-        let bitmap = data[40..40 + bitmap_len].to_vec();
-        // Create default SIP keys for hash functions
-        let sip_keys = [(0x517cc1b727220a95u64, 0x7696e0c3a46c21e1u64), 
-                        (0x96f8ab7e8c3f5c2eu64, 0x31a3c7d9e2b4f8a0u64)];
+        let bitmap = data[72..72 + bitmap_len].to_vec();
         let filter = Bloom::from_existing(&bitmap, num_bits as u64, num_hashes, sip_keys);
         
         Ok(Self {
