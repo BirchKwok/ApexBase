@@ -42,10 +42,17 @@ pub enum SqlStatement {
     DropTable { table: String, if_exists: bool },
     AlterTable { table: String, operation: AlterTableOp },
     TruncateTable { table: String },
+    // Index Statements
+    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool, index_type: Option<String>, if_not_exists: bool },
+    DropIndex { name: String, table: String, if_exists: bool },
     // DML Statements
     Insert { table: String, columns: Option<Vec<String>>, values: Vec<Vec<Value>> },
     Delete { table: String, where_clause: Option<SqlExpr> },
     Update { table: String, assignments: Vec<(String, SqlExpr)>, where_clause: Option<SqlExpr> },
+    // Transaction Statements
+    BeginTransaction { read_only: bool },
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone)]
@@ -497,8 +504,12 @@ enum Token {
     Create, Drop, View,
     // DDL keywords
     Table, Alter, Add, Column, Rename, To, If, Truncate,
+    // Index keywords
+    Index, Unique, Using,
     // DML keywords
     Insert, Into, Values, Delete, Update, Set,
+    // Transaction keywords
+    Begin, Commit, Rollback, Transaction, Read,
     // Symbols
     Star,           // *
     Comma,          // ,
@@ -787,6 +798,10 @@ impl SqlParser {
                     "TO" => Token::To,
                     "IF" => Token::If,
                     "TRUNCATE" => Token::Truncate,
+                    // Index keywords
+                    "INDEX" => Token::Index,
+                    "UNIQUE" => Token::Unique,
+                    "USING" => Token::Using,
                     // DML keywords
                     "INSERT" => Token::Insert,
                     "INTO" => Token::Into,
@@ -794,6 +809,12 @@ impl SqlParser {
                     "DELETE" => Token::Delete,
                     "UPDATE" => Token::Update,
                     "SET" => Token::Set,
+                    // Transaction keywords
+                    "BEGIN" => Token::Begin,
+                    "COMMIT" => Token::Commit,
+                    "ROLLBACK" => Token::Rollback,
+                    "TRANSACTION" => Token::Transaction,
+                    "READ" => Token::Read,
                     _ => Token::Identifier(word),
                 };
                 tokens.push(SpannedToken { token, start, end: i });
@@ -877,7 +898,7 @@ impl SqlParser {
             Token::Identifier(s) => {
                 let u = s.to_uppercase();
                 // Keep list small and stable; used only for human-friendly hints.
-                const KWS: [&str; 61] = [
+                const KWS: [&str; 69] = [
                     "SELECT",
                     "FROM",
                     "WHERE",
@@ -934,6 +955,10 @@ impl SqlParser {
                     "COLUMN",
                     "RENAME",
                     "TRUNCATE",
+                    // Index keywords
+                    "INDEX",
+                    "UNIQUE",
+                    "USING",
                     // DML keywords
                     "INSERT",
                     "INTO",
@@ -941,6 +966,12 @@ impl SqlParser {
                     "DELETE",
                     "UPDATE",
                     "SET",
+                    // Transaction keywords
+                    "BEGIN",
+                    "COMMIT",
+                    "ROLLBACK",
+                    "TRANSACTION",
+                    "READ",
                 ];
 
                 // Fast path for common "plural" / extra trailing char typos: FROMs, WHEREs, LIKEs, LIMITs
@@ -1134,8 +1165,15 @@ impl SqlParser {
             }
             Token::Create => {
                 self.advance();
+                // CREATE UNIQUE INDEX ...
+                let unique = if matches!(self.current(), Token::Unique) {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
                 match self.current() {
-                    Token::View => {
+                    Token::View if !unique => {
                         self.advance();
                         let name = self.parse_identifier()?;
                         self.expect(Token::As)?;
@@ -1146,7 +1184,7 @@ impl SqlParser {
                         let stmt = self.parse_select_internal(true)?;
                         Ok(SqlStatement::CreateView { name, stmt })
                     }
-                    Token::Table => {
+                    Token::Table if !unique => {
                         self.advance();
                         // Check for IF NOT EXISTS
                         let if_not_exists = self.parse_if_not_exists()?;
@@ -1162,9 +1200,32 @@ impl SqlParser {
                         };
                         Ok(SqlStatement::CreateTable { table, columns, if_not_exists })
                     }
+                    Token::Index => {
+                        // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col1[, col2, ...]) [USING HASH|BTREE]
+                        self.advance();
+                        let if_not_exists = self.parse_if_not_exists()?;
+                        let name = self.parse_identifier()?;
+                        self.expect(Token::On)?;
+                        let table = self.parse_identifier()?;
+                        self.expect(Token::LParen)?;
+                        let columns = self.parse_identifier_list()?;
+                        self.expect(Token::RParen)?;
+                        let index_type = if matches!(self.current(), Token::Using) {
+                            self.advance();
+                            let t = self.parse_identifier()?;
+                            Some(t.to_uppercase())
+                        } else {
+                            None
+                        };
+                        Ok(SqlStatement::CreateIndex { name, table, columns, unique, index_type, if_not_exists })
+                    }
                     _ => {
                         let (start, _) = self.current_span();
-                        Err(self.syntax_error(start, "Expected TABLE or VIEW after CREATE".to_string()))
+                        if unique {
+                            Err(self.syntax_error(start, "Expected INDEX after CREATE UNIQUE".to_string()))
+                        } else {
+                            Err(self.syntax_error(start, "Expected TABLE, VIEW, or INDEX after CREATE".to_string()))
+                        }
                     }
                 }
             }
@@ -1183,9 +1244,18 @@ impl SqlParser {
                         let table = self.parse_identifier()?;
                         Ok(SqlStatement::DropTable { table, if_exists })
                     }
+                    Token::Index => {
+                        // DROP INDEX [IF EXISTS] name ON table
+                        self.advance();
+                        let if_exists = self.parse_if_exists()?;
+                        let name = self.parse_identifier()?;
+                        self.expect(Token::On)?;
+                        let table = self.parse_identifier()?;
+                        Ok(SqlStatement::DropIndex { name, table, if_exists })
+                    }
                     _ => {
                         let (start, _) = self.current_span();
-                        Err(self.syntax_error(start, "Expected TABLE or VIEW after DROP".to_string()))
+                        Err(self.syntax_error(start, "Expected TABLE, VIEW, or INDEX after DROP".to_string()))
                     }
                 }
             }
@@ -1243,6 +1313,34 @@ impl SqlParser {
                     None
                 };
                 Ok(SqlStatement::Update { table, assignments, where_clause })
+            }
+            Token::Begin => {
+                // BEGIN [TRANSACTION] [READ ONLY]
+                self.advance();
+                if matches!(self.current(), Token::Transaction) {
+                    self.advance();
+                }
+                let read_only = if matches!(self.current(), Token::Read) {
+                    self.advance();
+                    // Expect "ONLY" as identifier
+                    let word = self.parse_identifier()?;
+                    if word.to_uppercase() != "ONLY" {
+                        let (start, _) = self.current_span();
+                        return Err(self.syntax_error(start, "Expected ONLY after READ".to_string()));
+                    }
+                    true
+                } else {
+                    false
+                };
+                Ok(SqlStatement::BeginTransaction { read_only })
+            }
+            Token::Commit => {
+                self.advance();
+                Ok(SqlStatement::Commit)
+            }
+            Token::Rollback => {
+                self.advance();
+                Ok(SqlStatement::Rollback)
             }
             _ => {
                 let (start, _) = self.current_span();

@@ -8,12 +8,24 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 
 use super::conflict::{ConflictDetector, ConflictResult};
 use super::context::TxnContext;
 use crate::storage::mvcc::snapshot::{Snapshot, SnapshotManager};
 use crate::storage::mvcc::version_store::{VersionStore, next_timestamp};
+
+// ============================================================================
+// Global TxnManager Singleton
+// ============================================================================
+
+static TXN_MANAGER: Lazy<TxnManager> = Lazy::new(TxnManager::new_standalone);
+
+/// Get the global transaction manager
+pub fn txn_manager() -> &'static TxnManager {
+    &TXN_MANAGER
+}
 
 // ============================================================================
 // Transaction ID

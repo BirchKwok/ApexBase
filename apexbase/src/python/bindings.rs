@@ -149,6 +149,8 @@ pub struct ApexStorageImpl {
     fts_index_fields: RwLock<HashMap<String, Vec<String>>>,
     /// Durability level for ACID guarantees
     durability: DurabilityLevel,
+    /// Current active transaction ID (None if not in a transaction)
+    current_txn_id: RwLock<Option<u64>>,
 }
 
 /// Internal Rust-only methods (not exposed to Python)
@@ -395,6 +397,7 @@ impl ApexStorageImpl {
             fts_manager: RwLock::new(None),
             fts_index_fields: RwLock::new(HashMap::new()),
             durability: durability_level,
+            current_txn_id: RwLock::new(None),
         })
     }
 
@@ -955,11 +958,75 @@ impl ApexStorageImpl {
             }
         }
         
+        // Transaction handling: intercept BEGIN/COMMIT/ROLLBACK
+        let is_begin = sql_upper.starts_with("BEGIN");
+        let is_commit = sql_upper == "COMMIT" || sql_upper == "COMMIT;";
+        let is_rollback = sql_upper == "ROLLBACK" || sql_upper == "ROLLBACK;";
+        let current_txn = *self.current_txn_id.read();
+        let is_txn_dml = current_txn.is_some() && (is_write_op || sql_upper.starts_with("INSERT"));
+
         let sql = sql.to_string();
         let base_dir = self.base_dir.clone();
 
         let (columns, rows) = py.allow_threads(|| -> PyResult<(Vec<String>, Vec<Vec<Value>>)> {
-            // Execute using ApexExecutor
+            // Transaction-aware execution
+            if is_begin {
+                let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                // extract txn_id from Scalar result
+                if let ApexResult::Scalar(txn_id) = &result {
+                    // Store txn_id - will be set after allow_threads
+                    return Ok((vec!["txn_id".to_string()], vec![vec![Value::Int64(*txn_id)]]));
+                }
+                let batch = result.to_record_batch()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                return Ok((vec![], vec![]));
+            }
+
+            if is_commit {
+                if let Some(txn_id) = current_txn {
+                    let result = ApexExecutor::execute_commit_txn(txn_id, &base_dir, &table_path)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    if let ApexResult::Scalar(n) = &result {
+                        return Ok((vec!["rows_applied".to_string()], vec![vec![Value::Int64(*n)]]));
+                    }
+                }
+                return Ok((vec![], vec![]));
+            }
+
+            if is_rollback {
+                if let Some(txn_id) = current_txn {
+                    ApexExecutor::execute_rollback_txn(txn_id)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                }
+                return Ok((vec![], vec![]));
+            }
+
+            if is_txn_dml {
+                // Inside a transaction: buffer DML writes
+                let txn_id = current_txn.unwrap();
+                let parsed = SqlParser::parse(&sql)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let result = ApexExecutor::execute_in_txn(txn_id, parsed, &base_dir, &table_path)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                if let ApexResult::Scalar(n) = &result {
+                    return Ok((vec!["rows_buffered".to_string()], vec![vec![Value::Int64(*n)]]));
+                }
+                let batch = result.to_record_batch()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let columns: Vec<String> = batch.schema().fields().iter().map(|f| f.name().clone()).collect();
+                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(batch.num_rows());
+                for row_idx in 0..batch.num_rows() {
+                    let mut row: Vec<Value> = Vec::with_capacity(batch.num_columns());
+                    for col_idx in 0..batch.num_columns() {
+                        row.push(arrow_value_at(batch.column(col_idx), row_idx));
+                    }
+                    rows.push(row);
+                }
+                return Ok((columns, rows));
+            }
+
+            // Normal (non-transaction) execution
             let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             
@@ -987,14 +1054,31 @@ impl ApexStorageImpl {
             Ok((columns, rows))
         })?;
 
+        // Update transaction state after execution
+        if is_begin {
+            // Extract txn_id from first row
+            if let Some(row) = rows.first() {
+                if let Some(Value::Int64(txn_id)) = row.first() {
+                    *self.current_txn_id.write() = Some(*txn_id as u64);
+                }
+            }
+        }
+        if is_commit || is_rollback {
+            *self.current_txn_id.write() = None;
+            // Invalidate backend after transaction completes
+            if !table_name.is_empty() {
+                self.invalidate_backend(&table_name);
+            }
+        }
+
         let out = PyDict::new_bound(py);
-        out.set_item("columns", columns)?;
+        out.set_item("columns", &columns)?;
 
         let py_rows = PyList::empty_bound(py);
-        for row in rows {
+        for row in &rows {
             let py_row = PyList::empty_bound(py);
             for v in row {
-                py_row.append(value_to_py(py, &v)?)?;
+                py_row.append(value_to_py(py, v)?)?;
             }
             py_rows.append(py_row)?;
         }

@@ -184,6 +184,58 @@ fn evict_lru_cache_entries(cache: &mut AHashMap<PathBuf, (Arc<TableStorageBacken
     }
 }
 
+// ============================================================================
+// Global Index Manager Cache
+// ============================================================================
+// Key: base_dir path, Value: table_name -> IndexManager
+// Lazily loaded from disk catalog on first access per table
+static INDEX_CACHE: Lazy<RwLock<AHashMap<PathBuf, Arc<parking_lot::Mutex<crate::storage::index::IndexManager>>>>> =
+    Lazy::new(|| RwLock::new(AHashMap::with_capacity(32)));
+
+/// Get or create an IndexManager for a table. Returns None if base_dir is not available.
+/// The key is base_dir/table_name to uniquely identify each table's index manager.
+fn get_index_manager(base_dir: &Path, table_name: &str) -> Arc<parking_lot::Mutex<crate::storage::index::IndexManager>> {
+    use crate::storage::index::IndexManager;
+    let cache_key = base_dir.join(table_name);
+
+    // Fast path: check read lock
+    {
+        let cache = INDEX_CACHE.read();
+        if let Some(mgr) = cache.get(&cache_key) {
+            return mgr.clone();
+        }
+    }
+
+    // Slow path: create and cache
+    let mgr = IndexManager::load(table_name, base_dir).unwrap_or_else(|_| IndexManager::new(table_name, base_dir));
+    let mgr = Arc::new(parking_lot::Mutex::new(mgr));
+
+    let mut cache = INDEX_CACHE.write();
+    cache.entry(cache_key).or_insert_with(|| mgr.clone());
+    mgr
+}
+
+/// Invalidate index cache for a specific table
+#[allow(dead_code)]
+fn invalidate_index_cache(base_dir: &Path, table_name: &str) {
+    let cache_key = base_dir.join(table_name);
+    INDEX_CACHE.write().remove(&cache_key);
+}
+
+/// Invalidate all index cache entries under a directory
+fn invalidate_index_cache_dir(dir: &Path) {
+    INDEX_CACHE.write().retain(|path, _| !path.starts_with(dir));
+}
+
+/// Derive (base_dir, table_name) from a storage_path like /data/users.apex
+fn base_dir_and_table(storage_path: &Path) -> (PathBuf, String) {
+    let base_dir = storage_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let table_name = storage_path.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "default".to_string());
+    (base_dir, table_name)
+}
+
 /// Zone Map (min-max index) for a column
 /// Used to skip filtering when conditions can't match
 #[derive(Clone, Debug)]
@@ -303,6 +355,8 @@ pub fn invalidate_storage_cache_dir(dir: &Path) {
     // Use path directly - avoid expensive canonicalize
     let mut cache = STORAGE_CACHE.write();
     cache.retain(|path, _| !path.starts_with(dir));
+    // Also invalidate index caches
+    invalidate_index_cache_dir(dir);
 }
 
 /// Public wrapper for get_cached_backend (used by Python bindings for fast point lookups)
@@ -489,6 +543,15 @@ impl ApexExecutor {
             SqlStatement::TruncateTable { .. } => {
                 Self::execute_truncate(storage_path)
             }
+            SqlStatement::BeginTransaction { read_only } => {
+                Self::execute_begin(read_only)
+            }
+            SqlStatement::Commit => {
+                Err(err_input("COMMIT requires txn_id context - use execute_commit_txn()"))
+            }
+            SqlStatement::Rollback => {
+                Err(err_input("ROLLBACK requires txn_id context - use execute_rollback_txn()"))
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "DDL statements require base_dir context - use execute_with_base_dir()",
@@ -535,6 +598,23 @@ impl ApexExecutor {
             SqlStatement::Update { table, assignments, where_clause } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 Self::execute_update(&table_path, &assignments, where_clause.as_ref())
+            }
+            // Index Statements
+            SqlStatement::CreateIndex { name, table, columns, unique, index_type, if_not_exists } => {
+                Self::execute_create_index(base_dir, default_table_path, &name, &table, &columns, unique, index_type.as_deref(), if_not_exists)
+            }
+            SqlStatement::DropIndex { name, table, if_exists } => {
+                Self::execute_drop_index(base_dir, &name, &table, if_exists)
+            }
+            // Transaction Statements
+            SqlStatement::BeginTransaction { read_only } => {
+                Self::execute_begin(read_only)
+            }
+            SqlStatement::Commit => {
+                Err(err_input("COMMIT requires txn_id context - use execute_commit_txn()"))
+            }
+            SqlStatement::Rollback => {
+                Err(err_input("ROLLBACK requires txn_id context - use execute_rollback_txn()"))
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -716,7 +796,16 @@ impl ApexExecutor {
                             && stmt.group_by.is_empty()
                             && !has_aggregation_check;
                         
-                        // FAST PATH 0: Check for _id = X pattern (O(1) lookup)
+                        // FAST PATH INDEX: Check if WHERE clause can use a secondary index
+                        if let Some(ref where_clause) = stmt.where_clause {
+                            if let Some(result) = Self::try_index_accelerated_read(
+                                &backend, &stmt, where_clause, base_dir, storage_path,
+                            )? {
+                                return Ok(result);
+                            }
+                        }
+
+                    // FAST PATH 0: Check for _id = X pattern (O(1) lookup)
                         if let Some(where_clause) = &stmt.where_clause {
                             if let Some(id) = Self::extract_id_equality_filter(where_clause) {
                                 if let Some(batch) = backend.read_row_by_id_to_arrow(id)? {
@@ -887,6 +976,146 @@ impl ApexExecutor {
         };
 
         Ok(ApexResult::Data(result))
+    }
+
+    /// Try to use a secondary index to accelerate a SELECT query.
+    /// Returns Some(result) if an index was used, None to fall through to scan paths.
+    /// Only used for simple equality WHERE clauses on indexed columns (no GROUP BY/aggregation).
+    fn try_index_accelerated_read(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+        where_clause: &SqlExpr,
+        base_dir: &Path,
+        storage_path: &Path,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::storage::index::index_manager::PredicateHint;
+        use crate::query::sql_parser::BinaryOperator;
+
+        // Only use index for simple queries: no GROUP BY, no aggregation, no JOIN
+        if !stmt.group_by.is_empty() || !stmt.joins.is_empty() {
+            return Ok(None);
+        }
+        let has_agg = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Aggregate { .. }));
+        if has_agg {
+            return Ok(None);
+        }
+
+        // Extract equality predicate: col = literal
+        let (col_name, hint) = match where_clause {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                if let SqlExpr::Column(col) = left.as_ref() {
+                    if col == "_id" {
+                        return Ok(None); // _id lookups already have a dedicated O(1) fast path
+                    }
+                    if let Some(val) = Self::expr_to_value(right) {
+                        (col.clone(), PredicateHint::Eq(val))
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+            SqlExpr::In { column, values, negated } => {
+                if *negated || column == "_id" {
+                    return Ok(None);
+                }
+                (column.clone(), PredicateHint::In(values.clone()))
+            }
+            _ => return Ok(None),
+        };
+
+        // Check if we have an index for this column
+        let (bd, tname) = base_dir_and_table(storage_path);
+        let idx_mgr_arc = get_index_manager(&bd, &tname);
+        let mut idx_mgr = idx_mgr_arc.lock();
+
+        if !idx_mgr.has_index_on(&col_name) {
+            return Ok(None);
+        }
+
+        // Do the index lookup
+        let lookup_result = idx_mgr.lookup(&col_name, &hint)?;
+        let row_ids = match lookup_result {
+            Some(r) => r.row_ids,
+            None => return Ok(None),
+        };
+
+        if row_ids.is_empty() {
+            let empty = backend.read_columns_to_arrow(None, 0, Some(0))?;
+            return Ok(Some(ApexResult::Empty(empty.schema())));
+        }
+
+        // Read matching rows by their _ids
+        // For small result sets, read individual rows and concat
+        // For large result sets, fall back to scan (index not beneficial)
+        let total_rows = backend.active_row_count();
+        if row_ids.len() > (total_rows as usize) / 2 {
+            return Ok(None); // Not selective enough, full scan is better
+        }
+
+        // Read matching rows one by one and concat
+        let mut batches: Vec<RecordBatch> = Vec::with_capacity(row_ids.len().min(1024));
+        for &rid in &row_ids {
+            if let Some(batch) = backend.read_row_by_id_to_arrow(rid)? {
+                batches.push(batch);
+            }
+        }
+
+        if batches.is_empty() {
+            let empty = backend.read_columns_to_arrow(None, 0, Some(0))?;
+            return Ok(Some(ApexResult::Empty(empty.schema())));
+        }
+
+        // Concat all batches into one
+        let schema = batches[0].schema();
+        let combined = arrow::compute::concat_batches(&schema, &batches)
+            .map_err(|e| err_data(e.to_string()))?;
+
+        // Apply ORDER BY if present
+        let sorted = if !stmt.order_by.is_empty() {
+            Self::apply_order_by(&combined, &stmt.order_by)?
+        } else {
+            combined
+        };
+
+        // Apply OFFSET + LIMIT
+        let result = {
+            let offset = stmt.offset.unwrap_or(0);
+            let total = sorted.num_rows();
+            if offset >= total {
+                sorted.slice(0, 0)
+            } else if let Some(limit) = stmt.limit {
+                let end = (offset + limit).min(total);
+                sorted.slice(offset, end - offset)
+            } else if offset > 0 {
+                sorted.slice(offset, total - offset)
+            } else {
+                sorted
+            }
+        };
+
+        // Apply column projection if not SELECT *
+        if !stmt.is_select_star() {
+            let projected = Self::apply_projection(&result, &stmt.columns)?;
+            if projected.num_rows() == 0 {
+                return Ok(Some(ApexResult::Empty(projected.schema())));
+            }
+            return Ok(Some(ApexResult::Data(projected)));
+        }
+
+        if result.num_rows() == 0 {
+            return Ok(Some(ApexResult::Empty(result.schema())));
+        }
+        Ok(Some(ApexResult::Data(result)))
+    }
+
+    /// Convert a SqlExpr literal to a Value (for index lookup)
+    fn expr_to_value(expr: &SqlExpr) -> Option<Value> {
+        match expr {
+            SqlExpr::Literal(v) => Some(v.clone()),
+            _ => None,
+        }
     }
 
     /// Fast path for simple string equality filters on dictionary-encoded columns
@@ -3547,6 +3776,28 @@ impl ApexExecutor {
                 (BinaryOperator::Le, false) | (BinaryOperator::Ge, true) => cmp::lt_eq(int_arr, &scalar),
                 (BinaryOperator::Gt, false) | (BinaryOperator::Lt, true) => cmp::gt(int_arr, &scalar),
                 (BinaryOperator::Ge, false) | (BinaryOperator::Le, true) => cmp::gt_eq(int_arr, &scalar),
+                _ => return Ok(None),
+            };
+            return result.map(Some).map_err(|e| err_data( e.to_string()));
+        }
+        
+        // UInt64 scalar comparison (for _id column)
+        if let Some(uint_arr) = col_array.as_any().downcast_ref::<UInt64Array>() {
+            let uint_val = match lit_val {
+                Value::UInt64(i) => *i,
+                Value::Int64(i) => *i as u64,
+                Value::UInt32(i) => *i as u64,
+                Value::Int32(i) => *i as u64,
+                _ => return Ok(None),
+            };
+            let scalar = Scalar::new(UInt64Array::from(vec![uint_val]));
+            let result = match (op, reversed) {
+                (BinaryOperator::Eq, _) => cmp::eq(uint_arr, &scalar),
+                (BinaryOperator::NotEq, _) => cmp::neq(uint_arr, &scalar),
+                (BinaryOperator::Lt, false) | (BinaryOperator::Gt, true) => cmp::lt(uint_arr, &scalar),
+                (BinaryOperator::Le, false) | (BinaryOperator::Ge, true) => cmp::lt_eq(uint_arr, &scalar),
+                (BinaryOperator::Gt, false) | (BinaryOperator::Lt, true) => cmp::gt(uint_arr, &scalar),
+                (BinaryOperator::Ge, false) | (BinaryOperator::Le, true) => cmp::gt_eq(uint_arr, &scalar),
                 _ => return Ok(None),
             };
             return result.map(Some).map_err(|e| err_data( e.to_string()));
@@ -8149,16 +8400,29 @@ impl ApexExecutor {
         let r_is_f = right.as_any().downcast_ref::<Float64Array>().is_some();
         let l_is_i = left.as_any().downcast_ref::<Int64Array>().is_some();
         let r_is_i = right.as_any().downcast_ref::<Int64Array>().is_some();
+        let l_is_u = left.as_any().downcast_ref::<UInt64Array>().is_some();
+        let r_is_u = right.as_any().downcast_ref::<UInt64Array>().is_some();
 
-        if (l_is_f && r_is_i) {
+        if l_is_f && r_is_i {
             let r2 = cast(&right, &DataType::Float64)
                 .map_err(|e| err_data( e.to_string()))?;
             return Ok((left, r2));
         }
-        if (l_is_i && r_is_f) {
+        if l_is_i && r_is_f {
             let l2 = cast(&left, &DataType::Float64)
                 .map_err(|e| err_data( e.to_string()))?;
             return Ok((l2, right));
+        }
+        // UInt64 ↔ Int64 coercion (e.g. _id column is UInt64, literals are Int64)
+        if l_is_u && r_is_i {
+            let l2 = cast(&left, &DataType::Int64)
+                .map_err(|e| err_data( e.to_string()))?;
+            return Ok((l2, right));
+        }
+        if l_is_i && r_is_u {
+            let r2 = cast(&right, &DataType::Int64)
+                .map_err(|e| err_data( e.to_string()))?;
+            return Ok((left, r2));
         }
 
         Ok((left, right))
@@ -9545,6 +9809,480 @@ impl ApexExecutor {
         Ok(ApexResult::Scalar(0))
     }
 
+    // ========== Transaction Execution Methods ==========
+
+    /// Execute BEGIN [TRANSACTION] [READ ONLY]
+    /// Returns the transaction ID as a scalar result
+    fn execute_begin(read_only: bool) -> io::Result<ApexResult> {
+        let mgr = crate::txn::txn_manager();
+        let txn_id = if read_only {
+            mgr.begin_read_only()
+        } else {
+            mgr.begin()
+        };
+        Ok(ApexResult::Scalar(txn_id as i64))
+    }
+
+    /// Execute COMMIT for a specific transaction
+    /// Validates OCC conflicts, then applies all buffered writes to storage
+    pub fn execute_commit_txn(txn_id: u64, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+        let mgr = crate::txn::txn_manager();
+
+        // Extract buffered writes before commit validation
+        let writes = mgr.with_context(txn_id, |ctx| {
+            Ok(ctx.write_set().to_vec())
+        })?;
+
+        // Commit validates OCC conflicts (read-set + write-set check)
+        mgr.commit(txn_id).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Transaction conflict: {}", e))
+        })?;
+
+        // Apply buffered writes to storage
+        let mut applied = 0i64;
+        for write in &writes {
+            let result = Self::apply_txn_write(write, base_dir, default_table_path);
+            match result {
+                Ok(count) => applied += count,
+                Err(e) => {
+                    eprintln!("Warning: failed to apply txn write: {}", e);
+                }
+            }
+        }
+
+        Ok(ApexResult::Scalar(applied))
+    }
+
+    /// Apply a single buffered write from a committed transaction
+    fn apply_txn_write(
+        write: &crate::txn::context::TxnWrite,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<i64> {
+        use crate::txn::context::TxnWrite;
+        match write {
+            TxnWrite::Insert { table, data, .. } => {
+                let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
+                let columns: Vec<String> = data.keys().cloned().collect();
+                let values: Vec<Value> = columns.iter().map(|c| data[c].clone()).collect();
+                let values_list = vec![values];
+                Self::execute_insert(&table_path, Some(&columns), &values_list)?;
+                Ok(1)
+            }
+            TxnWrite::Delete { table, row_id, .. } => {
+                let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
+                let where_clause = SqlExpr::BinaryOp {
+                    left: Box::new(SqlExpr::Column("_id".to_string())),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(SqlExpr::Literal(Value::UInt64(*row_id))),
+                };
+                Self::execute_delete(&table_path, Some(&where_clause))?;
+                Ok(1)
+            }
+            TxnWrite::Update { table, row_id, new_data, .. } => {
+                let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
+                let assignments: Vec<(String, SqlExpr)> = new_data.iter().map(|(col, val)| {
+                    (col.clone(), SqlExpr::Literal(val.clone()))
+                }).collect();
+                let where_clause = SqlExpr::BinaryOp {
+                    left: Box::new(SqlExpr::Column("_id".to_string())),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(SqlExpr::Literal(Value::UInt64(*row_id))),
+                };
+                Self::execute_update(&table_path, &assignments, Some(&where_clause))?;
+                Ok(1)
+            }
+        }
+    }
+
+    /// Execute ROLLBACK for a specific transaction
+    pub fn execute_rollback_txn(txn_id: u64) -> io::Result<ApexResult> {
+        let mgr = crate::txn::txn_manager();
+        mgr.rollback(txn_id)?;
+        Ok(ApexResult::Scalar(0))
+    }
+
+    /// Execute a DML statement within a transaction (buffers writes in TxnContext)
+    /// Returns the count of buffered operations
+    pub fn execute_in_txn(
+        txn_id: u64,
+        stmt: SqlStatement,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<ApexResult> {
+        let mgr = crate::txn::txn_manager();
+
+        match stmt {
+            SqlStatement::Insert { table, columns, values } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                let storage = TableStorageBackend::open(&table_path)?;
+                let schema = storage.get_schema();
+                // Use existing write count + active rows as base to ensure unique synthetic row IDs
+                let existing_writes = mgr.with_context(txn_id, |ctx| {
+                    Ok(ctx.write_set().len() as u64)
+                })?;
+                let base_id = storage.active_row_count() + existing_writes;
+                let mut buffered = 0i64;
+                for (ri, row_values) in values.iter().enumerate() {
+                    let row_id = base_id + ri as u64;
+                    let col_names: Vec<String> = if let Some(cols) = &columns {
+                        cols.clone()
+                    } else {
+                        schema.iter().map(|(n, _)| n.clone()).collect()
+                    };
+                    let mut data = std::collections::HashMap::new();
+                    for (i, val) in row_values.iter().enumerate() {
+                        if i < col_names.len() {
+                            data.insert(col_names[i].clone(), val.clone());
+                        }
+                    }
+                    mgr.with_context(txn_id, |ctx| {
+                        ctx.buffer_insert(&table, row_id, data)
+                    })?;
+                    buffered += 1;
+                }
+                Ok(ApexResult::Scalar(buffered))
+            }
+            SqlStatement::Delete { table, where_clause } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                let storage = TableStorageBackend::open(&table_path)?;
+                let mut buffered = 0i64;
+
+                // Extract columns from WHERE clause + always include _id
+                let mut needed_cols: Vec<String> = vec!["_id".to_string()];
+                if let Some(we) = &where_clause {
+                    Self::collect_columns_from_expr(we, &mut needed_cols);
+                }
+                needed_cols.sort();
+                needed_cols.dedup();
+                let col_refs: Vec<&str> = needed_cols.iter().map(|s| s.as_str()).collect();
+                let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
+
+                if let Some(where_expr) = &where_clause {
+                    let filter = Self::evaluate_predicate(&batch, where_expr)?;
+                    for i in 0..filter.len() {
+                        if filter.value(i) {
+                            if let Some(id_col) = batch.column_by_name("_id") {
+                                let rid = if let Some(a) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                                    Some(a.value(i))
+                                } else if let Some(a) = id_col.as_any().downcast_ref::<Int64Array>() {
+                                    Some(a.value(i) as u64)
+                                } else { None };
+                                if let Some(rid) = rid {
+                                    mgr.with_context(txn_id, |ctx| {
+                                        ctx.buffer_delete(&table, rid, std::collections::HashMap::new())
+                                    })?;
+                                    buffered += 1;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // DELETE all
+                    let col_refs2: Vec<&str> = vec!["_id"];
+                    let batch2 = storage.read_columns_to_arrow(Some(&col_refs2), 0, None)?;
+                    if let Some(id_col) = batch2.column_by_name("_id") {
+                        let len = id_col.len();
+                        for i in 0..len {
+                            let rid = if let Some(a) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                                Some(a.value(i))
+                            } else if let Some(a) = id_col.as_any().downcast_ref::<Int64Array>() {
+                                Some(a.value(i) as u64)
+                            } else { None };
+                            if let Some(rid) = rid {
+                                mgr.with_context(txn_id, |ctx| {
+                                    ctx.buffer_delete(&table, rid, std::collections::HashMap::new())
+                                })?;
+                                buffered += 1;
+                            }
+                        }
+                    }
+                }
+                Ok(ApexResult::Scalar(buffered))
+            }
+            SqlStatement::Update { table, assignments, where_clause } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                let storage = TableStorageBackend::open(&table_path)?;
+                let schema = storage.get_schema();
+                let mut needed_cols: Vec<String> = vec!["_id".to_string()];
+                if let Some(we) = &where_clause {
+                    Self::collect_columns_from_expr(we, &mut needed_cols);
+                }
+                // Also include columns from assignments for old_data
+                for (col, _) in &assignments {
+                    if !needed_cols.contains(col) {
+                        needed_cols.push(col.clone());
+                    }
+                }
+                needed_cols.sort();
+                needed_cols.dedup();
+                let col_refs: Vec<&str> = needed_cols.iter().map(|s| s.as_str()).collect();
+                let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
+                let mut buffered = 0i64;
+
+                let filter = if let Some(where_expr) = &where_clause {
+                    Self::evaluate_predicate(&batch, where_expr)?
+                } else {
+                    BooleanArray::from(vec![true; batch.num_rows()])
+                };
+
+                for i in 0..filter.len() {
+                    if filter.value(i) {
+                        if let Some(id_col) = batch.column_by_name("_id") {
+                            let rid = if let Some(a) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                                Some(a.value(i))
+                            } else if let Some(a) = id_col.as_any().downcast_ref::<Int64Array>() {
+                                Some(a.value(i) as u64)
+                            } else { None };
+                            if let Some(rid) = rid {
+                                let mut new_data = std::collections::HashMap::new();
+                                for (col, expr) in &assignments {
+                                    if let SqlExpr::Literal(val) = expr {
+                                        new_data.insert(col.clone(), val.clone());
+                                    }
+                                }
+                                mgr.with_context(txn_id, |ctx| {
+                                    ctx.buffer_update(&table, rid, std::collections::HashMap::new(), new_data)
+                                })?;
+                                buffered += 1;
+                            }
+                        }
+                    }
+                }
+                Ok(ApexResult::Scalar(buffered))
+            }
+            SqlStatement::Select(select) => {
+                Self::execute_parsed_multi(SqlStatement::Select(select), base_dir, default_table_path)
+            }
+            SqlStatement::Commit => Self::execute_commit_txn(txn_id, base_dir, default_table_path),
+            SqlStatement::Rollback => Self::execute_rollback_txn(txn_id),
+            other => Self::execute_parsed_multi(other, base_dir, default_table_path),
+        }
+    }
+
+    // ========== Index DDL Execution Methods ==========
+
+    /// Execute CREATE INDEX statement
+    /// Builds the index from existing data in the table
+    fn execute_create_index(
+        base_dir: &Path,
+        default_table_path: &Path,
+        name: &str,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+        index_type_str: Option<&str>,
+        if_not_exists: bool,
+    ) -> io::Result<ApexResult> {
+        use crate::storage::index::{IndexType, IndexManager};
+        use crate::storage::index::btree::IndexKey;
+        use crate::data::Value;
+
+        if columns.is_empty() {
+            return Err(err_input("CREATE INDEX requires at least one column"));
+        }
+        // Currently support single-column indexes only
+        if columns.len() > 1 {
+            return Err(err_input("Multi-column indexes not yet supported"));
+        }
+        let col_name = &columns[0];
+
+        let idx_type = match index_type_str {
+            Some("HASH") => IndexType::Hash,
+            Some("BTREE") | Some("B-TREE") | Some("B_TREE") => IndexType::BTree,
+            None => {
+                // Default: HASH for equality-heavy columns, BTREE otherwise
+                IndexType::Hash
+            }
+            Some(other) => return Err(err_input(format!("Unknown index type: {}. Use HASH or BTREE", other))),
+        };
+
+        let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
+        if !table_path.exists() {
+            return Err(err_not_found(format!("Table '{}' does not exist", table)));
+        }
+
+        // Get the IndexManager for this table
+        let idx_mgr_arc = get_index_manager(base_dir, table);
+        let mut idx_mgr = idx_mgr_arc.lock();
+
+        // Check if already exists
+        if idx_mgr.get_index_meta(name).is_some() {
+            if if_not_exists {
+                return Ok(ApexResult::Scalar(0));
+            }
+            return Err(err_input(format!("Index '{}' already exists on table '{}'", name, table)));
+        }
+
+        // Determine column data type from table schema
+        let storage = TableStorageBackend::open(&table_path)?;
+        let schema = storage.get_schema();
+        let data_type = schema.iter()
+            .find(|(n, _)| n == col_name)
+            .map(|(_, dt)| dt.clone())
+            .ok_or_else(|| err_not_found(format!("Column '{}' not found in table '{}'", col_name, table)))?;
+
+        // Create the index
+        idx_mgr.create_index(name, col_name, idx_type, unique, data_type)?;
+
+        // Build index from existing data
+        let row_count = storage.row_count();
+        if row_count > 0 {
+            // Read _id column and the indexed column
+            let col_refs = ["_id", col_name.as_str()];
+            let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
+
+            let id_col = batch.column_by_name("_id")
+                .ok_or_else(|| err_data("_id column not found"))?;
+            let data_col = batch.column_by_name(col_name)
+                .ok_or_else(|| err_data(format!("Column '{}' not found in result", col_name)))?;
+
+            let id_arr = id_col.as_any().downcast_ref::<UInt64Array>()
+                .or_else(|| None);
+            let id_arr_i64 = id_col.as_any().downcast_ref::<Int64Array>();
+
+            for row in 0..batch.num_rows() {
+                let row_id: u64 = if let Some(arr) = id_arr {
+                    arr.value(row)
+                } else if let Some(arr) = id_arr_i64 {
+                    arr.value(row) as u64
+                } else {
+                    row as u64
+                };
+
+                // Extract value from data column
+                let value = Self::arrow_value_at_col(data_col, row);
+                let mut col_vals = std::collections::HashMap::new();
+                col_vals.insert(col_name.clone(), value);
+                idx_mgr.on_insert(row_id, &col_vals)?;
+            }
+        }
+
+        // Save index to disk
+        idx_mgr.save()?;
+
+        Ok(ApexResult::Scalar(row_count as i64))
+    }
+
+    /// Execute DROP INDEX statement
+    fn execute_drop_index(
+        base_dir: &Path,
+        name: &str,
+        table: &str,
+        if_exists: bool,
+    ) -> io::Result<ApexResult> {
+        let idx_mgr_arc = get_index_manager(base_dir, table);
+        let mut idx_mgr = idx_mgr_arc.lock();
+
+        if idx_mgr.get_index_meta(name).is_none() {
+            if if_exists {
+                return Ok(ApexResult::Scalar(0));
+            }
+            return Err(err_not_found(format!("Index '{}' not found on table '{}'", name, table)));
+        }
+
+        idx_mgr.drop_index(name)?;
+        idx_mgr.save()?;
+
+        // Invalidate index cache to reload on next access
+        invalidate_index_cache(base_dir, table);
+
+        Ok(ApexResult::Scalar(0))
+    }
+
+    /// Extract a Value from an Arrow ArrayRef at a given row index (for index building)
+    fn arrow_value_at_col(col: &ArrayRef, row: usize) -> Value {
+        use arrow::array::{BooleanArray, Float32Array};
+        if col.is_null(row) {
+            return Value::Null;
+        }
+        if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+            Value::Int64(arr.value(row))
+        } else if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
+            Value::UInt64(arr.value(row))
+        } else if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+            Value::Float64(arr.value(row))
+        } else if let Some(arr) = col.as_any().downcast_ref::<Float32Array>() {
+            Value::Float32(arr.value(row))
+        } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+            Value::String(arr.value(row).to_string())
+        } else if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
+            Value::Bool(arr.value(row))
+        } else {
+            Value::Null
+        }
+    }
+
+    // ========== Index Maintenance Helpers ==========
+
+    /// Notify indexes that rows were inserted.
+    /// Called after SQL INSERT completes. Reads newly inserted rows' indexed columns.
+    fn notify_index_insert(storage_path: &Path, storage: &TableStorageBackend, start_row_count: u64) {
+        let (base_dir, table_name) = base_dir_and_table(storage_path);
+        let idx_mgr_arc = get_index_manager(&base_dir, &table_name);
+        let mut idx_mgr = idx_mgr_arc.lock();
+        if idx_mgr.list_indexes().is_empty() {
+            return;
+        }
+
+        // Read _id + indexed columns for new rows
+        let indexed_cols: Vec<String> = idx_mgr.list_indexes().iter()
+            .map(|m| m.column_name.clone())
+            .collect();
+        let mut col_names: Vec<String> = vec!["_id".to_string()];
+        col_names.extend(indexed_cols.iter().cloned());
+        col_names.sort();
+        col_names.dedup();
+
+        let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+        let new_count = storage.row_count();
+        if new_count <= start_row_count {
+            return;
+        }
+        // Read all rows and only process new ones (rows after start_row_count)
+        if let Ok(batch) = storage.read_columns_to_arrow(Some(&col_refs), 0, None) {
+            let id_col = batch.column_by_name("_id");
+            // Process rows from start_row_count onwards
+            let start = start_row_count as usize;
+            for row in start..batch.num_rows() {
+                let row_id = if let Some(col) = id_col {
+                    if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
+                        arr.value(row)
+                    } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                        arr.value(row) as u64
+                    } else { continue; }
+                } else { continue; };
+
+                let mut col_vals = std::collections::HashMap::new();
+                for col_name in &indexed_cols {
+                    if let Some(col) = batch.column_by_name(col_name) {
+                        col_vals.insert(col_name.clone(), Self::arrow_value_at_col(col, row));
+                    }
+                }
+                let _ = idx_mgr.on_insert(row_id, &col_vals);
+            }
+            let _ = idx_mgr.save();
+        }
+    }
+
+    /// Notify indexes that rows were deleted.
+    /// `deleted_ids` contains the _ids of deleted rows with their column values.
+    fn notify_index_delete(storage_path: &Path, deleted_entries: &[(u64, std::collections::HashMap<String, Value>)]) {
+        if deleted_entries.is_empty() {
+            return;
+        }
+        let (base_dir, table_name) = base_dir_and_table(storage_path);
+        let idx_mgr_arc = get_index_manager(&base_dir, &table_name);
+        let mut idx_mgr = idx_mgr_arc.lock();
+        if idx_mgr.list_indexes().is_empty() {
+            return;
+        }
+        for (row_id, col_vals) in deleted_entries {
+            idx_mgr.on_delete(*row_id, col_vals);
+        }
+        let _ = idx_mgr.save();
+    }
+
     // ========== DML Execution Methods ==========
 
     /// Execute INSERT statement
@@ -9600,9 +10338,15 @@ impl ApexExecutor {
         
         let rows_inserted = values.len() as i64;
         
+        // Capture row count before insert for index maintenance
+        let pre_insert_count = storage.row_count();
+        
         // Use insert_typed + save for reliable writes
         storage.insert_typed(int_columns, float_columns, string_columns, HashMap::new(), bool_columns)?;
         storage.save()?;
+        
+        // Update indexes for newly inserted rows
+        Self::notify_index_insert(storage_path, &storage, pre_insert_count);
         
         // Invalidate cache after write to ensure subsequent reads get fresh data
         invalidate_storage_cache(storage_path);
@@ -9622,28 +10366,57 @@ impl ApexExecutor {
         // Invalidate cache before write
         invalidate_storage_cache(storage_path);
         
+        // Collect indexed column names for this table (for index maintenance)
+        let indexed_cols: Vec<String> = {
+            let (bd, tn) = base_dir_and_table(storage_path);
+            let mgr = get_index_manager(&bd, &tn);
+            let lock = mgr.lock();
+            lock.list_indexes().iter().map(|m| m.column_name.clone()).collect()
+        };
+
         // For DELETE without WHERE, delete all rows (soft delete)
         if where_clause.is_none() {
-            // Soft delete only marks rows in bitmap - no need to load all column data
             let storage = TableStorageBackend::open(storage_path)?;
             let count = storage.active_row_count() as i64;
             
-            // Only read _id column for soft deletion (not all columns)
-            let batch = storage.read_columns_to_arrow(Some(&["_id"]), 0, None)?;
+            // Read _id + indexed columns for index maintenance
+            let mut read_cols: Vec<String> = vec!["_id".to_string()];
+            read_cols.extend(indexed_cols.iter().cloned());
+            read_cols.sort();
+            read_cols.dedup();
+            let col_refs: Vec<&str> = read_cols.iter().map(|s| s.as_str()).collect();
+            let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
+
+            let mut deleted_entries: Vec<(u64, std::collections::HashMap<String, Value>)> = Vec::new();
             if let Some(id_col) = batch.column_by_name("_id") {
                 if let Some(id_arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
                     for i in 0..id_arr.len() {
-                        storage.delete(id_arr.value(i));
+                        let rid = id_arr.value(i);
+                        let mut vals = std::collections::HashMap::new();
+                        for cn in &indexed_cols {
+                            if let Some(c) = batch.column_by_name(cn) {
+                                vals.insert(cn.clone(), Self::arrow_value_at_col(c, i));
+                            }
+                        }
+                        deleted_entries.push((rid, vals));
+                        storage.delete(rid);
                     }
                 } else if let Some(id_arr) = id_col.as_any().downcast_ref::<Int64Array>() {
                     for i in 0..id_arr.len() {
-                        storage.delete(id_arr.value(i) as u64);
+                        let rid = id_arr.value(i) as u64;
+                        let mut vals = std::collections::HashMap::new();
+                        for cn in &indexed_cols {
+                            if let Some(c) = batch.column_by_name(cn) {
+                                vals.insert(cn.clone(), Self::arrow_value_at_col(c, i));
+                            }
+                        }
+                        deleted_entries.push((rid, vals));
+                        storage.delete(rid);
                     }
                 }
             }
             storage.save()?;
-            
-            // Invalidate cache after write
+            Self::notify_index_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
             return Ok(ApexResult::Scalar(count));
         }
@@ -9651,9 +10424,10 @@ impl ApexExecutor {
         // Soft delete only marks rows in bitmap
         let storage = TableStorageBackend::open(storage_path)?;
         
-        // Extract column names from WHERE clause
+        // Extract column names from WHERE clause + indexed columns
         let mut where_cols: Vec<String> = Vec::new();
         Self::collect_columns_from_expr(where_clause.unwrap(), &mut where_cols);
+        where_cols.extend(indexed_cols.iter().cloned());
         where_cols.sort();
         where_cols.dedup();
         
@@ -9666,27 +10440,35 @@ impl ApexExecutor {
         let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
         let filter_mask = Self::evaluate_predicate(&batch, where_clause.unwrap())?;
         
-        // Count and delete matching rows
+        // Count and delete matching rows, collect entries for index maintenance
         let mut deleted = 0i64;
+        let mut deleted_entries: Vec<(u64, std::collections::HashMap<String, Value>)> = Vec::new();
         for i in 0..filter_mask.len() {
             if filter_mask.value(i) {
                 if let Some(id_col) = batch.column_by_name("_id") {
-                    if let Some(id_arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
-                        storage.delete(id_arr.value(i));
-                        deleted += 1;
+                    let rid = if let Some(id_arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                        Some(id_arr.value(i))
                     } else if let Some(id_arr) = id_col.as_any().downcast_ref::<Int64Array>() {
-                        storage.delete(id_arr.value(i) as u64);
+                        Some(id_arr.value(i) as u64)
+                    } else { None };
+                    if let Some(rid) = rid {
+                        let mut vals = std::collections::HashMap::new();
+                        for cn in &indexed_cols {
+                            if let Some(c) = batch.column_by_name(cn) {
+                                vals.insert(cn.clone(), Self::arrow_value_at_col(c, i));
+                            }
+                        }
+                        deleted_entries.push((rid, vals));
+                        storage.delete(rid);
                         deleted += 1;
                     }
                 }
             }
         }
         
-        // Only save if rows were actually deleted
-        // Calling save() with lazy-loaded storage (no column data) would corrupt the file
         if deleted > 0 {
             storage.save()?;
-            // Invalidate cache after write
+            Self::notify_index_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
         }
         
@@ -9712,42 +10494,29 @@ impl ApexExecutor {
         // Invalidate cache before write
         invalidate_storage_cache(storage_path);
         
-        // OPTIMIZATION: Only read columns needed for WHERE + columns being updated + _id
-        // This avoids loading unnecessary columns (can save 50-90% IO for wide tables)
+        // Collect indexed column names for index maintenance
+        let indexed_cols: Vec<String> = {
+            let (bd, tn) = base_dir_and_table(storage_path);
+            let mgr = get_index_manager(&bd, &tn);
+            let lock = mgr.lock();
+            lock.list_indexes().iter().map(|m| m.column_name.clone()).collect()
+        };
+        
+        // Read ALL columns: UPDATE uses delete+insert, so we need the complete row
+        // to re-insert with updated values. Reading only a subset would lose columns.
         let storage = TableStorageBackend::open(storage_path)?;
+        let batch = storage.read_columns_to_arrow(None, 0, None)?;
         
-        // Collect required columns: WHERE columns + assignment target columns + _id
-        let mut required_cols: Vec<String> = Vec::new();
-        
-        // Add columns from WHERE clause
-        if let Some(where_expr) = where_clause {
-            Self::collect_columns_from_expr(where_expr, &mut required_cols);
-        }
-        
-        // Add columns being assigned (both target and source columns in expressions)
-        for (col_name, expr) in assignments {
-            required_cols.push(col_name.clone());
-            Self::collect_columns_from_expr(expr, &mut required_cols);
-        }
-        
-        // Always include _id
-        required_cols.push("_id".to_string());
-        required_cols.sort();
-        required_cols.dedup();
-        
-        let col_refs: Vec<&str> = required_cols.iter().map(|s| s.as_str()).collect();
-        let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
-        
-        // Find rows to update
         let filter_mask = if let Some(where_expr) = where_clause {
             Self::evaluate_predicate(&batch, where_expr)?
         } else {
-            // Update all rows
             BooleanArray::from(vec![true; batch.num_rows()])
         };
         
-        // Collect IDs and new values for matching rows
-        let mut updates: Vec<(u64, StdHashMap<String, Value>)> = Vec::new();
+        // Collect IDs, original batch row index, old values (for index delete), and new values
+        // (batch_row_idx, row_id, update_data)
+        let mut updates: Vec<(usize, u64, StdHashMap<String, Value>)> = Vec::new();
+        let mut deleted_entries: Vec<(u64, std::collections::HashMap<String, Value>)> = Vec::new();
         
         for i in 0..filter_mask.len() {
             if filter_mask.value(i) {
@@ -9760,46 +10529,60 @@ impl ApexExecutor {
                         continue;
                     };
                     
-                    // Build update map
+                    // Collect old indexed column values for index delete
+                    let mut old_vals = std::collections::HashMap::new();
+                    for cn in &indexed_cols {
+                        if let Some(c) = batch.column_by_name(cn) {
+                            old_vals.insert(cn.clone(), Self::arrow_value_at_col(c, i));
+                        }
+                    }
+                    deleted_entries.push((id, old_vals));
+                    
                     let mut update_data: StdHashMap<String, Value> = StdHashMap::new();
                     for (col_name, expr) in assignments {
                         let value = Self::evaluate_expr_to_value(&batch, expr, i)?;
                         update_data.insert(col_name.clone(), value);
                     }
                     
-                    updates.push((id, update_data));
+                    updates.push((i, id, update_data));
                 }
             }
         }
         
-        // Apply updates: for each row, build complete row with updates applied
         let updated = updates.len() as i64;
-        
-        // Build lookup for existing row data from batch
         let schema = batch.schema();
         
-        for (row_idx, (_id, update_data)) in updates.into_iter().enumerate() {
-            // Get existing values from batch for this row
+        // Delete old rows first
+        for &(_, id, _) in &updates {
+            storage.delete(id);
+        }
+        
+        // Capture active row count AFTER deletes but BEFORE inserts for index maintenance
+        // Must use active_row_count since read_columns_to_arrow only returns active rows
+        let pre_insert_count = storage.active_row_count();
+        
+        // Insert updated rows
+        for (batch_row_idx, _id, update_data) in updates.into_iter() {
             let mut row_data = update_data;
-            
-            // Add existing column values that weren't updated
             for field in schema.fields() {
                 let col_name = field.name();
                 if col_name == "_id" || row_data.contains_key(col_name) {
                     continue;
                 }
                 if let Some(col) = batch.column_by_name(col_name) {
-                    if let Some(val) = Self::get_value_at(col, row_idx) {
+                    if let Some(val) = Self::get_value_at(col, batch_row_idx) {
                         row_data.insert(col_name.clone(), val);
                     }
                 }
             }
-            
-            // Insert the updated row (ID is auto-assigned, old row is soft-deleted)
             storage.insert_rows(&[row_data])?;
         }
         
         storage.save()?;
+        
+        // Index maintenance: delete old entries, insert new ones
+        Self::notify_index_delete(storage_path, &deleted_entries);
+        Self::notify_index_insert(storage_path, &storage, pre_insert_count);
         
         // Invalidate cache after write
         invalidate_storage_cache(storage_path);

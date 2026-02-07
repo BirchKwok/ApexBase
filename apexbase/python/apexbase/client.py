@@ -657,10 +657,29 @@ class ApexClient:
                     except Exception:
                         pass
             
+            # Transaction commands: route through session-aware execute() binding
+            if sql_upper.startswith('BEGIN') or sql_upper in ('COMMIT', 'COMMIT;', 'ROLLBACK', 'ROLLBACK;'):
+                result = self._storage.execute(sql)
+                # Track transaction state in Python client
+                if sql_upper.startswith('BEGIN'):
+                    self._in_txn = True
+                elif sql_upper in ('COMMIT', 'COMMIT;', 'ROLLBACK', 'ROLLBACK;'):
+                    self._in_txn = False
+                rv = ResultView(data=None)
+                rv._show_internal_id = show_internal_id
+                return rv
+
             # Validate table name for non-fast-path queries (skip for DDL)
             if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE')):
                 self._validate_table_in_sql(sql)
             
+            # DML within a transaction: route through session-aware execute() binding
+            if getattr(self, '_in_txn', False) and sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE')):
+                result = self._storage.execute(sql)
+                rv = ResultView(data=None)
+                rv._show_internal_id = show_internal_id
+                return rv
+
             # Standard path: Arrow IPC for efficient bulk transfer
             ipc_bytes = self._storage._execute_arrow_ipc(sql)
             

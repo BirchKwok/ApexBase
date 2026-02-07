@@ -26,6 +26,6 @@ pub mod manager;
 pub mod context;
 pub mod conflict;
 
-pub use manager::{TxnManager, TxnId, TxnStatus};
+pub use manager::{TxnManager, TxnId, TxnStatus, txn_manager};
 pub use context::TxnContext;
 pub use conflict::{ConflictDetector, ConflictResult};

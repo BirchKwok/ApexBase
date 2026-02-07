@@ -1674,6 +1674,9 @@ pub struct OnDemandStorage {
     auto_flush_bytes: AtomicU64,
     /// Count of rows inserted since last save (for auto-flush)
     pending_rows: AtomicU64,
+    /// Total rows physically on disk (including deleted). Only updated after disk writes.
+    /// Used by save() to distinguish in-memory-only rows from persisted rows.
+    persisted_row_count: AtomicU64,
 }
 
 impl OnDemandStorage {
@@ -1736,6 +1739,7 @@ impl OnDemandStorage {
             auto_flush_rows: AtomicU64::new(100000),
             auto_flush_bytes: AtomicU64::new(500 * 1024 * 1024),
             pending_rows: AtomicU64::new(0),
+            persisted_row_count: AtomicU64::new(0),
         };
 
         // Write initial file
@@ -1894,6 +1898,7 @@ impl OnDemandStorage {
             auto_flush_rows: AtomicU64::new(10000),
             auto_flush_bytes: AtomicU64::new(500 * 1024 * 1024),
             pending_rows: AtomicU64::new(0),
+            persisted_row_count: AtomicU64::new(id_count as u64),
         })
     }
     
@@ -2130,6 +2135,7 @@ impl OnDemandStorage {
             if let Ok(mut delta_file) = File::open(&delta_path) {
                 // Read delta IDs to find max
                 loop {
+                    // Read record count
                     let mut count_buf = [0u8; 8];
                     match delta_file.read_exact(&mut count_buf) {
                         Ok(_) => {},
@@ -2137,7 +2143,7 @@ impl OnDemandStorage {
                     }
                     let record_count = u64::from_le_bytes(count_buf) as usize;
                     
-                    // Read IDs and find max
+                    // Read IDs and track max
                     for _ in 0..record_count {
                         let mut id_buf = [0u8; 8];
                         if delta_file.read_exact(&mut id_buf).is_err() { break; }
@@ -2226,7 +2232,7 @@ impl OnDemandStorage {
             next_id: AtomicU64::new(next_id),
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(deleted),
-            id_to_idx: RwLock::new(None),
+            id_to_idx: RwLock::new(None), // Lazy loaded when needed
             active_count: AtomicU64::new(row_count),
             durability,
             wal_writer: RwLock::new(wal_writer),
@@ -2234,6 +2240,7 @@ impl OnDemandStorage {
             auto_flush_rows: AtomicU64::new(10000),
             auto_flush_bytes: AtomicU64::new(500 * 1024 * 1024),
             pending_rows: AtomicU64::new(0),
+            persisted_row_count: AtomicU64::new(row_count),
         })
     }
     
@@ -7681,6 +7688,45 @@ impl OnDemandStorage {
     /// 
     /// Automatically converts low-cardinality string columns to dictionary encoding.
     pub fn save(&self) -> io::Result<()> {
+        // OPTIMIZATION: For existing V4 files with only deletions (no new rows,
+        // no schema changes), update deletion vectors in-place instead of full rewrite.
+        // All other cases use the proven save_v4() full-rewrite path.
+        // Note: append optimization is handled at engine level (write_typed→append_row_group).
+        let header = self.header.read();
+        let is_v4 = header.version == FORMAT_VERSION_V4 && header.footer_offset > 0;
+        drop(header);
+
+        if is_v4 {
+            let on_disk_rows = self.persisted_row_count.load(Ordering::SeqCst) as usize;
+            let ids = self.ids.read();
+            let total_rows = ids.len();
+            let has_new_rows = total_rows > on_disk_rows;
+            drop(ids);
+
+            if !has_new_rows {
+                let deleted = self.deleted.read();
+                let has_deletes = deleted.iter().any(|&b| b != 0);
+                if has_deletes {
+                    // Count deleted rows for compaction threshold
+                    let del_count = (0..total_rows).filter(|&i| {
+                        let byte_idx = i / 8;
+                        let bit_idx = i % 8;
+                        byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 == 1
+                    }).count();
+                    drop(deleted);
+                    let ratio = if on_disk_rows > 0 { del_count as f64 / on_disk_rows as f64 } else { 0.0 };
+
+                    if ratio <= 0.5 {
+                        // Low deletion ratio → update deletion vectors in-place
+                        self.pending_rows.store(0, Ordering::SeqCst);
+                        return self.save_deletion_vectors();
+                    }
+                    // High deletion ratio → full rewrite to reclaim space (fall through)
+                }
+            }
+        }
+
+        self.pending_rows.store(0, Ordering::SeqCst);
         self.save_v4()
     }
     
@@ -7982,6 +8028,8 @@ impl OnDemandStorage {
         self.mmap_cache.write().invalidate();
         
         self.active_count.store(active_count as u64, Ordering::SeqCst);
+        // save_v4 physically removes deleted rows; persisted = active
+        self.persisted_row_count.store(active_count as u64, Ordering::SeqCst);
         let candidate = max_active_id + 1;
         let current = self.next_id.load(Ordering::SeqCst);
         if candidate > current {
@@ -8012,7 +8060,6 @@ impl OnDemandStorage {
             return Err(err_data("V4 file has no footer"));
         }
         let footer_offset = header.footer_offset;
-        let total_rows = header.row_count as usize;
         drop(header);
         
         // Read footer from file
@@ -8032,15 +8079,21 @@ impl OnDemandStorage {
         *self.schema.write() = footer.schema.clone();
         let col_count = footer.schema.column_count();
         
+        // Compute total rows from RG metadata (header.row_count stores active count,
+        // but RGs may contain deleted rows that are still physically present)
+        let total_rows: usize = footer.row_groups.iter().map(|rg| rg.row_count as usize).sum();
+        
         // Allocate flat columns
         let mut all_ids: Vec<u64> = Vec::with_capacity(total_rows);
         let mut all_columns: Vec<ColumnData> = (0..col_count)
             .map(|i| ColumnData::new(footer.schema.columns[i].1))
             .collect();
         let mut all_nulls: Vec<Vec<u8>> = vec![Vec::new(); col_count];
+        let mut all_deleted: Vec<u8> = Vec::new(); // flat deletion bitmap
         
         // Read each Row Group as a byte buffer, parse sequentially
         let mut max_id_seen: u64 = 0;
+        let mut total_deleted: u64 = 0;
         for rg_meta in &footer.row_groups {
             if rg_meta.row_count == 0 {
                 continue;
@@ -8070,8 +8123,27 @@ impl OnDemandStorage {
             }
             pos += id_byte_len;
             
-            // Skip deletion vector
+            // Read deletion vector and merge into flat bitmap
             let del_vec_len = (rg_rows + 7) / 8;
+            let del_bytes = &rg_buf[pos..pos + del_vec_len];
+            let needed_len = (ids_before + rg_rows + 7) / 8;
+            if all_deleted.len() < needed_len {
+                all_deleted.resize(needed_len, 0);
+            }
+            if ids_before % 8 == 0 {
+                let dest_byte = ids_before / 8;
+                let copy_len = del_vec_len.min(all_deleted.len() - dest_byte);
+                all_deleted[dest_byte..dest_byte + copy_len]
+                    .copy_from_slice(&del_bytes[..copy_len]);
+            } else {
+                for i in 0..rg_rows {
+                    if (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                        let flat_idx = ids_before + i;
+                        all_deleted[flat_idx / 8] |= 1 << (flat_idx % 8);
+                    }
+                }
+            }
+            total_deleted += rg_meta.deletion_count as u64;
             pos += del_vec_len;
             
             // Parse columns
@@ -8146,20 +8218,121 @@ impl OnDemandStorage {
         *self.columns.write() = all_columns;
         *self.nulls.write() = all_nulls;
         
+        // Use deletion vectors read from disk (not all-zeros)
         let deleted_len = (total_rows + 7) / 8;
-        *self.deleted.write() = vec![0u8; deleted_len];
+        if all_deleted.len() < deleted_len {
+            all_deleted.resize(deleted_len, 0);
+        }
+        *self.deleted.write() = all_deleted;
         
         self.next_id.store(next_id, Ordering::SeqCst);
-        self.active_count.store(total_rows as u64, Ordering::SeqCst);
+        self.active_count.store(total_rows as u64 - total_deleted, Ordering::SeqCst);
+        // Track actual on-disk row count (total rows in RGs, including deleted)
+        self.persisted_row_count.store(total_rows as u64, Ordering::SeqCst);
         *self.id_to_idx.write() = None;
         
         Ok(())
     }
     
-    /// Append a new Row Group to an existing V4 file without rewriting.
-    /// Overwrites old footer, writes new RG + updated footer, fixes header.
-    /// Peak memory: just the new RG's data (typically small).
-    pub fn append_row_group(
+    /// Update only the deletion vectors in existing Row Groups on disk.
+    /// O(num_RGs) random writes instead of O(all_data) full rewrite.
+    /// Also updates the footer's per-RG deletion_count and the header's row_count.
+    fn save_deletion_vectors(&self) -> io::Result<()> {
+        let header = self.header.read();
+        if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
+            return Err(err_data("save_deletion_vectors requires V4 format file"));
+        }
+        let footer_offset = header.footer_offset;
+        drop(header);
+
+        // Read existing footer
+        let file_len = std::fs::metadata(&self.path)?.len();
+        let footer_bytes = {
+            let file_guard = self.file.read();
+            let file = file_guard.as_ref()
+                .ok_or_else(|| err_not_conn("File not open"))?;
+            let mut mmap = self.mmap_cache.write();
+            let size = (file_len - footer_offset) as usize;
+            let mut buf = vec![0u8; size];
+            mmap.read_at(file, &mut buf, footer_offset)?;
+            buf
+        };
+        let mut footer = V4Footer::from_bytes(&footer_bytes)?;
+
+        // Release mmap before writing
+        self.mmap_cache.write().invalidate();
+        *self.file.write() = None;
+        crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
+
+        let deleted = self.deleted.read();
+        let mut file = OpenOptions::new().write(true).open(&self.path)?;
+
+        // For each RG, write the updated deletion vector at its known offset
+        let mut flat_row_start: usize = 0;
+        let mut total_active: u64 = 0;
+        for rg_meta in footer.row_groups.iter_mut() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 {
+                continue;
+            }
+
+            // Deletion vector starts after RG header (32 bytes) + IDs (rg_rows * 8)
+            let del_vec_offset = rg_meta.offset + 32 + (rg_rows as u64 * 8);
+            let del_vec_len = (rg_rows + 7) / 8;
+
+            // Extract this RG's slice from the flat deleted bitmap
+            let rg_del_vec = Self::slice_null_bitmap(
+                &deleted, flat_row_start, flat_row_start + rg_rows,
+            );
+
+            // Count deleted rows in this RG
+            let mut del_count: u32 = 0;
+            for i in 0..rg_rows {
+                if (rg_del_vec[i / 8] >> (i % 8)) & 1 == 1 {
+                    del_count += 1;
+                }
+            }
+            rg_meta.deletion_count = del_count;
+            total_active += (rg_rows as u32 - del_count) as u64;
+
+            // Write deletion vector to disk
+            file.seek(SeekFrom::Start(del_vec_offset))?;
+            file.write_all(&rg_del_vec[..del_vec_len])?;
+
+            flat_row_start += rg_rows;
+        }
+        drop(deleted);
+
+        // Rewrite footer with updated deletion_counts
+        file.seek(SeekFrom::Start(footer_offset))?;
+        let new_footer_bytes = footer.to_bytes();
+        file.write_all(&new_footer_bytes)?;
+        // Truncate in case new footer is shorter (shouldn't happen, but safety)
+        let new_end = footer_offset + new_footer_bytes.len() as u64;
+        file.set_len(new_end)?;
+        file.flush()?;
+
+        // Update header: row_count = active rows (matches save_v4 convention)
+        {
+            let mut header = self.header.write();
+            header.row_count = total_active;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&header.to_bytes())?;
+        }
+        file.flush()?;
+        drop(file);
+
+        // Reopen file handle
+        let new_file = File::open(&self.path)?;
+        *self.file.write() = Some(new_file);
+
+        Ok(())
+    }
+
+    /// Write a new Row Group to disk without modifying in-memory state.
+    /// Called by save() when rows are already in memory and only need persisting.
+    /// Also called by append_row_group() which additionally updates memory.
+    fn write_row_group_to_disk(
         &self,
         new_ids: &[u64],
         new_columns: &[ColumnData],
@@ -8167,10 +8340,9 @@ impl OnDemandStorage {
     ) -> io::Result<()> {
         let header = self.header.read();
         if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
-            return Err(err_data("append_row_group requires V4 format file"));
+            return Err(err_data("write_row_group_to_disk requires V4 format file"));
         }
         let footer_offset = header.footer_offset;
-        let old_total = header.row_count as usize;
         let col_count = header.column_count as usize;
         drop(header);
         
@@ -8271,10 +8443,11 @@ impl OnDemandStorage {
         writer.flush()?;
         
         // Fix header
+        let new_persisted = self.persisted_row_count.load(Ordering::SeqCst) + rg_rows as u64;
         let writer_inner = writer.get_mut();
         {
             let mut header = self.header.write();
-            header.row_count = (old_total + rg_rows) as u64;
+            header.row_count = new_persisted;
             header.footer_offset = new_footer_offset;
             header.row_group_count = footer.row_groups.len() as u32;
         }
@@ -8290,7 +8463,26 @@ impl OnDemandStorage {
         let new_file = File::open(&self.path)?;
         *self.file.write() = Some(new_file);
         
-        // Update in-memory IDs
+        // Update persisted count (disk now has more rows)
+        self.persisted_row_count.store(new_persisted, Ordering::SeqCst);
+        
+        Ok(())
+    }
+
+    /// Append a new Row Group to an existing V4 file without rewriting.
+    /// Overwrites old footer, writes new RG + updated footer, fixes header.
+    /// Also updates in-memory state (IDs, active_count).
+    /// Use this when adding NEW data that is NOT already in memory.
+    pub fn append_row_group(
+        &self,
+        new_ids: &[u64],
+        new_columns: &[ColumnData],
+        new_nulls: &[Vec<u8>],
+    ) -> io::Result<()> {
+        let rg_rows = new_ids.len();
+        self.write_row_group_to_disk(new_ids, new_columns, new_nulls)?;
+        
+        // Update in-memory state (caller hasn't added these rows yet)
         {
             let mut ids = self.ids.write();
             ids.extend_from_slice(new_ids);
