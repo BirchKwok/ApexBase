@@ -97,7 +97,23 @@ impl MmapCache {
             }
             // SAFETY: File must remain open while mmap is in use
             // We ensure this by keeping mmap in the same struct as file
-            let mmap = unsafe { Mmap::map(file)? };
+            let mmap = unsafe {
+                // On Linux, use MAP_POPULATE for files < 64MB to pre-fault pages
+                // and eliminate page-fault overhead on first access.
+                #[cfg(target_os = "linux")]
+                {
+                    if current_size < 64 * 1024 * 1024 {
+                        memmap2::MmapOptions::new().populate().map(file)?
+                    } else {
+                        Mmap::map(file)?
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                { Mmap::map(file)? }
+            };
+            // On Linux, hint sequential access so the kernel doubles readahead.
+            #[cfg(target_os = "linux")]
+            { let _ = mmap.advise(memmap2::Advice::Sequential); }
             self.mmap = Some(mmap);
             self.file_size = current_size;
         }
@@ -7974,6 +7990,16 @@ impl OnDemandStorage {
         
         let file = File::open(&self.path)?;
         *self.file.write() = Some(file);
+        
+        // On Linux, eagerly create the mmap so the next read avoids lazy-creation overhead.
+        // This is safe because the file was just written and is in a consistent state.
+        #[cfg(target_os = "linux")]
+        {
+            let file_guard = self.file.read();
+            if let Some(f) = file_guard.as_ref() {
+                let _ = self.mmap_cache.write().get_or_create(f);
+            }
+        }
         
         Ok(())
     }
