@@ -532,5 +532,322 @@ class TestTableManagement:
                 client.close()
 
 
+class TestCreateTableWithSchema:
+    """Test create_table with pre-defined schema parameter"""
+
+    def test_schema_basic(self):
+        """Test creating table with basic schema types"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("t", schema={
+                "name": "string",
+                "age": "int64",
+                "score": "float64",
+                "active": "bool",
+            })
+
+            # Schema should be visible immediately before any data is stored
+            fields = client.list_fields()
+            assert "name" in fields
+            assert "age" in fields
+            assert "score" in fields
+            assert "active" in fields
+
+            client.close()
+
+    def test_schema_store_and_query(self):
+        """Test storing and querying data in a schema-defined table"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("users", schema={
+                "name": "string",
+                "age": "int64",
+                "score": "float64",
+            })
+
+            client.store([
+                {"name": "Alice", "age": 30, "score": 95.5},
+                {"name": "Bob", "age": 25, "score": 88.0},
+            ])
+
+            assert client.count_rows() == 2
+
+            result = client.execute("SELECT * FROM users ORDER BY age")
+            rows = result.to_dict()
+            assert len(rows) == 2
+            assert rows[0]["name"] == "Bob"
+            assert rows[0]["age"] == 25
+            assert rows[1]["name"] == "Alice"
+            assert rows[1]["score"] == 95.5
+
+            client.close()
+
+    def test_schema_all_int_types(self):
+        """Test all integer type aliases"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("ints", schema={
+                "a": "int8",
+                "b": "int16",
+                "c": "int32",
+                "d": "int64",
+                "e": "integer",
+            })
+            fields = client.list_fields()
+            assert len(fields) == 5
+            client.close()
+
+    def test_schema_all_uint_types(self):
+        """Test all unsigned integer type aliases"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("uints", schema={
+                "a": "uint8",
+                "b": "uint16",
+                "c": "uint32",
+                "d": "uint64",
+            })
+            fields = client.list_fields()
+            assert len(fields) == 4
+            client.close()
+
+    def test_schema_float_types(self):
+        """Test float type aliases"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("floats", schema={
+                "a": "float32",
+                "b": "float64",
+                "c": "float",
+                "d": "double",
+            })
+            fields = client.list_fields()
+            assert len(fields) == 4
+            client.close()
+
+    def test_schema_string_aliases(self):
+        """Test string type aliases"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("strs", schema={
+                "a": "string",
+                "b": "str",
+                "c": "text",
+                "d": "varchar",
+            })
+            fields = client.list_fields()
+            assert len(fields) == 4
+            client.close()
+
+    def test_schema_binary_type(self):
+        """Test binary type aliases"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("bins", schema={
+                "a": "binary",
+                "b": "bytes",
+            })
+            fields = client.list_fields()
+            assert len(fields) == 2
+            client.close()
+
+    def test_schema_case_insensitive(self):
+        """Test that type names are case-insensitive"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("t", schema={
+                "a": "STRING",
+                "b": "Int64",
+                "c": "FLOAT64",
+                "d": "Bool",
+            })
+            fields = client.list_fields()
+            assert len(fields) == 4
+            client.close()
+
+    def test_schema_invalid_type_raises(self):
+        """Test that invalid type string raises ValueError"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            with pytest.raises((ValueError, OSError)):
+                client.create_table("bad", schema={"x": "invalid_type"})
+            client.close()
+
+    def test_schema_empty_dict(self):
+        """Test creating table with empty schema dict (same as no schema)"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("t", schema={})
+            # No pre-defined fields
+            fields = client.list_fields()
+            assert len(fields) == 0
+
+            # Should still be able to store data (schema inferred)
+            client.store({"x": 1, "y": "hello"})
+            assert client.count_rows() == 1
+            client.close()
+
+    def test_schema_without_schema_backward_compat(self):
+        """Test that create_table without schema still works (backward compatible)"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("t")
+            client.store({"a": 1, "b": "hello"})
+            assert client.count_rows() == 1
+            client.close()
+
+    def test_schema_persistence(self):
+        """Test that schema-defined table persists across sessions"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client1 = ApexClient(dirpath=temp_dir)
+            client1.create_table("t", schema={
+                "name": "string",
+                "value": "int64",
+            })
+            client1.store([
+                {"name": "A", "value": 1},
+                {"name": "B", "value": 2},
+            ])
+            client1.flush()
+            client1.close()
+
+            # Reopen
+            client2 = ApexClient(dirpath=temp_dir)
+            client2.use_table("t")
+            assert client2.count_rows() == 2
+            result = client2.execute("SELECT * FROM t ORDER BY value")
+            rows = result.to_dict()
+            assert rows[0]["name"] == "A"
+            assert rows[1]["value"] == 2
+            client2.close()
+
+    def test_schema_with_data_type_correctness(self):
+        """Test that pre-defined types are respected"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("t", schema={
+                "count": "int64",
+                "ratio": "float64",
+                "label": "string",
+                "flag": "bool",
+            })
+
+            client.store({"count": 42, "ratio": 3.14, "label": "test", "flag": True})
+            row = client.retrieve(0)
+            assert row["count"] == 42
+            assert abs(row["ratio"] - 3.14) < 0.001
+            assert row["label"] == "test"
+            assert row["flag"] is True
+            client.close()
+
+    def test_schema_columnar_store(self):
+        """Test columnar store into schema-defined table"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("t", schema={
+                "id": "int64",
+                "name": "string",
+                "score": "float64",
+            })
+
+            n = 1000
+            client.store({
+                "id": list(range(n)),
+                "name": [f"item_{i}" for i in range(n)],
+                "score": [float(i) for i in range(n)],
+            })
+            assert client.count_rows() == n
+
+            result = client.execute("SELECT COUNT(*) FROM t")
+            assert result.scalar() == n
+            client.close()
+
+    def test_schema_multiple_batches(self):
+        """Test multiple store calls into schema-defined table"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("t", schema={
+                "x": "int64",
+                "y": "float64",
+            })
+
+            for i in range(5):
+                client.store({"x": i, "y": float(i) * 0.5})
+
+            assert client.count_rows() == 5
+
+            result = client.execute("SELECT SUM(x), SUM(y) FROM t")
+            row = result.first()
+            assert row["SUM(x)"] == 10  # 0+1+2+3+4
+            assert abs(row["SUM(y)"] - 5.0) < 0.001  # 0+0.5+1+1.5+2
+            client.close()
+
+    def test_schema_with_from_pandas(self):
+        """Test from_pandas into a schema-defined table"""
+        pytest.importorskip("pandas")
+        import pandas as pd
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("t", schema={
+                "name": "string",
+                "value": "int64",
+            })
+
+            df = pd.DataFrame({"name": ["A", "B", "C"], "value": [10, 20, 30]})
+            client.from_pandas(df)
+            assert client.count_rows() == 3
+            client.close()
+
+    def test_schema_with_durability_levels(self):
+        """Test schema creation with different durability levels"""
+        for durability in ["fast", "safe", "max"]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                client = ApexClient(dirpath=temp_dir, durability=durability)
+                client.create_table("t", schema={"x": "int64", "y": "string"})
+                client.store({"x": 1, "y": "hello"})
+                client.flush()
+                assert client.count_rows() == 1
+                client.close()
+
+    def test_schema_performance(self):
+        """Test that schema-defined table is at least as fast as no-schema"""
+        import time
+
+        n = 100000
+        data = {
+            "id": list(range(n)),
+            "value": [float(i) for i in range(n)],
+            "name": [f"item_{i}" for i in range(n)],
+        }
+        schema = {"id": "int64", "value": "float64", "name": "string"}
+
+        times_schema = []
+        times_no_schema = []
+
+        for _ in range(3):
+            with tempfile.TemporaryDirectory() as td:
+                c = ApexClient(dirpath=td)
+                c.create_table("t", schema=schema)
+                t0 = time.perf_counter()
+                c.store(data)
+                times_schema.append(time.perf_counter() - t0)
+                c.close()
+
+            with tempfile.TemporaryDirectory() as td:
+                c = ApexClient(dirpath=td)
+                c.create_table("t")
+                t0 = time.perf_counter()
+                c.store(data)
+                times_no_schema.append(time.perf_counter() - t0)
+                c.close()
+
+        avg_schema = sum(times_schema) / len(times_schema)
+        avg_no_schema = sum(times_no_schema) / len(times_no_schema)
+        # Schema should not be more than 20% slower than no-schema
+        assert avg_schema < avg_no_schema * 1.2, \
+            f"Schema ({avg_schema*1000:.1f}ms) significantly slower than no-schema ({avg_no_schema*1000:.1f}ms)"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

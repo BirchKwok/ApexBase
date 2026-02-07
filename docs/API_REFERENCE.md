@@ -58,13 +58,28 @@ client = ApexClient.create_clean("./data")
 
 #### create_table
 ```python
-create_table(table_name: str) -> None
+create_table(table_name: str, schema: dict = None) -> None
 ```
-Create a new table.
+Create a new table, optionally with a pre-defined schema.
 
-**Example:**
+**Parameters:**
+- `table_name`: Name of the table to create.
+- `schema`: Optional dict mapping column names to type strings. Pre-defining schema avoids type inference on the first insert, providing a performance benefit for bulk loading.
+
+**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`
+
+**Examples:**
 ```python
+# Without schema
 client.create_table("users")
+
+# With pre-defined schema
+client.create_table("orders", schema={
+    "order_id": "int64",
+    "product": "string",
+    "price": "float64",
+    "paid": "bool"
+})
 ```
 
 #### drop_table

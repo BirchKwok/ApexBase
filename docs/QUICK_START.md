@@ -51,8 +51,13 @@ client = ApexClient("./data")
 client.create_table("users")
 client.store({"name": "Bob", "email": "bob@example.com"})
 
-client.create_table("orders")
-client.store({"user_id": 0, "amount": 100.0})
+# Create table with pre-defined schema (avoids type inference on first insert)
+client.create_table("orders", schema={
+    "user_id": "int64",
+    "amount": "float64",
+    "product": "string"
+})
+client.store({"user_id": 0, "amount": 100.0, "product": "Widget"})
 
 # Switch between tables
 client.use_table("users")

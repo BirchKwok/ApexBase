@@ -1668,8 +1668,29 @@ impl OnDemandStorage {
     
     /// Create a new V3 storage file with specified durability level
     pub fn create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+        Self::create_with_schema_and_durability(path, durability, &[])
+    }
+
+    /// Create a new storage file with pre-defined schema and durability level.
+    /// Pre-defining schema avoids schema inference on the first insert, providing
+    /// a performance benefit: columns and null vectors are pre-allocated with
+    /// correct types so insert_typed() hits the fast path immediately.
+    pub fn create_with_schema_and_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+        schema_cols: &[(String, ColumnType)],
+    ) -> io::Result<Self> {
         let header = OnDemandHeader::new();
-        let schema = OnDemandSchema::new();
+        let mut schema = OnDemandSchema::new();
+        let mut columns = Vec::with_capacity(schema_cols.len());
+        let mut nulls = Vec::with_capacity(schema_cols.len());
+
+        // Pre-populate schema and empty column vectors
+        for (name, dtype) in schema_cols {
+            schema.add_column(name, *dtype);
+            columns.push(ColumnData::new(*dtype));
+            nulls.push(Vec::new());
+        }
 
         // Initialize WAL for safe/max durability modes
         let wal_writer = if durability != super::DurabilityLevel::Fast {
@@ -1686,10 +1707,10 @@ impl OnDemandStorage {
             header: RwLock::new(header),
             schema: RwLock::new(schema),
             column_index: RwLock::new(Vec::new()),
-            columns: RwLock::new(Vec::new()),
+            columns: RwLock::new(columns),
             ids: RwLock::new(Vec::new()),
             next_id: AtomicU64::new(0),
-            nulls: RwLock::new(Vec::new()),
+            nulls: RwLock::new(nulls),
             deleted: RwLock::new(Vec::new()),
             id_to_idx: RwLock::new(Some(ahash::AHashMap::new())),
             active_count: AtomicU64::new(0),

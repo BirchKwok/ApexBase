@@ -197,6 +197,38 @@ impl ApexStorageImpl {
         let _ = lock_file.unlock();
         drop(lock_file);
     }
+
+    /// Parse a Python dict {col_name: type_str} into Vec<(String, ColumnType)>
+    fn parse_schema_dict(dict: &Bound<'_, PyDict>) -> PyResult<Vec<(String, crate::storage::on_demand::ColumnType)>> {
+        use crate::storage::on_demand::ColumnType;
+        let mut cols = Vec::with_capacity(dict.len());
+        for (key, value) in dict.iter() {
+            let col_name: String = key.extract()?;
+            let type_str: String = value.extract()?;
+            let ct = match type_str.to_lowercase().as_str() {
+                "int8" | "i8" => ColumnType::Int8,
+                "int16" | "i16" => ColumnType::Int16,
+                "int32" | "i32" | "int" => ColumnType::Int32,
+                "int64" | "i64" | "integer" => ColumnType::Int64,
+                "uint8" | "u8" => ColumnType::UInt8,
+                "uint16" | "u16" => ColumnType::UInt16,
+                "uint32" | "u32" => ColumnType::UInt32,
+                "uint64" | "u64" => ColumnType::UInt64,
+                "float32" | "f32" | "float" => ColumnType::Float32,
+                "float64" | "f64" | "double" => ColumnType::Float64,
+                "bool" | "boolean" => ColumnType::Bool,
+                "str" | "string" | "text" | "varchar" => ColumnType::String,
+                "bytes" | "binary" => ColumnType::Binary,
+                _ => return Err(PyValueError::new_err(format!(
+                    "Unknown column type '{}' for column '{}'. Supported: int8, int16, int32, int64, \
+                     uint8, uint16, uint32, uint64, float32, float64, bool, string, binary",
+                    type_str, col_name
+                ))),
+            };
+            cols.push((col_name, ct));
+        }
+        Ok(cols)
+    }
     
     /// Get the path for the current table
     #[inline]
@@ -1236,19 +1268,26 @@ impl ApexStorageImpl {
         self.current_table.read().clone()
     }
 
-    /// Create a new table
-    fn create_table(&self, name: &str) -> PyResult<()> {
+    /// Create a new table, optionally with a pre-defined schema dict {col_name: type_str}.
+    /// Pre-defining schema avoids type inference on the first insert.
+    #[pyo3(signature = (name, schema=None))]
+    fn create_table(&self, name: &str, schema: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
         let mut paths = self.table_paths.write();
         if paths.contains_key(name) {
             return Err(PyValueError::new_err(format!("Table already exists: {}", name)));
         }
 
         let table_path = self.base_dir.join(format!("{}.apex", name));
-        
-        // Use StorageEngine for unified create
         let engine = crate::storage::engine::engine();
-        engine.create_table(&table_path, self.durability)
-            .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))?;
+
+        if let Some(schema_dict) = schema {
+            let schema_cols = Self::parse_schema_dict(schema_dict)?;
+            engine.create_table_with_schema(&table_path, self.durability, &schema_cols)
+                .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))?;
+        } else {
+            engine.create_table(&table_path, self.durability)
+                .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))?;
+        }
         
         paths.insert(name.to_string(), table_path);
         drop(paths);

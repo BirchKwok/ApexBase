@@ -247,12 +247,24 @@ impl TableStorageBackend {
     }
     
     pub fn create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
-        let storage = OnDemandStorage::create_with_durability(path, durability)?;
+        Self::create_with_schema_and_durability(path, durability, &[])
+    }
+
+    pub fn create_with_schema_and_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+        schema_cols: &[(String, ColumnType)],
+    ) -> io::Result<Self> {
+        let storage = OnDemandStorage::create_with_schema_and_durability(path, durability, schema_cols)?;
+        let schema: Vec<(String, DataType)> = schema_cols
+            .iter()
+            .map(|(name, ct)| (name.clone(), column_type_to_datatype(*ct)))
+            .collect();
         Ok(Self {
             path: path.to_path_buf(),
             storage,
             cached_columns: RwLock::new(HashMap::new()),
-            schema: RwLock::new(Vec::new()),
+            schema: RwLock::new(schema),
             row_count: RwLock::new(0),
             dirty: RwLock::new(false),
             dict_cache: RwLock::new(HashMap::new()),

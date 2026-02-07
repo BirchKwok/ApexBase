@@ -182,11 +182,22 @@ class ApexClient:
         self._check_connection()
         return self._current_table
 
-    def create_table(self, table_name: str):
+    def create_table(self, table_name: str, schema: dict = None):
+        """Create a new table.
+
+        Args:
+            table_name: Name of the table to create.
+            schema: Optional dict mapping column names to type strings.
+                    Pre-defining schema avoids type inference on the first insert,
+                    providing a performance benefit for bulk loading.
+                    Supported types: int8, int16, int32, int64, uint8, uint16,
+                    uint32, uint64, float32, float64, bool, string, binary.
+                    Example: {"name": "string", "age": "int64", "score": "float64"}
+        """
         self._check_connection()
         with self._lock:
             try:
-                self._storage.create_table(table_name)
+                self._storage.create_table(table_name, schema)
             except OSError as e:
                 raise ValueError(str(e)) from e
         self._current_table = table_name

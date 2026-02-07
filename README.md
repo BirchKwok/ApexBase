@@ -72,8 +72,13 @@ ApexBase requires explicit table creation before any data operations. Each table
 # Create a table (automatically becomes the active table)
 client.create_table("users")
 
-# Create additional tables
-client.create_table("orders")
+# Create a table with pre-defined schema (avoids type inference on first insert)
+client.create_table("orders", schema={
+    "order_id": "int64",
+    "product": "string",
+    "price": "float64",
+    "paid": "bool"
+})
 
 # Switch between tables
 client.use_table("users")
@@ -344,7 +349,7 @@ with ApexClient("./data") as client:
 
 | Method | Description |
 |--------|-------------|
-| `create_table(name)` | Create a new table |
+| `create_table(name, schema=None)` | Create a new table, optionally with pre-defined schema |
 | `drop_table(name)` | Drop a table |
 | `use_table(name)` | Switch to a table |
 | `list_tables()` | List all tables |

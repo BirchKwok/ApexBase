@@ -86,7 +86,13 @@ client = ApexClient("./data")
 
 # Create tables (the last created table becomes the active table)
 client.create_table("users")
-client.create_table("orders")
+
+# Create table with pre-defined schema
+client.create_table("orders", schema={
+    "order_id": "int64",
+    "product": "string",
+    "price": "float64"
+})
 
 # List tables
 tables = client.list_tables()

@@ -37,6 +37,7 @@ use parking_lot::RwLock;
 
 use super::DurabilityLevel;
 use super::backend::TableStorageBackend;
+use super::on_demand::ColumnType;
 use crate::data::Value;
 use crate::query::ApexExecutor;
 
@@ -601,13 +602,29 @@ impl StorageEngine {
         Ok(backend.get_schema())
     }
     
-    /// Create a new table
+    /// Create a new table, optionally with a pre-defined schema.
+    /// Pre-defining schema avoids schema inference on the first insert.
     pub fn create_table(
         &self,
         table_path: &Path,
         durability: DurabilityLevel,
     ) -> io::Result<()> {
         let _backend = TableStorageBackend::create_with_durability(table_path, durability)?;
+        Ok(())
+    }
+
+    /// Create a new table with a pre-defined schema.
+    /// Columns and null vectors are pre-allocated with correct types so
+    /// insert_typed() hits the fast path immediately on the first insert.
+    pub fn create_table_with_schema(
+        &self,
+        table_path: &Path,
+        durability: DurabilityLevel,
+        schema_cols: &[(String, ColumnType)],
+    ) -> io::Result<()> {
+        let _backend = TableStorageBackend::create_with_schema_and_durability(
+            table_path, durability, schema_cols,
+        )?;
         Ok(())
     }
     
