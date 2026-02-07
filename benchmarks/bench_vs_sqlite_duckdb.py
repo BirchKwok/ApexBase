@@ -1,0 +1,619 @@
+"""
+ApexBase Performance Benchmark: ApexBase vs SQLite vs DuckDB
+
+Measures key HTAP operations across all three engines on the same dataset.
+Results are printed as a formatted table and optionally saved to JSON.
+
+Usage:
+    python benchmarks/bench_vs_sqlite_duckdb.py [--rows N] [--warmup N] [--iterations N] [--output FILE]
+"""
+
+import argparse
+import gc
+import json
+import os
+import platform
+import random
+import shutil
+import sqlite3
+import string
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Optional imports
+# ---------------------------------------------------------------------------
+try:
+    import duckdb
+    HAS_DUCKDB = True
+except ImportError:
+    HAS_DUCKDB = False
+
+try:
+    from apexbase import ApexClient
+    HAS_APEXBASE = True
+except ImportError:
+    HAS_APEXBASE = False
+
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
+
+try:
+    import pyarrow as pa
+    HAS_PYARROW = True
+except ImportError:
+    HAS_PYARROW = False
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+CITIES = ["Beijing", "Shanghai", "Guangzhou", "Shenzhen", "Hangzhou",
+          "Nanjing", "Chengdu", "Wuhan", "Xian", "Qingdao"]
+CATEGORIES = ["Electronics", "Clothing", "Food", "Sports", "Books",
+              "Home", "Auto", "Health", "Travel", "Gaming"]
+
+
+def generate_data(n: int):
+    """Generate test data as columnar dict."""
+    rng = random.Random(42)
+    names = [f"user_{i}" for i in range(n)]
+    ages = [rng.randint(18, 80) for _ in range(n)]
+    scores = [round(rng.uniform(0, 100), 2) for _ in range(n)]
+    cities = [rng.choice(CITIES) for _ in range(n)]
+    categories = [rng.choice(CATEGORIES) for _ in range(n)]
+    return {
+        "name": names,
+        "age": ages,
+        "score": scores,
+        "city": cities,
+        "category": categories,
+    }
+
+
+@contextmanager
+def timer():
+    """Context manager that yields a dict; sets 'elapsed_ms' on exit."""
+    result = {}
+    gc.collect()
+    t0 = time.perf_counter()
+    yield result
+    result["elapsed_ms"] = (time.perf_counter() - t0) * 1000
+
+
+def fmt_ms(ms):
+    if ms < 0.01:
+        return f"{ms * 1000:.2f}us"
+    if ms < 1:
+        return f"{ms:.3f}ms"
+    if ms < 1000:
+        return f"{ms:.2f}ms"
+    return f"{ms / 1000:.2f}s"
+
+
+def run_bench(fn, warmup=2, iterations=5):
+    """Run fn() with warmup, return average ms."""
+    for _ in range(warmup):
+        fn()
+    times = []
+    for _ in range(iterations):
+        with timer() as t:
+            fn()
+        times.append(t["elapsed_ms"])
+    return sum(times) / len(times)
+
+
+# ---------------------------------------------------------------------------
+# SQLite benchmark
+# ---------------------------------------------------------------------------
+
+class SQLiteBench:
+    def __init__(self, tmpdir, data):
+        self.db_path = os.path.join(tmpdir, "bench.db")
+        self.data = data
+        self.n = len(data["name"])
+        self.conn = None
+
+    def setup(self):
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=OFF")
+        self.conn.execute("""
+            CREATE TABLE bench (
+                _id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                age INTEGER,
+                score REAL,
+                city TEXT,
+                category TEXT
+            )
+        """)
+
+    def bench_insert(self):
+        rows = list(zip(
+            self.data["name"], self.data["age"], self.data["score"],
+            self.data["city"], self.data["category"]
+        ))
+        self.conn.executemany(
+            "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+            rows,
+        )
+        self.conn.commit()
+
+    def bench_count(self):
+        return self.conn.execute("SELECT COUNT(*) FROM bench").fetchone()[0]
+
+    def bench_select_limit(self, limit=100):
+        return self.conn.execute(f"SELECT * FROM bench LIMIT {limit}").fetchall()
+
+    def bench_select_limit_10k(self):
+        return self.conn.execute("SELECT * FROM bench LIMIT 10000").fetchall()
+
+    def bench_filter_string(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE name = 'user_5000'"
+        ).fetchall()
+
+    def bench_filter_range(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE age BETWEEN 25 AND 35"
+        ).fetchall()
+
+    def bench_group_by(self):
+        return self.conn.execute(
+            "SELECT city, COUNT(*), AVG(score) FROM bench GROUP BY city"
+        ).fetchall()
+
+    def bench_group_by_having(self):
+        return self.conn.execute(
+            "SELECT city, COUNT(*) as cnt, AVG(score) FROM bench GROUP BY city HAVING cnt > 1000"
+        ).fetchall()
+
+    def bench_order_limit(self):
+        return self.conn.execute(
+            "SELECT * FROM bench ORDER BY score DESC LIMIT 100"
+        ).fetchall()
+
+    def bench_aggregation(self):
+        return self.conn.execute(
+            "SELECT COUNT(*), AVG(age), SUM(score), MIN(age), MAX(age) FROM bench"
+        ).fetchone()
+
+    def bench_complex(self):
+        return self.conn.execute(
+            "SELECT city, AVG(score) as avg_s FROM bench WHERE age BETWEEN 25 AND 50 GROUP BY city ORDER BY avg_s DESC LIMIT 5"
+        ).fetchall()
+
+    def bench_point_lookup(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE _id = 5000"
+        ).fetchone()
+
+    def bench_insert_1k(self):
+        rows = [(f"new_{i}", 25, 50.0, "Beijing", "Books") for i in range(1000)]
+        self.conn.executemany(
+            "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+            rows,
+        )
+        self.conn.commit()
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# DuckDB benchmark
+# ---------------------------------------------------------------------------
+
+class DuckDBBench:
+    def __init__(self, tmpdir, data):
+        self.db_path = os.path.join(tmpdir, "bench.duckdb")
+        self.data = data
+        self.n = len(data["name"])
+        self.conn = None
+
+    def setup(self):
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        self.conn = duckdb.connect(self.db_path)
+        self.conn.execute("""
+            CREATE TABLE bench (
+                name VARCHAR,
+                age INTEGER,
+                score DOUBLE,
+                city VARCHAR,
+                category VARCHAR
+            )
+        """)
+
+    def bench_insert(self):
+        # Use DuckDB's efficient batch insert via pandas
+        if HAS_PANDAS:
+            df = pd.DataFrame(self.data)
+            self.conn.execute("INSERT INTO bench SELECT * FROM df")
+        else:
+            rows = list(zip(
+                self.data["name"], self.data["age"], self.data["score"],
+                self.data["city"], self.data["category"]
+            ))
+            self.conn.executemany(
+                "INSERT INTO bench VALUES (?,?,?,?,?)", rows
+            )
+
+    def bench_count(self):
+        return self.conn.execute("SELECT COUNT(*) FROM bench").fetchone()[0]
+
+    def bench_select_limit(self, limit=100):
+        return self.conn.execute(f"SELECT * FROM bench LIMIT {limit}").fetchall()
+
+    def bench_select_limit_10k(self):
+        return self.conn.execute("SELECT * FROM bench LIMIT 10000").fetchall()
+
+    def bench_filter_string(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE name = 'user_5000'"
+        ).fetchall()
+
+    def bench_filter_range(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE age BETWEEN 25 AND 35"
+        ).fetchall()
+
+    def bench_group_by(self):
+        return self.conn.execute(
+            "SELECT city, COUNT(*), AVG(score) FROM bench GROUP BY city"
+        ).fetchall()
+
+    def bench_group_by_having(self):
+        return self.conn.execute(
+            "SELECT city, COUNT(*) as cnt, AVG(score) FROM bench GROUP BY city HAVING cnt > 1000"
+        ).fetchall()
+
+    def bench_order_limit(self):
+        return self.conn.execute(
+            "SELECT * FROM bench ORDER BY score DESC LIMIT 100"
+        ).fetchall()
+
+    def bench_aggregation(self):
+        return self.conn.execute(
+            "SELECT COUNT(*), AVG(age), SUM(score), MIN(age), MAX(age) FROM bench"
+        ).fetchone()
+
+    def bench_complex(self):
+        return self.conn.execute(
+            "SELECT city, AVG(score) as avg_s FROM bench WHERE age BETWEEN 25 AND 50 GROUP BY city ORDER BY avg_s DESC LIMIT 5"
+        ).fetchall()
+
+    def bench_point_lookup(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE rowid = 5000"
+        ).fetchall()
+
+    def bench_insert_1k(self):
+        if HAS_PANDAS:
+            df = pd.DataFrame({
+                "name": [f"new_{i}" for i in range(1000)],
+                "age": [25] * 1000,
+                "score": [50.0] * 1000,
+                "city": ["Beijing"] * 1000,
+                "category": ["Books"] * 1000,
+            })
+            self.conn.execute("INSERT INTO bench SELECT * FROM df")
+        else:
+            rows = [(f"new_{i}", 25, 50.0, "Beijing", "Books") for i in range(1000)]
+            self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# ApexBase benchmark
+# ---------------------------------------------------------------------------
+
+class ApexBaseBench:
+    def __init__(self, tmpdir, data):
+        self.db_dir = os.path.join(tmpdir, "apex_bench")
+        self.data = data
+        self.n = len(data["name"])
+        self.client = None
+
+    def setup(self):
+        if os.path.exists(self.db_dir):
+            shutil.rmtree(self.db_dir)
+        self.client = ApexClient(self.db_dir, drop_if_exists=True)
+
+    def bench_insert(self):
+        self.client.store(self.data)
+
+    def bench_count(self):
+        return self.client.execute("SELECT COUNT(*) FROM default").scalar()
+
+    def bench_select_limit(self, limit=100):
+        return self.client.execute(f"SELECT * FROM default LIMIT {limit}")
+
+    def bench_select_limit_10k(self):
+        return self.client.execute("SELECT * FROM default LIMIT 10000")
+
+    def bench_filter_string(self):
+        return self.client.execute(
+            "SELECT * FROM default WHERE name = 'user_5000'"
+        )
+
+    def bench_filter_range(self):
+        return self.client.execute(
+            "SELECT * FROM default WHERE age BETWEEN 25 AND 35"
+        )
+
+    def bench_group_by(self):
+        return self.client.execute(
+            "SELECT city, COUNT(*), AVG(score) FROM default GROUP BY city"
+        )
+
+    def bench_group_by_having(self):
+        return self.client.execute(
+            "SELECT city, COUNT(*) as cnt, AVG(score) FROM default GROUP BY city HAVING cnt > 1000"
+        )
+
+    def bench_order_limit(self):
+        return self.client.execute(
+            "SELECT * FROM default ORDER BY score DESC LIMIT 100"
+        )
+
+    def bench_aggregation(self):
+        return self.client.execute(
+            "SELECT COUNT(*), AVG(age), SUM(score), MIN(age), MAX(age) FROM default"
+        )
+
+    def bench_complex(self):
+        return self.client.execute(
+            "SELECT city, AVG(score) as avg_s FROM default WHERE age BETWEEN 25 AND 50 GROUP BY city ORDER BY avg_s DESC LIMIT 5"
+        )
+
+    def bench_point_lookup(self):
+        return self.client.retrieve(5000)
+
+    def bench_insert_1k(self):
+        data_1k = {
+            "name": [f"new_{i}" for i in range(1000)],
+            "age": [25] * 1000,
+            "score": [50.0] * 1000,
+            "city": ["Beijing"] * 1000,
+            "category": ["Books"] * 1000,
+        }
+        self.client.store(data_1k)
+
+    def close(self):
+        if self.client:
+            self.client.close()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+BENCHMARKS = [
+    ("Bulk Insert (N rows)", "bench_insert", True),
+    ("COUNT(*)", "bench_count", False),
+    ("SELECT * LIMIT 100", "bench_select_limit", False),
+    ("SELECT * LIMIT 10K", "bench_select_limit_10k", False),
+    ("Filter (name = 'user_5000')", "bench_filter_string", False),
+    ("Filter (age BETWEEN 25 AND 35)", "bench_filter_range", False),
+    ("GROUP BY city (10 groups)", "bench_group_by", False),
+    ("GROUP BY + HAVING", "bench_group_by_having", False),
+    ("ORDER BY score LIMIT 100", "bench_order_limit", False),
+    ("Aggregation (5 funcs)", "bench_aggregation", False),
+    ("Complex (Filter+Group+Order)", "bench_complex", False),
+    ("Point Lookup (by ID)", "bench_point_lookup", False),
+    ("Insert 1K rows", "bench_insert_1k", False),
+]
+
+
+def get_system_info():
+    info = {
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "python": platform.python_version(),
+    }
+    try:
+        import psutil
+        info["cpu_count"] = psutil.cpu_count(logical=True)
+        info["memory_gb"] = round(psutil.virtual_memory().total / (1024**3), 1)
+    except ImportError:
+        info["cpu_count"] = os.cpu_count()
+        info["memory_gb"] = "N/A"
+
+    if HAS_APEXBASE:
+        try:
+            from apexbase._core import __version__
+            info["apexbase"] = __version__
+        except Exception:
+            info["apexbase"] = "unknown"
+    if HAS_DUCKDB:
+        info["duckdb"] = duckdb.__version__
+    info["sqlite"] = sqlite3.sqlite_version
+    if HAS_PYARROW:
+        info["pyarrow"] = pa.__version__
+    return info
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ApexBase vs SQLite vs DuckDB benchmark")
+    parser.add_argument("--rows", type=int, default=1_000_000, help="Number of rows (default: 1M)")
+    parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations (default: 2)")
+    parser.add_argument("--iterations", type=int, default=5, help="Timed iterations (default: 5)")
+    parser.add_argument("--output", type=str, default=None, help="JSON output file")
+    args = parser.parse_args()
+
+    N = args.rows
+    WARMUP = args.warmup
+    ITERS = args.iterations
+
+    print("=" * 80)
+    print(f" ApexBase vs SQLite vs DuckDB — Performance Benchmark")
+    print("=" * 80)
+
+    sys_info = get_system_info()
+    print(f"\nSystem: {sys_info['platform']} ({sys_info['machine']})")
+    print(f"CPU: {sys_info.get('processor', 'N/A')} ({sys_info['cpu_count']} cores)")
+    print(f"Memory: {sys_info['memory_gb']} GB")
+    print(f"Python: {sys_info['python']}")
+    if "apexbase" in sys_info:
+        print(f"ApexBase: v{sys_info['apexbase']}")
+    print(f"SQLite: v{sys_info['sqlite']}")
+    if HAS_DUCKDB:
+        print(f"DuckDB: v{sys_info['duckdb']}")
+    if HAS_PYARROW:
+        print(f"PyArrow: v{sys_info['pyarrow']}")
+    print(f"\nDataset: {N:,} rows × 5 columns (name, age, score, city, category)")
+    print(f"Warmup: {WARMUP} iterations, Timed: {ITERS} iterations (average)")
+    print()
+
+    # Generate data
+    print("Generating test data...", end=" ", flush=True)
+    data = generate_data(N)
+    print("done.")
+
+    tmpdir = tempfile.mkdtemp(prefix="apexbase_bench_")
+    results = {}
+
+    engines = []
+    if HAS_APEXBASE:
+        engines.append(("ApexBase", ApexBaseBench(tmpdir, data)))
+    engines.append(("SQLite", SQLiteBench(tmpdir, data)))
+    if HAS_DUCKDB:
+        engines.append(("DuckDB", DuckDBBench(tmpdir, data)))
+
+    if not engines:
+        print("ERROR: No database engines available!")
+        return
+
+    # Setup all engines
+    for name, bench in engines:
+        bench.setup()
+
+    # Run benchmarks
+    for bench_name, method_name, is_insert in BENCHMARKS:
+        results[bench_name] = {}
+        for eng_name, bench in engines:
+            fn = getattr(bench, method_name, None)
+            if fn is None:
+                results[bench_name][eng_name] = None
+                continue
+
+            if is_insert:
+                # Insert is special: setup fresh each time
+                with timer() as t:
+                    fn()
+                ms = t["elapsed_ms"]
+                results[bench_name][eng_name] = ms
+            else:
+                ms = run_bench(fn, warmup=WARMUP, iterations=ITERS)
+                results[bench_name][eng_name] = ms
+
+    # Cleanup
+    for name, bench in engines:
+        bench.close()
+
+    # Print results table
+    eng_names = [name for name, _ in engines]
+    col_width = 16
+
+    print()
+    header = f"{'Query':<40}"
+    for name in eng_names:
+        header += f" | {name:>{col_width}}"
+    if len(eng_names) >= 2:
+        header += f" | {'Ratio (Apex/Best)':>{col_width}}"
+    print(header)
+    print("-" * len(header))
+
+    json_results = []
+    for bench_name, method_name, is_insert in BENCHMARKS:
+        row = f"{bench_name:<40}"
+        values = {}
+        for eng_name in eng_names:
+            ms = results.get(bench_name, {}).get(eng_name)
+            if ms is not None:
+                row += f" | {fmt_ms(ms):>{col_width}}"
+                values[eng_name] = ms
+            else:
+                row += f" | {'N/A':>{col_width}}"
+
+        if len(eng_names) >= 2 and "ApexBase" in values:
+            others = {k: v for k, v in values.items() if k != "ApexBase"}
+            if others:
+                best_other = min(others.values())
+                ratio = values["ApexBase"] / best_other if best_other > 0 else float("inf")
+                if ratio < 1:
+                    label = f"{ratio:.2f}x (faster)"
+                elif ratio < 1.05:
+                    label = f"~1.0x (tied)"
+                else:
+                    label = f"{ratio:.1f}x (slower)"
+                row += f" | {label:>{col_width}}"
+
+        print(row)
+        json_results.append({
+            "query": bench_name,
+            **{k: round(v, 3) for k, v in values.items()},
+        })
+
+    print()
+
+    # Summary
+    if "ApexBase" in [n for n, _ in engines]:
+        wins = 0
+        ties = 0
+        total = 0
+        for bench_name, _, _ in BENCHMARKS:
+            vals = results.get(bench_name, {})
+            apex_ms = vals.get("ApexBase")
+            if apex_ms is None:
+                continue
+            others = {k: v for k, v in vals.items() if k != "ApexBase" and v is not None}
+            if not others:
+                continue
+            total += 1
+            best_other = min(others.values())
+            ratio = apex_ms / best_other if best_other > 0 else float("inf")
+            if ratio < 0.95:
+                wins += 1
+            elif ratio <= 1.05:
+                ties += 1
+        losses = total - wins - ties
+        print(f"Summary: ApexBase wins {wins}/{total}, ties {ties}/{total}, slower {losses}/{total}")
+
+    # Save JSON if requested
+    if args.output:
+        output = {
+            "system": sys_info,
+            "config": {"rows": N, "warmup": WARMUP, "iterations": ITERS},
+            "results": json_results,
+        }
+        with open(args.output, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"Results saved to {args.output}")
+
+    # Cleanup tmpdir
+    try:
+        shutil.rmtree(tmpdir)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()

@@ -20,4 +20,4 @@ pub use sql_parser::{
     // DDL types
     ColumnDef, AlterTableOp,
 };
-pub use executor::{ApexExecutor, ApexResult};
+pub use executor::{ApexExecutor, ApexResult, get_cached_backend_pub};

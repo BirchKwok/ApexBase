@@ -1,22 +1,25 @@
 # ApexBase
 
-**High-performance embedded database with Rust core and Python API**
+**High-performance HTAP embedded database with Rust core and Python API**
 
-ApexBase is a high-performance embedded database powered by a Rust core, with a clean and ergonomic Python API.
+ApexBase is an embedded columnar database engineered for **Hybrid Transactional/Analytical Processing (HTAP)** workloads. It combines a high-throughput columnar storage engine written in Rust with an ergonomic Python API, delivering analytical query speed comparable to DuckDB while supporting fast transactional writes — all in a single `.apex` file with zero external dependencies.
 
 ## ✨ Features
 
-- 🚀 **High performance** - Rust core with batch write throughput up to 970K+ ops/s
-- 📦 **Single-file storage** - custom `.apex` file format with no external dependencies
-- �️ **SQL DDL support** - CREATE TABLE, ALTER TABLE, DROP TABLE via standard SQL
-- � **Full-text search** - NanoFTS integration with fuzzy search support
-- 🐍 **Python-friendly** - clean API with Pandas/Polars/PyArrow integrations
-- 💾 **Compact storage** - ~45% smaller on disk compared to traditional approaches
+- 🚀 **HTAP architecture** — columnar V4 Row Group storage with delta writes for fast inserts and analytical scans
+- 📦 **Single-file storage** — custom `.apex` format, no server, no external dependencies
+- 🛠️ **Full SQL support** — DDL, DML, aggregations, GROUP BY, HAVING, ORDER BY, JOINs, sub-expressions
+- 🔍 **Full-text search** — built-in NanoFTS integration with fuzzy matching
+- 🐍 **Python-native** — zero-copy Arrow IPC bridge with Pandas / Polars / PyArrow
+- 💾 **Compact storage** — dictionary encoding for low-cardinality strings, ~45% smaller on disk
+- 🌐 **Cross-platform** — runs on Linux, macOS, and Windows (x86_64 & ARM64)
+- ⚡ **JIT compilation** — Cranelift-based JIT for predicate evaluation
+- 🔒 **Durability levels** — configurable `fast` / `safe` / `max` with WAL support
 
 ## 📦 Installation
 
 ```bash
-# Install from PyPI
+# Install from PyPI (Linux, macOS, Windows — Python 3.9–3.13)
 pip install apexbase
 
 # Build from source
@@ -243,40 +246,57 @@ with ApexClient("./data") as client:
     # Client automatically closed on exit
 ```
 
-## 📊 Performance Comparison
+## 📊 Performance Benchmark
 
-### ApexBase vs DuckDB
+### ApexBase vs SQLite vs DuckDB (1M rows)
 
-Comparison with [DuckDB](https://duckdb.org/) (v1.1.3), a popular embedded analytical database.
+Three-way comparison with [SQLite](https://www.sqlite.org/) (v3.45.3) and [DuckDB](https://duckdb.org/) (v1.1.3).
 
 **Test Environment**
 
 | Component | Specification |
 |-----------|---------------|
 | **Platform** | macOS 26.2 (arm64) |
-| **CPU** | Apple M1 Pro |
+| **CPU** | Apple M1 Pro (10 cores) |
 | **Memory** | 32.0 GB |
 | **Python** | 3.11.10 |
 | **ApexBase** | v0.5.0 |
+| **SQLite** | v3.45.3 |
 | **DuckDB** | v1.1.3 |
 | **PyArrow** | 19.0.0 |
 
-**Dataset**: 1,000,000 rows with columns: `name` (string), `age` (int), `score` (float), `category` (string)
+**Dataset**: 1,000,000 rows × 5 columns (`name` string, `age` int, `score` float, `city` string, `category` string)
 
 **Query Performance** (average of 5 iterations, after 2 warmup runs)
 
-| Query | ApexBase | DuckDB | Ratio |
-|-------|----------|--------|-------|
-| COUNT(*) | 0.08ms | 0.37ms | **0.22x** (4.6x faster) |
-| SELECT * LIMIT 100 | 0.09ms | 0.25ms | **0.35x** (2.9x faster) |
-| SELECT * LIMIT 10K | 0.26ms | 3.53ms | **0.07x** (13.6x faster) |
-| Filter (name = 'user_5000') | 7.41ms | 6.35ms | **1.17x** |
-| Insert 1M rows | 327.44ms | 197844.50ms | **0.00x** (604x faster) |
+| Query | ApexBase | SQLite | DuckDB | vs Best Other |
+|-------|----------|--------|--------|---------------|
+| **Bulk Insert (1M rows)** | 261ms | 930ms | 883ms | **0.30x** ✅ 3.4x faster |
+| **COUNT(*)** | 0.31ms | 8.78ms | 0.53ms | **0.59x** ✅ 1.7x faster |
+| **SELECT \* LIMIT 100** | 0.54ms | 0.11ms | 0.45ms | 5.1x slower |
+| **SELECT \* LIMIT 10K** | 1.27ms | 6.74ms | 4.54ms | **0.28x** ✅ 3.6x faster |
+| **Filter (string eq)** | 1.18ms | 40.0ms | 1.63ms | **0.72x** ✅ faster |
+| **Filter (range BETWEEN)** | 19.9ms | 166ms | 91.1ms | **0.22x** ✅ 4.6x faster |
+| **GROUP BY (10 groups)** | 2.70ms | 350ms | 3.50ms | **0.77x** ✅ faster |
+| **GROUP BY + HAVING** | 2.67ms | 349ms | 3.71ms | **0.72x** ✅ faster |
+| **ORDER BY + LIMIT** | 1.68ms | 52.8ms | 5.32ms | **0.32x** ✅ 3.2x faster |
+| **Aggregation (5 funcs)** | 1.56ms | 84.1ms | 1.33ms | 1.2x slower |
+| **Complex (Filter+Group+Order)** | 1.71ms | 160ms | 2.72ms | **0.63x** ✅ faster |
+| **Point Lookup (by ID)** | 0.063ms | 0.044ms | 3.31ms | 1.4x slower |
+| **Insert 1K rows (incremental)** | 0.64ms | 1.32ms | 2.72ms | **0.47x** ✅ 2.1x faster |
 
-**Notes**: 
-- Ratio < 1 means ApexBase is faster than DuckDB
-- ApexBase excels at INSERT operations and large LIMIT queries due to Arrow IPC optimization
-- DuckDB has better performance on complex GROUP BY and ORDER BY operations
+**Key Takeaways**:
+- ✅ **Wins 10 of 13 benchmarks** against both SQLite and DuckDB
+- ✅ **Bulk insert throughput**: 3.4x faster than both SQLite and DuckDB (columnar batch path)
+- ✅ **Analytical scans**: COUNT, range filters, ORDER BY+LIMIT — consistently faster
+- ✅ **GROUP BY**: Cached string dict indices + single-pass aggregation beats DuckDB (2.70ms vs 3.50ms)
+- ✅ **Complex queries**: Branchless BETWEEN+GROUP+ORDER beats DuckDB (1.71ms vs 2.72ms)
+- ✅ **String filter**: V4 in-memory scan beats DuckDB (1.18ms vs 1.63ms)
+- ✅ **Incremental insert**: V4 append row group — 2.1x faster than SQLite, 4.2x faster than DuckDB
+- ⚡ **Aggregation**: 1.2x vs DuckDB (Arrow SIMD ceiling), 54x faster than SQLite
+- ⚡ **Point Lookup**: 0.063ms (1.4x vs SQLite's C-level tuples)
+
+> Reproduce: `python benchmarks/bench_vs_sqlite_duckdb.py --rows 1000000`
 
 ## 🔧 API Reference
 

@@ -3403,6 +3403,258 @@ impl OnDemandStorage {
             .map_err(|e| err_data(e.to_string()))
     }
 
+    /// Build Arrow RecordBatch with a row LIMIT from in-memory V4 columns.
+    /// Much faster than read_columns() for small LIMIT queries (SELECT * LIMIT N).
+    pub fn to_arrow_batch_with_limit(
+        &self,
+        column_names: Option<&[&str]>,
+        include_id: bool,
+        limit: usize,
+    ) -> io::Result<RecordBatch> {
+        use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray, PrimitiveArray};
+        use arrow::buffer::{Buffer, NullBuffer, BooleanBuffer, ScalarBuffer};
+        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType, Int64Type, Float64Type};
+        use std::sync::Arc;
+
+        self.ensure_v4_loaded()?;
+
+        let schema = self.schema.read();
+        let ids = self.ids.read();
+        let columns = self.columns.read();
+        let nulls = self.nulls.read();
+        let deleted = self.deleted.read();
+
+        let total_rows = ids.len();
+        let col_count = schema.column_count();
+        let has_deleted = deleted.iter().any(|&b| b != 0);
+
+        // Collect first `limit` active row indices
+        let actual_limit;
+        let row_indices: Option<Vec<usize>> = if has_deleted {
+            let mut indices = Vec::with_capacity(limit.min(total_rows));
+            for i in 0..total_rows {
+                if indices.len() >= limit { break; }
+                let byte_idx = i / 8;
+                let bit_idx = i % 8;
+                if byte_idx >= deleted.len() || (deleted[byte_idx] >> bit_idx) & 1 == 0 {
+                    indices.push(i);
+                }
+            }
+            actual_limit = indices.len();
+            Some(indices)
+        } else {
+            actual_limit = limit.min(total_rows);
+            None // contiguous range 0..actual_limit
+        };
+
+        if actual_limit == 0 {
+            let arrow_schema = Arc::new(Schema::empty());
+            return Ok(RecordBatch::new_empty(arrow_schema));
+        }
+
+        let col_indices: Vec<usize> = if let Some(names) = column_names {
+            names.iter()
+                .filter(|&&n| n != "_id")
+                .filter_map(|&name| schema.get_index(name))
+                .collect()
+        } else {
+            (0..col_count).collect()
+        };
+
+        let mut fields: Vec<Field> = Vec::with_capacity(col_indices.len() + 1);
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_indices.len() + 1);
+
+        // _id column
+        if include_id {
+            fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            if let Some(ref indices) = row_indices {
+                let active_ids: Vec<i64> = indices.iter().map(|&i| ids[i] as i64).collect();
+                arrays.push(Arc::new(Int64Array::from(active_ids)));
+            } else {
+                // Contiguous: just copy first actual_limit IDs
+                let mut ids_copy: Vec<i64> = Vec::with_capacity(actual_limit);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        ids.as_ptr() as *const i64,
+                        ids_copy.as_mut_ptr(),
+                        actual_limit,
+                    );
+                    ids_copy.set_len(actual_limit);
+                }
+                arrays.push(Arc::new(Int64Array::from(ids_copy)));
+            }
+        }
+
+        for &col_idx in &col_indices {
+            let (col_name, _) = &schema.columns[col_idx];
+            let col_data = if col_idx < columns.len() { Some(&columns[col_idx]) } else { None };
+
+            // Build null buffer for this column (critical for IS NULL queries)
+            let null_buf: Option<NullBuffer> = if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                let null_bitmap = &nulls[col_idx];
+                let has_any_null = null_bitmap.iter().any(|&b| b != 0);
+                if has_any_null {
+                    let mut validity_bytes = vec![0xFFu8; (actual_limit + 7) / 8];
+                    if let Some(ref indices) = row_indices {
+                        for (new_idx, &old_idx) in indices.iter().enumerate() {
+                            let ob = old_idx / 8;
+                            let obit = old_idx % 8;
+                            if ob < null_bitmap.len() && (null_bitmap[ob] >> obit) & 1 == 1 {
+                                validity_bytes[new_idx / 8] &= !(1u8 << (new_idx % 8));
+                            }
+                        }
+                    } else {
+                        for byte_idx in 0..null_bitmap.len().min(validity_bytes.len()) {
+                            validity_bytes[byte_idx] = !null_bitmap[byte_idx];
+                        }
+                    }
+                    let tail = actual_limit % 8;
+                    if tail > 0 {
+                        let last = validity_bytes.len() - 1;
+                        validity_bytes[last] &= (1u8 << tail) - 1;
+                    }
+                    Some(NullBuffer::new(BooleanBuffer::new(Buffer::from(validity_bytes), 0, actual_limit)))
+                } else { None }
+            } else { None };
+
+            let (arrow_dt, array): (ArrowDataType, ArrayRef) = match col_data {
+                Some(ColumnData::Int64(values)) => {
+                    let data_vec: Vec<i64> = if let Some(ref indices) = row_indices {
+                        indices.iter().map(|&i| if i < values.len() { values[i] } else { 0 }).collect()
+                    } else {
+                        values[..actual_limit.min(values.len())].to_vec()
+                    };
+                    let arr = PrimitiveArray::<Int64Type>::new(ScalarBuffer::from(data_vec), null_buf);
+                    (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                }
+                Some(ColumnData::Float64(values)) => {
+                    let data_vec: Vec<f64> = if let Some(ref indices) = row_indices {
+                        indices.iter().map(|&i| if i < values.len() { values[i] } else { 0.0 }).collect()
+                    } else {
+                        values[..actual_limit.min(values.len())].to_vec()
+                    };
+                    let arr = PrimitiveArray::<Float64Type>::new(ScalarBuffer::from(data_vec), null_buf);
+                    (ArrowDataType::Float64, Arc::new(arr) as ArrayRef)
+                }
+                Some(ColumnData::String { offsets, data }) => {
+                    let count = offsets.len().saturating_sub(1);
+                    if null_buf.is_some() {
+                        // Has nulls: use Option<&str> path
+                        let null_bitmap = &nulls[col_idx];
+                        let strings: Vec<Option<&str>> = if let Some(ref indices) = row_indices {
+                            indices.iter().map(|&i| {
+                                let ob = i / 8;
+                                let obit = i % 8;
+                                if ob < null_bitmap.len() && (null_bitmap[ob] >> obit) & 1 == 1 {
+                                    None
+                                } else if i < count {
+                                    let start = offsets[i] as usize;
+                                    let end = offsets[i + 1] as usize;
+                                    std::str::from_utf8(&data[start..end]).ok()
+                                } else { None }
+                            }).collect()
+                        } else {
+                            (0..actual_limit.min(count)).map(|i| {
+                                let ob = i / 8;
+                                let obit = i % 8;
+                                if ob < null_bitmap.len() && (null_bitmap[ob] >> obit) & 1 == 1 {
+                                    None
+                                } else {
+                                    let start = offsets[i] as usize;
+                                    let end = offsets[i + 1] as usize;
+                                    std::str::from_utf8(&data[start..end]).ok()
+                                }
+                            }).collect()
+                        };
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    } else {
+                        let strings: Vec<&str> = if let Some(ref indices) = row_indices {
+                            indices.iter().map(|&i| {
+                                if i < count {
+                                    let start = offsets[i] as usize;
+                                    let end = offsets[i + 1] as usize;
+                                    std::str::from_utf8(&data[start..end]).unwrap_or("")
+                                } else { "" }
+                            }).collect()
+                        } else {
+                            let lim = actual_limit.min(count);
+                            (0..lim).map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                std::str::from_utf8(&data[start..end]).unwrap_or("")
+                            }).collect()
+                        };
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from_iter_values(strings)))
+                    }
+                }
+                Some(ColumnData::Bool { data: packed, len }) => {
+                    let bools: Vec<Option<bool>> = if let Some(ref indices) = row_indices {
+                        indices.iter().map(|&i| {
+                            // Check null
+                            if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                                let ob = i / 8;
+                                let obit = i % 8;
+                                if ob < nulls[col_idx].len() && (nulls[col_idx][ob] >> obit) & 1 == 1 {
+                                    return None;
+                                }
+                            }
+                            if i < *len {
+                                let byte_idx = i / 8;
+                                let bit_idx = i % 8;
+                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                            } else { None }
+                        }).collect()
+                    } else {
+                        (0..actual_limit.min(*len)).map(|i| {
+                            // Check null
+                            if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                                let ob = i / 8;
+                                let obit = i % 8;
+                                if ob < nulls[col_idx].len() && (nulls[col_idx][ob] >> obit) & 1 == 1 {
+                                    return None;
+                                }
+                            }
+                            let byte_idx = i / 8;
+                            let bit_idx = i % 8;
+                            Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                        }).collect()
+                    };
+                    (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
+                }
+                Some(ColumnData::Binary { offsets, data }) => {
+                    use arrow::array::BinaryArray;
+                    let count = offsets.len().saturating_sub(1);
+                    let binary_data: Vec<Option<&[u8]>> = if let Some(ref indices) = row_indices {
+                        indices.iter().map(|&i| {
+                            if i < count {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                Some(&data[start..end] as &[u8])
+                            } else { None }
+                        }).collect()
+                    } else {
+                        (0..actual_limit.min(count)).map(|i| {
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            Some(&data[start..end] as &[u8])
+                        }).collect()
+                    };
+                    (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                }
+                _ => {
+                    (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![0i64; actual_limit])))
+                }
+            };
+
+            fields.push(Field::new(col_name, arrow_dt, true));
+            arrays.push(array);
+        }
+
+        let arrow_schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(arrow_schema, arrays)
+            .map_err(|e| err_data(e.to_string()))
+    }
+
     // ========================================================================
     // On-Demand Read APIs (the key feature)
     // ========================================================================
@@ -3807,6 +4059,96 @@ impl OnDemandStorage {
         filter_value: &str,
         filter_eq: bool,  // true = equals, false = not equals
     ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
+        // V4 FAST PATH: scan in-memory columns directly (no disk I/O)
+        {
+            let header = self.header.read();
+            if header.footer_offset > 0 {
+                drop(header);
+                self.ensure_v4_loaded()?;
+                
+                let schema = self.schema.read();
+                let columns = self.columns.read();
+                let deleted = self.deleted.read();
+                let total_rows = self.ids.read().len();
+                
+                let filter_col_idx = match schema.get_index(filter_column) {
+                    Some(idx) => idx,
+                    None => return Ok((HashMap::new(), Vec::new())),
+                };
+                
+                let filter_bytes = filter_value.as_bytes();
+                let filter_len = filter_bytes.len();
+                let has_deleted = deleted.iter().any(|&b| b != 0);
+                
+                let mut matching_indices: Vec<usize> = Vec::with_capacity(1024);
+                
+                if filter_col_idx < columns.len() {
+                    if let ColumnData::String { offsets, data } = &columns[filter_col_idx] {
+                        let count = offsets.len().saturating_sub(1).min(total_rows);
+                        let first_byte = filter_bytes.first().copied();
+                        
+                        for i in 0..count {
+                            // Skip deleted rows
+                            if has_deleted {
+                                let byte_idx = i / 8;
+                                let bit_idx = i % 8;
+                                if byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 != 0 {
+                                    continue;
+                                }
+                            }
+                            
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            let str_len = end - start;
+                            
+                            // Fast rejection by length
+                            if str_len != filter_len {
+                                if !filter_eq { matching_indices.push(i); }
+                                continue;
+                            }
+                            
+                            // Fast rejection by first byte
+                            if let Some(fb) = first_byte {
+                                if start < data.len() && data[start] != fb {
+                                    if !filter_eq { matching_indices.push(i); }
+                                    continue;
+                                }
+                            }
+                            
+                            let matches = end <= data.len() && &data[start..end] == filter_bytes;
+                            if (filter_eq && matches) || (!filter_eq && !matches) {
+                                matching_indices.push(i);
+                            }
+                        }
+                    }
+                }
+                
+                if matching_indices.is_empty() {
+                    return Ok((HashMap::new(), Vec::new()));
+                }
+                
+                // Read only needed columns for matching indices
+                let col_indices: Vec<usize> = match column_names {
+                    Some(names) => names.iter()
+                        .filter(|&&n| n != "_id")
+                        .filter_map(|&name| schema.get_index(name))
+                        .collect(),
+                    None => (0..schema.column_count()).collect(),
+                };
+                
+                let mut result = HashMap::new();
+                for &col_idx in &col_indices {
+                    let (col_name, _) = &schema.columns[col_idx];
+                    if col_idx < columns.len() {
+                        result.insert(col_name.clone(), columns[col_idx].filter_by_indices(&matching_indices));
+                    }
+                }
+                
+                return Ok((result, matching_indices));
+            }
+        }
+        
+        // V3 SLOW PATH: read from disk
         let is_v4 = self.ensure_v4_loaded()?;
         
         let header = self.header.read();
@@ -6694,6 +7036,197 @@ impl OnDemandStorage {
         Ok(Some(result))
     }
 
+    /// Ultra-fast point lookup: returns Vec<(col_name, Value)> directly from V4 columns
+    /// Bypasses Arrow conversion and HashMap overhead
+    pub fn read_row_by_id_values(&self, id: u64) -> io::Result<Option<Vec<(String, crate::data::Value)>>> {
+        use crate::data::Value;
+        
+        let is_v4 = self.ensure_v4_loaded()?;
+        if !is_v4 { return Ok(None); }
+        
+        let row_idx = match self.get_row_idx(id) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        
+        let schema = self.schema.read();
+        let columns = self.columns.read();
+        let nulls = self.nulls.read();
+        
+        let mut result = Vec::with_capacity(schema.column_count() + 1);
+        result.push(("_id".to_string(), Value::Int64(id as i64)));
+        
+        for (col_idx, (col_name, _)) in schema.columns.iter().enumerate() {
+            // Check null
+            if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                let b = row_idx / 8; let bit = row_idx % 8;
+                if b < nulls[col_idx].len() && (nulls[col_idx][b] >> bit) & 1 == 1 {
+                    result.push((col_name.clone(), Value::Null));
+                    continue;
+                }
+            }
+            
+            if col_idx >= columns.len() {
+                result.push((col_name.clone(), Value::Null));
+                continue;
+            }
+            
+            let val = match &columns[col_idx] {
+                ColumnData::Int64(v) => {
+                    if row_idx < v.len() { Value::Int64(v[row_idx]) } else { Value::Null }
+                }
+                ColumnData::Float64(v) => {
+                    if row_idx < v.len() { Value::Float64(v[row_idx]) } else { Value::Null }
+                }
+                ColumnData::String { offsets, data } => {
+                    let count = offsets.len().saturating_sub(1);
+                    if row_idx < count {
+                        let s = offsets[row_idx] as usize;
+                        let e = offsets[row_idx + 1] as usize;
+                        Value::String(std::str::from_utf8(&data[s..e]).unwrap_or("").to_string())
+                    } else { Value::Null }
+                }
+                ColumnData::Bool { data, len } => {
+                    if row_idx < *len {
+                        let b = row_idx / 8; let bit = row_idx % 8;
+                        if b < data.len() {
+                            Value::Bool((data[b] >> bit) & 1 == 1)
+                        } else { Value::Null }
+                    } else { Value::Null }
+                }
+                ColumnData::Binary { offsets, data } => {
+                    let count = offsets.len().saturating_sub(1);
+                    if row_idx < count {
+                        let s = offsets[row_idx] as usize;
+                        let e = offsets[row_idx + 1] as usize;
+                        Value::Binary(data[s..e].to_vec())
+                    } else { Value::Null }
+                }
+                ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                    if row_idx < indices.len() {
+                        let idx = indices[row_idx];
+                        if idx == 0 { Value::Null } else {
+                            let di = (idx - 1) as usize;
+                            if di + 1 < dict_offsets.len() {
+                                let s = dict_offsets[di] as usize;
+                                let e = dict_offsets[di + 1] as usize;
+                                Value::String(std::str::from_utf8(&dict_data[s..e]).unwrap_or("").to_string())
+                            } else { Value::Null }
+                        }
+                    } else { Value::Null }
+                }
+                _ => Value::Null,
+            };
+            result.push((col_name.clone(), val));
+        }
+        
+        Ok(Some(result))
+    }
+
+    /// Fast SELECT * LIMIT N: read first N non-deleted rows directly from V4 columns
+    /// Returns (column_names, rows) where each row is Vec<Value>
+    /// Bypasses SQL parsing and Arrow conversion entirely
+    pub fn read_rows_limit_values(&self, limit: usize) -> io::Result<Option<(Vec<String>, Vec<Vec<crate::data::Value>>)>> {
+        use crate::data::Value;
+        
+        let is_v4 = self.ensure_v4_loaded()?;
+        if !is_v4 { return Ok(None); }
+        
+        let schema = self.schema.read();
+        let columns = self.columns.read();
+        let nulls = self.nulls.read();
+        let ids = self.ids.read();
+        let deleted = self.deleted.read();
+        let total_rows = ids.len();
+        let has_deleted = deleted.iter().any(|&b| b != 0);
+        
+        // Build column names
+        let mut col_names = Vec::with_capacity(schema.column_count() + 1);
+        col_names.push("_id".to_string());
+        for (name, _) in &schema.columns {
+            col_names.push(name.clone());
+        }
+        
+        let actual_limit = limit.min(total_rows);
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(actual_limit);
+        let mut emitted = 0usize;
+        
+        for row_idx in 0..total_rows {
+            if emitted >= limit { break; }
+            // Skip deleted
+            if has_deleted {
+                let b = row_idx / 8; let bit = row_idx % 8;
+                if b < deleted.len() && (deleted[b] >> bit) & 1 != 0 { continue; }
+            }
+            
+            let mut row = Vec::with_capacity(col_names.len());
+            // _id
+            row.push(if row_idx < ids.len() { Value::Int64(ids[row_idx] as i64) } else { Value::Null });
+            
+            for col_idx in 0..schema.column_count() {
+                // Null check
+                if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                    let b = row_idx / 8; let bit = row_idx % 8;
+                    if b < nulls[col_idx].len() && (nulls[col_idx][b] >> bit) & 1 == 1 {
+                        row.push(Value::Null);
+                        continue;
+                    }
+                }
+                if col_idx >= columns.len() { row.push(Value::Null); continue; }
+                
+                let val = match &columns[col_idx] {
+                    ColumnData::Int64(v) => {
+                        if row_idx < v.len() { Value::Int64(v[row_idx]) } else { Value::Null }
+                    }
+                    ColumnData::Float64(v) => {
+                        if row_idx < v.len() { Value::Float64(v[row_idx]) } else { Value::Null }
+                    }
+                    ColumnData::String { offsets, data } => {
+                        let count = offsets.len().saturating_sub(1);
+                        if row_idx < count {
+                            let s = offsets[row_idx] as usize;
+                            let e = offsets[row_idx + 1] as usize;
+                            Value::String(std::str::from_utf8(&data[s..e]).unwrap_or("").to_string())
+                        } else { Value::Null }
+                    }
+                    ColumnData::Bool { data, len } => {
+                        if row_idx < *len {
+                            let b = row_idx / 8; let bit = row_idx % 8;
+                            if b < data.len() { Value::Bool((data[b] >> bit) & 1 == 1) } else { Value::Null }
+                        } else { Value::Null }
+                    }
+                    ColumnData::Binary { offsets, data } => {
+                        let count = offsets.len().saturating_sub(1);
+                        if row_idx < count {
+                            let s = offsets[row_idx] as usize;
+                            let e = offsets[row_idx + 1] as usize;
+                            Value::Binary(data[s..e].to_vec())
+                        } else { Value::Null }
+                    }
+                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                        if row_idx < indices.len() {
+                            let idx = indices[row_idx];
+                            if idx == 0 { Value::Null } else {
+                                let di = (idx - 1) as usize;
+                                if di + 1 < dict_offsets.len() {
+                                    let s = dict_offsets[di] as usize;
+                                    let e = dict_offsets[di + 1] as usize;
+                                    Value::String(std::str::from_utf8(&dict_data[s..e]).unwrap_or("").to_string())
+                                } else { Value::Null }
+                            }
+                        } else { Value::Null }
+                    }
+                    _ => Value::Null,
+                };
+                row.push(val);
+            }
+            rows.push(row);
+            emitted += 1;
+        }
+        
+        Ok(Some((col_names, rows)))
+    }
+
     /// OPTIMIZED: Read multiple rows by IDs using O(1) index lookups
     /// Returns Vec of (id, row_data) for found rows
     pub fn read_rows_by_ids(&self, ids: &[u64], column_names: Option<&[&str]>) -> io::Result<Vec<(u64, HashMap<String, ColumnData>)>> {
@@ -7649,9 +8182,21 @@ impl OnDemandStorage {
             };
             writer.write_all(&padded)?;
             
-            // Column data
+            // Column data — dict-encode if footer schema expects StringDict
             if col_idx < new_columns.len() {
-                writer.write_all(&new_columns[col_idx].to_bytes())?;
+                let col = &new_columns[col_idx];
+                if col_idx < footer.schema.columns.len()
+                    && footer.schema.columns[col_idx].1 == ColumnType::StringDict
+                    && matches!(col, ColumnData::String { .. })
+                {
+                    if let Some(dict) = col.to_dict_encoded() {
+                        dict.write_to(&mut writer)?;
+                    } else {
+                        col.write_to(&mut writer)?;
+                    }
+                } else {
+                    col.write_to(&mut writer)?;
+                }
             }
         }
         
@@ -7738,6 +8283,626 @@ impl OnDemandStorage {
         Ok(())
     }
     
+    /// Execute simple aggregation (no GROUP BY, no WHERE) directly on V4 columns
+    /// Uses zero-copy Arrow SIMD: creates Arrow arrays pointing to V4 memory (no clone),
+    /// runs Arrow compute sum/min/max with SIMD, drops arrays before lock guards.
+    /// Returns (count, sum, min, max, is_int) for each requested column
+    pub fn execute_simple_agg(
+        &self,
+        agg_cols: &[&str],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        use arrow::array::PrimitiveArray;
+        use arrow::buffer::{Buffer, ScalarBuffer};
+        use arrow::datatypes::{Int64Type, Float64Type};
+        use std::sync::Arc;
+        
+        // Warm path: check columns directly, skip ensure_v4_loaded (saves 2 lock reads)
+        let columns = self.columns.read();
+        if columns.is_empty() || columns.iter().all(|c| c.len() == 0) {
+            drop(columns);
+            self.ensure_v4_loaded()?;
+            let columns2 = self.columns.read();
+            if columns2.is_empty() { return Ok(None); }
+            drop(columns2);
+            return self.execute_simple_agg(agg_cols);
+        }
+        
+        let schema = self.schema.read();
+        let deleted = self.deleted.read();
+        let total_rows = columns.first().map(|c| c.len()).unwrap_or(0);
+        
+        let has_deleted = deleted.iter().any(|&b| b != 0);
+        // Bail to Arrow path if there are deleted rows (need filtered arrays)
+        if has_deleted { return Ok(None); }
+        
+        let active_count = total_rows as i64;
+        let mut results: Vec<(i64, f64, f64, f64, bool)> = Vec::with_capacity(agg_cols.len());
+        
+        for &col_name in agg_cols {
+            if col_name == "*" || col_name == "1" {
+                results.push((active_count, 0.0, 0.0, 0.0, false));
+                continue;
+            }
+            
+            let col_idx = match schema.get_index(col_name) {
+                Some(idx) => idx,
+                None => { results.push((0, 0.0, 0.0, 0.0, false)); continue; }
+            };
+            if col_idx >= columns.len() { results.push((0, 0.0, 0.0, 0.0, false)); continue; }
+            
+            match &columns[col_idx] {
+                ColumnData::Int64(vals) => {
+                    // Zero-copy Arrow: create Buffer pointing to V4 memory (no clone!)
+                    // SAFETY: lock guards outlive the Arrow arrays in this scope
+                    let byte_len = vals.len() * std::mem::size_of::<i64>();
+                    let buffer = unsafe {
+                        Buffer::from_custom_allocation(
+                            std::ptr::NonNull::new_unchecked(vals.as_ptr() as *mut u8),
+                            byte_len,
+                            Arc::new(()), // no-op deallocator - V4 Vec owns the memory
+                        )
+                    };
+                    let arr = PrimitiveArray::<Int64Type>::new(
+                        ScalarBuffer::new(buffer, 0, vals.len()), None,
+                    );
+                    let sum = arrow::compute::sum(&arr).unwrap_or(0);
+                    let min_v = arrow::compute::min(&arr).unwrap_or(i64::MAX);
+                    let max_v = arrow::compute::max(&arr).unwrap_or(i64::MIN);
+                    // Drop Arrow array before lock guards
+                    drop(arr);
+                    results.push((vals.len() as i64, sum as f64, min_v as f64, max_v as f64, true));
+                }
+                ColumnData::Float64(vals) => {
+                    let byte_len = vals.len() * std::mem::size_of::<f64>();
+                    let buffer = unsafe {
+                        Buffer::from_custom_allocation(
+                            std::ptr::NonNull::new_unchecked(vals.as_ptr() as *mut u8),
+                            byte_len,
+                            Arc::new(()),
+                        )
+                    };
+                    let arr = PrimitiveArray::<Float64Type>::new(
+                        ScalarBuffer::new(buffer, 0, vals.len()), None,
+                    );
+                    let sum = arrow::compute::sum(&arr).unwrap_or(0.0);
+                    let min_v = arrow::compute::min(&arr).unwrap_or(f64::INFINITY);
+                    let max_v = arrow::compute::max(&arr).unwrap_or(f64::NEG_INFINITY);
+                    drop(arr);
+                    results.push((vals.len() as i64, sum, min_v, max_v, false));
+                }
+                _ => { results.push((active_count, 0.0, 0.0, 0.0, false)); }
+            }
+        }
+        
+        Ok(Some(results))
+    }
+
+    /// Build cached string dictionary indices for a column (row→group_id mapping)
+    /// Returns (dict_strings, group_ids) where group_ids[row] = index into dict_strings
+    pub fn build_string_dict_cache(
+        &self,
+        col_name: &str,
+    ) -> io::Result<Option<(Vec<String>, Vec<u16>)>> {
+        self.ensure_v4_loaded()?;
+        
+        let schema = self.schema.read();
+        let columns = self.columns.read();
+        let total_rows = self.ids.read().len();
+        
+        let col_idx = match schema.get_index(col_name) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        if col_idx >= columns.len() { return Ok(None); }
+        
+        let (offsets, data) = match &columns[col_idx] {
+            ColumnData::String { offsets, data } => (offsets, data),
+            _ => return Ok(None),
+        };
+        let count = offsets.len().saturating_sub(1).min(total_rows);
+        
+        let mut dict_map: ahash::AHashMap<&[u8], u16> = ahash::AHashMap::with_capacity(64);
+        let mut dict_strings: Vec<String> = Vec::with_capacity(64);
+        let mut group_ids: Vec<u16> = Vec::with_capacity(count);
+        
+        for i in 0..count {
+            let s = offsets[i] as usize;
+            let e = offsets[i + 1] as usize;
+            let key = &data[s..e];
+            let gid = match dict_map.get(key) {
+                Some(&id) => id,
+                None => {
+                    let id = dict_strings.len() as u16;
+                    dict_map.insert(key, id);
+                    dict_strings.push(std::str::from_utf8(key).unwrap_or("").to_string());
+                    id
+                }
+            };
+            group_ids.push(gid);
+        }
+        
+        Ok(Some((dict_strings, group_ids)))
+    }
+
+    /// Execute GROUP BY + aggregate using pre-built dict cache
+    /// Much faster than building dictionary on every query
+    pub fn execute_group_agg_cached(
+        &self,
+        dict_strings: &[String],
+        group_ids: &[u16],
+        agg_cols: &[(&str, bool)], // (col_name, is_count_star)
+    ) -> io::Result<Option<Vec<(String, Vec<(f64, i64)>)>>> {
+        self.ensure_v4_loaded()?;
+        
+        let schema = self.schema.read();
+        let columns = self.columns.read();
+        let deleted = self.deleted.read();
+        let total_rows = self.ids.read().len();
+        
+        let has_deleted = deleted.iter().any(|&b| b != 0);
+        let scan_rows = total_rows.min(group_ids.len());
+        let num_groups = dict_strings.len();
+        let num_aggs = agg_cols.len();
+        
+        struct AggSlice<'a> { i64_vals: Option<&'a [i64]>, f64_vals: Option<&'a [f64]>, is_count: bool }
+        let agg_slices: Vec<AggSlice> = agg_cols.iter().map(|(name, is_count)| {
+            if *is_count {
+                AggSlice { i64_vals: None, f64_vals: None, is_count: true }
+            } else if let Some(idx) = schema.get_index(name) {
+                if idx < columns.len() {
+                    match &columns[idx] {
+                        ColumnData::Int64(v) => AggSlice { i64_vals: Some(v.as_slice()), f64_vals: None, is_count: false },
+                        ColumnData::Float64(v) => AggSlice { i64_vals: None, f64_vals: Some(v.as_slice()), is_count: false },
+                        _ => AggSlice { i64_vals: None, f64_vals: None, is_count: true },
+                    }
+                } else { AggSlice { i64_vals: None, f64_vals: None, is_count: true } }
+            } else { AggSlice { i64_vals: None, f64_vals: None, is_count: true } }
+        }).collect();
+        
+        let flat_len = num_groups * num_aggs;
+        let mut flat_sums = vec![0.0f64; flat_len];
+        let mut flat_counts = vec![0i64; flat_len];
+        
+        // Single-pass aggregation with O(1) group lookup via cached group_ids
+        if has_deleted {
+            for i in 0..scan_rows {
+                let b = i / 8; let bit = i % 8;
+                if b < deleted.len() && (deleted[b] >> bit) & 1 != 0 { continue; }
+                let base = group_ids[i] as usize * num_aggs;
+                for (ai, agg) in agg_slices.iter().enumerate() {
+                    flat_counts[base + ai] += 1;
+                    if !agg.is_count {
+                        if let Some(vals) = agg.f64_vals { if i < vals.len() { flat_sums[base + ai] += vals[i]; } }
+                        else if let Some(vals) = agg.i64_vals { if i < vals.len() { flat_sums[base + ai] += vals[i] as f64; } }
+                    }
+                }
+            }
+        } else {
+            for i in 0..scan_rows {
+                let base = group_ids[i] as usize * num_aggs;
+                for (ai, agg) in agg_slices.iter().enumerate() {
+                    flat_counts[base + ai] += 1;
+                    if !agg.is_count {
+                        if let Some(vals) = agg.f64_vals { if i < vals.len() { unsafe { *flat_sums.get_unchecked_mut(base + ai) += *vals.get_unchecked(i); } } }
+                        else if let Some(vals) = agg.i64_vals { if i < vals.len() { unsafe { *flat_sums.get_unchecked_mut(base + ai) += *vals.get_unchecked(i) as f64; } } }
+                    }
+                }
+            }
+        }
+        
+        let results: Vec<(String, Vec<(f64, i64)>)> = (0..num_groups)
+            .filter(|&gid| flat_counts[gid * num_aggs] > 0)
+            .map(|gid| {
+                let aggs: Vec<(f64, i64)> = (0..num_aggs)
+                    .map(|ai| (flat_sums[gid * num_aggs + ai], flat_counts[gid * num_aggs + ai]))
+                    .collect();
+                (dict_strings[gid].clone(), aggs)
+            })
+            .collect();
+        
+        Ok(Some(results))
+    }
+
+    /// Execute BETWEEN + GROUP BY using pre-built dict cache
+    pub fn execute_between_group_agg_cached(
+        &self,
+        filter_col: &str,
+        lo: f64,
+        hi: f64,
+        dict_strings: &[String],
+        group_ids: &[u16],
+        agg_col: Option<&str>,
+    ) -> io::Result<Option<Vec<(String, f64, i64)>>> {
+        self.ensure_v4_loaded()?;
+        
+        let schema = self.schema.read();
+        let columns = self.columns.read();
+        let deleted = self.deleted.read();
+        let total_rows = self.ids.read().len();
+        
+        let filter_idx = match schema.get_index(filter_col) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        if filter_idx >= columns.len() { return Ok(None); }
+        
+        let has_deleted = deleted.iter().any(|&b| b != 0);
+        let lo_i64 = lo as i64;
+        let hi_i64 = hi as i64;
+        let scan_rows = total_rows.min(group_ids.len());
+        let num_groups = dict_strings.len();
+        
+        let mut group_sums = vec![0.0f64; num_groups];
+        let mut group_counts = vec![0i64; num_groups];
+        
+        let agg_idx = agg_col.and_then(|ac| schema.get_index(ac));
+        let agg_f64 = agg_idx.and_then(|idx| {
+            if idx < columns.len() { match &columns[idx] { ColumnData::Float64(v) => Some(v.as_slice()), _ => None } } else { None }
+        });
+        let agg_i64 = agg_idx.and_then(|idx| {
+            if idx < columns.len() { match &columns[idx] { ColumnData::Int64(v) => Some(v.as_slice()), _ => None } } else { None }
+        });
+        
+        // Branchless accumulation: eliminates branch misprediction at ~50% BETWEEN hit rate
+        // mask = (in_range) as i64 → 0 or 1, multiply with agg value so non-matching adds 0
+        macro_rules! between_agg_branchy {
+            ($filter_vals:expr, $lo_cmp:expr, $hi_cmp:expr, $limit:expr) => {{
+                for i in 0..$limit {
+                    let b = i / 8; let bit = i % 8;
+                    if b < deleted.len() && (deleted[b] >> bit) & 1 != 0 { continue; }
+                    let fv = unsafe { *$filter_vals.get_unchecked(i) };
+                    if fv >= $lo_cmp && fv <= $hi_cmp {
+                        let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
+                        unsafe { *group_counts.get_unchecked_mut(gid) += 1; }
+                        if let Some(av) = agg_f64 { unsafe { *group_sums.get_unchecked_mut(gid) += *av.get_unchecked(i); } }
+                        else if let Some(av) = agg_i64 { unsafe { *group_sums.get_unchecked_mut(gid) += *av.get_unchecked(i) as f64; } }
+                    }
+                }
+            }};
+        }
+        
+        if let Some(filter_vals) = match &columns[filter_idx] { ColumnData::Int64(v) => Some(v.as_slice()), _ => None } {
+            let limit = scan_rows.min(filter_vals.len()).min(group_ids.len());
+            let limit = limit.min(agg_f64.map_or(usize::MAX, |a| a.len())).min(agg_i64.map_or(usize::MAX, |a| a.len()));
+            if has_deleted {
+                between_agg_branchy!(filter_vals, lo_i64, hi_i64, limit);
+            } else if let Some(av) = agg_f64 {
+                // HOT PATH: branchless i64 filter + f64 agg (no deleted)
+                for i in 0..limit {
+                    let fv = unsafe { *filter_vals.get_unchecked(i) };
+                    let mask = (fv >= lo_i64 && fv <= hi_i64) as i64;
+                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
+                    unsafe {
+                        *group_counts.get_unchecked_mut(gid) += mask;
+                        *group_sums.get_unchecked_mut(gid) += mask as f64 * *av.get_unchecked(i);
+                    }
+                }
+            } else if let Some(av) = agg_i64 {
+                for i in 0..limit {
+                    let fv = unsafe { *filter_vals.get_unchecked(i) };
+                    let mask = (fv >= lo_i64 && fv <= hi_i64) as i64;
+                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
+                    unsafe {
+                        *group_counts.get_unchecked_mut(gid) += mask;
+                        *group_sums.get_unchecked_mut(gid) += mask as f64 * (*av.get_unchecked(i) as f64);
+                    }
+                }
+            } else {
+                // COUNT-only: branchless
+                for i in 0..limit {
+                    let fv = unsafe { *filter_vals.get_unchecked(i) };
+                    let mask = (fv >= lo_i64 && fv <= hi_i64) as i64;
+                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
+                    unsafe { *group_counts.get_unchecked_mut(gid) += mask; }
+                }
+            }
+        } else if let Some(filter_vals) = match &columns[filter_idx] { ColumnData::Float64(v) => Some(v.as_slice()), _ => None } {
+            let limit = scan_rows.min(filter_vals.len()).min(group_ids.len());
+            let limit = limit.min(agg_f64.map_or(usize::MAX, |a| a.len())).min(agg_i64.map_or(usize::MAX, |a| a.len()));
+            if has_deleted {
+                between_agg_branchy!(filter_vals, lo, hi, limit);
+            } else if let Some(av) = agg_f64 {
+                for i in 0..limit {
+                    let fv = unsafe { *filter_vals.get_unchecked(i) };
+                    let mask = (fv >= lo && fv <= hi) as i64;
+                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
+                    unsafe {
+                        *group_counts.get_unchecked_mut(gid) += mask;
+                        *group_sums.get_unchecked_mut(gid) += mask as f64 * *av.get_unchecked(i);
+                    }
+                }
+            } else if let Some(av) = agg_i64 {
+                for i in 0..limit {
+                    let fv = unsafe { *filter_vals.get_unchecked(i) };
+                    let mask = (fv >= lo && fv <= hi) as i64;
+                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
+                    unsafe {
+                        *group_counts.get_unchecked_mut(gid) += mask;
+                        *group_sums.get_unchecked_mut(gid) += mask as f64 * (*av.get_unchecked(i) as f64);
+                    }
+                }
+            } else {
+                for i in 0..limit {
+                    let fv = unsafe { *filter_vals.get_unchecked(i) };
+                    let mask = (fv >= lo && fv <= hi) as i64;
+                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
+                    unsafe { *group_counts.get_unchecked_mut(gid) += mask; }
+                }
+            }
+        }
+        
+        let results: Vec<(String, f64, i64)> = (0..num_groups)
+            .filter(|&gid| group_counts[gid] > 0)
+            .map(|gid| (dict_strings[gid].clone(), group_sums[gid], group_counts[gid]))
+            .collect();
+        
+        Ok(Some(results))
+    }
+
+    /// Execute BETWEEN + GROUP BY + aggregate directly on V4 in-memory columns
+    /// Returns Vec<(group_key, sum, count)> for the caller to compute final values
+    /// Uses pre-built row→group_id mapping for O(1) group lookup during aggregation
+    pub fn execute_between_group_agg(
+        &self,
+        filter_col: &str,
+        lo: f64,
+        hi: f64,
+        group_col: &str,
+        agg_col: Option<&str>,
+    ) -> io::Result<Option<Vec<(String, f64, i64)>>> {
+        self.ensure_v4_loaded()?;
+        
+        let schema = self.schema.read();
+        let columns = self.columns.read();
+        let deleted = self.deleted.read();
+        let total_rows = self.ids.read().len();
+        
+        let filter_idx = match schema.get_index(filter_col) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let group_idx = match schema.get_index(group_col) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let agg_idx = agg_col.and_then(|ac| schema.get_index(ac));
+        
+        if filter_idx >= columns.len() || group_idx >= columns.len() {
+            return Ok(None);
+        }
+        
+        let has_deleted = deleted.iter().any(|&b| b != 0);
+        let lo_i64 = lo as i64;
+        let hi_i64 = hi as i64;
+        
+        let (group_offsets, group_bytes) = match &columns[group_idx] {
+            ColumnData::String { offsets, data } => (offsets, data),
+            _ => return Ok(None),
+        };
+        let group_count = group_offsets.len().saturating_sub(1);
+        let scan_rows = total_rows.min(group_count);
+        
+        // Single-pass: build group dict + filter + aggregate simultaneously
+        // Use small linear-scan dict for ≤64 groups (faster than hash map for short strings)
+        let mut dict_entries: Vec<(u32, u32)> = Vec::with_capacity(32); // (start, end) in group_bytes
+        let mut dict_strings: Vec<String> = Vec::with_capacity(32);
+        let mut group_sums = vec![0.0f64; 64]; // pre-alloc for up to 64 groups
+        let mut group_counts = vec![0i64; 64];
+        
+        let filter_i64 = match &columns[filter_idx] {
+            ColumnData::Int64(v) => Some(v.as_slice()),
+            _ => None,
+        };
+        let filter_f64 = match &columns[filter_idx] {
+            ColumnData::Float64(v) => Some(v.as_slice()),
+            _ => None,
+        };
+        let agg_i64 = agg_idx.and_then(|idx| {
+            if idx < columns.len() { match &columns[idx] { ColumnData::Int64(v) => Some(v.as_slice()), _ => None } } else { None }
+        });
+        let agg_f64 = agg_idx.and_then(|idx| {
+            if idx < columns.len() { match &columns[idx] { ColumnData::Float64(v) => Some(v.as_slice()), _ => None } } else { None }
+        });
+        
+        // Macro for the inner aggregation to avoid code duplication
+        macro_rules! agg_row {
+            ($gid:expr, $i:expr) => {
+                group_counts[$gid] += 1;
+                if let Some(av) = agg_f64 { if $i < av.len() { group_sums[$gid] += av[$i]; } }
+                else if let Some(av) = agg_i64 { if $i < av.len() { group_sums[$gid] += av[$i] as f64; } }
+            }
+        }
+        
+        // Inline group lookup: linear scan of ≤64 entries
+        #[inline(always)]
+        fn find_group(dict: &[(u32, u32)], group_bytes: &[u8], s: usize, e: usize) -> Option<usize> {
+            let needle = &group_bytes[s..e];
+            let needle_len = (e - s) as u32;
+            for (idx, &(ds, de)) in dict.iter().enumerate() {
+                if de - ds == needle_len && &group_bytes[ds as usize..de as usize] == needle {
+                    return Some(idx);
+                }
+            }
+            None
+        }
+        
+        // Single-pass: filter + group + aggregate
+        if let Some(vals) = filter_i64 {
+            let limit = scan_rows.min(vals.len());
+            if has_deleted {
+                for i in 0..limit {
+                    let b = i / 8; let bit = i % 8;
+                    if b < deleted.len() && (deleted[b] >> bit) & 1 != 0 { continue; }
+                    if vals[i] >= lo_i64 && vals[i] <= hi_i64 && i < group_count {
+                        let s = group_offsets[i] as usize;
+                        let e = group_offsets[i + 1] as usize;
+                        let gid = if let Some(g) = find_group(&dict_entries, group_bytes, s, e) { g }
+                        else {
+                            let g = dict_entries.len();
+                            dict_entries.push((s as u32, e as u32));
+                            dict_strings.push(std::str::from_utf8(&group_bytes[s..e]).unwrap_or("").to_string());
+                            if g >= group_sums.len() { group_sums.resize(g + 16, 0.0); group_counts.resize(g + 16, 0); }
+                            g
+                        };
+                        agg_row!(gid, i);
+                    }
+                }
+            } else {
+                for i in 0..limit {
+                    if vals[i] >= lo_i64 && vals[i] <= hi_i64 && i < group_count {
+                        let s = group_offsets[i] as usize;
+                        let e = group_offsets[i + 1] as usize;
+                        let gid = if let Some(g) = find_group(&dict_entries, group_bytes, s, e) { g }
+                        else {
+                            let g = dict_entries.len();
+                            dict_entries.push((s as u32, e as u32));
+                            dict_strings.push(std::str::from_utf8(&group_bytes[s..e]).unwrap_or("").to_string());
+                            if g >= group_sums.len() { group_sums.resize(g + 16, 0.0); group_counts.resize(g + 16, 0); }
+                            g
+                        };
+                        agg_row!(gid, i);
+                    }
+                }
+            }
+        } else if let Some(vals) = filter_f64 {
+            let limit = scan_rows.min(vals.len());
+            for i in 0..limit {
+                if has_deleted {
+                    let b = i / 8; let bit = i % 8;
+                    if b < deleted.len() && (deleted[b] >> bit) & 1 != 0 { continue; }
+                }
+                if vals[i] >= lo && vals[i] <= hi && i < group_count {
+                    let s = group_offsets[i] as usize;
+                    let e = group_offsets[i + 1] as usize;
+                    let gid = if let Some(g) = find_group(&dict_entries, group_bytes, s, e) { g }
+                    else {
+                        let g = dict_entries.len();
+                        dict_entries.push((s as u32, e as u32));
+                        dict_strings.push(std::str::from_utf8(&group_bytes[s..e]).unwrap_or("").to_string());
+                        if g >= group_sums.len() { group_sums.resize(g + 16, 0.0); group_counts.resize(g + 16, 0); }
+                        g
+                    };
+                    agg_row!(gid, i);
+                }
+            }
+        }
+        
+        let num_groups = dict_entries.len();
+        
+        let results: Vec<(String, f64, i64)> = (0..num_groups)
+            .filter(|&gid| group_counts[gid] > 0)
+            .map(|gid| (dict_strings[gid].clone(), group_sums[gid], group_counts[gid]))
+            .collect();
+        
+        Ok(Some(results))
+    }
+
+    /// Execute GROUP BY + aggregate directly on V4 in-memory columns (no WHERE filter)
+    /// Returns Vec<(group_key, Vec<(sum, count)>)> for each aggregate column
+    pub fn execute_group_agg(
+        &self,
+        group_col: &str,
+        agg_cols: &[(&str, bool)],
+    ) -> io::Result<Option<Vec<(String, Vec<(f64, i64)>)>>> {
+        self.ensure_v4_loaded()?;
+        
+        let schema = self.schema.read();
+        let columns = self.columns.read();
+        let deleted = self.deleted.read();
+        let total_rows = self.ids.read().len();
+        
+        let group_idx = match schema.get_index(group_col) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        if group_idx >= columns.len() { return Ok(None); }
+        
+        let has_deleted = deleted.iter().any(|&b| b != 0);
+        
+        let (group_offsets, group_bytes) = match &columns[group_idx] {
+            ColumnData::String { offsets, data } => (offsets, data),
+            _ => return Ok(None),
+        };
+        let group_count = group_offsets.len().saturating_sub(1);
+        let scan_rows = total_rows.min(group_count);
+        let num_aggs = agg_cols.len();
+        
+        // Resolve agg column slices
+        struct AggSlice<'a> { i64_vals: Option<&'a [i64]>, f64_vals: Option<&'a [f64]>, is_count: bool }
+        let agg_slices: Vec<AggSlice> = agg_cols.iter().map(|(name, is_count)| {
+            if *is_count {
+                AggSlice { i64_vals: None, f64_vals: None, is_count: true }
+            } else if let Some(idx) = schema.get_index(name) {
+                if idx < columns.len() {
+                    match &columns[idx] {
+                        ColumnData::Int64(v) => AggSlice { i64_vals: Some(v.as_slice()), f64_vals: None, is_count: false },
+                        ColumnData::Float64(v) => AggSlice { i64_vals: None, f64_vals: Some(v.as_slice()), is_count: false },
+                        _ => AggSlice { i64_vals: None, f64_vals: None, is_count: true },
+                    }
+                } else { AggSlice { i64_vals: None, f64_vals: None, is_count: true } }
+            } else { AggSlice { i64_vals: None, f64_vals: None, is_count: true } }
+        }).collect();
+        
+        // Linear-scan dictionary for ≤64 groups (faster than hash map for short strings)
+        let mut dict_entries: Vec<(u32, u32)> = Vec::with_capacity(32);
+        let mut dict_strings: Vec<String> = Vec::with_capacity(32);
+        let max_flat = 64 * num_aggs;
+        let mut flat_sums = vec![0.0f64; max_flat];
+        let mut flat_counts = vec![0i64; max_flat];
+        
+        #[inline(always)]
+        fn find_group_ga(dict: &[(u32, u32)], gb: &[u8], s: usize, e: usize) -> Option<usize> {
+            let needle = &gb[s..e];
+            let nlen = (e - s) as u32;
+            for (idx, &(ds, de)) in dict.iter().enumerate() {
+                if de - ds == nlen && &gb[ds as usize..de as usize] == needle { return Some(idx); }
+            }
+            None
+        }
+        
+        // Single-pass: group + aggregate
+        for i in 0..scan_rows {
+            if has_deleted {
+                let b = i / 8; let bit = i % 8;
+                if b < deleted.len() && (deleted[b] >> bit) & 1 != 0 { continue; }
+            }
+            let s = group_offsets[i] as usize;
+            let e = group_offsets[i + 1] as usize;
+            let gid = if let Some(g) = find_group_ga(&dict_entries, group_bytes, s, e) { g }
+            else {
+                let g = dict_entries.len();
+                dict_entries.push((s as u32, e as u32));
+                dict_strings.push(std::str::from_utf8(&group_bytes[s..e]).unwrap_or("").to_string());
+                if (g + 1) * num_aggs > flat_sums.len() {
+                    flat_sums.resize((g + 16) * num_aggs, 0.0);
+                    flat_counts.resize((g + 16) * num_aggs, 0);
+                }
+                g
+            };
+            let base = gid * num_aggs;
+            for (ai, agg) in agg_slices.iter().enumerate() {
+                flat_counts[base + ai] += 1;
+                if !agg.is_count {
+                    if let Some(vals) = agg.f64_vals { if i < vals.len() { flat_sums[base + ai] += vals[i]; } }
+                    else if let Some(vals) = agg.i64_vals { if i < vals.len() { flat_sums[base + ai] += vals[i] as f64; } }
+                }
+            }
+        }
+        
+        let num_groups = dict_entries.len();
+        let results: Vec<(String, Vec<(f64, i64)>)> = (0..num_groups)
+            .filter(|&gid| flat_counts[gid * num_aggs] > 0)
+            .map(|gid| {
+                let aggs: Vec<(f64, i64)> = (0..num_aggs)
+                    .map(|ai| (flat_sums[gid * num_aggs + ai], flat_counts[gid * num_aggs + ai]))
+                    .collect();
+                (dict_strings[gid].clone(), aggs)
+            })
+            .collect();
+        
+        Ok(Some(results))
+    }
+
     /// Get the current durability level
     pub fn durability(&self) -> super::DurabilityLevel {
         self.durability
@@ -7826,6 +8991,19 @@ impl OnDemandStorage {
     /// Get schema
     pub fn get_schema(&self) -> Vec<(String, ColumnType)> {
         self.schema.read().columns.clone()
+    }
+
+    /// Get header info: (footer_offset, row_count)
+    #[inline]
+    pub fn header_info(&self) -> (u64, u64) {
+        let h = self.header.read();
+        (h.footer_offset, h.row_count)
+    }
+
+    /// Get the next available ID value
+    #[inline]
+    pub fn next_id_value(&self) -> u64 {
+        self.next_id.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // ========================================================================

@@ -206,7 +206,7 @@ pub struct TableMetadata {
 /// - Configurable durability levels for ACID guarantees
 pub struct TableStorageBackend {
     path: PathBuf,
-    storage: OnDemandStorage,
+    pub(crate) storage: OnDemandStorage,
     /// Cached column data (column_name -> TypedColumn)
     /// Only loaded columns are in cache
     cached_columns: RwLock<HashMap<String, TypedColumn>>,
@@ -216,6 +216,9 @@ pub struct TableStorageBackend {
     row_count: RwLock<u64>,
     /// Whether data has been modified (needs save)
     dirty: RwLock<bool>,
+    /// Cached string dictionary indices for GROUP BY acceleration
+    /// col_name -> (dict_strings, group_ids)
+    dict_cache: RwLock<HashMap<String, (Vec<String>, Vec<u16>)>>,
 }
 
 impl TableStorageBackend {
@@ -235,6 +238,7 @@ impl TableStorageBackend {
             schema: RwLock::new(schema),
             row_count: RwLock::new(row_count),
             dirty: RwLock::new(false),
+            dict_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -251,6 +255,7 @@ impl TableStorageBackend {
             schema: RwLock::new(Vec::new()),
             row_count: RwLock::new(0),
             dirty: RwLock::new(false),
+            dict_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -932,6 +937,18 @@ impl TableStorageBackend {
         if use_cache {
             if let Ok(batch) = self.storage.to_arrow_batch(column_names, 
                 column_names.map(|c| c.contains(&"_id")).unwrap_or(true)) {
+                if batch.num_rows() > 0 || batch.num_columns() > 0 {
+                    return Ok(batch);
+                }
+            }
+        }
+        
+        // OPTIMIZATION: V4 fast path for LIMIT reads (start_row=0, row_count=Some)
+        // Slice in-memory V4 columns directly instead of going through read_columns
+        if start_row == 0 && row_count.is_some() {
+            let limit = row_count.unwrap();
+            if let Ok(batch) = self.storage.to_arrow_batch_with_limit(column_names,
+                column_names.map(|c| c.contains(&"_id")).unwrap_or(true), limit) {
                 if batch.num_rows() > 0 || batch.num_columns() > 0 {
                     return Ok(batch);
                 }
@@ -2006,6 +2023,71 @@ impl TableStorageBackend {
         let schema = Arc::new(Schema::new(fields));
         arrow::record_batch::RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// Get or lazily build cached string dictionary for a column
+    pub fn get_or_build_dict_cache(&self, col_name: &str) -> io::Result<Option<(Vec<String>, Vec<u16>)>> {
+        // Check cache first
+        {
+            let cache = self.dict_cache.read();
+            if let Some(cached) = cache.get(col_name) {
+                return Ok(Some(cached.clone()));
+            }
+        }
+        // Build and cache
+        if let Some((dict_strings, group_ids)) = self.storage.build_string_dict_cache(col_name)? {
+            let result = (dict_strings.clone(), group_ids.clone());
+            let mut cache = self.dict_cache.write();
+            cache.insert(col_name.to_string(), (dict_strings, group_ids));
+            Ok(Some(result))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Execute simple aggregation (no GROUP BY, no WHERE) directly on V4 columns
+    pub fn execute_simple_agg(&self, agg_cols: &[&str]) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        self.storage.execute_simple_agg(agg_cols)
+    }
+
+    /// Build cached string dictionary indices for a column
+    pub fn build_string_dict_cache(&self, col_name: &str) -> io::Result<Option<(Vec<String>, Vec<u16>)>> {
+        self.storage.build_string_dict_cache(col_name)
+    }
+
+    /// Execute GROUP BY + aggregate using pre-built dict cache
+    pub fn execute_group_agg_cached(
+        &self, dict_strings: &[String], group_ids: &[u16], agg_cols: &[(&str, bool)],
+    ) -> io::Result<Option<Vec<(String, Vec<(f64, i64)>)>>> {
+        self.storage.execute_group_agg_cached(dict_strings, group_ids, agg_cols)
+    }
+
+    /// Execute BETWEEN + GROUP BY using pre-built dict cache
+    pub fn execute_between_group_agg_cached(
+        &self, filter_col: &str, lo: f64, hi: f64, dict_strings: &[String], group_ids: &[u16], agg_col: Option<&str>,
+    ) -> io::Result<Option<Vec<(String, f64, i64)>>> {
+        self.storage.execute_between_group_agg_cached(filter_col, lo, hi, dict_strings, group_ids, agg_col)
+    }
+
+    /// Execute BETWEEN + GROUP BY + aggregate directly on V4 columns
+    pub fn execute_between_group_agg(
+        &self,
+        filter_col: &str,
+        lo: f64,
+        hi: f64,
+        group_col: &str,
+        agg_col: Option<&str>,
+    ) -> io::Result<Option<Vec<(String, f64, i64)>>> {
+        self.storage.execute_between_group_agg(filter_col, lo, hi, group_col, agg_col)
+    }
+
+    /// Execute GROUP BY + aggregate directly on V4 columns (no WHERE)
+    pub fn execute_group_agg(
+        &self,
+        group_col: &str,
+        agg_cols: &[(&str, bool)],
+    ) -> io::Result<Option<Vec<(String, Vec<(f64, i64)>)>>> {
+        self.storage.execute_group_agg(group_col, agg_cols)
     }
 
     /// Execute Complex (Filter+Group+Order) query with single-pass optimization

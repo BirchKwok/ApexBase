@@ -905,8 +905,37 @@ impl ApexStorageImpl {
             self.invalidate_backend(&table_name);
         }
         
-        let sql = sql.to_string();
         let table_path = self.get_current_table_path()?;
+        
+        // FAST PATH: SELECT * FROM <table> LIMIT N — bypass SQL parse + Arrow entirely
+        if !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT") 
+            && !sql_upper.contains("WHERE") && !sql_upper.contains("ORDER") 
+            && !sql_upper.contains("GROUP") && !sql_upper.contains("JOIN") {
+            // Extract limit number from end of query
+            if let Some(limit_str) = sql_upper.rsplit("LIMIT").next() {
+                if let Ok(limit) = limit_str.trim().trim_end_matches(';').parse::<usize>() {
+                    if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+                        if let Ok(Some((col_names, row_values))) = backend.storage.read_rows_limit_values(limit) {
+                            let out = PyDict::new_bound(py);
+                            out.set_item("columns", &col_names)?;
+                            let py_rows = PyList::empty_bound(py);
+                            for row in row_values {
+                                let py_row = PyList::empty_bound(py);
+                                for v in row {
+                                    py_row.append(value_to_py(py, &v)?)?;
+                                }
+                                py_rows.append(py_row)?;
+                            }
+                            out.set_item("rows", py_rows)?;
+                            out.set_item("rows_affected", 0)?;
+                            return Ok(out.into());
+                        }
+                    }
+                }
+            }
+        }
+        
+        let sql = sql.to_string();
         let base_dir = self.base_dir.clone();
 
         let (columns, rows) = py.allow_threads(|| -> PyResult<(Vec<String>, Vec<Vec<Value>>)> {
@@ -1339,7 +1368,23 @@ impl ApexStorageImpl {
     fn retrieve(&self, py: Python<'_>, id: i64) -> PyResult<Option<PyObject>> {
         let table_path = self.get_current_table_path()?;
         
-        // Acquire shared read lock
+        if id < 0 {
+            return Ok(None);
+        }
+        
+        // ULTRA-FAST PATH: Direct V4 value read - no file lock, no Arrow, no GIL release
+        // Skip allow_threads() for sub-0.1ms operations where GIL overhead dominates
+        if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+            if let Ok(Some(vals)) = backend.storage.read_row_by_id_values(id as u64) {
+                let dict = PyDict::new_bound(py);
+                for (k, v) in vals {
+                    dict.set_item(k, value_to_py(py, &v)?)?;
+                }
+                return Ok(Some(dict.into()));
+            }
+        }
+        
+        // FALLBACK: File lock + Arrow path for edge cases
         let lock_file = Self::acquire_read_lock(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
@@ -1347,12 +1392,6 @@ impl ApexStorageImpl {
         let table_name = self.current_table.read().clone();
         
         let result = py.allow_threads(|| -> PyResult<Option<HashMap<String, Value>>> {
-            // Invalid IDs (negative) cannot exist
-            if id < 0 {
-                return Ok(None);
-            }
-            
-            // Use SQL query which handles delta merging
             let sql = format!("SELECT * FROM \"{}\" WHERE _id = {}", table_name, id);
             let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -1364,7 +1403,6 @@ impl ApexStorageImpl {
                 return Ok(None);
             }
             
-            // Convert first row to HashMap
             let mut row_data = HashMap::new();
             for (col_idx, field) in batch.schema().fields().iter().enumerate() {
                 let val = arrow_value_at(batch.column(col_idx), 0);
@@ -1373,7 +1411,6 @@ impl ApexStorageImpl {
             Ok(Some(row_data))
         });
         
-        // Release lock before handling result
         Self::release_lock(lock_file);
         
         let result = result?;

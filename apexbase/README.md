@@ -1,48 +1,27 @@
-# apex-core
+# apexbase — Rust Core
 
-High-performance storage engine for ApexBase (Rust core).
+High-performance HTAP storage engine for ApexBase.
 
 ## Overview
 
-This is the Rust core library that provides:
-- Custom single-file data storage format with high I/O efficiency
-- B-tree indexing for fast queries
-- LRU caching for frequently accessed data
-- Python bindings via PyO3
+This is the Rust core library (`apexbase` crate) that powers ApexBase:
 
-## Features
+- **V4 Row Group columnar storage** — 64K-row groups with per-column null bitmaps and dictionary encoding
+- **Delta write path** — append-only `.apex.delta` files for fast transactional inserts
+- **SQL engine** — parser, executor, JIT-compiled predicates (Cranelift)
+- **Arrow IPC bridge** — zero-copy data transfer to Python via PyArrow
+- **Full-text search** — NanoFTS integration with fuzzy matching
+- **WAL + durability** — configurable fast / safe / max levels
+- **Cross-platform** — Linux, macOS, Windows (x86_64 & ARM64)
 
-- **Single-file Storage**: All data stored in one file with custom format
-- **High Performance**: Optimized for both read and write operations
-- **Memory Efficient**: Uses memory-mapped I/O and LRU cache
-- **Python Integration**: Full Python API compatibility with the original ApexBase
-
-## Installation
+## Build
 
 ```bash
-pip install apex-core
-```
-
-Or build from source:
-
-```bash
-cd apex-core
+# Python extension (recommended)
 maturin develop --release
-```
 
-## Usage
-
-```python
-from apex_core import PyApexClient
-
-# Create a client
-client = PyApexClient("/path/to/data")
-
-# Store data
-client.store({"key": "value"})
-
-# Query data
-results = client.query("SELECT * FROM default_table")
+# Rust library only
+cargo build --release
 ```
 
 ## License

@@ -305,6 +305,12 @@ pub fn invalidate_storage_cache_dir(dir: &Path) {
     cache.retain(|path, _| !path.starts_with(dir));
 }
 
+/// Public wrapper for get_cached_backend (used by Python bindings for fast point lookups)
+#[inline]
+pub fn get_cached_backend_pub(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
+    get_cached_backend(path)
+}
+
 /// Get or open a cached storage backend
 /// Auto-compacts delta files before reading to ensure data consistency
 #[inline]
@@ -723,9 +729,12 @@ impl ApexExecutor {
                                 // FAST PATH for Complex (Filter+Group+Order) - biggest optimization
                                 return Ok(result);
                             } else if can_late_materialize_where {
-                                // FAST PATH 1: Try dictionary-based filter for simple string equality
+                                // FAST PATH 1: Try dictionary-based filter for simple string equality (with LIMIT)
                                 if let Some(result) = Self::try_fast_string_filter(&backend, &stmt)? {
                                     result
+                                // FAST PATH 1b: String equality without LIMIT - storage-level scan
+                                } else if let Some(result) = Self::try_fast_string_filter_no_limit(&backend, &stmt)? {
+                                    return Ok(ApexResult::Data(result));
                                 // FAST PATH 2: Try numeric range filter for BETWEEN
                                 } else if let Some(result) = Self::try_fast_numeric_range_filter(&backend, &stmt)? {
                                     result
@@ -781,8 +790,15 @@ impl ApexExecutor {
                                 && stmt.order_by.is_empty()
                                 && stmt.group_by.is_empty()
                                 && !has_aggregation_check;
+                            
+                            // Note: V4 fast agg disabled - Arrow clone+SIMD outperforms due to cache warming
+                            
                             if !stmt.group_by.is_empty() {
-                                // GROUP BY without WHERE: use dict-encoded path for faster string aggregation
+                                // V4 FAST PATH: Cached GROUP BY
+                                if let Some(result) = Self::try_fast_cached_group_by(&backend, &stmt)? {
+                                    return Ok(result);
+                                }
+                                // Fallback: dict-encoded Arrow path
                                 backend.read_columns_to_arrow_dict(col_refs_vec.as_deref())?
                             } else {
                                 let _row_limit = if can_pushdown_limit {
@@ -1134,17 +1150,31 @@ impl ApexExecutor {
             return Ok(None);
         }
         
-        // Must be simple string equality filter
-        let (filter_col, filter_val) = match where_clause {
+        // Support: string equality (col = 'val') OR BETWEEN (col BETWEEN low AND high)
+        enum FilterType<'a> {
+            StringEq(String, &'a str),
+            Between(String, f64, f64),
+        }
+        
+        let filter = match where_clause {
             SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
                 match (left.as_ref(), right.as_ref()) {
                     (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val))) => {
-                        (col.trim_matches('"').to_string(), val.as_str())
+                        FilterType::StringEq(col.trim_matches('"').to_string(), val.as_str())
                     }
                     (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
-                        (col.trim_matches('"').to_string(), val.as_str())
+                        FilterType::StringEq(col.trim_matches('"').to_string(), val.as_str())
                     }
                     _ => return Ok(None),
+                }
+            }
+            SqlExpr::Between { column, low, high, negated } if !negated => {
+                let low_val = Self::extract_numeric_value(low).ok();
+                let high_val = Self::extract_numeric_value(high).ok();
+                if let (Some(lo), Some(hi)) = (low_val, high_val) {
+                    FilterType::Between(column.trim_matches('"').to_string(), lo, hi)
+                } else {
+                    return Ok(None);
                 }
             }
             _ => return Ok(None),
@@ -1179,23 +1209,17 @@ impl ApexExecutor {
             None => return Ok(None),
         };
         
-        // Only support SUM and COUNT for now
-        if !matches!(agg_func, AggregateFunc::Sum | AggregateFunc::Count) {
+        // Support SUM, COUNT, and AVG
+        if !matches!(agg_func, AggregateFunc::Sum | AggregateFunc::Count | AggregateFunc::Avg) {
             return Ok(None);
         }
         
         // Check HAVING clause - must be simple
         if let Some(having) = &stmt.having {
-            // Only support simple column > value comparisons
             match having {
                 SqlExpr::BinaryOp { left, op: BinaryOperator::Gt, right } => {
                     match (left.as_ref(), right.as_ref()) {
-                        (SqlExpr::Column(col), SqlExpr::Literal(Value::Int64(val))) => {
-                            if col.trim_matches('"') != order_col {
-                                return Ok(None);
-                            }
-                            // Will apply this filter after aggregation
-                        }
+                        (SqlExpr::Column(_col), SqlExpr::Literal(Value::Int64(_val))) => {}
                         _ => return Ok(None),
                     }
                 }
@@ -1206,30 +1230,396 @@ impl ApexExecutor {
         let limit = stmt.limit.unwrap_or(100);
         let offset = stmt.offset.unwrap_or(0);
         
-        // Call storage-level optimized function
-        match backend.execute_filter_group_order(
-            &filter_col,
-            filter_val,
-            group_col,
-            agg_col,
-            agg_func,
-            order_col,
-            descending,
-            limit,
-            offset,
-        ) {
-            Ok(Some(result)) => {
-                // Apply HAVING if present
-                if stmt.having.is_some() {
-                    // HAVING already applied in storage function for simple cases
+        // For string equality filter, use existing storage-level path
+        match &filter {
+            FilterType::StringEq(filter_col, filter_val) => {
+                // Only SUM/COUNT for the storage-level string eq path
+                if !matches!(agg_func, AggregateFunc::Sum | AggregateFunc::Count) {
+                    return Ok(None);
                 }
+                match backend.execute_filter_group_order(
+                    filter_col,
+                    filter_val,
+                    group_col,
+                    agg_col,
+                    agg_func,
+                    order_col,
+                    descending,
+                    limit,
+                    offset,
+                ) {
+                    Ok(Some(result)) => Ok(Some(ApexResult::Data(result))),
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
+            FilterType::Between(filter_col, lo, hi) => {
+                // OPTIMIZED: Use cached dict for O(1) group lookup
+                let raw_results = if let Some((dict_strings, group_ids)) = backend.get_or_build_dict_cache(group_col)? {
+                    backend.execute_between_group_agg_cached(
+                        filter_col, *lo, *hi, &dict_strings, &group_ids, agg_col,
+                    )?
+                } else {
+                    backend.storage.execute_between_group_agg(
+                        filter_col, *lo, *hi, group_col, agg_col,
+                    )?
+                };
+                
+                let raw = match raw_results {
+                    Some(r) if !r.is_empty() => r,
+                    _ => return Ok(None),
+                };
+                
+                // Compute final aggregated values
+                let mut results: Vec<(String, f64)> = raw.into_iter().map(|(k, sum, count)| {
+                    let val = match agg_func {
+                        AggregateFunc::Sum => sum,
+                        AggregateFunc::Count => count as f64,
+                        AggregateFunc::Avg => if count > 0 { sum / count as f64 } else { 0.0 },
+                        _ => sum,
+                    };
+                    (k, val)
+                }).collect();
+                
+                // Sort
+                if descending {
+                    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                } else {
+                    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                }
+                let results: Vec<_> = results.into_iter().skip(offset).take(limit).collect();
+                
+                if results.is_empty() {
+                    return Ok(None);
+                }
+                
+                // Build Arrow result
+                let group_values: Vec<&str> = results.iter().map(|(k, _)| k.as_str()).collect();
+                let agg_values: Vec<f64> = results.iter().map(|(_, v)| *v).collect();
+                
+                let group_col_name = group_col.to_string();
+                let agg_col_name = stmt.columns.iter().find_map(|c| {
+                    if let SelectColumn::Aggregate { alias, .. } = c {
+                        alias.clone().or_else(|| Some(order_col.to_string()))
+                    } else { None }
+                }).unwrap_or_else(|| order_col.to_string());
+                
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new(&group_col_name, ArrowDataType::Utf8, false),
+                    Field::new(&agg_col_name, ArrowDataType::Float64, false),
+                ]));
+                let arrays: Vec<ArrayRef> = vec![
+                    Arc::new(StringArray::from(group_values)),
+                    Arc::new(Float64Array::from(agg_values)),
+                ];
+                let result = RecordBatch::try_new(schema, arrays)
+                    .map_err(|e| err_data(e.to_string()))?;
+                
                 Ok(Some(ApexResult::Data(result)))
             }
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
         }
     }
     
+    /// V4 FAST PATH for GROUP BY queries without WHERE
+    /// Handles: SELECT group_col, AGG1(col1), AGG2(col2) FROM table GROUP BY group_col
+    fn try_fast_v4_group_by(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::AggregateFunc;
+        
+        // Must be single GROUP BY column, no WHERE, no ORDER BY
+        if stmt.group_by.len() != 1 || stmt.where_clause.is_some() || !stmt.order_by.is_empty() {
+            return Ok(None);
+        }
+        
+        let group_col = stmt.group_by[0].trim_matches('"');
+        
+        // Extract aggregate columns: (col_name_or_"*", is_count_star, func, alias)
+        let mut agg_info: Vec<(&str, bool, AggregateFunc, Option<String>)> = Vec::new();
+        
+        for col in &stmt.columns {
+            match col {
+                SelectColumn::Aggregate { func, column, alias, .. } => {
+                    let is_count_star = matches!(func, AggregateFunc::Count) && column.is_none();
+                    let col_name = column.as_deref().unwrap_or("*");
+                    agg_info.push((col_name, is_count_star, func.clone(), alias.clone()));
+                }
+                SelectColumn::Column(name) => {
+                    if name.trim_matches('"') == group_col { continue; }
+                    return Ok(None);
+                }
+                SelectColumn::ColumnAlias { column, .. } => {
+                    if column.trim_matches('"') == group_col { continue; }
+                    return Ok(None);
+                }
+                _ => return Ok(None),
+            }
+        }
+        
+        if agg_info.is_empty() {
+            return Ok(None);
+        }
+        
+        // Build agg_cols for storage call
+        let agg_cols: Vec<(&str, bool)> = agg_info.iter()
+            .map(|(col, is_count, _, _)| (*col, *is_count))
+            .collect();
+        
+        let raw = match backend.execute_group_agg(group_col, &agg_cols)? {
+            Some(r) if !r.is_empty() => r,
+            _ => return Ok(None),
+        };
+        
+        // Build result: group_col + one column per aggregate
+        let num_groups = raw.len();
+        let group_values: Vec<&str> = raw.iter().map(|(k, _)| k.as_str()).collect();
+        
+        let mut fields: Vec<Field> = vec![
+            Field::new(group_col, ArrowDataType::Utf8, false),
+        ];
+        let mut arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(group_values)),
+        ];
+        
+        for (ai, (_, _, func, alias)) in agg_info.iter().enumerate() {
+            let col_name = alias.as_deref().unwrap_or(match func {
+                AggregateFunc::Count => "COUNT(*)",
+                AggregateFunc::Avg => "AVG",
+                AggregateFunc::Sum => "SUM",
+                AggregateFunc::Min => "MIN",
+                AggregateFunc::Max => "MAX",
+            });
+            
+            let values: Vec<f64> = raw.iter().map(|(_, aggs)| {
+                let (sum, count) = aggs[ai];
+                match func {
+                    AggregateFunc::Count => count as f64,
+                    AggregateFunc::Avg => if count > 0 { sum / count as f64 } else { 0.0 },
+                    AggregateFunc::Sum => sum,
+                    _ => sum,
+                }
+            }).collect();
+            
+            // Use Int64 for COUNT, Float64 for others
+            if matches!(func, AggregateFunc::Count) {
+                let int_values: Vec<i64> = values.iter().map(|v| *v as i64).collect();
+                fields.push(Field::new(col_name, ArrowDataType::Int64, false));
+                arrays.push(Arc::new(Int64Array::from(int_values)));
+            } else {
+                fields.push(Field::new(col_name, ArrowDataType::Float64, false));
+                arrays.push(Arc::new(Float64Array::from(values)));
+            }
+        }
+        
+        // Apply HAVING if present
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+        
+        if let Some(having) = &stmt.having {
+            // Apply having filter
+            let mask = Self::evaluate_predicate(&batch, having)?;
+            let filtered = arrow::compute::filter_record_batch(&batch, &mask)
+                .map_err(|e| err_data(e.to_string()))?;
+            if filtered.num_rows() == 0 {
+                return Ok(Some(ApexResult::Empty(filtered.schema())));
+            }
+            return Ok(Some(ApexResult::Data(filtered)));
+        }
+        
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
+    /// V4 FAST PATH: Simple aggregation (no GROUP BY, no WHERE)
+    /// Handles: SELECT COUNT(*), AVG(col), SUM(col), MIN(col), MAX(col) FROM table
+    fn try_fast_simple_agg(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::AggregateFunc;
+        
+        // Collect unique column names needed for aggregation
+        let mut unique_cols: Vec<String> = Vec::new();
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate { column, distinct, .. } = col {
+                if *distinct { return Ok(None); } // DISTINCT needs full scan
+                let name = column.as_deref().unwrap_or("*");
+                if name == "_id" { return Ok(None); } // _id stored separately
+                if !unique_cols.contains(&name.to_string()) {
+                    unique_cols.push(name.to_string());
+                }
+            } else {
+                return Ok(None); // Non-aggregate column present
+            }
+        }
+        if unique_cols.is_empty() { return Ok(None); }
+        
+        let col_refs: Vec<&str> = unique_cols.iter().map(|s| s.as_str()).collect();
+        let raw = match backend.execute_simple_agg(&col_refs)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        
+        // Build result
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+        
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate { func, column, alias, .. } = col {
+                let col_name = column.as_deref().unwrap_or("*");
+                let fn_name = match func { AggregateFunc::Count => "COUNT", AggregateFunc::Sum => "SUM", AggregateFunc::Avg => "AVG", AggregateFunc::Min => "MIN", AggregateFunc::Max => "MAX" };
+                let output_name = alias.clone().unwrap_or_else(|| if let Some(c) = column { format!("{}({})", fn_name, c) } else { format!("{}(*)", fn_name) });
+                
+                let idx = unique_cols.iter().position(|s| s == col_name).unwrap_or(0);
+                let (count, sum, min_v, max_v, is_int) = raw[idx];
+                
+                match func {
+                    AggregateFunc::Count => {
+                        fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
+                        arrays.push(Arc::new(Int64Array::from(vec![count])));
+                    }
+                    AggregateFunc::Sum => {
+                        if is_int {
+                            fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
+                            arrays.push(Arc::new(Int64Array::from(vec![sum as i64])));
+                        } else {
+                            fields.push(Field::new(&output_name, ArrowDataType::Float64, false));
+                            arrays.push(Arc::new(Float64Array::from(vec![sum])));
+                        }
+                    }
+                    AggregateFunc::Avg => {
+                        let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+                        fields.push(Field::new(&output_name, ArrowDataType::Float64, false));
+                        arrays.push(Arc::new(Float64Array::from(vec![avg])));
+                    }
+                    AggregateFunc::Min => {
+                        if is_int {
+                            fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
+                            arrays.push(Arc::new(Int64Array::from(vec![min_v as i64])));
+                        } else {
+                            fields.push(Field::new(&output_name, ArrowDataType::Float64, false));
+                            arrays.push(Arc::new(Float64Array::from(vec![min_v])));
+                        }
+                    }
+                    AggregateFunc::Max => {
+                        if is_int {
+                            fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
+                            arrays.push(Arc::new(Int64Array::from(vec![max_v as i64])));
+                        } else {
+                            fields.push(Field::new(&output_name, ArrowDataType::Float64, false));
+                            arrays.push(Arc::new(Float64Array::from(vec![max_v])));
+                        }
+                    }
+                }
+            }
+        }
+        
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
+    /// V4 FAST PATH: Cached GROUP BY (builds dict cache on first call, reuses on subsequent calls)
+    fn try_fast_cached_group_by(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::AggregateFunc;
+        
+        // Must be single GROUP BY column, no WHERE
+        if stmt.group_by.len() != 1 || stmt.where_clause.is_some() || !stmt.order_by.is_empty() {
+            return Ok(None);
+        }
+        
+        let group_col = stmt.group_by[0].trim_matches('"');
+        
+        // Extract aggregate info
+        let mut agg_info: Vec<(&str, bool, AggregateFunc, Option<String>)> = Vec::new();
+        for col in &stmt.columns {
+            match col {
+                SelectColumn::Aggregate { func, column, alias, .. } => {
+                    let is_count_star = matches!(func, AggregateFunc::Count) && column.is_none();
+                    let col_name = column.as_deref().unwrap_or("*");
+                    agg_info.push((col_name, is_count_star, func.clone(), alias.clone()));
+                }
+                SelectColumn::Column(name) => {
+                    if name.trim_matches('"') == group_col { continue; }
+                    return Ok(None);
+                }
+                SelectColumn::ColumnAlias { column, .. } => {
+                    if column.trim_matches('"') == group_col { continue; }
+                    return Ok(None);
+                }
+                _ => return Ok(None),
+            }
+        }
+        if agg_info.is_empty() { return Ok(None); }
+        
+        // Get or build cached dict
+        let (dict_strings, group_ids) = match backend.get_or_build_dict_cache(group_col)? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        
+        let agg_cols: Vec<(&str, bool)> = agg_info.iter()
+            .map(|(col, is_count, _, _)| (*col, *is_count))
+            .collect();
+        
+        let raw = match backend.execute_group_agg_cached(&dict_strings, &group_ids, &agg_cols)? {
+            Some(r) if !r.is_empty() => r,
+            _ => return Ok(None),
+        };
+        
+        // Build result
+        let num_groups = raw.len();
+        let group_values: Vec<&str> = raw.iter().map(|(k, _)| k.as_str()).collect();
+        
+        let mut fields: Vec<Field> = vec![Field::new(group_col, ArrowDataType::Utf8, false)];
+        let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(group_values))];
+        
+        for (ai, (_, _, func, alias)) in agg_info.iter().enumerate() {
+            let col_name = alias.as_deref().unwrap_or(match func {
+                AggregateFunc::Count => "COUNT(*)", AggregateFunc::Avg => "AVG",
+                AggregateFunc::Sum => "SUM", AggregateFunc::Min => "MIN", AggregateFunc::Max => "MAX",
+            });
+            let values: Vec<f64> = raw.iter().map(|(_, aggs)| {
+                let (sum, count) = aggs[ai];
+                match func {
+                    AggregateFunc::Count => count as f64,
+                    AggregateFunc::Avg => if count > 0 { sum / count as f64 } else { 0.0 },
+                    _ => sum,
+                }
+            }).collect();
+            if matches!(func, AggregateFunc::Count) {
+                let int_values: Vec<i64> = values.iter().map(|v| *v as i64).collect();
+                fields.push(Field::new(col_name, ArrowDataType::Int64, false));
+                arrays.push(Arc::new(Int64Array::from(int_values)));
+            } else {
+                fields.push(Field::new(col_name, ArrowDataType::Float64, false));
+                arrays.push(Arc::new(Float64Array::from(values)));
+            }
+        }
+        
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+        
+        // Apply HAVING
+        if let Some(having) = &stmt.having {
+            let mask = Self::evaluate_predicate(&batch, having)?;
+            let filtered = arrow::compute::filter_record_batch(&batch, &mask)
+                .map_err(|e| err_data(e.to_string()))?;
+            if filtered.num_rows() == 0 {
+                return Ok(Some(ApexResult::Empty(filtered.schema())));
+            }
+            return Ok(Some(ApexResult::Data(filtered)));
+        }
+        
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
     /// Helper to extract string equality: col = 'value'
     fn extract_string_equality(expr: &SqlExpr) -> Option<(String, String)> {
         use crate::query::sql_parser::BinaryOperator;
