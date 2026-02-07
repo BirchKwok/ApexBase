@@ -907,26 +907,27 @@ impl ApexStorageImpl {
         
         let table_path = self.get_current_table_path()?;
         
-        // FAST PATH: SELECT * FROM <table> LIMIT N — bypass SQL parse + Arrow entirely
+        // FAST PATH: SELECT * FROM <table> LIMIT N — bypass SQL parse + Arrow, return columnar
         if !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT") 
             && !sql_upper.contains("WHERE") && !sql_upper.contains("ORDER") 
             && !sql_upper.contains("GROUP") && !sql_upper.contains("JOIN") {
-            // Extract limit number from end of query
             if let Some(limit_str) = sql_upper.rsplit("LIMIT").next() {
                 if let Ok(limit) = limit_str.trim().trim_end_matches(';').parse::<usize>() {
                     if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
                         if let Ok(Some((col_names, row_values))) = backend.storage.read_rows_limit_values(limit) {
                             let out = PyDict::new_bound(py);
-                            out.set_item("columns", &col_names)?;
-                            let py_rows = PyList::empty_bound(py);
-                            for row in row_values {
-                                let py_row = PyList::empty_bound(py);
-                                for v in row {
-                                    py_row.append(value_to_py(py, &v)?)?;
+                            // Build columnar dict: {"col_name": [v1, v2, ...], ...}
+                            let columns_dict = PyDict::new_bound(py);
+                            let num_cols = col_names.len();
+                            let num_rows = row_values.len();
+                            for col_idx in 0..num_cols {
+                                let col_list = PyList::empty_bound(py);
+                                for row_idx in 0..num_rows {
+                                    col_list.append(value_to_py(py, &row_values[row_idx][col_idx])?)?;
                                 }
-                                py_rows.append(py_row)?;
+                                columns_dict.set_item(&col_names[col_idx], col_list)?;
                             }
-                            out.set_item("rows", py_rows)?;
+                            out.set_item("columns_dict", columns_dict)?;
                             out.set_item("rows_affected", 0)?;
                             return Ok(out.into());
                         }
@@ -1063,9 +1064,36 @@ impl ApexStorageImpl {
             self.invalidate_backend(&table_name);
         }
         
-        let sql = sql.to_string();
         let table_path = self.get_current_table_path()?;
         let base_dir = self.base_dir.clone();
+
+        // FAST PATH: SELECT * FROM <table> LIMIT N — build Arrow batch directly from V4
+        if !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT")
+            && !sql_upper.contains("WHERE") && !sql_upper.contains("ORDER")
+            && !sql_upper.contains("GROUP") && !sql_upper.contains("JOIN") {
+            if let Some(limit_str) = sql_upper.rsplit("LIMIT").next() {
+                if let Ok(limit) = limit_str.trim().trim_end_matches(';').parse::<usize>() {
+                    if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+                        if let Ok(batch) = backend.storage.to_arrow_batch_with_limit(None, false, limit) {
+                            if batch.num_rows() > 0 || batch.num_columns() > 0 {
+                                let mut buf = Vec::with_capacity(batch.get_array_memory_size() + 256);
+                                {
+                                    let mut writer = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
+                                        .map_err(|e| PyRuntimeError::new_err(format!("IPC writer error: {}", e)))?;
+                                    writer.write(&batch)
+                                        .map_err(|e| PyRuntimeError::new_err(format!("IPC write error: {}", e)))?;
+                                    writer.finish()
+                                        .map_err(|e| PyRuntimeError::new_err(format!("IPC finish error: {}", e)))?;
+                                }
+                                return Ok(PyBytes::new_bound(py, &buf).into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let sql = sql.to_string();
 
         // Execute query
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {

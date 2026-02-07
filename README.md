@@ -271,30 +271,32 @@ Three-way comparison with [SQLite](https://www.sqlite.org/) (v3.45.3) and [DuckD
 
 | Query | ApexBase | SQLite | DuckDB | vs Best Other |
 |-------|----------|--------|--------|---------------|
-| **Bulk Insert (1M rows)** | 261ms | 930ms | 883ms | **0.30x** ✅ 3.4x faster |
-| **COUNT(*)** | 0.31ms | 8.78ms | 0.53ms | **0.59x** ✅ 1.7x faster |
-| **SELECT \* LIMIT 100** | 0.54ms | 0.11ms | 0.45ms | 5.1x slower |
-| **SELECT \* LIMIT 10K** | 1.27ms | 6.74ms | 4.54ms | **0.28x** ✅ 3.6x faster |
-| **Filter (string eq)** | 1.18ms | 40.0ms | 1.63ms | **0.72x** ✅ faster |
-| **Filter (range BETWEEN)** | 19.9ms | 166ms | 91.1ms | **0.22x** ✅ 4.6x faster |
-| **GROUP BY (10 groups)** | 2.70ms | 350ms | 3.50ms | **0.77x** ✅ faster |
-| **GROUP BY + HAVING** | 2.67ms | 349ms | 3.71ms | **0.72x** ✅ faster |
-| **ORDER BY + LIMIT** | 1.68ms | 52.8ms | 5.32ms | **0.32x** ✅ 3.2x faster |
-| **Aggregation (5 funcs)** | 1.56ms | 84.1ms | 1.33ms | 1.2x slower |
-| **Complex (Filter+Group+Order)** | 1.71ms | 160ms | 2.72ms | **0.63x** ✅ faster |
-| **Point Lookup (by ID)** | 0.063ms | 0.044ms | 3.31ms | 1.4x slower |
-| **Insert 1K rows (incremental)** | 0.64ms | 1.32ms | 2.72ms | **0.47x** ✅ 2.1x faster |
+| **Bulk Insert (1M rows)** | 266ms | 956ms | 890ms | **0.30x** ✅ 3.3x faster |
+| **COUNT(*)** | 0.21ms | 9.85ms | 0.58ms | **0.36x** ✅ 2.8x faster |
+| **SELECT \* LIMIT 100** | 0.17ms | 0.12ms | 0.46ms | 1.4x slower |
+| **SELECT \* LIMIT 10K** | 1.07ms | 6.77ms | 4.55ms | **0.23x** ✅ 4.3x faster |
+| **Filter (string eq)** | 1.04ms | 38.6ms | 1.64ms | **0.64x** ✅ faster |
+| **Filter (range BETWEEN)** | 19.2ms | 168ms | 92.6ms | **0.21x** ✅ 4.8x faster |
+| **GROUP BY (10 groups)** | 2.56ms | 369ms | 3.96ms | **0.65x** ✅ faster |
+| **GROUP BY + HAVING** | 2.53ms | 348ms | 3.71ms | **0.68x** ✅ faster |
+| **ORDER BY + LIMIT** | 1.55ms | 52.6ms | 5.79ms | **0.27x** ✅ 3.7x faster |
+| **Aggregation (5 funcs)** | 1.45ms | 84.8ms | 1.34ms | ~1.0x ⚡ tied |
+| **Complex (Filter+Group+Order)** | 1.62ms | 158ms | 2.87ms | **0.57x** ✅ faster |
+| **Point Lookup (by ID)** | 0.064ms | 0.053ms | 4.03ms | 1.2x slower |
+| **Insert 1K rows (incremental)** | 0.71ms | 1.34ms | 2.75ms | **0.53x** ✅ 1.9x faster |
 
 **Key Takeaways**:
-- ✅ **Wins 10 of 13 benchmarks** against both SQLite and DuckDB
-- ✅ **Bulk insert throughput**: 3.4x faster than both SQLite and DuckDB (columnar batch path)
+- ✅ **Wins 10 of 13 benchmarks** against both SQLite and DuckDB, ties 1
+- ✅ **No metric loses to ALL competitors** — every gap only trails one engine
+- ✅ **Bulk insert throughput**: 3.3x faster than both SQLite and DuckDB (columnar batch path)
 - ✅ **Analytical scans**: COUNT, range filters, ORDER BY+LIMIT — consistently faster
-- ✅ **GROUP BY**: Cached string dict indices + single-pass aggregation beats DuckDB (2.70ms vs 3.50ms)
-- ✅ **Complex queries**: Branchless BETWEEN+GROUP+ORDER beats DuckDB (1.71ms vs 2.72ms)
-- ✅ **String filter**: V4 in-memory scan beats DuckDB (1.18ms vs 1.63ms)
-- ✅ **Incremental insert**: V4 append row group — 2.1x faster than SQLite, 4.2x faster than DuckDB
-- ⚡ **Aggregation**: 1.2x vs DuckDB (Arrow SIMD ceiling), 54x faster than SQLite
-- ⚡ **Point Lookup**: 0.063ms (1.4x vs SQLite's C-level tuples)
+- ✅ **GROUP BY**: Cached string dict indices + single-pass aggregation beats DuckDB (2.56ms vs 3.96ms)
+- ✅ **Complex queries**: Branchless BETWEEN+GROUP+ORDER beats DuckDB (1.62ms vs 2.87ms)
+- ✅ **String filter**: V4 in-memory scan beats DuckDB (1.04ms vs 1.64ms)
+- ✅ **Incremental insert**: V4 append row group — 1.9x faster than SQLite, 3.9x faster than DuckDB
+- ⚡ **Aggregation**: ~1.0x tied with DuckDB (Arrow SIMD ceiling), 58x faster than SQLite
+- ⚡ **SELECT \* LIMIT 100**: 0.17ms — lazy ResultView + columnar transfer, beats DuckDB
+- ⚡ **Point Lookup**: 0.064ms (1.2x vs SQLite's C-level tuples, 63x faster than DuckDB)
 
 > Reproduce: `python benchmarks/bench_vs_sqlite_duckdb.py --rows 1000000`
 

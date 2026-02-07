@@ -27,6 +27,10 @@ import polars as pl
 ARROW_AVAILABLE = True
 POLARS_AVAILABLE = True
 
+# Pre-compiled regex for SQL validation (avoids re-compilation on every query)
+_RE_CREATE_TABLE = re.compile(r"\bcreate\s+(table|view)\b", re.IGNORECASE)
+_RE_FROM_TABLE = re.compile(r"\bfrom\s+(\w+)", re.IGNORECASE)
+
 # Try to import nanofts Python library for optimized Arrow import
 try:
     import nanofts
@@ -607,106 +611,77 @@ class ApexClient:
     def execute(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
         self._check_connection()
         with self._lock:
-            # Validate table name if FROM clause exists
-            self._validate_table_in_sql(sql)
-            
             # Determine if _id should be shown based on SQL (like ApexClient)
             if show_internal_id is None:
                 show_internal_id = self._should_show_internal_id(sql)
             
-            # OPTIMIZATION: Use Arrow IPC for efficient bulk transfer
-            if hasattr(self._storage, '_execute_arrow_ipc'):
+            # FAST PATH: SELECT * LIMIT N (small N) — direct columnar transfer (no IPC)
+            sql_up = sql.strip().upper()
+            if (sql_up.startswith('SELECT *') and 'LIMIT' in sql_up
+                    and 'WHERE' not in sql_up and 'ORDER' not in sql_up
+                    and 'GROUP' not in sql_up and 'JOIN' not in sql_up):
+                # Extract limit value — only use columnar path for small limits
                 try:
-                    ipc_bytes = self._storage._execute_arrow_ipc(sql)
-                    
-                    # Deserialize IPC bytes to Arrow table
-                    import io
-                    reader = pa.ipc.open_stream(io.BytesIO(ipc_bytes))
-                    batches = list(reader)
-                    
-                    if batches:
-                        table = pa.Table.from_batches(batches)
-                        # Check if table has 0 rows - treat as empty result
-                        if table.num_rows == 0:
-                            table = None
-                    else:
-                        # Empty result - create empty table with 0 columns
-                        table = None
-                    
-                    rv = ResultView(arrow_table=table, data=None)
-                    rv._show_internal_id = show_internal_id
-                    return rv
-                except Exception as e:
-                    # Fallback to legacy path
-                    # Only warn for unexpected errors, not for common expected cases
-                    pass
+                    limit_val = int(sql_up.rsplit('LIMIT', 1)[1].strip().rstrip(';'))
+                except (ValueError, IndexError):
+                    limit_val = 999999
+                if limit_val <= 500:
+                    try:
+                        result = self._storage.execute(sql)
+                        if result is not None:
+                            columns_dict = result.get('columns_dict')
+                            if columns_dict is not None:
+                                rv = ResultView(lazy_pydict=dict(columns_dict))
+                                rv._show_internal_id = show_internal_id
+                                return rv
+                    except Exception:
+                        pass
             
-            # Legacy path: ApexStorage.execute returns a dict with columns and rows
-            result = self._storage.execute(sql)
+            # Validate table name for non-fast-path queries
+            self._validate_table_in_sql(sql)
             
-            if result is None:
-                return _empty_result_view()
+            # Standard path: Arrow IPC for efficient bulk transfer
+            ipc_bytes = self._storage._execute_arrow_ipc(sql)
             
-            # Convert dict result to Arrow table
-            columns = result.get('columns', [])
-            rows = result.get('rows', [])
+            reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
+            table = reader.read_all()
             
-            if not rows:
-                return _empty_result_view()
+            if table.num_rows == 0:
+                table = None
             
-            # Build dict of lists for Arrow table
-            col_data = {col: [] for col in columns}
-            for row in rows:
-                for i, col in enumerate(columns):
-                    col_data[col].append(row[i] if i < len(row) else None)
-            
-            table = pa.Table.from_pydict(col_data)
             rv = ResultView(arrow_table=table, data=None)
             rv._show_internal_id = show_internal_id
             return rv
     
     def _validate_table_in_sql(self, sql: str) -> None:
         """Validate that table names in SQL exist (skip for multi-statement SQL)"""
-        import re
-        
         # Skip validation for multi-statement SQL (contains CREATE TABLE/VIEW)
-        # Let Rust backend handle validation for these cases
-        if re.search(r"\bcreate\s+(table|view)\b", sql, flags=re.IGNORECASE):
+        if _RE_CREATE_TABLE.search(sql):
             return
         
         # Extract table name from FROM clause
-        m = re.search(r"\bfrom\s+(\w+)", sql, flags=re.IGNORECASE)
+        m = _RE_FROM_TABLE.search(sql)
         if not m:
             return
         
         table_name = m.group(1).lower()
         
-        # Get available tables
-        available_tables = set()
-        available_tables.add('default')
-        available_tables.add(self._current_table.lower())
+        # Fast path: skip expensive list_tables/listdir for known tables
+        if table_name == 'default' or table_name == self._current_table.lower():
+            return
         
-        # Check table_paths for other tables
-        if hasattr(self._storage, 'list_tables'):
-            try:
-                for t in self._storage.list_tables():
-                    available_tables.add(t.lower())
-            except Exception:
-                pass
+        # Check .apex file exists directly (O(1) vs O(n) listdir)
+        apex_path = os.path.join(self._dirpath, f"{table_name}.apex")
+        if os.path.exists(apex_path):
+            return
         
-        # Also check for .apex files in directory
-        import os
-        if os.path.isdir(self._dirpath):
-            for f in os.listdir(self._dirpath):
-                if f.endswith('.apex'):
-                    available_tables.add(f[:-5].lower())
-        
-        if table_name not in available_tables:
-            raise ValueError(f"Table '{m.group(1)}' not found")
+        raise ValueError(f"Table '{m.group(1)}' not found")
     
     def _should_show_internal_id(self, sql: str) -> bool:
         """Determine if _id should be visible based on SQL (mirrors ApexClient logic)"""
-        import re
+        # Fast path: if _id not mentioned at all, skip expensive regex
+        if '_id' not in sql:
+            return False
         
         # Check if _id is explicitly in SELECT clause
         m = re.search(r"\bselect\b(.*?)\bfrom\b", sql, flags=re.IGNORECASE | re.DOTALL)

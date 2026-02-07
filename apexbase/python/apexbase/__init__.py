@@ -88,17 +88,27 @@ atexit.register(_registry.close_all)
 class ResultView:
     """Query result view - Arrow-first high-performance implementation"""
     
-    def __init__(self, arrow_table=None, data=None):
+    def __init__(self, arrow_table=None, data=None, lazy_pydict=None):
         """
         Initialize ResultView (Arrow-first mode)
         
         Args:
             arrow_table: PyArrow Table (primary data source, fastest)
             data: List[dict] data (optional, for fallback)
+            lazy_pydict: dict of column_name -> list (deferred Arrow creation)
         """
         self._arrow_table = arrow_table
         self._data = data  # Lazy loading, convert from Arrow
-        self._num_rows = arrow_table.num_rows if arrow_table is not None else (len(data) if data else 0)
+        self._lazy_pydict = lazy_pydict  # Deferred: convert to Arrow on demand
+        if arrow_table is not None:
+            self._num_rows = arrow_table.num_rows
+        elif lazy_pydict is not None:
+            first_col = next(iter(lazy_pydict.values()), [])
+            self._num_rows = len(first_col)
+        elif data is not None:
+            self._num_rows = len(data)
+        else:
+            self._num_rows = 0
     
     @classmethod
     def from_arrow_bytes(cls, arrow_bytes: bytes) -> 'ResultView':
@@ -108,15 +118,31 @@ class ResultView:
     def from_dicts(cls, data: List[dict]) -> 'ResultView':
         raise RuntimeError("Non-Arrow query path has been removed. Use Arrow FFI results only.")
     
+    def _ensure_arrow(self):
+        """Materialize Arrow table from lazy_pydict if needed"""
+        if self._arrow_table is None and self._lazy_pydict is not None:
+            self._arrow_table = pa.Table.from_pydict(self._lazy_pydict)
+            self._lazy_pydict = None
+    
     def _ensure_data(self):
         """Ensure _data is available (lazy load from Arrow conversion, optionally hide _id)"""
-        if self._data is None and self._arrow_table is not None:
-            show_id = bool(getattr(self, "_show_internal_id", False))
-            if show_id:
-                self._data = [dict(row) for row in self._arrow_table.to_pylist()]
-            else:
-                self._data = [{k: v for k, v in row.items() if k != '_id'} 
-                              for row in self._arrow_table.to_pylist()]
+        if self._data is None:
+            # Try lazy pydict first (avoids Arrow round-trip for to_dict)
+            if self._lazy_pydict is not None:
+                show_id = bool(getattr(self, "_show_internal_id", False))
+                d = self._lazy_pydict
+                keys = [k for k in d if show_id or k != '_id']
+                n = len(next(iter(d.values()), []))
+                self._data = [{k: d[k][i] for k in keys} for i in range(n)]
+                return self._data
+            self._ensure_arrow()
+            if self._arrow_table is not None:
+                show_id = bool(getattr(self, "_show_internal_id", False))
+                if show_id:
+                    self._data = [dict(row) for row in self._arrow_table.to_pylist()]
+                else:
+                    self._data = [{k: v for k, v in row.items() if k != '_id'} 
+                                  for row in self._arrow_table.to_pylist()]
         return self._data if self._data is not None else []
     
     def to_dict(self) -> List[dict]:
@@ -149,6 +175,7 @@ class ResultView:
         if not ARROW_AVAILABLE:
             raise ImportError("pandas not available. Install with: pip install pandas")
         
+        self._ensure_arrow()
         if self._arrow_table is not None:
             show_id = bool(getattr(self, "_show_internal_id", False))
             if zero_copy:
@@ -186,6 +213,7 @@ class ResultView:
         if not POLARS_AVAILABLE:
             raise ImportError("polars not available. Install with: pip install polars")
         
+        self._ensure_arrow()
         if self._arrow_table is not None:
             df = pl.from_arrow(self._arrow_table)
             show_id = bool(getattr(self, "_show_internal_id", False))
@@ -206,6 +234,7 @@ class ResultView:
         if not ARROW_AVAILABLE:
             raise ImportError("pyarrow not available. Install with: pip install pyarrow")
         
+        self._ensure_arrow()
         if self._arrow_table is not None:
             show_id = bool(getattr(self, "_show_internal_id", False))
             if not show_id:
@@ -217,6 +246,7 @@ class ResultView:
     
     @property
     def shape(self):
+        self._ensure_arrow()
         if self._arrow_table is not None:
             return (self._arrow_table.num_rows, self._arrow_table.num_columns)
         # When arrow_table is None (empty result), return (0, 0)
@@ -224,6 +254,8 @@ class ResultView:
     
     @property
     def columns(self):
+        if self._lazy_pydict is not None:
+            return [c for c in self._lazy_pydict if c != '_id']
         if self._arrow_table is not None:
             cols = self._arrow_table.column_names
             show_id = bool(getattr(self, "_show_internal_id", False))
@@ -254,6 +286,7 @@ class ResultView:
         Returns:
             numpy.ndarray or list: Array of record IDs.
         """
+        self._ensure_arrow()
         if self._arrow_table is not None and '_id' in self._arrow_table.column_names:
             # Zero-copy path: directly convert from Arrow to numpy, bypassing Python objects
             id_array = self._arrow_table.column('_id').to_numpy()
@@ -269,6 +302,11 @@ class ResultView:
 
     def scalar(self):
         """Get single scalar value (for aggregate queries like COUNT(*))"""
+        if self._lazy_pydict is not None:
+            first_col = next((k for k in self._lazy_pydict if k != '_id'), None)
+            if first_col and self._lazy_pydict[first_col]:
+                return self._lazy_pydict[first_col][0]
+            return None
         if self._arrow_table is not None and self._arrow_table.num_rows > 0:
             # Skip _id if present
             col_names = self._arrow_table.column_names
