@@ -11,6 +11,7 @@ def test_multi_statement_sql():
     """Test executing multiple SQL statements separated by semicolons"""
     with tempfile.TemporaryDirectory() as temp_dir:
         client = ApexClient(dirpath=temp_dir)
+        client.create_table("default")
         
         print("Testing multi-statement SQL support...")
         

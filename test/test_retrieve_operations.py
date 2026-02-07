@@ -53,6 +53,7 @@ class TestSingleRetrieve:
         """Test retrieving an existing record"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = {"name": "Alice", "age": 25, "city": "NYC"}
@@ -74,6 +75,7 @@ class TestSingleRetrieve:
         """Test retrieving a nonexistent record"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store some data
             client.store({"name": "Alice", "age": 25})
@@ -88,6 +90,7 @@ class TestSingleRetrieve:
         """Test retrieving from empty database"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Try to retrieve from empty database
             result = client.retrieve(0)
@@ -99,6 +102,7 @@ class TestSingleRetrieve:
         """Test retrieving multiple specific records"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -128,6 +132,7 @@ class TestSingleRetrieve:
         """Test retrieving records with various data types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with various types
             test_data = {
@@ -165,6 +170,7 @@ class TestSingleRetrieve:
         """Test retrieving records with unicode characters"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store unicode data
             test_data = {
@@ -189,6 +195,7 @@ class TestSingleRetrieve:
         """Test retrieving records with special characters"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with special characters
             test_data = {
@@ -219,6 +226,7 @@ class TestRetrieveMany:
         """Test retrieving multiple records"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -250,6 +258,7 @@ class TestRetrieveMany:
         """Test retrieving records with unordered IDs"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -275,6 +284,7 @@ class TestRetrieveMany:
         """Test retrieving records with duplicate IDs"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -300,6 +310,7 @@ class TestRetrieveMany:
         """Test retrieving with empty ID list"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store some data
             client.store({"name": "Alice", "age": 25})
@@ -316,6 +327,7 @@ class TestRetrieveMany:
         """Test retrieving with some nonexistent IDs"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -341,6 +353,7 @@ class TestRetrieveMany:
         """Test retrieving with all nonexistent IDs"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store some data
             client.store({"name": "Alice", "age": 25})
@@ -357,6 +370,7 @@ class TestRetrieveMany:
         """Test retrieving with large ID list"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store large dataset
             large_data = [{"id": i, "value": f"item_{i}"} for i in range(1000)]
@@ -383,6 +397,7 @@ class TestRetrieveAll:
         """Test retrieving all records"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -410,6 +425,7 @@ class TestRetrieveAll:
         """Test retrieving all from empty database"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Retrieve all from empty database
             results = client.retrieve_all()
@@ -423,6 +439,7 @@ class TestRetrieveAll:
         """Test retrieving all from large dataset"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store large dataset
             large_data = [{"id": i, "value": f"item_{i}"} for i in range(5000)]
@@ -448,6 +465,7 @@ class TestRetrieveAll:
         """Test retrieving all records with various data types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with various types
             test_data = [
@@ -487,6 +505,7 @@ class TestRetrieveResultViewConversions:
         """Test retrieve_many to pandas conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -518,6 +537,7 @@ class TestRetrieveResultViewConversions:
         """Test retrieve_all to polars conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -544,6 +564,7 @@ class TestRetrieveResultViewConversions:
         """Test retrieve_many to Arrow conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -569,6 +590,7 @@ class TestRetrieveResultViewConversions:
         """Test get_ids on retrieve operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -605,6 +627,7 @@ class TestRetrievePerformance:
         """Test Arrow C Data Interface optimization"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -630,6 +653,7 @@ class TestRetrievePerformance:
         """Test performance comparison between retrieve methods"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store medium dataset
             data_size = 1000
@@ -664,6 +688,7 @@ class TestRetrievePerformance:
         """Test retrieving single record with large data"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store record with large data
             large_string = "x" * 1000000  # 1MB string
@@ -693,6 +718,7 @@ class TestRetrieveEdgeCases:
         """Test retrieve operations on closed client"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.close()
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
@@ -708,6 +734,7 @@ class TestRetrieveEdgeCases:
         """Test retrieving with invalid ID types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store some data
             client.store({"name": "Alice", "age": 25})
@@ -726,6 +753,7 @@ class TestRetrieveEdgeCases:
         """Test retrieving with very large ID"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store some data
             client.store({"name": "Alice", "age": 25})
@@ -741,6 +769,7 @@ class TestRetrieveEdgeCases:
         """Test retrieving from different tables"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data in default table
             client.store({"name": "Alice", "table": "default"})
@@ -767,6 +796,7 @@ class TestRetrieveEdgeCases:
         """Test retrieve operations with FTS enabled"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=["content"])
             
             # Store data with FTS content
@@ -790,6 +820,7 @@ class TestRetrieveEdgeCases:
         """Test retrieving after some records have been deleted"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -824,6 +855,7 @@ class TestRetrieveEdgeCases:
         """Test retrieve consistency after data modifications"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice", "age": 25})

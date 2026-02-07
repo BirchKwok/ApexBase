@@ -56,6 +56,7 @@ class TestFTSInitialization:
         """Test basic FTS initialization"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Initialize FTS with default settings
             client.init_fts()
@@ -71,6 +72,7 @@ class TestFTSInitialization:
         """Test FTS initialization with specific index fields"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Initialize FTS with specific fields
             client.init_fts(index_fields=['title', 'content', 'tags'])
@@ -86,6 +88,7 @@ class TestFTSInitialization:
         """Test FTS initialization with lazy loading"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Initialize FTS with lazy loading
             client.init_fts(lazy_load=True, cache_size=50000)
@@ -100,6 +103,7 @@ class TestFTSInitialization:
         """Test FTS initialization for specific table"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create table and initialize FTS for it
             client.create_table("articles")
@@ -118,6 +122,7 @@ class TestFTSInitialization:
         """Test FTS initialization for multiple tables with different configs"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Initialize FTS for multiple tables
             client.create_table("articles")
@@ -142,8 +147,9 @@ class TestFTSInitialization:
         """Test FTS initialization in chain calls"""
         with tempfile.TemporaryDirectory() as temp_dir:
             # Test chain call during initialization
-            client = (ApexClient(dirpath=temp_dir)
-                     .init_fts(index_fields=['content']))
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.init_fts(index_fields=['content'])
             
             assert client._is_fts_enabled()
             
@@ -153,6 +159,7 @@ class TestFTSInitialization:
         """Test FTS initialization on closed client"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.close()
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
@@ -165,11 +172,13 @@ class TestFTSPersistenceLifecycle:
     def test_fts_persist_and_auto_enable_on_reopen(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             client.store({"content": "Python programming language"})
             client.close()
 
             client2 = ApexClient(dirpath=temp_dir)
+            client2.create_table("default")
             assert client2._is_fts_enabled()
 
             # Should work without calling init_fts again (lazy init)
@@ -180,6 +189,7 @@ class TestFTSPersistenceLifecycle:
     def test_disable_fts_persists_across_reopen(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             client.store({"content": "Python programming language"})
 
@@ -187,6 +197,7 @@ class TestFTSPersistenceLifecycle:
             client.close()
 
             client2 = ApexClient(dirpath=temp_dir)
+            client2.create_table("default")
             assert not client2._is_fts_enabled()
             with pytest.raises(ValueError, match="Full-text search is not enabled"):
                 client2.search_text("python")
@@ -195,6 +206,7 @@ class TestFTSPersistenceLifecycle:
     def test_drop_fts_deletes_index_files_and_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             client.store({"content": "Python programming language"})
 
@@ -205,6 +217,7 @@ class TestFTSPersistenceLifecycle:
             index_path = Path(temp_dir) / "fts_indexes" / "default.nfts"
             # Index file may not exist on some platforms until flushed, but drop_fts should try to remove it if present
             client2 = ApexClient(dirpath=temp_dir)
+            client2.create_table("default")
             client2.drop_fts()
             client2.close()
 
@@ -218,6 +231,7 @@ class TestFTSPersistenceLifecycle:
             assert not index_path.exists()
 
             client3 = ApexClient(dirpath=temp_dir)
+            client3.create_table("default")
             assert not client3._is_fts_enabled()
             with pytest.raises(ValueError, match="Full-text search is not enabled"):
                 client3.search_text("python")
@@ -231,6 +245,7 @@ class TestBasicTextSearch:
         """Test basic text search"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store searchable documents
@@ -261,6 +276,7 @@ class TestBasicTextSearch:
         """Test search across multiple indexed fields"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['title', 'content', 'tags'])
             
             # Store documents with multiple fields
@@ -301,6 +317,7 @@ class TestBasicTextSearch:
         """Test case-insensitive search"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store documents with mixed case
@@ -327,6 +344,7 @@ class TestBasicTextSearch:
         """Test partial word matching"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store documents
@@ -351,6 +369,7 @@ class TestBasicTextSearch:
         """Test search with special characters"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store documents
@@ -374,6 +393,7 @@ class TestBasicTextSearch:
         """Test search with unicode characters"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store documents with simple unicode
@@ -400,6 +420,7 @@ class TestFuzzySearch:
         """Test basic fuzzy search"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store documents
@@ -427,6 +448,7 @@ class TestFuzzySearch:
         """Test fuzzy search with min_results parameter"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store documents
@@ -455,6 +477,7 @@ class TestFuzzySearch:
         """Test fuzzy search configuration"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store documents
@@ -485,6 +508,7 @@ class TestFuzzySearch:
         """Test fuzzy search vs exact search"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store documents
@@ -519,6 +543,7 @@ class TestSearchAndRetrieve:
         """Test basic search and retrieve"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['title', 'content'])
             
             # Store documents
@@ -549,6 +574,7 @@ class TestSearchAndRetrieve:
         """Test search and retrieve with limit"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store multiple Python-related documents
@@ -575,6 +601,7 @@ class TestSearchAndRetrieve:
         """Test search_and_retrieve_top method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store documents
@@ -601,6 +628,7 @@ class TestSearchAndRetrieve:
         """Test ResultView conversions from search and retrieve"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store documents
@@ -639,6 +667,7 @@ class TestSearchAndRetrieve:
         """Test search and retrieve on specific table"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create tables and initialize FTS
             client.create_table("articles")
@@ -679,6 +708,7 @@ class TestFTSStatistics:
         """Test getting FTS statistics"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Stats before FTS initialization
             stats = client.get_fts_stats()
@@ -711,6 +741,7 @@ class TestFTSStatistics:
         """Test FTS statistics for multiple tables"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Initialize FTS for multiple tables
             client.create_table("articles")
@@ -734,6 +765,7 @@ class TestFTSStatistics:
         """Test FTS index compaction"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store and delete data to create fragmentation
@@ -760,6 +792,7 @@ class TestFTSStatistics:
         """Test FTS terms warmup"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'], lazy_load=True)
             
             # Store documents
@@ -789,6 +822,7 @@ class TestFTSEdgeCases:
         """Test search without FTS initialization"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store some data
             client.store({"content": "Python programming"})
@@ -809,6 +843,7 @@ class TestFTSEdgeCases:
         """Test FTS operations on closed client"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             client.close()
             
@@ -820,6 +855,7 @@ class TestFTSEdgeCases:
         """Test search with empty query"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store some data
@@ -840,6 +876,7 @@ class TestFTSEdgeCases:
         """Test search with very long query"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store some data
@@ -856,6 +893,7 @@ class TestFTSEdgeCases:
         """Test FTS with non-indexed fields"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['title'])  # Only index title
             
             # Store documents with title and content
@@ -879,6 +917,7 @@ class TestFTSEdgeCases:
         """Test FTS after table operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create table and initialize FTS
             client.create_table("test_table")
@@ -907,6 +946,7 @@ class TestFTSEdgeCases:
         """Test FTS with large documents"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store large document
@@ -923,6 +963,7 @@ class TestFTSEdgeCases:
         """Test FTS performance with large dataset"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store large dataset

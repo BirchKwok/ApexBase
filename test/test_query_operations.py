@@ -53,6 +53,7 @@ class TestBasicQueryOperations:
         """Test querying all records"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -80,6 +81,7 @@ class TestBasicQueryOperations:
         """Test querying with WHERE clause"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -113,6 +115,7 @@ class TestBasicQueryOperations:
         """Test querying with limit"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [{"id": i, "value": f"item_{i}"} for i in range(10)]
@@ -134,6 +137,7 @@ class TestBasicQueryOperations:
         """Test querying with complex conditions"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -162,6 +166,7 @@ class TestBasicQueryOperations:
         """Test querying with string operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -185,6 +190,7 @@ class TestBasicQueryOperations:
         """Test querying with NULL values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data with NULL values
             test_data = [
@@ -209,6 +215,7 @@ class TestBasicQueryOperations:
         """Test querying empty database"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Query empty database
             results = client.query()
@@ -225,6 +232,7 @@ class TestBasicQueryOperations:
         """Test query that returns no results"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -248,6 +256,7 @@ class TestResultViewFunctionality:
         """Test ResultView basic properties"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -276,6 +285,7 @@ class TestResultViewFunctionality:
         """Test ResultView iteration"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -306,6 +316,7 @@ class TestResultViewFunctionality:
         """Test ResultView indexing"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -336,6 +347,7 @@ class TestResultViewFunctionality:
         """Test ResultView.to_dict() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -360,6 +372,7 @@ class TestResultViewFunctionality:
         """Test ResultView.to_pandas() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -394,6 +407,7 @@ class TestResultViewFunctionality:
         """Test ResultView.to_polars() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -418,6 +432,7 @@ class TestResultViewFunctionality:
         """Test ResultView.to_arrow() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -441,6 +456,7 @@ class TestResultViewFunctionality:
         """Test ResultView.get_ids() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -473,6 +489,7 @@ class TestResultViewFunctionality:
         """Test ResultView.ids property (deprecated)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -494,6 +511,7 @@ class TestResultViewFunctionality:
         """Test ResultView.__repr__ method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -518,6 +536,7 @@ class TestQueryEdgeCases:
         """Test query with invalid SQL syntax"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [{"name": "Alice", "age": 25}]
@@ -533,6 +552,7 @@ class TestQueryEdgeCases:
         """Test query with nonexistent column"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [{"name": "Alice", "age": 25}]
@@ -553,6 +573,7 @@ class TestQueryEdgeCases:
         """Test query operations on closed client"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.close()
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
@@ -568,6 +589,7 @@ class TestQueryEdgeCases:
         """Test query with special characters in values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data with special characters
             test_data = [
@@ -590,6 +612,7 @@ class TestQueryEdgeCases:
         """Test query with different numeric types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data with various numeric types
             test_data = [
@@ -617,6 +640,7 @@ class TestQueryEdgeCases:
         """Test query performance with large dataset"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store large dataset
             large_data = [
@@ -653,6 +677,7 @@ class TestQueryEdgeCases:
         """Test query with boolean values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data with boolean values
             test_data = [
@@ -680,6 +705,7 @@ class TestQueryEdgeCases:
         """Test query with IN operator"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -705,6 +731,7 @@ class TestQueryEdgeCases:
         """Test query with BETWEEN operator"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -736,6 +763,7 @@ class TestQueryOptimizations:
         """Test that limit parameter provides optimization"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store large dataset
             large_data = [{"id": i, "value": f"item_{i}"} for i in range(1000)]
@@ -757,6 +785,7 @@ class TestQueryOptimizations:
         """Test Arrow optimization when available"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -781,6 +810,7 @@ class TestQueryOptimizations:
         """Test ResultView with empty results"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Query empty database
             results = client.query("name = 'nonexistent'")

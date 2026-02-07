@@ -134,8 +134,6 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
 pub struct ApexStorageImpl {
     /// Base directory path
     base_dir: PathBuf,
-    /// Default table path (the primary table)
-    default_table_path: PathBuf,
     /// Table paths (table_name -> path) - lazily populated
     table_paths: RwLock<HashMap<String, PathBuf>>,
     /// Whether table_paths has been fully scanned from directory
@@ -204,6 +202,11 @@ impl ApexStorageImpl {
     #[inline]
     fn get_current_table_path(&self) -> PyResult<PathBuf> {
         let table_name = self.current_table.read().clone();
+        if table_name.is_empty() {
+            return Err(PyValueError::new_err(
+                "No table selected. Call create_table() or use_table() first."
+            ));
+        }
         let paths = self.table_paths.read();
         paths.get(&table_name)
             .cloned()
@@ -214,6 +217,11 @@ impl ApexStorageImpl {
     #[inline]
     fn get_current_table_info(&self) -> PyResult<(PathBuf, String)> {
         let table_name = self.current_table.read().clone();
+        if table_name.is_empty() {
+            return Err(PyValueError::new_err(
+                "No table selected. Call create_table() or use_table() first."
+            ));
+        }
         let paths = self.table_paths.read();
         let path = paths.get(&table_name)
             .cloned()
@@ -341,48 +349,17 @@ impl ApexStorageImpl {
             }
         }
 
-        let mut table_paths = HashMap::new();
+        let table_paths = HashMap::new();
         
-        // Always use "default" as the table name to match ApexClient/V3Client expectations
-        let default_table_name = "default";
-        
-        // Use the exact path provided for the default table (e.g., apexbase.apex)
-        let has_apex_ext = abs_path.extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s == "apex")
-            .unwrap_or(false);
-        let default_path = if has_apex_ext {
-            abs_path.clone()
-        } else {
-            base_dir.join("default.apex")
-        };
-        
-        // Check if the default path exists - if so, just register it; otherwise create it
-        // But if drop_if_exists was true, don't create file immediately (lazy creation)
-        if default_path.exists() {
-            // File exists - just register the path, don't create/overwrite
-            table_paths.insert(default_table_name.to_string(), default_path.clone());
-        } else if !drop_if_exists {
-            // Create default table at the specified path (only if not drop_if_exists)
-            TableStorageBackend::create(&default_path)
-                .map_err(|e| PyIOError::new_err(format!("Failed to create default table: {}", e)))?;
-            table_paths.insert(default_table_name.to_string(), default_path.clone());
-        } else {
-            // drop_if_exists=true and file doesn't exist - just register path for lazy creation
-            table_paths.insert(default_table_name.to_string(), default_path.clone());
-        }
-        
-        // OPTIMIZATION: Don't scan directory for other .apex files on creation
-        // This is lazily done when list_tables() is called
-        // This significantly speeds up client creation when many clients share a directory
+        // No default table - users must explicitly create or use a table
+        // Existing .apex files in the directory are discovered lazily via use_table() or list_tables()
 
         Ok(Self {
             base_dir,
-            default_table_path: default_path,
             table_paths: RwLock::new(table_paths),
             tables_scanned: RwLock::new(false),
             cached_backends: RwLock::new(HashMap::new()),
-            current_table: RwLock::new(default_table_name.to_string()),
+            current_table: RwLock::new(String::new()),
             fts_manager: RwLock::new(None),
             fts_index_fields: RwLock::new(HashMap::new()),
             durability: durability_level,
@@ -892,6 +869,7 @@ impl ApexStorageImpl {
     /// Execute SQL query
     fn execute(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
         let sql_upper = sql.trim().to_uppercase();
+        let is_ddl = sql_upper.starts_with("CREATE ") || sql_upper.starts_with("DROP TABLE");
         let is_write_op = sql_upper.starts_with("DELETE") 
             || sql_upper.starts_with("TRUNCATE") 
             || sql_upper.starts_with("UPDATE")
@@ -901,11 +879,16 @@ impl ApexStorageImpl {
         
         // Invalidate cached backend before write operations to avoid stale data
         let table_name = self.current_table.read().clone();
-        if is_write_op {
+        if is_write_op && !table_name.is_empty() {
             self.invalidate_backend(&table_name);
         }
         
-        let table_path = self.get_current_table_path()?;
+        // For DDL (CREATE/DROP TABLE), don't require a current table
+        let table_path = if is_ddl {
+            self.get_current_table_path().unwrap_or_else(|_| self.base_dir.clone())
+        } else {
+            self.get_current_table_path()?
+        };
         
         // FAST PATH: SELECT * FROM <table> LIMIT N — bypass SQL parse + Arrow, return columnar
         if !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT") 
@@ -983,8 +966,28 @@ impl ApexStorageImpl {
         out.set_item("rows_affected", 0)?;
         
         // Invalidate cached backend AFTER write operations to ensure fresh data on next access
-        if is_write_op {
+        if is_write_op && !table_name.is_empty() {
             self.invalidate_backend(&table_name);
+        }
+        
+        // After CREATE TABLE, register the new table and set it as current
+        if sql_upper.starts_with("CREATE TABLE") || sql_upper.starts_with("CREATE TABLE IF NOT EXISTS") {
+            let rest = sql_upper.strip_prefix("CREATE TABLE")
+                .unwrap_or("")
+                .trim();
+            let rest = if rest.starts_with("IF NOT EXISTS") {
+                rest.strip_prefix("IF NOT EXISTS").unwrap_or(rest).trim()
+            } else {
+                rest
+            };
+            if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == '(').next() {
+                let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
+                if !tbl.is_empty() {
+                    let tbl_path = self.base_dir.join(format!("{}.apex", tbl));
+                    self.table_paths.write().insert(tbl.clone(), tbl_path);
+                    *self.current_table.write() = tbl;
+                }
+            }
         }
         
         Ok(out.into())
@@ -1053,6 +1056,7 @@ impl ApexStorageImpl {
         
         // Invalidate cached backend before write operations
         let sql_upper = sql.trim().to_uppercase();
+        let is_ddl = sql_upper.starts_with("CREATE ") || sql_upper.starts_with("DROP TABLE");
         let is_write_op = sql_upper.starts_with("DELETE") 
             || sql_upper.starts_with("TRUNCATE") 
             || sql_upper.starts_with("UPDATE")
@@ -1060,11 +1064,16 @@ impl ApexStorageImpl {
             || sql_upper.starts_with("ALTER")
             || sql_upper.starts_with("DROP");
         let table_name = self.current_table.read().clone();
-        if is_write_op {
+        if is_write_op && !table_name.is_empty() {
             self.invalidate_backend(&table_name);
         }
         
-        let table_path = self.get_current_table_path()?;
+        // For DDL (CREATE/DROP TABLE), don't require a current table
+        let table_path = if is_ddl {
+            self.get_current_table_path().unwrap_or_else(|_| self.base_dir.clone())
+        } else {
+            self.get_current_table_path()?
+        };
         let base_dir = self.base_dir.clone();
 
         // FAST PATH: SELECT * FROM <table> LIMIT N — build Arrow batch directly from V4
@@ -1116,8 +1125,28 @@ impl ApexStorageImpl {
         }
         
         // Invalidate cached backend AFTER write operations
-        if is_write_op {
+        if is_write_op && !table_name.is_empty() {
             self.invalidate_backend(&table_name);
+        }
+        
+        // After CREATE TABLE, register the new table and set it as current
+        if sql_upper.starts_with("CREATE TABLE") {
+            let rest = sql_upper.strip_prefix("CREATE TABLE")
+                .unwrap_or("")
+                .trim();
+            let rest = if rest.starts_with("IF NOT EXISTS") {
+                rest.strip_prefix("IF NOT EXISTS").unwrap_or(rest).trim()
+            } else {
+                rest
+            };
+            if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == '(').next() {
+                let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
+                if !tbl.is_empty() {
+                    let tbl_path = self.base_dir.join(format!("{}.apex", tbl));
+                    self.table_paths.write().insert(tbl.clone(), tbl_path);
+                    *self.current_table.write() = tbl;
+                }
+            }
         }
         
         // Return as Python bytes
@@ -1131,20 +1160,21 @@ impl ApexStorageImpl {
         
         let table_path = self.get_current_table_path()?;
         let base_dir = self.base_dir.clone();
+        let table_name = self.current_table.read().clone();
         let where_clause = where_clause.to_string();
         
-        // Build SQL from where clause
+        // Build SQL from where clause using current table name
         let sql = if let Some(lim) = limit {
             if where_clause == "1=1" || where_clause.is_empty() {
-                format!("SELECT * FROM default LIMIT {}", lim)
+                format!("SELECT * FROM \"{}\" LIMIT {}", table_name, lim)
             } else {
-                format!("SELECT * FROM default WHERE {} LIMIT {}", where_clause, lim)
+                format!("SELECT * FROM \"{}\" WHERE {} LIMIT {}", table_name, where_clause, lim)
             }
         } else {
             if where_clause == "1=1" || where_clause.is_empty() {
-                "SELECT * FROM default".to_string()
+                format!("SELECT * FROM \"{}\"", table_name)
             } else {
-                format!("SELECT * FROM default WHERE {}", where_clause)
+                format!("SELECT * FROM \"{}\" WHERE {}", table_name, where_clause)
             }
         };
         
@@ -1229,10 +1259,6 @@ impl ApexStorageImpl {
 
     /// Drop a table
     fn drop_table(&self, name: &str) -> PyResult<()> {
-        if name == "default" {
-            return Err(PyValueError::new_err("Cannot drop default table"));
-        }
-
         // Invalidate cached backend first (releases file lock)
         self.invalidate_backend(name);
         
@@ -1246,7 +1272,7 @@ impl ApexStorageImpl {
         drop(paths);
 
         if *self.current_table.read() == name {
-            *self.current_table.write() = "default".to_string();
+            *self.current_table.write() = String::new();
         }
         Ok(())
     }

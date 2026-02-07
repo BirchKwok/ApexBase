@@ -27,6 +27,7 @@ class TestSqlBusinessCases:
         """E-commerce scenario: users, orders, payments with 3-table JOIN + aggregation (no VIEW)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             # Create tables and insert data using Python API
             client.create_table("users")
@@ -95,6 +96,7 @@ class TestSqlBusinessCases:
         """Support ticket SLA scenario: GROUP BY + HAVING + VIEW + pagination"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             # Create table and insert data using Python API
             client.create_table("tickets")
@@ -148,6 +150,7 @@ class TestSqlBusinessCases:
         """Marketing attribution scenario: campaigns + events JOIN + GROUP BY (no VIEW)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             # Create tables and insert data using Python API
             client.create_table("campaigns")
@@ -206,6 +209,7 @@ class TestSqlBusinessCases:
         """
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             # ALL DDL + DML + VIEW + JOIN in ONE execute call
             res = _execute_or_xfail(client, """

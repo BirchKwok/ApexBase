@@ -58,6 +58,7 @@ class TestSingleRecordStorage:
         """Test storing a single basic dictionary"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = {"name": "Alice", "age": 25, "city": "NYC"}
             client.store(data)
@@ -77,6 +78,7 @@ class TestSingleRecordStorage:
         """Test storing dict with all supported data types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = {
                 "string_field": "test_string",
@@ -111,6 +113,7 @@ class TestSingleRecordStorage:
         """Test storing dict with special values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Test with very large numbers
             data = {
@@ -135,6 +138,7 @@ class TestSingleRecordStorage:
         """Test storing empty dictionary"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store({})
             
@@ -150,6 +154,7 @@ class TestSingleRecordStorage:
         """Test storing dict with unicode characters"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = {
                 "chinese": "你好世界",
@@ -175,6 +180,7 @@ class TestBatchStorage:
         """Test storing list of basic dictionaries"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = [
                 {"name": "Alice", "age": 25},
@@ -201,6 +207,7 @@ class TestBatchStorage:
         """Test storing empty list"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([])
             
@@ -213,6 +220,7 @@ class TestBatchStorage:
         """Test storing list with mixed data types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = [
                 {"type": "string", "value": "test"},
@@ -240,6 +248,7 @@ class TestBatchStorage:
         """Test storing list where some dicts have missing fields"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = [
                 {"name": "Alice", "age": 25, "city": "NYC"},
@@ -262,6 +271,7 @@ class TestBatchStorage:
         """Test storing large list of records"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Generate 1000 records
             data = [{"id": i, "value": f"record_{i}"} for i in range(1000)]
@@ -290,6 +300,7 @@ class TestColumnarStorage:
         """Test basic columnar storage"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = {
                 "names": ["Alice", "Bob", "Charlie"],
@@ -316,6 +327,7 @@ class TestColumnarStorage:
         """Test columnar storage with mixed data types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = {
                 "strings": ["a", "b", "c"],
@@ -339,6 +351,7 @@ class TestColumnarStorage:
         """Test columnar storage with empty columns - should raise error for mismatched lengths"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = {
                 "empty_list": [],
@@ -355,6 +368,7 @@ class TestColumnarStorage:
         """Test columnar storage with unequal column lengths - should raise error"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Different lengths - should raise ValueError
             data = {
@@ -371,6 +385,7 @@ class TestColumnarStorage:
         """Test columnar storage with single value"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = {
                 "single": ["only_value"],
@@ -395,6 +410,7 @@ class TestNumPyStorage:
         """Test storing NumPy numeric arrays"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = {
                 "int_array": np.array([1, 2, 3, 4, 5], dtype=np.int64),
@@ -416,6 +432,7 @@ class TestNumPyStorage:
         """Test storing NumPy arrays with mixed dtypes"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = {
                 "int32": np.array([1, 2, 3], dtype=np.int32),
@@ -438,6 +455,7 @@ class TestNumPyStorage:
         """Test storing large NumPy arrays"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Large arrays for performance testing
             size = 10000
@@ -464,6 +482,7 @@ class TestNumPyStorage:
         """Test storing NumPy string arrays"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Arrays must have same length for columnar storage
             data = {
@@ -490,6 +509,7 @@ class TestPandasStorage:
         """Test storing basic Pandas DataFrame"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             df = pd.DataFrame({
                 "name": ["Alice", "Bob", "Charlie"],
@@ -511,6 +531,7 @@ class TestPandasStorage:
         """Test storing Pandas DataFrame with mixed dtypes"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             df = pd.DataFrame({
                 "strings": ["a", "b", "c"],
@@ -534,6 +555,7 @@ class TestPandasStorage:
         """Test storing empty Pandas DataFrame"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             df = pd.DataFrame()
             
@@ -548,6 +570,7 @@ class TestPandasStorage:
         """Test storing Pandas DataFrame with NaN values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # NaN handling may vary - use DataFrame without NaN for basic test
             df = pd.DataFrame({
@@ -569,6 +592,7 @@ class TestPandasStorage:
         """Test from_pandas convenience method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             df = pd.DataFrame({
                 "product": ["A", "B", "C"],
@@ -597,6 +621,7 @@ class TestPolarsStorage:
         """Test storing basic Polars DataFrame"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             df = pl.DataFrame({
                 "name": ["Alice", "Bob", "Charlie"],
@@ -619,6 +644,7 @@ class TestPolarsStorage:
         """Test storing Polars DataFrame with mixed dtypes"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             df = pl.DataFrame({
                 "strings": ["a", "b", "c"],
@@ -642,6 +668,7 @@ class TestPolarsStorage:
         """Test from_polars convenience method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             df = pl.DataFrame({
                 "id": [1, 2, 3],
@@ -670,6 +697,7 @@ class TestPyArrowStorage:
         """Test storing basic PyArrow Table"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             table = pa.Table.from_pydict({
                 "name": ["Alice", "Bob", "Charlie"],
@@ -691,6 +719,7 @@ class TestPyArrowStorage:
         """Test storing PyArrow Table with mixed dtypes"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             table = pa.Table.from_pydict({
                 "strings": ["a", "b", "c"],
@@ -713,6 +742,7 @@ class TestPyArrowStorage:
         """Test from_pyarrow convenience method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             table = pa.Table.from_pydict({
                 "key": ["a", "b", "c"],
@@ -740,6 +770,7 @@ class TestStorageEdgeCases:
         """Test storing unsupported data format"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Try to store unsupported format
             with pytest.raises(ValueError, match="Data must be dict, list of dicts"):
@@ -757,6 +788,7 @@ class TestStorageEdgeCases:
         """Test storage operations on closed client"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.close()
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
@@ -772,6 +804,7 @@ class TestStorageEdgeCases:
         """Test storing very large values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Very long string
             long_string = "x" * 1000000  # 1MB string
@@ -793,6 +826,7 @@ class TestStorageEdgeCases:
         """Test storing nested structures (should be handled gracefully)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Nested dict - might be converted to string
             data = {
@@ -815,6 +849,7 @@ class TestStorageEdgeCases:
         """Test storing data with special characters"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             data = {
                 "quotes": 'Single "double" quotes',
@@ -838,6 +873,7 @@ class TestStorageEdgeCases:
         """Test storage with FTS enabled"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=["content", "title"])
             
             data = {
@@ -858,6 +894,7 @@ class TestStorageEdgeCases:
         """Test performance considerations for different storage formats"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Test different storage formats with same data
             base_data = [{"id": i, "value": f"item_{i}"} for i in range(100)]

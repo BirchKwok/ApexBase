@@ -56,6 +56,7 @@ class TestPandasConversions:
         """Test basic from_pandas conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create pandas DataFrame
             df = pd.DataFrame({
@@ -89,6 +90,7 @@ class TestPandasConversions:
         """Test basic to_pandas conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -121,6 +123,7 @@ class TestPandasConversions:
         """Test pandas zero-copy conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -144,6 +147,7 @@ class TestPandasConversions:
         """Test pandas conversion with mixed data types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create DataFrame with mixed types
             df = pd.DataFrame({
@@ -173,6 +177,7 @@ class TestPandasConversions:
         """Test pandas conversion with null values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create DataFrame with null values
             df = pd.DataFrame({
@@ -196,6 +201,7 @@ class TestPandasConversions:
         """Test pandas conversion with empty DataFrame"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Convert from empty DataFrame
             empty_df = pd.DataFrame()
@@ -218,6 +224,7 @@ class TestPandasConversions:
         """Test pandas conversion with large dataset"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create large DataFrame
             size = 10000
@@ -251,6 +258,7 @@ class TestPolarsConversions:
         """Test basic from_polars conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create polars DataFrame
             df = pl.DataFrame({
@@ -284,6 +292,7 @@ class TestPolarsConversions:
         """Test basic to_polars conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -316,6 +325,7 @@ class TestPolarsConversions:
         """Test polars conversion with mixed data types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create DataFrame with mixed types
             df = pl.DataFrame({
@@ -344,6 +354,7 @@ class TestPolarsConversions:
         """Test polars conversion with null values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create DataFrame without null values (null handling may vary)
             df = pl.DataFrame({
@@ -365,6 +376,7 @@ class TestPolarsConversions:
         """Test polars conversion with empty DataFrame"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Convert from empty DataFrame
             empty_df = pl.DataFrame()
@@ -392,6 +404,7 @@ class TestPyArrowConversions:
         """Test basic from_pyarrow conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create Arrow Table
             table = pa.Table.from_pydict({
@@ -425,6 +438,7 @@ class TestPyArrowConversions:
         """Test basic to_arrow conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -457,6 +471,7 @@ class TestPyArrowConversions:
         """Test Arrow conversion with mixed data types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create Table with mixed types
             table = pa.Table.from_pydict({
@@ -485,6 +500,7 @@ class TestPyArrowConversions:
         """Test Arrow conversion with null values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create Table without null values (null handling may vary)
             table = pa.Table.from_pydict({
@@ -507,6 +523,7 @@ class TestPyArrowConversions:
         """Test Arrow conversion with empty Table"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Convert from empty Table
             empty_table = pa.Table.from_pydict({})
@@ -534,6 +551,7 @@ class TestCrossFormatConversions:
         """Test Polars -> ApexBase -> Pandas conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create Polars DataFrame
             pl_df = pl.DataFrame({
@@ -560,6 +578,7 @@ class TestCrossFormatConversions:
         """Test Pandas -> ApexBase -> Polars conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create Pandas DataFrame
             pd_df = pd.DataFrame({
@@ -591,6 +610,7 @@ class TestArrowPandasIntegration:
         """Test Arrow -> ApexBase -> Pandas -> Arrow roundtrip"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create Arrow Table
             original_table = pa.Table.from_pydict({
@@ -617,6 +637,7 @@ class TestConversionEdgeCases:
         """Test pandas conversion error handling"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Test to_pandas on empty results
             empty_results = client.query()
@@ -635,6 +656,7 @@ class TestConversionEdgeCases:
         """Test polars conversion error handling"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Test to_polars on empty results
             empty_results = client.query()
@@ -653,6 +675,7 @@ class TestConversionEdgeCases:
         """Test Arrow conversion error handling"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Test to_arrow on empty results
             empty_results = client.query()
@@ -671,6 +694,7 @@ class TestConversionEdgeCases:
         """Test conversions with special characters"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create DataFrame with special characters
             df = pd.DataFrame({
@@ -704,6 +728,7 @@ class TestConversionPerformance:
         """Test pandas conversion performance"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             import time
             
@@ -738,6 +763,7 @@ class TestConversionPerformance:
         """Test polars conversion performance"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             import time
             
@@ -776,6 +802,7 @@ class TestSqlResultConversions:
         """Test SqlResult to_pandas conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -807,6 +834,7 @@ class TestSqlResultConversions:
         """Test SqlResult to_polars conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [

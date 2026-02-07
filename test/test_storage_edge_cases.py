@@ -134,6 +134,7 @@ class TestAlterTableInsertScenarios:
             
             # Second session: reopen and insert
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.use_table("test")
             client.store([{"id": 2, "name": "Bob"}])
             client.flush()
@@ -513,6 +514,7 @@ class TestPersistenceRecovery:
             
             # Session 2: read
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.use_table("test")
             result = client.execute("SELECT * FROM test").to_dict()
             assert len(result) == 1
@@ -532,6 +534,7 @@ class TestPersistenceRecovery:
             
             # Session 2: use schema
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.use_table("test")
             client.store([{"name": "Bob", "age": 30}])
             client.flush()
@@ -546,6 +549,7 @@ class TestPersistenceRecovery:
         with tempfile.TemporaryDirectory() as temp_dir:
             for session in range(5):
                 client = ApexClient(dirpath=temp_dir)
+                client.create_table("default")
                 if session == 0:
                     client.create_table("test")
                 client.use_table("test")
@@ -557,6 +561,7 @@ class TestPersistenceRecovery:
             
             # Final read
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.use_table("test")
             result = client.execute("SELECT COUNT(*) as cnt FROM test").to_dict()
             assert result[0]["cnt"] == 500

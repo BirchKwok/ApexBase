@@ -54,6 +54,7 @@ class TestTableManagementAPI:
         """Test creating multiple tables"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             for name in ["customers", "orders", "products"]:
                 client.create_table(name)
@@ -115,6 +116,7 @@ class TestColumnManagementAPI:
         """Test adding column via API"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"id": 1, "name": "Alice"}])
             client.flush()
@@ -134,6 +136,7 @@ class TestColumnManagementAPI:
         """Test dropping column via API"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"id": 1, "keep": "yes", "drop_me": "no"}])
             client.flush()
@@ -144,6 +147,7 @@ class TestColumnManagementAPI:
             # Reopen to see changes
             client.close()
             client = ApexClient(dirpath=temp_dir)
+            client.use_table("default")
             
             result = client.execute("SELECT * FROM default")
             df = result.to_pandas()
@@ -157,6 +161,7 @@ class TestColumnManagementAPI:
         """Test renaming column via API"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"id": 1, "old_name": "value"}])
             client.flush()
@@ -167,6 +172,7 @@ class TestColumnManagementAPI:
             # Reopen to see changes
             client.close()
             client = ApexClient(dirpath=temp_dir)
+            client.use_table("default")
             
             result = client.execute("SELECT * FROM default")
             df = result.to_pandas()
@@ -187,6 +193,7 @@ class TestComplexSQLSelect:
         """Test SELECT with AND/OR conditions"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "category": "A", "status": "active", "value": 100},
@@ -213,6 +220,7 @@ class TestComplexSQLSelect:
         """Test SELECT with BETWEEN"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": i, "score": i * 10} for i in range(1, 11)
@@ -230,6 +238,7 @@ class TestComplexSQLSelect:
         """Test SELECT with IN clause"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "city": "NYC"},
@@ -250,6 +259,7 @@ class TestComplexSQLSelect:
         """Test SELECT with LIKE patterns"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "name": "Alice Johnson"},
@@ -276,6 +286,7 @@ class TestComplexSQLSelect:
         """Test SELECT with NOT conditions"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "active": True},
@@ -301,6 +312,7 @@ class TestSQLAggregations:
         """Test COUNT(*)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"id": i} for i in range(100)])
             
@@ -314,6 +326,7 @@ class TestSQLAggregations:
         """Test COUNT(column)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "value": 10},
@@ -332,6 +345,7 @@ class TestSQLAggregations:
         """Test SUM and AVG"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "amount": 100},
@@ -350,6 +364,7 @@ class TestSQLAggregations:
         """Test MIN and MAX"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "score": 85},
@@ -369,6 +384,7 @@ class TestSQLAggregations:
         """Test multiple aggregates in one query"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "price": 10.0},
@@ -402,6 +418,7 @@ class TestSQLGroupBy:
         """Test GROUP BY with single column"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"category": "A", "value": 10},
@@ -430,6 +447,7 @@ class TestSQLGroupBy:
         """Test GROUP BY with HAVING clause"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"dept": "Sales", "amount": 1000},
@@ -457,6 +475,7 @@ class TestSQLGroupBy:
         """Test GROUP BY with multiple columns"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"year": 2023, "quarter": "Q1", "revenue": 100},
@@ -489,6 +508,7 @@ class TestSQLOrderBy:
         """Test ORDER BY ascending"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 3, "name": "Charlie"},
@@ -509,6 +529,7 @@ class TestSQLOrderBy:
         """Test ORDER BY descending"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "score": 85},
@@ -528,6 +549,7 @@ class TestSQLOrderBy:
         """Test ORDER BY with multiple columns"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"category": "A", "value": 30},
@@ -551,6 +573,7 @@ class TestSQLOrderBy:
         """Test ORDER BY with NULL values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "value": 10},
@@ -578,6 +601,7 @@ class TestSQLLimitOffset:
         """Test basic LIMIT"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"id": i} for i in range(100)])
             
@@ -590,6 +614,7 @@ class TestSQLLimitOffset:
         """Test LIMIT with ORDER BY"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"id": i, "score": 100 - i} for i in range(50)])
             
@@ -609,6 +634,7 @@ class TestSQLLimitOffset:
         """Test LIMIT with OFFSET"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"id": i} for i in range(20)])
             
@@ -630,6 +656,7 @@ class TestSQLLimitOffset:
         """Test OFFSET larger than result set"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"id": i} for i in range(5)])
             
@@ -654,6 +681,7 @@ class TestSQLDistinct:
         """Test DISTINCT on single column"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"category": "A", "value": 1},
@@ -676,6 +704,7 @@ class TestSQLDistinct:
         """Test COUNT(DISTINCT column)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "category": "A"},
@@ -704,6 +733,7 @@ class TestSQLUnion:
         """Test basic UNION"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "source": "first"},
@@ -724,6 +754,7 @@ class TestSQLUnion:
         """Test UNION ALL (keeps duplicates)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "value": "same"},
@@ -752,6 +783,7 @@ class TestSQLFunctions:
         """Test string functions (UPPER, LOWER, LENGTH)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"text": "Hello World"}])
             
@@ -774,6 +806,7 @@ class TestSQLFunctions:
         """Test COALESCE function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "value": 10},
@@ -796,6 +829,7 @@ class TestSQLFunctions:
         """Test CAST function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"num": 42, "text": "100"}])
             
@@ -816,6 +850,7 @@ class TestSQLFunctions:
         """Test SUBSTR function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"text": "Hello World"}])
             
@@ -840,6 +875,7 @@ class TestSQLCase:
         """Test simple CASE expression"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "score": 95},
@@ -877,6 +913,7 @@ class TestSQLPerformance:
         """Test query with large result set"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Insert 10000 rows
             batch_size = 1000
@@ -898,6 +935,7 @@ class TestSQLPerformance:
         """Test aggregation performance on larger dataset"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Insert 5000 rows
             rows = [{"id": i, "category": f"cat_{i % 10}", "value": i % 100} for i in range(5000)]
@@ -922,6 +960,7 @@ class TestSQLPerformance:
         """Test filter with LIMIT for early termination"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Insert 10000 rows
             rows = [{"id": i, "status": "active" if i % 2 == 0 else "inactive"} for i in range(10000)]
@@ -969,6 +1008,7 @@ class TestSQLEdgeCases:
         """Test special characters in string values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "text": "Hello 'World'"},
@@ -985,6 +1025,7 @@ class TestSQLEdgeCases:
         """Test Unicode values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "text": "你好世界"},
@@ -1004,6 +1045,7 @@ class TestSQLEdgeCases:
         """Test NULL value handling via COALESCE"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "value": 10},
@@ -1024,6 +1066,7 @@ class TestSQLEdgeCases:
         """Test boolean value handling"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "active": True},
@@ -1051,6 +1094,7 @@ class TestSQLWindowFunctions:
         """Test basic ROW_NUMBER()"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "name": "Alice", "score": 85},
@@ -1077,6 +1121,7 @@ class TestSQLWindowFunctions:
         """Test ROW_NUMBER() with PARTITION BY"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"dept": "Sales", "name": "Alice", "salary": 5000},
@@ -1107,6 +1152,7 @@ class TestSQLWindowFunctions:
         """Test ROW_NUMBER() with WHERE filter"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"category": "A", "value": 10, "active": True},
@@ -1131,6 +1177,7 @@ class TestSQLWindowFunctions:
         """Test window function with SELECT *"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "value": 100},
@@ -1154,6 +1201,7 @@ class TestSQLWindowFunctions:
         """Test RANK() window function - same values get same rank, gaps in sequence"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "name": "A", "score": 100},
@@ -1183,6 +1231,7 @@ class TestSQLWindowFunctions:
         """Test DENSE_RANK() window function - same values get same rank, no gaps"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "name": "A", "score": 100},
@@ -1211,6 +1260,7 @@ class TestSQLWindowFunctions:
         """Test LAG() window function - get previous row value"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "month": 1, "sales": 100},
@@ -1239,6 +1289,7 @@ class TestSQLWindowFunctions:
         """Test LEAD() window function - get next row value"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "month": 1, "sales": 100},
@@ -1267,6 +1318,7 @@ class TestSQLWindowFunctions:
         """Test FIRST_VALUE() window function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "dept": "Sales", "employee": 1, "salary": 5000},
@@ -1294,6 +1346,7 @@ class TestSQLWindowFunctions:
         """Test LAST_VALUE() window function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "dept": "Sales", "employee": 1, "salary": 5000},
@@ -1321,6 +1374,7 @@ class TestSQLWindowFunctions:
         """Test SUM() OVER with PARTITION BY"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "region": "East", "sales": 100},
@@ -1348,6 +1402,7 @@ class TestSQLWindowFunctions:
         """Test AVG() OVER with PARTITION BY"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "dept": "Sales", "salary": 4000},
@@ -1375,6 +1430,7 @@ class TestSQLWindowFunctions:
         """Test COUNT() OVER with PARTITION BY"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "category": "A", "value": 10},
@@ -1403,6 +1459,7 @@ class TestSQLWindowFunctions:
         """Test MIN() and MAX() OVER with PARTITION BY"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "dept": "Sales", "salary": 4000},
@@ -1440,6 +1497,7 @@ class TestSQLWindowFunctions:
         """Test RUNNING_SUM() window function for cumulative totals"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "month": 1, "revenue": 100},
@@ -1467,6 +1525,7 @@ class TestSQLWindowFunctions:
         """Test NTILE() window function for bucketing"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": i, "value": i * 10} for i in range(1, 9)  # 8 rows
@@ -1489,6 +1548,7 @@ class TestSQLWindowFunctions:
         """Test window function performance with larger dataset"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create 1000 rows with simple category (0-9)
             import time
@@ -1528,6 +1588,7 @@ class TestSQLJoins:
         """Test INNER JOIN between two tables"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create users table
             client.create_table("users")
@@ -1567,6 +1628,7 @@ class TestSQLJoins:
         """Test LEFT JOIN between two tables"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create customers table
             client.create_table("customers")
@@ -1603,6 +1665,7 @@ class TestSQLJoins:
         """Test JOIN with aggregation"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create employees table
             client.create_table("employees")
@@ -1639,6 +1702,7 @@ class TestSQLExpressions:
         """Test arithmetic in WHERE clause"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "price": 100, "qty": 2},
@@ -1656,6 +1720,7 @@ class TestSQLExpressions:
         """Test column aliasing with AS"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"long_column_name": 100}])
             
@@ -1674,6 +1739,7 @@ class TestSQLExpressions:
         """Test literal values in SELECT"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"id": 1}])
             
@@ -1692,6 +1758,7 @@ class TestSQLExpressions:
         """Test various comparison operators"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"id": 1, "value": 10},
@@ -1731,6 +1798,7 @@ class TestSQLStringOperations:
         """Test CONCAT function with two arguments"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"fname": "John", "lname": "Doe"}])
             
@@ -1748,6 +1816,7 @@ class TestSQLStringOperations:
         """Test TRIM function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"text": "  hello  "}])
             
@@ -1765,6 +1834,7 @@ class TestSQLStringOperations:
         """Test REPLACE function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"text": "hello world"}])
             
@@ -1790,6 +1860,7 @@ class TestSQLMathFunctions:
         """Test ABS function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"value": 10}])
             
@@ -1805,6 +1876,7 @@ class TestSQLMathFunctions:
         """Test ROUND function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"value": 3.14159}])
             
@@ -1819,6 +1891,7 @@ class TestSQLMathFunctions:
         """Test FLOOR and CEIL functions"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"value": 3.7}])
             
@@ -1839,6 +1912,7 @@ class TestSQLMathFunctions:
         """Test SQRT function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([{"value": 16}])
             
@@ -1861,6 +1935,7 @@ class TestSQLComplexQueries:
         """Test aggregation grouped by type"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"type": "sale", "amount": 100},
@@ -1889,6 +1964,7 @@ class TestSQLComplexQueries:
         """Test query with WHERE, GROUP BY, HAVING, ORDER BY, LIMIT"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store([
                 {"category": "A", "status": "active", "value": 10},
@@ -1920,6 +1996,7 @@ class TestSQLComplexQueries:
         """Test complex query involving multiple tables"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Products table
             client.create_table("products")

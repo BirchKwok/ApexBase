@@ -17,6 +17,7 @@ class TestWindowRegexp:
     def test_regexp_and_row_number_over_partition_by(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             rows = [
                 {"col1": "A", "col2": "test_one", "col3": "a1", "col4": 2},
@@ -67,6 +68,7 @@ class TestWindowRegexp:
     def test_row_number_over_implicit_alias(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             rows = [
                 {"title": "A", "number": 2},
@@ -87,6 +89,7 @@ class TestWindowRegexp:
     def test_select_star_with_row_number_alias(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             rows = [
                 {"title": "A", "number": 2},

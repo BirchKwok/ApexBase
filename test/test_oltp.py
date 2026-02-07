@@ -39,6 +39,7 @@ def oltp_client():
     """Create a client with 1000 rows of OLTP-style data."""
     tmp = tempfile.mkdtemp()
     client = ApexClient(os.path.join(tmp, "oltp_test"))
+    client.create_table("default")
     cities = ["Beijing", "Shanghai", "Shenzhen", "Guangzhou", "Hangzhou"]
     rows = []
     for i in range(1000):
@@ -59,6 +60,7 @@ def empty_client():
     """Create an empty client."""
     tmp = tempfile.mkdtemp()
     client = ApexClient(os.path.join(tmp, "empty_test"))
+    client.create_table("default")
     yield client
     shutil.rmtree(tmp, ignore_errors=True)
 

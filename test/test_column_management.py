@@ -34,6 +34,7 @@ class TestColumnAddition:
         """Test basic column addition"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice", "age": 25})
@@ -60,6 +61,7 @@ class TestColumnAddition:
         """Test adding columns with different data types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice"})
@@ -96,6 +98,7 @@ class TestColumnAddition:
         """Test adding column to table with existing data"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store multiple records
             test_data = [
@@ -127,6 +130,7 @@ class TestColumnAddition:
         """Test adding column with duplicate name"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice", "age": 25})
@@ -149,6 +153,7 @@ class TestColumnAddition:
         """Test adding column with invalid data type"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice"})
@@ -171,6 +176,7 @@ class TestColumnAddition:
         """Test adding column with special characters in name"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice"})
@@ -198,6 +204,7 @@ class TestColumnAddition:
         """Test adding column with unicode characters in name"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice"})
@@ -227,6 +234,7 @@ class TestColumnDeletion:
         """Test basic column deletion"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with multiple columns
             client.store({"name": "Alice", "age": 25, "city": "NYC", "salary": 50000})
@@ -250,6 +258,7 @@ class TestColumnDeletion:
         """Test dropping nonexistent column"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice", "age": 25})
@@ -272,6 +281,7 @@ class TestColumnDeletion:
         """Test dropping _id column (should be prevented)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice", "age": 25})
@@ -290,6 +300,7 @@ class TestColumnDeletion:
         """Test dropping multiple columns sequentially"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with many columns
             client.store({
@@ -320,6 +331,7 @@ class TestColumnDeletion:
         """Test dropping column that contains data"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store multiple records with data in the column to be dropped
             test_data = [
@@ -352,6 +364,7 @@ class TestColumnRenaming:
         """Test basic column renaming"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with original column name
             client.store({"name": "Alice", "age": 25, "city": "NYC"})
@@ -372,6 +385,7 @@ class TestColumnRenaming:
         """Test renaming nonexistent column"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice", "age": 25})
@@ -393,6 +407,7 @@ class TestColumnRenaming:
         """Test renaming column to name that already exists"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with multiple columns
             client.store({"name": "Alice", "age": 25, "city": "NYC"})
@@ -413,6 +428,7 @@ class TestColumnRenaming:
         """Test renaming _id column (should be prevented)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice", "age": 25})
@@ -430,6 +446,7 @@ class TestColumnRenaming:
         """Test renaming column that contains data"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store multiple records with data in the column to be renamed
             test_data = [
@@ -457,6 +474,7 @@ class TestColumnRenaming:
         """Test renaming column with special characters"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice", "age": 25})
@@ -484,6 +502,7 @@ class TestColumnDataTypeRetrieval:
         """Test getting basic column data types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with various types
             client.store({
@@ -507,6 +526,7 @@ class TestColumnDataTypeRetrieval:
         """Test getting types of explicitly added columns"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice"})
@@ -525,6 +545,7 @@ class TestColumnDataTypeRetrieval:
         """Test getting type of nonexistent column"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice", "age": 25})
@@ -542,6 +563,7 @@ class TestColumnDataTypeRetrieval:
         """Test getting column type after renaming"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             client.store({"name": "Alice", "age": 25})
@@ -564,6 +586,7 @@ class TestColumnOperationsEdgeCases:
         """Test column operations on closed client"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.close()
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
@@ -582,6 +605,7 @@ class TestColumnOperationsEdgeCases:
         """Test column operations on empty table"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Add column to empty table - behavior may vary
             try:
@@ -600,6 +624,7 @@ class TestColumnOperationsEdgeCases:
         """Test column operations with FTS enabled"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store data with FTS content
@@ -625,6 +650,7 @@ class TestColumnOperationsEdgeCases:
         """Test column operations with large dataset"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store large dataset
             large_data = [{"id": i, "value": f"item_{i}"} for i in range(1000)]
@@ -654,6 +680,7 @@ class TestColumnOperationsEdgeCases:
         """Test column operations with various data types and values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with various types
             test_data = {
@@ -682,6 +709,7 @@ class TestColumnOperationsEdgeCases:
         """Test column operations are isolated to specific tables"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data in default table
             client.store({"name": "Alice", "age": 25})

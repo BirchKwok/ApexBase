@@ -39,6 +39,7 @@ class TestContextManager:
         """Test basic context manager usage"""
         with tempfile.TemporaryDirectory() as temp_dir:
             with ApexClient(dirpath=temp_dir) as client:
+                client.create_table("default")
                 assert not client._is_closed
                 
                 # Perform operations
@@ -54,6 +55,7 @@ class TestContextManager:
         with tempfile.TemporaryDirectory() as temp_dir:
             with pytest.raises(ValueError, match="test exception"):
                 with ApexClient(dirpath=temp_dir) as client:
+                    client.create_table("default")
                     client.store({"name": "Alice", "age": 25})
                     
                     # Raise an exception
@@ -65,7 +67,9 @@ class TestContextManager:
     def test_context_manager_chain_operations(self):
         """Test context manager with chain operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
-            with ApexClient(dirpath=temp_dir).init_fts(index_fields=['content']) as client:
+            with ApexClient(dirpath=temp_dir) as client:
+                client.create_table("default")
+                client.init_fts(index_fields=['content'])
                 assert client._is_fts_enabled()
                 
                 # Store searchable content
@@ -82,12 +86,14 @@ class TestContextManager:
         """Test nested context managers"""
         with tempfile.TemporaryDirectory() as temp_dir:
             with ApexClient(dirpath=temp_dir) as client1:
+                client1.create_table("default")
                 client1.store({"name": "Alice"})
                 
                 # Create second client with DIFFERENT path to avoid conflicts
                 temp_dir2 = tempfile.mkdtemp()
                 try:
                     with ApexClient(dirpath=temp_dir2) as client2:
+                        client2.create_table("default")
                         client2.store({"name": "Bob"})
                         
                         # Both clients should be active with different paths
@@ -103,6 +109,7 @@ class TestContextManager:
         """Test context manager return value"""
         with tempfile.TemporaryDirectory() as temp_dir:
             with ApexClient(dirpath=temp_dir) as client:
+                client.create_table("default")
                 # __enter__ should return self
                 assert client is not None
                 assert hasattr(client, 'store')
@@ -113,6 +120,7 @@ class TestContextManager:
         with tempfile.TemporaryDirectory() as temp_dir:
             with pytest.raises(ValueError, match="test exception"):
                 with ApexClient(dirpath=temp_dir) as client:
+                    client.create_table("default")
                     client.store({"test": "data"})
                     raise ValueError("test exception")
             
@@ -127,6 +135,7 @@ class TestManualCloseOperations:
         """Test basic manual close operation"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             assert not client._is_closed
             
@@ -147,6 +156,7 @@ class TestManualCloseOperations:
         """Test multiple close calls"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store({"name": "Alice"})
             client.close()
@@ -161,6 +171,7 @@ class TestManualCloseOperations:
         """Test force close operation"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             client.store({"name": "Alice"})
             
@@ -176,6 +187,7 @@ class TestManualCloseOperations:
         """Test close with FTS enabled"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             client.store({"content": "Test content"})
@@ -196,6 +208,7 @@ class TestInstanceRegistry:
         """Test automatic registration in instance registry"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Client should be registered
             db_path = str(client._db_path)
@@ -209,6 +222,7 @@ class TestInstanceRegistry:
         """Test automatic cleanup through registry"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store some data
             client.store({"name": "Alice", "age": 25})
@@ -235,6 +249,7 @@ class TestInstanceRegistry:
         try:
             for i, td in enumerate(temp_dirs):
                 client = ApexClient(dirpath=td)
+                client.create_table("default")
                 client.store({"id": i, "name": f"Client_{i}"})
                 clients.append(client)
             
@@ -255,10 +270,12 @@ class TestInstanceRegistry:
         with tempfile.TemporaryDirectory() as temp_dir:
             # Create first client
             client1 = ApexClient(dirpath=temp_dir)
+            client1.create_table("default")
             client1.store({"name": "First"})
             
             # Create second client with same path - first may be closed
             client2 = ApexClient(dirpath=temp_dir)
+            client2.create_table("default")
             
             # Second client should be active
             assert not client2._is_closed
@@ -274,6 +291,7 @@ class TestInstanceRegistry:
         """Test registry with auto management disabled"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, _auto_manage=False)
+            client.create_table("default")
             
             # Should not be in registry
             db_path = str(client._db_path)
@@ -291,6 +309,7 @@ class TestLifecycleStateTransitions:
         """Test proper state transition sequence"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Initial state: not closed
             assert not client._is_closed
@@ -310,6 +329,7 @@ class TestLifecycleStateTransitions:
         """Test state persistence across various operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # State should persist across operations
             operations = [
@@ -332,6 +352,7 @@ class TestLifecycleStateTransitions:
         """Test state with table operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Table operations should maintain state
             client.create_table("test_table")
@@ -354,6 +375,7 @@ class TestResourceLeakPrevention:
         """Test file handle cleanup on close"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data to ensure file handles are used
             for i in range(100):
@@ -376,6 +398,7 @@ class TestResourceLeakPrevention:
         """Test memory cleanup on close"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store large data to use memory
             large_data = [{"id": i, "data": "x" * 1000} for i in range(1000)]
@@ -400,6 +423,7 @@ class TestResourceLeakPrevention:
         """Test FTS resource cleanup"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store searchable data
@@ -430,6 +454,7 @@ class TestExceptionHandling:
             # Try to create client with invalid parameters
             try:
                 client = ApexClient(dirpath=temp_dir, durability="invalid")
+                client.create_table("default")
             except ValueError:
                 pass  # Expected
             
@@ -440,6 +465,7 @@ class TestExceptionHandling:
         """Test exception during operation"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Cause an exception during operation
             try:
@@ -462,6 +488,7 @@ class TestExceptionHandling:
             
             try:
                 with ApexClient(dirpath=temp_dir) as client:
+                    client.create_table("default")
                     client.store({"test": "data"})
                     raise ValueError("Test exception")
             except ValueError:
@@ -477,11 +504,13 @@ class TestExceptionHandling:
         
         try:
             with ApexClient(dirpath=temp_dir1) as client1:
+                client1.create_table("default")
                 client1.store({"name": "Alice"})
                 
                 try:
                     # Use different path to avoid conflicts
                     with ApexClient(dirpath=temp_dir2) as client2:
+                        client2.create_table("default")
                         client2.store({"name": "Bob"})
                         raise RuntimeError("Inner exception")
                 except RuntimeError:
@@ -505,6 +534,7 @@ class TestAtexitCleanup:
         """Test that clients are registered for atexit cleanup"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Client should be registered for cleanup
             # (Hard to test directly without actually exiting)
@@ -518,6 +548,7 @@ class TestAtexitCleanup:
         with tempfile.TemporaryDirectory() as temp_dir:
             # Create client
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.store({"test": "data"})
             
             # Simulate interpreter shutdown by calling registry cleanup
@@ -534,6 +565,7 @@ class TestConcurrentLifecycle:
         """Test concurrent close operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store some data
             for i in range(100):
@@ -578,6 +610,7 @@ class TestConcurrentLifecycle:
             def create_and_close():
                 try:
                     client = ApexClient(dirpath=temp_dir)
+                    client.create_table("default")
                     client.store({"test": "data"})
                     client.close()
                     return True
@@ -614,6 +647,7 @@ class TestLifecycleWithFTS:
         """Test FTS integration with lifecycle management"""
         with tempfile.TemporaryDirectory() as temp_dir:
             with ApexClient(dirpath=temp_dir) as client:
+                client.create_table("default")
                 # Initialize FTS
                 client.init_fts(index_fields=['content'])
                 
@@ -637,6 +671,7 @@ class TestLifecycleWithFTS:
         """Test FTS cleanup on close"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store and search data

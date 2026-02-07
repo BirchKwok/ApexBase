@@ -35,6 +35,7 @@ class TestDeleteOperations:
         """Test deleting a single record"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -69,6 +70,7 @@ class TestDeleteOperations:
         """Test deleting a nonexistent record"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             client.store({"name": "Alice", "age": 25})
@@ -86,6 +88,7 @@ class TestDeleteOperations:
         """Test deleting multiple records"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -128,6 +131,7 @@ class TestDeleteOperations:
         """Test deleting batch with some nonexistent IDs"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -153,6 +157,7 @@ class TestDeleteOperations:
         """Test deleting batch with all nonexistent IDs"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             client.store({"name": "Alice", "age": 25})
@@ -169,6 +174,7 @@ class TestDeleteOperations:
         """Test deleting with empty list"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             client.store({"name": "Alice", "age": 25})
@@ -186,6 +192,7 @@ class TestDeleteOperations:
         """Test deleting from empty database"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Try to delete from empty database
             result = client.delete(0)
@@ -200,6 +207,7 @@ class TestDeleteOperations:
         """Test deleting records with various data types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with various types (excluding bytes which may have issues)
             test_data = [
@@ -237,6 +245,7 @@ class TestReplaceOperations:
         """Test replacing a single record"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -270,6 +279,7 @@ class TestReplaceOperations:
         """Test replacing a nonexistent record"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             client.store({"name": "Alice", "age": 25})
@@ -292,6 +302,7 @@ class TestReplaceOperations:
         """Test replacing record with different field structure"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial record
             client.store({"name": "Alice", "age": 25, "city": "NYC"})
@@ -317,6 +328,7 @@ class TestReplaceOperations:
         """Test replacing record with fewer fields"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial record with many fields
             client.store({
@@ -343,6 +355,7 @@ class TestReplaceOperations:
         """Test replacing record with empty data"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial record
             client.store({"name": "Alice", "age": 25})
@@ -362,6 +375,7 @@ class TestReplaceOperations:
         """Test replacing record with various data types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial record
             client.store({"name": "Alice", "age": 25})
@@ -394,6 +408,7 @@ class TestBatchReplaceOperations:
         """Test basic batch replace operation"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -433,6 +448,7 @@ class TestBatchReplaceOperations:
         """Test batch replace with some nonexistent IDs"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -467,6 +483,7 @@ class TestBatchReplaceOperations:
         """Test batch replace with empty dictionary"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             client.store({"name": "Alice", "age": 25})
@@ -483,6 +500,7 @@ class TestBatchReplaceOperations:
         """Test batch replace with all nonexistent IDs"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             client.store({"name": "Alice", "age": 25})
@@ -507,6 +525,7 @@ class TestModificationWithFTS:
         """Test delete operations with FTS enabled"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store searchable documents
@@ -539,6 +558,7 @@ class TestModificationWithFTS:
         """Test replace operations with FTS enabled"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store searchable document
@@ -564,6 +584,7 @@ class TestModificationWithFTS:
         """Test batch operations with FTS enabled"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.init_fts(index_fields=['content'])
             
             # Store multiple documents
@@ -598,6 +619,7 @@ class TestModificationEdgeCases:
         """Test modifications on closed client"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.close()
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
@@ -616,6 +638,7 @@ class TestModificationEdgeCases:
         """Test delete with invalid ID types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store some data
             client.store({"name": "Alice", "age": 25})
@@ -636,6 +659,7 @@ class TestModificationEdgeCases:
         """Test replace with invalid ID types"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store some data
             client.store({"name": "Alice", "age": 25})
@@ -657,6 +681,7 @@ class TestModificationEdgeCases:
         """Test modifications with unicode data"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store unicode data
             unicode_data = {
@@ -684,6 +709,7 @@ class TestModificationEdgeCases:
         """Test modifications with large data"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store large data
             large_string = "x" * 100000  # 100KB string
@@ -713,6 +739,7 @@ class TestModificationEdgeCases:
         """Test data consistency after modifications"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store initial data
             initial_data = [
@@ -753,6 +780,7 @@ class TestModificationEdgeCases:
         """Test performance of modification operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store dataset
             data = [{"id": i, "value": f"item_{i}"} for i in range(100)]
@@ -780,6 +808,7 @@ class TestModificationWithDifferentTables:
         """Test that modifications are isolated to specific tables"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data in default table
             client.store({"name": "Alice", "table": "default"})
@@ -811,6 +840,7 @@ class TestModificationWithDifferentTables:
         """Test FTS modifications are table-specific"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create tables with FTS
             client.create_table("articles")

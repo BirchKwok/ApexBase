@@ -46,6 +46,7 @@ class TestInvalidParameters:
         with tempfile.TemporaryDirectory() as temp_dir:
             # Should not raise error but handle gracefully
             client = ApexClient(dirpath=temp_dir, batch_size=-1)
+            client.create_table("default")
             assert client._batch_size == -1
             client.close()
     
@@ -54,6 +55,7 @@ class TestInvalidParameters:
         with tempfile.TemporaryDirectory() as temp_dir:
             # Should not raise error but handle gracefully
             client = ApexClient(dirpath=temp_dir, cache_size=-1)
+            client.create_table("default")
             assert client._cache_size == -1
             client.close()
     
@@ -61,6 +63,7 @@ class TestInvalidParameters:
         """Test invalid limit values in queries"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             client.store({"name": "Alice", "age": 25})
@@ -86,6 +89,7 @@ class TestInvalidParameters:
         """Test invalid ID values for operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             client.store({"name": "Alice", "age": 25})
@@ -109,6 +113,7 @@ class TestInvalidParameters:
         """Test invalid table names"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Test empty table name
             try:
@@ -135,6 +140,7 @@ class TestResourceExhaustion:
         """Test handling of very large data that might exhaust memory"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Try to store very large data
             try:
@@ -161,6 +167,7 @@ class TestResourceExhaustion:
         """Test behavior when disk space is exhausted"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Fill up temporary directory to simulate disk exhaustion
             try:
@@ -186,6 +193,7 @@ class TestResourceExhaustion:
         """Test behavior with too many open files"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             try:
                 # Try to open many clients (simulating file handle exhaustion)
@@ -193,6 +201,7 @@ class TestResourceExhaustion:
                 for i in range(1000):
                     try:
                         new_client = ApexClient(dirpath=temp_dir)
+                        new_client.create_table("default")
                         clients.append(new_client)
                         new_client.store({"id": i, "data": f"test_{i}"})
                     except OSError:
@@ -211,6 +220,7 @@ class TestResourceExhaustion:
         """Test concurrent resource usage - writes only (reads during concurrent writes may see stale data)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             def worker(worker_id):
                 try:
@@ -248,6 +258,7 @@ class TestConcurrentAccess:
         """Test concurrent write operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             def writer(writer_id):
                 try:
@@ -278,6 +289,7 @@ class TestConcurrentAccess:
         """Test concurrent read and write operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Pre-populate some data
             for i in range(100):
@@ -317,6 +329,7 @@ class TestConcurrentAccess:
         """Test concurrent table operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             def table_worker(worker_id):
                 try:
@@ -351,6 +364,7 @@ class TestDataCorruptionScenarios:
         """Test handling of interrupted data writes"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store large data that might be interrupted
             large_data = {
@@ -377,6 +391,7 @@ class TestDataCorruptionScenarios:
         """Test handling of mixed data types that might cause corruption"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with mixed and potentially problematic types
             problematic_data = [
@@ -408,6 +423,7 @@ class TestDataCorruptionScenarios:
         """Test unicode data corruption scenarios"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store various unicode sequences that might cause corruption
             unicode_data = [
@@ -441,6 +457,7 @@ class TestNetworkAndIOErrors:
         """Test handling of file permission errors"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store some data
             client.store({"test": "data"})
@@ -459,6 +476,7 @@ class TestNetworkAndIOErrors:
                 # Try to write to read-only database
                 try:
                     client2 = ApexClient(dirpath=temp_dir)
+                    client2.create_table("default")
                     client2.store({"new": "data"})
                     client2.close()
                 except (PermissionError, RuntimeError, OSError):
@@ -483,6 +501,7 @@ class TestNetworkAndIOErrors:
                 # Try to create client in read-only directory
                 try:
                     client = ApexClient(dirpath=temp_dir)
+                    client.create_table("default")
                     client.close()
                 except PermissionError:
                     pass  # Expected
@@ -500,16 +519,18 @@ class TestNetworkAndIOErrors:
         """Test handling of missing database file"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.store({"test": "data"})
             client.close()
             
             # Remove database file
-            db_file = Path(temp_dir) / "apexbase.apex"
+            db_file = Path(temp_dir) / "default.apex"
             db_file.unlink()
             
             # Try to open client with missing file
             try:
                 client2 = ApexClient(dirpath=temp_dir)
+                client2.create_table("default")
                 # Should create new file or handle gracefully
                 client2.store({"new": "data"})
                 client2.close()
@@ -524,6 +545,7 @@ class TestMemoryPressure:
         """Test handling of large result sets that might cause memory pressure"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store large dataset
             large_data = [
@@ -556,6 +578,7 @@ class TestMemoryPressure:
         """Test for potential memory leaks with repeated operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             try:
                 # Perform many operations that might leak memory
@@ -594,6 +617,7 @@ class TestInvalidStateTransitions:
         """Test operations after client close"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.store({"test": "data"})
             client.close()
             
@@ -620,6 +644,7 @@ class TestInvalidStateTransitions:
         """Test multiple close calls"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.store({"test": "data"})
             
             # Multiple close calls should not raise errors
@@ -631,6 +656,7 @@ class TestInvalidStateTransitions:
         """Test FTS operations without initialization"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.store({"content": "test"})
             
             # FTS operations should raise ValueError
@@ -653,6 +679,7 @@ class TestBoundaryConditions:
         """Test operations with empty strings"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with empty strings
             client.store({"empty": "", "normal": "test"})
@@ -675,6 +702,7 @@ class TestBoundaryConditions:
         """Test operations with zero and negative values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with zero and negative values
             test_data = [
@@ -700,6 +728,7 @@ class TestBoundaryConditions:
         """Test operations with maximum values"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data with maximum values
             test_data = [
@@ -725,6 +754,7 @@ class TestBoundaryConditions:
         """Test operations with very long identifiers"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Very long field names
             long_field_name = "field_" + "x" * 1000
@@ -749,6 +779,7 @@ class TestExceptionPropagation:
         """Test that error messages are descriptive"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.close()
             
             # Check that error messages are descriptive
@@ -763,6 +794,7 @@ class TestExceptionPropagation:
         """Test error recovery scenarios"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Cause an error and try to recover
             try:

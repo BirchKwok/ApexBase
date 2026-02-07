@@ -45,6 +45,7 @@ def olap_client():
     """Create a client with 5000 rows of OLAP-style data."""
     tmp = tempfile.mkdtemp()
     client = ApexClient(os.path.join(tmp, "olap_test"))
+    client.create_table("default")
     cities = ["Beijing", "Shanghai", "Shenzhen", "Guangzhou", "Hangzhou",
               "Chengdu", "Wuhan", "Nanjing", "Tianjin", "Xian"]
     depts = ["Engineering", "Sales", "Marketing", "HR", "Finance"]

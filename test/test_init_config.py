@@ -32,6 +32,7 @@ class TestApexClientInitialization:
         """Test ApexClient initialization with default parameters"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Check basic attributes
             assert client._dirpath == Path(temp_dir)
@@ -80,6 +81,7 @@ class TestApexClientInitialization:
         for durability in valid_durabilities:
             with tempfile.TemporaryDirectory() as temp_dir:
                 client = ApexClient(dirpath=temp_dir, durability=durability)
+                client.create_table("default")
                 assert client._durability == durability
                 client.close()
     
@@ -92,10 +94,11 @@ class TestApexClientInitialization:
     def test_drop_if_exists_true(self):
         """Test drop_if_exists=True removes existing database"""
         with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "apexbase.apex"
+            db_path = Path(temp_dir) / "default.apex"
             
             # Create initial database
             client1 = ApexClient(dirpath=temp_dir)
+            client1.create_table("default")
             client1.store({"test": "data"})
             client1.close()
             assert db_path.exists()
@@ -103,21 +106,24 @@ class TestApexClientInitialization:
             # Create new client with drop_if_exists=True
             client2 = ApexClient(dirpath=temp_dir, drop_if_exists=True)
             assert not db_path.exists()  # Should be dropped during init
+            client2.create_table("default")
             client2.close()
     
     def test_drop_if_exists_false(self):
         """Test drop_if_exists=False preserves existing database"""
         with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "apexbase.apex"
+            db_path = Path(temp_dir) / "default.apex"
             
             # Create initial database
             client1 = ApexClient(dirpath=temp_dir)
+            client1.create_table("default")
             client1.store({"test": "data"})
             client1.close()
             assert db_path.exists()
             
             # Create new client with drop_if_exists=False
             client2 = ApexClient(dirpath=temp_dir, drop_if_exists=False)
+            client2.use_table("default")
             assert db_path.exists()  # Should still exist
             client2.close()
     
@@ -128,6 +134,7 @@ class TestApexClientInitialization:
             try:
                 os.chdir(temp_dir)
                 client = ApexClient(dirpath=None)
+                client.create_table("default")
                 assert client._dirpath == Path('.')
                 client.close()
             finally:
@@ -143,6 +150,7 @@ class TestApexClientInitialization:
             os.chdir(temp_dir)
             try:
                 client = ApexClient(dirpath=relative_path)
+                client.create_table("default")
                 # Directory should be created
                 assert client._dirpath.exists()
                 client.close()
@@ -155,6 +163,7 @@ class TestApexClientInitialization:
             nested_path = Path(temp_dir) / "level1" / "level2" / "level3"
             
             client = ApexClient(dirpath=str(nested_path))
+            client.create_table("default")
             assert nested_path.exists()
             assert nested_path.is_dir()
             client.close()
@@ -162,16 +171,18 @@ class TestApexClientInitialization:
     def test_create_clean_classmethod(self):
         """Test ApexClient.create_clean() class method"""
         with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "apexbase.apex"
+            db_path = Path(temp_dir) / "default.apex"
             
             # Create initial database
             client1 = ApexClient(dirpath=temp_dir)
+            client1.create_table("default")
             client1.store({"test": "data"})
             client1.close()
             assert db_path.exists()
             
             # Use create_clean which should drop existing
             client2 = ApexClient.create_clean(dirpath=temp_dir)
+            client2.create_table("default")
             # Database should be fresh (no previous data)
             assert client2.count_rows() == 0
             client2.close()
@@ -192,6 +203,7 @@ class TestApexClientInitialization:
         """Test __repr__ method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             repr_str = repr(client)
             assert "ApexClient" in repr_str
             assert str(client._dirpath) in repr_str
@@ -202,10 +214,12 @@ class TestApexClientInitialization:
         """Test multiple clients accessing same directory"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client1 = ApexClient(dirpath=temp_dir)
+            client1.create_table("default")
             client1.store({"client": 1})
             
             # Second client should access same database
             client2 = ApexClient(dirpath=temp_dir)
+            client2.use_table("default")
             count = client2.count_rows()
             assert count == 1
             
@@ -216,6 +230,7 @@ class TestApexClientInitialization:
         """Test operations on closed client raise RuntimeError"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.close()
             
             # All operations should raise RuntimeError
@@ -241,6 +256,7 @@ class TestApexClientInitialization:
             try:
                 os.chdir(temp_dir)
                 client = ApexClient(dirpath="")
+                client.create_table("default")
                 assert client._dirpath == Path('.')
                 client.close()
             finally:
@@ -254,6 +270,7 @@ class TestApexClientInitialization:
             whitespace_path = os.path.join(temp_dir, "test db")
             try:
                 client = ApexClient(dirpath=whitespace_path)
+                client.create_table("default")
                 # Should handle whitespace in path
                 client.store({"test": "data"})
                 client.close()
@@ -265,6 +282,7 @@ class TestApexClientInitialization:
         """Test very large batch size"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, batch_size=1000000)
+            client.create_table("default")
             assert client._batch_size == 1000000
             client.close()
     
@@ -272,6 +290,7 @@ class TestApexClientInitialization:
         """Test zero batch size"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, batch_size=0)
+            client.create_table("default")
             assert client._batch_size == 0
             client.close()
     
@@ -279,6 +298,7 @@ class TestApexClientInitialization:
         """Test negative batch size"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, batch_size=-1)
+            client.create_table("default")
             assert client._batch_size == -1
             client.close()
     
@@ -286,6 +306,7 @@ class TestApexClientInitialization:
         """Test very large cache size"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, cache_size=1000000)
+            client.create_table("default")
             assert client._cache_size == 1000000
             client.close()
     
@@ -293,6 +314,7 @@ class TestApexClientInitialization:
         """Test FTS tables dictionary initialization"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             assert isinstance(client._fts_tables, dict)
             assert len(client._fts_tables) == 0
             client.close()
@@ -302,6 +324,7 @@ class TestApexClientInitialization:
         with tempfile.TemporaryDirectory() as temp_dir:
             # Force prefer_arrow_format=False even if Arrow is available
             client = ApexClient(dirpath=temp_dir, prefer_arrow_format=False)
+            client.create_table("default")
             assert client._prefer_arrow_format is False
             client.close()
     
@@ -309,6 +332,7 @@ class TestApexClientInitialization:
         """Test _auto_manage disabled"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, _auto_manage=False)
+            client.create_table("default")
             assert client._auto_manage is False
             client.close()
     
@@ -316,6 +340,7 @@ class TestApexClientInitialization:
         """Test database file creation with appropriate permissions"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data to ensure file is created
             client.store({"test": "data"})
@@ -339,6 +364,7 @@ class TestDurabilityLevels:
         """Test 'fast' durability is default"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             assert client._durability == 'fast'
             client.close()
     
@@ -346,6 +372,7 @@ class TestDurabilityLevels:
         """Test 'safe' durability level"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, durability='safe')
+            client.create_table("default")
             assert client._durability == 'safe'
             
             # Test basic operations work
@@ -358,6 +385,7 @@ class TestDurabilityLevels:
         """Test 'max' durability level"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, durability='max')
+            client.create_table("default")
             assert client._durability == 'max'
             
             # Test basic operations work
@@ -371,6 +399,7 @@ class TestDurabilityLevels:
         """Test basic operations work with all durability levels"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, durability=durability)
+            client.create_table("default")
             
             # Test store and retrieve
             client.store({"name": "test", "value": 123})
@@ -397,6 +426,7 @@ class TestDurabilityExceptionScenarios:
         with tempfile.TemporaryDirectory() as temp_dir:
             # First session: write data
             client1 = ApexClient(dirpath=temp_dir, durability=durability)
+            client1.create_table("default")
             
             test_data = [
                 {"id": 1, "name": "Alice", "value": 100},
@@ -416,6 +446,7 @@ class TestDurabilityExceptionScenarios:
             
             # Second session: verify data persisted
             client2 = ApexClient(dirpath=temp_dir, durability=durability)
+            client2.use_table("default")
             
             reopened_count = client2.count_rows()
             assert reopened_count == original_count, \
@@ -434,6 +465,7 @@ class TestDurabilityExceptionScenarios:
         """Test that flush() ensures data is persisted for all durability levels"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client1 = ApexClient(dirpath=temp_dir, durability=durability)
+            client1.create_table("default")
             
             # Write data
             client1.store({"test": "flush_data", "value": 42})
@@ -446,6 +478,7 @@ class TestDurabilityExceptionScenarios:
             
             # Reopen and verify
             client2 = ApexClient(dirpath=temp_dir, durability=durability)
+            client2.use_table("default")
             count_after_reopen = client2.count_rows()
             
             assert count_after_reopen == count_before_close, \
@@ -462,6 +495,7 @@ class TestDurabilityExceptionScenarios:
         """Test batch write persistence with different durability levels"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client1 = ApexClient(dirpath=temp_dir, durability=durability)
+            client1.create_table("default")
             
             # Batch write
             batch_size = 100
@@ -476,6 +510,7 @@ class TestDurabilityExceptionScenarios:
             
             # Verify all data persisted
             client2 = ApexClient(dirpath=temp_dir, durability=durability)
+            client2.use_table("default")
             assert client2.count_rows() == batch_size, \
                 f"Batch data not fully persisted with durability='{durability}'"
             
@@ -496,6 +531,7 @@ class TestDurabilityExceptionScenarios:
             
             # Session 1
             client1 = ApexClient(dirpath=temp_dir, durability=durability)
+            client1.create_table("default")
             client1.store([{"session": 1, "idx": i} for i in range(10)])
             client1.flush()
             total_records += 10
@@ -504,6 +540,7 @@ class TestDurabilityExceptionScenarios:
             
             # Session 2
             client2 = ApexClient(dirpath=temp_dir, durability=durability)
+            client2.use_table("default")
             assert client2.count_rows() == total_records, "Data from session 1 not persisted"
             client2.store([{"session": 2, "idx": i} for i in range(10)])
             client2.flush()
@@ -513,6 +550,7 @@ class TestDurabilityExceptionScenarios:
             
             # Session 3 - verify all data
             client3 = ApexClient(dirpath=temp_dir, durability=durability)
+            client3.use_table("default")
             assert client3.count_rows() == total_records, \
                 f"Expected {total_records} records, got {client3.count_rows()}"
             client3.close()
@@ -522,6 +560,7 @@ class TestDurabilityExceptionScenarios:
         """Test recovery after exception during write operation"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, durability=durability)
+            client.create_table("default")
             
             # Successful write
             client.store({"status": "before_error", "value": 1})
@@ -550,6 +589,7 @@ class TestDurabilityExceptionScenarios:
             
             # Verify persistence after exception scenario
             client2 = ApexClient(dirpath=temp_dir, durability=durability)
+            client2.use_table("default")
             assert client2.count_rows() == 2
             client2.close()
     
@@ -562,6 +602,7 @@ class TestDurabilityExceptionScenarios:
         """
         with tempfile.TemporaryDirectory() as temp_dir:
             client1 = ApexClient(dirpath=temp_dir, durability=durability)
+            client1.create_table("default")
             
             # Write data WITHOUT explicit flush
             client1.store({"test": "no_flush", "value": 123})
@@ -572,6 +613,7 @@ class TestDurabilityExceptionScenarios:
             
             # Reopen and check
             client2 = ApexClient(dirpath=temp_dir, durability=durability)
+            client2.use_table("default")
             count_after = client2.count_rows()
             
             # For 'max' and 'safe', data should persist
@@ -589,6 +631,7 @@ class TestDurabilityExceptionScenarios:
         """Test persistence of larger data with different durability levels"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client1 = ApexClient(dirpath=temp_dir, durability=durability)
+            client1.create_table("default")
             
             # Write moderately large data
             large_string = "x" * 10000  # 10KB string
@@ -604,6 +647,7 @@ class TestDurabilityExceptionScenarios:
             
             # Verify persistence and data integrity
             client2 = ApexClient(dirpath=temp_dir, durability=durability)
+            client2.use_table("default")
             assert client2.count_rows() == 50
             
             # Verify content integrity
@@ -619,12 +663,14 @@ class TestDurabilityExceptionScenarios:
         with tempfile.TemporaryDirectory() as temp_dir:
             # Create with 'safe'
             client1 = ApexClient(dirpath=temp_dir, durability='safe')
+            client1.create_table("default")
             client1.store({"created_with": "safe"})
             client1.flush()
             client1.close()
             
             # Reopen with 'max'
             client2 = ApexClient(dirpath=temp_dir, durability='max')
+            client2.use_table("default")
             assert client2.count_rows() == 1
             
             result = client2.retrieve(0)
@@ -638,6 +684,7 @@ class TestDurabilityExceptionScenarios:
             
             # Verify all data persisted
             client3 = ApexClient(dirpath=temp_dir, durability='fast')
+            client3.use_table("default")
             assert client3.count_rows() == 2
             client3.close()
     
@@ -646,12 +693,14 @@ class TestDurabilityExceptionScenarios:
         with tempfile.TemporaryDirectory() as temp_dir:
             # Create with 'max'
             client1 = ApexClient(dirpath=temp_dir, durability='max')
+            client1.create_table("default")
             client1.store({"created_with": "max"})
             client1.flush()
             client1.close()
             
             # Reopen with 'fast'
             client2 = ApexClient(dirpath=temp_dir, durability='fast')
+            client2.use_table("default")
             assert client2.count_rows() == 1
             
             result = client2.retrieve(0)

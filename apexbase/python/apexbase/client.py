@@ -85,7 +85,7 @@ class ApexClient:
         self._connected = True
         self._lock = threading.RLock()
         
-        self._current_table = "default"  # Match ApexClient's default table name
+        self._current_table = None  # No default table - user must create/use a table explicitly
         self._batch_size = batch_size
         self._enable_cache = enable_cache
         self._cache_size = cache_size
@@ -164,6 +164,10 @@ class ApexClient:
     def _check_connection(self):
         if self._is_closed or self._storage is None:
             raise RuntimeError("ApexClient connection has been closed, cannot perform operations.")
+    
+    def _ensure_table_selected(self):
+        if self._current_table is None:
+            raise RuntimeError("No table selected. Call create_table() or use_table() first.")
 
     # ============ Table Management ============
 
@@ -230,7 +234,7 @@ class ApexClient:
             pass
         
         if self._current_table == table_name:
-            self._current_table = "default"
+            self._current_table = None
 
     def list_tables(self) -> List[str]:
         self._check_connection()
@@ -491,6 +495,7 @@ class ApexClient:
 
     def store(self, data) -> None:
         self._check_connection()
+        self._ensure_table_selected()
         with self._lock:
             # 1. Columnar data Dict[str, list/ndarray]
             if isinstance(data, dict):
@@ -610,6 +615,10 @@ class ApexClient:
 
     def execute(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
         self._check_connection()
+        # DDL (CREATE TABLE) is allowed without a table selected
+        sql_upper = sql.strip().upper()
+        if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE')):
+            self._ensure_table_selected()
         with self._lock:
             # Determine if _id should be shown based on SQL (like ApexClient)
             if show_internal_id is None:
@@ -637,11 +646,16 @@ class ApexClient:
                     except Exception:
                         pass
             
-            # Validate table name for non-fast-path queries
-            self._validate_table_in_sql(sql)
+            # Validate table name for non-fast-path queries (skip for DDL)
+            if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE')):
+                self._validate_table_in_sql(sql)
             
             # Standard path: Arrow IPC for efficient bulk transfer
             ipc_bytes = self._storage._execute_arrow_ipc(sql)
+            
+            # After CREATE TABLE, sync Python-side _current_table with Rust-side
+            if sql_upper.startswith('CREATE TABLE'):
+                self._current_table = self._storage.current_table()
             
             reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
             table = reader.read_all()
@@ -667,7 +681,7 @@ class ApexClient:
         table_name = m.group(1).lower()
         
         # Fast path: skip expensive list_tables/listdir for known tables
-        if table_name == 'default' or table_name == self._current_table.lower():
+        if self._current_table and table_name == self._current_table.lower():
             return
         
         # Check .apex file exists directly (O(1) vs O(n) listdir)
@@ -724,6 +738,7 @@ class ApexClient:
 
     def query(self, sql: str = None, where_clause: str = None, limit: int = None) -> 'ResultView':
         """Query with SQL or WHERE clause (for ApexClient compatibility)"""
+        self._ensure_table_selected()
         if sql is not None:
             # Check if it's a full SQL statement or a filter expression
             sql_upper = sql.strip().upper()
@@ -749,11 +764,13 @@ class ApexClient:
 
     def retrieve(self, id_: int) -> Optional[dict]:
         self._check_connection()
+        self._ensure_table_selected()
         with self._lock:
             return self._storage.retrieve(id_)
 
     def retrieve_many(self, ids: List[int]) -> 'ResultView':
         self._check_connection()
+        self._ensure_table_selected()
         with self._lock:
             if not ids:
                 return _empty_result_view()
@@ -775,6 +792,7 @@ class ApexClient:
 
     def retrieve_all(self) -> 'ResultView':
         self._check_connection()
+        self._ensure_table_selected()
         with self._lock:
             results = self._storage.retrieve_all()
         if not results:
@@ -785,6 +803,7 @@ class ApexClient:
 
     def list_fields(self) -> List[str]:
         self._check_connection()
+        self._ensure_table_selected()
         with self._lock:
             return self._storage.list_fields()
 
@@ -815,6 +834,7 @@ class ApexClient:
             client.delete(where="age > 30")        # Delete matching records
         """
         self._check_connection()
+        self._ensure_table_selected()
         
         # Safety check: require at least one parameter to prevent accidental deletion of all data
         if id is None and where is None:
@@ -847,6 +867,7 @@ class ApexClient:
 
     def replace(self, id_: int, data: dict) -> bool:
         self._check_connection()
+        self._ensure_table_selected()
         with self._lock:
             return self._storage.replace(id_, data)
 
@@ -860,20 +881,36 @@ class ApexClient:
 
     # ============ DataFrame Import ============
 
-    def from_pandas(self, df) -> 'ApexClient':
+    def from_pandas(self, df, table_name: str = None) -> 'ApexClient':
+        if table_name is not None:
+            self._select_or_create_table(table_name)
+        self._ensure_table_selected()
         records = df.to_dict('records')
         self.store(records)
         return self
 
-    def from_pyarrow(self, table) -> 'ApexClient':
+    def from_pyarrow(self, table, table_name: str = None) -> 'ApexClient':
+        if table_name is not None:
+            self._select_or_create_table(table_name)
+        self._ensure_table_selected()
         records = table.to_pylist()
         self.store(records)
         return self
 
-    def from_polars(self, df) -> 'ApexClient':
+    def from_polars(self, df, table_name: str = None) -> 'ApexClient':
+        if table_name is not None:
+            self._select_or_create_table(table_name)
+        self._ensure_table_selected()
         records = df.to_dicts()
         self.store(records)
         return self
+
+    def _select_or_create_table(self, table_name: str):
+        """Select an existing table or create a new one."""
+        try:
+            self.use_table(table_name)
+        except (ValueError, RuntimeError):
+            self.create_table(table_name)
 
     # ============ Utility ============
 
@@ -889,8 +926,10 @@ class ApexClient:
                 original = self._current_table
                 self.use_table(table_name)
                 count = self._storage.row_count()
-                self.use_table(original)
+                if original is not None:
+                    self.use_table(original)
                 return count
+            self._ensure_table_selected()
             return self._storage.row_count()
 
     def flush(self) -> None:

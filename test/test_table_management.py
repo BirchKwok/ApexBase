@@ -31,6 +31,7 @@ class TestTableManagement:
         """Test creating a new table"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create a new table
             client.create_table("users")
@@ -66,6 +67,7 @@ class TestTableManagement:
         """Test switching between tables"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create multiple tables
             client.create_table("users")
@@ -88,6 +90,7 @@ class TestTableManagement:
         """Test dropping a table"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create and populate table
             client.create_table("temp_table")
@@ -104,8 +107,8 @@ class TestTableManagement:
             tables = client.list_tables()
             assert "temp_table" not in tables
             
-            # Current table should be reset to default
-            assert client.current_table == "default"
+            # Current table should be None after dropping the active table
+            assert client.current_table is None
             
             client.close()
     
@@ -113,6 +116,7 @@ class TestTableManagement:
         """Test dropping the current table"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create and switch to table
             client.create_table("current")
@@ -121,8 +125,8 @@ class TestTableManagement:
             # Drop current table
             client.drop_table("current")
             
-            # Should reset to default
-            assert client.current_table == "default"
+            # Should be None after dropping the active table
+            assert client.current_table is None
             
             client.close()
     
@@ -130,6 +134,7 @@ class TestTableManagement:
         """Test listing all tables"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Initially empty (no tables created yet)
             tables = client.list_tables()
@@ -154,10 +159,15 @@ class TestTableManagement:
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, drop_if_exists=True)
             
+            # Fresh database has no tables until explicitly created
             tables = client.list_tables()
             assert isinstance(tables, list)
-            # Fresh database has no tables until explicitly created
             assert len(tables) == 0
+            
+            # After creating a table, it should appear
+            client.create_table("default")
+            tables = client.list_tables()
+            assert "default" in tables
             
             client.close()
     
@@ -165,6 +175,7 @@ class TestTableManagement:
         """Test current_table property"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Default should be "default"
             assert client.current_table == "default"
@@ -183,6 +194,7 @@ class TestTableManagement:
         """Test data isolation between tables"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data in default table
             client.store({"type": "default_data", "value": 1})
@@ -208,6 +220,7 @@ class TestTableManagement:
         """Test table name validation with various inputs"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Valid table names
             valid_names = [
@@ -231,6 +244,7 @@ class TestTableManagement:
         """Test table names with special characters"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Test various special characters
             special_names = [
@@ -263,6 +277,7 @@ class TestTableManagement:
         """Test table names with unicode characters"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             unicode_names = [
                 "用户",  # Chinese
@@ -286,6 +301,7 @@ class TestTableManagement:
         """Test dropping a table that doesn't exist"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Try to drop non-existent table
             # Should not raise exception (graceful handling)
@@ -297,6 +313,7 @@ class TestTableManagement:
         """Test switching to a table that doesn't exist"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Using non-existent table should create it or handle gracefully
             try:
@@ -313,6 +330,7 @@ class TestTableManagement:
         """Test creating a table that already exists"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create table
             client.create_table("existing")
@@ -331,6 +349,7 @@ class TestTableManagement:
         """Test table operations when FTS is enabled"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create table with FTS
             client.create_table("fts_table")
@@ -359,6 +378,7 @@ class TestTableManagement:
         """Test different FTS configurations for different tables"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Create multiple tables with different FTS configs
             client.create_table("articles")
@@ -383,6 +403,7 @@ class TestTableManagement:
         """Test table operations on closed client"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.close()
             
             # All table operations should raise RuntimeError
@@ -405,6 +426,7 @@ class TestTableManagement:
         """Test count_rows with specific table name"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store data in default table
             client.store({"table": "default"})
@@ -430,6 +452,7 @@ class TestTableManagement:
         """Test edge cases for table operations"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Test empty string table name
             try:
@@ -471,6 +494,7 @@ class TestTableManagement:
             
             # Verify tables persist with second client
             client2 = ApexClient(dirpath=temp_dir)
+            client2.create_table("default")
             tables = client2.list_tables()
             assert "persistent1" in tables
             assert "persistent2" in tables
@@ -489,6 +513,7 @@ class TestTableManagement:
         for durability in durability_levels:
             with tempfile.TemporaryDirectory() as temp_dir:
                 client = ApexClient(dirpath=temp_dir, durability=durability)
+                client.create_table("default")
                 
                 # Test all table operations
                 client.create_table(f"test_{durability}")

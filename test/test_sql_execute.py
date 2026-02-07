@@ -62,6 +62,7 @@ class TestBasicSQLExecute:
         """Test basic SELECT statement"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -86,6 +87,7 @@ class TestBasicSQLExecute:
     def test_execute_cast_expression(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([{"s": "123", "f": "1.25", "b": "true", "n": 7}])
             client.flush()
@@ -121,6 +123,7 @@ class TestBasicSQLExecute:
     def test_where_multi_column_arithmetic_predicate(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store(
                 [
@@ -143,6 +146,7 @@ class TestBasicSQLExecute:
     def test_where_multi_column_arithmetic_predicate_with_limit_offset(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store(
                 [
@@ -166,6 +170,7 @@ class TestBasicSQLExecute:
     def test_execute_temporary_view_create_select_drop(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([{"a": 1}, {"a": 2}])
             client.flush()
@@ -192,10 +197,8 @@ class TestBasicSQLExecute:
             client = ApexClient(dirpath=temp_dir)
 
             client.create_table("t")
-            client.use_table("t")
             client.store([{"x": 1}])
             client.flush()
-            client.use_table("default")
 
             with pytest.raises(Exception):
                 client.execute("CREATE VIEW t AS SELECT 1 AS x")
@@ -205,6 +208,7 @@ class TestBasicSQLExecute:
     def test_execute_string_scalar_functions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([{"s": "  Abc-XYZ  ", "n": 2}])
             client.flush()
@@ -268,6 +272,7 @@ class TestBasicSQLExecute:
     def test_execute_scalar_standard_functions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([{"v": 1}])
             client.flush()
@@ -311,6 +316,7 @@ class TestBasicSQLExecute:
     def test_execute_rand_function(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             rows = [{"v": i} for i in range(100)]
             client.store(rows)
@@ -447,6 +453,7 @@ class TestBasicSQLExecute:
     def test_execute_aggregate_implicit_alias_keyword(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             rows = [{"v": i} for i in range(10)]
             client.store(rows)
@@ -467,6 +474,7 @@ class TestBasicSQLExecute:
     def test_execute_aggregate_implicit_alias(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             rows = [{"v": i} for i in range(10)]
             client.store(rows)
@@ -487,6 +495,7 @@ class TestBasicSQLExecute:
     def test_execute_min_max_count_constant_on_internal_id(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             rows = [{"v": i} for i in range(100)]
             client.store(rows)
@@ -505,6 +514,7 @@ class TestBasicSQLExecute:
     def test_execute_count_constant(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             rows = [{"v": i} for i in range(10)]
             client.store(rows)
@@ -523,6 +533,7 @@ class TestBasicSQLExecute:
     def test_execute_min_max_count_on_internal_id(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             rows = [{"v": i} for i in range(100)]
             client.store(rows)
@@ -544,6 +555,7 @@ class TestBasicSQLExecute:
                 pytest.skip("Arrow/PyArrow not available")
 
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             # Trigger large-result Arrow paths (threshold is > 10_000)
             rows = [{"name": f"u{i}", "age": i} for i in range(12000)]
@@ -568,6 +580,7 @@ class TestBasicSQLExecute:
         """Test SELECT with qualified internal id column (e.g., default._id)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([
                 {"name": "Alice", "age": 25},
@@ -586,6 +599,7 @@ class TestBasicSQLExecute:
         """Test SELECT with quoted internal id column (\"_id\")"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([
                 {"name": "Alice", "age": 25},
@@ -604,6 +618,7 @@ class TestBasicSQLExecute:
         """Test SELECT *, _id should explicitly expose _id"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([
                 {"name": "Alice", "age": 25},
@@ -624,6 +639,7 @@ class TestBasicSQLExecute:
         """Test SELECT explicitly returning internal _id column"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([
                 {"name": "Alice", "age": 25},
@@ -648,6 +664,7 @@ class TestBasicSQLExecute:
                 pytest.skip("Arrow/PyArrow/Pandas not available")
 
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             repeated = [{"title": "Python编程指南", "content": "same", "number": i % 10} for i in range(6000)]
             client.store(repeated)
@@ -671,6 +688,7 @@ class TestBasicSQLExecute:
     def test_execute_where_not_like_and_like(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             rows = [
                 {"title": "Python编程指南第1章", "content": "a"},
@@ -695,6 +713,7 @@ class TestBasicSQLExecute:
         """Test SELECT with specific columns"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -726,6 +745,7 @@ class TestBasicSQLExecute:
         """Test SELECT with WHERE clause"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -755,6 +775,7 @@ class TestBasicSQLExecute:
         """Test SELECT with ORDER BY clause"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -785,6 +806,7 @@ class TestBasicSQLExecute:
         """Test SELECT with LIMIT clause"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [{"id": i, "value": f"item_{i}"} for i in range(10)]
@@ -809,6 +831,7 @@ class TestBasicSQLExecute:
         """Test SELECT with LIMIT and OFFSET"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [{"id": i, "value": f"item_{i}"} for i in range(10)]
@@ -828,6 +851,7 @@ class TestBasicSQLExecute:
         """Test SELECT DISTINCT"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data with duplicates
             test_data = [
@@ -866,6 +890,7 @@ class TestSQLAggregates:
         """Test COUNT aggregate function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -899,6 +924,7 @@ class TestSQLAggregates:
         """Test SUM aggregate function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -926,6 +952,7 @@ class TestSQLAggregates:
         """Test AVG aggregate function"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -948,6 +975,7 @@ class TestSQLAggregates:
         """Test MIN and MAX aggregate functions"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -987,6 +1015,7 @@ class TestSQLGroupBy:
         """Test basic GROUP BY"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1010,6 +1039,7 @@ class TestSQLGroupBy:
         """Test GROUP BY with various aggregates"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1031,6 +1061,7 @@ class TestSQLGroupBy:
         """Test GROUP BY with HAVING clause"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1058,6 +1089,7 @@ class TestSQLRealWorldQueries:
     def test_execute_union_and_union_all(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([
                 {"k": 1, "city": "NYC"},
@@ -1134,6 +1166,7 @@ class TestSQLRealWorldQueries:
     def test_execute_multi_group_by_having(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([
                 {"region": "CN", "channel": "online", "amount": 120},
@@ -1165,6 +1198,7 @@ class TestSQLRealWorldQueries:
     def test_execute_nested_aggregation_second_stage(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([
                 {"region": "CN", "amount": 120},
@@ -1302,6 +1336,7 @@ class TestSQLRealWorldQueries:
     def test_execute_union_with_limit_offset(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([
                 {"k": 1, "city": "NYC"},
@@ -1410,6 +1445,7 @@ class TestSQLRealWorldQueries:
     def test_execute_two_stage_aggregation_bucketed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             client.store([
                 {"region": "CN", "amount": 120},
@@ -1574,6 +1610,7 @@ class TestSqlResultFunctionality:
         """Test ResultView basic properties"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1596,6 +1633,7 @@ class TestSqlResultFunctionality:
         """Test ResultView iteration"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1624,6 +1662,7 @@ class TestSqlResultFunctionality:
         """Test ResultView.to_dict() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1648,6 +1687,7 @@ class TestSqlResultFunctionality:
         """Test ResultView.to_pandas() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1673,6 +1713,7 @@ class TestSqlResultFunctionality:
         """Test ResultView.to_polars() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1696,6 +1737,7 @@ class TestSqlResultFunctionality:
         """Test ResultView.get_ids() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1725,6 +1767,7 @@ class TestSqlResultFunctionality:
         """Test ResultView.scalar() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1754,6 +1797,7 @@ class TestSqlResultFunctionality:
         """Test ResultView.first() method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1782,6 +1826,7 @@ class TestSqlResultFunctionality:
         """Test ResultView.__repr__ method"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1806,6 +1851,7 @@ class TestSQLEdgeCases:
         """Test invalid SQL syntax"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [{"name": "Alice", "age": 25}]
@@ -1824,6 +1870,7 @@ class TestSQLEdgeCases:
         """Test SELECT with nonexistent columns"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [{"name": "Alice", "age": 25}]
@@ -1844,6 +1891,7 @@ class TestSQLEdgeCases:
         """Test execute operations on closed client"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             client.close()
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
@@ -1856,6 +1904,7 @@ class TestSQLEdgeCases:
         """Test execute operations on empty database"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Test SELECT on empty database
             result = client.execute("SELECT * FROM default")
@@ -1871,6 +1920,7 @@ class TestSQLEdgeCases:
         """Test execute with special characters in data"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data with special characters
             test_data = [
@@ -1892,6 +1942,7 @@ class TestSQLEdgeCases:
         """Test complex SQL operations (if supported)"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -1944,6 +1995,7 @@ class TestSQLPerformance:
         """Test execute performance with large dataset"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store dataset
             data = [
@@ -1971,6 +2023,7 @@ class TestSQLPerformance:
         """Test Arrow optimization in execute when available"""
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
             
             # Store test data
             test_data = [
@@ -2077,6 +2130,7 @@ class TestSQLPerformance1M:
     def test_perf_1m_nested_subquery_two_stage(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
 
             t_store0 = time.perf_counter()
             _store_rows_in_chunks(

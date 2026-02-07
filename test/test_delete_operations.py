@@ -15,6 +15,7 @@ class TestDeleteOperations:
         """Create a client with test data."""
         tmpdir = tempfile.mkdtemp()
         client = ApexClient(os.path.join(tmpdir, 'test_delete'))
+        client.create_table("default")
         
         # Insert test data
         client.store([
@@ -162,6 +163,7 @@ class TestDeleteEdgeCases:
         """Create an empty client."""
         tmpdir = tempfile.mkdtemp()
         client = ApexClient(os.path.join(tmpdir, 'test_empty'))
+        client.create_table("default")
         
         yield client
         
@@ -182,6 +184,7 @@ class TestDeleteEdgeCases:
         tmpdir = tempfile.mkdtemp()
         try:
             client = ApexClient(os.path.join(tmpdir, 'test'))
+            client.create_table("default")
             client.store([{'name': 'test'}])
             
             # Empty list should succeed but delete nothing
