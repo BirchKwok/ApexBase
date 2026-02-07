@@ -42,6 +42,9 @@ client = ApexClient.create_clean("./fresh_data")
 ### Storing Data
 
 ```python
+# Create a table first (required before any data operations)
+client.create_table("users")
+
 # Single record
 client.store({"name": "Alice", "age": 30})
 
@@ -67,6 +70,7 @@ client.close()
 
 # Context manager (recommended)
 with ApexClient("./data") as client:
+    client.create_table("mydata")
     client.store({"key": "value"})
     # Auto-closes on exit
 ```
@@ -75,25 +79,31 @@ with ApexClient("./data") as client:
 
 ## Table Management
 
+ApexBase requires explicit table creation before any data operations. Each table is stored as a separate `.apex` file.
+
 ```python
 client = ApexClient("./data")
 
-# Create tables
+# Create tables (the last created table becomes the active table)
 client.create_table("users")
 client.create_table("orders")
 
 # List tables
 tables = client.list_tables()
-print(tables)  # ['default', 'users', 'orders']
+print(tables)  # ['users', 'orders']
 
 # Switch table
 client.use_table("users")
 print(client.current_table)  # 'users'
 
-# Store in specific table
+# Store in the active table
 client.store({"username": "alice", "email": "alice@example.com"})
 
-# Drop table
+# Reopen an existing database
+client2 = ApexClient("./data")
+client2.use_table("users")  # Select an existing table
+
+# Drop table (active table resets to None)
 client.drop_table("orders")
 
 client.close()
@@ -110,14 +120,14 @@ ApexBase supports full SQL DDL (Data Definition Language) operations:
 ```python
 client = ApexClient("./data")
 
-# Create a new table
+# Create a new table (becomes the active table)
 client.execute("CREATE TABLE employees")
 
 # Create table only if it doesn't exist
 client.execute("CREATE TABLE IF NOT EXISTS departments")
 
 # Verify tables were created
-print(client.list_tables())  # ['default', 'employees', 'departments']
+print(client.list_tables())  # ['employees', 'departments']
 ```
 
 ### INSERT
@@ -163,7 +173,7 @@ client.execute("DROP TABLE departments")
 client.execute("DROP TABLE IF EXISTS temp_table")
 
 # Verify department table was dropped
-print(client.list_tables())  # ['default', 'employees']
+print(client.list_tables())  # ['employees']
 ```
 
 ### Complete DDL Workflow
@@ -288,7 +298,8 @@ df = pd.DataFrame({
     "quantity": [100, 200, 150]
 })
 
-client.from_pandas(df)
+# table_name auto-creates and selects the table
+client.from_pandas(df, table_name="products")
 ```
 
 ### From Polars
@@ -303,7 +314,7 @@ df = pl.DataFrame({
     "score": [85, 92, 78]
 })
 
-client.from_polars(df)
+client.from_polars(df, table_name="scores")
 ```
 
 ### From PyArrow
@@ -318,7 +329,7 @@ table = pa.table({
     "value": ["a", "b", "c"]
 })
 
-client.from_pyarrow(table)
+client.from_pyarrow(table, table_name="items")
 ```
 
 ---
@@ -329,21 +340,22 @@ client.from_pyarrow(table)
 
 ```python
 client = ApexClient("./data")
+client.create_table("metrics")
 
 # Insert test data
 for i in range(100):
     client.store({"id": i, "value": i * 10, "category": f"cat_{i % 5}"})
 
-# Basic SELECT
-results = client.execute("SELECT * FROM default")
+# Basic SELECT (use your table name in FROM clause)
+results = client.execute("SELECT * FROM metrics")
 print(f"Total rows: {len(results)}")
 
 # WHERE clause
-results = client.execute("SELECT * FROM default WHERE value > 500")
+results = client.execute("SELECT * FROM metrics WHERE value > 500")
 
 # ORDER BY with LIMIT
 results = client.execute("""
-    SELECT * FROM default
+    SELECT * FROM metrics
     WHERE category = 'cat_1'
     ORDER BY value DESC
     LIMIT 10
@@ -356,21 +368,21 @@ results = client.execute("""
         AVG(value) as avg_value,
         MAX(value) as max_value,
         MIN(value) as min_value
-    FROM default
+    FROM metrics
 """)
 print(results.first())
 
 # GROUP BY
 results = client.execute("""
     SELECT category, COUNT(*), AVG(value)
-    FROM default
+    FROM metrics
     GROUP BY category
 """)
 for row in results:
     print(row)
 
 # Get single scalar value
-count = client.execute("SELECT COUNT(*) FROM default").scalar()
+count = client.execute("SELECT COUNT(*) FROM metrics").scalar()
 print(f"Count: {count}")
 
 # Count rows shortcut
@@ -384,8 +396,9 @@ client.close()
 
 ```python
 client = ApexClient("./data")
+client.use_table("users")  # Select existing table
 
-# Simple WHERE expression
+# Simple WHERE expression (uses the active table)
 results = client.query("age > 25")
 results = client.query("name LIKE 'A%'")
 
@@ -402,6 +415,7 @@ client.close()
 
 ```python
 client = ApexClient("./data")
+client.use_table("users")
 
 # Single record
 record = client.retrieve(0)
@@ -421,7 +435,7 @@ client.close()
 ### ResultView Operations
 
 ```python
-results = client.execute("SELECT * FROM default WHERE age > 25")
+results = client.execute("SELECT * FROM users WHERE age > 25")
 
 # Convert formats
 df = results.to_pandas()
@@ -440,7 +454,7 @@ ids = results.get_ids(return_list=True)  # Python list
 
 # Get single values
 first = results.first()
-scalar = client.execute("SELECT COUNT(*) FROM default").scalar()
+scalar = client.execute("SELECT COUNT(*) FROM users").scalar()
 
 # Iteration
 for row in results:
@@ -456,6 +470,7 @@ row = results[0]
 
 ```python
 client = ApexClient("./data")
+client.create_table("people")
 client.store({"name": "Alice", "age": 30})
 
 # Add column
@@ -487,6 +502,7 @@ client.close()
 
 ```python
 client = ApexClient("./data")
+client.create_table("docs")
 
 # Add documents
 client.store([
@@ -530,6 +546,7 @@ client.close()
 
 ```python
 client = ApexClient("./data")
+client.use_table("docs")
 
 # Initialize with lazy loading
 client.init_fts(
@@ -552,6 +569,7 @@ client.close()
 
 ```python
 client = ApexClient("./data")
+client.create_table("people")
 
 # Insert test data
 client.store({"name": "Alice", "age": 30})
@@ -572,6 +590,7 @@ client.close()
 
 ```python
 client = ApexClient("./data")
+client.use_table("people")
 
 # Delete single record
 client.delete(5)
@@ -588,6 +607,7 @@ client.close()
 
 ```python
 client = ApexClient("./data")
+client.use_table("users")
 
 # Flush data to disk
 client.flush()
@@ -672,6 +692,7 @@ client = ApexClient("./data", durability="max")
 ```python
 # Use columnar storage for bulk inserts
 client = ApexClient("./data")
+client.create_table("benchmark")
 
 # Generate large dataset
 import numpy as np
@@ -687,7 +708,7 @@ data = {
 client.store(data)
 
 # Query with limit
-results = client.execute("SELECT * FROM default LIMIT 100")
+results = client.execute("SELECT * FROM benchmark LIMIT 100")
 
 client.close()
 ```
@@ -702,7 +723,6 @@ import pandas as pd
 with ApexClient("./analytics", durability="safe") as client:
     # Create table
     client.create_table("sales")
-    client.use_table("sales")
     
     # Import data from pandas
     df = pd.DataFrame({
@@ -752,7 +772,7 @@ with ApexClient("./analytics", durability="safe") as client:
 
 **Table Management:** `use_table`, `create_table`, `drop_table`, `list_tables`, `current_table`
 
-**Data Storage:** `store`, `from_pandas`, `from_polars`, `from_pyarrow`
+**Data Storage:** `store`, `from_pandas(df, table_name=)`, `from_polars(df, table_name=)`, `from_pyarrow(table, table_name=)`
 
 **Query:** `execute`, `query`, `retrieve`, `retrieve_many`, `retrieve_all`, `count_rows`
 

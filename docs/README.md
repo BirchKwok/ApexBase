@@ -32,8 +32,11 @@ maturin develop --release
 ```python
 from apexbase import ApexClient
 
-# Create client (single .apex file storage)
+# Create client
 client = ApexClient("./data")
+
+# Create a table (required before any data operations)
+client.create_table("users")
 
 # Store data (columnar batch — fastest path)
 client.store({
@@ -42,8 +45,8 @@ client.store({
     "city": ["Beijing", "Shanghai", "Beijing"],
 })
 
-# SQL query
-results = client.execute("SELECT * FROM default WHERE age > 25")
+# SQL query (use your table name in FROM clause)
+results = client.execute("SELECT * FROM users WHERE age > 25")
 
 # Convert to DataFrame (zero-copy Arrow IPC)
 df = results.to_pandas()

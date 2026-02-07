@@ -85,7 +85,7 @@ ApexBase uses a unified `StorageEngine` as the single entry point for all storag
 
 | Method | Description |
 |--------|-------------|
-| `query(sql, base_dir, default_table)` | Execute SQL query |
+| `query(sql, base_dir, table_name)` | Execute SQL query |
 | `retrieve(path, base_dir, table_name, id)` | Get single record |
 | `exists(path, id)` | Check if record exists |
 | `row_count(path)` | Total row count |
@@ -292,4 +292,4 @@ conda run -n dev maturin develop --release
 conda run -n dev pytest test/ --tb=short -q
 ```
 
-Expected: **600 passed**
+Expected: **663 passed**

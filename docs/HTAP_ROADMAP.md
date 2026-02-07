@@ -118,5 +118,5 @@ Long-term. Requires Row Groups + Transactions to be stable.
 
 ```
 Rust:   143/143 passed  (4 V4 Row Group tests)
-Pytest: 600/600 passed
+Pytest: 663/663 passed
 ```

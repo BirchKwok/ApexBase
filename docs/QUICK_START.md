@@ -23,38 +23,46 @@ from apexbase import ApexClient
 # 1. Create client
 client = ApexClient("./my_data")
 
-# 2. Store data
+# 2. Create a table (required before any data operations)
+client.create_table("users")
+
+# 3. Store data
 client.store({"name": "Alice", "age": 30, "city": "NYC"})
 
-# 3. Query
-results = client.execute("SELECT * FROM default WHERE age > 25")
+# 4. Query
+results = client.execute("SELECT * FROM users WHERE age > 25")
 
-# 4. Use results
+# 5. Use results
 df = results.to_pandas()
 print(df)
 
-# 5. Close
+# 6. Close
 client.close()
 ```
 
 ## Working with Tables
 
+ApexBase requires explicit table creation before any data operations. Each table is stored as a separate `.apex` file.
+
 ```python
 client = ApexClient("./data")
 
-# Create tables
+# Create tables (the last created table becomes the active table)
 client.create_table("users")
+client.store({"name": "Bob", "email": "bob@example.com"})
+
 client.create_table("orders")
+client.store({"user_id": 0, "amount": 100.0})
 
 # Switch between tables
 client.use_table("users")
-client.store({"name": "Bob", "email": "bob@example.com"})
-
-client.use_table("orders")
-client.store({"user_id": 0, "amount": 100.0})
 
 # List tables
-print(client.list_tables())  # ['default', 'users', 'orders']
+print(client.list_tables())  # ['users', 'orders']
+
+# Reopen an existing database
+client2 = ApexClient("./data")
+client2.use_table("users")  # Select an existing table
 
 client.close()
 ```
@@ -138,14 +146,14 @@ import pandas as pd
 
 client = ApexClient("./data")
 
-# From pandas
+# from_pandas with table_name auto-creates and selects the table
 df = pd.DataFrame({
     "name": ["Alice", "Bob", "Charlie"],
     "age": [25, 30, 35]
 })
-client.from_pandas(df)
+client.from_pandas(df, table_name="users")
 
-# From columnar dict (fastest)
+# From columnar dict (fastest, requires active table)
 client.store({
     "product": ["A", "B", "C"],
     "price": [10.5, 20.0, 15.0],
@@ -159,17 +167,18 @@ client.close()
 
 ```python
 client = ApexClient("./data")
+client.create_table("metrics")
 
 # Insert test data
 for i in range(100):
     client.store({"id": i, "value": i * 10})
 
-# Basic query
-results = client.execute("SELECT * FROM default WHERE value > 500")
+# Basic query (use your table name in FROM clause)
+results = client.execute("SELECT * FROM metrics WHERE value > 500")
 
 # Aggregation
-count = client.execute("SELECT COUNT(*) FROM default").scalar()
-avg = client.execute("SELECT AVG(value) FROM default").scalar()
+scalar = client.execute("SELECT COUNT(*) FROM users").scalar()
+avg = client.execute("SELECT AVG(value) FROM metrics").scalar()
 
 # GROUP BY
 results = client.execute("""
@@ -180,7 +189,7 @@ results = client.execute("""
 
 # ORDER BY with LIMIT
 results = client.execute("""
-    SELECT * FROM default
+    SELECT * FROM metrics
     ORDER BY value DESC
     LIMIT 10
 """)
@@ -192,6 +201,7 @@ client.close()
 
 ```python
 client = ApexClient("./data")
+client.create_table("docs")
 
 # Add documents
 client.store([
@@ -222,6 +232,7 @@ client.close()
 
 ```python
 client = ApexClient("./data")
+client.create_table("people")
 client.store({"name": "Alice", "age": 30})
 
 # Add column
@@ -249,13 +260,15 @@ client.close()
 ```python
 # Automatic cleanup
 with ApexClient("./data") as client:
+    client.create_table("mydata")
     client.store({"key": "value"})
-    results = client.execute("SELECT * FROM default")
+    results = client.execute("SELECT * FROM mydata")
     df = results.to_pandas()
     # Client automatically closed
 
 # With clean slate
 with ApexClient.create_clean("./fresh_data") as client:
+    client.create_table("mydata")
     client.store({"fresh": "start"})
 ```
 
@@ -275,7 +288,7 @@ client = ApexClient("./data", durability="max")
 ## ResultView Operations
 
 ```python
-results = client.execute("SELECT * FROM default")
+results = client.execute("SELECT * FROM users")
 
 # Different formats
 df = results.to_pandas()

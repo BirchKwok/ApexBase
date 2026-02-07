@@ -39,8 +39,11 @@ pip install apexbase
 ```python
 from apexbase import ApexClient
 
-# Create a client (data stored in single .apex file)
+# Create a client
 client = ApexClient("./data")
+
+# Create a table (required before any data operations)
+client.create_table("users")
 
 # Store single record
 client.store({"name": "Alice", "age": 30, "city": "Beijing"})
@@ -51,8 +54,8 @@ client.store([
     {"name": "Charlie", "age": 35, "city": "Beijing"}
 ])
 
-# SQL query (recommended)
-results = client.execute("SELECT * FROM default WHERE age > 28")
+# SQL query
+results = client.execute("SELECT * FROM users WHERE age > 28")
 
 # Convert to DataFrame
 df = results.to_pandas()
@@ -63,39 +66,50 @@ client.close()
 
 ### Table Management
 
+ApexBase requires explicit table creation before any data operations. Each table is stored as a separate `.apex` file in the data directory.
+
 ```python
-# Create and switch tables
+# Create a table (automatically becomes the active table)
 client.create_table("users")
+
+# Create additional tables
+client.create_table("orders")
+
+# Switch between tables
 client.use_table("users")
 
-# List all tables
-tables = client.list_tables()
+# Reopen an existing database
+client2 = ApexClient("./data")
+client2.use_table("users")  # Select an existing table
 
-# Drop table
-client.drop_table("old_table")
+# List all tables
+tables = client.list_tables()  # ["users", "orders"]
+
+# Drop table (active table resets to None)
+client.drop_table("orders")
 ```
 
 ### Data Operations
 
 ```python
-# Store from various formats
 import pandas as pd
 import polars as pl
 import pyarrow as pa
 
-# From pandas DataFrame
+# From pandas DataFrame (table_name creates/selects the table automatically)
 df = pd.DataFrame({"name": ["A", "B"], "age": [20, 30]})
-client.from_pandas(df)
+client.from_pandas(df, table_name="users")
 
 # From polars DataFrame
 df_pl = pl.DataFrame({"name": ["C", "D"], "age": [25, 35]})
-client.from_polars(df_pl)
+client.from_polars(df_pl, table_name="users")
 
 # From PyArrow Table
 table = pa.table({"name": ["E", "F"], "age": [28, 38]})
-client.from_pyarrow(table)
+client.from_pyarrow(table, table_name="users")
 
-# Columnar storage (fastest for bulk data)
+# Columnar storage (fastest for bulk data, requires active table)
+client.use_table("users")
 client.store({
     "name": ["G", "H", "I"],
     "age": [22, 32, 42]
@@ -105,16 +119,16 @@ client.store({
 ### Query Operations
 
 ```python
-# Full SQL support
-results = client.execute("SELECT name, age FROM default WHERE age > 25 ORDER BY age DESC LIMIT 10")
+# Full SQL support (use your table name in FROM clause)
+results = client.execute("SELECT name, age FROM users WHERE age > 25 ORDER BY age DESC LIMIT 10")
 
-# WHERE expression (compatibility mode)
+# WHERE expression (uses the active table)
 results = client.query("age > 28")
 results = client.query("name LIKE 'A%'")
 results = client.query(where_clause="city = 'Beijing'", limit=100)
 
 # Aggregation
-agg = client.execute("SELECT COUNT(*), AVG(age), MAX(age) FROM default")
+agg = client.execute("SELECT COUNT(*), AVG(age), MAX(age) FROM users")
 count = agg.scalar()  # Get single value
 
 # Retrieve by _id (internal auto-increment ID)
@@ -144,10 +158,10 @@ fields = client.list_fields()
 
 ### SQL DDL (Data Definition Language)
 
-ApexBase supports full SQL DDL operations:
+ApexBase supports full SQL DDL operations. Tables created via SQL are automatically registered and become the active table:
 
 ```python
-# Create table via SQL
+# Create table via SQL (becomes the active table)
 client.execute("CREATE TABLE employees")
 client.execute("CREATE TABLE IF NOT EXISTS departments")  # No error if exists
 
@@ -217,7 +231,7 @@ client.drop_fts()
 ### ResultView Operations
 
 ```python
-results = client.execute("SELECT * FROM default")
+results = client.execute("SELECT * FROM users")
 
 # Convert to different formats
 df = results.to_pandas()          # pandas DataFrame
@@ -233,7 +247,7 @@ print(len(results))        # row count
 # Get single values
 first_row = results.first()
 ids = results.get_ids()    # numpy array
-scalar = client.execute("SELECT COUNT(*) FROM default").scalar()
+scalar = client.execute("SELECT COUNT(*) FROM users").scalar()
 ```
 
 ### Context Manager Support
@@ -241,8 +255,9 @@ scalar = client.execute("SELECT COUNT(*) FROM default").scalar()
 ```python
 # Automatic cleanup with context manager
 with ApexClient("./data") as client:
+    client.create_table("mydata")
     client.store({"key": "value"})
-    results = client.execute("SELECT * FROM default")
+    results = client.execute("SELECT * FROM mydata")
     # Client automatically closed on exit
 ```
 
@@ -339,10 +354,10 @@ with ApexClient("./data") as client:
 
 | Method | Description |
 |--------|-------------|
-| `store(data)` | Store data (dict, list, DataFrame, Arrow Table) |
-| `from_pandas(df)` | Import from pandas DataFrame |
-| `from_polars(df)` | Import from polars DataFrame |
-| `from_pyarrow(table)` | Import from PyArrow Table |
+| `store(data)` | Store data (dict, list, DataFrame, Arrow Table) into the active table |
+| `from_pandas(df, table_name=None)` | Import from pandas DataFrame (auto-creates table if `table_name` given) |
+| `from_polars(df, table_name=None)` | Import from polars DataFrame (auto-creates table if `table_name` given) |
+| `from_pyarrow(table, table_name=None)` | Import from PyArrow Table (auto-creates table if `table_name` given) |
 
 #### Data Retrieval
 

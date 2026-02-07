@@ -98,14 +98,14 @@ Return list of all table names.
 **Example:**
 ```python
 tables = client.list_tables()
-print(tables)  # ['default', 'users', 'orders']
+print(tables)  # ['users', 'orders']
 ```
 
 #### current_table
 ```python
-current_table: str  # Property
+current_table: Optional[str]  # Property
 ```
-Get the name of the currently active table.
+Get the name of the currently active table. Returns `None` if no table is selected.
 
 **Example:**
 ```python
@@ -120,7 +120,7 @@ print(client.current_table)  # 'users'
 ```python
 store(data) -> None
 ```
-Store data in the current table. Accepts multiple formats:
+Store data in the active table. Requires a table to be selected via `create_table()` or `use_table()` first. Accepts multiple formats:
 - Single dict: `{"name": "Alice", "age": 30}`
 - List of dicts: `[{"name": "A"}, {"name": "B"}]`
 - Dict of columns: `{"name": ["A", "B"], "age": [20, 30]}`
@@ -148,41 +148,53 @@ client.store({
 
 #### from_pandas
 ```python
-from_pandas(df: pd.DataFrame) -> ApexClient
+from_pandas(df: pd.DataFrame, table_name: str = None) -> ApexClient
 ```
 Import data from pandas DataFrame. Returns self for chaining.
+
+**Parameters:**
+- `df`: pandas DataFrame to import
+- `table_name`: Optional. If provided, auto-creates/selects the table before importing.
 
 **Example:**
 ```python
 import pandas as pd
 df = pd.DataFrame({"name": ["A", "B"], "age": [20, 30]})
-client.from_pandas(df)
+client.from_pandas(df, table_name="users")
 ```
 
 #### from_polars
 ```python
-from_polars(df: pl.DataFrame) -> ApexClient
+from_polars(df: pl.DataFrame, table_name: str = None) -> ApexClient
 ```
 Import data from polars DataFrame. Returns self for chaining.
+
+**Parameters:**
+- `df`: polars DataFrame to import
+- `table_name`: Optional. If provided, auto-creates/selects the table before importing.
 
 **Example:**
 ```python
 import polars as pl
 df = pl.DataFrame({"name": ["A", "B"], "age": [20, 30]})
-client.from_polars(df)
+client.from_polars(df, table_name="users")
 ```
 
 #### from_pyarrow
 ```python
-from_pyarrow(table: pa.Table) -> ApexClient
+from_pyarrow(table: pa.Table, table_name: str = None) -> ApexClient
 ```
 Import data from PyArrow Table. Returns self for chaining.
+
+**Parameters:**
+- `table`: PyArrow Table to import
+- `table_name`: Optional. If provided, auto-creates/selects the table before importing.
 
 **Example:**
 ```python
 import pyarrow as pa
 table = pa.table({"name": ["A", "B"], "age": [20, 30]})
-client.from_pyarrow(table)
+client.from_pyarrow(table, table_name="users")
 ```
 
 ---
@@ -201,8 +213,8 @@ Execute SQL query and return results.
 
 **Example:**
 ```python
-# Basic query
-results = client.execute("SELECT * FROM default WHERE age > 25")
+# Basic query (use your table name in FROM clause)
+results = client.execute("SELECT * FROM users WHERE age > 25")
 
 # Aggregation
 results = client.execute("SELECT COUNT(*), AVG(age) FROM users")
