@@ -9438,8 +9438,11 @@ impl ApexExecutor {
     fn execute_drop_table(base_dir: &Path, table: &str, if_exists: bool) -> io::Result<ApexResult> {
         let table_path = base_dir.join(format!("{}.apex", table));
         
-        // Invalidate cache first to release file handles
+        // Invalidate caches to release file handles and mmaps
         invalidate_storage_cache(&table_path);
+        // On Windows, active mmaps prevent file deletion (OS error 1224)
+        #[cfg(target_os = "windows")]
+        crate::storage::engine::engine().invalidate(&table_path);
         
         if !table_path.exists() {
             if if_exists {
@@ -9514,8 +9517,11 @@ impl ApexExecutor {
             ));
         }
         
-        // Invalidate cache before write
+        // Invalidate caches before write
         invalidate_storage_cache(storage_path);
+        // On Windows, engine insert_cache may hold mmaps that block file truncate (OS error 1224)
+        #[cfg(target_os = "windows")]
+        crate::storage::engine::engine().invalidate(storage_path);
         
         // OPTIMIZATION: Use open_for_schema_change - only loads metadata, NOT column data
         let old_storage = TableStorageBackend::open_for_schema_change(storage_path)?;
@@ -9533,6 +9539,8 @@ impl ApexExecutor {
         
         // Invalidate cache after write to ensure subsequent reads get fresh data
         invalidate_storage_cache(storage_path);
+        #[cfg(target_os = "windows")]
+        crate::storage::engine::engine().invalidate(storage_path);
         
         Ok(ApexResult::Scalar(0))
     }

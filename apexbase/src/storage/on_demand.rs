@@ -7715,6 +7715,12 @@ impl OnDemandStorage {
     pub fn save_v4(&self) -> io::Result<()> {
         self.mmap_cache.write().invalidate();
         *self.file.write() = None;
+        // On Windows, active mmaps prevent file truncate/write (OS error 1224).
+        // Must invalidate ALL caches (engine cache + insert_cache + schema_cache + executor STORAGE_CACHE).
+        // On Unix/Linux, only executor cache needs invalidation (mmaps don't block writes).
+        #[cfg(target_os = "windows")]
+        super::engine::engine().invalidate(&self.path);
+        #[cfg(not(target_os = "windows"))]
         crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
         
         let file = OpenOptions::new()

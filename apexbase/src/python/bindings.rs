@@ -867,6 +867,8 @@ impl ApexStorageImpl {
         
         // Invalidate cached backend since data changed
         self.invalidate_backend(&table_name);
+        // Invalidate StorageEngine cache so count_rows() sees updated state
+        crate::storage::engine::engine().invalidate(&table_path);
         
         // Extract scalar result (number of deleted rows)
         match result {
@@ -890,6 +892,8 @@ impl ApexStorageImpl {
         
         // Invalidate cached backend since data changed
         self.invalidate_backend(&table_name);
+        // Invalidate StorageEngine cache so count_rows() sees updated state
+        crate::storage::engine::engine().invalidate(&table_path);
         
         // Extract scalar result (number of deleted rows)
         match result {
