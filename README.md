@@ -280,7 +280,7 @@ Three-way comparison with [SQLite](https://www.sqlite.org/) (v3.45.3) and [DuckD
 | **CPU** | Apple M1 Pro (10 cores) |
 | **Memory** | 32.0 GB |
 | **Python** | 3.11.10 |
-| **ApexBase** | v0.5.0 |
+| **ApexBase** | v0.6.0 |
 | **SQLite** | v3.45.3 |
 | **DuckDB** | v1.1.3 |
 | **PyArrow** | 19.0.0 |
