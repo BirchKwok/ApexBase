@@ -9840,7 +9840,13 @@ impl ApexExecutor {
 
         // Apply buffered writes to storage
         let mut applied = 0i64;
+        let mut affected_tables: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
         for write in &writes {
+            // Track affected table paths for cache invalidation
+            let table_name = write.table();
+            let table_path = Self::resolve_table_path(table_name, base_dir, default_table_path);
+            affected_tables.insert(table_path);
+
             let result = Self::apply_txn_write(write, base_dir, default_table_path);
             match result {
                 Ok(count) => applied += count,
@@ -9848,6 +9854,12 @@ impl ApexExecutor {
                     eprintln!("Warning: failed to apply txn write: {}", e);
                 }
             }
+        }
+
+        // Invalidate StorageEngine cache for all affected tables
+        let engine = crate::storage::engine::engine();
+        for table_path in &affected_tables {
+            engine.invalidate(table_path);
         }
 
         Ok(ApexResult::Scalar(applied))
