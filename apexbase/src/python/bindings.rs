@@ -161,26 +161,40 @@ impl ApexStorageImpl {
         table_path.with_extension("apex.lock")
     }
     
-    /// Acquire a lock on the table (shared for read, exclusive for write)
+    /// Acquire a lock on the table (shared for read, exclusive for write).
+    /// Uses retry with exponential backoff (100µs → 200µs → ... → 50ms max total wait).
+    /// This avoids spurious "Database is locked" errors under concurrent load.
     fn acquire_lock(table_path: &Path, exclusive: bool) -> io::Result<File> {
         let lock_path = Self::get_lock_path(table_path);
         let lock_file = OpenOptions::new()
             .read(true).write(true).create(true).truncate(false)
             .open(&lock_path)?;
         
-        if exclusive {
-            lock_file.try_lock_exclusive().map_err(|e| io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!("Database is locked: {}", e)
-            ))?;
-        } else {
-            lock_file.try_lock_shared().map_err(|e| io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!("Database is locked: {}", e)
-            ))?;
-        }
+        let max_wait = std::time::Duration::from_millis(50);
+        let mut backoff = std::time::Duration::from_micros(100);
+        let start = std::time::Instant::now();
         
-        Ok(lock_file)
+        loop {
+            let result: io::Result<()> = if exclusive {
+                lock_file.try_lock_exclusive()
+            } else {
+                lock_file.try_lock_shared().map_err(|e| io::Error::new(io::ErrorKind::WouldBlock, e.to_string()))
+            };
+            
+            match result {
+                Ok(()) => return Ok(lock_file),
+                Err(_) if start.elapsed() < max_wait => {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(std::time::Duration::from_millis(5));
+                }
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!("Database is locked (waited {}ms): {}", start.elapsed().as_millis(), e)
+                    ));
+                }
+            }
+        }
     }
     
     #[inline]
@@ -960,10 +974,13 @@ impl ApexStorageImpl {
             }
         }
         
-        // Transaction handling: intercept BEGIN/COMMIT/ROLLBACK
+        // Transaction handling: intercept BEGIN/COMMIT/ROLLBACK/SAVEPOINT
         let is_begin = sql_upper.starts_with("BEGIN");
         let is_commit = sql_upper == "COMMIT" || sql_upper == "COMMIT;";
         let is_rollback = sql_upper == "ROLLBACK" || sql_upper == "ROLLBACK;";
+        let is_savepoint = sql_upper.starts_with("SAVEPOINT ");
+        let is_rollback_to = sql_upper.starts_with("ROLLBACK TO");
+        let is_release = sql_upper.starts_with("RELEASE");
         let current_txn = *self.current_txn_id.read();
         let is_txn_dml = current_txn.is_some() && (is_write_op || sql_upper.starts_with("INSERT"));
         let is_txn_select = current_txn.is_some() && sql_upper.starts_with("SELECT");
@@ -1001,6 +1018,53 @@ impl ApexStorageImpl {
                 if let Some(txn_id) = current_txn {
                     ApexExecutor::execute_rollback_txn(txn_id)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                }
+                return Ok((vec![], vec![]));
+            }
+
+            // SAVEPOINT name — create savepoint within active transaction
+            if is_savepoint {
+                if let Some(txn_id) = current_txn {
+                    let name = sql.trim().strip_prefix("SAVEPOINT ").or_else(|| sql.trim().strip_prefix("savepoint "))
+                        .unwrap_or("").trim().trim_end_matches(';').to_string();
+                    let mgr = crate::txn::txn_manager();
+                    mgr.with_context(txn_id, |ctx| {
+                        ctx.savepoint(&name);
+                        Ok(())
+                    }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                }
+                return Ok((vec![], vec![]));
+            }
+
+            // ROLLBACK TO [SAVEPOINT] name — partial rollback
+            if is_rollback_to {
+                if let Some(txn_id) = current_txn {
+                    let upper_trimmed = sql.trim().to_uppercase();
+                    let rest = upper_trimmed.strip_prefix("ROLLBACK TO").unwrap_or("").trim();
+                    let rest = rest.strip_prefix("SAVEPOINT").unwrap_or(rest).trim().trim_end_matches(';');
+                    // Use original case from SQL for the name
+                    let name_start = sql.trim().to_uppercase().find(rest).unwrap_or(0);
+                    let name = sql.trim()[name_start..].trim().trim_end_matches(';').to_string();
+                    let mgr = crate::txn::txn_manager();
+                    mgr.with_context(txn_id, |ctx| {
+                        ctx.rollback_to_savepoint(&name)
+                    }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                }
+                return Ok((vec![], vec![]));
+            }
+
+            // RELEASE [SAVEPOINT] name — release savepoint
+            if is_release {
+                if let Some(txn_id) = current_txn {
+                    let upper_trimmed = sql.trim().to_uppercase();
+                    let rest = upper_trimmed.strip_prefix("RELEASE").unwrap_or("").trim();
+                    let rest = rest.strip_prefix("SAVEPOINT").unwrap_or(rest).trim().trim_end_matches(';');
+                    let name_start = sql.trim().to_uppercase().find(rest).unwrap_or(0);
+                    let name = sql.trim()[name_start..].trim().trim_end_matches(';').to_string();
+                    let mgr = crate::txn::txn_manager();
+                    mgr.with_context(txn_id, |ctx| {
+                        ctx.release_savepoint(&name)
+                    }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 }
                 return Ok((vec![], vec![]));
             }
@@ -1427,7 +1491,8 @@ impl ApexStorageImpl {
         tables
     }
 
-    /// Get row count for current table (excluding deleted rows) using StorageEngine
+    /// Get row count for current table (excluding deleted rows) using StorageEngine.
+    /// LOCK-FREE: active_count is an AtomicU64 — no file lock needed for this metadata read.
     fn row_count(&self) -> PyResult<u64> {
         let table_path = self.get_current_table_path()?;
         // If file doesn't exist (e.g., after drop_if_exists), return 0
@@ -1435,16 +1500,11 @@ impl ApexStorageImpl {
             return Ok(0);
         }
         
-        // Acquire shared read lock
-        let lock_file = Self::acquire_read_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
-        // Use StorageEngine for unified read
+        // No file lock needed — active_count is atomic and always consistent
         let engine = crate::storage::engine::engine();
         let count = engine.active_row_count(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
-        Self::release_lock(lock_file);
         Ok(count)
     }
     

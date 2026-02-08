@@ -2571,6 +2571,10 @@ pub struct OnDemandStorage {
     /// Whether V4 base data was bulk-loaded into memory (only in tests via open_v4_data).
     /// Production code never sets this — in-memory data is always just the write buffer.
     v4_base_loaded: AtomicBool,
+    /// Lock-free cache of header.footer_offset for V4 detection on the read path.
+    /// Avoids acquiring header RwLock on every to_arrow_batch / read call.
+    /// Updated atomically whenever header.footer_offset changes (save_v4, open, append_row_group).
+    cached_footer_offset: AtomicU64,
     /// Cached V4 footer with Row Group metadata (lazy-loaded from disk).
     /// Enables on-demand mmap reads without loading all data into memory.
     v4_footer: RwLock<Option<V4Footer>>,
@@ -2642,6 +2646,7 @@ impl OnDemandStorage {
             pending_rows: AtomicU64::new(0),
             persisted_row_count: AtomicU64::new(0),
             v4_base_loaded: AtomicBool::new(false),
+            cached_footer_offset: AtomicU64::new(0),
             v4_footer: RwLock::new(None),
             delta_store: RwLock::new(DeltaStore::new(path)),
         };
@@ -2830,6 +2835,7 @@ impl OnDemandStorage {
         };
         
         let final_next_id = recovered_next_id.max(next_id);
+        let cached_fo = header.footer_offset;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -2853,6 +2859,7 @@ impl OnDemandStorage {
             pending_rows: AtomicU64::new(0),
             persisted_row_count: AtomicU64::new(id_count as u64),
             v4_base_loaded: AtomicBool::new(false),
+            cached_footer_offset: AtomicU64::new(cached_fo),
             v4_footer: RwLock::new(None),
             delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
         })
@@ -3154,6 +3161,7 @@ impl OnDemandStorage {
         
         let row_count = header.row_count; // Cache before moving header
         let column_count = header.column_count as usize;
+        let cached_fo = header.footer_offset;
         
         // Empty columns - will be loaded on-demand if needed
         let columns = vec![ColumnData::new(ColumnType::Int64); column_count];
@@ -3193,6 +3201,7 @@ impl OnDemandStorage {
             pending_rows: AtomicU64::new(0),
             persisted_row_count: AtomicU64::new(row_count),
             v4_base_loaded: AtomicBool::new(false),
+            cached_footer_offset: AtomicU64::new(cached_fo),
             v4_footer: RwLock::new(None),
             delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
         })
@@ -4321,10 +4330,9 @@ impl OnDemandStorage {
 
         // ON-DEMAND MMAP PATH: For V4 files, prefer reading directly from mmap
         // instead of loading all data into memory. This is the key memory optimization.
+        // LOCK-FREE: use cached_footer_offset atomic instead of header RwLock.
         {
-            let header = self.header.read();
-            let is_v4 = header.footer_offset > 0;
-            drop(header);
+            let is_v4 = self.cached_footer_offset.load(Ordering::Relaxed) > 0;
 
             if is_v4 {
                 // Check if columns are already loaded in memory (write buffer has data)
@@ -4692,10 +4700,9 @@ impl OnDemandStorage {
         use std::sync::Arc;
 
         // ON-DEMAND MMAP PATH for LIMIT queries
+        // LOCK-FREE: use cached_footer_offset atomic instead of header RwLock.
         {
-            let header = self.header.read();
-            let is_v4 = header.footer_offset > 0;
-            drop(header);
+            let is_v4 = self.cached_footer_offset.load(Ordering::Relaxed) > 0;
             if is_v4 {
                 let cols = self.columns.read();
                 let has_in_memory_data = !cols.is_empty() && cols.iter().any(|c| c.len() > 0);
@@ -5038,7 +5045,8 @@ impl OnDemandStorage {
         };
         
         // V4 fast path: read from in-memory columns (no mmap column index)
-        let v4_mode = column_index.is_empty() && header.footer_offset > 0;
+        // LOCK-FREE: use cached_footer_offset for V4 detection
+        let v4_mode = column_index.is_empty() && self.cached_footer_offset.load(Ordering::Relaxed) > 0;
         drop(column_index);
         drop(schema);
         drop(header);
@@ -5567,10 +5575,9 @@ impl OnDemandStorage {
         filter_eq: bool,  // true = equals, false = not equals
     ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
         // V4 FAST PATH: scan in-memory columns directly (no disk I/O)
+        // LOCK-FREE: use cached_footer_offset for V4 detection
         {
-            let header = self.header.read();
-            if header.footer_offset > 0 {
-                drop(header);
+            if self.cached_footer_offset.load(Ordering::Relaxed) > 0 {
                 if self.has_v4_in_memory_data() {
                     // In-memory fast path
                     let schema = self.schema.read();
@@ -5974,10 +5981,9 @@ impl OnDemandStorage {
         offset: usize,
     ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
         // V4: scan in-memory columns directly with early termination
+        // LOCK-FREE: use cached_footer_offset for V4 detection
         {
-            let header = self.header.read();
-            if header.footer_offset > 0 {
-                drop(header);
+            if self.cached_footer_offset.load(Ordering::Relaxed) > 0 {
                 if !self.has_v4_in_memory_data() {
                     // MMAP PATH: delegate to non-limit mmap scan, then apply offset+limit
                     let (mut result, mut indices) = self.read_columns_filtered_string_mmap(
@@ -6243,10 +6249,9 @@ impl OnDemandStorage {
         offset: usize,
     ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
         // V4: scan in-memory columns directly with early termination
+        // LOCK-FREE: use cached_footer_offset for V4 detection
         {
-            let header = self.header.read();
-            if header.footer_offset > 0 {
-                drop(header);
+            if self.cached_footer_offset.load(Ordering::Relaxed) > 0 {
                 if !self.has_v4_in_memory_data() {
                     // MMAP PATH: use BETWEEN as >= low AND <= high
                     let (mut result, mut indices) = self.read_columns_filtered_mmap(
@@ -6486,10 +6491,9 @@ impl OnDemandStorage {
         offset: usize,
     ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
         // V4: scan in-memory columns directly with early termination
+        // LOCK-FREE: use cached_footer_offset for V4 detection
         {
-            let header = self.header.read();
-            if header.footer_offset > 0 {
-                drop(header);
+            if self.cached_footer_offset.load(Ordering::Relaxed) > 0 {
                 if !self.has_v4_in_memory_data() {
                     // MMAP PATH: scan string + numeric filter columns, then apply limit
                     let (result, indices) = self.read_columns_filtered_string_mmap(
@@ -6837,9 +6841,10 @@ impl OnDemandStorage {
     }
 
     /// Check if this is a V4 format file (has footer).
+    /// LOCK-FREE: uses cached_footer_offset atomic instead of header RwLock.
     #[inline]
     pub fn is_v4_format(&self) -> bool {
-        self.header.read().footer_offset > 0
+        self.cached_footer_offset.load(Ordering::Relaxed) > 0
     }
 
     /// Check if V4 column data is currently loaded in memory.
@@ -7410,7 +7415,7 @@ impl OnDemandStorage {
             return Ok(());
         }
         
-        if header.footer_offset > 0 {
+        if self.cached_footer_offset.load(Ordering::Relaxed) > 0 {
             // V4: Load IDs from Row Groups via mmap (no column data loaded)
             drop(header);
             return self.ensure_ids_loaded_v4();
@@ -7830,11 +7835,9 @@ impl OnDemandStorage {
         use std::sync::Arc;
 
         // V4: mmap dict scan is V3-specific, let caller use general query path
-        {
-            let header = self.header.read();
-            if header.footer_offset > 0 {
-                return Ok(None);
-            }
+        // LOCK-FREE: use cached_footer_offset for V4 detection
+        if self.cached_footer_offset.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            return Ok(None);
         }
 
         let schema = self.schema.read();
@@ -10670,6 +10673,7 @@ impl OnDemandStorage {
             header.column_index_offset = 0;
             header.id_column_offset = 0;
         }
+        self.cached_footer_offset.store(footer_offset, Ordering::Release);
         let header = self.header.read();
         let writer_inner = writer.get_mut();
         writer_inner.seek(SeekFrom::Start(0))?;
@@ -11256,6 +11260,7 @@ impl OnDemandStorage {
             header.footer_offset = new_footer_offset;
             header.row_group_count = footer.row_groups.len() as u32;
         }
+        self.cached_footer_offset.store(new_footer_offset, Ordering::Release);
         let header = self.header.read();
         writer_inner.seek(SeekFrom::Start(0))?;
         writer_inner.write_all(&header.to_bytes())?;
