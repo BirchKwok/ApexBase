@@ -534,6 +534,9 @@ impl ApexExecutor {
             SqlStatement::Insert { values, columns, .. } => {
                 Self::execute_insert(storage_path, columns.as_deref(), &values)
             }
+            SqlStatement::InsertSelect { columns, query, .. } => {
+                Self::execute_insert_select(storage_path, columns.as_deref(), *query, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
+            }
             SqlStatement::Delete { where_clause, .. } => {
                 Self::execute_delete(storage_path, where_clause.as_ref())
             }
@@ -542,6 +545,12 @@ impl ApexExecutor {
             }
             SqlStatement::TruncateTable { .. } => {
                 Self::execute_truncate(storage_path)
+            }
+            SqlStatement::Explain { stmt, analyze } => {
+                Self::execute_explain(*stmt, analyze, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
+            }
+            SqlStatement::Cte { name, body, main } => {
+                Self::execute_cte(&name, *body, *main, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
             }
             SqlStatement::BeginTransaction { read_only } => {
                 Self::execute_begin(read_only)
@@ -591,6 +600,10 @@ impl ApexExecutor {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 Self::execute_insert(&table_path, columns.as_deref(), &values)
             }
+            SqlStatement::InsertSelect { table, columns, query } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                Self::execute_insert_select(&table_path, columns.as_deref(), *query, base_dir, default_table_path)
+            }
             SqlStatement::Delete { table, where_clause } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 Self::execute_delete(&table_path, where_clause.as_ref())
@@ -605,6 +618,14 @@ impl ApexExecutor {
             }
             SqlStatement::DropIndex { name, table, if_exists } => {
                 Self::execute_drop_index(base_dir, &name, &table, if_exists)
+            }
+            // EXPLAIN
+            SqlStatement::Explain { stmt, analyze } => {
+                Self::execute_explain(*stmt, analyze, base_dir, default_table_path)
+            }
+            // CTE
+            SqlStatement::Cte { name, body, main } => {
+                Self::execute_cte(&name, *body, *main, base_dir, default_table_path)
             }
             // Transaction Statements
             SqlStatement::BeginTransaction { read_only } => {
@@ -9871,6 +9892,298 @@ impl ApexExecutor {
         crate::storage::engine::engine().invalidate(storage_path);
         
         Ok(ApexResult::Scalar(0))
+    }
+
+    // ========== EXPLAIN / CTE / INSERT SELECT ==========
+
+    /// Execute EXPLAIN statement — returns a text description of the query plan
+    fn execute_explain(stmt: SqlStatement, analyze: bool, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+        let mut plan_lines: Vec<String> = Vec::new();
+
+        // Describe the statement type
+        match &stmt {
+            SqlStatement::Select(select) => {
+                plan_lines.push("Query Plan:".to_string());
+                // FROM
+                if let Some(ref from) = select.from {
+                    match from {
+                        FromItem::Table { table, alias } => {
+                            let alias_str = alias.as_ref().map(|a| format!(" AS {}", a)).unwrap_or_default();
+                            plan_lines.push(format!("  Scan: table={}{}", table, alias_str));
+                            let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
+                            if table_path.exists() {
+                                if let Ok(backend) = get_cached_backend(&table_path) {
+                                    let row_count = backend.row_count();
+                                    let schema = backend.get_schema();
+                                    plan_lines.push(format!("    Rows: ~{}", row_count));
+                                    plan_lines.push(format!("    Columns: {}", schema.len()));
+                                }
+                            }
+                        }
+                        FromItem::Subquery { alias, .. } => {
+                            plan_lines.push(format!("  Scan: subquery AS {}", alias));
+                        }
+                    }
+                }
+                // JOINs
+                for join in &select.joins {
+                    let jt = match join.join_type {
+                        JoinType::Inner => "INNER JOIN",
+                        JoinType::Left => "LEFT JOIN",
+                    };
+                    let table_name = match &join.right {
+                        FromItem::Table { table, .. } => table.clone(),
+                        FromItem::Subquery { alias, .. } => format!("(subquery) {}", alias),
+                    };
+                    plan_lines.push(format!("  {}: {}", jt, table_name));
+                }
+                // WHERE
+                if select.where_clause.is_some() {
+                    plan_lines.push("  Filter: WHERE <predicate>".to_string());
+                }
+                // GROUP BY
+                if !select.group_by.is_empty() {
+                    plan_lines.push(format!("  GroupBy: {}", select.group_by.join(", ")));
+                }
+                // HAVING
+                if select.having.is_some() {
+                    plan_lines.push("  Filter: HAVING <predicate>".to_string());
+                }
+                // ORDER BY
+                if !select.order_by.is_empty() {
+                    let obs: Vec<String> = select.order_by.iter()
+                        .map(|o| format!("{} {}", o.column, if o.descending { "DESC" } else { "ASC" }))
+                        .collect();
+                    plan_lines.push(format!("  Sort: {}", obs.join(", ")));
+                }
+                // LIMIT/OFFSET
+                if let Some(limit) = select.limit {
+                    plan_lines.push(format!("  Limit: {}", limit));
+                }
+                if let Some(offset) = select.offset {
+                    plan_lines.push(format!("  Offset: {}", offset));
+                }
+                // Projection
+                let proj: Vec<String> = select.columns.iter().map(|c| match c {
+                    SelectColumn::All => "*".to_string(),
+                    SelectColumn::Column(name) => name.clone(),
+                    SelectColumn::ColumnAlias { column, alias } => format!("{} AS {}", column, alias),
+                    SelectColumn::Aggregate { func, column, .. } => {
+                        format!("{}({})", func, column.as_deref().unwrap_or("*"))
+                    }
+                    SelectColumn::Expression { alias, .. } => {
+                        alias.as_deref().unwrap_or("<expr>").to_string()
+                    }
+                    SelectColumn::WindowFunction { name, alias, .. } => {
+                        alias.as_deref().unwrap_or(name.as_str()).to_string()
+                    }
+                }).collect();
+                plan_lines.push(format!("  Output: {}", proj.join(", ")));
+            }
+            SqlStatement::Insert { table, values, .. } => {
+                plan_lines.push("Query Plan:".to_string());
+                plan_lines.push(format!("  Insert: table={}, rows={}", table, values.len()));
+            }
+            SqlStatement::InsertSelect { table, .. } => {
+                plan_lines.push("Query Plan:".to_string());
+                plan_lines.push(format!("  InsertSelect: table={}", table));
+            }
+            SqlStatement::Update { table, .. } => {
+                plan_lines.push("Query Plan:".to_string());
+                plan_lines.push(format!("  Update: table={}", table));
+            }
+            SqlStatement::Delete { table, .. } => {
+                plan_lines.push("Query Plan:".to_string());
+                plan_lines.push(format!("  Delete: table={}", table));
+            }
+            SqlStatement::Union(_) => {
+                plan_lines.push("Query Plan:".to_string());
+                plan_lines.push("  Union".to_string());
+            }
+            SqlStatement::Cte { name, .. } => {
+                plan_lines.push("Query Plan:".to_string());
+                plan_lines.push(format!("  CTE: {}", name));
+            }
+            other => {
+                plan_lines.push(format!("Query Plan: {:?}", std::mem::discriminant(other)));
+            }
+        }
+
+        // EXPLAIN ANALYZE: actually run the query and report timing
+        if analyze {
+            let start = std::time::Instant::now();
+            let result = Self::execute_parsed_multi(stmt, base_dir, default_table_path)?;
+            let elapsed = start.elapsed();
+            plan_lines.push(format!("  Actual Time: {:.3}ms", elapsed.as_secs_f64() * 1000.0));
+            if let Ok(batch) = result.to_record_batch() {
+                plan_lines.push(format!("  Actual Rows: {}", batch.num_rows()));
+            }
+        }
+
+        // Return as a single-column RecordBatch with plan lines
+        let plan_text = plan_lines.join("\n");
+        let arr = arrow::array::StringArray::from(vec![plan_text.as_str()]);
+        let schema = Schema::new(vec![Field::new("plan", ArrowDataType::Utf8, false)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arr)])
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(ApexResult::Data(batch))
+    }
+
+    /// Execute CTE (WITH name AS (...) main_query)
+    /// Materializes the CTE body into a temp table and rewrites the main query to reference it.
+    fn execute_cte(name: &str, body: SqlStatement, main: SqlStatement, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+        // Step 1: Execute the CTE body query
+        let cte_result = Self::execute_parsed_multi(body, base_dir, default_table_path)?;
+        let cte_batch = cte_result.to_record_batch()
+            .map_err(|e| err_data(format!("CTE body must return a result set: {}", e)))?;
+
+        // Step 2: Materialize CTE into a temp table
+        let temp_path = base_dir.join(format!("__cte_{}_{}.apex", name, std::process::id()));
+        {
+            let backend = TableStorageBackend::create(&temp_path)?;
+            // Set up schema from CTE result
+            let schema = cte_batch.schema();
+            for field in schema.fields() {
+                let col_type = match field.data_type() {
+                    ArrowDataType::Int64 | ArrowDataType::UInt64 => crate::data::DataType::Int64,
+                    ArrowDataType::Float64 => crate::data::DataType::Float64,
+                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => crate::data::DataType::String,
+                    ArrowDataType::Boolean => crate::data::DataType::Bool,
+                    _ => crate::data::DataType::String,
+                };
+                backend.add_column(field.name(), col_type)?;
+            }
+
+            // Insert rows from CTE result
+            if cte_batch.num_rows() > 0 {
+                let mut rows: Vec<std::collections::HashMap<String, crate::data::Value>> = Vec::with_capacity(cte_batch.num_rows());
+                for row_idx in 0..cte_batch.num_rows() {
+                    let mut row = std::collections::HashMap::new();
+                    for (col_idx, field) in schema.fields().iter().enumerate() {
+                        let col = cte_batch.column(col_idx);
+                        let val = Self::arrow_value_at_col(col, row_idx);
+                        row.insert(field.name().clone(), val);
+                    }
+                    rows.push(row);
+                }
+                backend.insert_rows(&rows)?;
+            }
+            backend.save()?;
+        }
+
+        // Step 3: Execute the main query, rewriting references to the CTE name
+        // If the main is itself a CTE, recurse
+        let result = match main {
+            SqlStatement::Cte { name: inner_name, body: inner_body, main: inner_main } => {
+                Self::execute_cte(&inner_name, *inner_body, *inner_main, base_dir, &temp_path)
+            }
+            SqlStatement::Select(mut select) => {
+                // Rewrite FROM clause to reference the temp table
+                if let Some(ref from) = select.from {
+                    if let FromItem::Table { table, .. } = from {
+                        if table.eq_ignore_ascii_case(name) {
+                            select.from = Some(FromItem::Table { table: format!("__cte_{}_{}", name, std::process::id()), alias: Some(name.to_string()) });
+                        }
+                    }
+                }
+                // Rewrite JOIN references too
+                for join in &mut select.joins {
+                    if let FromItem::Table { table, alias } = &join.right {
+                        if table.eq_ignore_ascii_case(name) {
+                            join.right = FromItem::Table {
+                                table: format!("__cte_{}_{}", name, std::process::id()),
+                                alias: Some(alias.clone().unwrap_or_else(|| name.to_string())),
+                            };
+                        }
+                    }
+                }
+                Self::execute_parsed_multi(SqlStatement::Select(select), base_dir, default_table_path)
+            }
+            other => Self::execute_parsed_multi(other, base_dir, default_table_path),
+        };
+
+        // Step 4: Clean up temp table
+        let _ = std::fs::remove_file(&temp_path);
+        // Clean up associated files
+        let _ = std::fs::remove_file(temp_path.with_extension("apex.wal"));
+        let _ = std::fs::remove_file(temp_path.with_extension("apex.lock"));
+        let _ = std::fs::remove_file(temp_path.with_extension("apex.deltastore"));
+        invalidate_storage_cache(&temp_path);
+
+        result
+    }
+
+    /// Execute INSERT ... SELECT statement
+    fn execute_insert_select(
+        target_path: &Path,
+        columns: Option<&[String]>,
+        query: SqlStatement,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<ApexResult> {
+        // Step 1: Execute the SELECT query
+        let select_result = Self::execute_parsed_multi(query, base_dir, default_table_path)?;
+        let select_batch = select_result.to_record_batch()
+            .map_err(|e| err_data(format!("INSERT SELECT query must return a result set: {}", e)))?;
+
+        if select_batch.num_rows() == 0 {
+            return Ok(ApexResult::Scalar(0));
+        }
+
+        // Step 2: Convert Arrow batch rows to Value rows for execute_insert
+        let schema = select_batch.schema();
+        let num_cols = if let Some(cols) = columns {
+            cols.len().min(schema.fields().len())
+        } else {
+            schema.fields().len()
+        };
+
+        let mut values: Vec<Vec<crate::data::Value>> = Vec::with_capacity(select_batch.num_rows());
+        for row_idx in 0..select_batch.num_rows() {
+            let mut row: Vec<crate::data::Value> = Vec::with_capacity(num_cols);
+            for col_idx in 0..num_cols {
+                let col = select_batch.column(col_idx);
+                let val = Self::arrow_value_at_col(col, row_idx);
+                row.push(val);
+            }
+            values.push(row);
+        }
+
+        // Step 3: Determine column names
+        let col_names: Option<Vec<String>> = if let Some(cols) = columns {
+            Some(cols.to_vec())
+        } else {
+            // Use column names from the SELECT result, excluding _id
+            let names: Vec<String> = schema.fields().iter()
+                .take(num_cols)
+                .map(|f| f.name().clone())
+                .filter(|n| n != "_id")
+                .collect();
+            if names.len() < num_cols {
+                // Had _id column, need to rebuild values without _id
+                let id_indices: Vec<usize> = schema.fields().iter()
+                    .enumerate()
+                    .filter(|(_, f)| f.name() == "_id")
+                    .map(|(i, _)| i)
+                    .collect();
+                if !id_indices.is_empty() {
+                    let mut new_values: Vec<Vec<crate::data::Value>> = Vec::with_capacity(values.len());
+                    for row in &values {
+                        let filtered: Vec<crate::data::Value> = row.iter().enumerate()
+                            .filter(|(i, _)| !id_indices.contains(i))
+                            .map(|(_, v)| v.clone())
+                            .collect();
+                        new_values.push(filtered);
+                    }
+                    return Self::execute_insert(target_path, Some(&names), &new_values);
+                }
+                Some(names)
+            } else {
+                Some(names)
+            }
+        };
+
+        Self::execute_insert(target_path, col_names.as_deref(), &values)
     }
 
     // ========== Transaction Execution Methods ==========

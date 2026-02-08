@@ -57,8 +57,12 @@ pub enum SqlStatement {
     DropIndex { name: String, table: String, if_exists: bool },
     // DML Statements
     Insert { table: String, columns: Option<Vec<String>>, values: Vec<Vec<Value>> },
+    InsertSelect { table: String, columns: Option<Vec<String>>, query: Box<SqlStatement> },
+    Explain { stmt: Box<SqlStatement>, analyze: bool },
     Delete { table: String, where_clause: Option<SqlExpr> },
     Update { table: String, assignments: Vec<(String, SqlExpr)>, where_clause: Option<SqlExpr> },
+    // CTE wrapper
+    Cte { name: String, body: Box<SqlStatement>, main: Box<SqlStatement> },
     // Transaction Statements
     BeginTransaction { read_only: bool },
     Commit,
@@ -520,6 +524,8 @@ enum Token {
     Insert, Into, Values, Delete, Update, Set,
     // Transaction keywords
     Begin, Commit, Rollback, Transaction, Read,
+    // CTE / EXPLAIN keywords
+    With, Explain, Recursive,
     // Symbols
     Star,           // *
     Comma,          // ,
@@ -825,6 +831,10 @@ impl SqlParser {
                     "ROLLBACK" => Token::Rollback,
                     "TRANSACTION" => Token::Transaction,
                     "READ" => Token::Read,
+                    // CTE / EXPLAIN keywords
+                    "WITH" => Token::With,
+                    "EXPLAIN" => Token::Explain,
+                    "RECURSIVE" => Token::Recursive,
                     _ => Token::Identifier(word),
                 };
                 tokens.push(SpannedToken { token, start, end: i });
@@ -908,7 +918,7 @@ impl SqlParser {
             Token::Identifier(s) => {
                 let u = s.to_uppercase();
                 // Keep list small and stable; used only for human-friendly hints.
-                const KWS: [&str; 69] = [
+                const KWS: [&str; 72] = [
                     "SELECT",
                     "FROM",
                     "WHERE",
@@ -982,6 +992,9 @@ impl SqlParser {
                     "ROLLBACK",
                     "TRANSACTION",
                     "READ",
+                    "WITH",
+                    "EXPLAIN",
+                    "RECURSIVE",
                 ];
 
                 // Fast path for common "plural" / extra trailing char typos: FROMs, WHEREs, LIKEs, LIMITs
@@ -1089,6 +1102,57 @@ impl SqlParser {
 
     fn parse_statement(&mut self) -> Result<SqlStatement, ApexError> {
         match self.current() {
+            Token::Explain => {
+                self.advance();
+                let analyze = if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "ANALYZE") {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let inner = self.parse_statement()?;
+                Ok(SqlStatement::Explain { stmt: Box::new(inner), analyze })
+            }
+            Token::With => {
+                // CTE: WITH name AS (SELECT ...) [, name2 AS (SELECT ...)] SELECT ...
+                self.advance();
+                let _recursive = if matches!(self.current(), Token::Recursive) {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let mut ctes: Vec<(String, SqlStatement)> = Vec::new();
+                loop {
+                    let cte_name = self.parse_identifier()?;
+                    self.expect(Token::As)?;
+                    self.expect(Token::LParen)?;
+                    let cte_stmt = self.parse_statement()?;
+                    self.expect(Token::RParen)?;
+                    ctes.push((cte_name, cte_stmt));
+                    if matches!(self.current(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                // Parse the main statement (SELECT, INSERT, etc.)
+                let mut main_stmt = self.parse_statement()?;
+                // Attach CTEs to the main statement by wrapping in CTE variant
+                // We store CTEs by converting to temp-table materialization at execution time
+                // For now, return the main statement with CTEs stored
+                // We'll use a simple approach: wrap in a new variant or pass through
+                // Since CTE execution is handled in executor, we need a way to carry the CTE definitions.
+                // Add a CTE wrapper approach:
+                for (cte_name, cte_body) in ctes.into_iter().rev() {
+                    main_stmt = SqlStatement::Cte {
+                        name: cte_name,
+                        body: Box::new(cte_body),
+                        main: Box::new(main_stmt),
+                    };
+                }
+                Ok(main_stmt)
+            }
             Token::Select => {
                 // Parse the first SELECT part without consuming ORDER/LIMIT/OFFSET.
                 // Those trailing clauses belong to UNION result if a UNION follows.
@@ -1288,6 +1352,8 @@ impl SqlParser {
                 let table = self.parse_identifier()?;
                 // Optional column list
                 let columns = if matches!(self.current(), Token::LParen) {
+                    // Peek ahead: could be column list followed by VALUES/SELECT,
+                    // or could be VALUES directly
                     self.advance();
                     let cols = self.parse_identifier_list()?;
                     self.expect(Token::RParen)?;
@@ -1295,9 +1361,15 @@ impl SqlParser {
                 } else {
                     None
                 };
-                self.expect(Token::Values)?;
-                let values = self.parse_values_list()?;
-                Ok(SqlStatement::Insert { table, columns, values })
+                // INSERT ... SELECT or INSERT ... VALUES
+                if matches!(self.current(), Token::Select) || matches!(self.current(), Token::With) {
+                    let query = self.parse_statement()?;
+                    Ok(SqlStatement::InsertSelect { table, columns, query: Box::new(query) })
+                } else {
+                    self.expect(Token::Values)?;
+                    let values = self.parse_values_list()?;
+                    Ok(SqlStatement::Insert { table, columns, values })
+                }
             }
             Token::Delete => {
                 self.advance();
