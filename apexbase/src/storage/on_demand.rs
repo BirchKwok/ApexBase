@@ -965,6 +965,89 @@ impl ColumnData {
         }
     }
 
+    /// Apply a null bitmap: for rows marked as null (bit set), replace string data
+    /// with empty strings (clearing the NULL marker sentinel). For numeric types,
+    /// null rows get zeroed. This cleans up the `\x00__NULL__\x00` sentinel used
+    /// by insert_typed_with_nulls so downstream consumers see proper empty/zero values.
+    pub fn apply_null_bitmap(&mut self, null_bitmap: &[u8]) {
+        match self {
+            ColumnData::String { offsets, data } => {
+                if offsets.len() < 2 { return; }
+                let row_count = offsets.len() - 1;
+                let mut new_offsets = Vec::with_capacity(row_count + 1);
+                let mut new_data = Vec::new();
+                new_offsets.push(0u32);
+                for i in 0..row_count {
+                    let byte_idx = i / 8;
+                    let bit_idx = i % 8;
+                    let is_null = byte_idx < null_bitmap.len()
+                        && (null_bitmap[byte_idx] >> bit_idx) & 1 != 0;
+                    if is_null {
+                        new_offsets.push(new_data.len() as u32);
+                    } else {
+                        let s = offsets[i] as usize;
+                        let e = offsets[i + 1] as usize;
+                        new_data.extend_from_slice(&data[s..e]);
+                        new_offsets.push(new_data.len() as u32);
+                    }
+                }
+                *offsets = new_offsets;
+                *data = new_data;
+            }
+            ColumnData::Int64(v) => {
+                for i in 0..v.len() {
+                    let b = i / 8; let bit = i % 8;
+                    if b < null_bitmap.len() && (null_bitmap[b] >> bit) & 1 != 0 {
+                        v[i] = 0;
+                    }
+                }
+            }
+            ColumnData::Float64(v) => {
+                for i in 0..v.len() {
+                    let b = i / 8; let bit = i % 8;
+                    if b < null_bitmap.len() && (null_bitmap[b] >> bit) & 1 != 0 {
+                        v[i] = 0.0;
+                    }
+                }
+            }
+            ColumnData::Bool { data: bits, len } => {
+                for i in 0..*len {
+                    let b = i / 8; let bit = i % 8;
+                    if b < null_bitmap.len() && (null_bitmap[b] >> bit) & 1 != 0 {
+                        // Clear the bit for null rows
+                        if i / 8 < bits.len() {
+                            bits[i / 8] &= !(1 << (i % 8));
+                        }
+                    }
+                }
+            }
+            ColumnData::Binary { offsets, data } => {
+                if offsets.len() < 2 { return; }
+                let row_count = offsets.len() - 1;
+                let mut new_offsets = Vec::with_capacity(row_count + 1);
+                let mut new_data = Vec::new();
+                new_offsets.push(0u32);
+                for i in 0..row_count {
+                    let byte_idx = i / 8;
+                    let bit_idx = i % 8;
+                    let is_null = byte_idx < null_bitmap.len()
+                        && (null_bitmap[byte_idx] >> bit_idx) & 1 != 0;
+                    if is_null {
+                        new_offsets.push(new_data.len() as u32);
+                    } else {
+                        let s = offsets[i] as usize;
+                        let e = offsets[i + 1] as usize;
+                        new_data.extend_from_slice(&data[s..e]);
+                        new_offsets.push(new_data.len() as u32);
+                    }
+                }
+                *offsets = new_offsets;
+                *data = new_data;
+            }
+            _ => {}
+        }
+    }
+
     /// Filter column data to only include rows at specified indices.
     /// OPTIMIZATION: uses pre-allocation and unchecked indexing for hot paths.
     pub fn filter_by_indices(&self, indices: &[usize]) -> Self {
@@ -2992,6 +3075,66 @@ impl OnDemandStorage {
         Ok(())
     }
     
+    /// Convert an Arrow ArrayRef to ColumnData, preserving nulls.
+    fn arrow_array_to_column_data(array: &dyn arrow::array::Array) -> ColumnData {
+        use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray, BinaryArray, Array};
+        use arrow::datatypes::DataType as ArrowDT;
+        match array.data_type() {
+            ArrowDT::Int64 => {
+                let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                ColumnData::Int64(arr.values().to_vec())
+            }
+            ArrowDT::Float64 => {
+                let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                ColumnData::Float64(arr.values().to_vec())
+            }
+            ArrowDT::Utf8 => {
+                let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+                let mut offsets = Vec::with_capacity(arr.len() + 1);
+                let mut data = Vec::new();
+                offsets.push(0u32);
+                for j in 0..arr.len() {
+                    if arr.is_null(j) {
+                        offsets.push(data.len() as u32);
+                    } else {
+                        let s = arr.value(j).as_bytes();
+                        data.extend_from_slice(s);
+                        offsets.push(data.len() as u32);
+                    }
+                }
+                ColumnData::String { offsets, data }
+            }
+            ArrowDT::Boolean => {
+                let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                let n = arr.len();
+                let byte_len = (n + 7) / 8;
+                let mut bits = vec![0u8; byte_len];
+                for j in 0..n {
+                    if !arr.is_null(j) && arr.value(j) {
+                        bits[j / 8] |= 1 << (j % 8);
+                    }
+                }
+                ColumnData::Bool { data: bits, len: n }
+            }
+            ArrowDT::Binary => {
+                let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+                let mut offsets = Vec::with_capacity(arr.len() + 1);
+                let mut data = Vec::new();
+                offsets.push(0u32);
+                for j in 0..arr.len() {
+                    if arr.is_null(j) {
+                        offsets.push(data.len() as u32);
+                    } else {
+                        data.extend_from_slice(arr.value(j));
+                        offsets.push(data.len() as u32);
+                    }
+                }
+                ColumnData::Binary { offsets, data }
+            }
+            _ => ColumnData::new(ColumnType::Int64),
+        }
+    }
+
     /// Create a column filled with default values (0, 0.0, "", false).
     /// Used for columns added via ALTER TABLE that have no disk data yet.
     fn create_default_column(dtype: ColumnType, count: usize) -> ColumnData {
@@ -4077,6 +4220,38 @@ impl OnDemandStorage {
                         Self::create_default_column(*col_type, base_count));
                 }
             }
+        } else if v4_mode && base_count > 0 {
+            // V4 MMAP PATH: scan columns from RGs via mmap with null bitmaps, then slice
+            if let Some(footer) = self.get_or_load_footer()? {
+                let f_schema = &footer.schema;
+                let (scanned, _del, col_nulls) = self.scan_columns_mmap_with_nulls(&col_indices, &footer)?;
+                for (out_pos, &col_idx) in col_indices.iter().enumerate() {
+                    let (col_name, col_type) = &f_schema.columns[col_idx];
+                    if out_pos < scanned.len() {
+                        let mut col = scanned[out_pos].clone();
+                        // Apply null bitmap: replace NULL marker strings with empty strings
+                        if out_pos < col_nulls.len() && !col_nulls[out_pos].is_empty() {
+                            col.apply_null_bitmap(&col_nulls[out_pos]);
+                        }
+                        let col_len = col.len();
+                        if base_start == 0 && base_count >= col_len {
+                            result.insert(col_name.clone(), col);
+                        } else {
+                            let end = (base_start + base_count).min(col_len);
+                            if base_start < end {
+                                let indices: Vec<usize> = (base_start..end).collect();
+                                result.insert(col_name.clone(), col.filter_by_indices(&indices));
+                            } else {
+                                result.insert(col_name.clone(),
+                                    Self::create_default_column(*col_type, base_count));
+                            }
+                        }
+                    } else {
+                        result.insert(col_name.clone(),
+                            Self::create_default_column(*col_type, base_count));
+                    }
+                }
+            }
         } else if base_count > 0 {
             // V3: read from mmap via column index
             let file_guard = self.file.read();
@@ -4239,8 +4414,63 @@ impl OnDemandStorage {
                     }
                 }
             } else {
-                // Read null bitmap from file via mmap
                 drop(nulls);
+                // V4 mmap path: read null bitmap from RG data
+                let header = self.header.read();
+                if header.footer_offset > 0 {
+                    drop(header);
+                    drop(schema);
+                    if let Ok(Some(footer)) = self.get_or_load_footer() {
+                        let f_schema = &footer.schema;
+                        let f_col_count = f_schema.column_count();
+                        if let Some(file_guard) = self.file.try_read() {
+                            if let Some(file) = file_guard.as_ref() {
+                                let mut mmap_guard = self.mmap_cache.write();
+                                if let Ok(mmap_ref) = mmap_guard.get_or_create(file) {
+                                    let mut global_row = 0usize;
+                                    for rg_meta in &footer.row_groups {
+                                        let rg_rows = rg_meta.row_count as usize;
+                                        let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+                                        if rg_end > mmap_ref.len() { break; }
+                                        let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+                                        let mut pos: usize = 32 + rg_rows * 8; // skip header + IDs
+                                        let del_vec_len = (rg_rows + 7) / 8;
+                                        pos += del_vec_len; // skip deletion vector
+                                        let null_bitmap_len = (rg_rows + 7) / 8;
+                                        // Navigate to the right column's null bitmap
+                                        for ci in 0..f_col_count {
+                                            if pos + null_bitmap_len > rg_bytes.len() { break; }
+                                            let null_bytes = &rg_bytes[pos..pos + null_bitmap_len];
+                                            pos += null_bitmap_len;
+                                            if ci == col_idx {
+                                                // Extract null bits for rows in range
+                                                for ri in 0..rg_rows {
+                                                    let global_ri = global_row + ri;
+                                                    if global_ri >= start_row && global_ri < start_row + row_count {
+                                                        let out_i = global_ri - start_row;
+                                                        let b = ri / 8; let bit = ri % 8;
+                                                        if b < null_bytes.len() && (null_bytes[b] >> bit) & 1 != 0 {
+                                                            result[out_i] = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Skip column data
+                                            let ct = f_schema.columns[ci].1;
+                                            if let Ok(consumed) = ColumnData::skip_bytes_typed(&rg_bytes[pos..], ct) {
+                                                pos += consumed;
+                                            } else { break; }
+                                        }
+                                        global_row += rg_rows;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return result;
+                }
+                drop(header);
+                // V3: Read null bitmap from file via column index
                 let column_index = self.column_index.read();
                 if col_idx < column_index.len() {
                     let index_entry = &column_index[col_idx];
@@ -4283,9 +4513,9 @@ impl OnDemandStorage {
         filter_value: f64,
     ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
         let is_v4 = self.is_v4_format();
-        // V4 without in-memory data: return empty — caller falls back to mmap
+        // V4 without in-memory data: use mmap path
         if is_v4 && !self.has_v4_in_memory_data() {
-            return Ok((HashMap::new(), Vec::new()));
+            return self.read_columns_filtered_mmap(column_names, filter_column, filter_op, filter_value);
         }
         
         let header = self.header.read();
@@ -4385,6 +4615,90 @@ impl OnDemandStorage {
         Ok((result, matching_indices))
     }
 
+    /// MMAP PATH: numeric filter directly on V4 RG data via mmap
+    fn read_columns_filtered_mmap(
+        &self,
+        column_names: Option<&[&str]>,
+        filter_column: &str,
+        filter_op: &str,
+        filter_value: f64,
+    ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok((HashMap::new(), Vec::new())),
+        };
+        let schema = &footer.schema;
+        
+        let filter_col_idx = match schema.get_index(filter_column) {
+            Some(idx) => idx,
+            None => return Ok((HashMap::new(), Vec::new())),
+        };
+        
+        // Scan filter column from mmap
+        let (scanned, del_bytes) = self.scan_columns_mmap(&[filter_col_idx], &footer)?;
+        if scanned.is_empty() { return Ok((HashMap::new(), Vec::new())); }
+        
+        let has_deleted = del_bytes.iter().any(|&b| b != 0);
+        
+        let matching_indices: Vec<usize> = match &scanned[0] {
+            ColumnData::Int64(values) => {
+                let fv = filter_value as i64;
+                values.iter().enumerate()
+                    .filter(|(i, _)| {
+                        if has_deleted { let b = i / 8; let bit = i % 8; if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { return false; } }
+                        true
+                    })
+                    .filter(|(_, &v)| match filter_op {
+                        ">=" => v >= fv, ">" => v > fv, "<=" => v <= fv, "<" => v < fv,
+                        "=" | "==" => v == fv, "!=" | "<>" => v != fv, _ => true,
+                    })
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+            ColumnData::Float64(values) => {
+                values.iter().enumerate()
+                    .filter(|(i, _)| {
+                        if has_deleted { let b = i / 8; let bit = i % 8; if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { return false; } }
+                        true
+                    })
+                    .filter(|(_, &v)| match filter_op {
+                        ">=" => v >= filter_value, ">" => v > filter_value,
+                        "<=" => v <= filter_value, "<" => v < filter_value,
+                        "=" | "==" => (v - filter_value).abs() < f64::EPSILON,
+                        "!=" | "<>" => (v - filter_value).abs() >= f64::EPSILON, _ => true,
+                    })
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+            _ => return Ok((HashMap::new(), Vec::new())),
+        };
+        
+        if matching_indices.is_empty() {
+            return Ok((HashMap::new(), Vec::new()));
+        }
+        
+        // Scan result columns
+        let col_indices: Vec<usize> = match column_names {
+            Some(names) => names.iter()
+                .filter(|&&n| n != "_id")
+                .filter_map(|&name| schema.get_index(name))
+                .collect(),
+            None => (0..schema.column_count()).collect(),
+        };
+        
+        let (all_cols, _) = self.scan_columns_mmap(&col_indices, &footer)?;
+        
+        let mut result = HashMap::new();
+        for (out_idx, &col_idx) in col_indices.iter().enumerate() {
+            let (col_name, _) = &schema.columns[col_idx];
+            if out_idx < all_cols.len() {
+                result.insert(col_name.clone(), all_cols[out_idx].filter_by_indices(&matching_indices));
+            }
+        }
+        
+        Ok((result, matching_indices))
+    }
+
     /// Read columns with STRING predicate pushdown - filter rows at storage level
     /// This is optimized for string equality filters (column = 'value')
     /// Uses bloom filters to skip row groups that definitely don't contain the value
@@ -4400,90 +4714,89 @@ impl OnDemandStorage {
             let header = self.header.read();
             if header.footer_offset > 0 {
                 drop(header);
-                // Only use fast path if data is already in memory
-                if !self.has_v4_in_memory_data() {
-                    return Ok((HashMap::new(), Vec::new()));
-                }
-                
-                let schema = self.schema.read();
-                let columns = self.columns.read();
-                let deleted = self.deleted.read();
-                let total_rows = self.ids.read().len();
-                
-                let filter_col_idx = match schema.get_index(filter_column) {
-                    Some(idx) => idx,
-                    None => return Ok((HashMap::new(), Vec::new())),
-                };
-                
-                let filter_bytes = filter_value.as_bytes();
-                let filter_len = filter_bytes.len();
-                let has_deleted = deleted.iter().any(|&b| b != 0);
-                
-                let mut matching_indices: Vec<usize> = Vec::with_capacity(1024);
-                
-                if filter_col_idx < columns.len() {
-                    if let ColumnData::String { offsets, data } = &columns[filter_col_idx] {
-                        let count = offsets.len().saturating_sub(1).min(total_rows);
-                        let first_byte = filter_bytes.first().copied();
-                        
-                        for i in 0..count {
-                            // Skip deleted rows
-                            if has_deleted {
-                                let byte_idx = i / 8;
-                                let bit_idx = i % 8;
-                                if byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 != 0 {
-                                    continue;
+                if self.has_v4_in_memory_data() {
+                    // In-memory fast path
+                    let schema = self.schema.read();
+                    let columns = self.columns.read();
+                    let deleted = self.deleted.read();
+                    let total_rows = self.ids.read().len();
+                    
+                    let filter_col_idx = match schema.get_index(filter_column) {
+                        Some(idx) => idx,
+                        None => return Ok((HashMap::new(), Vec::new())),
+                    };
+                    
+                    let filter_bytes = filter_value.as_bytes();
+                    let filter_len = filter_bytes.len();
+                    let has_deleted = deleted.iter().any(|&b| b != 0);
+                    
+                    let mut matching_indices: Vec<usize> = Vec::with_capacity(1024);
+                    
+                    if filter_col_idx < columns.len() {
+                        if let ColumnData::String { offsets, data } = &columns[filter_col_idx] {
+                            let count = offsets.len().saturating_sub(1).min(total_rows);
+                            let first_byte = filter_bytes.first().copied();
+                            
+                            for i in 0..count {
+                                if has_deleted {
+                                    let byte_idx = i / 8;
+                                    let bit_idx = i % 8;
+                                    if byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 != 0 {
+                                        continue;
+                                    }
                                 }
-                            }
-                            
-                            let start = offsets[i] as usize;
-                            let end = offsets[i + 1] as usize;
-                            let str_len = end - start;
-                            
-                            // Fast rejection by length
-                            if str_len != filter_len {
-                                if !filter_eq { matching_indices.push(i); }
-                                continue;
-                            }
-                            
-                            // Fast rejection by first byte
-                            if let Some(fb) = first_byte {
-                                if start < data.len() && data[start] != fb {
+                                
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                let str_len = end - start;
+                                
+                                if str_len != filter_len {
                                     if !filter_eq { matching_indices.push(i); }
                                     continue;
                                 }
-                            }
-                            
-                            let matches = end <= data.len() && &data[start..end] == filter_bytes;
-                            if (filter_eq && matches) || (!filter_eq && !matches) {
-                                matching_indices.push(i);
+                                
+                                if let Some(fb) = first_byte {
+                                    if start < data.len() && data[start] != fb {
+                                        if !filter_eq { matching_indices.push(i); }
+                                        continue;
+                                    }
+                                }
+                                
+                                let matches = end <= data.len() && &data[start..end] == filter_bytes;
+                                if (filter_eq && matches) || (!filter_eq && !matches) {
+                                    matching_indices.push(i);
+                                }
                             }
                         }
                     }
-                }
-                
-                if matching_indices.is_empty() {
-                    return Ok((HashMap::new(), Vec::new()));
-                }
-                
-                // Read only needed columns for matching indices
-                let col_indices: Vec<usize> = match column_names {
-                    Some(names) => names.iter()
-                        .filter(|&&n| n != "_id")
-                        .filter_map(|&name| schema.get_index(name))
-                        .collect(),
-                    None => (0..schema.column_count()).collect(),
-                };
-                
-                let mut result = HashMap::new();
-                for &col_idx in &col_indices {
-                    let (col_name, _) = &schema.columns[col_idx];
-                    if col_idx < columns.len() {
-                        result.insert(col_name.clone(), columns[col_idx].filter_by_indices(&matching_indices));
+                    
+                    if matching_indices.is_empty() {
+                        return Ok((HashMap::new(), Vec::new()));
                     }
+                    
+                    let col_indices: Vec<usize> = match column_names {
+                        Some(names) => names.iter()
+                            .filter(|&&n| n != "_id")
+                            .filter_map(|&name| schema.get_index(name))
+                            .collect(),
+                        None => (0..schema.column_count()).collect(),
+                    };
+                    
+                    let mut result = HashMap::new();
+                    for &col_idx in &col_indices {
+                        let (col_name, _) = &schema.columns[col_idx];
+                        if col_idx < columns.len() {
+                            result.insert(col_name.clone(), columns[col_idx].filter_by_indices(&matching_indices));
+                        }
+                    }
+                    
+                    return Ok((result, matching_indices));
                 }
                 
-                return Ok((result, matching_indices));
+                // MMAP PATH: scan string filter column from V4 RGs
+                return self.read_columns_filtered_string_mmap(
+                    column_names, filter_column, filter_value, filter_eq,
+                );
             }
         }
         
@@ -4705,6 +5018,93 @@ impl OnDemandStorage {
         Ok((result, matching_indices))
     }
     
+    /// MMAP PATH: string filter directly on V4 RG data via mmap
+    fn read_columns_filtered_string_mmap(
+        &self,
+        column_names: Option<&[&str]>,
+        filter_column: &str,
+        filter_value: &str,
+        filter_eq: bool,
+    ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok((HashMap::new(), Vec::new())),
+        };
+        let schema = &footer.schema;
+        
+        let filter_col_idx = match schema.get_index(filter_column) {
+            Some(idx) => idx,
+            None => return Ok((HashMap::new(), Vec::new())),
+        };
+        
+        // Scan filter column from mmap
+        let (scanned, del_bytes) = self.scan_columns_mmap(&[filter_col_idx], &footer)?;
+        if scanned.is_empty() { return Ok((HashMap::new(), Vec::new())); }
+        
+        let has_deleted = del_bytes.iter().any(|&b| b != 0);
+        let filter_bytes = filter_value.as_bytes();
+        let filter_len = filter_bytes.len();
+        let first_byte = filter_bytes.first().copied();
+        
+        let mut matching_indices: Vec<usize> = Vec::with_capacity(1024);
+        
+        match &scanned[0] {
+            ColumnData::String { offsets, data } => {
+                let count = offsets.len().saturating_sub(1);
+                for i in 0..count {
+                    if has_deleted {
+                        let b = i / 8; let bit = i % 8;
+                        if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { continue; }
+                    }
+                    let start = offsets[i] as usize;
+                    let end = offsets[i + 1] as usize;
+                    let str_len = end - start;
+                    
+                    if str_len != filter_len {
+                        if !filter_eq { matching_indices.push(i); }
+                        continue;
+                    }
+                    if let Some(fb) = first_byte {
+                        if start < data.len() && data[start] != fb {
+                            if !filter_eq { matching_indices.push(i); }
+                            continue;
+                        }
+                    }
+                    let matches = end <= data.len() && &data[start..end] == filter_bytes;
+                    if (filter_eq && matches) || (!filter_eq && !matches) {
+                        matching_indices.push(i);
+                    }
+                }
+            }
+            _ => return Ok((HashMap::new(), Vec::new())),
+        }
+        
+        if matching_indices.is_empty() {
+            return Ok((HashMap::new(), Vec::new()));
+        }
+        
+        // Now scan the result columns for matching rows
+        let col_indices: Vec<usize> = match column_names {
+            Some(names) => names.iter()
+                .filter(|&&n| n != "_id")
+                .filter_map(|&name| schema.get_index(name))
+                .collect(),
+            None => (0..schema.column_count()).collect(),
+        };
+        
+        let (all_cols, _) = self.scan_columns_mmap(&col_indices, &footer)?;
+        
+        let mut result = HashMap::new();
+        for (out_idx, &col_idx) in col_indices.iter().enumerate() {
+            let (col_name, _) = &schema.columns[col_idx];
+            if out_idx < all_cols.len() {
+                result.insert(col_name.clone(), all_cols[out_idx].filter_by_indices(&matching_indices));
+            }
+        }
+        
+        Ok((result, matching_indices))
+    }
+
     /// Read columns with STRING predicate pushdown and early termination for LIMIT
     /// Stops scanning once we have enough matching rows - much faster for LIMIT queries
     pub fn read_columns_filtered_string_with_limit(
@@ -4722,7 +5122,23 @@ impl OnDemandStorage {
             if header.footer_offset > 0 {
                 drop(header);
                 if !self.has_v4_in_memory_data() {
-                    return Ok((HashMap::new(), Vec::new()));
+                    // MMAP PATH: delegate to non-limit mmap scan, then apply offset+limit
+                    let (mut result, mut indices) = self.read_columns_filtered_string_mmap(
+                        column_names, filter_column, filter_value, filter_eq,
+                    )?;
+                    if indices.len() > offset {
+                        let end = (offset + limit).min(indices.len());
+                        let sliced_indices: Vec<usize> = indices[offset..end].to_vec();
+                        // Re-filter result columns to only keep the offset+limit slice
+                        let keep: Vec<usize> = (offset..end).collect();
+                        for (_name, col) in result.iter_mut() {
+                            *col = col.filter_by_indices(&keep);
+                        }
+                        indices = sliced_indices;
+                    } else {
+                        return Ok((HashMap::new(), Vec::new()));
+                    }
+                    return Ok((result, indices));
                 }
                 
                 let schema = self.schema.read();
@@ -4975,7 +5391,33 @@ impl OnDemandStorage {
             if header.footer_offset > 0 {
                 drop(header);
                 if !self.has_v4_in_memory_data() {
-                    return Ok((HashMap::new(), Vec::new()));
+                    // MMAP PATH: use BETWEEN as >= low AND <= high
+                    let (mut result, mut indices) = self.read_columns_filtered_mmap(
+                        column_names, filter_column, ">=", low,
+                    )?;
+                    // Apply <= high filter
+                    indices.retain(|&i| {
+                        for col in result.values() {
+                            match col {
+                                ColumnData::Int64(v) => { if i < v.len() && v[i] > high as i64 { return false; } }
+                                ColumnData::Float64(v) => { if i < v.len() && v[i] > high { return false; } }
+                                _ => {}
+                            }
+                        }
+                        true
+                    });
+                    // Apply offset+limit
+                    if indices.len() > offset {
+                        let end = (offset + limit).min(indices.len());
+                        let keep: Vec<usize> = (offset..end).collect();
+                        for (_name, col) in result.iter_mut() {
+                            *col = col.filter_by_indices(&keep);
+                        }
+                        indices = indices[offset..end].to_vec();
+                    } else {
+                        return Ok((HashMap::new(), Vec::new()));
+                    }
+                    return Ok((result, indices));
                 }
                 
                 let schema = self.schema.read();
@@ -5191,7 +5633,15 @@ impl OnDemandStorage {
             let header = self.header.read();
             if header.footer_offset > 0 {
                 drop(header);
-                if !self.has_v4_in_memory_data() { return Ok((HashMap::new(), Vec::new())); }
+                if !self.has_v4_in_memory_data() {
+                    // MMAP PATH: scan string + numeric filter columns, then apply limit
+                    let (result, indices) = self.read_columns_filtered_string_mmap(
+                        column_names, string_column, string_value, true,
+                    )?;
+                    // TODO: apply numeric filter + offset/limit on top
+                    // For now return the string-filtered result (numeric filter applied by caller)
+                    return Ok((result, indices));
+                }
                 
                 let schema = self.schema.read();
                 let columns = self.columns.read();
@@ -6056,7 +6506,8 @@ impl OnDemandStorage {
     }
 
     /// Ensure IDs are loaded into memory (lazy loading optimization)
-    /// This is called on-demand when IDs are actually needed
+    /// This is called on-demand when IDs are actually needed.
+    /// For V4: loads IDs from Row Groups via mmap (lightweight — only IDs, not column data).
     fn ensure_ids_loaded(&self) -> io::Result<()> {
         // Quick check without write lock
         if !self.ids.read().is_empty() {
@@ -6070,9 +6521,10 @@ impl OnDemandStorage {
             return Ok(());
         }
         
-        // V4: IDs are read via mmap on demand, no bulk loading needed
         if header.footer_offset > 0 {
-            return Ok(());
+            // V4: Load IDs from Row Groups via mmap (no column data loaded)
+            drop(header);
+            return self.ensure_ids_loaded_v4();
         }
         
         let file_guard = self.file.read();
@@ -6099,6 +6551,191 @@ impl OnDemandStorage {
         }
         
         Ok(())
+    }
+
+    /// V4-specific: Load IDs + deletion vector from Row Groups via mmap.
+    /// This is lightweight — only reads IDs and deletion bitmaps, NOT column data.
+    /// Enables delete/exists/id_index operations without loading full table into memory.
+    fn ensure_ids_loaded_v4(&self) -> io::Result<()> {
+        // Double-check under write lock
+        let mut ids = self.ids.write();
+        if !ids.is_empty() {
+            return Ok(());
+        }
+
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for V4 ID load"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        let total_active: usize = footer.row_groups.iter()
+            .map(|rg| rg.row_count as usize)
+            .sum();
+        ids.reserve(total_active);
+        let mut deleted_acc: Vec<u8> = Vec::new();
+        let mut max_id: u64 = 0;
+
+        for rg_meta in &footer.row_groups {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 { continue; }
+
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return Err(err_data("RG extends past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+            let mut pos: usize = 32; // skip RG header
+
+            // Read IDs
+            let id_byte_len = rg_rows * 8;
+            if pos + id_byte_len > rg_bytes.len() {
+                return Err(err_data("RG IDs truncated"));
+            }
+            let id_slice = &rg_bytes[pos..pos + id_byte_len];
+            pos += id_byte_len;
+
+            for i in 0..rg_rows {
+                let id = u64::from_le_bytes(
+                    id_slice[i * 8..(i + 1) * 8].try_into().unwrap()
+                );
+                ids.push(id);
+                if id > max_id { max_id = id; }
+            }
+
+            // Read deletion vector
+            let del_vec_len = (rg_rows + 7) / 8;
+            if pos + del_vec_len > rg_bytes.len() {
+                return Err(err_data("RG deletion vector truncated"));
+            }
+            deleted_acc.extend_from_slice(&rg_bytes[pos..pos + del_vec_len]);
+        }
+
+        drop(mmap_guard);
+        drop(file_guard);
+
+        // Update deletion bitmap
+        {
+            let mut deleted = self.deleted.write();
+            if deleted.is_empty() && !deleted_acc.is_empty() {
+                *deleted = deleted_acc;
+            }
+        }
+
+        // Update next_id
+        let current_next = self.next_id.load(Ordering::SeqCst);
+        if max_id + 1 > current_next {
+            self.next_id.store(max_id + 1, Ordering::SeqCst);
+        }
+
+        Ok(())
+    }
+
+    /// Scan specific columns from V4 Row Groups via mmap WITHOUT loading all data.
+    /// Returns (Vec<ColumnData>, deletion_bitmap, Vec<null_bitmap_per_output_col>).
+    /// This is the core building block for mmap-based fast paths (agg, filter, GROUP BY).
+    fn scan_columns_mmap(
+        &self,
+        col_indices: &[usize],
+        footer: &V4Footer,
+    ) -> io::Result<(Vec<ColumnData>, Vec<u8>)> {
+        let (cols, del, _nulls) = self.scan_columns_mmap_with_nulls(col_indices, footer)?;
+        Ok((cols, del))
+    }
+
+    /// Same as scan_columns_mmap but also returns per-column null bitmaps.
+    fn scan_columns_mmap_with_nulls(
+        &self,
+        col_indices: &[usize],
+        footer: &V4Footer,
+    ) -> io::Result<(Vec<ColumnData>, Vec<u8>, Vec<Vec<u8>>)> {
+        let schema = &footer.schema;
+        let col_count = schema.column_count();
+
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for mmap scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        // Build output accumulators
+        let mut col_accumulators: Vec<ColumnData> = col_indices.iter()
+            .map(|&ci| {
+                let ct = schema.columns[ci].1;
+                let acc_type = if ct == ColumnType::StringDict { ColumnType::String } else { ct };
+                ColumnData::new(acc_type)
+            })
+            .collect();
+        let mut all_del_bytes: Vec<u8> = Vec::new();
+        let mut col_null_bitmaps: Vec<Vec<u8>> = col_indices.iter().map(|_| Vec::new()).collect();
+
+        let col_idx_to_out: HashMap<usize, usize> = col_indices.iter()
+            .enumerate()
+            .map(|(out_pos, &col_idx)| (col_idx, out_pos))
+            .collect();
+
+        for rg_meta in &footer.row_groups {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 { continue; }
+
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return Err(err_data("RG extends past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+            let mut pos: usize = 32; // skip RG header
+
+            // Skip IDs
+            pos += rg_rows * 8;
+
+            // Read deletion vector
+            let del_vec_len = (rg_rows + 7) / 8;
+            if pos + del_vec_len > rg_bytes.len() {
+                return Err(err_data("RG deletion vector truncated"));
+            }
+            all_del_bytes.extend_from_slice(&rg_bytes[pos..pos + del_vec_len]);
+            pos += del_vec_len;
+
+            // Parse columns — read requested, skip others
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            for col_idx in 0..col_count {
+                if pos + null_bitmap_len > rg_bytes.len() { break; }
+                let null_bytes = &rg_bytes[pos..pos + null_bitmap_len];
+                pos += null_bitmap_len;
+
+                let col_type = schema.columns[col_idx].1;
+
+                if let Some(&out_pos) = col_idx_to_out.get(&col_idx) {
+                    // Accumulate null bitmap for this column
+                    col_null_bitmaps[out_pos].extend_from_slice(null_bytes);
+
+                    let (col_data, consumed) = ColumnData::from_bytes_typed(
+                        &rg_bytes[pos..], col_type,
+                    )?;
+                    pos += consumed;
+
+                    // Decode StringDict → String
+                    let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                        col_data.decode_string_dict()
+                    } else {
+                        col_data
+                    };
+                    col_accumulators[out_pos].append(&col_data);
+                } else {
+                    let consumed = ColumnData::skip_bytes_typed(
+                        &rg_bytes[pos..], col_type,
+                    )?;
+                    pos += consumed;
+                }
+            }
+        }
+
+        Ok((col_accumulators, all_del_bytes, col_null_bitmaps))
     }
 
     /// Read IDs for a row range (lazy loads IDs if not already loaded)
@@ -7764,14 +8401,13 @@ impl OnDemandStorage {
         }
     }
 
-    /// OPTIMIZED: Read a single row by ID using O(1) index lookup
-    /// Returns HashMap of column_name -> ColumnData (single element)
-    /// Much faster than WHERE _id = X which scans all data
+    /// OPTIMIZED: Read a single row by ID using O(1) index lookup.
+    /// Returns HashMap of column_name -> ColumnData (single element).
+    /// Supports both in-memory and mmap-only paths.
     pub fn read_row_by_id(&self, id: u64, column_names: Option<&[&str]>) -> io::Result<Option<HashMap<String, ColumnData>>> {
         let is_v4 = self.is_v4_format();
-        if is_v4 && !self.has_v4_in_memory_data() { return Ok(None); }
         
-        // O(1) lookup using id_to_idx index
+        // O(1) lookup using id_to_idx index (works for both in-memory and mmap-loaded IDs)
         let row_idx = match self.get_row_idx(id) {
             Some(idx) => idx,
             None => return Ok(None),
@@ -7810,9 +8446,26 @@ impl OnDemandStorage {
             result.insert("_id".to_string(), ColumnData::Int64(vec![id as i64]));
         }
         
-        for (col_idx, col_name, col_type) in cols_to_read {
-            let col_data = self.read_column_scattered_auto(col_idx, col_type, &indices, total_rows, is_v4)?;
-            result.insert(col_name, col_data);
+        if is_v4 && !self.has_v4_in_memory_data() {
+            // MMAP PATH: scan needed columns from RGs with null bitmaps, extract single row
+            let col_indices: Vec<usize> = cols_to_read.iter().map(|(idx, _, _)| *idx).collect();
+            if let Some(footer) = self.get_or_load_footer()? {
+                let (scanned, _del, col_nulls) = self.scan_columns_mmap_with_nulls(&col_indices, &footer)?;
+                for (out_pos, (_, col_name, _)) in cols_to_read.iter().enumerate() {
+                    if out_pos < scanned.len() {
+                        let mut col = scanned[out_pos].clone();
+                        if out_pos < col_nulls.len() && !col_nulls[out_pos].is_empty() {
+                            col.apply_null_bitmap(&col_nulls[out_pos]);
+                        }
+                        result.insert(col_name.clone(), col.filter_by_indices(&indices));
+                    }
+                }
+            }
+        } else {
+            for (col_idx, col_name, col_type) in cols_to_read {
+                let col_data = self.read_column_scattered_auto(col_idx, col_type, &indices, total_rows, is_v4)?;
+                result.insert(col_name, col_data);
+            }
         }
         
         Ok(Some(result))
@@ -7824,7 +8477,56 @@ impl OnDemandStorage {
         use crate::data::Value;
         
         let is_v4 = self.is_v4_format();
-        if !is_v4 || !self.has_v4_in_memory_data() { return Ok(None); }
+        if !is_v4 { return Ok(None); }
+        if !self.has_v4_in_memory_data() {
+            // MMAP PATH: delegate to read_row_by_id and convert to Value
+            // Also check null mask to properly return Value::Null
+            let row_idx = match self.get_row_idx(id) {
+                Some(idx) => idx,
+                None => return Ok(None),
+            };
+            if let Some(row_map) = self.read_row_by_id(id, None)? {
+                let mut result = Vec::with_capacity(row_map.len());
+                for (col_name, col_data) in row_map {
+                    // Check null bitmap for this column at this row
+                    let is_null = if col_name != "_id" {
+                        let mask = self.get_null_mask(&col_name, row_idx, 1);
+                        !mask.is_empty() && mask[0]
+                    } else {
+                        false
+                    };
+                    let val = if is_null {
+                        Value::Null
+                    } else {
+                        match &col_data {
+                            ColumnData::Int64(v) => if !v.is_empty() { Value::Int64(v[0]) } else { Value::Null },
+                            ColumnData::Float64(v) => if !v.is_empty() { Value::Float64(v[0]) } else { Value::Null },
+                            ColumnData::String { offsets, data } => {
+                                if offsets.len() > 1 {
+                                    let s = offsets[0] as usize;
+                                    let e = offsets[1] as usize;
+                                    Value::String(std::str::from_utf8(&data[s..e]).unwrap_or("").to_string())
+                                } else { Value::Null }
+                            }
+                            ColumnData::Bool { data, len } => {
+                                if *len > 0 { Value::Bool((data[0] & 1) != 0) } else { Value::Null }
+                            }
+                            ColumnData::Binary { offsets, data } => {
+                                if offsets.len() > 1 {
+                                    let s = offsets[0] as usize;
+                                    let e = offsets[1] as usize;
+                                    Value::Binary(data[s..e].to_vec())
+                                } else { Value::Null }
+                            }
+                            _ => Value::Null,
+                        }
+                    };
+                    result.push((col_name, val));
+                }
+                return Ok(Some(result));
+            }
+            return Ok(None);
+        }
         
         let row_idx = match self.get_row_idx(id) {
             Some(idx) => idx,
@@ -8017,7 +8719,16 @@ impl OnDemandStorage {
         }
         
         let is_v4 = self.is_v4_format();
-        if is_v4 && !self.has_v4_in_memory_data() { return Ok(Vec::new()); }
+        if is_v4 && !self.has_v4_in_memory_data() {
+            // MMAP PATH: delegate to read_row_by_id per ID
+            let mut results = Vec::with_capacity(ids.len());
+            for &id in ids {
+                if let Some(row) = self.read_row_by_id(id, column_names)? {
+                    results.push((id, row));
+                }
+            }
+            return Ok(results);
+        }
         
         // Build id_to_idx if needed
         self.ensure_id_index();
@@ -8847,6 +9558,8 @@ impl OnDemandStorage {
         self.active_count.store(active_count as u64, Ordering::SeqCst);
         // save_v4 physically removes deleted rows; persisted = active
         self.persisted_row_count.store(active_count as u64, Ordering::SeqCst);
+        // Mark base as loaded — all data is now in memory after full rewrite
+        self.v4_base_loaded.store(true, Ordering::SeqCst);
         let candidate = max_active_id + 1;
         let current = self.next_id.load(Ordering::SeqCst);
         if candidate > current {
@@ -9427,9 +10140,8 @@ impl OnDemandStorage {
         Ok(())
     }
     
-    /// Execute simple aggregation (no GROUP BY, no WHERE) directly on V4 columns
-    /// Uses zero-copy Arrow SIMD: creates Arrow arrays pointing to V4 memory (no clone),
-    /// runs Arrow compute sum/min/max with SIMD, drops arrays before lock guards.
+    /// Execute simple aggregation (no GROUP BY, no WHERE) directly on V4 columns.
+    /// Supports both in-memory and mmap-only paths.
     /// Returns (count, sum, min, max, is_int) for each requested column
     pub fn execute_simple_agg(
         &self,
@@ -9442,8 +10154,12 @@ impl OnDemandStorage {
         
         // Check if in-memory data is available for fast path
         let columns = self.columns.read();
-        if columns.is_empty() || columns.iter().all(|c| c.len() == 0) {
-            return Ok(None);
+        let has_in_memory = !columns.is_empty() && columns.iter().any(|c| c.len() > 0);
+        
+        if !has_in_memory {
+            drop(columns);
+            // MMAP PATH: scan columns from disk without loading into memory
+            return self.execute_simple_agg_mmap(agg_cols);
         }
         
         let schema = self.schema.read();
@@ -9471,14 +10187,12 @@ impl OnDemandStorage {
             
             match &columns[col_idx] {
                 ColumnData::Int64(vals) => {
-                    // Zero-copy Arrow: create Buffer pointing to V4 memory (no clone!)
-                    // SAFETY: lock guards outlive the Arrow arrays in this scope
                     let byte_len = vals.len() * std::mem::size_of::<i64>();
                     let buffer = unsafe {
                         Buffer::from_custom_allocation(
                             std::ptr::NonNull::new_unchecked(vals.as_ptr() as *mut u8),
                             byte_len,
-                            Arc::new(()), // no-op deallocator - V4 Vec owns the memory
+                            Arc::new(()),
                         )
                     };
                     let arr = PrimitiveArray::<Int64Type>::new(
@@ -9487,7 +10201,6 @@ impl OnDemandStorage {
                     let sum = arrow::compute::sum(&arr).unwrap_or(0);
                     let min_v = arrow::compute::min(&arr).unwrap_or(i64::MAX);
                     let max_v = arrow::compute::max(&arr).unwrap_or(i64::MIN);
-                    // Drop Arrow array before lock guards
                     drop(arr);
                     results.push((vals.len() as i64, sum as f64, min_v as f64, max_v as f64, true));
                 }
@@ -9516,29 +10229,171 @@ impl OnDemandStorage {
         Ok(Some(results))
     }
 
+    /// MMAP PATH: Execute simple aggregation by scanning V4 RGs via mmap
+    fn execute_simple_agg_mmap(
+        &self,
+        agg_cols: &[&str],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+
+        let schema = &footer.schema;
+        // Resolve which columns need scanning (skip * and 1)
+        let col_indices: Vec<usize> = agg_cols.iter()
+            .filter(|&&n| n != "*" && n != "1")
+            .filter_map(|&n| schema.get_index(n))
+            .collect();
+
+        // Count active rows from footer metadata (O(1), no scan needed)
+        let total_active: i64 = footer.row_groups.iter()
+            .map(|rg| rg.active_rows() as i64)
+            .sum();
+
+        if col_indices.is_empty() {
+            // COUNT(*) only — no column scan needed
+            return Ok(Some(agg_cols.iter().map(|_| (total_active, 0.0, 0.0, 0.0, false)).collect()));
+        }
+
+        let (scanned_cols, del_bytes) = self.scan_columns_mmap(&col_indices, &footer)?;
+        let has_deleted = del_bytes.iter().any(|&b| b != 0);
+
+        // Build results
+        let mut results: Vec<(i64, f64, f64, f64, bool)> = Vec::with_capacity(agg_cols.len());
+        let mut scan_idx = 0usize;
+        for &col_name in agg_cols {
+            if col_name == "*" || col_name == "1" {
+                results.push((total_active, 0.0, 0.0, 0.0, false));
+                continue;
+            }
+            if scan_idx >= scanned_cols.len() {
+                results.push((0, 0.0, 0.0, 0.0, false));
+                continue;
+            }
+            let col = &scanned_cols[scan_idx];
+            scan_idx += 1;
+            match col {
+                ColumnData::Int64(vals) => {
+                    if has_deleted {
+                        let mut count = 0i64; let mut sum = 0i64;
+                        let mut min_v = i64::MAX; let mut max_v = i64::MIN;
+                        for (i, &v) in vals.iter().enumerate() {
+                            let b = i / 8; let bit = i % 8;
+                            if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { continue; }
+                            count += 1; sum += v;
+                            if v < min_v { min_v = v; }
+                            if v > max_v { max_v = v; }
+                        }
+                        results.push((count, sum as f64, min_v as f64, max_v as f64, true));
+                    } else {
+                        let n = vals.len() as i64;
+                        let sum: i64 = vals.iter().sum();
+                        let min_v = vals.iter().copied().min().unwrap_or(i64::MAX);
+                        let max_v = vals.iter().copied().max().unwrap_or(i64::MIN);
+                        results.push((n, sum as f64, min_v as f64, max_v as f64, true));
+                    }
+                }
+                ColumnData::Float64(vals) => {
+                    if has_deleted {
+                        let mut count = 0i64; let mut sum = 0.0f64;
+                        let mut min_v = f64::INFINITY; let mut max_v = f64::NEG_INFINITY;
+                        for (i, &v) in vals.iter().enumerate() {
+                            let b = i / 8; let bit = i % 8;
+                            if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { continue; }
+                            count += 1; sum += v;
+                            if v < min_v { min_v = v; }
+                            if v > max_v { max_v = v; }
+                        }
+                        results.push((count, sum, min_v, max_v, false));
+                    } else {
+                        let n = vals.len() as i64;
+                        let sum: f64 = vals.iter().sum();
+                        let min_v = vals.iter().copied().fold(f64::INFINITY, f64::min);
+                        let max_v = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        results.push((n, sum, min_v, max_v, false));
+                    }
+                }
+                _ => { results.push((total_active, 0.0, 0.0, 0.0, false)); }
+            }
+        }
+        Ok(Some(results))
+    }
+
     /// Build cached string dictionary indices for a column (row→group_id mapping)
-    /// Returns (dict_strings, group_ids) where group_ids[row] = index into dict_strings
+    /// Returns (dict_strings, group_ids) where group_ids[row] = index into dict_strings.
+    /// Supports both in-memory and mmap-only paths.
     pub fn build_string_dict_cache(
         &self,
         col_name: &str,
     ) -> io::Result<Option<(Vec<String>, Vec<u16>)>> {
-        if !self.has_v4_in_memory_data() { return Ok(None); }
+        if self.has_v4_in_memory_data() {
+            // In-memory fast path
+            let schema = self.schema.read();
+            let columns = self.columns.read();
+            let total_rows = self.ids.read().len();
+            
+            let col_idx = match schema.get_index(col_name) {
+                Some(idx) => idx,
+                None => return Ok(None),
+            };
+            if col_idx >= columns.len() { return Ok(None); }
+            
+            let (offsets, data) = match &columns[col_idx] {
+                ColumnData::String { offsets, data } => (offsets, data),
+                _ => return Ok(None),
+            };
+            let count = offsets.len().saturating_sub(1).min(total_rows);
+            
+            let mut dict_map: ahash::AHashMap<&[u8], u16> = ahash::AHashMap::with_capacity(64);
+            let mut dict_strings: Vec<String> = Vec::with_capacity(64);
+            let mut group_ids: Vec<u16> = Vec::with_capacity(count);
+            
+            for i in 0..count {
+                let s = offsets[i] as usize;
+                let e = offsets[i + 1] as usize;
+                let key = &data[s..e];
+                let gid = match dict_map.get(key) {
+                    Some(&id) => id,
+                    None => {
+                        let id = dict_strings.len() as u16;
+                        dict_map.insert(key, id);
+                        dict_strings.push(std::str::from_utf8(key).unwrap_or("").to_string());
+                        id
+                    }
+                };
+                group_ids.push(gid);
+            }
+            
+            return Ok(Some((dict_strings, group_ids)));
+        }
         
-        let schema = self.schema.read();
-        let columns = self.columns.read();
-        let total_rows = self.ids.read().len();
-        
-        let col_idx = match schema.get_index(col_name) {
+        // MMAP PATH: scan string column from V4 RGs
+        self.build_string_dict_cache_mmap(col_name)
+    }
+    
+    /// MMAP PATH: build string dict cache by scanning V4 RGs
+    fn build_string_dict_cache_mmap(
+        &self,
+        col_name: &str,
+    ) -> io::Result<Option<(Vec<String>, Vec<u16>)>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let col_idx = match footer.schema.get_index(col_name) {
             Some(idx) => idx,
             None => return Ok(None),
         };
-        if col_idx >= columns.len() { return Ok(None); }
         
-        let (offsets, data) = match &columns[col_idx] {
+        let (scanned_cols, _del_bytes) = self.scan_columns_mmap(&[col_idx], &footer)?;
+        if scanned_cols.is_empty() { return Ok(None); }
+        
+        let (offsets, data) = match &scanned_cols[0] {
             ColumnData::String { offsets, data } => (offsets, data),
             _ => return Ok(None),
         };
-        let count = offsets.len().saturating_sub(1).min(total_rows);
+        let count = offsets.len().saturating_sub(1);
         
         let mut dict_map: ahash::AHashMap<&[u8], u16> = ahash::AHashMap::with_capacity(64);
         let mut dict_strings: Vec<String> = Vec::with_capacity(64);
@@ -9563,15 +10418,18 @@ impl OnDemandStorage {
         Ok(Some((dict_strings, group_ids)))
     }
 
-    /// Execute GROUP BY + aggregate using pre-built dict cache
-    /// Much faster than building dictionary on every query
+    /// Execute GROUP BY + aggregate using pre-built dict cache.
+    /// Supports both in-memory and mmap-only paths.
     pub fn execute_group_agg_cached(
         &self,
         dict_strings: &[String],
         group_ids: &[u16],
         agg_cols: &[(&str, bool)], // (col_name, is_count_star)
     ) -> io::Result<Option<Vec<(String, Vec<(f64, i64)>)>>> {
-        if !self.has_v4_in_memory_data() { return Ok(None); }
+        if !self.has_v4_in_memory_data() {
+            // MMAP PATH: scan agg columns from disk, then aggregate with pre-built dict
+            return self.execute_group_agg_cached_mmap(dict_strings, group_ids, agg_cols);
+        }
         
         let schema = self.schema.read();
         let columns = self.columns.read();
@@ -9642,7 +10500,82 @@ impl OnDemandStorage {
         Ok(Some(results))
     }
 
-    /// Execute BETWEEN + GROUP BY using pre-built dict cache
+    /// MMAP PATH: execute GROUP BY + aggregate using pre-built dict cache, scanning agg columns from disk.
+    fn execute_group_agg_cached_mmap(
+        &self,
+        dict_strings: &[String],
+        group_ids: &[u16],
+        agg_cols: &[(&str, bool)],
+    ) -> io::Result<Option<Vec<(String, Vec<(f64, i64)>)>>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        
+        // Resolve agg column indices (skip count-star which doesn't need a column)
+        let agg_col_indices: Vec<Option<usize>> = agg_cols.iter()
+            .map(|(name, is_count)| if *is_count { None } else { schema.get_index(name) })
+            .collect();
+        let needed: Vec<usize> = agg_col_indices.iter().filter_map(|&x| x).collect();
+        
+        let (scanned, del_bytes) = if needed.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            self.scan_columns_mmap(&needed, &footer)?
+        };
+        let has_deleted = del_bytes.iter().any(|&b| b != 0);
+        
+        // Map needed index → scanned position
+        let needed_to_pos: HashMap<usize, usize> = needed.iter().enumerate()
+            .map(|(pos, &idx)| (idx, pos))
+            .collect();
+        
+        let num_groups = dict_strings.len();
+        let num_aggs = agg_cols.len();
+        let scan_rows = group_ids.len();
+        let flat_len = num_groups * num_aggs;
+        let mut flat_sums = vec![0.0f64; flat_len];
+        let mut flat_counts = vec![0i64; flat_len];
+        
+        for i in 0..scan_rows {
+            if has_deleted {
+                let b = i / 8; let bit = i % 8;
+                if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { continue; }
+            }
+            let base = group_ids[i] as usize * num_aggs;
+            if base + num_aggs > flat_len { continue; }
+            for (ai, opt_idx) in agg_col_indices.iter().enumerate() {
+                flat_counts[base + ai] += 1;
+                if let Some(&col_idx) = opt_idx.as_ref() {
+                    if let Some(&pos) = needed_to_pos.get(&col_idx) {
+                        if pos < scanned.len() {
+                            match &scanned[pos] {
+                                ColumnData::Int64(v) => { if i < v.len() { flat_sums[base + ai] += v[i] as f64; } }
+                                ColumnData::Float64(v) => { if i < v.len() { flat_sums[base + ai] += v[i]; } }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        let results: Vec<(String, Vec<(f64, i64)>)> = (0..num_groups)
+            .filter(|&gid| flat_counts[gid * num_aggs] > 0)
+            .map(|gid| {
+                let aggs: Vec<(f64, i64)> = (0..num_aggs)
+                    .map(|ai| (flat_sums[gid * num_aggs + ai], flat_counts[gid * num_aggs + ai]))
+                    .collect();
+                (dict_strings[gid].clone(), aggs)
+            })
+            .collect();
+        
+        Ok(Some(results))
+    }
+
+    /// Execute BETWEEN + GROUP BY using pre-built dict cache.
+    /// Supports both in-memory and mmap-only paths.
     pub fn execute_between_group_agg_cached(
         &self,
         filter_col: &str,
@@ -9652,7 +10585,10 @@ impl OnDemandStorage {
         group_ids: &[u16],
         agg_col: Option<&str>,
     ) -> io::Result<Option<Vec<(String, f64, i64)>>> {
-        if !self.has_v4_in_memory_data() { return Ok(None); }
+        if !self.has_v4_in_memory_data() {
+            // MMAP PATH: scan filter+agg columns from disk
+            return self.execute_between_group_agg_cached_mmap(filter_col, lo, hi, dict_strings, group_ids, agg_col);
+        }
         
         let schema = self.schema.read();
         let columns = self.columns.read();
@@ -9778,9 +10714,90 @@ impl OnDemandStorage {
         Ok(Some(results))
     }
 
-    /// Execute BETWEEN + GROUP BY + aggregate directly on V4 in-memory columns
-    /// Returns Vec<(group_key, sum, count)> for the caller to compute final values
-    /// Uses pre-built row→group_id mapping for O(1) group lookup during aggregation
+    /// MMAP PATH: execute BETWEEN + GROUP BY using pre-built dict cache, scanning filter+agg from disk.
+    fn execute_between_group_agg_cached_mmap(
+        &self,
+        filter_col: &str,
+        lo: f64,
+        hi: f64,
+        dict_strings: &[String],
+        group_ids: &[u16],
+        agg_col: Option<&str>,
+    ) -> io::Result<Option<Vec<(String, f64, i64)>>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        
+        let filter_idx = match schema.get_index(filter_col) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let agg_idx = agg_col.and_then(|ac| schema.get_index(ac));
+        
+        let mut needed: Vec<usize> = vec![filter_idx];
+        if let Some(ai) = agg_idx {
+            if ai != filter_idx { needed.push(ai); }
+        }
+        
+        let (scanned, del_bytes) = self.scan_columns_mmap(&needed, &footer)?;
+        let has_deleted = del_bytes.iter().any(|&b| b != 0);
+        
+        let filter_col_data = &scanned[0];
+        let agg_col_data = agg_idx.map(|ai| {
+            if ai == filter_idx { &scanned[0] } else { &scanned[1] }
+        });
+        
+        let num_groups = dict_strings.len();
+        let scan_rows = group_ids.len();
+        let mut group_sums = vec![0.0f64; num_groups];
+        let mut group_counts = vec![0i64; num_groups];
+        let lo_i64 = lo as i64;
+        let hi_i64 = hi as i64;
+        
+        macro_rules! between_mmap {
+            ($fvals:expr, $lo_c:expr, $hi_c:expr) => {
+                let limit = scan_rows.min($fvals.len()).min(group_ids.len());
+                for i in 0..limit {
+                    if has_deleted {
+                        let b = i / 8; let bit = i % 8;
+                        if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { continue; }
+                    }
+                    let fv = $fvals[i];
+                    if fv >= $lo_c && fv <= $hi_c {
+                        let gid = group_ids[i] as usize;
+                        if gid < num_groups {
+                            group_counts[gid] += 1;
+                            if let Some(acd) = agg_col_data {
+                                match acd {
+                                    ColumnData::Int64(v) => { if i < v.len() { group_sums[gid] += v[i] as f64; } }
+                                    ColumnData::Float64(v) => { if i < v.len() { group_sums[gid] += v[i]; } }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+        }
+        
+        match filter_col_data {
+            ColumnData::Int64(vals) => { between_mmap!(vals, lo_i64, hi_i64); }
+            ColumnData::Float64(vals) => { between_mmap!(vals, lo, hi); }
+            _ => return Ok(None),
+        }
+        
+        let results: Vec<(String, f64, i64)> = (0..num_groups)
+            .filter(|&gid| group_counts[gid] > 0)
+            .map(|gid| (dict_strings[gid].clone(), group_sums[gid], group_counts[gid]))
+            .collect();
+        
+        Ok(Some(results))
+    }
+
+    /// Execute BETWEEN + GROUP BY + aggregate directly on V4 columns.
+    /// Supports both in-memory and mmap-only paths.
     pub fn execute_between_group_agg(
         &self,
         filter_col: &str,
@@ -9789,7 +10806,13 @@ impl OnDemandStorage {
         group_col: &str,
         agg_col: Option<&str>,
     ) -> io::Result<Option<Vec<(String, f64, i64)>>> {
-        if !self.has_v4_in_memory_data() { return Ok(None); }
+        if !self.has_v4_in_memory_data() {
+            // MMAP PATH: build dict + scan filter+agg from disk
+            if let Some((dict_strings, group_ids)) = self.build_string_dict_cache(group_col)? {
+                return self.execute_between_group_agg_cached_mmap(filter_col, lo, hi, &dict_strings, &group_ids, agg_col);
+            }
+            return Ok(None);
+        }
         
         let schema = self.schema.read();
         let columns = self.columns.read();
@@ -9936,14 +10959,20 @@ impl OnDemandStorage {
         Ok(Some(results))
     }
 
-    /// Execute GROUP BY + aggregate directly on V4 in-memory columns (no WHERE filter)
-    /// Returns Vec<(group_key, Vec<(sum, count)>)> for each aggregate column
+    /// Execute GROUP BY + aggregate directly on V4 columns (no WHERE filter).
+    /// Supports both in-memory and mmap-only paths.
     pub fn execute_group_agg(
         &self,
         group_col: &str,
         agg_cols: &[(&str, bool)],
     ) -> io::Result<Option<Vec<(String, Vec<(f64, i64)>)>>> {
-        if !self.has_v4_in_memory_data() { return Ok(None); }
+        if !self.has_v4_in_memory_data() {
+            // MMAP PATH: build dict cache from disk, then aggregate
+            if let Some((dict_strings, group_ids)) = self.build_string_dict_cache(group_col)? {
+                return self.execute_group_agg_cached_mmap(&dict_strings, &group_ids, agg_cols);
+            }
+            return Ok(None);
+        }
         
         let schema = self.schema.read();
         let columns = self.columns.read();
