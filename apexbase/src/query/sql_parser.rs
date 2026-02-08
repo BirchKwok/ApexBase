@@ -22,6 +22,8 @@ pub enum ColumnConstraintKind {
     PrimaryKey,
     Unique,
     Default(Value),
+    Check(String),
+    ForeignKey { ref_table: String, ref_column: String },
 }
 
 /// Column definition for CREATE TABLE
@@ -57,16 +59,24 @@ pub enum SqlStatement {
     DropIndex { name: String, table: String, if_exists: bool },
     // DML Statements
     Insert { table: String, columns: Option<Vec<String>>, values: Vec<Vec<Value>> },
+    InsertOnConflict { table: String, columns: Option<Vec<String>>, values: Vec<Vec<Value>>, conflict_columns: Vec<String>, do_update: Option<Vec<(String, SqlExpr)>> },
     InsertSelect { table: String, columns: Option<Vec<String>>, query: Box<SqlStatement> },
+    CreateTableAs { table: String, query: Box<SqlStatement>, if_not_exists: bool },
     Explain { stmt: Box<SqlStatement>, analyze: bool },
     Delete { table: String, where_clause: Option<SqlExpr> },
     Update { table: String, assignments: Vec<(String, SqlExpr)>, where_clause: Option<SqlExpr> },
     // CTE wrapper
-    Cte { name: String, body: Box<SqlStatement>, main: Box<SqlStatement> },
+    Cte { name: String, column_aliases: Vec<String>, body: Box<SqlStatement>, main: Box<SqlStatement>, recursive: bool },
     // Transaction Statements
     BeginTransaction { read_only: bool },
     Commit,
     Rollback,
+    Savepoint { name: String },
+    ReleaseSavepoint { name: String },
+    RollbackToSavepoint { name: String },
+    AnalyzeTable { table: String },
+    CopyToParquet { table: String, file_path: String },
+    CopyFromParquet { table: String, file_path: String },
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +105,9 @@ pub enum FromItem {
 pub enum JoinType {
     Inner,
     Left,
+    Right,
+    Full,
+    Cross,
 }
 
 #[derive(Debug, Clone)]
@@ -510,7 +523,7 @@ enum Token {
     Regexp,
     Over,
     Partition,
-    Join, Left, Right, Full, Inner, Outer, On,
+    Join, Left, Right, Full, Inner, Outer, Cross, On,
     Union, All,
     Exists,
     Cast,
@@ -792,6 +805,7 @@ impl SqlParser {
                     "FULL" => Token::Full,
                     "INNER" => Token::Inner,
                     "OUTER" => Token::Outer,
+                    "CROSS" => Token::Cross,
                     "ON" => Token::On,
                     "UNION" => Token::Union,
                     "ALL" => Token::All,
@@ -1116,20 +1130,34 @@ impl SqlParser {
             Token::With => {
                 // CTE: WITH name AS (SELECT ...) [, name2 AS (SELECT ...)] SELECT ...
                 self.advance();
-                let _recursive = if matches!(self.current(), Token::Recursive) {
+                let recursive = if matches!(self.current(), Token::Recursive) {
                     self.advance();
                     true
                 } else {
                     false
                 };
-                let mut ctes: Vec<(String, SqlStatement)> = Vec::new();
+                let mut ctes: Vec<(String, Vec<String>, SqlStatement)> = Vec::new();
                 loop {
                     let cte_name = self.parse_identifier()?;
+                    // Optional column alias list: cte_name(col1, col2, ...)
+                    let mut col_aliases = Vec::new();
+                    if matches!(self.current(), Token::LParen) {
+                        self.advance();
+                        loop {
+                            col_aliases.push(self.parse_identifier()?);
+                            if matches!(self.current(), Token::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        self.expect(Token::RParen)?;
+                    }
                     self.expect(Token::As)?;
                     self.expect(Token::LParen)?;
                     let cte_stmt = self.parse_statement()?;
                     self.expect(Token::RParen)?;
-                    ctes.push((cte_name, cte_stmt));
+                    ctes.push((cte_name, col_aliases, cte_stmt));
                     if matches!(self.current(), Token::Comma) {
                         self.advance();
                     } else {
@@ -1144,11 +1172,13 @@ impl SqlParser {
                 // We'll use a simple approach: wrap in a new variant or pass through
                 // Since CTE execution is handled in executor, we need a way to carry the CTE definitions.
                 // Add a CTE wrapper approach:
-                for (cte_name, cte_body) in ctes.into_iter().rev() {
+                for (cte_name, col_aliases, cte_body) in ctes.into_iter().rev() {
                     main_stmt = SqlStatement::Cte {
                         name: cte_name,
+                        column_aliases: col_aliases,
                         body: Box::new(cte_body),
                         main: Box::new(main_stmt),
+                        recursive,
                     };
                 }
                 Ok(main_stmt)
@@ -1263,6 +1293,12 @@ impl SqlParser {
                         // Check for IF NOT EXISTS
                         let if_not_exists = self.parse_if_not_exists()?;
                         let table = self.parse_identifier()?;
+                        // CTAS: CREATE TABLE name AS SELECT ...
+                        if matches!(self.current(), Token::As) {
+                            self.advance();
+                            let query = self.parse_statement()?;
+                            return Ok(SqlStatement::CreateTableAs { table, query: Box::new(query), if_not_exists });
+                        }
                         // Column definitions are optional: CREATE TABLE t OR CREATE TABLE t (col INT)
                         let columns = if matches!(self.current(), Token::LParen) {
                             self.advance();
@@ -1368,7 +1404,43 @@ impl SqlParser {
                 } else {
                     self.expect(Token::Values)?;
                     let values = self.parse_values_list()?;
-                    Ok(SqlStatement::Insert { table, columns, values })
+                    // Check for ON CONFLICT clause (UPSERT)
+                    if matches!(self.current(), Token::On) {
+                        self.advance();
+                        // Expect CONFLICT as identifier
+                        let kw = self.parse_identifier()?;
+                        if kw.to_uppercase() != "CONFLICT" {
+                            let (start, _) = self.current_span();
+                            return Err(self.syntax_error(start, "Expected CONFLICT after ON".to_string()));
+                        }
+                        // Parse conflict target: (col1, col2, ...)
+                        self.expect(Token::LParen)?;
+                        let conflict_columns = self.parse_identifier_list()?;
+                        self.expect(Token::RParen)?;
+                        // Expect DO
+                        let do_kw = self.parse_identifier()?;
+                        if do_kw.to_uppercase() != "DO" {
+                            let (start, _) = self.current_span();
+                            return Err(self.syntax_error(start, "Expected DO after conflict target".to_string()));
+                        }
+                        // DO UPDATE SET ... or DO NOTHING
+                        let action_kw = self.parse_identifier()?;
+                        let do_update = match action_kw.to_uppercase().as_str() {
+                            "NOTHING" => None,
+                            "UPDATE" => {
+                                self.expect(Token::Set)?;
+                                let assignments = self.parse_assignments()?;
+                                Some(assignments)
+                            }
+                            _ => {
+                                let (start, _) = self.current_span();
+                                return Err(self.syntax_error(start, "Expected UPDATE or NOTHING after DO".to_string()));
+                            }
+                        };
+                        Ok(SqlStatement::InsertOnConflict { table, columns, values, conflict_columns, do_update })
+                    } else {
+                        Ok(SqlStatement::Insert { table, columns, values })
+                    }
                 }
             }
             Token::Delete => {
@@ -1422,9 +1494,77 @@ impl SqlParser {
             }
             Token::Rollback => {
                 self.advance();
-                Ok(SqlStatement::Rollback)
+                // Check for ROLLBACK TO [SAVEPOINT] name
+                if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "TO") {
+                    self.advance();
+                    // Optional SAVEPOINT keyword
+                    if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "SAVEPOINT") {
+                        self.advance();
+                    }
+                    let name = self.parse_identifier()?;
+                    Ok(SqlStatement::RollbackToSavepoint { name })
+                } else {
+                    Ok(SqlStatement::Rollback)
+                }
             }
             _ => {
+                // Check for SAVEPOINT / RELEASE as identifier-based keywords
+                if let Token::Identifier(ref s) = self.current().clone() {
+                    let upper = s.to_uppercase();
+                    match upper.as_str() {
+                        "SAVEPOINT" => {
+                            self.advance();
+                            let name = self.parse_identifier()?;
+                            return Ok(SqlStatement::Savepoint { name });
+                        }
+                        "ANALYZE" => {
+                            self.advance();
+                            // Optional TABLE keyword
+                            if matches!(self.current(), Token::Table) {
+                                self.advance();
+                            }
+                            let table = self.parse_identifier()?;
+                            return Ok(SqlStatement::AnalyzeTable { table });
+                        }
+                        "COPY" => {
+                            self.advance();
+                            let table = self.parse_identifier()?;
+                            // Expect TO or FROM
+                            let direction = if let Token::Identifier(ref kw) = self.current().clone() {
+                                let u = kw.to_uppercase();
+                                self.advance();
+                                u
+                            } else {
+                                return Err(ApexError::QueryParseError("Expected TO or FROM after COPY table".to_string()));
+                            };
+                            // file path as string literal
+                            let file_path = if let Token::StringLit(ref s) = self.current().clone() {
+                                let p = s.clone();
+                                self.advance();
+                                p
+                            } else {
+                                return Err(ApexError::QueryParseError("Expected file path string after COPY table TO/FROM".to_string()));
+                            };
+                            // Optional FORMAT PARQUET or just PARQUET keyword
+                            // We accept: COPY t TO 'f.parquet'  or  COPY t TO 'f' FORMAT PARQUET
+                            match direction.as_str() {
+                                "TO" => return Ok(SqlStatement::CopyToParquet { table, file_path }),
+                                "FROM" => return Ok(SqlStatement::CopyFromParquet { table, file_path }),
+                                _ => return Err(ApexError::QueryParseError("Expected TO or FROM in COPY statement".to_string())),
+                            }
+                        }
+                        "RELEASE" => {
+                            self.advance();
+                            // Optional SAVEPOINT keyword
+                            if matches!(self.current(), Token::Identifier(ref s2) if s2.to_uppercase() == "SAVEPOINT") {
+                                self.advance();
+                            }
+                            let name = self.parse_identifier()?;
+                            return Ok(SqlStatement::ReleaseSavepoint { name });
+                        }
+                        _ => {}
+                    }
+                }
                 let (start, _) = self.current_span();
                 let mut msg = "Expected SQL statement".to_string();
                 if let Some(kw) = self.keyword_suggestion() {
@@ -1531,10 +1671,28 @@ impl SqlParser {
                 }
                 self.expect(Token::Join)?;
                 JoinType::Left
+            } else if matches!(self.current(), Token::Right) {
+                self.advance();
+                if matches!(self.current(), Token::Outer) {
+                    self.advance();
+                }
+                self.expect(Token::Join)?;
+                JoinType::Right
+            } else if matches!(self.current(), Token::Full) {
+                self.advance();
+                if matches!(self.current(), Token::Outer) {
+                    self.advance();
+                }
+                self.expect(Token::Join)?;
+                JoinType::Full
             } else if matches!(self.current(), Token::Inner) {
                 self.advance();
                 self.expect(Token::Join)?;
                 JoinType::Inner
+            } else if matches!(self.current(), Token::Cross) {
+                self.advance();
+                self.expect(Token::Join)?;
+                JoinType::Cross
             } else {
                 break;
             };
@@ -1559,8 +1717,13 @@ impl SqlParser {
                 }
             };
 
-            self.expect(Token::On)?;
-            let on = self.parse_expr()?;
+            let on = if join_type == JoinType::Cross {
+                // CROSS JOIN has no ON clause — use a dummy true expression
+                SqlExpr::Literal(Value::Bool(true))
+            } else {
+                self.expect(Token::On)?;
+                self.parse_expr()?
+            };
             joins.push(JoinClause { join_type, right, on });
         }
 
@@ -1872,6 +2035,39 @@ impl SqlParser {
 
                         columns.push(SelectColumn::Expression { expr: func_expr, alias });
                     }
+                } else if matches!(self.current(), Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent) {
+                    // Column reference followed by arithmetic operator → parse as expression
+                    // Build left side as SqlExpr::Column, then continue with binary op parsing
+                    let mut left = SqlExpr::Column(name);
+                    // Parse add/sub level (which internally parses mul/div)
+                    loop {
+                        let op = match self.current() {
+                            Token::Plus => Some(BinaryOperator::Add),
+                            Token::Minus => Some(BinaryOperator::Sub),
+                            Token::Star => Some(BinaryOperator::Mul),
+                            Token::Slash => Some(BinaryOperator::Div),
+                            Token::Percent => Some(BinaryOperator::Mod),
+                            _ => None,
+                        };
+                        if let Some(op) = op {
+                            self.advance();
+                            let right = self.parse_unary()?;
+                            left = SqlExpr::BinaryOp {
+                                left: Box::new(left),
+                                op,
+                                right: Box::new(right),
+                            };
+                        } else {
+                            break;
+                        }
+                    }
+                    let alias = if matches!(self.current(), Token::As) {
+                        self.advance();
+                        self.parse_alias_identifier()
+                    } else {
+                        self.parse_alias_identifier()
+                    };
+                    columns.push(SelectColumn::Expression { expr: left, alias });
                 } else {
                     // Regular column with optional alias
                     if matches!(self.current(), Token::As) {
@@ -2090,6 +2286,23 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
             Token::Null => {
                 self.advance();
                 Ok(Value::Null)
+            }
+            Token::Minus => {
+                self.advance();
+                match self.current().clone() {
+                    Token::IntLit(n) => {
+                        self.advance();
+                        Ok(Value::Int64(-n))
+                    }
+                    Token::FloatLit(f) => {
+                        self.advance();
+                        Ok(Value::Float64(-f))
+                    }
+                    other => Err(ApexError::QueryParseError(format!(
+                        "Expected number after '-', got {:?}",
+                        other
+                    ))),
+                }
             }
             other => Err(ApexError::QueryParseError(format!(
                 "Expected literal value, got {:?}",
@@ -2610,6 +2823,54 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                     self.advance();
                     constraints.push(ColumnConstraintKind::Unique);
                 }
+                Token::Identifier(s) if s.to_uppercase() == "CHECK" => {
+                    self.advance();
+                    // CHECK ( expression ) — capture raw SQL text between parens
+                    if !matches!(self.current(), Token::LParen) {
+                        let (start, _) = self.current_span();
+                        return Err(self.syntax_error(start, "Expected '(' after CHECK".to_string()));
+                    }
+                    let (paren_start, _) = self.current_span();
+                    self.advance(); // consume '('
+                    let (expr_start, _) = self.current_span();
+                    // Skip tokens until matching ')' (handle nested parens)
+                    let mut depth = 1u32;
+                    while depth > 0 {
+                        match self.current() {
+                            Token::LParen => { depth += 1; self.advance(); }
+                            Token::RParen => {
+                                depth -= 1;
+                                if depth > 0 { self.advance(); }
+                            }
+                            Token::Eof => {
+                                return Err(self.syntax_error(paren_start, "Unclosed CHECK expression".to_string()));
+                            }
+                            _ => { self.advance(); }
+                        }
+                    }
+                    let (expr_end, _) = self.current_span();
+                    // Extract the SQL text between '(' and ')' from sql_chars
+                    let check_sql: String = self.sql_chars[expr_start..expr_end].iter().collect::<String>().trim().to_string();
+                    self.advance(); // consume final ')'
+                    constraints.push(ColumnConstraintKind::Check(check_sql));
+                }
+                Token::Identifier(s) if s.to_uppercase() == "REFERENCES" => {
+                    self.advance();
+                    // REFERENCES table_name(column_name)
+                    let ref_table = self.parse_identifier()?;
+                    if !matches!(self.current(), Token::LParen) {
+                        let (start, _) = self.current_span();
+                        return Err(self.syntax_error(start, "Expected '(' after REFERENCES table".to_string()));
+                    }
+                    self.advance(); // consume '('
+                    let ref_column = self.parse_identifier()?;
+                    if !matches!(self.current(), Token::RParen) {
+                        let (start, _) = self.current_span();
+                        return Err(self.syntax_error(start, "Expected ')' after REFERENCES column".to_string()));
+                    }
+                    self.advance(); // consume ')'
+                    constraints.push(ColumnConstraintKind::ForeignKey { ref_table, ref_column });
+                }
                 Token::Identifier(s) if s.to_uppercase() == "DEFAULT" => {
                     self.advance();
                     // Parse default value (literal)
@@ -2645,6 +2906,23 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                     "BOOL" | "BOOLEAN" => Ok(DataType::Bool),
                     // Bytes type not supported yet, treat as String
                     "BYTES" | "BLOB" | "BINARY" => Ok(DataType::String),
+                    "DECIMAL" | "NUMERIC" => {
+                        // Skip optional (precision, scale) parameters
+                        if matches!(self.current(), Token::LParen) {
+                            self.advance(); // skip '('
+                            // precision
+                            if matches!(self.current(), Token::IntLit(_)) { self.advance(); }
+                            // optional comma + scale
+                            if matches!(self.current(), Token::Comma) {
+                                self.advance();
+                                if matches!(self.current(), Token::IntLit(_)) { self.advance(); }
+                            }
+                            self.expect(Token::RParen)?;
+                        }
+                        Ok(DataType::String) // Store DECIMAL as String for now (preserves precision)
+                    }
+                    "TIMESTAMP" | "DATETIME" => Ok(DataType::Timestamp),
+                    "DATE" => Ok(DataType::Date),
                     _ => {
                         let (start, _) = self.current_span();
                         Err(self.syntax_error(start, format!("Unknown data type: {}", s)))
@@ -2910,5 +3188,124 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Syntax error"));
         assert!(msg.contains("did you mean JOIN"));
+    }
+
+    // ====== CTE column alias parsing ======
+
+    #[test]
+    fn test_cte_without_column_aliases() {
+        let sql = "WITH cte AS (SELECT 1) SELECT * FROM cte";
+        let stmt = SqlParser::parse(sql).unwrap();
+        if let SqlStatement::Cte { name, column_aliases, recursive, .. } = stmt {
+            assert_eq!(name, "cte");
+            assert!(column_aliases.is_empty());
+            assert!(!recursive);
+        } else {
+            panic!("Expected CTE statement");
+        }
+    }
+
+    #[test]
+    fn test_cte_with_single_column_alias() {
+        let sql = "WITH cte(x) AS (SELECT 1) SELECT x FROM cte";
+        let stmt = SqlParser::parse(sql).unwrap();
+        if let SqlStatement::Cte { name, column_aliases, .. } = stmt {
+            assert_eq!(name, "cte");
+            assert_eq!(column_aliases, vec!["x"]);
+        } else {
+            panic!("Expected CTE statement");
+        }
+    }
+
+    #[test]
+    fn test_cte_with_multiple_column_aliases() {
+        let sql = "WITH RECURSIVE fact(n, val) AS (SELECT 1, 1 UNION ALL SELECT n+1, val*(n+1) FROM fact WHERE n < 5) SELECT n, val FROM fact";
+        let stmt = SqlParser::parse(sql).unwrap();
+        if let SqlStatement::Cte { name, column_aliases, recursive, .. } = stmt {
+            assert_eq!(name, "fact");
+            assert_eq!(column_aliases, vec!["n", "val"]);
+            assert!(recursive);
+        } else {
+            panic!("Expected CTE statement");
+        }
+    }
+
+    #[test]
+    fn test_cte_recursive_three_columns() {
+        let sql = "WITH RECURSIVE fib(n, a, b) AS (SELECT 1, 0, 1 UNION ALL SELECT n+1, b, a+b FROM fib WHERE n < 10) SELECT n, b FROM fib";
+        let stmt = SqlParser::parse(sql).unwrap();
+        if let SqlStatement::Cte { column_aliases, recursive, .. } = stmt {
+            assert_eq!(column_aliases, vec!["n", "a", "b"]);
+            assert!(recursive);
+        } else {
+            panic!("Expected CTE statement");
+        }
+    }
+
+    // ====== CHECK constraint parsing ======
+
+    #[test]
+    fn test_check_constraint_parsed() {
+        let sql = "CREATE TABLE t (age INTEGER CHECK(age > 0))";
+        let stmt = SqlParser::parse(sql).unwrap();
+        if let SqlStatement::CreateTable { columns, .. } = stmt {
+            assert_eq!(columns.len(), 1);
+            let has_check = columns[0].constraints.iter().any(|c| matches!(c, ColumnConstraintKind::Check(_)));
+            assert!(has_check, "CHECK constraint not parsed");
+        } else {
+            panic!("Expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_check_constraint_expression_captured() {
+        let sql = "CREATE TABLE t (val INTEGER CHECK(val >= 0 AND val < 1000))";
+        let stmt = SqlParser::parse(sql).unwrap();
+        if let SqlStatement::CreateTable { columns, .. } = stmt {
+            let check = columns[0].constraints.iter().find_map(|c| {
+                if let ColumnConstraintKind::Check(s) = c { Some(s.clone()) } else { None }
+            });
+            assert!(check.is_some());
+            let expr = check.unwrap();
+            assert!(expr.contains("val") && expr.contains("0") && expr.contains("1000"));
+        } else {
+            panic!("Expected CreateTable");
+        }
+    }
+
+    // ====== FOREIGN KEY constraint parsing ======
+
+    #[test]
+    fn test_fk_constraint_parsed() {
+        let sql = "CREATE TABLE child (id INTEGER, parent_id INTEGER REFERENCES parent(id))";
+        let stmt = SqlParser::parse(sql).unwrap();
+        if let SqlStatement::CreateTable { columns, .. } = stmt {
+            assert_eq!(columns.len(), 2);
+            let fk = columns[1].constraints.iter().find_map(|c| {
+                if let ColumnConstraintKind::ForeignKey { ref_table, ref_column } = c {
+                    Some((ref_table.clone(), ref_column.clone()))
+                } else { None }
+            });
+            assert_eq!(fk, Some(("parent".to_string(), "id".to_string())));
+        } else {
+            panic!("Expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_fk_and_check_together() {
+        let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER CHECK(val > 0) REFERENCES other(val))";
+        let stmt = SqlParser::parse(sql).unwrap();
+        if let SqlStatement::CreateTable { columns, .. } = stmt {
+            assert_eq!(columns.len(), 2);
+            let has_pk = columns[0].constraints.iter().any(|c| matches!(c, ColumnConstraintKind::PrimaryKey));
+            assert!(has_pk);
+            let has_check = columns[1].constraints.iter().any(|c| matches!(c, ColumnConstraintKind::Check(_)));
+            let has_fk = columns[1].constraints.iter().any(|c| matches!(c, ColumnConstraintKind::ForeignKey { .. }));
+            assert!(has_check);
+            assert!(has_fk);
+        } else {
+            panic!("Expected CreateTable");
+        }
     }
 }

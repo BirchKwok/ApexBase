@@ -24,6 +24,7 @@ pub enum DataType {
     Timestamp = 15,
     Date = 16,
     Array = 17,
+    Decimal = 18,
 }
 
 impl DataType {
@@ -37,6 +38,7 @@ impl DataType {
             DataType::Int32 | DataType::UInt32 | DataType::Float32 => Some(4),
             DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Timestamp => Some(8),
             DataType::Date => Some(4),
+            DataType::Decimal => Some(16), // i128 for decimal storage
             DataType::String | DataType::Binary | DataType::Json | DataType::Array => None,
         }
     }
@@ -55,6 +57,7 @@ impl DataType {
                 | DataType::UInt64
                 | DataType::Float32
                 | DataType::Float64
+                | DataType::Decimal
         )
     }
 
@@ -64,6 +67,11 @@ impl DataType {
             self,
             DataType::String | DataType::Binary | DataType::Json | DataType::Array
         )
+    }
+
+    /// Check if this type is a decimal type
+    pub fn is_decimal(&self) -> bool {
+        matches!(self, DataType::Decimal)
     }
 
     /// Convert from SQL type string (for compatibility with DuckDB types)
@@ -84,6 +92,7 @@ impl DataType {
             "VARCHAR" | "TEXT" | "STRING" | "CHAR" => DataType::String,
             "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => DataType::Binary,
             "JSON" => DataType::Json,
+            "DECIMAL" | "NUMERIC" => DataType::Decimal,
             "TIMESTAMP" | "DATETIME" => DataType::Timestamp,
             "DATE" => DataType::Date,
             _ => DataType::String, // Default to String for unknown types
@@ -111,6 +120,7 @@ impl DataType {
             DataType::Timestamp => "TIMESTAMP",
             DataType::Date => "DATE",
             DataType::Array => "ARRAY",
+            DataType::Decimal => "DECIMAL",
         }
     }
 }

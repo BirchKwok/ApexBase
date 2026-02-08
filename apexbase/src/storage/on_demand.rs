@@ -207,6 +207,14 @@ const MAGIC_V4_FOOTER: &[u8; 8] = b"APXFOOT\0";
 /// Size of a serialized RowGroupMeta entry in the footer (8+8+4+8+8+4 = 40 bytes)
 const ROW_GROUP_META_SIZE: usize = 40;
 
+// Per-RG compression flags (stored in RG header byte 28)
+const RG_COMPRESS_NONE: u8 = 0;
+const RG_COMPRESS_LZ4: u8 = 1;
+
+/// Minimum RG body size (bytes) to bother compressing.
+/// Below this threshold, compression overhead exceeds savings.
+const LZ4_MIN_BODY_SIZE: usize = 512;
+
 // Column type identifiers
 const TYPE_NULL: u8 = 0;
 const TYPE_BOOL: u8 = 1;
@@ -223,6 +231,8 @@ const TYPE_FLOAT64: u8 = 11;
 const TYPE_STRING: u8 = 12;
 const TYPE_BINARY: u8 = 13;
 const TYPE_STRING_DICT: u8 = 14;  // Dictionary-encoded string (DuckDB-style)
+const TYPE_TIMESTAMP: u8 = 15;   // Timestamp (microseconds since Unix epoch)
+const TYPE_DATE: u8 = 16;        // Date (days since Unix epoch)
 
 // ============================================================================
 // Data Types
@@ -247,6 +257,8 @@ pub enum ColumnType {
     String = TYPE_STRING,
     Binary = TYPE_BINARY,
     StringDict = TYPE_STRING_DICT,  // Dictionary-encoded string for low-cardinality columns
+    Timestamp = TYPE_TIMESTAMP,      // Timestamp (i64 microseconds since Unix epoch)
+    Date = TYPE_DATE,                // Date (i64 days since Unix epoch, stored as i64 for alignment)
 }
 
 impl ColumnType {
@@ -267,6 +279,8 @@ impl ColumnType {
             TYPE_STRING => Some(ColumnType::String),
             TYPE_BINARY => Some(ColumnType::Binary),
             TYPE_STRING_DICT => Some(ColumnType::StringDict),
+            TYPE_TIMESTAMP => Some(ColumnType::Timestamp),
+            TYPE_DATE => Some(ColumnType::Date),
             _ => None,
         }
     }
@@ -279,7 +293,7 @@ impl ColumnType {
             ColumnType::Int8 | ColumnType::UInt8 => 1,
             ColumnType::Int16 | ColumnType::UInt16 => 2,
             ColumnType::Int32 | ColumnType::UInt32 | ColumnType::Float32 => 4,
-            ColumnType::Int64 | ColumnType::UInt64 | ColumnType::Float64 => 8,
+            ColumnType::Int64 | ColumnType::UInt64 | ColumnType::Float64 | ColumnType::Timestamp | ColumnType::Date => 8,
             ColumnType::String | ColumnType::Binary | ColumnType::StringDict => 0,
         }
     }
@@ -386,7 +400,8 @@ impl ColumnData {
         match dtype {
             ColumnType::Bool => ColumnData::Bool { data: Vec::new(), len: 0 },
             ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::Int64 |
-            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 => {
+            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+            ColumnType::Timestamp | ColumnType::Date => {
                 ColumnData::Int64(Vec::new())
             }
             ColumnType::Float32 | ColumnType::Float64 => ColumnData::Float64(Vec::new()),
@@ -709,7 +724,8 @@ impl ColumnData {
                 Ok((ColumnData::Bool { data, len }, pos))
             }
             ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
-            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 => {
+            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+            ColumnType::Timestamp | ColumnType::Date => {
                 let count = read_u64!() as usize;
                 let byte_len = count * 8;
                 if pos + byte_len > bytes.len() {
@@ -847,7 +863,8 @@ impl ColumnData {
                 pos += byte_len;
             }
             ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
-            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 => {
+            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+            ColumnType::Timestamp | ColumnType::Date => {
                 let count = read_u64!() as usize;
                 pos += count * 8;
             }
@@ -1561,10 +1578,74 @@ impl RowGroupMeta {
 /// [footer_size: u64]       ← total footer bytes (for seeking from EOF)
 /// [MAGIC_V4_FOOTER: 8 bytes]
 /// ```
+/// Per-column zone map (min/max) for a single Row Group.
+/// Used to skip entire RGs during scans when the filter range doesn't overlap.
+#[derive(Debug, Clone)]
+pub struct RgColumnZoneMap {
+    /// Column index in the schema
+    pub col_idx: u16,
+    /// Min value (i64 bits for Int64, f64 bits for Float64)
+    pub min_bits: i64,
+    /// Max value (i64 bits for Int64, f64 bits for Float64)
+    pub max_bits: i64,
+    /// True if the column contains any NULL values in this RG
+    pub has_nulls: bool,
+    /// True if this is a Float64 column (min_bits/max_bits are f64::to_bits)
+    pub is_float: bool,
+}
+
+impl RgColumnZoneMap {
+    /// Check if a filter value might match rows in this zone map.
+    /// `op` is one of: "=", ">", ">=", "<", "<="
+    pub fn may_contain_int(&self, op: &str, val: i64) -> bool {
+        match op {
+            "=" | "==" => val >= self.min_bits && val <= self.max_bits,
+            ">" => self.max_bits > val,
+            ">=" => self.max_bits >= val,
+            "<" => self.min_bits < val,
+            "<=" => self.min_bits <= val,
+            _ => true,
+        }
+    }
+
+    pub fn may_contain_float(&self, op: &str, val: f64) -> bool {
+        let min_f = f64::from_bits(self.min_bits as u64);
+        let max_f = f64::from_bits(self.max_bits as u64);
+        match op {
+            "=" | "==" => val >= min_f && val <= max_f,
+            ">" => max_f > val,
+            ">=" => max_f >= val,
+            "<" => min_f < val,
+            "<=" => min_f <= val,
+            _ => true,
+        }
+    }
+
+    /// Check if a BETWEEN range might overlap this zone map (Int64)
+    pub fn may_overlap_int_range(&self, low: i64, high: i64) -> bool {
+        self.max_bits >= low && self.min_bits <= high
+    }
+
+    /// Check if a BETWEEN range might overlap this zone map (Float64)
+    pub fn may_overlap_float_range(&self, low: f64, high: f64) -> bool {
+        let min_f = f64::from_bits(self.min_bits as u64);
+        let max_f = f64::from_bits(self.max_bits as u64);
+        max_f >= low && min_f <= high
+    }
+}
+
+/// Zone maps for all RGs: outer Vec is per-RG, inner Vec is per-column.
+/// Only numeric columns (Int64, Float64) have zone maps.
+pub type RgZoneMaps = Vec<Vec<RgColumnZoneMap>>;
+
+const ZONE_MAP_MAGIC: &[u8; 4] = b"ZMAP";
+
 #[derive(Debug, Clone)]
 pub struct V4Footer {
     pub schema: OnDemandSchema,
     pub row_groups: Vec<RowGroupMeta>,
+    /// Per-RG per-column zone maps (min/max for numeric columns)
+    pub zone_maps: RgZoneMaps,
 }
 
 impl V4Footer {
@@ -1572,13 +1653,7 @@ impl V4Footer {
         let schema_bytes = self.schema.to_bytes();
         let rg_count = self.row_groups.len() as u32;
         
-        let total_size = 8 + schema_bytes.len()     // schema_bytes_len + schema
-            + 4                                       // rg_count
-            + self.row_groups.len() * ROW_GROUP_META_SIZE  // RG entries
-            + 8                                       // footer_size
-            + 8;                                      // footer magic
-        
-        let mut buf = Vec::with_capacity(total_size);
+        let mut buf = Vec::with_capacity(1024);
         
         // Schema
         buf.extend_from_slice(&(schema_bytes.len() as u64).to_le_bytes());
@@ -1588,6 +1663,22 @@ impl V4Footer {
         buf.extend_from_slice(&rg_count.to_le_bytes());
         for rg in &self.row_groups {
             buf.extend_from_slice(&rg.to_bytes());
+        }
+        
+        // Zone maps section (optional, backward-compat: old readers skip to footer_size)
+        if !self.zone_maps.is_empty() {
+            buf.extend_from_slice(ZONE_MAP_MAGIC);
+            buf.extend_from_slice(&(self.zone_maps.len() as u32).to_le_bytes()); // rg count
+            for rg_zmaps in &self.zone_maps {
+                buf.extend_from_slice(&(rg_zmaps.len() as u16).to_le_bytes()); // cols in this RG
+                for zm in rg_zmaps {
+                    buf.extend_from_slice(&zm.col_idx.to_le_bytes());
+                    buf.extend_from_slice(&zm.min_bits.to_le_bytes());
+                    buf.extend_from_slice(&zm.max_bits.to_le_bytes());
+                    let flags: u8 = (zm.has_nulls as u8) | ((zm.is_float as u8) << 1);
+                    buf.push(flags);
+                }
+            }
         }
         
         // Footer size (everything before this field + 8 bytes for size + 8 bytes for magic)
@@ -1629,7 +1720,40 @@ impl V4Footer {
             pos += ROW_GROUP_META_SIZE;
         }
         
-        Ok(Self { schema, row_groups })
+        // Try reading zone maps section (backward compat: may not exist)
+        let mut zone_maps: RgZoneMaps = Vec::new();
+        if pos + 4 <= bytes.len() && &bytes[pos..pos+4] == ZONE_MAP_MAGIC {
+            pos += 4;
+            let zm_rg_count = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            for _ in 0..zm_rg_count {
+                if pos + 2 > bytes.len() { break; }
+                let col_count = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap()) as usize;
+                pos += 2;
+                let mut rg_zmaps = Vec::with_capacity(col_count);
+                for _ in 0..col_count {
+                    if pos + 19 > bytes.len() { break; } // 2+8+8+1 = 19 bytes per entry
+                    let col_idx = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap());
+                    pos += 2;
+                    let min_bits = i64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+                    pos += 8;
+                    let max_bits = i64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+                    pos += 8;
+                    let flags = bytes[pos];
+                    pos += 1;
+                    rg_zmaps.push(RgColumnZoneMap {
+                        col_idx,
+                        min_bits,
+                        max_bits,
+                        has_nulls: (flags & 1) != 0,
+                        is_float: (flags & 2) != 0,
+                    });
+                }
+                zone_maps.push(rg_zmaps);
+            }
+        }
+        
+        Ok(Self { schema, row_groups, zone_maps })
     }
     
     /// Total active rows across all Row Groups
@@ -1696,6 +1820,10 @@ pub struct ColumnConstraints {
     pub primary_key: bool,
     pub unique: bool,
     pub default_value: Option<DefaultValue>,
+    /// CHECK constraint expression stored as SQL text (re-parsed at enforcement time)
+    pub check_expr_sql: Option<String>,
+    /// FOREIGN KEY: references (table_name, column_name) in another table
+    pub foreign_key: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1817,6 +1945,48 @@ impl OnDemandSchema {
                     }
                 }
             }
+            
+            // Serialize CHECK expressions (marker 0xCE)
+            let has_checks = self.constraints.iter().any(|c| c.check_expr_sql.is_some());
+            if has_checks {
+                buf.push(0xCE); // marker byte for CHECK expressions section
+                for i in 0..self.columns.len() {
+                    let cons = self.constraints.get(i);
+                    match cons.and_then(|c| c.check_expr_sql.as_ref()) {
+                        Some(sql) => {
+                            let sb = sql.as_bytes();
+                            buf.extend_from_slice(&(sb.len() as u16).to_le_bytes());
+                            buf.extend_from_slice(sb);
+                        }
+                        None => {
+                            buf.extend_from_slice(&0u16.to_le_bytes()); // len=0 means no CHECK
+                        }
+                    }
+                }
+            }
+            
+            // Serialize FOREIGN KEY references (marker 0xFC)
+            let has_fks = self.constraints.iter().any(|c| c.foreign_key.is_some());
+            if has_fks {
+                buf.push(0xFC); // marker byte for FOREIGN KEY section
+                for i in 0..self.columns.len() {
+                    let cons = self.constraints.get(i);
+                    match cons.and_then(|c| c.foreign_key.as_ref()) {
+                        Some((ref_table, ref_col)) => {
+                            // Format: u16(table_len) + table_bytes + u16(col_len) + col_bytes
+                            let tb = ref_table.as_bytes();
+                            let cb = ref_col.as_bytes();
+                            buf.extend_from_slice(&(tb.len() as u16).to_le_bytes());
+                            buf.extend_from_slice(tb);
+                            buf.extend_from_slice(&(cb.len() as u16).to_le_bytes());
+                            buf.extend_from_slice(cb);
+                        }
+                        None => {
+                            buf.extend_from_slice(&0u16.to_le_bytes()); // len=0 means no FK
+                        }
+                    }
+                }
+            }
         }
         
         buf
@@ -1873,6 +2043,8 @@ impl OnDemandSchema {
                         primary_key: flags & 2 != 0,
                         unique: flags & 4 != 0,
                         default_value: None, // filled below if marker present
+                        check_expr_sql: None, // filled below if marker present
+                        foreign_key: None, // filled below if marker present
                     };
                 }
             }
@@ -1918,6 +2090,48 @@ impl OnDemandSchema {
                     };
                     if i < schema.constraints.len() {
                         schema.constraints[i].default_value = dv;
+                    }
+                }
+            }
+            
+            // Check for CHECK expressions marker (0xCE) after defaults
+            if pos < bytes.len() && bytes[pos] == 0xCE {
+                pos += 1;
+                for i in 0..column_count {
+                    if pos + 2 > bytes.len() { break; }
+                    let slen = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap()) as usize;
+                    pos += 2;
+                    if slen > 0 {
+                        if pos + slen > bytes.len() { break; }
+                        let sql = std::str::from_utf8(&bytes[pos..pos+slen]).unwrap_or("").to_string();
+                        pos += slen;
+                        if i < schema.constraints.len() {
+                            schema.constraints[i].check_expr_sql = Some(sql);
+                        }
+                    }
+                }
+            }
+            
+            // Check for FOREIGN KEY marker (0xFC) after CHECK
+            if pos < bytes.len() && bytes[pos] == 0xFC {
+                pos += 1;
+                for i in 0..column_count {
+                    if pos + 2 > bytes.len() { break; }
+                    let tlen = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap()) as usize;
+                    pos += 2;
+                    if tlen > 0 {
+                        if pos + tlen > bytes.len() { break; }
+                        let ref_table = std::str::from_utf8(&bytes[pos..pos+tlen]).unwrap_or("").to_string();
+                        pos += tlen;
+                        if pos + 2 > bytes.len() { break; }
+                        let clen = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap()) as usize;
+                        pos += 2;
+                        if pos + clen > bytes.len() { break; }
+                        let ref_col = std::str::from_utf8(&bytes[pos..pos+clen]).unwrap_or("").to_string();
+                        pos += clen;
+                        if i < schema.constraints.len() {
+                            schema.constraints[i].foreign_key = Some((ref_table, ref_col));
+                        }
                     }
                 }
             }
@@ -2181,12 +2395,24 @@ impl OnDemandStorage {
                     .collect();
                 
                 // Filter: keep only auto-commit (txn_id=0) and committed txn DML records
+                // ALSO: idempotency guard — skip Insert/BatchInsert records whose IDs
+                // are already in the base file (id < next_id). This prevents duplicate
+                // rows if WAL is replayed after the base file was already saved.
+                let base_next_id = next_id; // next_id from base file before WAL recovery
                 let records: Vec<_> = all_records.into_iter().filter(|r| {
                     match r {
-                        super::incremental::WalRecord::Insert { txn_id, .. } |
-                        super::incremental::WalRecord::Delete { txn_id, .. } |
-                        super::incremental::WalRecord::BatchInsert { txn_id, .. } => {
-                            *txn_id == 0 || committed_txns.contains(txn_id)
+                        super::incremental::WalRecord::Insert { txn_id, id, .. } => {
+                            (*txn_id == 0 || committed_txns.contains(txn_id))
+                                && *id >= base_next_id // Skip if already persisted
+                        }
+                        super::incremental::WalRecord::BatchInsert { txn_id, start_id, rows, .. } => {
+                            let end_id = *start_id + rows.len() as u64;
+                            (*txn_id == 0 || committed_txns.contains(txn_id))
+                                && end_id > base_next_id // Keep if any rows are new
+                        }
+                        super::incremental::WalRecord::Delete { txn_id, id, .. } => {
+                            (*txn_id == 0 || committed_txns.contains(txn_id))
+                                && *id < base_next_id // Only delete rows that exist in base
                         }
                         _ => true, // Keep checkpoints, txn boundaries
                     }
@@ -2998,7 +3224,8 @@ impl OnDemandStorage {
         for (col_name, col_type) in &schema.columns {
             match col_type {
                 ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
-                ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 => { 
+                ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+                ColumnType::Timestamp | ColumnType::Date => { 
                     int_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
                 }
                 ColumnType::Float64 | ColumnType::Float32 => { 
@@ -3026,7 +3253,8 @@ impl OnDemandStorage {
                 let val = row.get(col_name);
                 match col_type {
                     ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
-                    ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 => {
+                    ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+                    ColumnType::Timestamp | ColumnType::Date => {
                         let v = val.and_then(|v| if let ColumnValue::Int64(n) = v { Some(*n) } else { None }).unwrap_or(0);
                         int_columns.get_mut(col_name).unwrap().push(v);
                     }
@@ -3330,7 +3558,8 @@ impl OnDemandStorage {
                 len: count,
             },
             ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
-            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 => {
+            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+            ColumnType::Timestamp | ColumnType::Date => {
                 ColumnData::Int64(vec![0i64; count])
             }
             ColumnType::Float64 | ColumnType::Float32 => {
@@ -3838,17 +4067,39 @@ impl OnDemandStorage {
                 None // No null info
             };
 
+            let schema_col_type = *_col_type;
             let (arrow_dt, array): (ArrowDataType, ArrayRef) = match col_data {
                 Some(ColumnData::Int64(values)) => {
-                    let data_vec = if let Some(ref indices) = active_indices {
+                    let data_vec: Vec<i64> = if let Some(ref indices) = active_indices {
                         indices.iter().map(|&i| if i < values.len() { values[i] } else { 0 }).collect()
                     } else {
                         values.clone()
                     };
-                    let arr = PrimitiveArray::<Int64Type>::new(
-                        ScalarBuffer::from(data_vec), null_buf,
-                    );
-                    (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                    // Use schema type to produce proper Arrow type for Timestamp/Date
+                    match schema_col_type {
+                        ColumnType::Timestamp => {
+                            use arrow::datatypes::TimestampMicrosecondType;
+                            let arr = PrimitiveArray::<TimestampMicrosecondType>::new(
+                                ScalarBuffer::from(data_vec), null_buf,
+                            );
+                            (ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None), Arc::new(arr) as ArrayRef)
+                        }
+                        ColumnType::Date => {
+                            // Date stored as i64 days since epoch, convert to i32 for Arrow Date32
+                            use arrow::datatypes::Date32Type;
+                            let data_i32: Vec<i32> = data_vec.iter().map(|&v| v as i32).collect();
+                            let arr = PrimitiveArray::<Date32Type>::new(
+                                ScalarBuffer::from(data_i32), null_buf,
+                            );
+                            (ArrowDataType::Date32, Arc::new(arr) as ArrayRef)
+                        }
+                        _ => {
+                            let arr = PrimitiveArray::<Int64Type>::new(
+                                ScalarBuffer::from(data_vec), null_buf,
+                            );
+                            (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                        }
+                    }
                 }
                 Some(ColumnData::Float64(values)) => {
                     let data_vec = if let Some(ref indices) = active_indices {
@@ -4142,7 +4393,8 @@ impl OnDemandStorage {
         }
 
         for &col_idx in &col_indices {
-            let (col_name, _) = &schema.columns[col_idx];
+            let (col_name, schema_col_type) = &schema.columns[col_idx];
+            let schema_col_type = *schema_col_type;
             let col_data = if col_idx < columns.len() { Some(&columns[col_idx]) } else { None };
 
             // Build null buffer for this column (critical for IS NULL queries)
@@ -4180,8 +4432,27 @@ impl OnDemandStorage {
                     } else {
                         values[..actual_limit.min(values.len())].to_vec()
                     };
-                    let arr = PrimitiveArray::<Int64Type>::new(ScalarBuffer::from(data_vec), null_buf);
-                    (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                    match schema_col_type {
+                        ColumnType::Timestamp => {
+                            use arrow::datatypes::TimestampMicrosecondType;
+                            let arr = PrimitiveArray::<TimestampMicrosecondType>::new(
+                                ScalarBuffer::from(data_vec), null_buf,
+                            );
+                            (ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None), Arc::new(arr) as ArrayRef)
+                        }
+                        ColumnType::Date => {
+                            use arrow::datatypes::Date32Type;
+                            let data_i32: Vec<i32> = data_vec.iter().map(|&v| v as i32).collect();
+                            let arr = PrimitiveArray::<Date32Type>::new(
+                                ScalarBuffer::from(data_i32), null_buf,
+                            );
+                            (ArrowDataType::Date32, Arc::new(arr) as ArrayRef)
+                        }
+                        _ => {
+                            let arr = PrimitiveArray::<Int64Type>::new(ScalarBuffer::from(data_vec), null_buf);
+                            (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                        }
+                    }
                 }
                 Some(ColumnData::Float64(values)) => {
                     let data_vec: Vec<f64> = if let Some(ref indices) = row_indices {
@@ -4616,14 +4887,25 @@ impl OnDemandStorage {
                                         let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
                                         if rg_end > mmap_ref.len() { break; }
                                         let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
-                                        let mut pos: usize = 32 + rg_rows * 8; // skip header + IDs
+                                        // Check compression flag at RG header byte 28
+                                        let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+                                        let decompressed_buf: Vec<u8>;
+                                        let body: &[u8] = if compress_flag == RG_COMPRESS_LZ4 {
+                                            if let Ok(d) = lz4_flex::decompress_size_prepended(&rg_bytes[32..]) {
+                                                decompressed_buf = d;
+                                                &decompressed_buf
+                                            } else { break; }
+                                        } else {
+                                            &rg_bytes[32..]
+                                        };
+                                        let mut pos: usize = rg_rows * 8; // skip IDs
                                         let del_vec_len = (rg_rows + 7) / 8;
                                         pos += del_vec_len; // skip deletion vector
                                         let null_bitmap_len = (rg_rows + 7) / 8;
                                         // Navigate to the right column's null bitmap
                                         for ci in 0..f_col_count {
-                                            if pos + null_bitmap_len > rg_bytes.len() { break; }
-                                            let null_bytes = &rg_bytes[pos..pos + null_bitmap_len];
+                                            if pos + null_bitmap_len > body.len() { break; }
+                                            let null_bytes = &body[pos..pos + null_bitmap_len];
                                             pos += null_bitmap_len;
                                             if ci == col_idx {
                                                 // Extract null bits for rows in range
@@ -4640,7 +4922,7 @@ impl OnDemandStorage {
                                             }
                                             // Skip column data
                                             let ct = f_schema.columns[ci].1;
-                                            if let Ok(consumed) = ColumnData::skip_bytes_typed(&rg_bytes[pos..], ct) {
+                                            if let Ok(consumed) = ColumnData::skip_bytes_typed(&body[pos..], ct) {
                                                 pos += consumed;
                                             } else { break; }
                                         }
@@ -6191,7 +6473,7 @@ impl OnDemandStorage {
     /// Returns None for V3 files.
     /// NOTE: Always re-reads header + footer from disk via a fresh file handle
     /// to avoid stale cache issues when another storage instance has appended data.
-    fn get_or_load_footer(&self) -> io::Result<Option<V4Footer>> {
+    pub(crate) fn get_or_load_footer(&self) -> io::Result<Option<V4Footer>> {
         let file_len = std::fs::metadata(&self.path)
             .map(|m| m.len())
             .unwrap_or(0);
@@ -6357,22 +6639,34 @@ impl OnDemandStorage {
             }
             let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
 
-            let mut pos: usize = 32; // skip RG header
+            // Check compression flag at RG header byte 28
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            
+            // Get the body bytes (after 32-byte RG header), decompressing if needed
+            let decompressed_buf: Vec<u8>;
+            let body: &[u8] = if compress_flag == RG_COMPRESS_LZ4 {
+                decompressed_buf = lz4_flex::decompress_size_prepended(&rg_bytes[32..])
+                    .map_err(|e| err_data(&format!("LZ4 decompress failed: {}", e)))?;
+                &decompressed_buf
+            } else {
+                &rg_bytes[32..]
+            };
+            let mut pos: usize = 0;
 
             // Read IDs
             let id_byte_len = rg_rows * 8;
-            if pos + id_byte_len > rg_bytes.len() {
+            if pos + id_byte_len > body.len() {
                 return Err(err_data("RG IDs truncated"));
             }
-            let id_slice = &rg_bytes[pos..pos + id_byte_len];
+            let id_slice = &body[pos..pos + id_byte_len];
             pos += id_byte_len;
 
             // Read deletion vector
             let del_vec_len = (rg_rows + 7) / 8;
-            if pos + del_vec_len > rg_bytes.len() {
+            if pos + del_vec_len > body.len() {
                 return Err(err_data("RG deletion vector truncated"));
             }
-            let del_bytes = &rg_bytes[pos..pos + del_vec_len];
+            let del_bytes = &body[pos..pos + del_vec_len];
             pos += del_vec_len;
 
             // Build active row mask for this RG
@@ -6410,10 +6704,10 @@ impl OnDemandStorage {
             for col_idx in 0..col_count {
                 // Schema evolution: RG may have fewer columns than footer schema.
                 // If we've exhausted the RG data, remaining columns get defaults.
-                if pos + null_bitmap_len > rg_bytes.len() {
+                if pos + null_bitmap_len > body.len() {
                     break;
                 }
-                let null_bytes = &rg_bytes[pos..pos + null_bitmap_len];
+                let null_bytes = &body[pos..pos + null_bitmap_len];
                 pos += null_bitmap_len;
 
                 let col_type = schema.columns[col_idx].1;
@@ -6421,7 +6715,7 @@ impl OnDemandStorage {
                 if let Some(&out_pos) = col_idx_to_out.get(&col_idx) {
                     // Parse this column's data
                     let (col_data, consumed) = ColumnData::from_bytes_typed(
-                        &rg_bytes[pos..], col_type,
+                        &body[pos..], col_type,
                     )?;
                     pos += consumed;
 
@@ -6469,7 +6763,7 @@ impl OnDemandStorage {
                 } else {
                     // Skip this column (no allocation)
                     let consumed = ColumnData::skip_bytes_typed(
-                        &rg_bytes[pos..], col_type,
+                        &body[pos..], col_type,
                     )?;
                     pos += consumed;
                 }
@@ -6506,7 +6800,8 @@ impl OnDemandStorage {
 
         // Data columns
         for (out_idx, &col_idx) in col_indices.iter().enumerate() {
-            let (col_name, _col_type) = &schema.columns[col_idx];
+            let (col_name, schema_col_type_ref) = &schema.columns[col_idx];
+            let schema_col_type = *schema_col_type_ref;
             let col_data = &col_accumulators[out_idx];
             let null_bitmap = &null_accumulators[out_idx];
 
@@ -6526,10 +6821,29 @@ impl OnDemandStorage {
 
             let (arrow_dt, array): (ArrowDataType, ArrayRef) = match col_data {
                 ColumnData::Int64(values) => {
-                    let arr = PrimitiveArray::<Int64Type>::new(
-                        ScalarBuffer::from(values.clone()), null_buf,
-                    );
-                    (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                    match schema_col_type {
+                        ColumnType::Timestamp => {
+                            use arrow::datatypes::TimestampMicrosecondType;
+                            let arr = PrimitiveArray::<TimestampMicrosecondType>::new(
+                                ScalarBuffer::from(values.clone()), null_buf,
+                            );
+                            (ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None), Arc::new(arr) as ArrayRef)
+                        }
+                        ColumnType::Date => {
+                            use arrow::datatypes::Date32Type;
+                            let data_i32: Vec<i32> = values.iter().map(|&v| v as i32).collect();
+                            let arr = PrimitiveArray::<Date32Type>::new(
+                                ScalarBuffer::from(data_i32), null_buf,
+                            );
+                            (ArrowDataType::Date32, Arc::new(arr) as ArrayRef)
+                        }
+                        _ => {
+                            let arr = PrimitiveArray::<Int64Type>::new(
+                                ScalarBuffer::from(values.clone()), null_buf,
+                            );
+                            (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                        }
+                    }
                 }
                 ColumnData::Float64(values) => {
                     let arr = PrimitiveArray::<Float64Type>::new(
@@ -6773,14 +7087,27 @@ impl OnDemandStorage {
                 return Err(err_data("RG extends past EOF"));
             }
             let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
-            let mut pos: usize = 32; // skip RG header
+            
+            // Check compression flag at RG header byte 28
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            
+            // Get the body bytes (after 32-byte RG header), decompressing if needed
+            let decompressed_buf: Vec<u8>;
+            let body: &[u8] = if compress_flag == RG_COMPRESS_LZ4 {
+                decompressed_buf = lz4_flex::decompress_size_prepended(&rg_bytes[32..])
+                    .map_err(|e| err_data(&format!("LZ4 decompress failed: {}", e)))?;
+                &decompressed_buf
+            } else {
+                &rg_bytes[32..]
+            };
+            let mut pos: usize = 0;
 
             // Read IDs
             let id_byte_len = rg_rows * 8;
-            if pos + id_byte_len > rg_bytes.len() {
+            if pos + id_byte_len > body.len() {
                 return Err(err_data("RG IDs truncated"));
             }
-            let id_slice = &rg_bytes[pos..pos + id_byte_len];
+            let id_slice = &body[pos..pos + id_byte_len];
             pos += id_byte_len;
 
             for i in 0..rg_rows {
@@ -6793,10 +7120,10 @@ impl OnDemandStorage {
 
             // Read deletion vector
             let del_vec_len = (rg_rows + 7) / 8;
-            if pos + del_vec_len > rg_bytes.len() {
+            if pos + del_vec_len > body.len() {
                 return Err(err_data("RG deletion vector truncated"));
             }
-            deleted_acc.extend_from_slice(&rg_bytes[pos..pos + del_vec_len]);
+            deleted_acc.extend_from_slice(&body[pos..pos + del_vec_len]);
         }
 
         drop(mmap_guard);
@@ -6871,24 +7198,37 @@ impl OnDemandStorage {
                 return Err(err_data("RG extends past EOF"));
             }
             let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
-            let mut pos: usize = 32; // skip RG header
+            
+            // Check compression flag at RG header byte 28
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            
+            // Get the body bytes (after 32-byte RG header), decompressing if needed
+            let decompressed_buf: Vec<u8>;
+            let body: &[u8] = if compress_flag == RG_COMPRESS_LZ4 {
+                decompressed_buf = lz4_flex::decompress_size_prepended(&rg_bytes[32..])
+                    .map_err(|e| err_data(&format!("LZ4 decompress failed: {}", e)))?;
+                &decompressed_buf
+            } else {
+                &rg_bytes[32..]
+            };
+            let mut pos: usize = 0;
 
             // Skip IDs
             pos += rg_rows * 8;
 
             // Read deletion vector
             let del_vec_len = (rg_rows + 7) / 8;
-            if pos + del_vec_len > rg_bytes.len() {
+            if pos + del_vec_len > body.len() {
                 return Err(err_data("RG deletion vector truncated"));
             }
-            all_del_bytes.extend_from_slice(&rg_bytes[pos..pos + del_vec_len]);
+            all_del_bytes.extend_from_slice(&body[pos..pos + del_vec_len]);
             pos += del_vec_len;
 
             // Parse columns — read requested, skip others
             let null_bitmap_len = (rg_rows + 7) / 8;
             for col_idx in 0..col_count {
-                if pos + null_bitmap_len > rg_bytes.len() { break; }
-                let null_bytes = &rg_bytes[pos..pos + null_bitmap_len];
+                if pos + null_bitmap_len > body.len() { break; }
+                let null_bytes = &body[pos..pos + null_bitmap_len];
                 pos += null_bitmap_len;
 
                 let col_type = schema.columns[col_idx].1;
@@ -6898,7 +7238,7 @@ impl OnDemandStorage {
                     col_null_bitmaps[out_pos].extend_from_slice(null_bytes);
 
                     let (col_data, consumed) = ColumnData::from_bytes_typed(
-                        &rg_bytes[pos..], col_type,
+                        &body[pos..], col_type,
                     )?;
                     pos += consumed;
 
@@ -6911,7 +7251,7 @@ impl OnDemandStorage {
                     col_accumulators[out_pos].append(&col_data);
                 } else {
                     let consumed = ColumnData::skip_bytes_typed(
-                        &rg_bytes[pos..], col_type,
+                        &body[pos..], col_type,
                     )?;
                     pos += consumed;
                 }
@@ -7275,7 +7615,8 @@ impl OnDemandStorage {
         
         match dtype {
             ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
-            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 => {
+            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+            ColumnType::Timestamp | ColumnType::Date => {
                 // Format: [count:u64][values:i64*]
                 // Zero-copy optimization: read directly into i64 buffer
                 let byte_offset = HEADER_SIZE + (start_row * 8) as u64;
@@ -7813,7 +8154,8 @@ impl OnDemandStorage {
         
         match dtype {
             ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
-            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 => {
+            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+            ColumnType::Timestamp | ColumnType::Date => {
                 Self::read_numeric_scattered_optimized::<i64>(mmap_cache, file, index, row_indices, HEADER_SIZE)
                     .map(ColumnData::Int64)
             }
@@ -9055,6 +9397,8 @@ impl OnDemandStorage {
             DataType::String => ColumnType::String,
             DataType::Bool => ColumnType::Bool,
             DataType::Binary => ColumnType::Binary,
+            DataType::Timestamp => ColumnType::Timestamp,
+            DataType::Date => ColumnType::Date,
             _ => ColumnType::String,
         };
         
@@ -9583,6 +9927,7 @@ impl OnDemandStorage {
         
         // Write Row Groups
         let mut rg_metas: Vec<RowGroupMeta> = Vec::new();
+        let mut all_zone_maps: RgZoneMaps = Vec::new();
         let mut actual_col_types: Vec<ColumnType> = Vec::new();
         let mut chunk_start = 0;
         
@@ -9612,68 +9957,135 @@ impl OnDemandStorage {
             let min_id = chunk_ids.iter().copied().min().unwrap_or(0);
             let max_id = chunk_ids.iter().copied().max().unwrap_or(0);
             
-            // RG header (32 bytes)
+            // Serialize RG body to buffer (IDs + deletion vector + columns)
+            let is_single_rg = chunk_start == 0 && chunk_end == active_count;
+            let null_bitmap_len = (chunk_rows + 7) / 8;
+            let mut body_buf: Vec<u8> = Vec::with_capacity(chunk_rows * 8 + chunk_rows * col_count);
+            {
+                let mut body_writer = std::io::Cursor::new(&mut body_buf);
+                
+                // IDs — bulk write via unsafe slice cast
+                let id_bytes = unsafe {
+                    std::slice::from_raw_parts(chunk_ids.as_ptr() as *const u8, chunk_ids.len() * 8)
+                };
+                body_writer.write_all(id_bytes)?;
+                
+                // Deletion vector (all zeros — fresh save, no deletes)
+                let del_vec_len = (chunk_rows + 7) / 8;
+                body_writer.write_all(&vec![0u8; del_vec_len])?;
+                
+                // Columns
+                for col_idx in 0..col_count {
+                    let chunk_col_owned;
+                    let chunk_col_ref: &ColumnData = if is_single_rg {
+                        &active_columns[col_idx]
+                    } else {
+                        chunk_col_owned = active_columns[col_idx].slice_range(chunk_start, chunk_end);
+                        &chunk_col_owned
+                    };
+                    
+                    // Dict-encode low-cardinality string columns for disk
+                    let dict_encoded;
+                    let processed: &ColumnData = if Self::should_dict_encode(chunk_col_ref) {
+                        dict_encoded = chunk_col_ref.to_dict_encoded().unwrap_or_else(|| chunk_col_ref.clone());
+                        &dict_encoded
+                    } else {
+                        chunk_col_ref
+                    };
+                    
+                    // Track actual type for footer schema
+                    if rg_metas.is_empty() {
+                        let actual_type = match processed {
+                            ColumnData::StringDict { .. } => ColumnType::StringDict,
+                            _ => schema_clone.columns[col_idx].1,
+                        };
+                        actual_col_types.push(actual_type);
+                    }
+                    
+                    // Null bitmap
+                    if is_single_rg && active_nulls[col_idx].len() == null_bitmap_len {
+                        body_writer.write_all(&active_nulls[col_idx])?;
+                    } else {
+                        let chunk_nulls = Self::slice_null_bitmap(
+                            &active_nulls[col_idx], chunk_start, chunk_end,
+                        );
+                        body_writer.write_all(&chunk_nulls)?;
+                    }
+                    processed.write_to(&mut body_writer)?;
+                }
+            }
+            
+            // LZ4 compress body if large enough
+            let (compress_flag, disk_body) = if body_buf.len() >= LZ4_MIN_BODY_SIZE {
+                let compressed = lz4_flex::compress_prepend_size(&body_buf);
+                if compressed.len() < body_buf.len() {
+                    (RG_COMPRESS_LZ4, compressed)
+                } else {
+                    (RG_COMPRESS_NONE, body_buf)
+                }
+            } else {
+                (RG_COMPRESS_NONE, body_buf)
+            };
+            
+            // RG header (32 bytes) — byte 28 = compression flag
             writer.write_all(MAGIC_ROW_GROUP)?;
             writer.write_all(&(chunk_rows as u32).to_le_bytes())?;
             writer.write_all(&(col_count as u32).to_le_bytes())?;
             writer.write_all(&min_id.to_le_bytes())?;
             writer.write_all(&max_id.to_le_bytes())?;
-            writer.write_all(&[0u8; 4])?;
+            writer.write_all(&[compress_flag, 0, 0, 0])?;
             
-            // IDs — bulk write via unsafe slice cast (avoids per-element loop)
-            let id_bytes = unsafe {
-                std::slice::from_raw_parts(chunk_ids.as_ptr() as *const u8, chunk_ids.len() * 8)
-            };
-            writer.write_all(id_bytes)?;
+            // RG body (possibly compressed)
+            writer.write_all(&disk_body)?;
             
-            // Deletion vector (all zeros — fresh save, no deletes)
-            let del_vec_len = (chunk_rows + 7) / 8;
-            writer.write_all(&vec![0u8; del_vec_len])?;
-            
-            // Columns — use direct reference for single-RG, slice for multi-RG
-            let is_single_rg = chunk_start == 0 && chunk_end == active_count;
-            let null_bitmap_len = (chunk_rows + 7) / 8;
+            // Compute zone maps for this RG's numeric columns
+            let mut rg_zmaps: Vec<RgColumnZoneMap> = Vec::new();
             for col_idx in 0..col_count {
-                // OPTIMIZATION: skip slice_range when chunk covers entire column (single-RG)
-                let chunk_col_owned;
                 let chunk_col_ref: &ColumnData = if is_single_rg {
                     &active_columns[col_idx]
                 } else {
-                    chunk_col_owned = active_columns[col_idx].slice_range(chunk_start, chunk_end);
-                    &chunk_col_owned
+                    // Already sliced above — re-slice for zone map
+                    // Use active_columns directly since we only need min/max
+                    &active_columns[col_idx]
                 };
-                
-                // Dict-encode low-cardinality string columns for disk
-                let dict_encoded;
-                let processed: &ColumnData = if Self::should_dict_encode(chunk_col_ref) {
-                    dict_encoded = chunk_col_ref.to_dict_encoded().unwrap_or_else(|| chunk_col_ref.clone());
-                    &dict_encoded
-                } else {
-                    chunk_col_ref
-                };
-                
-                // Track actual type for footer schema
-                if rg_metas.is_empty() {
-                    let actual_type = match processed {
-                        ColumnData::StringDict { .. } => ColumnType::StringDict,
-                        _ => schema_clone.columns[col_idx].1,
-                    };
-                    actual_col_types.push(actual_type);
+                match chunk_col_ref {
+                    ColumnData::Int64(data) => {
+                        if !data.is_empty() {
+                            let slice = if is_single_rg {
+                                &data[..]
+                            } else {
+                                &data[chunk_start..chunk_end]
+                            };
+                            let (mut mn, mut mx) = (i64::MAX, i64::MIN);
+                            for &v in slice { mn = mn.min(v); mx = mx.max(v); }
+                            rg_zmaps.push(RgColumnZoneMap {
+                                col_idx: col_idx as u16, min_bits: mn, max_bits: mx,
+                                has_nulls: false, is_float: false,
+                            });
+                        }
+                    }
+                    ColumnData::Float64(data) => {
+                        if !data.is_empty() {
+                            let slice = if is_single_rg {
+                                &data[..]
+                            } else {
+                                &data[chunk_start..chunk_end]
+                            };
+                            let (mut mn, mut mx) = (f64::INFINITY, f64::NEG_INFINITY);
+                            for &v in slice { if v < mn { mn = v; } if v > mx { mx = v; } }
+                            rg_zmaps.push(RgColumnZoneMap {
+                                col_idx: col_idx as u16,
+                                min_bits: mn.to_bits() as i64,
+                                max_bits: mx.to_bits() as i64,
+                                has_nulls: false, is_float: true,
+                            });
+                        }
+                    }
+                    _ => {}
                 }
-                
-                // Null bitmap
-                if is_single_rg && active_nulls[col_idx].len() == null_bitmap_len {
-                    writer.write_all(&active_nulls[col_idx])?;
-                } else {
-                    let chunk_nulls = Self::slice_null_bitmap(
-                        &active_nulls[col_idx], chunk_start, chunk_end,
-                    );
-                    writer.write_all(&chunk_nulls)?;
-                }
-                // OPTIMIZATION: write_to avoids intermediate Vec<u8> allocation
-                processed.write_to(&mut writer)?;
             }
-            
+            all_zone_maps.push(rg_zmaps);
+
             let rg_end = writer.stream_position()?;
             rg_metas.push(RowGroupMeta {
                 offset: rg_offset, data_size: rg_end - rg_offset,
@@ -9702,6 +10114,7 @@ impl OnDemandStorage {
         let footer = V4Footer {
             schema: modified_schema,
             row_groups: rg_metas.clone(),
+            zone_maps: all_zone_maps,
         };
         writer.write_all(&footer.to_bytes())?;
         writer.flush()?;
@@ -9832,7 +10245,19 @@ impl OnDemandStorage {
             let mut rg_buf = vec![0u8; rg_size];
             mmap.read_at(file, &mut rg_buf, rg_meta.offset)?;
             
-            let mut pos = 32; // skip RG header (32 bytes)
+            // Check compression flag at RG header byte 28
+            let compress_flag = if rg_buf.len() >= 32 { rg_buf[28] } else { RG_COMPRESS_NONE };
+            
+            // Get the body bytes (after 32-byte RG header), decompressing if needed
+            let decompressed_buf: Vec<u8>;
+            let body: &[u8] = if compress_flag == RG_COMPRESS_LZ4 {
+                decompressed_buf = lz4_flex::decompress_size_prepended(&rg_buf[32..])
+                    .map_err(|e| err_data(&format!("LZ4 decompress failed: {}", e)))?;
+                &decompressed_buf
+            } else {
+                &rg_buf[32..]
+            };
+            let mut pos: usize = 0;
             
             // Parse IDs — OPTIMIZATION: bulk memcpy instead of per-element loop
             let ids_before = all_ids.len();
@@ -9840,7 +10265,7 @@ impl OnDemandStorage {
             all_ids.resize(ids_before + rg_rows, 0);
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    rg_buf[pos..].as_ptr(),
+                    body[pos..].as_ptr(),
                     all_ids[ids_before..].as_mut_ptr() as *mut u8,
                     id_byte_len,
                 );
@@ -9852,7 +10277,7 @@ impl OnDemandStorage {
             
             // Read deletion vector and merge into flat bitmap
             let del_vec_len = (rg_rows + 7) / 8;
-            let del_bytes = &rg_buf[pos..pos + del_vec_len];
+            let del_bytes = &body[pos..pos + del_vec_len];
             let needed_len = (ids_before + rg_rows + 7) / 8;
             if all_deleted.len() < needed_len {
                 all_deleted.resize(needed_len, 0);
@@ -9877,7 +10302,7 @@ impl OnDemandStorage {
             let null_bitmap_len = (rg_rows + 7) / 8;
             for col_idx in 0..col_count {
                 // Read null bitmap
-                let null_bytes = &rg_buf[pos..pos + null_bitmap_len];
+                let null_bytes = &body[pos..pos + null_bitmap_len];
                 
                 // Merge into flat nulls
                 let flat_start = ids_before;
@@ -9904,7 +10329,7 @@ impl OnDemandStorage {
                 // Parse column data using from_bytes_typed
                 let col_type = footer.schema.columns[col_idx].1;
                 let (col_data, consumed) = ColumnData::from_bytes_typed(
-                    &rg_buf[pos..], col_type,
+                    &body[pos..], col_type,
                 )?;
                 pos += consumed;
                 
@@ -10180,55 +10605,76 @@ impl OnDemandStorage {
         let min_id = new_ids.iter().copied().min().unwrap_or(0);
         let max_id = new_ids.iter().copied().max().unwrap_or(0);
         
-        // Write RG header (32 bytes)
+        // Serialize RG body to buffer (IDs + deletion vector + columns)
+        let null_bitmap_len = (rg_rows + 7) / 8;
+        let mut body_buf: Vec<u8> = Vec::with_capacity(rg_rows * 8 + rg_rows * col_count);
+        {
+            let mut body_writer = std::io::Cursor::new(&mut body_buf);
+            
+            // IDs
+            for &id in new_ids {
+                body_writer.write_all(&id.to_le_bytes())?;
+            }
+            
+            // Deletion vector (all zeros)
+            let del_vec_len = (rg_rows + 7) / 8;
+            body_writer.write_all(&vec![0u8; del_vec_len])?;
+            
+            // Columns
+            for col_idx in 0..col_count {
+                // Null bitmap
+                let col_nulls = new_nulls.get(col_idx).map(|v| v.as_slice()).unwrap_or(&[]);
+                let padded = if col_nulls.len() < null_bitmap_len {
+                    let mut v = vec![0u8; null_bitmap_len];
+                    let copy = col_nulls.len().min(null_bitmap_len);
+                    v[..copy].copy_from_slice(&col_nulls[..copy]);
+                    v
+                } else {
+                    col_nulls[..null_bitmap_len].to_vec()
+                };
+                body_writer.write_all(&padded)?;
+                
+                // Column data — dict-encode if footer schema expects StringDict
+                if col_idx < new_columns.len() {
+                    let col = &new_columns[col_idx];
+                    if col_idx < footer.schema.columns.len()
+                        && footer.schema.columns[col_idx].1 == ColumnType::StringDict
+                        && matches!(col, ColumnData::String { .. })
+                    {
+                        if let Some(dict) = col.to_dict_encoded() {
+                            dict.write_to(&mut body_writer)?;
+                        } else {
+                            col.write_to(&mut body_writer)?;
+                        }
+                    } else {
+                        col.write_to(&mut body_writer)?;
+                    }
+                }
+            }
+        }
+        
+        // LZ4 compress body if large enough
+        let (compress_flag, disk_body) = if body_buf.len() >= LZ4_MIN_BODY_SIZE {
+            let compressed = lz4_flex::compress_prepend_size(&body_buf);
+            if compressed.len() < body_buf.len() {
+                (RG_COMPRESS_LZ4, compressed)
+            } else {
+                (RG_COMPRESS_NONE, body_buf)
+            }
+        } else {
+            (RG_COMPRESS_NONE, body_buf)
+        };
+        
+        // Write RG header (32 bytes) — byte 28 = compression flag
         writer.write_all(MAGIC_ROW_GROUP)?;
         writer.write_all(&(rg_rows as u32).to_le_bytes())?;
         writer.write_all(&(col_count as u32).to_le_bytes())?;
         writer.write_all(&min_id.to_le_bytes())?;
         writer.write_all(&max_id.to_le_bytes())?;
-        writer.write_all(&[0u8; 4])?;
+        writer.write_all(&[compress_flag, 0, 0, 0])?;
         
-        // IDs
-        for &id in new_ids {
-            writer.write_all(&id.to_le_bytes())?;
-        }
-        
-        // Deletion vector (all zeros)
-        let del_vec_len = (rg_rows + 7) / 8;
-        writer.write_all(&vec![0u8; del_vec_len])?;
-        
-        // Columns
-        let null_bitmap_len = (rg_rows + 7) / 8;
-        for col_idx in 0..col_count {
-            // Null bitmap
-            let col_nulls = new_nulls.get(col_idx).map(|v| v.as_slice()).unwrap_or(&[]);
-            let padded = if col_nulls.len() < null_bitmap_len {
-                let mut v = vec![0u8; null_bitmap_len];
-                let copy = col_nulls.len().min(null_bitmap_len);
-                v[..copy].copy_from_slice(&col_nulls[..copy]);
-                v
-            } else {
-                col_nulls[..null_bitmap_len].to_vec()
-            };
-            writer.write_all(&padded)?;
-            
-            // Column data — dict-encode if footer schema expects StringDict
-            if col_idx < new_columns.len() {
-                let col = &new_columns[col_idx];
-                if col_idx < footer.schema.columns.len()
-                    && footer.schema.columns[col_idx].1 == ColumnType::StringDict
-                    && matches!(col, ColumnData::String { .. })
-                {
-                    if let Some(dict) = col.to_dict_encoded() {
-                        dict.write_to(&mut writer)?;
-                    } else {
-                        col.write_to(&mut writer)?;
-                    }
-                } else {
-                    col.write_to(&mut writer)?;
-                }
-            }
-        }
+        // RG body (possibly compressed)
+        writer.write_all(&disk_body)?;
         
         let rg_end = writer.stream_position()?;
         
@@ -11338,7 +11784,7 @@ impl OnDemandStorage {
     /// Check if any column has constraints defined
     pub fn has_constraints(&self) -> bool {
         let schema = self.schema.read();
-        schema.constraints.iter().any(|c| c.not_null || c.primary_key || c.unique)
+        schema.constraints.iter().any(|c| c.not_null || c.primary_key || c.unique || c.check_expr_sql.is_some() || c.foreign_key.is_some())
     }
 
     /// Set constraints for a column by name
@@ -11560,7 +12006,8 @@ impl OnDemandStorage {
             for (col_name, col_type) in &schema.columns {
                 match col_type {
                     ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
-                    ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 => {
+                    ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+                    ColumnType::Timestamp | ColumnType::Date => {
                         int_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
                     ColumnType::Float64 | ColumnType::Float32 => {
@@ -12273,6 +12720,215 @@ mod tests {
             assert_eq!(vals, &[20, 30]);
         } else {
             panic!("Expected Int64 for partial age read");
+        }
+    }
+
+    // ====== LZ4 Compression Tests ======
+
+    #[test]
+    fn test_lz4_compression_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lz4_test.apex");
+
+        // Insert enough data to trigger LZ4 (body > 512 bytes)
+        {
+            let storage = OnDemandStorage::create(&path).unwrap();
+            let mut int_cols = HashMap::new();
+            let ids: Vec<i64> = (0..200).collect();
+            int_cols.insert("id".to_string(), ids);
+            let mut str_cols = HashMap::new();
+            let names: Vec<String> = (0..200).map(|i| format!("name_{:04}", i)).collect();
+            str_cols.insert("name".to_string(), names);
+            storage.insert_typed(int_cols, HashMap::new(), str_cols, HashMap::new(), HashMap::new()).unwrap();
+            storage.save_v4().unwrap();
+        }
+
+        // Reopen and verify data survives LZ4 compression
+        {
+            let storage = OnDemandStorage::open(&path).unwrap();
+            storage.open_v4_data().unwrap();
+            let data = storage.read_columns(Some(&["id", "name"]), 0, None).unwrap();
+            if let ColumnData::Int64(vals) = &data["id"] {
+                assert_eq!(vals.len(), 200);
+                assert_eq!(vals[0], 0);
+                assert_eq!(vals[199], 199);
+            } else {
+                panic!("Expected Int64 for id");
+            }
+            if let ColumnData::String { offsets, data: sdata } = &data["name"] {
+                let first = std::str::from_utf8(&sdata[offsets[0] as usize..offsets[1] as usize]).unwrap();
+                assert_eq!(first, "name_0000");
+                let last_start = offsets[199] as usize;
+                let last_end = offsets[200] as usize;
+                let last = std::str::from_utf8(&sdata[last_start..last_end]).unwrap();
+                assert_eq!(last, "name_0199");
+            } else {
+                panic!("Expected String for name");
+            }
+        }
+    }
+
+    #[test]
+    fn test_lz4_small_data_no_compression() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("small.apex");
+
+        {
+            let storage = OnDemandStorage::create(&path).unwrap();
+            let mut int_cols = HashMap::new();
+            int_cols.insert("a".to_string(), vec![1i64, 2, 3]);
+            storage.insert_typed(int_cols, HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new()).unwrap();
+            storage.save_v4().unwrap();
+        }
+        {
+            let storage = OnDemandStorage::open(&path).unwrap();
+            storage.open_v4_data().unwrap();
+            let data = storage.read_columns(Some(&["a"]), 0, None).unwrap();
+            if let ColumnData::Int64(vals) = &data["a"] {
+                assert_eq!(vals, &[1, 2, 3]);
+            } else {
+                panic!("Expected Int64");
+            }
+        }
+    }
+
+    #[test]
+    fn test_lz4_mixed_types() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mixed.apex");
+
+        {
+            let storage = OnDemandStorage::create(&path).unwrap();
+            let n = 200;
+            let mut int_cols = HashMap::new();
+            int_cols.insert("i".to_string(), (0..n).map(|x| x as i64).collect());
+            let mut float_cols = HashMap::new();
+            float_cols.insert("f".to_string(), (0..n).map(|x| x as f64 * 0.5).collect());
+            let mut str_cols = HashMap::new();
+            str_cols.insert("s".to_string(), (0..n).map(|x| format!("v{}", x)).collect());
+            let mut bool_cols = HashMap::new();
+            bool_cols.insert("b".to_string(), (0..n).map(|x| x % 2 == 0).collect());
+            storage.insert_typed(int_cols, float_cols, str_cols, HashMap::new(), bool_cols).unwrap();
+            storage.save_v4().unwrap();
+        }
+        {
+            let storage = OnDemandStorage::open(&path).unwrap();
+            storage.open_v4_data().unwrap();
+            let data = storage.read_columns(None, 0, None).unwrap();
+            if let ColumnData::Int64(vals) = &data["i"] {
+                assert_eq!(vals.len(), 200);
+                assert_eq!(vals[100], 100);
+            } else {
+                panic!("Expected Int64 for i");
+            }
+            if let ColumnData::Float64(vals) = &data["f"] {
+                assert!((vals[100] - 50.0).abs() < 0.01);
+            } else {
+                panic!("Expected Float64 for f");
+            }
+        }
+    }
+
+    // ====== Constraint Serialization Tests ======
+
+    #[test]
+    fn test_check_constraint_serialization() {
+        let mut schema = OnDemandSchema::new();
+        schema.add_column_with_constraints("age", ColumnType::Int64, ColumnConstraints {
+            not_null: false,
+            primary_key: false,
+            unique: false,
+            default_value: None,
+            check_expr_sql: Some("age > 0".to_string()),
+            foreign_key: None,
+        });
+
+        let bytes = schema.to_bytes();
+        let restored = OnDemandSchema::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.columns.len(), 1);
+        assert_eq!(restored.constraints[0].check_expr_sql, Some("age > 0".to_string()));
+    }
+
+    #[test]
+    fn test_fk_constraint_serialization() {
+        let mut schema = OnDemandSchema::new();
+        schema.add_column_with_constraints("dept_id", ColumnType::Int64, ColumnConstraints {
+            not_null: false,
+            primary_key: false,
+            unique: false,
+            default_value: None,
+            check_expr_sql: None,
+            foreign_key: Some(("departments".to_string(), "id".to_string())),
+        });
+
+        let bytes = schema.to_bytes();
+        let restored = OnDemandSchema::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.constraints[0].foreign_key, Some(("departments".to_string(), "id".to_string())));
+    }
+
+    #[test]
+    fn test_all_constraints_serialization() {
+        let mut schema = OnDemandSchema::new();
+        schema.add_column_with_constraints("id", ColumnType::Int64, ColumnConstraints {
+            not_null: true,
+            primary_key: true,
+            unique: false,
+            default_value: None,
+            check_expr_sql: None,
+            foreign_key: None,
+        });
+        schema.add_column_with_constraints("val", ColumnType::Int64, ColumnConstraints {
+            not_null: true,
+            primary_key: false,
+            unique: true,
+            default_value: Some(DefaultValue::Int64(0)),
+            check_expr_sql: Some("val >= 0".to_string()),
+            foreign_key: Some(("other".to_string(), "val".to_string())),
+        });
+
+        let bytes = schema.to_bytes();
+        let restored = OnDemandSchema::from_bytes(&bytes).unwrap();
+
+        // Column 0: id
+        assert!(restored.constraints[0].primary_key);
+        assert!(restored.constraints[0].not_null);
+        assert!(restored.constraints[0].check_expr_sql.is_none());
+        assert!(restored.constraints[0].foreign_key.is_none());
+
+        // Column 1: val
+        assert!(restored.constraints[1].not_null);
+        assert!(restored.constraints[1].unique);
+        assert_eq!(restored.constraints[1].default_value, Some(DefaultValue::Int64(0)));
+        assert_eq!(restored.constraints[1].check_expr_sql, Some("val >= 0".to_string()));
+        assert_eq!(restored.constraints[1].foreign_key, Some(("other".to_string(), "val".to_string())));
+    }
+
+    #[test]
+    fn test_constraint_persisted_through_save_v4() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cons.apex");
+
+        {
+            let storage = OnDemandStorage::create(&path).unwrap();
+            let mut int_cols = HashMap::new();
+            int_cols.insert("val".to_string(), vec![1i64, 2, 3]);
+            storage.insert_typed(int_cols, HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new()).unwrap();
+            storage.set_column_constraints("val", ColumnConstraints {
+                not_null: true,
+                primary_key: false,
+                unique: false,
+                default_value: None,
+                check_expr_sql: Some("val > 0".to_string()),
+                foreign_key: Some(("parent".to_string(), "id".to_string())),
+            });
+            storage.save_v4().unwrap();
+        }
+        {
+            let storage = OnDemandStorage::open(&path).unwrap();
+            let cons = storage.get_column_constraints("val");
+            assert!(cons.not_null);
+            assert_eq!(cons.check_expr_sql, Some("val > 0".to_string()));
+            assert_eq!(cons.foreign_key, Some(("parent".to_string(), "id".to_string())));
         }
     }
 }

@@ -628,7 +628,7 @@ class ApexClient:
         self._check_connection()
         # DDL (CREATE TABLE) is allowed without a table selected
         sql_upper = sql.strip().upper()
-        if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE')):
+        if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE') or sql_upper.startswith('WITH ')):
             self._ensure_table_selected()
         with self._lock:
             # Determine if _id should be shown based on SQL (like ApexClient)
@@ -658,7 +658,12 @@ class ApexClient:
                         pass
             
             # Transaction commands: route through session-aware execute() binding
-            if sql_upper.startswith('BEGIN') or sql_upper in ('COMMIT', 'COMMIT;', 'ROLLBACK', 'ROLLBACK;'):
+            is_txn_cmd = (sql_upper.startswith('BEGIN') or 
+                         sql_upper in ('COMMIT', 'COMMIT;', 'ROLLBACK', 'ROLLBACK;') or
+                         sql_upper.startswith('SAVEPOINT') or
+                         sql_upper.startswith('RELEASE') or
+                         sql_upper.startswith('ROLLBACK TO'))
+            if is_txn_cmd:
                 result = self._storage.execute(sql)
                 # Track transaction state in Python client
                 if sql_upper.startswith('BEGIN'):
@@ -710,6 +715,10 @@ class ApexClient:
         """Validate that table names in SQL exist (skip for multi-statement SQL)"""
         # Skip validation for multi-statement SQL (contains CREATE TABLE/VIEW)
         if _RE_CREATE_TABLE.search(sql):
+            return
+        
+        # Skip validation for CTE queries (WITH ... AS ...)
+        if sql.strip().upper().startswith('WITH'):
             return
         
         # Extract table name from FROM clause

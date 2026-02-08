@@ -244,12 +244,20 @@ impl TxnManager {
                     let store = self.get_version_store(table);
                     store.insert(*row_id, commit_ts, data.clone());
                 }
-                TxnWrite::Delete { table, row_id, .. } => {
+                TxnWrite::Delete { table, row_id, old_data, .. } => {
                     let store = self.get_version_store(table);
+                    // Ensure base version exists so older snapshots can see the row
+                    if store.read_latest(*row_id).is_none() && !old_data.is_empty() {
+                        store.insert(*row_id, 1, old_data.clone()); // begin_ts=1: existed from start
+                    }
                     let _ = store.delete(*row_id, commit_ts);
                 }
-                TxnWrite::Update { table, row_id, new_data, .. } => {
+                TxnWrite::Update { table, row_id, old_data, new_data, .. } => {
                     let store = self.get_version_store(table);
+                    // Ensure base version exists so older snapshots can see old data
+                    if store.read_latest(*row_id).is_none() && !old_data.is_empty() {
+                        store.insert(*row_id, 1, old_data.clone()); // begin_ts=1: existed from start
+                    }
                     let _ = store.update(*row_id, commit_ts, new_data.clone());
                 }
             }

@@ -304,6 +304,11 @@ impl VersionStore {
         self.chains.read().len()
     }
 
+    /// Get read access to the chains map (for snapshot isolation visibility checks)
+    pub fn chains_ref(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<u64, VersionChain>> {
+        self.chains.read()
+    }
+
     /// Whether GC should run (heuristic)
     pub fn needs_gc(&self) -> bool {
         let total = self.total_versions();

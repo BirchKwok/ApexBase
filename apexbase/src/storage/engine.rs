@@ -416,6 +416,9 @@ impl StorageEngine {
             ids
         };
         
+        // Notify indexes about the new rows (keeps indexes in sync for Python store() API)
+        ApexExecutor::notify_indexes_after_write(table_path, &ids);
+        
         Ok(ids)
     }
     
@@ -839,7 +842,8 @@ impl StorageEngine {
                                     match col_type {
                                         ColumnType::Int64 | ColumnType::Int32 | ColumnType::Int16 |
                                         ColumnType::Int8 | ColumnType::UInt8 | ColumnType::UInt16 |
-                                        ColumnType::UInt32 | ColumnType::UInt64 => {
+                                        ColumnType::UInt32 | ColumnType::UInt64 |
+                                        ColumnType::Timestamp | ColumnType::Date => {
                                             let vals = int_columns.get(col_name)
                                                 .cloned().unwrap_or_else(|| vec![0; row_count]);
                                             new_columns.push(ColumnData::Int64(vals));
@@ -898,6 +902,7 @@ impl StorageEngine {
                                 match storage.append_row_group(&ids, &new_columns, &new_nulls) {
                                     Ok(()) => {
                                         self.invalidate(table_path);
+                                        ApexExecutor::notify_indexes_after_write(table_path, &ids);
                                         return Ok(ids);
                                     }
                                     Err(_) => {
@@ -924,6 +929,7 @@ impl StorageEngine {
         )?;
         backend.save()?;
         self.invalidate(table_path);
+        ApexExecutor::notify_indexes_after_write(table_path, &ids);
         Ok(ids)
     }
 }

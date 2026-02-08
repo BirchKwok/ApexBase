@@ -221,9 +221,11 @@ impl ApexStorageImpl {
                 "bool" | "boolean" => ColumnType::Bool,
                 "str" | "string" | "text" | "varchar" => ColumnType::String,
                 "bytes" | "binary" => ColumnType::Binary,
+                "timestamp" | "datetime" => ColumnType::Timestamp,
+                "date" => ColumnType::Date,
                 _ => return Err(PyValueError::new_err(format!(
                     "Unknown column type '{}' for column '{}'. Supported: int8, int16, int32, int64, \
-                     uint8, uint16, uint32, uint64, float32, float64, bool, string, binary",
+                     uint8, uint16, uint32, uint64, float32, float64, bool, string, binary, timestamp, date",
                     type_str, col_name
                 ))),
             };
@@ -1189,8 +1191,9 @@ impl ApexStorageImpl {
             self.invalidate_backend(&table_name);
         }
         
-        // For DDL (CREATE/DROP TABLE), don't require a current table
-        let table_path = if is_ddl {
+        // For DDL (CREATE/DROP TABLE) and CTE (WITH ...) queries, don't require a current table
+        let is_cte = sql_upper.starts_with("WITH ");
+        let table_path = if is_ddl || is_cte {
             self.get_current_table_path().unwrap_or_else(|_| self.base_dir.clone())
         } else {
             self.get_current_table_path()?
@@ -1767,6 +1770,8 @@ impl ApexStorageImpl {
             "bool" | "boolean" => crate::data::DataType::Bool,
             "str" | "string" | "text" => crate::data::DataType::String,
             "bytes" | "binary" => crate::data::DataType::Binary,
+            "timestamp" | "datetime" => crate::data::DataType::Timestamp,
+            "date" => crate::data::DataType::Date,
             _ => crate::data::DataType::String,
         };
         

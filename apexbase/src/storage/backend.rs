@@ -31,6 +31,8 @@ pub fn datatype_to_column_type(dt: &DataType) -> ColumnType {
         DataType::String => ColumnType::String,
         DataType::Bool => ColumnType::Bool,
         DataType::Binary => ColumnType::Binary,
+        DataType::Timestamp => ColumnType::Timestamp,
+        DataType::Date => ColumnType::Date,
         _ => ColumnType::String, // Fallback for complex types
     }
 }
@@ -44,6 +46,8 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::String | ColumnType::StringDict => DataType::String,
         ColumnType::Bool => DataType::Bool,
         ColumnType::Binary => DataType::Binary,
+        ColumnType::Timestamp => DataType::Timestamp,
+        ColumnType::Date => DataType::Date,
         ColumnType::Null => DataType::String,
     }
 }

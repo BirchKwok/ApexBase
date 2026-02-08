@@ -98,6 +98,8 @@ pub struct TxnContext {
     read_only: bool,
     /// Whether the transaction has been committed or aborted
     finished: bool,
+    /// Savepoints: (name, write_set_len_at_savepoint, write_keys_snapshot)
+    savepoints: Vec<(String, usize, HashSet<(String, u64)>)>,
 }
 
 impl TxnContext {
@@ -112,6 +114,7 @@ impl TxnContext {
             tables_touched: HashSet::new(),
             read_only,
             finished: false,
+            savepoints: Vec::new(),
         }
     }
 
@@ -273,12 +276,46 @@ impl TxnContext {
         self.write_set.iter().rev().cloned().collect()
     }
 
+    // ========================================================================
+    // Savepoints
+    // ========================================================================
+
+    /// Create a savepoint at the current write-set position
+    pub fn savepoint(&mut self, name: &str) {
+        self.savepoints.push((name.to_string(), self.write_set.len(), self.write_keys.clone()));
+    }
+
+    /// Rollback to a named savepoint — truncate write_set and restore write_keys
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> io::Result<()> {
+        if let Some(pos) = self.savepoints.iter().rposition(|(n, _, _)| n == name) {
+            let (_, ws_len, keys_snapshot) = self.savepoints[pos].clone();
+            self.write_set.truncate(ws_len);
+            self.write_keys = keys_snapshot;
+            // Remove this savepoint and all later ones
+            self.savepoints.truncate(pos);
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::NotFound, format!("Savepoint '{}' not found", name)))
+        }
+    }
+
+    /// Release a named savepoint (just removes it, keeps writes)
+    pub fn release_savepoint(&mut self, name: &str) -> io::Result<()> {
+        if let Some(pos) = self.savepoints.iter().rposition(|(n, _, _)| n == name) {
+            self.savepoints.remove(pos);
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::NotFound, format!("Savepoint '{}' not found", name)))
+        }
+    }
+
     /// Clear all state (after commit or abort)
     pub fn clear(&mut self) {
         self.read_set.clear();
         self.write_set.clear();
         self.write_keys.clear();
         self.tables_touched.clear();
+        self.savepoints.clear();
         self.finished = true;
     }
 }

@@ -534,6 +534,9 @@ impl ApexExecutor {
             SqlStatement::Insert { values, columns, .. } => {
                 Self::execute_insert(storage_path, columns.as_deref(), &values)
             }
+            SqlStatement::InsertOnConflict { values, columns, conflict_columns, do_update, .. } => {
+                Self::execute_insert_on_conflict(storage_path, columns.as_deref(), &values, &conflict_columns, do_update.as_deref())
+            }
             SqlStatement::InsertSelect { columns, query, .. } => {
                 Self::execute_insert_select(storage_path, columns.as_deref(), *query, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
             }
@@ -549,8 +552,8 @@ impl ApexExecutor {
             SqlStatement::Explain { stmt, analyze } => {
                 Self::execute_explain(*stmt, analyze, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
             }
-            SqlStatement::Cte { name, body, main } => {
-                Self::execute_cte(&name, *body, *main, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
+            SqlStatement::Cte { name, column_aliases, body, main, recursive } => {
+                Self::execute_cte(&name, &column_aliases, *body, *main, recursive, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
             }
             SqlStatement::BeginTransaction { read_only } => {
                 Self::execute_begin(read_only)
@@ -600,9 +603,28 @@ impl ApexExecutor {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 Self::execute_insert(&table_path, columns.as_deref(), &values)
             }
+            SqlStatement::InsertOnConflict { table, columns, values, conflict_columns, do_update } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                Self::execute_insert_on_conflict(&table_path, columns.as_deref(), &values, &conflict_columns, do_update.as_deref())
+            }
+            SqlStatement::AnalyzeTable { table } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                Self::execute_analyze(&table_path, &table)
+            }
+            SqlStatement::CopyToParquet { table, file_path } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                Self::execute_copy_to_parquet(&table_path, &table, &file_path)
+            }
+            SqlStatement::CopyFromParquet { table, file_path } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                Self::execute_copy_from_parquet(&table_path, &table, &file_path, base_dir.as_ref(), default_table_path.as_ref())
+            }
             SqlStatement::InsertSelect { table, columns, query } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 Self::execute_insert_select(&table_path, columns.as_deref(), *query, base_dir, default_table_path)
+            }
+            SqlStatement::CreateTableAs { table, query, if_not_exists } => {
+                Self::execute_create_table_as(base_dir, default_table_path, &table, *query, if_not_exists)
             }
             SqlStatement::Delete { table, where_clause } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
@@ -624,8 +646,8 @@ impl ApexExecutor {
                 Self::execute_explain(*stmt, analyze, base_dir, default_table_path)
             }
             // CTE
-            SqlStatement::Cte { name, body, main } => {
-                Self::execute_cte(&name, *body, *main, base_dir, default_table_path)
+            SqlStatement::Cte { name, column_aliases, body, main, recursive } => {
+                Self::execute_cte(&name, &column_aliases, *body, *main, recursive, base_dir, default_table_path)
             }
             // Transaction Statements
             SqlStatement::BeginTransaction { read_only } => {
@@ -768,7 +790,15 @@ impl ApexExecutor {
                 let sub_result = Self::execute_select_with_base_dir(*sub_stmt.clone(), &sub_path, base_dir, default_table_path)?;
                 sub_result.to_record_batch()?
             }
-            _ => {
+            None => {
+                // No FROM clause (e.g., SELECT 1, 1) — create a single-row virtual batch
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("_dummy", ArrowDataType::Int64, false),
+                ]));
+                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![0i64])) as ArrayRef])
+                    .map_err(|e| err_data(e.to_string()))?
+            }
+            Some(FromItem::Table { .. }) => {
                 // Normal table - read from storage
                 // If file doesn't exist (e.g., after drop_if_exists), return empty batch
                 if !storage_path.exists() {
@@ -1034,44 +1064,53 @@ impl ApexExecutor {
             return Ok(None);
         }
 
-        // Extract equality predicate: col = literal
-        let (col_name, hint) = match where_clause {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                if let SqlExpr::Column(col) = left.as_ref() {
-                    if col == "_id" {
-                        return Ok(None); // _id lookups already have a dedicated O(1) fast path
-                    }
-                    if let Some(val) = Self::expr_to_value(right) {
-                        (col.clone(), PredicateHint::Eq(val))
-                    } else {
-                        return Ok(None);
-                    }
-                } else {
-                    return Ok(None);
-                }
-            }
-            SqlExpr::In { column, values, negated } => {
-                if *negated || column == "_id" {
-                    return Ok(None);
-                }
-                (column.clone(), PredicateHint::In(values.clone()))
-            }
-            _ => return Ok(None),
-        };
+        // Extract predicate(s): single or AND-combined predicates
+        // Flatten AND chains into individual (col_name, hint) pairs
+        let mut predicates: Vec<(String, PredicateHint)> = Vec::new();
+        Self::extract_index_predicates(where_clause, &mut predicates);
 
-        // Check if we have an index for this column
+        if predicates.is_empty() {
+            return Ok(None);
+        }
+
+        // Check which predicates have indexes available
         let (bd, tname) = base_dir_and_table(storage_path);
         let idx_mgr_arc = get_index_manager(&bd, &tname);
         let mut idx_mgr = idx_mgr_arc.lock();
 
-        if !idx_mgr.has_index_on(&col_name) {
+        // Filter to predicates that have indexes
+        let indexed_preds: Vec<(String, PredicateHint)> = predicates.into_iter()
+            .filter(|(col, _)| idx_mgr.has_index_on(col))
+            .collect();
+
+        if indexed_preds.is_empty() {
             return Ok(None);
         }
 
-        // Do the index lookup
-        let lookup_result = idx_mgr.lookup(&col_name, &hint)?;
-        let row_ids = match lookup_result {
-            Some(r) => r.row_ids,
+        // Look up each indexed predicate and intersect row ID sets
+        let mut row_ids: Option<Vec<u64>> = None;
+        for (col_name, hint) in &indexed_preds {
+            let lookup_result = idx_mgr.lookup(col_name, hint)?;
+            match lookup_result {
+                Some(r) => {
+                    row_ids = Some(match row_ids {
+                        None => r.row_ids,
+                        Some(existing) => {
+                            // Intersect: keep only IDs in both sets
+                            let set: std::collections::HashSet<u64> = r.row_ids.into_iter().collect();
+                            existing.into_iter().filter(|id| set.contains(id)).collect()
+                        }
+                    });
+                }
+                None => {
+                    // Index couldn't satisfy this predicate, skip it
+                    // (still use other index results if available)
+                }
+            }
+        }
+
+        let row_ids = match row_ids {
+            Some(ids) => ids,
             None => return Ok(None),
         };
 
@@ -1142,6 +1181,65 @@ impl ApexExecutor {
             return Ok(Some(ApexResult::Empty(result.schema())));
         }
         Ok(Some(ApexResult::Data(result)))
+    }
+
+    /// Extract index-usable predicates from an expression (flattens AND chains).
+    /// Each predicate is (column_name, PredicateHint).
+    fn extract_index_predicates(expr: &SqlExpr, out: &mut Vec<(String, crate::storage::index::index_manager::PredicateHint)>) {
+        use crate::query::sql_parser::BinaryOperator;
+        use crate::storage::index::index_manager::PredicateHint;
+        match expr {
+            // AND chain: recurse into both sides
+            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                Self::extract_index_predicates(left, out);
+                Self::extract_index_predicates(right, out);
+            }
+            // col OP literal or literal OP col
+            SqlExpr::BinaryOp { left, op, right } => {
+                if let SqlExpr::Column(col) = left.as_ref() {
+                    if col != "_id" {
+                        if let Some(val) = Self::expr_to_value(right) {
+                            let h = match op {
+                                BinaryOperator::Eq => Some(PredicateHint::Eq(val)),
+                                BinaryOperator::Gt => Some(PredicateHint::Gt(val)),
+                                BinaryOperator::Ge => Some(PredicateHint::Gte(val)),
+                                BinaryOperator::Lt => Some(PredicateHint::Lt(val)),
+                                BinaryOperator::Le => Some(PredicateHint::Lte(val)),
+                                _ => None,
+                            };
+                            if let Some(hint) = h { out.push((col.clone(), hint)); }
+                        }
+                    }
+                } else if let SqlExpr::Column(col) = right.as_ref() {
+                    if col != "_id" {
+                        if let Some(val) = Self::expr_to_value(left) {
+                            let h = match op {
+                                BinaryOperator::Eq => Some(PredicateHint::Eq(val)),
+                                BinaryOperator::Gt => Some(PredicateHint::Lt(val)),
+                                BinaryOperator::Ge => Some(PredicateHint::Lte(val)),
+                                BinaryOperator::Lt => Some(PredicateHint::Gt(val)),
+                                BinaryOperator::Le => Some(PredicateHint::Gte(val)),
+                                _ => None,
+                            };
+                            if let Some(hint) = h { out.push((col.clone(), hint)); }
+                        }
+                    }
+                }
+            }
+            SqlExpr::Between { column, low, high, negated } => {
+                if !negated && column != "_id" {
+                    if let (Some(low_val), Some(high_val)) = (Self::expr_to_value(low), Self::expr_to_value(high)) {
+                        out.push((column.clone(), PredicateHint::Range { low: low_val, high: high_val }));
+                    }
+                }
+            }
+            SqlExpr::In { column, values, negated } => {
+                if !negated && column != "_id" {
+                    out.push((column.clone(), PredicateHint::In(values.clone())));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Convert a SqlExpr literal to a Value (for index lookup)
@@ -2638,17 +2736,22 @@ impl ApexExecutor {
                 }
             };
 
-            // Extract join keys from ON condition
-            let (left_key, right_key) = Self::extract_join_keys(&join_clause.on)?;
+            // CROSS JOIN has no ON clause — use cartesian product directly
+            if join_clause.join_type == JoinType::Cross {
+                result_batch = Self::cross_join(&result_batch, &right_batch)?;
+            } else {
+                // Extract join keys from ON condition
+                let (left_key, right_key) = Self::extract_join_keys(&join_clause.on)?;
 
-            // Perform the join
-            result_batch = Self::hash_join(
-                &result_batch,
-                &right_batch,
-                &left_key,
-                &right_key,
-                &join_clause.join_type,
-            )?;
+                // Perform the join
+                result_batch = Self::hash_join(
+                    &result_batch,
+                    &right_batch,
+                    &left_key,
+                    &right_key,
+                    &join_clause.join_type,
+                )?;
+            }
         }
 
         if result_batch.num_rows() == 0 {
@@ -2793,6 +2896,22 @@ impl ApexExecutor {
         right_key: &str,
         join_type: &JoinType,
     ) -> io::Result<RecordBatch> {
+        // RIGHT JOIN → LEFT JOIN with swapped tables, then reorder columns
+        if *join_type == JoinType::Right {
+            let swapped = Self::hash_join(right, left, right_key, left_key, &JoinType::Left)?;
+            return Self::reorder_join_columns(&swapped, left, right, right_key);
+        }
+
+        // FULL OUTER JOIN → LEFT JOIN + append unmatched right rows
+        if *join_type == JoinType::Full {
+            return Self::full_outer_join(left, right, left_key, right_key);
+        }
+
+        // CROSS JOIN → cartesian product
+        if *join_type == JoinType::Cross {
+            return Self::cross_join(left, right);
+        }
+
         // Get key columns
         let left_key_col = left.column_by_name(left_key)
             .ok_or_else(|| io::Error::new(
@@ -3017,6 +3136,202 @@ impl ApexExecutor {
 
         RecordBatch::try_new(result_schema, columns)
             .map_err(|e| err_data( e.to_string()))
+    }
+
+    /// Reorder columns from a swapped LEFT JOIN back to original left→right order.
+    /// Used by RIGHT JOIN: we did LEFT JOIN(right, left) so result has right cols first.
+    /// We need to put left cols first, right cols second (excluding join key from right).
+    fn reorder_join_columns(
+        swapped_result: &RecordBatch,
+        original_left: &RecordBatch,
+        original_right: &RecordBatch,
+        right_key: &str,
+    ) -> io::Result<RecordBatch> {
+        // swapped_result has: [right_columns..., left_columns_minus_join_key...]
+        // We want:            [left_columns...(nullable), right_columns_minus_join_key...]
+        let left_ncols = original_left.num_columns();
+        let right_ncols = original_right.num_columns();
+        // In swapped result: first right_ncols are from original_right, rest are from original_left (minus key)
+        let right_cols_in_result = right_ncols;
+        let left_cols_in_result = swapped_result.num_columns() - right_cols_in_result;
+
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+
+        // Left columns come from the tail of swapped_result (but they are nullable — RIGHT JOIN preserves all right rows)
+        for i in 0..left_cols_in_result {
+            let col_idx = right_cols_in_result + i;
+            fields.push(swapped_result.schema().field(col_idx).as_ref().clone());
+            arrays.push(swapped_result.column(col_idx).clone());
+        }
+
+        // Right columns (excluding join key) come from the head of swapped_result
+        let swapped_schema = swapped_result.schema();
+        for i in 0..right_cols_in_result {
+            let field = swapped_schema.field(i);
+            if field.name() == right_key { continue; }
+            let new_name = if fields.iter().any(|f| f.name() == field.name()) {
+                format!("{}_right", field.name())
+            } else {
+                field.name().clone()
+            };
+            fields.push(Field::new(&new_name, field.data_type().clone(), true));
+            arrays.push(swapped_result.column(i).clone());
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, arrays)
+            .map_err(|e| err_data(e.to_string()))
+    }
+
+    /// FULL OUTER JOIN: LEFT JOIN + append unmatched right rows with NULL left columns
+    fn full_outer_join(
+        left: &RecordBatch,
+        right: &RecordBatch,
+        left_key: &str,
+        right_key: &str,
+    ) -> io::Result<RecordBatch> {
+        // Step 1: Do LEFT JOIN to get all left rows + matched right rows
+        let left_result = Self::hash_join(left, right, left_key, right_key, &JoinType::Left)?;
+
+        // Step 2: Find unmatched right rows
+        let left_key_col = left.column_by_name(left_key)
+            .ok_or_else(|| err_data(format!("Left join key '{}' not found", left_key)))?;
+        let right_key_col = right.column_by_name(right_key)
+            .ok_or_else(|| err_data(format!("Right join key '{}' not found", right_key)))?;
+
+        // Build hash set of left keys
+        let mut left_key_hashes: ahash::AHashSet<u64> = ahash::AHashSet::with_capacity(left.num_rows());
+        for i in 0..left.num_rows() {
+            left_key_hashes.insert(Self::hash_array_value_fast(left_key_col, i));
+        }
+
+        // Find right rows whose keys don't exist in left
+        let mut unmatched_right_indices: Vec<u32> = Vec::new();
+        for i in 0..right.num_rows() {
+            let hash = Self::hash_array_value_fast(right_key_col, i);
+            if !left_key_hashes.contains(&hash) {
+                unmatched_right_indices.push(i as u32);
+            } else {
+                // Hash match doesn't guarantee value match — verify
+                let mut found = false;
+                for j in 0..left.num_rows() {
+                    if Self::arrays_equal_at(right_key_col, i, left_key_col, j) {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    unmatched_right_indices.push(i as u32);
+                }
+            }
+        }
+
+        if unmatched_right_indices.is_empty() {
+            return Ok(left_result);
+        }
+
+        // Step 3: Build rows for unmatched right: NULL left cols + right values
+        // Make all fields nullable for FULL OUTER JOIN (left side can be NULL for unmatched right rows)
+        let nullable_fields: Vec<Field> = left_result.schema().fields().iter()
+            .map(|f| Field::new(f.name(), f.data_type().clone(), true))
+            .collect();
+        let nullable_schema = Arc::new(Schema::new(nullable_fields));
+
+        // Re-wrap left_result columns with nullable schema
+        let left_result = RecordBatch::try_new(nullable_schema.clone(), left_result.columns().to_vec())
+            .map_err(|e| err_data(e.to_string()))?;
+
+        let left_ncols = left.num_columns();
+        let n_unmatched = unmatched_right_indices.len();
+        let right_take = arrow::array::UInt32Array::from(unmatched_right_indices);
+
+        let mut extra_columns: Vec<ArrayRef> = Vec::with_capacity(nullable_schema.fields().len());
+
+        // Left columns → all NULL
+        for i in 0..left_ncols {
+            let dt = nullable_schema.field(i).data_type();
+            extra_columns.push(arrow::array::new_null_array(dt, n_unmatched));
+        }
+
+        // Right columns (excluding join key) → take from right batch
+        for (col_idx, field) in right.schema().fields().iter().enumerate() {
+            if field.name() == right_key { continue; }
+            let taken = compute::take(right.column(col_idx).as_ref(), &right_take, None)
+                .map_err(|e| err_data(e.to_string()))?;
+            extra_columns.push(taken);
+        }
+
+        let extra_batch = RecordBatch::try_new(nullable_schema.clone(), extra_columns)
+            .map_err(|e| err_data(e.to_string()))?;
+
+        // Step 4: Concat left_result + extra_batch
+        arrow::compute::concat_batches(&nullable_schema, &[left_result, extra_batch])
+            .map_err(|e| err_data(e.to_string()))
+    }
+
+    /// CROSS JOIN: Cartesian product of two tables
+    fn cross_join(left: &RecordBatch, right: &RecordBatch) -> io::Result<RecordBatch> {
+        let left_rows = left.num_rows();
+        let right_rows = right.num_rows();
+        let total = left_rows * right_rows;
+
+        if total == 0 {
+            // Build empty schema
+            let mut fields: Vec<Field> = left.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+            for field in right.schema().fields() {
+                let new_name = if fields.iter().any(|f| f.name() == field.name()) {
+                    format!("{}_right", field.name())
+                } else {
+                    field.name().clone()
+                };
+                fields.push(Field::new(&new_name, field.data_type().clone(), true));
+            }
+            let schema = Arc::new(Schema::new(fields));
+            let empty_cols: Vec<ArrayRef> = schema.fields().iter().map(|f| arrow::array::new_null_array(f.data_type(), 0) as ArrayRef).collect();
+            return RecordBatch::try_new(schema, empty_cols)
+                .map_err(|e| err_data(e.to_string()));
+        }
+
+        // Build index arrays: left[0,0,...,1,1,...] right[0,1,2,...,0,1,2,...]
+        let mut left_idx: Vec<u32> = Vec::with_capacity(total);
+        let mut right_idx: Vec<u32> = Vec::with_capacity(total);
+        for l in 0..left_rows {
+            for r in 0..right_rows {
+                left_idx.push(l as u32);
+                right_idx.push(r as u32);
+            }
+        }
+
+        let left_take = arrow::array::UInt32Array::from(left_idx);
+        let right_take = arrow::array::UInt32Array::from(right_idx);
+
+        let mut fields: Vec<Field> = left.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(left.num_columns() + right.num_columns());
+
+        for col in left.columns() {
+            let taken = compute::take(col.as_ref(), &left_take, None)
+                .map_err(|e| err_data(e.to_string()))?;
+            columns.push(taken);
+        }
+
+        for field in right.schema().fields() {
+            let new_name = if fields.iter().any(|f| f.name() == field.name()) {
+                format!("{}_right", field.name())
+            } else {
+                field.name().clone()
+            };
+            fields.push(Field::new(&new_name, field.data_type().clone(), true));
+        }
+        for col in right.columns() {
+            let taken = compute::take(col.as_ref(), &right_take, None)
+                .map_err(|e| err_data(e.to_string()))?;
+            columns.push(taken);
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| err_data(e.to_string()))
     }
 
     /// Hash a value at given index in an array (legacy, uses DefaultHasher)
@@ -4183,8 +4498,22 @@ impl ApexExecutor {
                 let s = j.to_string();
                 Arc::new(StringArray::from(vec![s.as_str(); num_rows]))
             }
-            Value::Timestamp(ts) => Arc::new(Int64Array::from(vec![*ts; num_rows])),
-            Value::Date(d) => Arc::new(Int64Array::from(vec![*d as i64; num_rows])),
+            Value::Timestamp(ts) => {
+                use arrow::array::PrimitiveArray;
+                use arrow::datatypes::TimestampMicrosecondType;
+                use arrow::buffer::ScalarBuffer;
+                Arc::new(PrimitiveArray::<TimestampMicrosecondType>::new(
+                    ScalarBuffer::from(vec![*ts; num_rows]), None,
+                ))
+            }
+            Value::Date(d) => {
+                use arrow::array::PrimitiveArray;
+                use arrow::datatypes::Date32Type;
+                use arrow::buffer::ScalarBuffer;
+                Arc::new(PrimitiveArray::<Date32Type>::new(
+                    ScalarBuffer::from(vec![*d; num_rows]), None,
+                ))
+            }
             Value::Array(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -5275,10 +5604,337 @@ impl ApexExecutor {
                     Ok(Arc::new(StringArray::from(vec![Some(joined.as_str()); batch.num_rows()])))
                 } else { Err(err_data("GROUP_CONCAT requires string")) }
             }
+            // ===== JSON Functions =====
+            "JSON_EXTRACT" | "JSON_VALUE" => {
+                if args.len() != 2 { return Err(err_input("JSON_EXTRACT requires 2 arguments (json, path)")); }
+                let json_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let path_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                let n = batch.num_rows();
+                let mut result: Vec<Option<String>> = Vec::with_capacity(n);
+                let json_sa = json_arr.as_any().downcast_ref::<StringArray>();
+                let path_sa = path_arr.as_any().downcast_ref::<StringArray>();
+                for i in 0..n {
+                    if json_arr.is_null(i) || path_arr.is_null(i) {
+                        result.push(None);
+                        continue;
+                    }
+                    let json_str = json_sa.map(|a| a.value(i)).unwrap_or("");
+                    let path_str = path_sa.map(|a| a.value(i)).unwrap_or("");
+                    result.push(Self::json_extract_path(json_str, path_str));
+                }
+                Ok(Arc::new(StringArray::from(result)))
+            }
+            "JSON_TYPE" => {
+                if args.len() != 1 { return Err(err_input("JSON_TYPE requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let n = batch.num_rows();
+                let mut result: Vec<Option<String>> = Vec::with_capacity(n);
+                let sa = arr.as_any().downcast_ref::<StringArray>();
+                for i in 0..n {
+                    if arr.is_null(i) {
+                        result.push(Some("NULL".to_string()));
+                        continue;
+                    }
+                    let s = sa.map(|a| a.value(i)).unwrap_or("");
+                    let trimmed = s.trim();
+                    let jtype = if trimmed.starts_with('{') { "OBJECT" }
+                        else if trimmed.starts_with('[') { "ARRAY" }
+                        else if trimmed == "true" || trimmed == "false" { "BOOLEAN" }
+                        else if trimmed == "null" { "NULL" }
+                        else if trimmed.starts_with('"') { "STRING" }
+                        else if trimmed.parse::<f64>().is_ok() { if trimmed.contains('.') { "REAL" } else { "INTEGER" } }
+                        else { "NULL" };
+                    result.push(Some(jtype.to_string()));
+                }
+                Ok(Arc::new(StringArray::from(result)))
+            }
+            "JSON_VALID" => {
+                if args.len() != 1 { return Err(err_input("JSON_VALID requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let n = batch.num_rows();
+                let mut result: Vec<i64> = Vec::with_capacity(n);
+                let sa = arr.as_any().downcast_ref::<StringArray>();
+                for i in 0..n {
+                    if arr.is_null(i) { result.push(0); continue; }
+                    let s = sa.map(|a| a.value(i)).unwrap_or("");
+                    result.push(if Self::is_valid_json(s) { 1 } else { 0 });
+                }
+                Ok(Arc::new(Int64Array::from(result)))
+            }
+            "JSON_ARRAY_LENGTH" => {
+                if args.len() < 1 { return Err(err_input("JSON_ARRAY_LENGTH requires at least 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let n = batch.num_rows();
+                let mut result: Vec<Option<i64>> = Vec::with_capacity(n);
+                let sa = arr.as_any().downcast_ref::<StringArray>();
+                for i in 0..n {
+                    if arr.is_null(i) { result.push(None); continue; }
+                    let s = sa.map(|a| a.value(i)).unwrap_or("");
+                    // If path arg provided, extract first
+                    let json_str = if args.len() > 1 {
+                        let path_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                        let path_sa = path_arr.as_any().downcast_ref::<StringArray>();
+                        let p = path_sa.map(|a| a.value(i)).unwrap_or("");
+                        Self::json_extract_path(s, p).unwrap_or_default()
+                    } else {
+                        s.to_string()
+                    };
+                    let trimmed = json_str.trim();
+                    if trimmed.starts_with('[') {
+                        // Count top-level array elements
+                        result.push(Some(Self::json_count_array_elements(trimmed)));
+                    } else {
+                        result.push(Some(0));
+                    }
+                }
+                Ok(Arc::new(Int64Array::from(result)))
+            }
+            "JSON_OBJECT" => {
+                // JSON_OBJECT('key1', val1, 'key2', val2, ...)
+                if args.len() % 2 != 0 { return Err(err_input("JSON_OBJECT requires even number of arguments (key-value pairs)")); }
+                let n = batch.num_rows();
+                let mut result: Vec<String> = Vec::with_capacity(n);
+                let mut key_arrs = Vec::new();
+                let mut val_arrs = Vec::new();
+                for i in (0..args.len()).step_by(2) {
+                    key_arrs.push(Self::evaluate_expr_to_array(batch, &args[i])?);
+                    val_arrs.push(Self::evaluate_expr_to_array(batch, &args[i + 1])?);
+                }
+                for row in 0..n {
+                    let mut obj = String::from("{");
+                    for (pi, (ka, va)) in key_arrs.iter().zip(val_arrs.iter()).enumerate() {
+                        if pi > 0 { obj.push(','); }
+                        let key = if let Some(sa) = ka.as_any().downcast_ref::<StringArray>() {
+                            if sa.is_null(row) { "null".to_string() } else { format!("\"{}\"", sa.value(row)) }
+                        } else { "null".to_string() };
+                        let val = Self::json_value_from_array(va, row);
+                        obj.push_str(&format!("{}:{}", key, val));
+                    }
+                    obj.push('}');
+                    result.push(obj);
+                }
+                Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_str()).collect::<Vec<_>>())))
+            }
+            "JSON_ARRAY" => {
+                let n = batch.num_rows();
+                let mut result: Vec<String> = Vec::with_capacity(n);
+                let mut elem_arrs = Vec::new();
+                for arg in args {
+                    elem_arrs.push(Self::evaluate_expr_to_array(batch, arg)?);
+                }
+                for row in 0..n {
+                    let mut arr_str = String::from("[");
+                    for (ei, ea) in elem_arrs.iter().enumerate() {
+                        if ei > 0 { arr_str.push(','); }
+                        arr_str.push_str(&Self::json_value_from_array(ea, row));
+                    }
+                    arr_str.push(']');
+                    result.push(arr_str);
+                }
+                Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_str()).collect::<Vec<_>>())))
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported function: {}", name),
             )),
+        }
+    }
+
+    // ========== JSON Helper Methods ==========
+
+    /// Extract a value from a JSON string using a simplified JSON path (e.g., "$.key", "$.arr[0]", "$.a.b")
+    fn json_extract_path(json_str: &str, path: &str) -> Option<String> {
+        let trimmed = json_str.trim();
+        // Parse path: strip leading $
+        let path_str = path.trim().trim_start_matches('$').trim_start_matches('.');
+        if path_str.is_empty() {
+            return Some(trimmed.to_string());
+        }
+
+        // Split path into segments
+        let mut current = trimmed;
+        let mut owned = String::new();
+        for segment in path_str.split('.') {
+            let (key, array_idx) = if let Some(bracket_pos) = segment.find('[') {
+                let key_part = &segment[..bracket_pos];
+                let idx_str = segment[bracket_pos + 1..].trim_end_matches(']');
+                (key_part, idx_str.parse::<usize>().ok())
+            } else {
+                (segment, None)
+            };
+
+            if !key.is_empty() {
+                // Navigate into object key
+                if let Some(val) = Self::json_get_key(current, key) {
+                    owned = val;
+                    current = &owned;
+                } else {
+                    return None;
+                }
+            }
+
+            if let Some(idx) = array_idx {
+                // Navigate into array index
+                if let Some(val) = Self::json_get_index(current, idx) {
+                    owned = val;
+                    current = &owned;
+                } else {
+                    return None;
+                }
+            }
+        }
+        Some(current.to_string())
+    }
+
+    /// Get a value from a JSON object by key (simple parser, no external deps)
+    fn json_get_key(json: &str, key: &str) -> Option<String> {
+        let trimmed = json.trim();
+        if !trimmed.starts_with('{') { return None; }
+        let bytes = trimmed.as_bytes();
+        let mut i = 1; // skip '{'
+        let len = bytes.len();
+
+        loop {
+            // Skip whitespace
+            while i < len && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\t') { i += 1; }
+            if i >= len || bytes[i] == b'}' { return None; }
+            // Parse key
+            if bytes[i] != b'"' { return None; }
+            i += 1;
+            let key_start = i;
+            while i < len && bytes[i] != b'"' { if bytes[i] == b'\\' { i += 1; } i += 1; }
+            let parsed_key = &trimmed[key_start..i];
+            i += 1; // skip closing "
+            // Skip whitespace + colon
+            while i < len && bytes[i] != b':' { i += 1; }
+            i += 1; // skip ':'
+            while i < len && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\t') { i += 1; }
+            // Parse value
+            let val_start = i;
+            let val_end = Self::json_skip_value(trimmed, i);
+            let value = trimmed[val_start..val_end].trim();
+
+            if parsed_key == key {
+                // Unquote strings
+                if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+                    return Some(value[1..value.len()-1].to_string());
+                }
+                return Some(value.to_string());
+            }
+            i = val_end;
+            while i < len && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\t') { i += 1; }
+            if i < len && bytes[i] == b',' { i += 1; }
+        }
+    }
+
+    /// Get an element from a JSON array by index
+    fn json_get_index(json: &str, idx: usize) -> Option<String> {
+        let trimmed = json.trim();
+        if !trimmed.starts_with('[') { return None; }
+        let mut i = 1;
+        let len = trimmed.len();
+        let bytes = trimmed.as_bytes();
+        let mut current_idx = 0;
+
+        loop {
+            while i < len && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\t') { i += 1; }
+            if i >= len || bytes[i] == b']' { return None; }
+            let val_start = i;
+            let val_end = Self::json_skip_value(trimmed, i);
+            if current_idx == idx {
+                let value = trimmed[val_start..val_end].trim();
+                if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+                    return Some(value[1..value.len()-1].to_string());
+                }
+                return Some(value.to_string());
+            }
+            i = val_end;
+            current_idx += 1;
+            while i < len && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\t') { i += 1; }
+            if i < len && bytes[i] == b',' { i += 1; }
+        }
+    }
+
+    /// Skip a JSON value starting at position i, returns the position after the value
+    fn json_skip_value(json: &str, start: usize) -> usize {
+        let bytes = json.as_bytes();
+        let len = bytes.len();
+        if start >= len { return start; }
+        match bytes[start] {
+            b'"' => {
+                let mut i = start + 1;
+                while i < len { if bytes[i] == b'\\' { i += 2; } else if bytes[i] == b'"' { return i + 1; } else { i += 1; } }
+                len
+            }
+            b'{' | b'[' => {
+                let open = bytes[start];
+                let close = if open == b'{' { b'}' } else { b']' };
+                let mut depth = 1;
+                let mut i = start + 1;
+                let mut in_string = false;
+                while i < len && depth > 0 {
+                    if in_string { if bytes[i] == b'\\' { i += 1; } else if bytes[i] == b'"' { in_string = false; } }
+                    else { match bytes[i] { b'"' => in_string = true, b if b == open => depth += 1, b if b == close => depth -= 1, _ => {} } }
+                    i += 1;
+                }
+                i
+            }
+            _ => {
+                // Number, true, false, null
+                let mut i = start;
+                while i < len && bytes[i] != b',' && bytes[i] != b'}' && bytes[i] != b']' && bytes[i] != b' ' && bytes[i] != b'\n' { i += 1; }
+                i
+            }
+        }
+    }
+
+    /// Check if a string is valid JSON
+    fn is_valid_json(s: &str) -> bool {
+        let trimmed = s.trim();
+        if trimmed.is_empty() { return false; }
+        match trimmed.as_bytes()[0] {
+            b'{' => trimmed.ends_with('}'),
+            b'[' => trimmed.ends_with(']'),
+            b'"' => trimmed.ends_with('"') && trimmed.len() >= 2,
+            _ => trimmed == "true" || trimmed == "false" || trimmed == "null" || trimmed.parse::<f64>().is_ok(),
+        }
+    }
+
+    /// Count top-level elements in a JSON array string
+    fn json_count_array_elements(json: &str) -> i64 {
+        let trimmed = json.trim();
+        if !trimmed.starts_with('[') { return 0; }
+        if trimmed == "[]" { return 0; }
+        let mut i = 1;
+        let len = trimmed.len();
+        let bytes = trimmed.as_bytes();
+        let mut count = 0i64;
+        loop {
+            while i < len && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\t') { i += 1; }
+            if i >= len || bytes[i] == b']' { break; }
+            count += 1;
+            i = Self::json_skip_value(trimmed, i);
+            while i < len && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\t') { i += 1; }
+            if i < len && bytes[i] == b',' { i += 1; }
+        }
+        count
+    }
+
+    /// Convert an Arrow array value at a given row to a JSON-encoded string
+    fn json_value_from_array(arr: &ArrayRef, row: usize) -> String {
+        if arr.is_null(row) { return "null".to_string(); }
+        if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() {
+            format!("\"{}\"", sa.value(row).replace('\\', "\\\\").replace('"', "\\\""))
+        } else if let Some(ia) = arr.as_any().downcast_ref::<Int64Array>() {
+            ia.value(row).to_string()
+        } else if let Some(fa) = arr.as_any().downcast_ref::<Float64Array>() {
+            fa.value(row).to_string()
+        } else if let Some(ba) = arr.as_any().downcast_ref::<BooleanArray>() {
+            if ba.value(row) { "true".to_string() } else { "false".to_string() }
+        } else if let Some(ua) = arr.as_any().downcast_ref::<UInt64Array>() {
+            ua.value(row).to_string()
+        } else {
+            "null".to_string()
         }
     }
 
@@ -5303,6 +5959,114 @@ impl ApexExecutor {
         } else {
             Err(err_data( "Date function requires string argument"))
         }
+    }
+
+    /// Parse a timestamp string to microseconds since Unix epoch.
+    /// Supports: "YYYY-MM-DD HH:MM:SS", "YYYY-MM-DD HH:MM:SS.fff", "YYYY-MM-DD"
+    fn parse_timestamp_string(s: &str) -> i64 {
+        // Try datetime with fractional seconds
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+            return dt.and_utc().timestamp_micros();
+        }
+        // Try datetime without fractional seconds
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+            return dt.and_utc().timestamp_micros();
+        }
+        // Try date only (midnight)
+        if s.len() >= 10 {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d") {
+                if let Some(dt) = d.and_hms_opt(0, 0, 0) {
+                    return dt.and_utc().timestamp_micros();
+                }
+            }
+        }
+        // Try parsing as raw integer (epoch micros)
+        s.parse::<i64>().unwrap_or(0)
+    }
+
+    /// Convert a SqlExpr back to a SQL string (for CHECK constraint persistence)
+    fn sql_expr_to_string(expr: &SqlExpr) -> String {
+        use crate::query::sql_parser::{BinaryOperator, UnaryOperator};
+        match expr {
+            SqlExpr::Column(name) => name.clone(),
+            SqlExpr::Literal(v) => match v {
+                Value::Int64(n) => n.to_string(),
+                Value::Int32(n) => n.to_string(),
+                Value::Float64(f) => format!("{}", f),
+                Value::Float32(f) => format!("{}", f),
+                Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                Value::Bool(b) => if *b { "TRUE".to_string() } else { "FALSE".to_string() },
+                Value::Null => "NULL".to_string(),
+                _ => format!("{:?}", v),
+            },
+            SqlExpr::BinaryOp { left, op, right } => {
+                let op_str = match op {
+                    BinaryOperator::Eq => "=",
+                    BinaryOperator::NotEq => "!=",
+                    BinaryOperator::Lt => "<",
+                    BinaryOperator::Le => "<=",
+                    BinaryOperator::Gt => ">",
+                    BinaryOperator::Ge => ">=",
+                    BinaryOperator::And => "AND",
+                    BinaryOperator::Or => "OR",
+                    BinaryOperator::Add => "+",
+                    BinaryOperator::Sub => "-",
+                    BinaryOperator::Mul => "*",
+                    BinaryOperator::Div => "/",
+                    BinaryOperator::Mod => "%",
+                };
+                format!("{} {} {}", Self::sql_expr_to_string(left), op_str, Self::sql_expr_to_string(right))
+            }
+            SqlExpr::UnaryOp { op, expr } => {
+                match op {
+                    UnaryOperator::Not => format!("NOT {}", Self::sql_expr_to_string(expr)),
+                    UnaryOperator::Minus => format!("-{}", Self::sql_expr_to_string(expr)),
+                }
+            }
+            SqlExpr::Paren(inner) => format!("({})", Self::sql_expr_to_string(inner)),
+            SqlExpr::Like { column, pattern, negated } => {
+                if *negated { format!("{} NOT LIKE '{}'", column, pattern) }
+                else { format!("{} LIKE '{}'", column, pattern) }
+            }
+            SqlExpr::In { column, values, negated } => {
+                let vals: Vec<String> = values.iter().map(|v| match v {
+                    Value::Int64(n) => n.to_string(),
+                    Value::String(s) => format!("'{}'", s),
+                    _ => format!("{:?}", v),
+                }).collect();
+                if *negated { format!("{} NOT IN ({})", column, vals.join(", ")) }
+                else { format!("{} IN ({})", column, vals.join(", ")) }
+            }
+            SqlExpr::IsNull { column, negated } => {
+                if *negated { format!("{} IS NOT NULL", column) }
+                else { format!("{} IS NULL", column) }
+            }
+            SqlExpr::Between { column, low, high, negated } => {
+                if *negated { format!("{} NOT BETWEEN {} AND {}", column, Self::sql_expr_to_string(low), Self::sql_expr_to_string(high)) }
+                else { format!("{} BETWEEN {} AND {}", column, Self::sql_expr_to_string(low), Self::sql_expr_to_string(high)) }
+            }
+            SqlExpr::Function { name, args } => {
+                let arg_strs: Vec<String> = args.iter().map(|a| Self::sql_expr_to_string(a)).collect();
+                format!("{}({})", name, arg_strs.join(", "))
+            }
+            SqlExpr::Cast { expr, data_type } => {
+                format!("CAST({} AS {:?})", Self::sql_expr_to_string(expr), data_type)
+            }
+            _ => format!("{:?}", expr),
+        }
+    }
+
+    /// Parse a date string to days since Unix epoch.
+    /// Supports: "YYYY-MM-DD"
+    fn parse_date_string(s: &str) -> i64 {
+        if s.len() >= 10 {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d") {
+                let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                return (d - epoch).num_days();
+            }
+        }
+        // Try parsing as raw integer (epoch days)
+        s.parse::<i64>().unwrap_or(0)
     }
 
     /// Evaluate array index expression: array[index]
@@ -9364,8 +10128,21 @@ impl ApexExecutor {
             groups.entry(key).or_insert_with(|| Vec::with_capacity(16)).push(row_idx);
         }
 
-        // Build window function result array
+        // Build window function result arrays (one for int, one for float)
         let mut window_values: Vec<i64> = vec![0; batch.num_rows()];
+        let mut window_float_values: Vec<f64> = vec![0.0; batch.num_rows()];
+        // Determine if the window function operates on a float column
+        let value_funcs = ["SUM", "AVG", "MIN", "MAX", "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE", "RUNNING_SUM"];
+        let is_value_func = value_funcs.contains(&func_name.as_str());
+        let src_col_name = if is_value_func { func_args.get(0).map(|s| s.trim_matches('"').to_string()) } else { None };
+        // AVG always returns float regardless of source column type
+        let use_float = if func_name == "AVG" {
+            true
+        } else if let Some(ref cn) = src_col_name {
+            batch.column_by_name(cn).map(|c| c.as_any().downcast_ref::<Float64Array>().is_some()).unwrap_or(false)
+        } else {
+            false
+        };
         
         for (_, mut indices) in groups {
             // Sort within partition by ORDER BY
@@ -9486,13 +10263,22 @@ impl ApexExecutor {
                     let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
                     
                     if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
+                            for (pos, &row_idx) in indices.iter().enumerate() {
+                                if pos >= offset {
+                                    let prev_row = indices[pos - offset];
+                                    window_float_values[row_idx] = if float_arr.is_null(prev_row) { 0.0 } else { float_arr.value(prev_row) };
+                                } else {
+                                    window_float_values[row_idx] = 0.0;
+                                }
+                            }
+                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
                             for (pos, &row_idx) in indices.iter().enumerate() {
                                 if pos >= offset {
                                     let prev_row = indices[pos - offset];
                                     window_values[row_idx] = if int_arr.is_null(prev_row) { 0 } else { int_arr.value(prev_row) };
                                 } else {
-                                    window_values[row_idx] = 0; // default
+                                    window_values[row_idx] = 0;
                                 }
                             }
                         }
@@ -9506,14 +10292,24 @@ impl ApexExecutor {
                     let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
                     
                     if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
+                            let len = indices.len();
+                            for (pos, &row_idx) in indices.iter().enumerate() {
+                                if pos + offset < len {
+                                    let next_row = indices[pos + offset];
+                                    window_float_values[row_idx] = if float_arr.is_null(next_row) { 0.0 } else { float_arr.value(next_row) };
+                                } else {
+                                    window_float_values[row_idx] = 0.0;
+                                }
+                            }
+                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
                             let len = indices.len();
                             for (pos, &row_idx) in indices.iter().enumerate() {
                                 if pos + offset < len {
                                     let next_row = indices[pos + offset];
                                     window_values[row_idx] = if int_arr.is_null(next_row) { 0 } else { int_arr.value(next_row) };
                                 } else {
-                                    window_values[row_idx] = 0; // default
+                                    window_values[row_idx] = 0;
                                 }
                             }
                         }
@@ -9523,7 +10319,13 @@ impl ApexExecutor {
                     // FIRST_VALUE(column) - get first value in partition
                     let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
                     if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
+                            let first_row = indices[0];
+                            let first_val = if float_arr.is_null(first_row) { 0.0 } else { float_arr.value(first_row) };
+                            for &row_idx in &indices {
+                                window_float_values[row_idx] = first_val;
+                            }
+                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
                             let first_row = indices[0];
                             let first_val = if int_arr.is_null(first_row) { 0 } else { int_arr.value(first_row) };
                             for &row_idx in &indices {
@@ -9536,7 +10338,13 @@ impl ApexExecutor {
                     // LAST_VALUE(column) - get last value in partition
                     let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
                     if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
+                            let last_row = indices[indices.len() - 1];
+                            let last_val = if float_arr.is_null(last_row) { 0.0 } else { float_arr.value(last_row) };
+                            for &row_idx in &indices {
+                                window_float_values[row_idx] = last_val;
+                            }
+                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
                             let last_row = indices[indices.len() - 1];
                             let last_val = if int_arr.is_null(last_row) { 0 } else { int_arr.value(last_row) };
                             for &row_idx in &indices {
@@ -9549,7 +10357,14 @@ impl ApexExecutor {
                     // SUM(column) OVER - running sum in partition
                     let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
                     if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
+                            let total: f64 = indices.iter()
+                                .filter_map(|&i| if float_arr.is_null(i) { None } else { Some(float_arr.value(i)) })
+                                .sum();
+                            for &row_idx in &indices {
+                                window_float_values[row_idx] = total;
+                            }
+                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
                             let total: i64 = indices.iter()
                                 .filter_map(|&i| if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) })
                                 .sum();
@@ -9560,16 +10375,24 @@ impl ApexExecutor {
                     }
                 }
                 "AVG" => {
-                    // AVG(column) OVER - average in partition
+                    // AVG(column) OVER - average in partition (always returns float)
                     let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
                     if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
+                            let vals: Vec<f64> = indices.iter()
+                                .filter_map(|&i| if float_arr.is_null(i) { None } else { Some(float_arr.value(i)) })
+                                .collect();
+                            let avg = if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 };
+                            for &row_idx in &indices {
+                                window_float_values[row_idx] = avg;
+                            }
+                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
                             let vals: Vec<i64> = indices.iter()
                                 .filter_map(|&i| if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) })
                                 .collect();
-                            let avg = if vals.is_empty() { 0 } else { vals.iter().sum::<i64>() / vals.len() as i64 };
+                            let avg = if vals.is_empty() { 0.0 } else { vals.iter().sum::<i64>() as f64 / vals.len() as f64 };
                             for &row_idx in &indices {
-                                window_values[row_idx] = avg;
+                                window_float_values[row_idx] = avg;
                             }
                         }
                     }
@@ -9585,7 +10408,15 @@ impl ApexExecutor {
                     // MIN(column) OVER - minimum in partition
                     let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
                     if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
+                            let min_val = indices.iter()
+                                .filter_map(|&i| if float_arr.is_null(i) { None } else { Some(float_arr.value(i)) })
+                                .fold(f64::INFINITY, f64::min);
+                            let min_val = if min_val == f64::INFINITY { 0.0 } else { min_val };
+                            for &row_idx in &indices {
+                                window_float_values[row_idx] = min_val;
+                            }
+                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
                             let min_val = indices.iter()
                                 .filter_map(|&i| if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) })
                                 .min()
@@ -9600,7 +10431,15 @@ impl ApexExecutor {
                     // MAX(column) OVER - maximum in partition
                     let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
                     if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
+                            let max_val = indices.iter()
+                                .filter_map(|&i| if float_arr.is_null(i) { None } else { Some(float_arr.value(i)) })
+                                .fold(f64::NEG_INFINITY, f64::max);
+                            let max_val = if max_val == f64::NEG_INFINITY { 0.0 } else { max_val };
+                            for &row_idx in &indices {
+                                window_float_values[row_idx] = max_val;
+                            }
+                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
                             let max_val = indices.iter()
                                 .filter_map(|&i| if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) })
                                 .max()
@@ -9615,7 +10454,15 @@ impl ApexExecutor {
                     // RUNNING_SUM(column) OVER - cumulative sum (rows unbounded preceding to current)
                     let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
                     if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
+                            let mut running = 0.0f64;
+                            for &row_idx in &indices {
+                                if !float_arr.is_null(row_idx) {
+                                    running += float_arr.value(row_idx);
+                                }
+                                window_float_values[row_idx] = running;
+                            }
+                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
                             let mut running = 0i64;
                             for &row_idx in &indices {
                                 if !int_arr.is_null(row_idx) {
@@ -9634,7 +10481,15 @@ impl ApexExecutor {
                     } else { 1usize };
                     
                     if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
+                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
+                            let nth_val = if n > 0 && n <= indices.len() {
+                                let nth_row = indices[n - 1];
+                                if float_arr.is_null(nth_row) { 0.0 } else { float_arr.value(nth_row) }
+                            } else { 0.0 };
+                            for &row_idx in &indices {
+                                window_float_values[row_idx] = nth_val;
+                            }
+                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
                             let nth_val = if n > 0 && n <= indices.len() {
                                 let nth_row = indices[n - 1];
                                 if int_arr.is_null(nth_row) { 0 } else { int_arr.value(nth_row) }
@@ -9677,8 +10532,13 @@ impl ApexExecutor {
                 }
                 SelectColumn::WindowFunction { name, alias, .. } => {
                     let out_name = alias.clone().unwrap_or_else(|| name.to_lowercase());
-                    result_fields.push(Field::new(&out_name, ArrowDataType::Int64, false));
-                    result_arrays.push(Arc::new(Int64Array::from(window_values.clone())));
+                    if use_float {
+                        result_fields.push(Field::new(&out_name, ArrowDataType::Float64, false));
+                        result_arrays.push(Arc::new(Float64Array::from(window_float_values.clone())));
+                    } else {
+                        result_fields.push(Field::new(&out_name, ArrowDataType::Int64, false));
+                        result_arrays.push(Arc::new(Int64Array::from(window_values.clone())));
+                    }
                 }
                 _ => {}
             }
@@ -9767,11 +10627,23 @@ impl ApexExecutor {
                             })
                         } else { None }
                     });
+                    let check_sql = col_def.constraints.iter().find_map(|c| {
+                        if let ColumnConstraintKind::Check(sql) = c {
+                            Some(sql.clone())
+                        } else { None }
+                    });
+                    let fk = col_def.constraints.iter().find_map(|c| {
+                        if let ColumnConstraintKind::ForeignKey { ref_table, ref_column } = c {
+                            Some((ref_table.clone(), ref_column.clone()))
+                        } else { None }
+                    });
                     storage.storage.set_column_constraints(&col_def.name, ColumnConstraints {
                         not_null: col_def.constraints.contains(&ColumnConstraintKind::NotNull),
                         primary_key: col_def.constraints.contains(&ColumnConstraintKind::PrimaryKey),
                         unique: col_def.constraints.contains(&ColumnConstraintKind::Unique),
                         default_value: default_val,
+                        check_expr_sql: check_sql,
+                        foreign_key: fk,
                     });
                 }
             }
@@ -9930,6 +10802,9 @@ impl ApexExecutor {
                     let jt = match join.join_type {
                         JoinType::Inner => "INNER JOIN",
                         JoinType::Left => "LEFT JOIN",
+                        JoinType::Right => "RIGHT JOIN",
+                        JoinType::Full => "FULL OUTER JOIN",
+                        JoinType::Cross => "CROSS JOIN",
                     };
                     let table_name = match &join.right {
                         FromItem::Table { table, .. } => table.clone(),
@@ -9988,6 +10863,10 @@ impl ApexExecutor {
                 plan_lines.push("Query Plan:".to_string());
                 plan_lines.push(format!("  InsertSelect: table={}", table));
             }
+            SqlStatement::CreateTableAs { table, .. } => {
+                plan_lines.push("Query Plan:".to_string());
+                plan_lines.push(format!("  CreateTableAs: table={}", table));
+            }
             SqlStatement::Update { table, .. } => {
                 plan_lines.push("Query Plan:".to_string());
                 plan_lines.push(format!("  Update: table={}", table));
@@ -10031,86 +10910,215 @@ impl ApexExecutor {
 
     /// Execute CTE (WITH name AS (...) main_query)
     /// Materializes the CTE body into a temp table and rewrites the main query to reference it.
-    fn execute_cte(name: &str, body: SqlStatement, main: SqlStatement, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
-        // Step 1: Execute the CTE body query
-        let cte_result = Self::execute_parsed_multi(body, base_dir, default_table_path)?;
-        let cte_batch = cte_result.to_record_batch()
-            .map_err(|e| err_data(format!("CTE body must return a result set: {}", e)))?;
-
-        // Step 2: Materialize CTE into a temp table
+    /// For recursive CTEs, implements iterative fixpoint: anchor UNION ALL recursive until no new rows.
+    fn execute_cte(name: &str, column_aliases: &[String], body: SqlStatement, main: SqlStatement, recursive: bool, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
         let temp_path = base_dir.join(format!("__cte_{}_{}.apex", name, std::process::id()));
-        {
-            let backend = TableStorageBackend::create(&temp_path)?;
-            // Set up schema from CTE result
-            let schema = cte_batch.schema();
-            for field in schema.fields() {
-                let col_type = match field.data_type() {
-                    ArrowDataType::Int64 | ArrowDataType::UInt64 => crate::data::DataType::Int64,
-                    ArrowDataType::Float64 => crate::data::DataType::Float64,
-                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => crate::data::DataType::String,
-                    ArrowDataType::Boolean => crate::data::DataType::Bool,
-                    _ => crate::data::DataType::String,
-                };
-                backend.add_column(field.name(), col_type)?;
-            }
-
-            // Insert rows from CTE result
-            if cte_batch.num_rows() > 0 {
-                let mut rows: Vec<std::collections::HashMap<String, crate::data::Value>> = Vec::with_capacity(cte_batch.num_rows());
-                for row_idx in 0..cte_batch.num_rows() {
-                    let mut row = std::collections::HashMap::new();
-                    for (col_idx, field) in schema.fields().iter().enumerate() {
-                        let col = cte_batch.column(col_idx);
-                        let val = Self::arrow_value_at_col(col, row_idx);
-                        row.insert(field.name().clone(), val);
-                    }
-                    rows.push(row);
+        
+        // Helper: materialize a RecordBatch into a temp table (create or append)
+        let materialize_batch = |batch: &RecordBatch, path: &Path, create: bool| -> io::Result<()> {
+            if create {
+                let backend = TableStorageBackend::create(path)?;
+                let schema = batch.schema();
+                for field in schema.fields() {
+                    let col_type = match field.data_type() {
+                        ArrowDataType::Int64 | ArrowDataType::UInt64 => crate::data::DataType::Int64,
+                        ArrowDataType::Float64 => crate::data::DataType::Float64,
+                        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => crate::data::DataType::String,
+                        ArrowDataType::Boolean => crate::data::DataType::Bool,
+                        _ => crate::data::DataType::String,
+                    };
+                    backend.add_column(field.name(), col_type)?;
                 }
-                backend.insert_rows(&rows)?;
-            }
-            backend.save()?;
-        }
-
-        // Step 3: Execute the main query, rewriting references to the CTE name
-        // If the main is itself a CTE, recurse
-        let result = match main {
-            SqlStatement::Cte { name: inner_name, body: inner_body, main: inner_main } => {
-                Self::execute_cte(&inner_name, *inner_body, *inner_main, base_dir, &temp_path)
-            }
-            SqlStatement::Select(mut select) => {
-                // Rewrite FROM clause to reference the temp table
-                if let Some(ref from) = select.from {
-                    if let FromItem::Table { table, .. } = from {
-                        if table.eq_ignore_ascii_case(name) {
-                            select.from = Some(FromItem::Table { table: format!("__cte_{}_{}", name, std::process::id()), alias: Some(name.to_string()) });
-                        }
-                    }
+                if batch.num_rows() > 0 {
+                    Self::insert_batch_into_backend(&backend, batch)?;
                 }
-                // Rewrite JOIN references too
-                for join in &mut select.joins {
-                    if let FromItem::Table { table, alias } = &join.right {
-                        if table.eq_ignore_ascii_case(name) {
-                            join.right = FromItem::Table {
-                                table: format!("__cte_{}_{}", name, std::process::id()),
-                                alias: Some(alias.clone().unwrap_or_else(|| name.to_string())),
-                            };
-                        }
-                    }
-                }
-                Self::execute_parsed_multi(SqlStatement::Select(select), base_dir, default_table_path)
+                backend.save()?;
+            } else if batch.num_rows() > 0 {
+                let backend = TableStorageBackend::open_for_write(path)?;
+                Self::insert_batch_into_backend(&backend, batch)?;
+                backend.save()?;
             }
-            other => Self::execute_parsed_multi(other, base_dir, default_table_path),
+            invalidate_storage_cache(path);
+            Ok(())
         };
 
-        // Step 4: Clean up temp table
-        let _ = std::fs::remove_file(&temp_path);
-        // Clean up associated files
-        let _ = std::fs::remove_file(temp_path.with_extension("apex.wal"));
-        let _ = std::fs::remove_file(temp_path.with_extension("apex.lock"));
-        let _ = std::fs::remove_file(temp_path.with_extension("apex.deltastore"));
-        invalidate_storage_cache(&temp_path);
+        if recursive {
+            // Recursive CTE: body must be UNION ALL with anchor (left) and recursive part (right)
+            let (anchor_stmt, recursive_stmt, _union_all) = match body {
+                SqlStatement::Union(ref u) => {
+                    ((*u.left).clone(), (*u.right).clone(), u.all)
+                }
+                _ => {
+                    // Not a UNION — treat as non-recursive fallback
+                    let cte_result = Self::execute_parsed_multi(body, base_dir, default_table_path)?;
+                    let cte_batch = cte_result.to_record_batch()
+                        .map_err(|e| err_data(format!("CTE body must return a result set: {}", e)))?;
+                    materialize_batch(&cte_batch, &temp_path, true)?;
+                    
+                    let result = Self::execute_main_with_cte(name, main, base_dir, default_table_path, &temp_path)?;
+                    Self::cleanup_temp_table(&temp_path);
+                    return result;
+                }
+            };
+            
+            // Step 1: Execute anchor query
+            let anchor_result = Self::execute_parsed_multi(anchor_stmt, base_dir, default_table_path)?;
+            let mut anchor_batch = anchor_result.to_record_batch()
+                .map_err(|e| err_data(format!("Recursive CTE anchor must return a result set: {}", e)))?;
+            
+            // Apply column aliases if provided: WITH RECURSIVE fact(n, val) AS (...)
+            if !column_aliases.is_empty() {
+                anchor_batch = Self::remap_batch_columns(&anchor_batch, column_aliases)?;
+            }
+            
+            if anchor_batch.num_rows() == 0 {
+                // Empty anchor → materialize empty table, run main
+                materialize_batch(&anchor_batch, &temp_path, true)?;
+                let result = Self::execute_main_with_cte(name, main, base_dir, default_table_path, &temp_path)?;
+                Self::cleanup_temp_table(&temp_path);
+                return result;
+            }
+            
+            // Record anchor column names (defines CTE schema — uses aliases if provided)
+            let anchor_col_names: Vec<String> = anchor_batch.schema().fields()
+                .iter().map(|f| f.name().clone()).collect();
+            
+            // Materialize anchor into temp table
+            materialize_batch(&anchor_batch, &temp_path, true)?;
+            
+            // Step 2: Iterative fixpoint — execute recursive part until no new rows
+            // Use a working table to hold last iteration's new rows (same schema as anchor)
+            let working_path = base_dir.join(format!("__cte_{}_work_{}.apex", name, std::process::id()));
+            materialize_batch(&anchor_batch, &working_path, true)?;
+            
+            const MAX_ITERATIONS: usize = 1000;
+            for _iter in 0..MAX_ITERATIONS {
+                // Execute recursive part with CTE name → working table
+                let recursive_result = Self::execute_main_with_cte(name, recursive_stmt.clone(), base_dir, default_table_path, &working_path)?;
+                let new_batch = match recursive_result {
+                    Ok(r) => r.to_record_batch().ok(),
+                    Err(_) => None,
+                };
+                
+                let new_batch = match new_batch {
+                    Some(b) if b.num_rows() > 0 => b,
+                    _ => break, // No new rows — fixpoint reached
+                };
+                
+                // Remap recursive result columns to anchor column names (by position)
+                let remapped = Self::remap_batch_columns(&new_batch, &anchor_col_names)?;
+                
+                // Append remapped rows to the main CTE temp table
+                materialize_batch(&remapped, &temp_path, false)?;
+                
+                // Replace working table with remapped rows for next iteration
+                Self::cleanup_temp_table(&working_path);
+                materialize_batch(&remapped, &working_path, true)?;
+            }
+            
+            // Clean up working table
+            Self::cleanup_temp_table(&working_path);
+            
+            // Step 3: Execute main query against accumulated CTE table
+            let result = Self::execute_main_with_cte(name, main, base_dir, default_table_path, &temp_path)?;
+            Self::cleanup_temp_table(&temp_path);
+            result
+        } else {
+            // Non-recursive CTE: materialize body, execute main
+            let cte_result = Self::execute_parsed_multi(body, base_dir, default_table_path)?;
+            let mut cte_batch = cte_result.to_record_batch()
+                .map_err(|e| err_data(format!("CTE body must return a result set: {}", e)))?;
+            if !column_aliases.is_empty() {
+                cte_batch = Self::remap_batch_columns(&cte_batch, column_aliases)?;
+            }
+            materialize_batch(&cte_batch, &temp_path, true)?;
 
-        result
+            let result = Self::execute_main_with_cte(name, main, base_dir, default_table_path, &temp_path)?;
+            Self::cleanup_temp_table(&temp_path);
+            result
+        }
+    }
+    
+    /// Helper: insert a RecordBatch into a TableStorageBackend
+    fn insert_batch_into_backend(backend: &TableStorageBackend, batch: &RecordBatch) -> io::Result<()> {
+        let schema = batch.schema();
+        let mut rows: Vec<std::collections::HashMap<String, crate::data::Value>> = Vec::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            let mut row = std::collections::HashMap::new();
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let col = batch.column(col_idx);
+                let val = Self::arrow_value_at_col(col, row_idx);
+                row.insert(field.name().clone(), val);
+            }
+            rows.push(row);
+        }
+        backend.insert_rows(&rows)?;
+        Ok(())
+    }
+    
+    /// Helper: execute a statement with CTE name rewritten to reference temp table
+    fn execute_main_with_cte(name: &str, main: SqlStatement, base_dir: &Path, default_table_path: &Path, temp_path: &Path) -> io::Result<io::Result<ApexResult>> {
+        let temp_table_name = temp_path.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        
+        match main {
+            SqlStatement::Cte { name: inner_name, column_aliases: inner_aliases, body: inner_body, main: inner_main, recursive: inner_recursive } => {
+                Ok(Self::execute_cte(&inner_name, &inner_aliases, *inner_body, *inner_main, inner_recursive, base_dir, temp_path))
+            }
+            SqlStatement::Select(mut select) => {
+                Self::rewrite_cte_references_in_select(&mut select, name, &temp_table_name);
+                Ok(Self::execute_parsed_multi(SqlStatement::Select(select), base_dir, default_table_path))
+            }
+            other => Ok(Self::execute_parsed_multi(other, base_dir, default_table_path)),
+        }
+    }
+    
+    /// Helper: rewrite FROM/JOIN references to CTE name → temp table name
+    fn rewrite_cte_references_in_select(select: &mut SelectStatement, cte_name: &str, temp_table_name: &str) {
+        if let Some(ref from) = select.from {
+            if let FromItem::Table { table, .. } = from {
+                if table.eq_ignore_ascii_case(cte_name) {
+                    select.from = Some(FromItem::Table { table: temp_table_name.to_string(), alias: Some(cte_name.to_string()) });
+                }
+            }
+        }
+        for join in &mut select.joins {
+            if let FromItem::Table { table, alias } = &join.right {
+                if table.eq_ignore_ascii_case(cte_name) {
+                    join.right = FromItem::Table {
+                        table: temp_table_name.to_string(),
+                        alias: Some(alias.clone().unwrap_or_else(|| cte_name.to_string())),
+                    };
+                }
+            }
+        }
+    }
+    
+    /// Helper: remap a RecordBatch's column names by position to match target names.
+    /// Used in recursive CTEs where the recursive part may have different column names than the anchor.
+    fn remap_batch_columns(batch: &RecordBatch, target_names: &[String]) -> io::Result<RecordBatch> {
+        let num_cols = batch.num_columns().min(target_names.len());
+        let batch_schema = batch.schema();
+        let mut fields = Vec::with_capacity(num_cols);
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(num_cols);
+        for i in 0..num_cols {
+            let old_field = batch_schema.field(i);
+            fields.push(Field::new(&target_names[i], old_field.data_type().clone(), old_field.is_nullable()));
+            arrays.push(batch.column(i).clone());
+        }
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, arrays)
+            .map_err(|e| err_data(format!("Failed to remap CTE columns: {}", e)))
+    }
+    
+    /// Helper: clean up temp CTE files
+    fn cleanup_temp_table(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("apex.wal"));
+        let _ = std::fs::remove_file(path.with_extension("apex.lock"));
+        let _ = std::fs::remove_file(path.with_extension("apex.deltastore"));
+        invalidate_storage_cache(path);
     }
 
     /// Execute INSERT ... SELECT statement
@@ -10184,6 +11192,68 @@ impl ApexExecutor {
         };
 
         Self::execute_insert(target_path, col_names.as_deref(), &values)
+    }
+
+    /// Execute CREATE TABLE ... AS SELECT statement
+    fn execute_create_table_as(
+        base_dir: &Path,
+        default_table_path: &Path,
+        table: &str,
+        query: SqlStatement,
+        if_not_exists: bool,
+    ) -> io::Result<ApexResult> {
+        let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
+
+        if table_path.exists() {
+            if if_not_exists {
+                return Ok(ApexResult::Scalar(0));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("Table '{}' already exists", table),
+            ));
+        }
+
+        // Step 1: Execute the SELECT query
+        let select_result = Self::execute_parsed_multi(query, base_dir, default_table_path)?;
+        let select_batch = select_result.to_record_batch()
+            .map_err(|e| err_data(format!("CTAS query must return a result set: {}", e)))?;
+
+        // Step 2: Create the table with schema from SELECT result
+        let schema = select_batch.schema();
+        let backend = TableStorageBackend::create(&table_path)?;
+        for field in schema.fields() {
+            if field.name() == "_id" { continue; }
+            let col_type = match field.data_type() {
+                ArrowDataType::Int64 | ArrowDataType::UInt64 => crate::data::DataType::Int64,
+                ArrowDataType::Float64 => crate::data::DataType::Float64,
+                ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => crate::data::DataType::String,
+                ArrowDataType::Boolean => crate::data::DataType::Bool,
+                _ => crate::data::DataType::String,
+            };
+            backend.add_column(field.name(), col_type)?;
+        }
+
+        // Step 3: Insert rows if any
+        let inserted = select_batch.num_rows();
+        if inserted > 0 {
+            let mut rows: Vec<std::collections::HashMap<String, crate::data::Value>> = Vec::with_capacity(inserted);
+            for row_idx in 0..inserted {
+                let mut row = std::collections::HashMap::new();
+                for (col_idx, field) in schema.fields().iter().enumerate() {
+                    if field.name() == "_id" { continue; }
+                    let col = select_batch.column(col_idx);
+                    let val = Self::arrow_value_at_col(col, row_idx);
+                    row.insert(field.name().clone(), val);
+                }
+                rows.push(row);
+            }
+            backend.insert_rows(&rows)?;
+        }
+        backend.save()?;
+        invalidate_storage_cache(&table_path);
+
+        Ok(ApexResult::Scalar(inserted as i64))
     }
 
     // ========== Transaction Execution Methods ==========
@@ -10394,50 +11464,34 @@ impl ApexExecutor {
                 let storage = TableStorageBackend::open(&table_path)?;
                 let mut buffered = 0i64;
 
-                // Extract columns from WHERE clause + always include _id
-                let mut needed_cols: Vec<String> = vec!["_id".to_string()];
-                if let Some(we) = &where_clause {
-                    Self::collect_columns_from_expr(we, &mut needed_cols);
-                }
-                needed_cols.sort();
-                needed_cols.dedup();
-                let col_refs: Vec<&str> = needed_cols.iter().map(|s| s.as_str()).collect();
-                let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
+                // Read ALL columns so we can capture old_data for VersionStore (snapshot isolation)
+                let batch = storage.read_columns_to_arrow(None, 0, None)?;
+                let col_names: Vec<String> = batch.schema().fields().iter()
+                    .map(|f| f.name().clone()).collect();
 
-                if let Some(where_expr) = &where_clause {
-                    let filter = Self::evaluate_predicate(&batch, where_expr)?;
-                    for i in 0..filter.len() {
-                        if filter.value(i) {
-                            if let Some(id_col) = batch.column_by_name("_id") {
-                                let rid = if let Some(a) = id_col.as_any().downcast_ref::<UInt64Array>() {
-                                    Some(a.value(i))
-                                } else if let Some(a) = id_col.as_any().downcast_ref::<Int64Array>() {
-                                    Some(a.value(i) as u64)
-                                } else { None };
-                                if let Some(rid) = rid {
-                                    mgr.with_context(txn_id, |ctx| {
-                                        ctx.buffer_delete(&table, rid, std::collections::HashMap::new())
-                                    })?;
-                                    buffered += 1;
-                                }
-                            }
-                        }
-                    }
+                let filter = if let Some(where_expr) = &where_clause {
+                    Self::evaluate_predicate(&batch, where_expr)?
                 } else {
-                    // DELETE all
-                    let col_refs2: Vec<&str> = vec!["_id"];
-                    let batch2 = storage.read_columns_to_arrow(Some(&col_refs2), 0, None)?;
-                    if let Some(id_col) = batch2.column_by_name("_id") {
-                        let len = id_col.len();
-                        for i in 0..len {
+                    BooleanArray::from(vec![true; batch.num_rows()])
+                };
+
+                for i in 0..filter.len() {
+                    if filter.value(i) {
+                        if let Some(id_col) = batch.column_by_name("_id") {
                             let rid = if let Some(a) = id_col.as_any().downcast_ref::<UInt64Array>() {
                                 Some(a.value(i))
                             } else if let Some(a) = id_col.as_any().downcast_ref::<Int64Array>() {
                                 Some(a.value(i) as u64)
                             } else { None };
                             if let Some(rid) = rid {
+                                // Capture old row data for VersionStore
+                                let mut old_data = std::collections::HashMap::new();
+                                for (ci, cn) in col_names.iter().enumerate() {
+                                    if cn == "_id" { continue; }
+                                    old_data.insert(cn.clone(), Self::arrow_value_at_col(batch.column(ci), i));
+                                }
                                 mgr.with_context(txn_id, |ctx| {
-                                    ctx.buffer_delete(&table, rid, std::collections::HashMap::new())
+                                    ctx.buffer_delete(&table, rid, old_data)
                                 })?;
                                 buffered += 1;
                             }
@@ -10449,21 +11503,10 @@ impl ApexExecutor {
             SqlStatement::Update { table, assignments, where_clause } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 let storage = TableStorageBackend::open(&table_path)?;
-                let schema = storage.get_schema();
-                let mut needed_cols: Vec<String> = vec!["_id".to_string()];
-                if let Some(we) = &where_clause {
-                    Self::collect_columns_from_expr(we, &mut needed_cols);
-                }
-                // Also include columns from assignments for old_data
-                for (col, _) in &assignments {
-                    if !needed_cols.contains(col) {
-                        needed_cols.push(col.clone());
-                    }
-                }
-                needed_cols.sort();
-                needed_cols.dedup();
-                let col_refs: Vec<&str> = needed_cols.iter().map(|s| s.as_str()).collect();
-                let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
+                // Read ALL columns for old_data capture (snapshot isolation)
+                let batch = storage.read_columns_to_arrow(None, 0, None)?;
+                let col_names: Vec<String> = batch.schema().fields().iter()
+                    .map(|f| f.name().clone()).collect();
                 let mut buffered = 0i64;
 
                 let filter = if let Some(where_expr) = &where_clause {
@@ -10481,6 +11524,12 @@ impl ApexExecutor {
                                 Some(a.value(i) as u64)
                             } else { None };
                             if let Some(rid) = rid {
+                                // Capture old row data for VersionStore
+                                let mut old_data = std::collections::HashMap::new();
+                                for (ci, cn) in col_names.iter().enumerate() {
+                                    if cn == "_id" { continue; }
+                                    old_data.insert(cn.clone(), Self::arrow_value_at_col(batch.column(ci), i));
+                                }
                                 let mut new_data = std::collections::HashMap::new();
                                 for (col, expr) in &assignments {
                                     if let SqlExpr::Literal(val) = expr {
@@ -10488,7 +11537,7 @@ impl ApexExecutor {
                                     }
                                 }
                                 mgr.with_context(txn_id, |ctx| {
-                                    ctx.buffer_update(&table, rid, std::collections::HashMap::new(), new_data)
+                                    ctx.buffer_update(&table, rid, old_data, new_data)
                                 })?;
                                 buffered += 1;
                             }
@@ -10507,12 +11556,16 @@ impl ApexExecutor {
                 // Execute SELECT normally against base storage
                 let result = Self::execute_parsed_multi(stmt, base_dir, default_table_path)?;
 
-                // P0-6 Phase A: Overlay buffered writes from this transaction
+                // Get transaction snapshot timestamp for MVCC visibility
+                let snapshot_ts = mgr.get_snapshot_ts(txn_id)?;
+                let version_store = mgr.get_version_store(&table_name);
+
+                // Phase A: Overlay buffered writes from this transaction
                 let writes = mgr.with_context(txn_id, |ctx| {
                     Ok(ctx.write_set().to_vec())
                 })?;
 
-                // Collect inserts and deletes for this table
+                // Collect inserts and deletes for this table (own writes)
                 let mut inserted_rows: Vec<&std::collections::HashMap<String, Value>> = Vec::new();
                 let mut deleted_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
                 let mut updated_rows: Vec<(u64, &std::collections::HashMap<String, Value>)> = Vec::new();
@@ -10532,8 +11585,12 @@ impl ApexExecutor {
                     }
                 }
 
-                // If no buffered writes affect this table, return as-is
-                if inserted_rows.is_empty() && deleted_ids.is_empty() && updated_rows.is_empty() {
+                // Check if VersionStore has any entries (Phase B: cross-txn isolation)
+                let has_versions = version_store.row_count() > 0;
+                let has_own_writes = !inserted_rows.is_empty() || !deleted_ids.is_empty() || !updated_rows.is_empty();
+
+                // If no version history and no own writes, return as-is (fast path)
+                if !has_versions && !has_own_writes {
                     return Ok(result);
                 }
 
@@ -10543,47 +11600,100 @@ impl ApexExecutor {
                 let num_cols = batch.num_columns();
                 let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
 
-                // Build row-level representation for overlay
+                // Build row-level representation with MVCC snapshot filter + own-write overlay
                 let mut rows: Vec<Vec<Value>> = Vec::new();
                 for row_idx in 0..batch.num_rows() {
-                    // Check if this row is deleted
-                    let mut skip = false;
-                    if !deleted_ids.is_empty() {
-                        if let Some(id_col) = batch.column_by_name("_id") {
-                            let rid = if let Some(a) = id_col.as_any().downcast_ref::<UInt64Array>() {
-                                Some(a.value(row_idx))
-                            } else if let Some(a) = id_col.as_any().downcast_ref::<Int64Array>() {
-                                Some(a.value(row_idx) as u64)
-                            } else { None };
-                            if let Some(rid) = rid {
-                                if deleted_ids.contains(&rid) {
-                                    skip = true;
+                    // Get row ID
+                    let rid = if let Some(id_col) = batch.column_by_name("_id") {
+                        if let Some(a) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                            Some(a.value(row_idx))
+                        } else if let Some(a) = id_col.as_any().downcast_ref::<Int64Array>() {
+                            Some(a.value(row_idx) as u64)
+                        } else { None }
+                    } else { None };
+
+                    // Check own deletes first
+                    if let Some(rid) = rid {
+                        if deleted_ids.contains(&rid) {
+                            continue; // Deleted by this transaction
+                        }
+                    }
+
+                    // Phase B: MVCC snapshot isolation — check VersionStore
+                    if has_versions {
+                        if let Some(rid) = rid {
+                            // Check if VersionStore has a version chain for this row
+                            let visible = version_store.read(rid, snapshot_ts);
+                            let exists_in_vs = version_store.row_count() > 0 && {
+                                // Check if this specific row has a chain
+                                version_store.exists(rid, u64::MAX - 2) || // exists at any ts
+                                version_store.read_latest(rid).is_some() ||
+                                version_store.read(rid, u64::MAX - 2).is_some()
+                            };
+
+                            if exists_in_vs {
+                                // Row has version history — use snapshot visibility
+                                if version_store.read(rid, snapshot_ts).is_none() {
+                                    // Not visible at snapshot_ts:
+                                    // Either inserted after snapshot or deleted before snapshot
+                                    // Check if it's an insert after snapshot (begin_ts > snapshot_ts)
+                                    let is_deleted = {
+                                        let chains = version_store.chains_ref();
+                                        chains.get(&rid).map(|c| c.is_deleted_at(snapshot_ts)).unwrap_or(false)
+                                    };
+                                    if is_deleted {
+                                        // Row was deleted before our snapshot — already gone
+                                        continue;
+                                    }
+                                    // Row was inserted after our snapshot — invisible
+                                    continue;
+                                }
+                                // Visible: check if we should use version data instead of storage data
+                                if let Some(versioned_data) = visible {
+                                    // Use versioned data (may differ from current storage)
+                                    let mut row = Vec::with_capacity(num_cols);
+                                    for cn in &col_names {
+                                        if cn == "_id" {
+                                            row.push(Value::UInt64(rid));
+                                        } else if let Some(val) = versioned_data.get(cn) {
+                                            row.push(val.clone());
+                                        } else {
+                                            // Column not in version data, use storage value
+                                            let ci = col_names.iter().position(|n| n == cn).unwrap();
+                                            row.push(Self::arrow_value_at_col(batch.column(ci), row_idx));
+                                        }
+                                    }
+                                    // Apply own updates on top
+                                    for (uid, new_data) in &updated_rows {
+                                        if rid == *uid {
+                                            for (col, val) in *new_data {
+                                                if let Some(ci) = col_names.iter().position(|n| n == col) {
+                                                    row[ci] = val.clone();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    rows.push(row);
+                                    continue;
                                 }
                             }
                         }
                     }
-                    if skip { continue; }
 
+                    // No version history for this row — use storage data as-is
                     let mut row = Vec::with_capacity(num_cols);
                     for col_idx in 0..num_cols {
                         row.push(Self::arrow_value_at_col(batch.column(col_idx), row_idx));
                     }
 
-                    // Apply updates
+                    // Apply own updates
                     if !updated_rows.is_empty() {
-                        if let Some(id_col) = batch.column_by_name("_id") {
-                            let rid = if let Some(a) = id_col.as_any().downcast_ref::<UInt64Array>() {
-                                Some(a.value(row_idx))
-                            } else if let Some(a) = id_col.as_any().downcast_ref::<Int64Array>() {
-                                Some(a.value(row_idx) as u64)
-                            } else { None };
-                            if let Some(rid) = rid {
-                                for (uid, new_data) in &updated_rows {
-                                    if rid == *uid {
-                                        for (col, val) in *new_data {
-                                            if let Some(ci) = col_names.iter().position(|n| n == col) {
-                                                row[ci] = val.clone();
-                                            }
+                        if let Some(rid) = rid {
+                            for (uid, new_data) in &updated_rows {
+                                if rid == *uid {
+                                    for (col, val) in *new_data {
+                                        if let Some(ci) = col_names.iter().position(|n| n == col) {
+                                            row[ci] = val.clone();
                                         }
                                     }
                                 }
@@ -10594,7 +11704,7 @@ impl ApexExecutor {
                     rows.push(row);
                 }
 
-                // Append buffered inserts
+                // Append buffered inserts (own writes)
                 for insert_data in &inserted_rows {
                     let mut row = vec![Value::Null; num_cols];
                     for (col, val) in *insert_data {
@@ -10610,6 +11720,25 @@ impl ApexExecutor {
             }
             SqlStatement::Commit => Self::execute_commit_txn(txn_id, base_dir, default_table_path),
             SqlStatement::Rollback => Self::execute_rollback_txn(txn_id),
+            SqlStatement::Savepoint { name } => {
+                mgr.with_context(txn_id, |ctx| {
+                    ctx.savepoint(&name);
+                    Ok(())
+                })?;
+                Ok(ApexResult::Scalar(0))
+            }
+            SqlStatement::RollbackToSavepoint { name } => {
+                mgr.with_context(txn_id, |ctx| {
+                    ctx.rollback_to_savepoint(&name)
+                })?;
+                Ok(ApexResult::Scalar(0))
+            }
+            SqlStatement::ReleaseSavepoint { name } => {
+                mgr.with_context(txn_id, |ctx| {
+                    ctx.release_savepoint(&name)
+                })?;
+                Ok(ApexResult::Scalar(0))
+            }
             other => Self::execute_parsed_multi(other, base_dir, default_table_path),
         }
     }
@@ -10824,7 +11953,12 @@ impl ApexExecutor {
             }
         }
 
-        let batch = RecordBatch::try_new(schema.clone(), arrays)
+        // Make all fields nullable to avoid Arrow errors when overlay produces nulls
+        let nullable_fields: Vec<Field> = schema.fields().iter()
+            .map(|f| Field::new(f.name(), f.data_type().clone(), true))
+            .collect();
+        let nullable_schema = Arc::new(Schema::new(nullable_fields));
+        let batch = RecordBatch::try_new(nullable_schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(ApexResult::Data(batch))
     }
@@ -10853,6 +11987,79 @@ impl ApexExecutor {
     }
 
     // ========== Index Maintenance Helpers ==========
+
+    /// Public API: Notify indexes about rows inserted via non-SQL path (Python store() API).
+    /// Called from engine.rs after write()/write_typed() completes.
+    /// `storage_path` is the .apex file path, `inserted_ids` are the new row IDs.
+    pub fn notify_indexes_after_write(storage_path: &Path, inserted_ids: &[u64]) {
+        if inserted_ids.is_empty() {
+            return;
+        }
+        let (base_dir, table_name) = base_dir_and_table(storage_path);
+        let idx_mgr_arc = get_index_manager(&base_dir, &table_name);
+        let mut idx_mgr = idx_mgr_arc.lock();
+        if idx_mgr.list_indexes().is_empty() {
+            return;
+        }
+
+        let indexed_cols: Vec<String> = idx_mgr.list_indexes().iter()
+            .map(|m| m.column_name.clone())
+            .collect();
+        let mut col_names: Vec<String> = vec!["_id".to_string()];
+        col_names.extend(indexed_cols.iter().cloned());
+        col_names.sort();
+        col_names.dedup();
+
+        // Open a read backend to get inserted row data
+        if let Ok(backend) = TableStorageBackend::open(storage_path) {
+            let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+            if let Ok(batch) = backend.read_columns_to_arrow(Some(&col_refs), 0, None) {
+                let id_col = batch.column_by_name("_id");
+                let id_set: std::collections::HashSet<u64> = inserted_ids.iter().copied().collect();
+                for row in 0..batch.num_rows() {
+                    let row_id = if let Some(col) = id_col {
+                        if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
+                            arr.value(row)
+                        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                            arr.value(row) as u64
+                        } else { continue; }
+                    } else { continue; };
+
+                    if !id_set.contains(&row_id) {
+                        continue;
+                    }
+
+                    let mut col_vals = std::collections::HashMap::new();
+                    for col_name in &indexed_cols {
+                        if let Some(col) = batch.column_by_name(col_name) {
+                            col_vals.insert(col_name.clone(), Self::arrow_value_at_col(col, row));
+                        }
+                    }
+                    let _ = idx_mgr.on_insert(row_id, &col_vals);
+                }
+                let _ = idx_mgr.save();
+            }
+        }
+    }
+
+    /// Public API: Notify indexes about rows deleted via non-SQL path (Python delete() API).
+    pub fn notify_indexes_after_delete(storage_path: &Path, deleted_ids: &[u64], column_values: &[std::collections::HashMap<String, Value>]) {
+        if deleted_ids.is_empty() {
+            return;
+        }
+        let (base_dir, table_name) = base_dir_and_table(storage_path);
+        let idx_mgr_arc = get_index_manager(&base_dir, &table_name);
+        let mut idx_mgr = idx_mgr_arc.lock();
+        if idx_mgr.list_indexes().is_empty() {
+            return;
+        }
+        for (i, &row_id) in deleted_ids.iter().enumerate() {
+            if i < column_values.len() {
+                idx_mgr.on_delete(row_id, &column_values[i]);
+            }
+        }
+        let _ = idx_mgr.save();
+    }
 
     /// Notify indexes that rows were inserted.
     /// Called after SQL INSERT completes. Reads newly inserted rows' indexed columns.
@@ -10952,27 +12159,41 @@ impl ApexExecutor {
             storage.get_schema().iter().map(|(n, _)| n.clone()).collect()
         };
         
-        // Build typed column data from values
-        let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
-        let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
-        let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
-        let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
-        
+        // Build a schema type lookup for auto-coercing string→timestamp/date
+        let schema_types: std::collections::HashMap<String, crate::storage::on_demand::ColumnType> = {
+            let schema = storage.get_schema();
+            schema.iter().map(|(name, dt)| {
+                (name.clone(), crate::storage::backend::datatype_to_column_type(dt))
+            }).collect()
+        };
+
+        // Build row-based data with proper NULL handling via Value::Null
+        // Auto-coerce string→timestamp/date based on schema type
+        let mut rows: Vec<HashMap<String, Value>> = Vec::with_capacity(values.len());
         for row_values in values {
+            let mut row = HashMap::new();
             for (i, value) in row_values.iter().enumerate() {
                 if i < col_names.len() {
                     let col_name = &col_names[i];
-                    match value {
-                        Value::Int64(v) => int_columns.entry(col_name.clone()).or_default().push(*v),
-                        Value::Int32(v) => int_columns.entry(col_name.clone()).or_default().push(*v as i64),
-                        Value::Float64(v) => float_columns.entry(col_name.clone()).or_default().push(*v),
-                        Value::Float32(v) => float_columns.entry(col_name.clone()).or_default().push(*v as f64),
-                        Value::String(v) => string_columns.entry(col_name.clone()).or_default().push(v.clone()),
-                        Value::Bool(v) => bool_columns.entry(col_name.clone()).or_default().push(*v),
-                        _ => {}
-                    }
+                    let col_schema_type = schema_types.get(col_name).copied();
+                    let coerced = match value {
+                        Value::String(v) => {
+                            match col_schema_type {
+                                Some(crate::storage::on_demand::ColumnType::Timestamp) => {
+                                    Value::Timestamp(Self::parse_timestamp_string(v))
+                                }
+                                Some(crate::storage::on_demand::ColumnType::Date) => {
+                                    Value::Date(Self::parse_date_string(v) as i32)
+                                }
+                                _ => value.clone(),
+                            }
+                        }
+                        _ => value.clone(),
+                    };
+                    row.insert(col_name.clone(), coerced);
                 }
             }
+            rows.push(row);
         }
         
         let rows_inserted = values.len() as i64;
@@ -11008,29 +12229,23 @@ impl ApexExecutor {
             }
         }
         
-        // Fill in DEFAULT values for missing columns
+        // Fill in DEFAULT values for missing columns into row maps
         if storage.storage.has_constraints() {
             let schema = storage.get_schema();
-            let row_count = values.len();
             for (schema_col, _) in &schema {
                 if !col_names.iter().any(|c| c == schema_col) {
                     let cons = storage.storage.get_column_constraints(schema_col);
                     if let Some(ref dv) = cons.default_value {
                         use crate::storage::on_demand::DefaultValue;
-                        match dv {
-                            DefaultValue::Int64(v) => {
-                                int_columns.entry(schema_col.clone()).or_default().extend(std::iter::repeat(*v).take(row_count));
-                            }
-                            DefaultValue::Float64(v) => {
-                                float_columns.entry(schema_col.clone()).or_default().extend(std::iter::repeat(*v).take(row_count));
-                            }
-                            DefaultValue::String(v) => {
-                                string_columns.entry(schema_col.clone()).or_default().extend(std::iter::repeat(v.clone()).take(row_count));
-                            }
-                            DefaultValue::Bool(v) => {
-                                bool_columns.entry(schema_col.clone()).or_default().extend(std::iter::repeat(*v).take(row_count));
-                            }
-                            DefaultValue::Null => {} // NULL default — no column data needed
+                        let default_val = match dv {
+                            DefaultValue::Int64(v) => Value::Int64(*v),
+                            DefaultValue::Float64(v) => Value::Float64(*v),
+                            DefaultValue::String(v) => Value::String(v.clone()),
+                            DefaultValue::Bool(v) => Value::Bool(*v),
+                            DefaultValue::Null => Value::Null,
+                        };
+                        for row in rows.iter_mut() {
+                            row.entry(schema_col.clone()).or_insert_with(|| default_val.clone());
                         }
                     }
                 }
@@ -11138,11 +12353,149 @@ impl ApexExecutor {
             }
         }
 
+        // Enforce CHECK constraints
+        if storage.storage.has_constraints() {
+            let schema = storage.get_schema();
+            for (schema_col, _) in &schema {
+                let cons = storage.storage.get_column_constraints(schema_col);
+                if let Some(ref check_sql) = cons.check_expr_sql {
+                    // Parse the CHECK expression once
+                    let check_expr = {
+                        // Wrap in a SELECT WHERE to reuse the expression parser
+                        let parse_sql = format!("SELECT 1 FROM _dummy WHERE {}", check_sql);
+                        match crate::query::sql_parser::SqlParser::parse(&parse_sql) {
+                            Ok(crate::query::sql_parser::SqlStatement::Select(sel)) => {
+                                sel.where_clause.clone()
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(ref expr) = check_expr {
+                        // Evaluate CHECK for each row
+                        for (row_idx, row_values) in values.iter().enumerate() {
+                            // Build a 1-row RecordBatch with this row's values
+                            let mut fields = Vec::new();
+                            let mut arrays: Vec<ArrayRef> = Vec::new();
+                            for (i, value) in row_values.iter().enumerate() {
+                                if i < col_names.len() {
+                                    let cn = &col_names[i];
+                                    match value {
+                                        Value::Int64(v) => {
+                                            fields.push(Field::new(cn, ArrowDataType::Int64, true));
+                                            arrays.push(Arc::new(Int64Array::from(vec![*v])));
+                                        }
+                                        Value::Float64(v) => {
+                                            fields.push(Field::new(cn, ArrowDataType::Float64, true));
+                                            arrays.push(Arc::new(Float64Array::from(vec![*v])));
+                                        }
+                                        Value::String(v) => {
+                                            fields.push(Field::new(cn, ArrowDataType::Utf8, true));
+                                            arrays.push(Arc::new(StringArray::from(vec![v.as_str()])));
+                                        }
+                                        Value::Bool(v) => {
+                                            fields.push(Field::new(cn, ArrowDataType::Boolean, true));
+                                            arrays.push(Arc::new(BooleanArray::from(vec![*v])));
+                                        }
+                                        Value::Null => {
+                                            fields.push(Field::new(cn, ArrowDataType::Utf8, true));
+                                            arrays.push(Arc::new(StringArray::from(vec![Option::<&str>::None])));
+                                        }
+                                        _ => {
+                                            fields.push(Field::new(cn, ArrowDataType::Utf8, true));
+                                            arrays.push(Arc::new(StringArray::from(vec![format!("{:?}", value).as_str()])));
+                                        }
+                                    }
+                                }
+                            }
+                            if !fields.is_empty() {
+                                let batch_schema = Arc::new(Schema::new(fields));
+                                if let Ok(row_batch) = RecordBatch::try_new(batch_schema, arrays) {
+                                    match Self::evaluate_predicate(&row_batch, expr) {
+                                        Ok(mask) => {
+                                            if mask.len() > 0 && !mask.value(0) {
+                                                return Err(io::Error::new(
+                                                    io::ErrorKind::InvalidInput,
+                                                    format!("CHECK constraint violated: {} (column '{}', row {})", check_sql, schema_col, row_idx + 1),
+                                                ));
+                                            }
+                                        }
+                                        Err(_) => {
+                                            // If evaluation fails (e.g., column not in batch), treat as violation
+                                            // This handles cases where the CHECK references a column not present
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Enforce FOREIGN KEY constraints
+        if storage.storage.has_constraints() {
+            let (base_dir, _) = base_dir_and_table(storage_path);
+            let schema = storage.get_schema();
+            for (schema_col, _) in &schema {
+                let cons = storage.storage.get_column_constraints(schema_col);
+                if let Some((ref ref_table, ref ref_column)) = cons.foreign_key {
+                    // Find column index in inserted data
+                    let col_idx = col_names.iter().position(|n| n == schema_col);
+                    if col_idx.is_none() { continue; }
+                    let col_idx = col_idx.unwrap();
+                    
+                    // Open referenced table
+                    let ref_path = base_dir.join(format!("{}.apex", ref_table));
+                    if !ref_path.exists() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("FOREIGN KEY: referenced table '{}' does not exist", ref_table),
+                        ));
+                    }
+                    let ref_storage = TableStorageBackend::open(&ref_path)?;
+                    let ref_batch = ref_storage.read_columns_to_arrow(Some(&[ref_column.as_str()]), 0, None)?;
+                    let ref_col_arr = ref_batch.column_by_name(ref_column);
+                    
+                    // Check each inserted value exists in referenced column
+                    for (row_idx, row_values) in values.iter().enumerate() {
+                        if col_idx >= row_values.len() { continue; }
+                        let val = &row_values[col_idx];
+                        if matches!(val, Value::Null) { continue; } // NULL is allowed in FK
+                        
+                        let found = if let Some(ref_arr) = ref_col_arr {
+                            let mut exists = false;
+                            for r in 0..ref_arr.len() {
+                                if ref_arr.is_null(r) { continue; }
+                                let matches = match val {
+                                    Value::Int64(v) => ref_arr.as_any().downcast_ref::<Int64Array>().map(|a| a.value(r) == *v).unwrap_or(false),
+                                    Value::Float64(v) => ref_arr.as_any().downcast_ref::<Float64Array>().map(|a| (a.value(r) - v).abs() < f64::EPSILON).unwrap_or(false),
+                                    Value::String(v) => ref_arr.as_any().downcast_ref::<StringArray>().map(|a| a.value(r) == v.as_str()).unwrap_or(false),
+                                    Value::Bool(v) => ref_arr.as_any().downcast_ref::<BooleanArray>().map(|a| a.value(r) == *v).unwrap_or(false),
+                                    _ => false,
+                                };
+                                if matches { exists = true; break; }
+                            }
+                            exists
+                        } else {
+                            false
+                        };
+                        
+                        if !found {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("FOREIGN KEY constraint violated: value in column '{}' not found in {}.{} (row {})", schema_col, ref_table, ref_column, row_idx + 1),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // Capture row count before insert for index maintenance
         let pre_insert_count = storage.row_count();
         
-        // Use insert_typed + save for reliable writes
-        storage.insert_typed(int_columns, float_columns, string_columns, HashMap::new(), bool_columns)?;
+        // Use insert_rows for proper NULL handling (Value::Null → ColumnValue::Null)
+        storage.insert_rows(&rows)?;
         storage.save()?;
         
         // Update indexes for newly inserted rows
@@ -11152,6 +12505,316 @@ impl ApexExecutor {
         invalidate_storage_cache(storage_path);
         
         Ok(ApexResult::Scalar(rows_inserted))
+    }
+
+    /// Execute COPY table TO 'file.parquet' — export table data to Parquet file
+    fn execute_copy_to_parquet(storage_path: &Path, table_name: &str, file_path: &str) -> io::Result<ApexResult> {
+        if !storage_path.exists() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' does not exist", table_name)));
+        }
+        let storage = TableStorageBackend::open(storage_path)?;
+        let batch = storage.read_columns_to_arrow(None, 0, None)?;
+        let schema = batch.schema();
+
+        let file = std::fs::File::create(file_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Cannot create parquet file '{}': {}", file_path, e)))?;
+
+        let props = parquet::file::properties::WriterProperties::builder().build();
+        let mut writer = parquet::arrow::arrow_writer::ArrowWriter::try_new(file, schema.clone(), Some(props))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Parquet writer error: {}", e)))?;
+
+        writer.write(&batch)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Parquet write error: {}", e)))?;
+        writer.close()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Parquet close error: {}", e)))?;
+
+        Ok(ApexResult::Scalar(batch.num_rows() as i64))
+    }
+
+    /// Execute COPY table FROM 'file.parquet' — import data from Parquet file into table
+    fn execute_copy_from_parquet(
+        storage_path: &Path,
+        table_name: &str,
+        file_path: &str,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<ApexResult> {
+        let file = std::fs::File::open(file_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("Cannot open parquet file '{}': {}", file_path, e)))?;
+
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Parquet reader error: {}", e)))?
+            .build()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Parquet reader build error: {}", e)))?;
+
+        let mut total_rows = 0i64;
+        for batch_result in reader {
+            let batch = batch_result
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Parquet read error: {}", e)))?;
+            let schema = batch.schema();
+            let num_rows = batch.num_rows();
+            if num_rows == 0 { continue; }
+
+            // Convert RecordBatch rows to Value vectors for insert
+            let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+            let mut values: Vec<Vec<Value>> = Vec::with_capacity(num_rows);
+            for row_idx in 0..num_rows {
+                let mut row: Vec<Value> = Vec::with_capacity(col_names.len());
+                for col_idx in 0..col_names.len() {
+                    let col = batch.column(col_idx);
+                    row.push(Self::arrow_value_at_col(col, row_idx));
+                }
+                values.push(row);
+            }
+
+            // Ensure table exists — create if not
+            if !storage_path.exists() {
+                let mut col_defs = Vec::new();
+                for field in schema.fields() {
+                    let type_str = match field.data_type() {
+                        arrow::datatypes::DataType::Int64 => "INTEGER",
+                        arrow::datatypes::DataType::Float64 => "REAL",
+                        arrow::datatypes::DataType::Boolean => "BOOLEAN",
+                        arrow::datatypes::DataType::UInt64 => "INTEGER",
+                        _ => "TEXT",
+                    };
+                    col_defs.push(format!("{} {}", field.name(), type_str));
+                }
+                let create_sql = format!("CREATE TABLE {} ({})", table_name, col_defs.join(", "));
+                let create_stmt = SqlParser::parse(&create_sql)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to parse CREATE TABLE: {}", e)))?;
+                Self::execute_parsed_multi(create_stmt, base_dir, default_table_path)?;
+            }
+
+            Self::execute_insert(storage_path, Some(&col_names), &values)?;
+            total_rows += num_rows as i64;
+        }
+
+        Ok(ApexResult::Scalar(total_rows))
+    }
+
+    /// Execute ANALYZE — collect column statistics (NDV, min, max, null_count, row_count)
+    fn execute_analyze(storage_path: &Path, table_name: &str) -> io::Result<ApexResult> {
+        if !storage_path.exists() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' does not exist", table_name)));
+        }
+        let storage = TableStorageBackend::open(storage_path)?;
+        let batch = storage.read_columns_to_arrow(None, 0, None)?;
+        let schema = batch.schema();
+        let num_rows = batch.num_rows();
+
+        let mut col_names: Vec<String> = Vec::new();
+        let mut col_types: Vec<String> = Vec::new();
+        let mut ndv_vals: Vec<i64> = Vec::new();
+        let mut null_counts: Vec<i64> = Vec::new();
+        let mut min_vals: Vec<String> = Vec::new();
+        let mut max_vals: Vec<String> = Vec::new();
+        let mut row_counts: Vec<i64> = Vec::new();
+
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            let col = batch.column(col_idx);
+            col_names.push(field.name().clone());
+            col_types.push(format!("{}", field.data_type()));
+            row_counts.push(num_rows as i64);
+
+            // Count nulls
+            let nc = (0..num_rows).filter(|&i| col.is_null(i)).count() as i64;
+            null_counts.push(nc);
+
+            // Collect distinct values and min/max
+            let mut distinct = std::collections::HashSet::new();
+            let mut min_s = String::new();
+            let mut max_s = String::new();
+            let mut first = true;
+
+            for i in 0..num_rows {
+                if col.is_null(i) { continue; }
+                let val_str = Self::arrow_value_at_col(col, i).to_string();
+                distinct.insert(val_str.clone());
+                if first {
+                    min_s = val_str.clone();
+                    max_s = val_str;
+                    first = false;
+                } else {
+                    if val_str < min_s { min_s = val_str.clone(); }
+                    if val_str > max_s { max_s = val_str; }
+                }
+            }
+            ndv_vals.push(distinct.len() as i64);
+            min_vals.push(min_s);
+            max_vals.push(max_s);
+        }
+
+        // Build result as a RecordBatch
+        let result_schema = Arc::new(Schema::new(vec![
+            Field::new("column_name", arrow::datatypes::DataType::Utf8, false),
+            Field::new("column_type", arrow::datatypes::DataType::Utf8, false),
+            Field::new("row_count", arrow::datatypes::DataType::Int64, false),
+            Field::new("null_count", arrow::datatypes::DataType::Int64, false),
+            Field::new("ndv", arrow::datatypes::DataType::Int64, false),
+            Field::new("min_value", arrow::datatypes::DataType::Utf8, true),
+            Field::new("max_value", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(col_names.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(col_types.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(row_counts)),
+            Arc::new(Int64Array::from(null_counts)),
+            Arc::new(Int64Array::from(ndv_vals)),
+            Arc::new(StringArray::from(min_vals.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(max_vals.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+        ];
+        let result_batch = RecordBatch::try_new(result_schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(ApexResult::Data(result_batch))
+    }
+
+    /// Execute INSERT ON CONFLICT (UPSERT)
+    /// - DO NOTHING: skip rows that conflict on the specified columns
+    /// - DO UPDATE SET ...: update conflicting rows with the specified assignments
+    fn execute_insert_on_conflict(
+        storage_path: &Path,
+        columns: Option<&[String]>,
+        values: &[Vec<Value>],
+        conflict_columns: &[String],
+        do_update: Option<&[(String, SqlExpr)]>,
+    ) -> io::Result<ApexResult> {
+        use std::collections::HashMap;
+
+        if !storage_path.exists() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Table does not exist"));
+        }
+
+        invalidate_storage_cache(storage_path);
+        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        let schema = storage.get_schema();
+
+        let col_names: Vec<String> = if let Some(cols) = columns {
+            cols.to_vec()
+        } else {
+            schema.iter().map(|(n, _)| n.clone()).collect()
+        };
+
+        // Read existing data for conflict detection
+        let conflict_refs: Vec<&str> = conflict_columns.iter().map(|s| s.as_str()).collect();
+        let mut read_cols: Vec<&str> = vec!["_id"];
+        for c in &conflict_refs {
+            if !read_cols.contains(c) { read_cols.push(c); }
+        }
+        let existing = storage.read_columns_to_arrow(Some(&read_cols), 0, None)?;
+
+        // Build lookup: conflict key → row index in existing data
+        let existing_rows = existing.num_rows();
+
+        // Helper: extract value from Arrow column at row
+        let extract_val = |col_name: &str, row: usize| -> Option<Value> {
+            existing.column_by_name(col_name).map(|c| Self::arrow_value_at_col(c, row))
+        };
+
+        // For each input row, check if it conflicts
+        let mut inserted = 0i64;
+        let mut updated = 0i64;
+
+        for row_values in values {
+            // Build this row's conflict key values
+            let mut conflict_vals: Vec<Value> = Vec::new();
+            for cc in conflict_columns {
+                if let Some(idx) = col_names.iter().position(|n| n == cc) {
+                    if idx < row_values.len() {
+                        conflict_vals.push(row_values[idx].clone());
+                    } else {
+                        conflict_vals.push(Value::Null);
+                    }
+                } else {
+                    conflict_vals.push(Value::Null);
+                }
+            }
+
+            // Search for a matching existing row
+            let mut conflict_row_id: Option<u64> = None;
+            for er in 0..existing_rows {
+                let mut all_match = true;
+                for (ci, cc) in conflict_columns.iter().enumerate() {
+                    let existing_val = extract_val(cc, er);
+                    let new_val = &conflict_vals[ci];
+                    let matches = match (&existing_val, new_val) {
+                        (Some(Value::Int64(a)), Value::Int64(b)) => a == b,
+                        (Some(Value::Int32(a)), Value::Int32(b)) => a == b,
+                        (Some(Value::Int64(a)), Value::Int32(b)) => *a == *b as i64,
+                        (Some(Value::Float64(a)), Value::Float64(b)) => (a - b).abs() < f64::EPSILON,
+                        (Some(Value::String(a)), Value::String(b)) => a == b,
+                        (Some(Value::Bool(a)), Value::Bool(b)) => a == b,
+                        (Some(Value::UInt64(a)), Value::Int64(b)) => *a as i64 == *b,
+                        (Some(Value::Int64(a)), Value::UInt64(b)) => *a == *b as i64,
+                        (Some(Value::Null), Value::Null) => false, // NULL != NULL
+                        _ => false,
+                    };
+                    if !matches {
+                        all_match = false;
+                        break;
+                    }
+                }
+                if all_match {
+                    // Found conflict — get row_id
+                    if let Some(id_col) = existing.column_by_name("_id") {
+                        if let Some(a) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                            conflict_row_id = Some(a.value(er));
+                        } else if let Some(a) = id_col.as_any().downcast_ref::<Int64Array>() {
+                            conflict_row_id = Some(a.value(er) as u64);
+                        }
+                    }
+                    break;
+                }
+            }
+
+            if let Some(rid) = conflict_row_id {
+                // Conflict found
+                if let Some(assignments) = do_update {
+                    // DO UPDATE SET ...
+                    // Build a row data map for expression evaluation
+                    let mut row_data: HashMap<String, Value> = HashMap::new();
+                    for (i, val) in row_values.iter().enumerate() {
+                        if i < col_names.len() {
+                            row_data.insert(col_names[i].clone(), val.clone());
+                        }
+                    }
+
+                    let mut update_assignments: Vec<(String, SqlExpr)> = Vec::new();
+                    for (col, expr) in assignments {
+                        // Support EXCLUDED.col syntax: replace with the new row's value
+                        let resolved_expr = match expr {
+                            SqlExpr::Column(ref name) if name.starts_with("EXCLUDED.") || name.starts_with("excluded.") => {
+                                let src_col = &name[9..]; // skip "EXCLUDED." or "excluded."
+                                if let Some(val) = row_data.get(src_col) {
+                                    SqlExpr::Literal(val.clone())
+                                } else {
+                                    expr.clone()
+                                }
+                            }
+                            _ => expr.clone(),
+                        };
+                        update_assignments.push((col.clone(), resolved_expr));
+                    }
+
+                    // Execute UPDATE for this specific row
+                    let where_clause = SqlExpr::BinaryOp {
+                        left: Box::new(SqlExpr::Column("_id".to_string())),
+                        op: BinaryOperator::Eq,
+                        right: Box::new(SqlExpr::Literal(Value::UInt64(rid))),
+                    };
+                    Self::execute_update(storage_path, &update_assignments, Some(&where_clause))?;
+                    updated += 1;
+                }
+                // else DO NOTHING — skip this row
+            } else {
+                // No conflict — insert the row
+                Self::execute_insert(storage_path, Some(&col_names), &[row_values.clone()])?;
+                inserted += 1;
+            }
+        }
+
+        invalidate_storage_cache(storage_path);
+        Ok(ApexResult::Scalar(inserted + updated))
     }
 
     /// Execute DELETE statement (soft delete - marks rows as deleted without physical removal)
@@ -11174,8 +12837,54 @@ impl ApexExecutor {
             lock.list_indexes().iter().map(|m| m.column_name.clone()).collect()
         };
 
+        // FOREIGN KEY enforcement: check if any child tables reference this table
+        // We need to scan sibling .apex files for FK constraints pointing here
+        let (base_dir, this_table_name) = base_dir_and_table(storage_path);
+        let fk_children: Vec<(String, String, String)> = { // (child_table_path, child_col, ref_col)
+            let mut children = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&base_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().map(|e| e == "apex").unwrap_or(false) && p != storage_path {
+                        if let Ok(child_storage) = TableStorageBackend::open(&p) {
+                            let child_schema = child_storage.get_schema();
+                            for (col_name, _) in &child_schema {
+                                let cons = child_storage.storage.get_column_constraints(col_name);
+                                if let Some((ref rt, ref rc)) = cons.foreign_key {
+                                    if rt == &this_table_name {
+                                        children.push((p.to_string_lossy().to_string(), col_name.clone(), rc.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            children
+        };
+
         // For DELETE without WHERE, delete all rows (soft delete)
         if where_clause.is_none() {
+            // FK enforcement: if deleting ALL rows, check child tables have no referencing rows
+            if !fk_children.is_empty() {
+                for (child_path, child_col, _ref_col) in &fk_children {
+                    let child_storage = TableStorageBackend::open(std::path::Path::new(child_path))?;
+                    let child_batch = child_storage.read_columns_to_arrow(Some(&[child_col.as_str()]), 0, None)?;
+                    if let Some(col_arr) = child_batch.column_by_name(child_col) {
+                        // Check if any non-null FK values exist in child
+                        for r in 0..col_arr.len() {
+                            if !col_arr.is_null(r) {
+                                let child_table = std::path::Path::new(child_path).file_stem()
+                                    .map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("FOREIGN KEY constraint violated: cannot delete from '{}' — referenced by '{}.{}'", this_table_name, child_table, child_col),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
             let storage = TableStorageBackend::open_for_write(storage_path)?;
             let count = storage.active_row_count() as i64;
             
@@ -11224,10 +12933,16 @@ impl ApexExecutor {
         // Soft delete only marks rows in bitmap
         let storage = TableStorageBackend::open_for_write(storage_path)?;
         
-        // Extract column names from WHERE clause + indexed columns
+        // Extract column names from WHERE clause + indexed columns + FK-referenced columns
         let mut where_cols: Vec<String> = Vec::new();
         Self::collect_columns_from_expr(where_clause.unwrap(), &mut where_cols);
         where_cols.extend(indexed_cols.iter().cloned());
+        // Include columns referenced by child FKs so we can check them
+        for (_, _, ref_col) in &fk_children {
+            if !where_cols.contains(ref_col) {
+                where_cols.push(ref_col.clone());
+            }
+        }
         where_cols.sort();
         where_cols.dedup();
         
@@ -11240,6 +12955,41 @@ impl ApexExecutor {
         let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
         let filter_mask = Self::evaluate_predicate(&batch, where_clause.unwrap())?;
         
+        // FK enforcement: for rows being deleted, check no child references exist
+        if !fk_children.is_empty() {
+            for (child_path, child_col, ref_col) in &fk_children {
+                // Get the parent column values being deleted
+                let parent_arr = batch.column_by_name(ref_col);
+                if parent_arr.is_none() { continue; }
+                let parent_arr = parent_arr.unwrap();
+                
+                // Load child FK column
+                let child_storage = TableStorageBackend::open(std::path::Path::new(child_path))?;
+                let child_batch = child_storage.read_columns_to_arrow(Some(&[child_col.as_str()]), 0, None)?;
+                let child_arr = child_batch.column_by_name(child_col);
+                if child_arr.is_none() { continue; }
+                let child_arr = child_arr.unwrap();
+                
+                for i in 0..filter_mask.len() {
+                    if !filter_mask.value(i) || parent_arr.is_null(i) { continue; }
+                    let parent_val = Self::arrow_value_at_col(parent_arr, i);
+                    // Check if any child row references this value
+                    for cr in 0..child_arr.len() {
+                        if child_arr.is_null(cr) { continue; }
+                        let child_val = Self::arrow_value_at_col(child_arr, cr);
+                        if parent_val == child_val {
+                            let child_table = std::path::Path::new(child_path).file_stem()
+                                .map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("FOREIGN KEY constraint violated: cannot delete from '{}' — value referenced by '{}.{}'", this_table_name, child_table, child_col),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // Count and delete matching rows, collect entries for index maintenance
         let mut deleted = 0i64;
         let mut deleted_entries: Vec<(u64, std::collections::HashMap<String, Value>)> = Vec::new();
@@ -11448,6 +13198,118 @@ impl ApexExecutor {
                                     format!("{} constraint violated: duplicate value in column '{}'", constraint_kind, uc),
                                 ));
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Enforce CHECK constraints on updated values
+        if updated > 0 && storage.storage.has_constraints() {
+            let schema = storage.get_schema();
+            for (schema_col, _) in &schema {
+                let cons = storage.storage.get_column_constraints(schema_col);
+                if let Some(ref check_sql) = cons.check_expr_sql {
+                    let check_expr = {
+                        let parse_sql = format!("SELECT 1 FROM _dummy WHERE {}", check_sql);
+                        match crate::query::sql_parser::SqlParser::parse(&parse_sql) {
+                            Ok(crate::query::sql_parser::SqlStatement::Select(sel)) => {
+                                sel.where_clause.clone()
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(ref expr) = check_expr {
+                        for (_row_id, update_data) in &updates {
+                            // Build a 1-row batch from the update data
+                            let mut fields = Vec::new();
+                            let mut arrays: Vec<ArrayRef> = Vec::new();
+                            for (cn, value) in update_data {
+                                match value {
+                                    Value::Int64(v) => {
+                                        fields.push(Field::new(cn, ArrowDataType::Int64, true));
+                                        arrays.push(Arc::new(Int64Array::from(vec![*v])));
+                                    }
+                                    Value::Float64(v) => {
+                                        fields.push(Field::new(cn, ArrowDataType::Float64, true));
+                                        arrays.push(Arc::new(Float64Array::from(vec![*v])));
+                                    }
+                                    Value::String(v) => {
+                                        fields.push(Field::new(cn, ArrowDataType::Utf8, true));
+                                        arrays.push(Arc::new(StringArray::from(vec![v.as_str()])));
+                                    }
+                                    Value::Bool(v) => {
+                                        fields.push(Field::new(cn, ArrowDataType::Boolean, true));
+                                        arrays.push(Arc::new(BooleanArray::from(vec![*v])));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !fields.is_empty() {
+                                let batch_schema = Arc::new(Schema::new(fields));
+                                if let Ok(row_batch) = RecordBatch::try_new(batch_schema, arrays) {
+                                    if let Ok(mask) = Self::evaluate_predicate(&row_batch, expr) {
+                                        if mask.len() > 0 && !mask.value(0) {
+                                            return Err(io::Error::new(
+                                                io::ErrorKind::InvalidInput,
+                                                format!("CHECK constraint violated: {} (column '{}')", check_sql, schema_col),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Enforce FOREIGN KEY constraints on updated values
+        if updated > 0 && storage.storage.has_constraints() {
+            let (base_dir, _) = base_dir_and_table(storage_path);
+            let schema = storage.get_schema();
+            for (schema_col, _) in &schema {
+                let cons = storage.storage.get_column_constraints(schema_col);
+                if let Some((ref ref_table, ref ref_column)) = cons.foreign_key {
+                    // Collect updated values for this FK column
+                    let fk_vals: Vec<&Value> = updates.iter()
+                        .filter_map(|(_, data)| data.get(schema_col))
+                        .collect();
+                    if fk_vals.is_empty() { continue; }
+                    
+                    let ref_path = base_dir.join(format!("{}.apex", ref_table));
+                    if !ref_path.exists() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("FOREIGN KEY: referenced table '{}' does not exist", ref_table),
+                        ));
+                    }
+                    let ref_storage = TableStorageBackend::open(&ref_path)?;
+                    let ref_batch = ref_storage.read_columns_to_arrow(Some(&[ref_column.as_str()]), 0, None)?;
+                    let ref_col_arr = ref_batch.column_by_name(ref_column);
+                    
+                    for val in &fk_vals {
+                        if matches!(val, Value::Null) { continue; }
+                        let found = if let Some(ref_arr) = ref_col_arr {
+                            let mut exists = false;
+                            for r in 0..ref_arr.len() {
+                                if ref_arr.is_null(r) { continue; }
+                                let matches = match val {
+                                    Value::Int64(v) => ref_arr.as_any().downcast_ref::<Int64Array>().map(|a| a.value(r) == *v).unwrap_or(false),
+                                    Value::Float64(v) => ref_arr.as_any().downcast_ref::<Float64Array>().map(|a| (a.value(r) - v).abs() < f64::EPSILON).unwrap_or(false),
+                                    Value::String(v) => ref_arr.as_any().downcast_ref::<StringArray>().map(|a| a.value(r) == v.as_str()).unwrap_or(false),
+                                    Value::Bool(v) => ref_arr.as_any().downcast_ref::<BooleanArray>().map(|a| a.value(r) == *v).unwrap_or(false),
+                                    _ => false,
+                                };
+                                if matches { exists = true; break; }
+                            }
+                            exists
+                        } else { false };
+                        if !found {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("FOREIGN KEY constraint violated: value in column '{}' not found in {}.{}", schema_col, ref_table, ref_column),
+                            ));
                         }
                     }
                 }
@@ -12569,5 +14431,149 @@ mod tests {
             exec_multi("INSERT INTO t9 (id, email) VALUES (1, 'x@y.com'), (2, 'x@y.com')", base),
             "UNIQUE",
         );
+    }
+
+    // ========== P1: CTAS Tests ==========
+
+    #[test]
+    fn test_ctas_basic() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE src (id INT, name TEXT)", base).unwrap();
+        exec_multi("INSERT INTO src (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')", base).unwrap();
+        let result = exec_multi("CREATE TABLE dst AS SELECT id, name FROM src WHERE id > 1", base).unwrap();
+        // Should return number of inserted rows
+        if let ApexResult::Scalar(n) = result { assert_eq!(n, 2); }
+        // Verify the new table has the right data
+        let q = exec_multi("SELECT COUNT(*) FROM dst", base).unwrap();
+        let batch = q.to_record_batch().unwrap();
+        assert_eq!(batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 2);
+    }
+
+    #[test]
+    fn test_ctas_if_not_exists() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE src2 (id INT)", base).unwrap();
+        exec_multi("INSERT INTO src2 (id) VALUES (1)", base).unwrap();
+        exec_multi("CREATE TABLE dst2 AS SELECT id FROM src2", base).unwrap();
+        // Second CTAS without IF NOT EXISTS should error
+        assert_err_contains(
+            exec_multi("CREATE TABLE dst2 AS SELECT id FROM src2", base),
+            "already exists",
+        );
+        // With IF NOT EXISTS should succeed silently
+        let result = exec_multi("CREATE TABLE IF NOT EXISTS dst2 AS SELECT id FROM src2", base).unwrap();
+        if let ApexResult::Scalar(n) = result { assert_eq!(n, 0); }
+    }
+
+    #[test]
+    fn test_ctas_empty_result() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE src3 (id INT, val TEXT)", base).unwrap();
+        exec_multi("INSERT INTO src3 (id, val) VALUES (1, 'x')", base).unwrap();
+        let result = exec_multi("CREATE TABLE dst3 AS SELECT id, val FROM src3 WHERE id > 999", base).unwrap();
+        if let ApexResult::Scalar(n) = result { assert_eq!(n, 0); }
+        let q = exec_multi("SELECT COUNT(*) FROM dst3", base).unwrap();
+        let batch = q.to_record_batch().unwrap();
+        assert_eq!(batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 0);
+    }
+
+    // ========== P1: RIGHT / FULL OUTER / CROSS JOIN Tests ==========
+
+    #[test]
+    fn test_right_join() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE left_t (id INT, lval TEXT)", base).unwrap();
+        exec_multi("CREATE TABLE right_t (id INT, rval TEXT)", base).unwrap();
+        exec_multi("INSERT INTO left_t (id, lval) VALUES (1, 'a'), (2, 'b')", base).unwrap();
+        exec_multi("INSERT INTO right_t (id, rval) VALUES (2, 'x'), (3, 'y')", base).unwrap();
+        let result = exec_multi("SELECT * FROM left_t RIGHT JOIN right_t ON left_t.id = right_t.id", base).unwrap();
+        let batch = result.to_record_batch().unwrap();
+        // RIGHT JOIN: all right rows preserved. id=2 matches, id=3 has NULL left.
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[test]
+    fn test_full_outer_join() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE fl (id INT, lv TEXT)", base).unwrap();
+        exec_multi("CREATE TABLE fr (id INT, rv TEXT)", base).unwrap();
+        exec_multi("INSERT INTO fl (id, lv) VALUES (1, 'a'), (2, 'b')", base).unwrap();
+        exec_multi("INSERT INTO fr (id, rv) VALUES (2, 'x'), (3, 'y')", base).unwrap();
+        let result = exec_multi("SELECT * FROM fl FULL OUTER JOIN fr ON fl.id = fr.id", base).unwrap();
+        let batch = result.to_record_batch().unwrap();
+        // FULL OUTER: id=1 (left only), id=2 (both), id=3 (right only) = 3 rows
+        assert_eq!(batch.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_cross_join() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE ca (id INT)", base).unwrap();
+        exec_multi("CREATE TABLE cb (id INT)", base).unwrap();
+        exec_multi("INSERT INTO ca (id) VALUES (1), (2)", base).unwrap();
+        exec_multi("INSERT INTO cb (id) VALUES (10), (20), (30)", base).unwrap();
+        let result = exec_multi("SELECT * FROM ca CROSS JOIN cb", base).unwrap();
+        let batch = result.to_record_batch().unwrap();
+        // CROSS JOIN: 2 × 3 = 6 rows
+        assert_eq!(batch.num_rows(), 6);
+    }
+
+    // ========== P1: Per-RG Zone Maps Tests ==========
+
+    #[test]
+    fn test_zone_maps_persisted_in_footer() {
+        use crate::storage::on_demand::OnDemandStorage;
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE zm (id INT, score INT, name TEXT)", base).unwrap();
+        exec_multi("INSERT INTO zm (id, score, name) VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')", base).unwrap();
+
+        // Open storage and check footer has zone maps
+        let path = base.join("zm.apex");
+        let storage = OnDemandStorage::open(&path).unwrap();
+        if let Some(footer) = storage.get_or_load_footer().unwrap() {
+            assert!(!footer.zone_maps.is_empty(), "Zone maps should be populated");
+            // First RG should have zone maps for Int64 columns (id and score)
+            let rg0_zmaps = &footer.zone_maps[0];
+            assert!(rg0_zmaps.len() >= 2, "Should have zone maps for at least 2 Int64 columns");
+            // Check zone map values for id column (min=1, max=3)
+            let id_zm = &rg0_zmaps[0];
+            assert_eq!(id_zm.min_bits, 1);
+            assert_eq!(id_zm.max_bits, 3);
+            assert!(!id_zm.is_float);
+            // Check zone map values for score column (min=10, max=30)
+            let score_zm = &rg0_zmaps[1];
+            assert_eq!(score_zm.min_bits, 10);
+            assert_eq!(score_zm.max_bits, 30);
+        } else {
+            panic!("Expected V4 footer");
+        }
+    }
+
+    #[test]
+    fn test_zone_map_pruning_logic() {
+        use crate::storage::on_demand::RgColumnZoneMap;
+        let zm = RgColumnZoneMap {
+            col_idx: 0, min_bits: 10, max_bits: 100,
+            has_nulls: false, is_float: false,
+        };
+        // Value 50 is in range [10,100]
+        assert!(zm.may_contain_int("=", 50));
+        // Value 200 is NOT in range [10,100]
+        assert!(!zm.may_contain_int("=", 200));
+        // All values > 5 — max=100 > 5
+        assert!(zm.may_contain_int(">", 5));
+        // All values > 100 — max=100 NOT > 100
+        assert!(!zm.may_contain_int(">", 100));
+        // BETWEEN 50..150 overlaps [10,100]
+        assert!(zm.may_overlap_int_range(50, 150));
+        // BETWEEN 200..300 does NOT overlap [10,100]
+        assert!(!zm.may_overlap_int_range(200, 300));
     }
 }
