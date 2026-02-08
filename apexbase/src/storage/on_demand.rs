@@ -210,10 +210,51 @@ const ROW_GROUP_META_SIZE: usize = 40;
 // Per-RG compression flags (stored in RG header byte 28)
 const RG_COMPRESS_NONE: u8 = 0;
 const RG_COMPRESS_LZ4: u8 = 1;
+const RG_COMPRESS_ZSTD: u8 = 2;
 
 /// Minimum RG body size (bytes) to bother compressing.
 /// Below this threshold, compression overhead exceeds savings.
-const LZ4_MIN_BODY_SIZE: usize = 512;
+const COMPRESS_MIN_BODY_SIZE: usize = 512;
+
+/// Decompress an RG body based on the compression flag.
+/// Returns Ok(None) if uncompressed (caller should use raw bytes),
+/// or Ok(Some(Vec<u8>)) with decompressed data.
+fn decompress_rg_body(compress_flag: u8, compressed: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    match compress_flag {
+        RG_COMPRESS_NONE => Ok(None),
+        RG_COMPRESS_LZ4 => {
+            let decompressed = lz4_flex::decompress_size_prepended(compressed)
+                .map_err(|e| err_data(&format!("LZ4 decompress failed: {}", e)))?;
+            Ok(Some(decompressed))
+        }
+        RG_COMPRESS_ZSTD => {
+            let decompressed = zstd::bulk::decompress(compressed, 256 * 1024 * 1024)
+                .map_err(|e| err_data(&format!("Zstd decompress failed: {}", e)))?;
+            Ok(Some(decompressed))
+        }
+        _ => Err(err_data(&format!("Unknown compression flag: {}", compress_flag))),
+    }
+}
+
+/// Compress an RG body using Zstd (default) with LZ4 fallback.
+/// Returns (compress_flag, compressed_or_original_bytes).
+fn compress_rg_body(body: Vec<u8>) -> (u8, Vec<u8>) {
+    if body.len() < COMPRESS_MIN_BODY_SIZE {
+        return (RG_COMPRESS_NONE, body);
+    }
+    // Try Zstd first (default, better ratio)
+    if let Ok(compressed) = zstd::bulk::compress(&body, 1) {
+        if compressed.len() < body.len() {
+            return (RG_COMPRESS_ZSTD, compressed);
+        }
+    }
+    // Fallback: try LZ4 (faster but lower ratio)
+    let compressed = lz4_flex::compress_prepend_size(&body);
+    if compressed.len() < body.len() {
+        return (RG_COMPRESS_LZ4, compressed);
+    }
+    (RG_COMPRESS_NONE, body)
+}
 
 // Column type identifiers
 const TYPE_NULL: u8 = 0;
@@ -4889,15 +4930,11 @@ impl OnDemandStorage {
                                         let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
                                         // Check compression flag at RG header byte 28
                                         let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
-                                        let decompressed_buf: Vec<u8>;
-                                        let body: &[u8] = if compress_flag == RG_COMPRESS_LZ4 {
-                                            if let Ok(d) = lz4_flex::decompress_size_prepended(&rg_bytes[32..]) {
-                                                decompressed_buf = d;
-                                                &decompressed_buf
-                                            } else { break; }
-                                        } else {
-                                            &rg_bytes[32..]
+                                        let decompressed_buf: Option<Vec<u8>> = match decompress_rg_body(compress_flag, &rg_bytes[32..]) {
+                                            Ok(v) => v,
+                                            Err(_) => break,
                                         };
+                                        let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_bytes[32..]);
                                         let mut pos: usize = rg_rows * 8; // skip IDs
                                         let del_vec_len = (rg_rows + 7) / 8;
                                         pos += del_vec_len; // skip deletion vector
@@ -6643,14 +6680,8 @@ impl OnDemandStorage {
             let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
             
             // Get the body bytes (after 32-byte RG header), decompressing if needed
-            let decompressed_buf: Vec<u8>;
-            let body: &[u8] = if compress_flag == RG_COMPRESS_LZ4 {
-                decompressed_buf = lz4_flex::decompress_size_prepended(&rg_bytes[32..])
-                    .map_err(|e| err_data(&format!("LZ4 decompress failed: {}", e)))?;
-                &decompressed_buf
-            } else {
-                &rg_bytes[32..]
-            };
+            let decompressed_buf = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+            let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_bytes[32..]);
             let mut pos: usize = 0;
 
             // Read IDs
@@ -7092,14 +7123,8 @@ impl OnDemandStorage {
             let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
             
             // Get the body bytes (after 32-byte RG header), decompressing if needed
-            let decompressed_buf: Vec<u8>;
-            let body: &[u8] = if compress_flag == RG_COMPRESS_LZ4 {
-                decompressed_buf = lz4_flex::decompress_size_prepended(&rg_bytes[32..])
-                    .map_err(|e| err_data(&format!("LZ4 decompress failed: {}", e)))?;
-                &decompressed_buf
-            } else {
-                &rg_bytes[32..]
-            };
+            let decompressed_buf = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+            let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_bytes[32..]);
             let mut pos: usize = 0;
 
             // Read IDs
@@ -7203,14 +7228,8 @@ impl OnDemandStorage {
             let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
             
             // Get the body bytes (after 32-byte RG header), decompressing if needed
-            let decompressed_buf: Vec<u8>;
-            let body: &[u8] = if compress_flag == RG_COMPRESS_LZ4 {
-                decompressed_buf = lz4_flex::decompress_size_prepended(&rg_bytes[32..])
-                    .map_err(|e| err_data(&format!("LZ4 decompress failed: {}", e)))?;
-                &decompressed_buf
-            } else {
-                &rg_bytes[32..]
-            };
+            let decompressed_buf = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+            let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_bytes[32..]);
             let mut pos: usize = 0;
 
             // Skip IDs
@@ -10015,17 +10034,8 @@ impl OnDemandStorage {
                 }
             }
             
-            // LZ4 compress body if large enough
-            let (compress_flag, disk_body) = if body_buf.len() >= LZ4_MIN_BODY_SIZE {
-                let compressed = lz4_flex::compress_prepend_size(&body_buf);
-                if compressed.len() < body_buf.len() {
-                    (RG_COMPRESS_LZ4, compressed)
-                } else {
-                    (RG_COMPRESS_NONE, body_buf)
-                }
-            } else {
-                (RG_COMPRESS_NONE, body_buf)
-            };
+            // Compress body (Zstd default, LZ4 fallback)
+            let (compress_flag, disk_body) = compress_rg_body(body_buf);
             
             // RG header (32 bytes) — byte 28 = compression flag
             writer.write_all(MAGIC_ROW_GROUP)?;
@@ -10249,14 +10259,8 @@ impl OnDemandStorage {
             let compress_flag = if rg_buf.len() >= 32 { rg_buf[28] } else { RG_COMPRESS_NONE };
             
             // Get the body bytes (after 32-byte RG header), decompressing if needed
-            let decompressed_buf: Vec<u8>;
-            let body: &[u8] = if compress_flag == RG_COMPRESS_LZ4 {
-                decompressed_buf = lz4_flex::decompress_size_prepended(&rg_buf[32..])
-                    .map_err(|e| err_data(&format!("LZ4 decompress failed: {}", e)))?;
-                &decompressed_buf
-            } else {
-                &rg_buf[32..]
-            };
+            let decompressed_buf = decompress_rg_body(compress_flag, &rg_buf[32..])?;
+            let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_buf[32..]);
             let mut pos: usize = 0;
             
             // Parse IDs — OPTIMIZATION: bulk memcpy instead of per-element loop
@@ -10479,6 +10483,30 @@ impl OnDemandStorage {
         };
         let mut footer = V4Footer::from_bytes(&footer_bytes)?;
 
+        // Check if any RG is compressed — if so, we cannot do in-place deletion
+        // vector updates (the deletion vector is inside the compressed body).
+        // Fall back to full rewrite via save_v4().
+        {
+            let file_guard = self.file.read();
+            let file = file_guard.as_ref()
+                .ok_or_else(|| err_not_conn("File not open"))?;
+            let mut mmap = self.mmap_cache.write();
+            let mmap_ref = mmap.get_or_create(file)?;
+            for rg_meta in &footer.row_groups {
+                if rg_meta.row_count == 0 { continue; }
+                let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+                if rg_end <= mmap_ref.len() {
+                    let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+                    if rg_bytes.len() >= 32 && rg_bytes[28] != RG_COMPRESS_NONE {
+                        // Compressed RG detected — must do full rewrite
+                        drop(mmap);
+                        drop(file_guard);
+                        return self.save_v4();
+                    }
+                }
+            }
+        }
+
         // Release mmap before writing
         self.mmap_cache.write().invalidate();
         *self.file.write() = None;
@@ -10653,17 +10681,8 @@ impl OnDemandStorage {
             }
         }
         
-        // LZ4 compress body if large enough
-        let (compress_flag, disk_body) = if body_buf.len() >= LZ4_MIN_BODY_SIZE {
-            let compressed = lz4_flex::compress_prepend_size(&body_buf);
-            if compressed.len() < body_buf.len() {
-                (RG_COMPRESS_LZ4, compressed)
-            } else {
-                (RG_COMPRESS_NONE, body_buf)
-            }
-        } else {
-            (RG_COMPRESS_NONE, body_buf)
-        };
+        // Compress body (Zstd default, LZ4 fallback)
+        let (compress_flag, disk_body) = compress_rg_body(body_buf);
         
         // Write RG header (32 bytes) — byte 28 = compression flag
         writer.write_all(MAGIC_ROW_GROUP)?;

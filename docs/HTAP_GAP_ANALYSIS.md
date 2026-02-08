@@ -5,7 +5,9 @@
 > **重要更新（第四版）：** P0 全部完成。P1 全部完成（含 Snapshot Isolation 初步接入）。P2 新增 7 项已实现：
 > DECIMAL 类型、JSON 类型+函数、ANALYZE 统计收集、UPSERT、Savepoint、Parquet 导入/导出、Snapshot Isolation（VersionStore 已接入事务读路径）。
 > **第四版新增完成：** LZ4 压缩（per-RG 自动 LZ4，透明解压）、CHECK 约束、FOREIGN KEY 约束（CASCADE/RESTRICT/SET NULL）、递归 CTE（WITH RECURSIVE + 迭代定点）。
-> 剩余核心差距：**CBO（基于代价的优化器）**。
+> **第五版新增完成：** Zstd 压缩（默认，per-RG 自动 Zstd，LZ4 fallback，透明解压；save_deletion_vectors 压缩 RG 检测+回退 save_v4）。
+> CBO 基础（TableStats 缓存 + 代价模型 + 选择率估算 + Join 顺序优化）、Statement-level 回滚（隐式 Savepoint）、GC 自动触发（接入 TxnManager commit）。
+> 剩余差距：高级 CBO（直方图、多表 Join 柚果式枚举）、RLE/Bit-packing 编码、覆盖索引。
 
 ---
 
@@ -45,7 +47,7 @@ ApexBase 当前是一个 **功能全面的嵌入式列存 HTAP 数据库**，在
 
 | 缺失项 | 重要性 | 说明 |
 |--------|:------:|------|
-| ✅ **通用压缩** (LZ4 per-RG) | 🔴 高 | 已实现：save_v4 自动 LZ4 压缩大 RG body，读取时透明解压（lz4_flex） |
+| ✅ **通用压缩** (Zstd 默认 + LZ4 fallback) | 🔴 高 | 已实现：save_v4/append_row_group 默认 Zstd 压缩（level 1），LZ4 fallback，读取时透明解压（zstd + lz4_flex）。save_deletion_vectors 自动检测压缩 RG 并回退 save_v4() |
 | **RLE 编码** (Run-Length Encoding) | 🟡 中 | 排序列、布尔列压缩率极高 |
 | **Bit-packing / Delta encoding** (整型) | 🟡 中 | 窄整型存储优化，DuckDB/Parquet 标配 |
 | ✅ **Zone maps / Min-Max per-RG** | 🔴 高 | 已实现：Per-RG per-column zone maps (Int64/Float64)，存储在 V4Footer |
@@ -109,7 +111,7 @@ ApexBase 当前是一个 **功能全面的嵌入式列存 HTAP 数据库**，在
 |--------|:------:|------|
 | ✅ **跨事务隔离 (Snapshot Isolation)** | 🔴 高 | 已实现：VersionStore 已接入 execute_in_txn 读路径，snapshot_ts 可见性判断 |
 | ✅ **Savepoint** | 🟡 中 | 已实现：SAVEPOINT name / ROLLBACK TO name / RELEASE name |
-| **Statement-level 回滚** | 🟡 中 | 单条 SQL 失败应回滚该 SQL 但不中止事务 |
+| ✅ **Statement-level 回滚** | 🟡 中 | 已实现：每条 DML 自动创建隐式 Savepoint，失败时只回滚该语句，事务保持活跃 |
 | **死锁检测** | � 低 | OCC 理论上无死锁，但未来若加锁需要 |
 
 ### 4. 并发控制 — ⚠️ 基本安全
@@ -197,7 +199,7 @@ ApexBase 当前是一个 **功能全面的嵌入式列存 HTAP 数据库**，在
 
 | 缺失项 | 重要性 | 说明 |
 |--------|:------:|------|
-| **Cost-Based Optimizer (CBO)** | 🔴 高 | 当前所有决策是规则硬编码，无基于统计的代价模型 |
+| ✅ **Cost-Based Optimizer (CBO) 基础** | 🔴 高 | 已实现：TableStats 缓存、代价模型 (seq_scan/index_scan/hash_join)、选择率估算 (NDV-based)、Join 顺序优化、plan_with_stats() |
 | ✅ **统计信息收集 (ANALYZE)** | 🔴 高 | 已实现：ANALYZE table 收集 NDV/min/max/null_count/row_count |
 | **Join 顺序优化** | 🟡 中 | 多表 JOIN 目前按 SQL 书写顺序执行 |
 | **谓词下推到存储层** | 🟡 中 | 部分手写了但不系统化 |
@@ -214,10 +216,10 @@ ApexBase 当前是一个 **功能全面的嵌入式列存 HTAP 数据库**，在
 |------|------|:----:|------|
 | **DeltaStore** (cell-level updates) | `storage/delta/` | 9 | ✅ 已接入 executor UPDATE 路径 + to_arrow_batch_mmap overlay |
 | **VersionStore** (MVCC 行版本) | `storage/mvcc/version_store.rs` | ✅ | ✅ 已接入 execute_in_txn 读路径 (snapshot_ts 可见性) |
-| **GarbageCollector** (旧版本回收) | `storage/mvcc/gc.rs` | ✅ | ⚠️ 已有实现，待自动触发接入 |
+| **GarbageCollector** (旧版本回收) | `storage/mvcc/gc.rs` | ✅ | ✅ 已接入 TxnManager commit 路径，maybe_run() 自动触发 |
 | **Horizontal Scaling** | `scaling/` | 18 | ❌ 完全 standalone，无任何接入点 |
 | **CompactTypedColumn** (SSO + 字符串池) | `table/compact.rs` | ✅ | ❌ 未在任何存储路径中使用 |
-| **Query Planner** | `query/planner.rs` | 2 | ⚠️ 只做特征分析，不生成执行计划 |
+| **Query Planner** | `query/planner.rs` | 2 | ✅ CBO 基础：TableStats + 代价模型 + plan_with_stats() |
 
 ### 10. 测试覆盖
 
@@ -258,14 +260,14 @@ ApexBase 当前是一个 **功能全面的嵌入式列存 HTAP 数据库**，在
 4. ✅ **RIGHT/FULL OUTER/CROSS JOIN** — 已实现，SQL 兼容性
 5. ✅ **隔离级别 (Snapshot Isolation)** — 已实现，VersionStore 接入 execute_in_txn 读路径
 6. ✅ **Date/Timestamp 类型** — 已实现，原生 TIMESTAMP/DATE 类型
-7. **LZ4/Zstd 压缩** — ⏳ 待实现
+7. ✅ **Zstd/LZ4 压缩** — 已实现：默认 Zstd，LZ4 fallback
 8. ✅ **B-Tree 范围查询加速** — 已实现，索引加速 >/>=/</<=/BETWEEN
 9. ✅ **Per-RG Zone Maps (存储层)** — 已实现，Int64/Float64 min/max per-RG per-column
 10. ✅ **CREATE TABLE AS SELECT (CTAS)** — 已实现，含 IF NOT EXISTS
 
 ### P2 — 竞争力提升（当前优先级）
 
-11. **LZ4/Zstd 压缩** — per-RG 透明压缩，磁盘 I/O 优化
+11. ✅ **Zstd/LZ4 压缩** — per-RG 默认 Zstd 压缩，LZ4 fallback，磁盘 I/O 优化
 12. **CHECK 约束** — `CHECK(age > 0)` 数据完整性
 13. **FOREIGN KEY 约束** — 表间引用完整性
 14. **递归 CTE (WITH RECURSIVE)** — 层次查询、图遍历
@@ -304,7 +306,7 @@ ApexBase 当前是一个 **功能全面的嵌入式列存 HTAP 数据库**，在
 | 崩溃恢复 | ✅ WAL v2 + 原子写 | ✅ WAL + journal | ✅ WAL |
 | 并发控制 | RwLock + fs2 文件锁 | 文件锁 + WAL | 进程内 MVCC |
 | 约束系统 | ✅ PK/UNIQUE/NOT NULL | ✅ 完整 | ✅ 完整 |
-| 压缩 | Dict only | ❌ | LZ4 + Zstd + Delta + RLE |
+| 压缩 | ✅ Zstd + LZ4 + Dict | ❌ | LZ4 + Zstd + Delta + RLE |
 | 索引 | B-Tree + Hash (等值+范围) | B-Tree (范围) | ART + 自适应 |
 | CTE | ✅ 非递归 | ✅ 含递归 | ✅ 含递归 |
 | Window Func | ✅ 17种 (Int64+Float64) | ✅ 完整 | ✅ 完整 |
@@ -326,13 +328,15 @@ P0 + P1 全部达标。P2 已完成 11 项（DECIMAL、JSON、ANALYZE、UPSERT�
 
 ✅ 已完成：
 
-1. **LZ4 压缩** — per-RG 自动 LZ4 压缩，读取时透明解压（lz4_flex）
+1. **Zstd + LZ4 压缩** — per-RG 默认 Zstd 压缩（level 1），LZ4 fallback，读取时透明解压（zstd + lz4_flex）。save_deletion_vectors 检测压缩 RG 自动回退 save_v4()
 2. **CHECK 约束** — CHECK(expr) DDL + INSERT/UPDATE 时自动校验
 3. **FOREIGN KEY 约束** — REFERENCES parent(col) + INSERT/UPDATE 引用完整性检查
 4. **递归 CTE** — WITH RECURSIVE 迭代定点算法，支持列别名、层次查询、数列生成
 
 当前最大短板：
 
-1. **缺 CBO** — 查询优化全靠规则硬编码，大数据量下可能选错计划
+1. **高级 CBO** — 直方图、多表 Join 柚果式枚举、自适应索引选择
+2. **RLE / Bit-packing 编码** — 排序列、布尔列、窄整型压缩
+3. **覆盖索引** — 避免回表
 
-下一步重点：**CBO（基于代价的优化器）**。
+下一步重点：**高级 CBO（直方图 + 多表 Join 优化）**、**RLE/Bit-packing 编码**。

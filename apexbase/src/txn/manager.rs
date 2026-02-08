@@ -13,6 +13,7 @@ use parking_lot::RwLock;
 
 use super::conflict::{ConflictDetector, ConflictResult};
 use super::context::TxnContext;
+use crate::storage::mvcc::gc::GarbageCollector;
 use crate::storage::mvcc::snapshot::{Snapshot, SnapshotManager};
 use crate::storage::mvcc::version_store::{VersionStore, next_timestamp};
 
@@ -91,6 +92,8 @@ pub struct TxnManager {
     conflict_detector: ConflictDetector,
     /// Per-table version stores for MVCC visibility
     version_stores: RwLock<HashMap<String, Arc<VersionStore>>>,
+    /// Garbage collector for old MVCC versions
+    gc: GarbageCollector,
     /// Total committed transactions (for monitoring)
     total_committed: AtomicU64,
     /// Total aborted transactions (for monitoring)
@@ -105,6 +108,7 @@ impl TxnManager {
             snapshot_manager,
             conflict_detector: ConflictDetector::new(),
             version_stores: RwLock::new(HashMap::new()),
+            gc: GarbageCollector::new(),
             total_committed: AtomicU64::new(0),
             total_aborted: AtomicU64::new(0),
         }
@@ -270,6 +274,11 @@ impl TxnManager {
         let oldest = self.snapshot_manager.oldest_active_timestamp();
         if oldest != u64::MAX {
             self.conflict_detector.advance_watermark(oldest);
+        }
+
+        // Auto-trigger GC for old MVCC versions
+        for store in self.version_stores.read().values() {
+            self.gc.maybe_run(store, &self.snapshot_manager);
         }
 
         Ok(())

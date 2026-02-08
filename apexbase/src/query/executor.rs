@@ -11419,7 +11419,11 @@ impl ApexExecutor {
     }
 
     /// Execute a DML statement within a transaction (buffers writes in TxnContext)
-    /// Returns the count of buffered operations
+    /// Returns the count of buffered operations.
+    ///
+    /// Statement-level rollback: an implicit savepoint is created before each DML.
+    /// If the statement fails, only that statement's writes are rolled back;
+    /// the transaction remains active with prior writes intact.
     pub fn execute_in_txn(
         txn_id: u64,
         stmt: SqlStatement,
@@ -11428,6 +11432,45 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         let mgr = crate::txn::txn_manager();
 
+        // Statement-level rollback: create implicit savepoint for DML statements
+        let is_dml = matches!(&stmt,
+            SqlStatement::Insert { .. } | SqlStatement::Delete { .. } | SqlStatement::Update { .. }
+        );
+        let implicit_sp = "__stmt_savepoint__";
+        if is_dml {
+            let _ = mgr.with_context(txn_id, |ctx| {
+                ctx.savepoint(implicit_sp);
+                Ok(())
+            });
+        }
+
+        let result = Self::execute_in_txn_inner(txn_id, stmt, base_dir, default_table_path, mgr);
+
+        // On DML failure, rollback to implicit savepoint (undo this statement only)
+        if is_dml {
+            if result.is_err() {
+                let _ = mgr.with_context(txn_id, |ctx| {
+                    ctx.rollback_to_savepoint(implicit_sp)
+                });
+            } else {
+                // Success — release the implicit savepoint
+                let _ = mgr.with_context(txn_id, |ctx| {
+                    ctx.release_savepoint(implicit_sp)
+                });
+            }
+        }
+
+        result
+    }
+
+    /// Inner implementation of execute_in_txn (separated for statement-level rollback)
+    fn execute_in_txn_inner(
+        txn_id: u64,
+        stmt: SqlStatement,
+        base_dir: &Path,
+        default_table_path: &Path,
+        mgr: &'static crate::txn::manager::TxnManager,
+    ) -> io::Result<ApexResult> {
         match stmt {
             SqlStatement::Insert { table, columns, values } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
@@ -12610,6 +12653,7 @@ impl ApexExecutor {
         let mut min_vals: Vec<String> = Vec::new();
         let mut max_vals: Vec<String> = Vec::new();
         let mut row_counts: Vec<i64> = Vec::new();
+        let mut col_stats_map: std::collections::HashMap<String, crate::query::planner::ColumnStats> = std::collections::HashMap::new();
 
         for (col_idx, field) in schema.fields().iter().enumerate() {
             let col = batch.column(col_idx);
@@ -12641,9 +12685,31 @@ impl ApexExecutor {
                 }
             }
             ndv_vals.push(distinct.len() as i64);
-            min_vals.push(min_s);
-            max_vals.push(max_s);
+            min_vals.push(min_s.clone());
+            max_vals.push(max_s.clone());
+
+            // Accumulate stats for CBO cache
+            col_stats_map.insert(field.name().clone(), crate::query::planner::ColumnStats {
+                ndv: distinct.len() as u64,
+                null_count: nc as u64,
+                min_value: min_s,
+                max_value: max_s,
+            });
         }
+
+        // Store stats in CBO cache for cost-based optimization
+        let table_stats = crate::query::planner::TableStats {
+            row_count: num_rows as u64,
+            columns: col_stats_map,
+            collected_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+        crate::query::planner::store_table_stats(
+            &storage_path.to_string_lossy(),
+            table_stats,
+        );
 
         // Build result as a RecordBatch
         let result_schema = Arc::new(Schema::new(vec![
