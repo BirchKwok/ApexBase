@@ -335,7 +335,10 @@ impl DeltaStore {
 
         let data = bincode::serialize(&persisted)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        std::fs::write(&delta_path, &data)?;
+        // Atomic write: write to .tmp then rename to prevent corruption on crash
+        let tmp_path = delta_path.with_extension("deltastore.tmp");
+        std::fs::write(&tmp_path, &data)?;
+        std::fs::rename(&tmp_path, &delta_path)?;
         self.dirty = false;
         Ok(())
     }

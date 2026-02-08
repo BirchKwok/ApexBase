@@ -27,6 +27,7 @@ use crate::query::{SqlParser, SqlStatement, SelectStatement, SqlExpr, SelectColu
 use crate::query::sql_parser::BinaryOperator;
 use crate::query::sql_parser::FromItem;
 use crate::query::jit::{ExprJIT, FilterFnI64, simd_sum_i64, simd_sum_f64, simd_min_i64, simd_max_i64};
+use crate::query::planner::{QueryPlanner, ExecutionStrategy, get_table_stats, invalidate_table_stats};
 
 /// Zone Map optimization result for filter pruning
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -847,12 +848,32 @@ impl ApexExecutor {
                             && stmt.group_by.is_empty()
                             && !has_aggregation_check;
                         
+                        // CBO: Use plan_with_stats() to decide execution strategy.
+                        // Skip expensive index checks when CBO recommends full scan or aggregation.
+                        let cbo_strategy = {
+                            let table_key = storage_path.to_string_lossy();
+                            let (bd, tname) = base_dir_and_table(storage_path);
+                            let idx_mgr_arc = get_index_manager(&bd, &tname);
+                            let idx_mgr = idx_mgr_arc.lock();
+                            let sql_stmt = SqlStatement::Select(stmt.clone());
+                            QueryPlanner::plan_with_stats(&sql_stmt, Some(&*idx_mgr), &table_key)
+                        };
+                        let cbo_skip_index = matches!(
+                            cbo_strategy,
+                            ExecutionStrategy::OlapFullScan
+                            | ExecutionStrategy::OlapAggregation
+                            | ExecutionStrategy::OlapFilteredScan
+                        );
+
                         // FAST PATH INDEX: Check if WHERE clause can use a secondary index
-                        if let Some(ref where_clause) = stmt.where_clause {
-                            if let Some(result) = Self::try_index_accelerated_read(
-                                &backend, &stmt, where_clause, base_dir, storage_path,
-                            )? {
-                                return Ok(result);
+                        // (skipped when CBO says full scan/aggregation is cheaper)
+                        if !cbo_skip_index {
+                            if let Some(ref where_clause) = stmt.where_clause {
+                                if let Some(result) = Self::try_index_accelerated_read(
+                                    &backend, &stmt, where_clause, base_dir, storage_path,
+                                )? {
+                                    return Ok(result);
+                                }
                             }
                         }
 
@@ -904,6 +925,8 @@ impl ApexExecutor {
                                 // GROUP BY with WHERE: use dict-encoded path for faster string aggregation
                                 let col_refs = Self::get_col_refs(&stmt);
                                 backend.read_columns_to_arrow_dict(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref())?
+                            } else if let Some(batch) = Self::try_numeric_predicate_pushdown(&backend, &stmt)? {
+                                batch
                             } else {
                                 let col_refs = Self::get_col_refs(&stmt);
                                 backend.read_columns_to_arrow(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref(), 0, None)?
@@ -926,6 +949,8 @@ impl ApexExecutor {
                             // FAST PATH: String filter without LIMIT (uses dictionary scan)
                             if let Some(result) = Self::try_fast_string_filter_no_limit(&backend, &stmt)? {
                                 result
+                            } else if let Some(batch) = Self::try_numeric_predicate_pushdown(&backend, &stmt)? {
+                                batch
                             } else {
                                 let col_refs = Self::get_col_refs(&stmt);
                                 backend.read_columns_to_arrow(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref(), 0, None)?
@@ -1087,6 +1112,15 @@ impl ApexExecutor {
             return Ok(None);
         }
 
+        // CBO: Pre-estimate selectivity using ANALYZE stats before expensive index lookup
+        let table_key = storage_path.to_string_lossy();
+        if let Some(stats) = get_table_stats(&table_key) {
+            let selectivity = QueryPlanner::estimate_selectivity(where_clause, &stats);
+            if stats.row_count > 0 && !QueryPlanner::should_use_index("", selectivity, stats.row_count) {
+                return Ok(None); // CBO says full scan is cheaper, skip index lookup
+            }
+        }
+
         // Look up each indexed predicate and intersect row ID sets
         let mut row_ids: Option<Vec<u64>> = None;
         for (col_name, hint) in &indexed_preds {
@@ -1120,11 +1154,18 @@ impl ApexExecutor {
         }
 
         // Read matching rows by their _ids
-        // For small result sets, read individual rows and concat
-        // For large result sets, fall back to scan (index not beneficial)
+        // CBO: use ANALYZE stats to decide index vs full scan cost
         let total_rows = backend.active_row_count();
-        if row_ids.len() > (total_rows as usize) / 2 {
-            return Ok(None); // Not selective enough, full scan is better
+        let selectivity = if total_rows > 0 { row_ids.len() as f64 / total_rows as f64 } else { 1.0 };
+        if !QueryPlanner::should_use_index("", selectivity, total_rows as u64) {
+            return Ok(None); // Cost model says full scan is cheaper
+        }
+
+        // Covering index (index-only scan): if all SELECT columns are covered by
+        // the index (_id + indexed columns), build result directly without reading
+        // the base table — avoids expensive per-row table lookups.
+        if let Some(covered) = Self::try_index_only_scan(stmt, &indexed_preds, &row_ids)? {
+            return Ok(Some(covered));
         }
 
         // Read matching rows one by one and concat
@@ -1240,6 +1281,129 @@ impl ApexExecutor {
             }
             _ => {}
         }
+    }
+
+    /// Covering index (index-only scan): build result directly from index data
+    /// when all SELECT columns are covered by {_id, indexed_columns}.
+    /// For equality predicates, the column value is known from the predicate itself.
+    /// Returns None if the query needs columns not available from the index.
+    fn try_index_only_scan(
+        stmt: &SelectStatement,
+        indexed_preds: &[(String, crate::storage::index::index_manager::PredicateHint)],
+        row_ids: &[u64],
+    ) -> io::Result<Option<ApexResult>> {
+        use std::collections::HashMap;
+        // Only for non-* queries (SELECT * needs all columns)
+        if stmt.is_select_star() {
+            return Ok(None);
+        }
+        // Only for simple equality predicates (we know the exact value)
+        // Collect indexed column names and their known values
+        use crate::storage::index::index_manager::PredicateHint;
+        let mut known_values: HashMap<String, Value> = HashMap::new();
+        for (col, hint) in indexed_preds {
+            match hint {
+                PredicateHint::Eq(val) => { known_values.insert(col.clone(), val.clone()); }
+                PredicateHint::In(_) if row_ids.len() <= 1 => {
+                    return Ok(None);
+                }
+                _ => { return Ok(None); } // Range predicates: values vary per row
+            }
+        }
+        if known_values.is_empty() {
+            return Ok(None);
+        }
+
+        // Check if all SELECT columns are covered by {_id} ∪ {indexed columns}
+        let mut need_id = false;
+        let mut need_cols: Vec<String> = Vec::new();
+        for col in &stmt.columns {
+            match col {
+                SelectColumn::Column(name) => {
+                    let clean = name.trim_matches('"');
+                    if clean == "_id" {
+                        need_id = true;
+                    } else if known_values.contains_key(clean) {
+                        need_cols.push(clean.to_string());
+                    } else {
+                        return Ok(None); // Need a column not in index → can't cover
+                    }
+                }
+                SelectColumn::ColumnAlias { column, .. } => {
+                    let clean = column.trim_matches('"');
+                    if clean == "_id" {
+                        need_id = true;
+                    } else if known_values.contains_key(clean) {
+                        need_cols.push(clean.to_string());
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                SelectColumn::All => { return Ok(None); }
+                _ => { return Ok(None); } // Aggregate, expression, etc.
+            }
+        }
+
+        // Build Arrow RecordBatch directly from index data
+        let n = row_ids.len();
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+
+        if need_id {
+            fields.push(Field::new("_id", arrow::datatypes::DataType::Int64, false));
+            let id_arr: Int64Array = row_ids.iter().map(|&id| id as i64).collect();
+            arrays.push(Arc::new(id_arr) as ArrayRef);
+        }
+
+        for col_name in &need_cols {
+            let val = &known_values[col_name];
+            match val {
+                Value::Int64(v) => {
+                    fields.push(Field::new(col_name, arrow::datatypes::DataType::Int64, true));
+                    let arr = Int64Array::from(vec![*v; n]);
+                    arrays.push(Arc::new(arr) as ArrayRef);
+                }
+                Value::Float64(f) => {
+                    fields.push(Field::new(col_name, arrow::datatypes::DataType::Float64, true));
+                    let arr = Float64Array::from(vec![*f; n]);
+                    arrays.push(Arc::new(arr) as ArrayRef);
+                }
+                Value::String(s) => {
+                    fields.push(Field::new(col_name, arrow::datatypes::DataType::Utf8, true));
+                    let arr = StringArray::from(vec![s.as_str(); n]);
+                    arrays.push(Arc::new(arr) as ArrayRef);
+                }
+                Value::Bool(b) => {
+                    fields.push(Field::new(col_name, arrow::datatypes::DataType::Boolean, true));
+                    let arr = BooleanArray::from(vec![*b; n]);
+                    arrays.push(Arc::new(arr) as ArrayRef);
+                }
+                _ => { return Ok(None); } // Unsupported value type for index-only scan
+            }
+        }
+
+        if fields.is_empty() {
+            return Ok(None);
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+
+        // Apply ORDER BY if present
+        let sorted = if !stmt.order_by.is_empty() {
+            Self::apply_order_by(&batch, &stmt.order_by)?
+        } else {
+            batch
+        };
+
+        // Apply OFFSET + LIMIT
+        let result = Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset)?;
+
+        if result.num_rows() == 0 {
+            return Ok(Some(ApexResult::Empty(result.schema())));
+        }
+        Ok(Some(ApexResult::Data(result)))
     }
 
     /// Convert a SqlExpr literal to a Value (for index lookup)
@@ -2063,6 +2227,39 @@ impl ApexExecutor {
         }
     }
 
+    /// Systematic predicate pushdown: extract simple numeric comparison from WHERE
+    /// and use storage-level filtered read instead of full table scan.
+    /// Handles: col > N, col >= N, col < N, col <= N, col = N, col != N
+    /// Returns Some(batch) if pushdown succeeded, None to fall through.
+    fn try_numeric_predicate_pushdown(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<RecordBatch>> {
+        if backend.has_pending_deltas() || backend.is_mmap_only() {
+            return Ok(None);
+        }
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        // Try to extract a simple numeric comparison (col op literal)
+        let (col_name, op_str, value) = match Self::extract_numeric_comparison(where_clause) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        // Column projection pushdown
+        let col_refs = Self::get_col_refs(stmt);
+        let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
+        let batch = backend.read_columns_filtered_to_arrow(
+            col_refs_vec.as_deref(),
+            &col_name,
+            &op_str,
+            value,
+        )?;
+        Ok(Some(batch))
+    }
+
     /// Execute SELECT * with late materialization optimization
     /// 1. Read only WHERE columns first
     /// 2. Apply filter to get matching row indices
@@ -2701,6 +2898,11 @@ impl ApexExecutor {
 
     /// Execute SELECT statement with JOINs
     fn execute_select_with_joins(stmt: SelectStatement, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+        // CBO: Reorder INNER JOINs by ascending right-table size (star join optimization).
+        // Only when ALL joins are INNER and each ON condition references only the FROM table
+        // and its own right table (no cross-JOIN column dependencies).
+        let joins = Self::maybe_reorder_joins(&stmt.joins, base_dir, default_table_path);
+
         // Get the left (base) table - supports both Table and Subquery (VIEW)
         let mut result_batch = match &stmt.from {
             Some(FromItem::Table { table, .. }) => {
@@ -2721,7 +2923,7 @@ impl ApexExecutor {
         };
 
         // Process each JOIN clause - supports both Table and Subquery (VIEW)
-        for join_clause in &stmt.joins {
+        for join_clause in &joins {
             let right_batch = match &join_clause.right {
                 FromItem::Table { table, .. } => {
                     let right_path = Self::resolve_table_path(table, base_dir, default_table_path);
@@ -2835,6 +3037,103 @@ impl ApexExecutor {
                 .collect();
             let truncated_name = if safe_name.len() > 200 { &safe_name[..200] } else { &safe_name };
             base_dir.join(format!("{}.apex", truncated_name))
+        }
+    }
+
+    /// CBO: Reorder INNER JOIN clauses by ascending right-table row count.
+    /// Only applies when ALL joins are INNER and each ON condition is a simple
+    /// equality (star join pattern — no cross-JOIN column dependencies).
+    /// Returns the original order unchanged if reordering is unsafe.
+    fn maybe_reorder_joins(
+        joins: &[JoinClause],
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> Vec<JoinClause> {
+        // Need 2+ joins to benefit from reordering
+        if joins.len() < 2 {
+            return joins.to_vec();
+        }
+        // Only reorder if ALL joins are INNER (LEFT/RIGHT/FULL/CROSS are order-dependent)
+        if !joins.iter().all(|j| j.join_type == JoinType::Inner) {
+            return joins.to_vec();
+        }
+        // Only reorder if all ON conditions are simple equalities (safe to reorder)
+        for j in joins {
+            if Self::extract_join_keys(&j.on).is_err() {
+                return joins.to_vec();
+            }
+        }
+        // Collect right-table row counts
+        let mut indexed: Vec<(usize, u64)> = Vec::with_capacity(joins.len());
+        for (i, j) in joins.iter().enumerate() {
+            let row_count = match &j.right {
+                FromItem::Table { table, .. } => {
+                    let path = Self::resolve_table_path(table, base_dir, default_table_path);
+                    get_cached_backend(&path)
+                        .map(|b| b.active_row_count())
+                        .unwrap_or(u64::MAX)
+                }
+                _ => u64::MAX, // Subqueries: unknown size, keep original position
+            };
+            indexed.push((i, row_count));
+        }
+        // Sort by ascending row count (smallest tables joined first)
+        indexed.sort_by_key(|&(_, rows)| rows);
+        let reordered: Vec<JoinClause> = indexed.iter().map(|&(i, _)| joins[i].clone()).collect();
+        
+        // Validate column dependencies: each JOIN's ON clause left key must reference
+        // a column available from the FROM table or a previously-joined right table.
+        // If reordering breaks this (e.g., ON a.col = p.col where 'a' hasn't been joined yet),
+        // fall back to the original order.
+        let mut available_tables: Vec<String> = Vec::new();
+        // Add FROM table alias/name
+        // (We don't have the FROM here, but we can detect cross-table references in ON clauses)
+        for (idx, j) in reordered.iter().enumerate() {
+            if let Ok((left_key_full, _)) = Self::extract_join_keys_qualified(&j.on) {
+                // Check if the left key has a table qualifier that matches a right table
+                // that hasn't been joined yet in the reordered sequence
+                if let Some(dot_pos) = left_key_full.rfind('.') {
+                    let table_prefix = &left_key_full[..dot_pos];
+                    // Check if this table prefix matches any RIGHT table that comes AFTER this join
+                    let is_forward_ref = reordered[idx + 1..].iter().any(|future_j| {
+                        match &future_j.right {
+                            FromItem::Table { table, alias, .. } => {
+                                alias.as_deref().unwrap_or(table) == table_prefix
+                            }
+                            _ => false,
+                        }
+                    });
+                    if is_forward_ref {
+                        // Reordering broke column dependency — fall back to original order
+                        return joins.to_vec();
+                    }
+                }
+            }
+            // Track joined tables
+            if let FromItem::Table { table, alias, .. } = &j.right {
+                available_tables.push(alias.clone().unwrap_or_else(|| table.clone()));
+            }
+        }
+        
+        reordered
+    }
+
+    /// Extract join keys preserving table qualifiers (e.g., "a.project_id" not just "project_id")
+    fn extract_join_keys_qualified(on_expr: &SqlExpr) -> io::Result<(String, String)> {
+        use crate::query::sql_parser::BinaryOperator;
+        match on_expr {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                let left_col = match left.as_ref() {
+                    SqlExpr::Column(name) => name.clone(),
+                    _ => return Err(io::Error::new(io::ErrorKind::Unsupported, "JOIN key must be a column reference")),
+                };
+                let right_col = match right.as_ref() {
+                    SqlExpr::Column(name) => name.clone(),
+                    _ => return Err(io::Error::new(io::ErrorKind::Unsupported, "JOIN key must be a column reference")),
+                };
+                Ok((left_col, right_col))
+            }
+            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "JOIN ON clause must be a simple equality")),
         }
     }
 
@@ -3771,7 +4070,12 @@ impl ApexExecutor {
             
             Ok(BooleanArray::from(results))
         } else {
-            // Correlated: evaluate for each row
+            // Decorrelation: try to convert correlated IN to hash semi-join
+            if let Some(result) = Self::try_decorrelate_in(batch, main_col, stmt, &outer_cols, negated, &subquery_path)? {
+                return Ok(result);
+            }
+            
+            // Fallback: Correlated, evaluate for each row
             let mut results = Vec::with_capacity(batch.num_rows());
             
             for row_idx in 0..batch.num_rows() {
@@ -3794,6 +4098,89 @@ impl ApexExecutor {
             Ok(BooleanArray::from(results))
         }
     }
+    
+    /// Try to decorrelate a correlated IN subquery using hash semi-join.
+    /// Pattern: col IN (SELECT x FROM t WHERE t.y = outer.y)
+    fn try_decorrelate_in(
+        batch: &RecordBatch,
+        main_col: &ArrayRef,
+        stmt: &SelectStatement,
+        outer_refs: &[String],
+        negated: bool,
+        subquery_path: &Path,
+    ) -> io::Result<Option<BooleanArray>> {
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        
+        let (outer_col, inner_col, remaining_pred) = match Self::extract_correlation_equality(where_clause, outer_refs) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        
+        // Execute decorrelated subquery: SELECT original_select_col, inner_col FROM ... WHERE remaining
+        let mut decorrelated = stmt.clone();
+        // Keep original SELECT columns and add the inner join column
+        let orig_cols = decorrelated.columns.clone();
+        let inner_col_clean = if let Some(dot_pos) = inner_col.rfind('.') {
+            inner_col[dot_pos + 1..].to_string()
+        } else {
+            inner_col.clone()
+        };
+        // Check if inner_col is already in SELECT
+        let has_inner = orig_cols.iter().any(|c| {
+            if let SelectColumn::Column(name) = c { name == &inner_col_clean } else { false }
+        });
+        if !has_inner {
+            decorrelated.columns.push(SelectColumn::Column(inner_col_clean.clone()));
+        }
+        decorrelated.where_clause = remaining_pred;
+        
+        let sub_result = Self::execute_select(decorrelated, subquery_path)?;
+        let sub_batch = sub_result.to_record_batch()?;
+        
+        if sub_batch.num_rows() == 0 {
+            return Ok(Some(BooleanArray::from(vec![negated; batch.num_rows()])));
+        }
+        
+        // Build a map: inner_col_value -> set of subquery result values
+        let inner_join_col = sub_batch.column_by_name(&inner_col_clean)
+            .or_else(|| sub_batch.column(sub_batch.num_columns() - 1).into())
+            .ok_or_else(|| err_not_found(format!("Inner join column: {}", inner_col_clean)))?;
+        let sub_value_col = sub_batch.column(0);
+        
+        // Build hash map: outer_value -> set of IN values
+        let mut join_map: std::collections::HashMap<String, HashSet<u64>> = std::collections::HashMap::new();
+        for i in 0..sub_batch.num_rows() {
+            if !inner_join_col.is_null(i) {
+                let join_key = Self::arrow_value_to_string(inner_join_col, i);
+                let in_hash = Self::hash_array_value(sub_value_col, i);
+                join_map.entry(join_key).or_default().insert(in_hash);
+            }
+        }
+        
+        // Resolve outer column
+        let outer_col_clean = if let Some(dot_pos) = outer_col.rfind('.') {
+            &outer_col[dot_pos + 1..]
+        } else {
+            &outer_col
+        };
+        let outer_join_array = batch.column_by_name(outer_col_clean)
+            .ok_or_else(|| err_not_found(format!("Outer column: {}", outer_col_clean)))?;
+        
+        let mut results = Vec::with_capacity(batch.num_rows());
+        for i in 0..batch.num_rows() {
+            let outer_key = Self::arrow_value_to_string(outer_join_array, i);
+            let main_hash = Self::hash_array_value(main_col, i);
+            let found = join_map.get(&outer_key)
+                .map(|set| set.contains(&main_hash))
+                .unwrap_or(false);
+            results.push(if negated { !found } else { found });
+        }
+        
+        Ok(Some(BooleanArray::from(results)))
+    }
 
     /// Execute EXISTS subquery (supports correlated subqueries)
     fn evaluate_exists_subquery(
@@ -3814,11 +4201,17 @@ impl ApexExecutor {
             let exists = sub_batch.num_rows() > 0;
             Ok(BooleanArray::from(vec![exists; batch.num_rows()]))
         } else {
-            // Correlated: evaluate for each row
+            // Decorrelation: try to convert correlated EXISTS to hash semi-join.
+            // Pattern: WHERE inner_col = outer_col (simple equality correlation)
+            // Instead of executing subquery N times, execute once and hash-join.
+            if let Some(result) = Self::try_decorrelate_exists(batch, stmt, &outer_cols, &subquery_path)? {
+                return Ok(result);
+            }
+            
+            // Fallback: Correlated, evaluate for each row
             let mut results = Vec::with_capacity(batch.num_rows());
             
             for row_idx in 0..batch.num_rows() {
-                // Build modified subquery with outer values substituted
                 let modified_stmt = Self::substitute_outer_refs(stmt, batch, row_idx, &outer_cols);
                 
                 let sub_result = Self::execute_select(modified_stmt, &subquery_path)?;
@@ -3828,6 +4221,139 @@ impl ApexExecutor {
             
             Ok(BooleanArray::from(results))
         }
+    }
+    
+    /// Try to decorrelate an EXISTS subquery by converting to hash semi-join.
+    /// Detects pattern: WHERE inner_col = outer_col (AND other_predicates)
+    /// Executes subquery once with non-correlated predicates, builds hash set of
+    /// join column values, then probes for each outer row — O(N+M) vs O(N*M).
+    fn try_decorrelate_exists(
+        batch: &RecordBatch,
+        stmt: &SelectStatement,
+        outer_refs: &[String],
+        subquery_path: &Path,
+    ) -> io::Result<Option<BooleanArray>> {
+        use crate::query::sql_parser::BinaryOperator;
+        
+        // Extract correlation predicate: find "outer.col = inner.col" pattern
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        
+        // Try to split WHERE into correlation predicate and remaining predicates
+        let (outer_col, inner_col, remaining_pred) = match Self::extract_correlation_equality(where_clause, outer_refs) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        
+        // Build decorrelated subquery: SELECT inner_col FROM ... WHERE remaining_pred
+        let mut decorrelated = stmt.clone();
+        decorrelated.columns = vec![SelectColumn::Column(inner_col.clone())];
+        decorrelated.where_clause = remaining_pred;
+        decorrelated.group_by_exprs = decorrelated.group_by_exprs.clone();
+        
+        // Execute decorrelated subquery once
+        let sub_result = Self::execute_select(decorrelated, subquery_path)?;
+        let sub_batch = sub_result.to_record_batch()?;
+        
+        if sub_batch.num_columns() == 0 {
+            return Ok(Some(BooleanArray::from(vec![false; batch.num_rows()])));
+        }
+        
+        // Build hash set from inner column values
+        let inner_array = sub_batch.column(0);
+        let mut hash_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for i in 0..inner_array.len() {
+            if !inner_array.is_null(i) {
+                let val = Self::arrow_value_to_string(inner_array, i);
+                hash_set.insert(val);
+            }
+        }
+        
+        // Resolve outer column name (strip table prefix)
+        let outer_col_clean = if let Some(dot_pos) = outer_col.rfind('.') {
+            &outer_col[dot_pos + 1..]
+        } else {
+            &outer_col
+        };
+        
+        // Probe outer batch against hash set
+        let outer_array = batch.column_by_name(outer_col_clean)
+            .ok_or_else(|| err_not_found(format!("Outer column: {}", outer_col_clean)))?;
+        
+        let mut results = Vec::with_capacity(batch.num_rows());
+        for i in 0..batch.num_rows() {
+            if outer_array.is_null(i) {
+                results.push(false);
+            } else {
+                let val = Self::arrow_value_to_string(outer_array, i);
+                results.push(hash_set.contains(&val));
+            }
+        }
+        
+        Ok(Some(BooleanArray::from(results)))
+    }
+    
+    /// Extract correlation equality from a WHERE clause.
+    /// Returns (outer_col, inner_col, remaining_predicate) or None.
+    /// Handles: outer.col = inner.col AND other_pred
+    fn extract_correlation_equality(
+        expr: &SqlExpr,
+        outer_refs: &[String],
+    ) -> Option<(String, String, Option<SqlExpr>)> {
+        use crate::query::sql_parser::BinaryOperator;
+        
+        match expr {
+            // Simple equality: outer.col = inner.col
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                if let (SqlExpr::Column(a), SqlExpr::Column(b)) = (left.as_ref(), right.as_ref()) {
+                    let a_clean = a.trim_matches('"');
+                    let b_clean = b.trim_matches('"');
+                    if outer_refs.iter().any(|r| r == a_clean) {
+                        return Some((a_clean.to_string(), b_clean.to_string(), None));
+                    }
+                    if outer_refs.iter().any(|r| r == b_clean) {
+                        return Some((b_clean.to_string(), a_clean.to_string(), None));
+                    }
+                }
+                None
+            }
+            // AND chain: try to find correlation equality in one branch
+            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                // Try left side first
+                if let Some((outer_col, inner_col, _)) = Self::extract_correlation_equality(left, outer_refs) {
+                    return Some((outer_col, inner_col, Some(*right.clone())));
+                }
+                // Try right side
+                if let Some((outer_col, inner_col, _)) = Self::extract_correlation_equality(right, outer_refs) {
+                    return Some((outer_col, inner_col, Some(*left.clone())));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    
+    /// Convert an Arrow array value at index to a string for hash comparison
+    fn arrow_value_to_string(array: &ArrayRef, idx: usize) -> String {
+        use arrow::array::*;
+        if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+            return a.value(idx).to_string();
+        }
+        if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+            return a.value(idx).to_string();
+        }
+        if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+            return a.value(idx).to_string();
+        }
+        if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
+            return a.value(idx).to_string();
+        }
+        if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
+            return a.value(idx).to_string();
+        }
+        format!("{:?}", array)
     }
     
     /// Resolve subquery's table path from its FROM clause
@@ -7055,6 +7581,9 @@ impl ApexExecutor {
             return Err(err_input( "GROUP BY requires at least one column"));
         }
 
+        // Materialize expression-based GROUP BY columns (e.g., YEAR(date), MONTH(ts))
+        let batch = Self::materialize_group_by_exprs(batch, stmt)?;
+
         // Build group keys - strip table prefix if present (e.g., "u.tier" -> "tier")
         let group_cols: Vec<String> = stmt.group_by.iter().map(|s| {
             let trimmed = s.trim_matches('"');
@@ -7072,15 +7601,53 @@ impl ApexExecutor {
         if can_use_incremental {
             // Try vectorized execution for single-column GROUP BY
             if group_cols.len() == 1 {
-                if let Ok(result) = Self::execute_group_by_vectorized(batch, stmt, &group_cols[0]) {
+                if let Ok(result) = Self::execute_group_by_vectorized(&batch, stmt, &group_cols[0]) {
                     return Ok(result);
                 }
             }
-            return Self::execute_group_by_incremental(batch, stmt, &group_cols);
+            return Self::execute_group_by_incremental(&batch, stmt, &group_cols);
         }
         
         // Fall back to full row-index based aggregation for complex cases
-        Self::execute_group_by_with_indices(batch, stmt, &group_cols)
+        Self::execute_group_by_with_indices(&batch, stmt, &group_cols)
+    }
+    
+    /// Materialize expression-based GROUP BY columns into the batch as virtual columns.
+    /// For example, GROUP BY YEAR(date) evaluates YEAR(date) for each row and adds a
+    /// column named "YEAR(date)" to the batch so the grouping logic can use it.
+    fn materialize_group_by_exprs(batch: &RecordBatch, stmt: &SelectStatement) -> io::Result<RecordBatch> {
+        let mut has_exprs = false;
+        for expr_opt in &stmt.group_by_exprs {
+            if expr_opt.is_some() {
+                has_exprs = true;
+                break;
+            }
+        }
+        if !has_exprs {
+            return Ok(batch.clone());
+        }
+        
+        // Evaluate each expression and add as a new column
+        let mut fields: Vec<Field> = batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut arrays: Vec<ArrayRef> = (0..batch.num_columns()).map(|i| batch.column(i).clone()).collect();
+        
+        for (i, expr_opt) in stmt.group_by_exprs.iter().enumerate() {
+            if let Some(expr) = expr_opt {
+                let col_name = &stmt.group_by[i];
+                // Skip if column already exists in batch (shouldn't happen, but safety check)
+                if batch.column_by_name(col_name).is_some() {
+                    continue;
+                }
+                let result_array = Self::evaluate_expr_to_array(batch, expr)?;
+                let dt = result_array.data_type().clone();
+                fields.push(Field::new(col_name, dt, true));
+                arrays.push(result_array);
+            }
+        }
+        
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
     
     /// Execute GROUP BY using vectorized execution engine
@@ -10644,6 +11211,7 @@ impl ApexExecutor {
                         default_value: default_val,
                         check_expr_sql: check_sql,
                         foreign_key: fk,
+                        autoincrement: col_def.constraints.contains(&ColumnConstraintKind::Autoincrement),
                     });
                 }
             }
@@ -10760,6 +11328,7 @@ impl ApexExecutor {
         
         // Invalidate cache after write to ensure subsequent reads get fresh data
         invalidate_storage_cache(storage_path);
+        invalidate_table_stats(&storage_path.to_string_lossy());
         #[cfg(target_os = "windows")]
         crate::storage::engine::engine().invalidate(storage_path);
         
@@ -11252,6 +11821,7 @@ impl ApexExecutor {
         }
         backend.save()?;
         invalidate_storage_cache(&table_path);
+        invalidate_table_stats(&table_path.to_string_lossy());
 
         Ok(ApexResult::Scalar(inserted as i64))
     }
@@ -12261,7 +12831,7 @@ impl ApexExecutor {
                 for (schema_col, _) in &schema {
                     if !col_names.iter().any(|c| c == schema_col) {
                         let cons = storage.storage.get_column_constraints(schema_col);
-                        if cons.not_null && cons.default_value.is_none() {
+                        if cons.not_null && cons.default_value.is_none() && !cons.autoincrement {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
                                 format!("NOT NULL constraint violated: column '{}' has no value and no DEFAULT", schema_col),
@@ -12289,6 +12859,31 @@ impl ApexExecutor {
                         };
                         for row in rows.iter_mut() {
                             row.entry(schema_col.clone()).or_insert_with(|| default_val.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // AUTOINCREMENT: auto-fill sequential values for autoincrement columns
+        if storage.storage.has_constraints() {
+            let schema = storage.get_schema();
+            for (schema_col, _) in &schema {
+                let cons = storage.storage.get_column_constraints(schema_col);
+                if cons.autoincrement {
+                    // Find current max value for this column
+                    let col_refs = [schema_col.as_str()];
+                    let existing = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
+                    let mut next_val: i64 = if let Some(col) = existing.column_by_name(schema_col) {
+                        if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                            arr.iter().filter_map(|v| v).max().unwrap_or(0) + 1
+                        } else { 1 }
+                    } else { 1 };
+                    // Fill in autoincrement values for rows that don't have this column set
+                    for row in rows.iter_mut() {
+                        if !row.contains_key(schema_col) || matches!(row.get(schema_col), Some(Value::Null)) {
+                            row.insert(schema_col.clone(), Value::Int64(next_val));
+                            next_val += 1;
                         }
                     }
                 }
@@ -12546,6 +13141,7 @@ impl ApexExecutor {
         
         // Invalidate cache after write to ensure subsequent reads get fresh data
         invalidate_storage_cache(storage_path);
+        invalidate_table_stats(&storage_path.to_string_lossy());
         
         Ok(ApexResult::Scalar(rows_inserted))
     }
@@ -12880,6 +13476,7 @@ impl ApexExecutor {
         }
 
         invalidate_storage_cache(storage_path);
+        invalidate_table_stats(&storage_path.to_string_lossy());
         Ok(ApexResult::Scalar(inserted + updated))
     }
 
@@ -12993,6 +13590,7 @@ impl ApexExecutor {
             storage.save()?;
             Self::notify_index_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
+            invalidate_table_stats(&storage_path.to_string_lossy());
             return Ok(ApexResult::Scalar(count));
         }
         
@@ -13086,6 +13684,7 @@ impl ApexExecutor {
             storage.save()?;
             Self::notify_index_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
+            invalidate_table_stats(&storage_path.to_string_lossy());
         }
         
         Ok(ApexResult::Scalar(deleted))
@@ -13414,6 +14013,7 @@ impl ApexExecutor {
         
         // Invalidate cache after write
         invalidate_storage_cache(storage_path);
+        invalidate_table_stats(&storage_path.to_string_lossy());
         
         Ok(ApexResult::Scalar(updated))
     }

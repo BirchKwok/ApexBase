@@ -42,7 +42,7 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -215,6 +215,337 @@ const RG_COMPRESS_ZSTD: u8 = 2;
 /// Minimum RG body size (bytes) to bother compressing.
 /// Below this threshold, compression overhead exceeds savings.
 const COMPRESS_MIN_BODY_SIZE: usize = 512;
+
+// Per-column encoding types (stored as 1-byte prefix when encoding_version=1)
+const COL_ENCODING_PLAIN: u8 = 0;
+const COL_ENCODING_RLE: u8 = 1;
+const COL_ENCODING_BITPACK: u8 = 2;
+
+/// Encode an Int64 column with RLE (Run-Length Encoding).
+/// Format: [count:u64][num_runs:u64][(value:i64, run_len:u32)...]
+/// Returns None if RLE is not beneficial (fewer than 30% compression).
+fn rle_encode_i64(data: &[i64]) -> Option<Vec<u8>> {
+    if data.len() < 16 { return None; }
+    let mut runs: Vec<(i64, u32)> = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let val = data[i];
+        let mut run_len: u32 = 1;
+        while (i + run_len as usize) < data.len() && data[i + run_len as usize] == val {
+            run_len += 1;
+        }
+        runs.push((val, run_len));
+        i += run_len as usize;
+    }
+    // Only use RLE if it saves space: runs * 12 bytes < original count * 8 bytes
+    let rle_size = 16 + runs.len() * 12; // 8 (count) + 8 (num_runs) + runs * (8+4)
+    let plain_size = 8 + data.len() * 8; // 8 (count) + data * 8
+    if rle_size >= (plain_size * 7 / 10) { return None; } // Need at least 30% savings
+    let mut buf = Vec::with_capacity(rle_size);
+    buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&(runs.len() as u64).to_le_bytes());
+    for (val, len) in &runs {
+        buf.extend_from_slice(&val.to_le_bytes());
+        buf.extend_from_slice(&len.to_le_bytes());
+    }
+    Some(buf)
+}
+
+/// Decode RLE-encoded Int64 data back to plain Vec<i64>.
+fn rle_decode_i64(bytes: &[u8]) -> io::Result<(Vec<i64>, usize)> {
+    if bytes.len() < 16 {
+        return Err(err_data("RLE Int64: truncated header"));
+    }
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    let num_runs = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    let body_len = num_runs * 12;
+    if bytes.len() < 16 + body_len {
+        return Err(err_data("RLE Int64: truncated runs"));
+    }
+    let mut result = Vec::with_capacity(count);
+    let mut pos = 16;
+    for _ in 0..num_runs {
+        let val = i64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+        let run_len = u32::from_le_bytes(bytes[pos+8..pos+12].try_into().unwrap()) as usize;
+        result.extend(std::iter::repeat(val).take(run_len));
+        pos += 12;
+    }
+    Ok((result, pos))
+}
+
+/// Encode an Int64 column with Bit-packing.
+/// Format: [count:u64][bit_width:u8][min_value:i64][packed_data...]
+/// Stores (value - min_value) in bit_width bits each.
+/// Returns None if bit-packing doesn't save enough space (need < 48-bit width).
+fn bitpack_encode_i64(data: &[i64]) -> Option<Vec<u8>> {
+    if data.len() < 16 { return None; }
+    let min_val = *data.iter().min()?;
+    let max_val = *data.iter().max()?;
+    if min_val == max_val {
+        // All same value — RLE handles this better
+        return None;
+    }
+    let range = (max_val as u128).wrapping_sub(min_val as u128);
+    if range > u64::MAX as u128 { return None; }
+    let range_u64 = range as u64;
+    let bit_width = 64 - range_u64.leading_zeros(); // bits needed
+    if bit_width == 0 || bit_width >= 48 { return None; } // Need meaningful savings
+    let packed_bits = data.len() as u64 * bit_width as u64;
+    let packed_bytes = ((packed_bits + 7) / 8) as usize;
+    // Header: 8 (count) + 1 (bit_width) + 8 (min_value) = 17 bytes
+    let total_size = 17 + packed_bytes;
+    let plain_size = 8 + data.len() * 8;
+    if total_size >= (plain_size * 7 / 10) { return None; } // Need at least 30% savings
+    let mut buf = Vec::with_capacity(total_size);
+    buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    buf.push(bit_width as u8);
+    buf.extend_from_slice(&min_val.to_le_bytes());
+    // Pack values
+    let mut packed = vec![0u8; packed_bytes];
+    let bw = bit_width as usize;
+    for (i, &val) in data.iter().enumerate() {
+        let delta = (val - min_val) as u64;
+        let bit_offset = i * bw;
+        for b in 0..bw {
+            if (delta >> b) & 1 == 1 {
+                let global_bit = bit_offset + b;
+                packed[global_bit / 8] |= 1 << (global_bit % 8);
+            }
+        }
+    }
+    buf.extend_from_slice(&packed);
+    Some(buf)
+}
+
+/// Decode Bit-packed Int64 data back to plain Vec<i64>.
+fn bitpack_decode_i64(bytes: &[u8]) -> io::Result<(Vec<i64>, usize)> {
+    if bytes.len() < 17 {
+        return Err(err_data("BitPack Int64: truncated header"));
+    }
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    let bit_width = bytes[8] as usize;
+    let min_val = i64::from_le_bytes(bytes[9..17].try_into().unwrap());
+    let packed_bits = count * bit_width;
+    let packed_bytes = (packed_bits + 7) / 8;
+    if bytes.len() < 17 + packed_bytes {
+        return Err(err_data("BitPack Int64: truncated packed data"));
+    }
+    let packed = &bytes[17..17 + packed_bytes];
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        let bit_offset = i * bit_width;
+        let mut delta: u64 = 0;
+        for b in 0..bit_width {
+            let global_bit = bit_offset + b;
+            if (packed[global_bit / 8] >> (global_bit % 8)) & 1 == 1 {
+                delta |= 1u64 << b;
+            }
+        }
+        result.push(min_val.wrapping_add(delta as i64));
+    }
+    Ok((result, 17 + packed_bytes))
+}
+
+/// Encode a Bool column with RLE (Run-Length Encoding).
+/// Format: [count:u64][num_runs:u64][(value:u8, run_len:u32)...]
+/// Bool columns are stored as packed bits; RLE encodes runs of true/false.
+/// Returns None if RLE is not beneficial (fewer than 30% compression).
+fn rle_encode_bool(data: &[u8], len: usize) -> Option<Vec<u8>> {
+    if len < 16 { return None; }
+    let mut runs: Vec<(u8, u32)> = Vec::new();
+    let mut i = 0;
+    while i < len {
+        let val = if (data[i / 8] >> (i % 8)) & 1 == 1 { 1u8 } else { 0u8 };
+        let mut run_len: u32 = 1;
+        while (i + run_len as usize) < len {
+            let next_bit = (data[(i + run_len as usize) / 8] >> ((i + run_len as usize) % 8)) & 1;
+            if (next_bit == 1) != (val == 1) { break; }
+            run_len += 1;
+        }
+        runs.push((val, run_len));
+        i += run_len as usize;
+    }
+    // RLE size: 16 header + 5 per run (1 byte val + 4 byte len)
+    let rle_size = 16 + runs.len() * 5;
+    let plain_size = 8 + (len + 7) / 8; // 8 (count) + packed_bits
+    if rle_size >= (plain_size * 7 / 10) { return None; } // Need ≥30% savings
+    let mut buf = Vec::with_capacity(rle_size);
+    buf.extend_from_slice(&(len as u64).to_le_bytes());
+    buf.extend_from_slice(&(runs.len() as u64).to_le_bytes());
+    for (val, run_len) in &runs {
+        buf.push(*val);
+        buf.extend_from_slice(&run_len.to_le_bytes());
+    }
+    Some(buf)
+}
+
+/// Decode RLE-encoded Bool data back to ColumnData::Bool.
+fn rle_decode_bool(bytes: &[u8]) -> io::Result<(ColumnData, usize)> {
+    if bytes.len() < 16 {
+        return Err(err_data("RLE Bool: truncated header"));
+    }
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    let num_runs = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    let body_len = num_runs * 5;
+    if bytes.len() < 16 + body_len {
+        return Err(err_data("RLE Bool: truncated runs"));
+    }
+    let packed_byte_len = (count + 7) / 8;
+    let mut data = vec![0u8; packed_byte_len];
+    let mut pos = 16;
+    let mut bit_idx = 0;
+    for _ in 0..num_runs {
+        let val = bytes[pos];
+        let run_len = u32::from_le_bytes(bytes[pos+1..pos+5].try_into().unwrap()) as usize;
+        if val == 1 {
+            for j in 0..run_len {
+                let bi = bit_idx + j;
+                data[bi / 8] |= 1 << (bi % 8);
+            }
+        }
+        bit_idx += run_len;
+        pos += 5;
+    }
+    Ok((ColumnData::Bool { data, len: count }, pos))
+}
+
+const COL_ENCODING_RLE_BOOL: u8 = 3;
+
+/// Write a column with encoding prefix: [encoding:u8][encoded_data...]
+/// Tries RLE → Bit-pack → Plain, picks the smallest encoding.
+fn write_column_encoded<W: Write>(col: &ColumnData, col_type: ColumnType, writer: &mut W) -> io::Result<()> {
+    match col {
+        ColumnData::Int64(data) => {
+            // Try RLE first (best for sorted/low-cardinality)
+            if let Some(rle_bytes) = rle_encode_i64(data) {
+                // Try Bit-pack too and pick the smaller
+                if let Some(bp_bytes) = bitpack_encode_i64(data) {
+                    if bp_bytes.len() < rle_bytes.len() {
+                        writer.write_all(&[COL_ENCODING_BITPACK])?;
+                        return writer.write_all(&bp_bytes);
+                    }
+                }
+                writer.write_all(&[COL_ENCODING_RLE])?;
+                return writer.write_all(&rle_bytes);
+            }
+            // Try Bit-pack alone
+            if let Some(bp_bytes) = bitpack_encode_i64(data) {
+                writer.write_all(&[COL_ENCODING_BITPACK])?;
+                return writer.write_all(&bp_bytes);
+            }
+            // Fallback: plain
+            writer.write_all(&[COL_ENCODING_PLAIN])?;
+            col.write_to(writer)
+        }
+        ColumnData::Bool { data, len } => {
+            // Try Bool RLE (best for long runs of true/false)
+            if let Some(rle_bytes) = rle_encode_bool(data, *len) {
+                writer.write_all(&[COL_ENCODING_RLE_BOOL])?;
+                return writer.write_all(&rle_bytes);
+            }
+            writer.write_all(&[COL_ENCODING_PLAIN])?;
+            col.write_to(writer)
+        }
+        _ => {
+            // Other types: always plain
+            writer.write_all(&[COL_ENCODING_PLAIN])?;
+            col.write_to(writer)
+        }
+    }
+}
+
+/// Read a column with encoding prefix: [encoding:u8][encoded_data...]
+/// Returns (ColumnData, bytes_consumed) including the encoding prefix byte.
+fn read_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<(ColumnData, usize)> {
+    if bytes.is_empty() {
+        return Err(err_data("read_column_encoded: empty input"));
+    }
+    let encoding = bytes[0];
+    let data_bytes = &bytes[1..];
+    match encoding {
+        COL_ENCODING_PLAIN => {
+            let (col, consumed) = ColumnData::from_bytes_typed(data_bytes, col_type)?;
+            Ok((col, 1 + consumed))
+        }
+        COL_ENCODING_RLE => {
+            match col_type {
+                ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
+                ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+                ColumnType::Timestamp | ColumnType::Date => {
+                    let (data, consumed) = rle_decode_i64(data_bytes)?;
+                    Ok((ColumnData::Int64(data), 1 + consumed))
+                }
+                _ => {
+                    // RLE for non-integer type — fallback to plain
+                    let (col, consumed) = ColumnData::from_bytes_typed(data_bytes, col_type)?;
+                    Ok((col, 1 + consumed))
+                }
+            }
+        }
+        COL_ENCODING_BITPACK => {
+            match col_type {
+                ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
+                ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+                ColumnType::Timestamp | ColumnType::Date => {
+                    let (data, consumed) = bitpack_decode_i64(data_bytes)?;
+                    Ok((ColumnData::Int64(data), 1 + consumed))
+                }
+                _ => {
+                    let (col, consumed) = ColumnData::from_bytes_typed(data_bytes, col_type)?;
+                    Ok((col, 1 + consumed))
+                }
+            }
+        }
+        COL_ENCODING_RLE_BOOL => {
+            let (col, consumed) = rle_decode_bool(data_bytes)?;
+            Ok((col, 1 + consumed))
+        }
+        _ => Err(err_data(&format!("Unknown column encoding: {}", encoding))),
+    }
+}
+
+/// Skip over an encoded column's data without allocating.
+/// Returns bytes consumed including the encoding prefix byte.
+fn skip_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<usize> {
+    if bytes.is_empty() {
+        return Err(err_data("skip_column_encoded: empty input"));
+    }
+    let encoding = bytes[0];
+    let data_bytes = &bytes[1..];
+    match encoding {
+        COL_ENCODING_PLAIN => {
+            let consumed = ColumnData::skip_bytes_typed(data_bytes, col_type)?;
+            Ok(1 + consumed)
+        }
+        COL_ENCODING_RLE => {
+            // RLE format: [count:u64][num_runs:u64][(value:i64, run_len:u32)...]
+            if data_bytes.len() < 16 {
+                return Err(err_data("skip RLE: truncated header"));
+            }
+            let num_runs = u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
+            Ok(1 + 16 + num_runs * 12)
+        }
+        COL_ENCODING_BITPACK => {
+            // BitPack format: [count:u64][bit_width:u8][min_value:i64][packed...]
+            if data_bytes.len() < 17 {
+                return Err(err_data("skip BitPack: truncated header"));
+            }
+            let count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+            let bit_width = data_bytes[8] as usize;
+            let packed_bytes = (count * bit_width + 7) / 8;
+            Ok(1 + 17 + packed_bytes)
+        }
+        COL_ENCODING_RLE_BOOL => {
+            // Bool RLE format: [count:u64][num_runs:u64][(value:u8, run_len:u32)...]
+            if data_bytes.len() < 16 {
+                return Err(err_data("skip RLE Bool: truncated header"));
+            }
+            let num_runs = u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
+            Ok(1 + 16 + num_runs * 5)
+        }
+        _ => Err(err_data(&format!("skip_column_encoded: unknown encoding {}", encoding))),
+    }
+}
 
 /// Decompress an RG body based on the compression flag.
 /// Returns Ok(None) if uncompressed (caller should use raw bytes),
@@ -1865,6 +2196,8 @@ pub struct ColumnConstraints {
     pub check_expr_sql: Option<String>,
     /// FOREIGN KEY: references (table_name, column_name) in another table
     pub foreign_key: Option<(String, String)>,
+    /// AUTOINCREMENT: auto-generate sequential integer values on INSERT
+    pub autoincrement: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1926,7 +2259,7 @@ impl OnDemandSchema {
     /// Serialize schema to bytes (no bincode)
     /// Layout: [col_count:u32][ [name_len:u16][name:bytes][type:u8] ... ][ [flags:u8] ... ]
     /// Constraint flags are appended AFTER all column data for backward compatibility.
-    /// Constraint flags byte: bit0=not_null, bit1=primary_key, bit2=unique
+    /// Constraint flags byte: bit0=not_null, bit1=primary_key, bit2=unique, bit4=autoincrement
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         
@@ -1942,14 +2275,15 @@ impl OnDemandSchema {
         }
         
         // Append constraint flags after all columns (1 byte per column)
-        let has_any = self.constraints.iter().any(|c| c.not_null || c.primary_key || c.unique || c.default_value.is_some());
+        let has_any = self.constraints.iter().any(|c| c.not_null || c.primary_key || c.unique || c.default_value.is_some() || c.autoincrement);
         if has_any || !self.constraints.is_empty() {
             for i in 0..self.columns.len() {
                 let cons = self.constraints.get(i).cloned().unwrap_or_default();
                 let flags = (cons.not_null as u8)
                     | ((cons.primary_key as u8) << 1)
                     | ((cons.unique as u8) << 2)
-                    | (if cons.default_value.is_some() { 0x08 } else { 0 });
+                    | (if cons.default_value.is_some() { 0x08 } else { 0 })
+                    | ((cons.autoincrement as u8) << 4);
                 buf.push(flags);
             }
             // Serialize default values for columns that have them (bit3 set in flags)
@@ -2086,6 +2420,7 @@ impl OnDemandSchema {
                         default_value: None, // filled below if marker present
                         check_expr_sql: None, // filled below if marker present
                         foreign_key: None, // filled below if marker present
+                        autoincrement: flags & 0x10 != 0,
                     };
                 }
             }
@@ -2335,10 +2670,20 @@ impl OnDemandStorage {
     /// Open existing V3 storage with specified durability level
     /// Uses mmap for fast zero-copy reads with OS page cache
     pub fn open_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
-        // Clean up stale .tmp file from a crashed save_v4() atomic write
+        // Clean up stale .tmp files from crashed atomic writes
         let tmp_path = path.with_extension("apex.tmp");
         if tmp_path.exists() {
             let _ = std::fs::remove_file(&tmp_path);
+        }
+        // Clean up stale .deltastore.tmp from crashed DeltaStore save
+        let ds_tmp = {
+            let mut p = path.to_path_buf();
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            p.set_file_name(format!("{}.deltastore.tmp", name));
+            p
+        };
+        if ds_tmp.exists() {
+            let _ = std::fs::remove_file(&ds_tmp);
         }
         
         let file = File::open(path)?;
@@ -4928,8 +5273,9 @@ impl OnDemandStorage {
                                         let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
                                         if rg_end > mmap_ref.len() { break; }
                                         let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
-                                        // Check compression flag at RG header byte 28
+                                        // Check compression flag at RG header byte 28, encoding version at byte 29
                                         let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+                                        let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
                                         let decompressed_buf: Option<Vec<u8>> = match decompress_rg_body(compress_flag, &rg_bytes[32..]) {
                                             Ok(v) => v,
                                             Err(_) => break,
@@ -4957,10 +5303,15 @@ impl OnDemandStorage {
                                                     }
                                                 }
                                             }
-                                            // Skip column data
+                                            // Skip column data (encoding-aware)
                                             let ct = f_schema.columns[ci].1;
-                                            if let Ok(consumed) = ColumnData::skip_bytes_typed(&body[pos..], ct) {
-                                                pos += consumed;
+                                            let consumed = if encoding_version >= 1 {
+                                                skip_column_encoded(&body[pos..], ct)
+                                            } else {
+                                                ColumnData::skip_bytes_typed(&body[pos..], ct)
+                                            };
+                                            if let Ok(c) = consumed {
+                                                pos += c;
                                             } else { break; }
                                         }
                                         global_row += rg_rows;
@@ -5118,6 +5469,7 @@ impl OnDemandStorage {
     }
 
     /// MMAP PATH: numeric filter directly on V4 RG data via mmap
+    /// Uses per-RG zone maps to skip Row Groups where filter can't match.
     fn read_columns_filtered_mmap(
         &self,
         column_names: Option<&[&str]>,
@@ -5136,8 +5488,11 @@ impl OnDemandStorage {
             None => return Ok((HashMap::new(), Vec::new())),
         };
         
-        // Scan filter column from mmap
-        let (scanned, del_bytes) = self.scan_columns_mmap(&[filter_col_idx], &footer)?;
+        // Per-RG zone map pruning: build set of RG indices to skip
+        let skip_rgs = Self::zone_map_prune_rgs(&footer, filter_col_idx, filter_op, filter_value);
+        
+        // Scan filter column from mmap (skipping pruned RGs)
+        let (scanned, del_bytes) = self.scan_columns_mmap_skip_rgs(&[filter_col_idx], &footer, &skip_rgs)?;
         if scanned.is_empty() { return Ok((HashMap::new(), Vec::new())); }
         
         let has_deleted = del_bytes.iter().any(|&b| b != 0);
@@ -5179,7 +5534,7 @@ impl OnDemandStorage {
             return Ok((HashMap::new(), Vec::new()));
         }
         
-        // Scan result columns
+        // Scan result columns (skip same pruned RGs)
         let col_indices: Vec<usize> = match column_names {
             Some(names) => names.iter()
                 .filter(|&&n| n != "_id")
@@ -5188,7 +5543,7 @@ impl OnDemandStorage {
             None => (0..schema.column_count()).collect(),
         };
         
-        let (all_cols, _) = self.scan_columns_mmap(&col_indices, &footer)?;
+        let (all_cols, _) = self.scan_columns_mmap_skip_rgs(&col_indices, &footer, &skip_rgs)?;
         
         let mut result = HashMap::new();
         for (out_idx, &col_idx) in col_indices.iter().enumerate() {
@@ -6744,10 +7099,13 @@ impl OnDemandStorage {
                 let col_type = schema.columns[col_idx].1;
 
                 if let Some(&out_pos) = col_idx_to_out.get(&col_idx) {
-                    // Parse this column's data
-                    let (col_data, consumed) = ColumnData::from_bytes_typed(
-                        &body[pos..], col_type,
-                    )?;
+                    // Parse this column's data (encoding-aware)
+                    let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+                    let (col_data, consumed) = if encoding_version >= 1 {
+                        read_column_encoded(&body[pos..], col_type)?
+                    } else {
+                        ColumnData::from_bytes_typed(&body[pos..], col_type)?
+                    };
                     pos += consumed;
 
                     // Decode StringDict → String for in-memory use
@@ -6792,10 +7150,13 @@ impl OnDemandStorage {
                     }
                     rg_filled[out_pos] = true;
                 } else {
-                    // Skip this column (no allocation)
-                    let consumed = ColumnData::skip_bytes_typed(
-                        &body[pos..], col_type,
-                    )?;
+                    // Skip this column (no allocation, encoding-aware)
+                    let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+                    let consumed = if encoding_version >= 1 {
+                        skip_column_encoded(&body[pos..], col_type)?
+                    } else {
+                        ColumnData::skip_bytes_typed(&body[pos..], col_type)?
+                    };
                     pos += consumed;
                 }
             }
@@ -7224,8 +7585,9 @@ impl OnDemandStorage {
             }
             let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
             
-            // Check compression flag at RG header byte 28
+            // Check compression flag at RG header byte 28, encoding version at byte 29
             let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
             
             // Get the body bytes (after 32-byte RG header), decompressing if needed
             let decompressed_buf = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
@@ -7256,9 +7618,11 @@ impl OnDemandStorage {
                     // Accumulate null bitmap for this column
                     col_null_bitmaps[out_pos].extend_from_slice(null_bytes);
 
-                    let (col_data, consumed) = ColumnData::from_bytes_typed(
-                        &body[pos..], col_type,
-                    )?;
+                    let (col_data, consumed) = if encoding_version >= 1 {
+                        read_column_encoded(&body[pos..], col_type)?
+                    } else {
+                        ColumnData::from_bytes_typed(&body[pos..], col_type)?
+                    };
                     pos += consumed;
 
                     // Decode StringDict → String
@@ -7269,15 +7633,155 @@ impl OnDemandStorage {
                     };
                     col_accumulators[out_pos].append(&col_data);
                 } else {
-                    let consumed = ColumnData::skip_bytes_typed(
-                        &body[pos..], col_type,
-                    )?;
+                    let consumed = if encoding_version >= 1 {
+                        skip_column_encoded(&body[pos..], col_type)?
+                    } else {
+                        ColumnData::skip_bytes_typed(&body[pos..], col_type)?
+                    };
                     pos += consumed;
                 }
             }
         }
 
         Ok((col_accumulators, all_del_bytes, col_null_bitmaps))
+    }
+
+    /// Determine which Row Groups can be skipped based on per-RG zone maps.
+    /// Returns a set of RG indices that definitely won't match the filter.
+    fn zone_map_prune_rgs(
+        footer: &V4Footer,
+        filter_col_idx: usize,
+        filter_op: &str,
+        filter_value: f64,
+    ) -> HashSet<usize> {
+        let mut skip: HashSet<usize> = HashSet::new();
+        let filter_val_i64 = filter_value as i64;
+        for (rg_idx, rg_zmaps) in footer.zone_maps.iter().enumerate() {
+            for zm in rg_zmaps {
+                if zm.col_idx as usize != filter_col_idx { continue; }
+                let dominated = if zm.is_float {
+                    let mn = f64::from_bits(zm.min_bits as u64);
+                    let mx = f64::from_bits(zm.max_bits as u64);
+                    match filter_op {
+                        ">"  => mx <= filter_value,
+                        ">=" => mx < filter_value,
+                        "<"  => mn >= filter_value,
+                        "<=" => mn > filter_value,
+                        "=" | "==" => filter_value < mn || filter_value > mx,
+                        _ => false,
+                    }
+                } else {
+                    let mn = zm.min_bits;
+                    let mx = zm.max_bits;
+                    match filter_op {
+                        ">"  => mx <= filter_val_i64,
+                        ">=" => mx < filter_val_i64,
+                        "<"  => mn >= filter_val_i64,
+                        "<=" => mn > filter_val_i64,
+                        "=" | "==" => filter_val_i64 < mn || filter_val_i64 > mx,
+                        "!=" | "<>" => mn == mx && mn == filter_val_i64,
+                        _ => false,
+                    }
+                };
+                if dominated { skip.insert(rg_idx); }
+                break; // only one zone map per column per RG
+            }
+        }
+        skip
+    }
+
+    /// Like scan_columns_mmap but skips Row Groups in the `skip_rgs` set.
+    /// Used for zone-map-pruned filtered scans.
+    fn scan_columns_mmap_skip_rgs(
+        &self,
+        col_indices: &[usize],
+        footer: &V4Footer,
+        skip_rgs: &HashSet<usize>,
+    ) -> io::Result<(Vec<ColumnData>, Vec<u8>)> {
+        if skip_rgs.is_empty() {
+            // No pruning needed — delegate to normal scan
+            return self.scan_columns_mmap(col_indices, footer);
+        }
+
+        let schema = &footer.schema;
+        let col_count = schema.column_count();
+
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for mmap scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        let mut col_accumulators: Vec<ColumnData> = col_indices.iter()
+            .map(|&ci| {
+                let ct = schema.columns[ci].1;
+                let acc_type = if ct == ColumnType::StringDict { ColumnType::String } else { ct };
+                ColumnData::new(acc_type)
+            })
+            .collect();
+        let mut all_del_bytes: Vec<u8> = Vec::new();
+
+        let col_idx_to_out: HashMap<usize, usize> = col_indices.iter()
+            .enumerate()
+            .map(|(out_pos, &col_idx)| (col_idx, out_pos))
+            .collect();
+
+        for (rg_idx, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 { continue; }
+            if skip_rgs.contains(&rg_idx) { continue; } // Zone map pruned!
+
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return Err(err_data("RG extends past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+            let decompressed_buf = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+            let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_bytes[32..]);
+            let mut pos: usize = 0;
+
+            pos += rg_rows * 8; // skip IDs
+
+            let del_vec_len = (rg_rows + 7) / 8;
+            if pos + del_vec_len > body.len() {
+                return Err(err_data("RG deletion vector truncated"));
+            }
+            all_del_bytes.extend_from_slice(&body[pos..pos + del_vec_len]);
+            pos += del_vec_len;
+
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            for col_idx in 0..col_count {
+                if pos + null_bitmap_len > body.len() { break; }
+                pos += null_bitmap_len; // skip null bitmap
+
+                let col_type = schema.columns[col_idx].1;
+                if let Some(&out_pos) = col_idx_to_out.get(&col_idx) {
+                    let (col_data, consumed) = if encoding_version >= 1 {
+                        read_column_encoded(&body[pos..], col_type)?
+                    } else {
+                        ColumnData::from_bytes_typed(&body[pos..], col_type)?
+                    };
+                    pos += consumed;
+                    let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                        col_data.decode_string_dict()
+                    } else {
+                        col_data
+                    };
+                    col_accumulators[out_pos].append(&col_data);
+                } else {
+                    let consumed = if encoding_version >= 1 {
+                        skip_column_encoded(&body[pos..], col_type)?
+                    } else {
+                        ColumnData::skip_bytes_typed(&body[pos..], col_type)?
+                    };
+                    pos += consumed;
+                }
+            }
+        }
+
+        Ok((col_accumulators, all_del_bytes))
     }
 
     /// Read IDs for a row range (lazy loads IDs if not already loaded)
@@ -9800,8 +10304,29 @@ impl OnDemandStorage {
         // After full rewrite, clear delta store (deltas are now in the base file)
         if result.is_ok() {
             let _ = self.clear_delta_store();
+            // WAL checkpoint: all data is persisted, truncate WAL to prevent unbounded growth
+            self.checkpoint_wal();
         }
         result
+    }
+    
+    /// Checkpoint WAL: truncate the WAL file after a successful save.
+    /// All WAL records are now redundant since data is fully persisted to .apex.
+    fn checkpoint_wal(&self) {
+        let mut wal_writer = self.wal_writer.write();
+        if wal_writer.is_some() {
+            // Drop the existing writer to release file handle
+            *wal_writer = None;
+            // Recreate WAL file (truncates old content)
+            let wal_path = Self::wal_path(&self.path);
+            let next_id = self.next_id.load(Ordering::SeqCst);
+            if let Ok(writer) = super::incremental::WalWriter::create(&wal_path, next_id) {
+                *wal_writer = Some(writer);
+            }
+        }
+        // Clear WAL buffer
+        let mut wal_buffer = self.wal_buffer.write();
+        wal_buffer.clear();
     }
     
     // ========================================================================
@@ -10030,20 +10555,20 @@ impl OnDemandStorage {
                         );
                         body_writer.write_all(&chunk_nulls)?;
                     }
-                    processed.write_to(&mut body_writer)?;
+                    write_column_encoded(processed, schema_clone.columns[col_idx].1, &mut body_writer)?;
                 }
             }
             
             // Compress body (Zstd default, LZ4 fallback)
             let (compress_flag, disk_body) = compress_rg_body(body_buf);
             
-            // RG header (32 bytes) — byte 28 = compression flag
+            // RG header (32 bytes) — byte 28 = compression flag, byte 29 = encoding version
             writer.write_all(MAGIC_ROW_GROUP)?;
             writer.write_all(&(chunk_rows as u32).to_le_bytes())?;
             writer.write_all(&(col_count as u32).to_le_bytes())?;
             writer.write_all(&min_id.to_le_bytes())?;
             writer.write_all(&max_id.to_le_bytes())?;
-            writer.write_all(&[compress_flag, 0, 0, 0])?;
+            writer.write_all(&[compress_flag, 1, 0, 0])?; // encoding_version=1: per-column encoding prefix
             
             // RG body (possibly compressed)
             writer.write_all(&disk_body)?;
@@ -10255,8 +10780,9 @@ impl OnDemandStorage {
             let mut rg_buf = vec![0u8; rg_size];
             mmap.read_at(file, &mut rg_buf, rg_meta.offset)?;
             
-            // Check compression flag at RG header byte 28
+            // Check compression flag at RG header byte 28, encoding version at byte 29
             let compress_flag = if rg_buf.len() >= 32 { rg_buf[28] } else { RG_COMPRESS_NONE };
+            let encoding_version = if rg_buf.len() >= 32 { rg_buf[29] } else { 0 };
             
             // Get the body bytes (after 32-byte RG header), decompressing if needed
             let decompressed_buf = decompress_rg_body(compress_flag, &rg_buf[32..])?;
@@ -10330,11 +10856,13 @@ impl OnDemandStorage {
                 }
                 pos += null_bitmap_len;
                 
-                // Parse column data using from_bytes_typed
+                // Parse column data (encoding-aware for version 1, plain for version 0)
                 let col_type = footer.schema.columns[col_idx].1;
-                let (col_data, consumed) = ColumnData::from_bytes_typed(
-                    &body[pos..], col_type,
-                )?;
+                let (col_data, consumed) = if encoding_version >= 1 {
+                    read_column_encoded(&body[pos..], col_type)?
+                } else {
+                    ColumnData::from_bytes_typed(&body[pos..], col_type)?
+                };
                 pos += consumed;
                 
                 // Append to flat column
@@ -10665,17 +11193,21 @@ impl OnDemandStorage {
                 // Column data — dict-encode if footer schema expects StringDict
                 if col_idx < new_columns.len() {
                     let col = &new_columns[col_idx];
-                    if col_idx < footer.schema.columns.len()
-                        && footer.schema.columns[col_idx].1 == ColumnType::StringDict
+                    let col_type = if col_idx < footer.schema.columns.len() {
+                        footer.schema.columns[col_idx].1
+                    } else {
+                        ColumnType::Int64
+                    };
+                    if col_type == ColumnType::StringDict
                         && matches!(col, ColumnData::String { .. })
                     {
                         if let Some(dict) = col.to_dict_encoded() {
-                            dict.write_to(&mut body_writer)?;
+                            write_column_encoded(&dict, col_type, &mut body_writer)?;
                         } else {
-                            col.write_to(&mut body_writer)?;
+                            write_column_encoded(col, col_type, &mut body_writer)?;
                         }
                     } else {
-                        col.write_to(&mut body_writer)?;
+                        write_column_encoded(col, col_type, &mut body_writer)?;
                     }
                 }
             }
@@ -10690,7 +11222,7 @@ impl OnDemandStorage {
         writer.write_all(&(col_count as u32).to_le_bytes())?;
         writer.write_all(&min_id.to_le_bytes())?;
         writer.write_all(&max_id.to_le_bytes())?;
-        writer.write_all(&[compress_flag, 0, 0, 0])?;
+        writer.write_all(&[compress_flag, 1, 0, 0])?; // encoding_version=1: per-column encoding prefix
         
         // RG body (possibly compressed)
         writer.write_all(&disk_body)?;
@@ -12860,6 +13392,7 @@ mod tests {
             default_value: None,
             check_expr_sql: Some("age > 0".to_string()),
             foreign_key: None,
+            autoincrement: false,
         });
 
         let bytes = schema.to_bytes();
@@ -12878,6 +13411,7 @@ mod tests {
             default_value: None,
             check_expr_sql: None,
             foreign_key: Some(("departments".to_string(), "id".to_string())),
+            autoincrement: false,
         });
 
         let bytes = schema.to_bytes();
@@ -12895,6 +13429,7 @@ mod tests {
             default_value: None,
             check_expr_sql: None,
             foreign_key: None,
+            autoincrement: false,
         });
         schema.add_column_with_constraints("val", ColumnType::Int64, ColumnConstraints {
             not_null: true,
@@ -12903,6 +13438,7 @@ mod tests {
             default_value: Some(DefaultValue::Int64(0)),
             check_expr_sql: Some("val >= 0".to_string()),
             foreign_key: Some(("other".to_string(), "val".to_string())),
+            autoincrement: false,
         });
 
         let bytes = schema.to_bytes();
@@ -12939,6 +13475,7 @@ mod tests {
                 default_value: None,
                 check_expr_sql: Some("val > 0".to_string()),
                 foreign_key: Some(("parent".to_string(), "id".to_string())),
+                autoincrement: false,
             });
             storage.save_v4().unwrap();
         }

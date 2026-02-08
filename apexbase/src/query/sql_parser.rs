@@ -24,6 +24,7 @@ pub enum ColumnConstraintKind {
     Default(Value),
     Check(String),
     ForeignKey { ref_table: String, ref_column: String },
+    Autoincrement,
 }
 
 /// Column definition for CREATE TABLE
@@ -126,6 +127,7 @@ pub struct SelectStatement {
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<SqlExpr>,
     pub group_by: Vec<String>,
+    pub group_by_exprs: Vec<Option<SqlExpr>>,
     pub having: Option<SqlExpr>,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<usize>,
@@ -357,9 +359,11 @@ impl SelectStatement {
             }
         }
         
-        // Extract from GROUP BY
-        for col in &self.group_by {
-            if col != "_id" {
+        // Extract from GROUP BY (including expression column refs)
+        for (i, col) in self.group_by.iter().enumerate() {
+            if let Some(Some(expr)) = self.group_by_exprs.get(i) {
+                Self::extract_columns_from_expr(expr, &mut columns);
+            } else if col != "_id" {
                 columns.push(col.clone());
             }
         }
@@ -1735,13 +1739,13 @@ impl SqlParser {
             None
         };
 
-        // GROUP BY
-        let group_by = if matches!(self.current(), Token::Group) {
+        // GROUP BY (supports expressions like YEAR(date), city)
+        let (group_by, group_by_exprs) = if matches!(self.current(), Token::Group) {
             self.advance();
             self.expect(Token::By)?;
-            self.parse_column_list()?
+            self.parse_group_by_list()?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         // HAVING
@@ -1792,6 +1796,7 @@ impl SqlParser {
             joins,
             where_clause,
             group_by,
+            group_by_exprs,
             having,
             order_by,
             limit,
@@ -2154,6 +2159,70 @@ impl SqlParser {
     }
 
     Ok(columns)
+}
+
+/// Parse GROUP BY list: supports both simple columns and expressions like YEAR(date)
+fn parse_group_by_list(&mut self) -> Result<(Vec<String>, Vec<Option<SqlExpr>>), ApexError> {
+    let mut names = Vec::new();
+    let mut exprs = Vec::new();
+    
+    loop {
+        // Check if this is a function call: IDENT '(' ...
+        let is_func = matches!(self.current(), Token::Identifier(_)) && {
+            let next_pos = self.pos + 1;
+            next_pos < self.tokens.len() && matches!(self.tokens[next_pos].token, Token::LParen)
+        };
+        
+        if is_func {
+            // Parse as expression (function call like YEAR(date))
+            let expr = self.parse_expr()?;
+            let display = Self::expr_to_display_string(&expr);
+            names.push(display);
+            exprs.push(Some(expr));
+        } else if matches!(self.current(), Token::Identifier(_)) {
+            let name = self.parse_column_ref()?;
+            names.push(name);
+            exprs.push(None);
+        } else {
+            return Err(ApexError::QueryParseError("Expected column name or expression in GROUP BY".to_string()));
+        }
+        
+        if matches!(self.current(), Token::Comma) {
+            self.advance();
+        } else {
+            break;
+        }
+    }
+    
+    Ok((names, exprs))
+}
+
+/// Convert a SqlExpr to a display string for use as column name
+fn expr_to_display_string(expr: &SqlExpr) -> String {
+    match expr {
+        SqlExpr::Column(name) => name.clone(),
+        SqlExpr::Function { name, args } => {
+            let arg_strs: Vec<String> = args.iter().map(Self::expr_to_display_string).collect();
+            format!("{}({})", name.to_uppercase(), arg_strs.join(", "))
+        }
+        SqlExpr::BinaryOp { left, op, right } => {
+            let op_str = match op {
+                crate::query::sql_parser::BinaryOperator::Add => "+",
+                crate::query::sql_parser::BinaryOperator::Sub => "-",
+                crate::query::sql_parser::BinaryOperator::Mul => "*",
+                crate::query::sql_parser::BinaryOperator::Div => "/",
+                crate::query::sql_parser::BinaryOperator::Mod => "%",
+                _ => "?",
+            };
+            format!("{} {} {}", Self::expr_to_display_string(left), op_str, Self::expr_to_display_string(right))
+        }
+        SqlExpr::Cast { expr, data_type } => {
+            format!("CAST({} AS {:?})", Self::expr_to_display_string(expr), data_type)
+        }
+        SqlExpr::Literal(val) => format!("{:?}", val),
+        SqlExpr::Paren(inner) => format!("({})", Self::expr_to_display_string(inner)),
+        _ => format!("{:?}", expr),
+    }
 }
 
 fn parse_column_list(&mut self) -> Result<Vec<String>, ApexError> {
@@ -2887,6 +2956,10 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                         }
                     };
                     constraints.push(ColumnConstraintKind::Default(val));
+                }
+                Token::Identifier(s) if s.to_uppercase() == "AUTOINCREMENT" || s.to_uppercase() == "AUTO_INCREMENT" => {
+                    self.advance();
+                    constraints.push(ColumnConstraintKind::Autoincrement);
                 }
                 _ => break,
             }
