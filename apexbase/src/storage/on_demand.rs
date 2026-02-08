@@ -1679,10 +1679,31 @@ impl ColumnIndexEntry {
 // Schema (bincode-free serialization)
 // ============================================================================
 
+/// A default value for a column constraint (serializable)
+#[derive(Debug, Clone, PartialEq)]
+pub enum DefaultValue {
+    Int64(i64),
+    Float64(f64),
+    String(String),
+    Bool(bool),
+    Null,
+}
+
+/// Per-column constraint flags stored in schema
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ColumnConstraints {
+    pub not_null: bool,
+    pub primary_key: bool,
+    pub unique: bool,
+    pub default_value: Option<DefaultValue>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OnDemandSchema {
     pub columns: Vec<(String, ColumnType)>,
     name_to_idx: HashMap<String, usize>,
+    /// Per-column constraints (indexed same as columns)
+    pub constraints: Vec<ColumnConstraints>,
 }
 
 impl OnDemandSchema {
@@ -1690,6 +1711,7 @@ impl OnDemandSchema {
         Self {
             columns: Vec::new(),
             name_to_idx: HashMap::new(),
+            constraints: Vec::new(),
         }
     }
 
@@ -1700,7 +1722,28 @@ impl OnDemandSchema {
         let idx = self.columns.len();
         self.columns.push((name.to_string(), dtype));
         self.name_to_idx.insert(name.to_string(), idx);
+        self.constraints.push(ColumnConstraints::default());
         idx
+    }
+
+    /// Add a column with constraints
+    pub fn add_column_with_constraints(&mut self, name: &str, dtype: ColumnType, cons: ColumnConstraints) -> usize {
+        if let Some(&idx) = self.name_to_idx.get(name) {
+            if idx < self.constraints.len() {
+                self.constraints[idx] = cons;
+            }
+            return idx;
+        }
+        let idx = self.columns.len();
+        self.columns.push((name.to_string(), dtype));
+        self.name_to_idx.insert(name.to_string(), idx);
+        self.constraints.push(cons);
+        idx
+    }
+
+    /// Get constraints for a column by name
+    pub fn get_constraints(&self, name: &str) -> Option<&ColumnConstraints> {
+        self.name_to_idx.get(name).and_then(|&idx| self.constraints.get(idx))
     }
 
     pub fn get_index(&self, name: &str) -> Option<usize> {
@@ -1712,6 +1755,9 @@ impl OnDemandSchema {
     }
 
     /// Serialize schema to bytes (no bincode)
+    /// Layout: [col_count:u32][ [name_len:u16][name:bytes][type:u8] ... ][ [flags:u8] ... ]
+    /// Constraint flags are appended AFTER all column data for backward compatibility.
+    /// Constraint flags byte: bit0=not_null, bit1=primary_key, bit2=unique
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         
@@ -1726,10 +1772,59 @@ impl OnDemandSchema {
             buf.push(*dtype as u8);
         }
         
+        // Append constraint flags after all columns (1 byte per column)
+        let has_any = self.constraints.iter().any(|c| c.not_null || c.primary_key || c.unique || c.default_value.is_some());
+        if has_any || !self.constraints.is_empty() {
+            for i in 0..self.columns.len() {
+                let cons = self.constraints.get(i).cloned().unwrap_or_default();
+                let flags = (cons.not_null as u8)
+                    | ((cons.primary_key as u8) << 1)
+                    | ((cons.unique as u8) << 2)
+                    | (if cons.default_value.is_some() { 0x08 } else { 0 });
+                buf.push(flags);
+            }
+            // Serialize default values for columns that have them (bit3 set in flags)
+            let has_defaults = self.constraints.iter().any(|c| c.default_value.is_some());
+            if has_defaults {
+                buf.push(0xDF); // marker byte for default values section
+                for i in 0..self.columns.len() {
+                    let cons = self.constraints.get(i);
+                    match cons.and_then(|c| c.default_value.as_ref()) {
+                        Some(DefaultValue::Int64(v)) => {
+                            buf.push(1); // type tag
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
+                        Some(DefaultValue::Float64(v)) => {
+                            buf.push(2);
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
+                        Some(DefaultValue::String(v)) => {
+                            buf.push(3);
+                            let sb = v.as_bytes();
+                            buf.extend_from_slice(&(sb.len() as u16).to_le_bytes());
+                            buf.extend_from_slice(sb);
+                        }
+                        Some(DefaultValue::Bool(v)) => {
+                            buf.push(4);
+                            buf.push(*v as u8);
+                        }
+                        Some(DefaultValue::Null) => {
+                            buf.push(5);
+                        }
+                        None => {
+                            buf.push(0); // no default
+                        }
+                    }
+                }
+            }
+        }
+        
         buf
     }
 
     /// Deserialize schema from bytes (no bincode)
+    /// Backward compatible: parses columns first, then checks if trailing bytes
+    /// contain constraint flags (exactly column_count bytes remaining = constraints).
     pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
         let mut pos = 0;
         
@@ -1742,6 +1837,7 @@ impl OnDemandSchema {
         
         let mut schema = Self::new();
         
+        // Parse columns: [name_len:u16][name:bytes][type:u8]
         for _ in 0..column_count {
             if pos + 2 > bytes.len() {
                 return Err(err_data("Truncated schema"));
@@ -1764,6 +1860,67 @@ impl OnDemandSchema {
             pos += 1;
             
             schema.add_column(&name, dtype);
+        }
+        
+        // Check for trailing constraint flags (at least column_count bytes remaining)
+        let remaining = bytes.len() - pos;
+        if remaining >= column_count && column_count > 0 {
+            for i in 0..column_count {
+                let flags = bytes[pos + i];
+                if i < schema.constraints.len() {
+                    schema.constraints[i] = ColumnConstraints {
+                        not_null: flags & 1 != 0,
+                        primary_key: flags & 2 != 0,
+                        unique: flags & 4 != 0,
+                        default_value: None, // filled below if marker present
+                    };
+                }
+            }
+            pos += column_count;
+
+            // Check for default values marker (0xDF) after flags
+            if pos < bytes.len() && bytes[pos] == 0xDF {
+                pos += 1;
+                for i in 0..column_count {
+                    if pos >= bytes.len() { break; }
+                    let tag = bytes[pos];
+                    pos += 1;
+                    let dv = match tag {
+                        1 => { // Int64
+                            if pos + 8 > bytes.len() { break; }
+                            let v = i64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+                            pos += 8;
+                            Some(DefaultValue::Int64(v))
+                        }
+                        2 => { // Float64
+                            if pos + 8 > bytes.len() { break; }
+                            let v = f64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+                            pos += 8;
+                            Some(DefaultValue::Float64(v))
+                        }
+                        3 => { // String
+                            if pos + 2 > bytes.len() { break; }
+                            let slen = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap()) as usize;
+                            pos += 2;
+                            if pos + slen > bytes.len() { break; }
+                            let s = std::str::from_utf8(&bytes[pos..pos+slen]).unwrap_or("").to_string();
+                            pos += slen;
+                            Some(DefaultValue::String(s))
+                        }
+                        4 => { // Bool
+                            if pos >= bytes.len() { break; }
+                            let v = bytes[pos] != 0;
+                            pos += 1;
+                            Some(DefaultValue::Bool(v))
+                        }
+                        5 => Some(DefaultValue::Null),
+                        _ => None, // 0 = no default
+                    };
+                    if i < schema.constraints.len() {
+                        schema.constraints[i].default_value = dv;
+                    }
+                }
+            }
         }
         
         Ok(schema)
@@ -1923,6 +2080,12 @@ impl OnDemandStorage {
     /// Open existing V3 storage with specified durability level
     /// Uses mmap for fast zero-copy reads with OS page cache
     pub fn open_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+        // Clean up stale .tmp file from a crashed save_v4() atomic write
+        let tmp_path = path.with_extension("apex.tmp");
+        if tmp_path.exists() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        
         let file = File::open(path)?;
         
         // Create mmap cache and use it for initial reads
@@ -2007,13 +2170,33 @@ impl OnDemandStorage {
             if wal_path.exists() {
                 // Replay WAL for crash recovery
                 let mut reader = super::incremental::WalReader::open(&wal_path)?;
-                let records = reader.read_all()?;
+                let all_records = reader.read_all()?;
+                
+                // P0-3: Collect committed txn_ids for recovery filtering
+                let committed_txns: std::collections::HashSet<u64> = all_records.iter()
+                    .filter_map(|r| match r {
+                        super::incremental::WalRecord::TxnCommit { txn_id } => Some(*txn_id),
+                        _ => None,
+                    })
+                    .collect();
+                
+                // Filter: keep only auto-commit (txn_id=0) and committed txn DML records
+                let records: Vec<_> = all_records.into_iter().filter(|r| {
+                    match r {
+                        super::incremental::WalRecord::Insert { txn_id, .. } |
+                        super::incremental::WalRecord::Delete { txn_id, .. } |
+                        super::incremental::WalRecord::BatchInsert { txn_id, .. } => {
+                            *txn_id == 0 || committed_txns.contains(txn_id)
+                        }
+                        _ => true, // Keep checkpoints, txn boundaries
+                    }
+                }).collect();
                 
                 // Find max ID from WAL records (handles both Insert and BatchInsert)
                 let max_wal_id = records.iter().filter_map(|r| {
                     match r {
                         super::incremental::WalRecord::Insert { id, .. } => Some(*id),
-                        super::incremental::WalRecord::BatchInsert { start_id, rows } => {
+                        super::incremental::WalRecord::BatchInsert { start_id, rows, .. } => {
                             Some(*start_id + rows.len() as u64 - 1)
                         }
                         _ => None,
@@ -9313,9 +9496,12 @@ impl OnDemandStorage {
         #[cfg(not(target_os = "windows"))]
         crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
         
+        // Atomic write: write to .tmp file, then rename over the original.
+        // If crash occurs mid-write, only the .tmp file is corrupted; original is intact.
+        let tmp_path = self.path.with_extension("apex.tmp");
         let file = OpenOptions::new()
             .write(true).create(true).truncate(true)
-            .open(&self.path)?;
+            .open(&tmp_path)?;
         let mut writer = BufWriter::with_capacity(256 * 1024, file);
         
         // Phase 1: Build filtered (active) data under read guards.
@@ -9498,11 +9684,14 @@ impl OnDemandStorage {
         }
         
         // Build modified schema with actual types (StringDict if dict-encoded)
+        // IMPORTANT: preserve constraints from the original schema
         let modified_schema = if !actual_col_types.is_empty() {
             let mut ms = OnDemandSchema::new();
             for (col_idx, (col_name, _)) in schema_clone.columns.iter().enumerate() {
                 ms.add_column(col_name, actual_col_types[col_idx]);
             }
+            // Copy constraints from original schema
+            ms.constraints = schema_clone.constraints.clone();
             ms
         } else {
             schema_clone.clone()
@@ -9537,11 +9726,18 @@ impl OnDemandStorage {
         let writer_inner = writer.get_mut();
         writer_inner.seek(SeekFrom::Start(0))?;
         writer_inner.write_all(&header.to_bytes())?;
+        writer_inner.flush()?;
         
-        // Phase 3: Set in-memory state directly — NO disk reload needed.
-        // active_columns/active_ids/active_nulls are already the correct post-save state.
+        // Ensure all data is on disk before the atomic rename
+        if self.durability != super::DurabilityLevel::Fast {
+            writer_inner.sync_all()?;
+        }
+        
+        // Phase 3: Atomic rename .tmp → .apex
+        // POSIX rename is atomic; on crash the original file remains intact.
         drop(header);
         drop(writer);
+        std::fs::rename(&tmp_path, &self.path)?;
         
         // OPTIMIZATION: compute max_id BEFORE moving active_ids (avoids re-reading after write)
         let max_active_id = active_ids.iter().max().copied().unwrap_or(0);
@@ -11133,6 +11329,92 @@ impl OnDemandStorage {
         !self.wal_buffer.read().is_empty()
     }
 
+    /// Get constraints for a column by name (returns default if none set)
+    pub fn get_column_constraints(&self, name: &str) -> ColumnConstraints {
+        let schema = self.schema.read();
+        schema.get_constraints(name).cloned().unwrap_or_default()
+    }
+
+    /// Check if any column has constraints defined
+    pub fn has_constraints(&self) -> bool {
+        let schema = self.schema.read();
+        schema.constraints.iter().any(|c| c.not_null || c.primary_key || c.unique)
+    }
+
+    /// Set constraints for a column by name
+    pub fn set_column_constraints(&self, name: &str, cons: ColumnConstraints) {
+        let mut schema = self.schema.write();
+        if let Some(idx) = schema.get_index(name) {
+            if idx < schema.constraints.len() {
+                schema.constraints[idx] = cons;
+            }
+        }
+    }
+
+    /// Write a transactional INSERT record to WAL (P0-4: WAL-first for crash recovery)
+    pub fn wal_write_txn_insert(&self, txn_id: u64, id: u64, data: HashMap<String, super::on_demand::ColumnValue>) -> io::Result<()> {
+        let mut wal_writer = self.wal_writer.write();
+        if let Some(writer) = wal_writer.as_mut() {
+            let record = super::incremental::WalRecord::Insert { id, data, txn_id };
+            writer.append(&record)?;
+        }
+        Ok(())
+    }
+
+    /// Write a transactional DELETE record to WAL (P0-4: WAL-first for crash recovery)
+    pub fn wal_write_txn_delete(&self, txn_id: u64, id: u64) -> io::Result<()> {
+        let mut wal_writer = self.wal_writer.write();
+        if let Some(writer) = wal_writer.as_mut() {
+            let record = super::incremental::WalRecord::Delete { id, txn_id };
+            writer.append(&record)?;
+        }
+        Ok(())
+    }
+
+    /// Write a transaction BEGIN marker to WAL (for crash recovery)
+    pub fn wal_write_txn_begin(&self, txn_id: u64) -> io::Result<()> {
+        let mut wal_writer = self.wal_writer.write();
+        if let Some(writer) = wal_writer.as_mut() {
+            let record = super::incremental::WalRecord::TxnBegin { txn_id };
+            writer.append(&record)?;
+        }
+        Ok(())
+    }
+
+    /// Write a transaction COMMIT marker to WAL (for crash recovery)
+    pub fn wal_write_txn_commit(&self, txn_id: u64) -> io::Result<()> {
+        let mut wal_writer = self.wal_writer.write();
+        if let Some(writer) = wal_writer.as_mut() {
+            let record = super::incremental::WalRecord::TxnCommit { txn_id };
+            writer.append(&record)?;
+            writer.flush()?;
+            if self.durability == super::DurabilityLevel::Max {
+                writer.sync()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write a transaction ROLLBACK marker to WAL (for crash recovery)
+    pub fn wal_write_txn_rollback(&self, txn_id: u64) -> io::Result<()> {
+        let mut wal_writer = self.wal_writer.write();
+        if let Some(writer) = wal_writer.as_mut() {
+            let record = super::incremental::WalRecord::TxnRollback { txn_id };
+            writer.append(&record)?;
+            writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Sync the WAL to disk (fsync)
+    pub fn wal_sync(&self) -> io::Result<()> {
+        let mut wal_writer = self.wal_writer.write();
+        if let Some(writer) = wal_writer.as_mut() {
+            writer.sync()?;
+        }
+        Ok(())
+    }
+
     // ========================================================================
     // Query APIs
     // ========================================================================
@@ -11202,7 +11484,8 @@ impl OnDemandStorage {
             if let Some(writer) = wal_writer.as_mut() {
                 let record = super::incremental::WalRecord::BatchInsert { 
                     start_id, 
-                    rows: rows.to_vec()
+                    rows: rows.to_vec(),
+                    txn_id: 0,
                 };
                 writer.append(&record)?;
                 writer.flush()?;

@@ -15,11 +15,21 @@ use crate::ApexError;
 use crate::data::DataType;
 use crate::data::Value;
 
+/// Column-level constraint kinds
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnConstraintKind {
+    NotNull,
+    PrimaryKey,
+    Unique,
+    Default(Value),
+}
+
 /// Column definition for CREATE TABLE
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
+    pub constraints: Vec<ColumnConstraintKind>,
 }
 
 /// ALTER TABLE operation types
@@ -2471,13 +2481,15 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
     }
 
     /// Parse column definitions for CREATE TABLE
+    /// Supports: name TYPE [NOT NULL] [PRIMARY KEY] [UNIQUE] [DEFAULT value]
     fn parse_column_defs(&mut self) -> Result<Vec<ColumnDef>, ApexError> {
         let mut columns = Vec::new();
         
         loop {
             let name = self.parse_identifier()?;
             let data_type = self.parse_data_type()?;
-            columns.push(ColumnDef { name, data_type });
+            let constraints = self.parse_column_constraints()?;
+            columns.push(ColumnDef { name, data_type, constraints });
             
             if matches!(self.current(), Token::Comma) {
                 self.advance();
@@ -2487,6 +2499,66 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
         }
         
         Ok(columns)
+    }
+
+    /// Parse column constraints after the data type.
+    /// Uses context-sensitive keyword detection: PRIMARY, KEY, DEFAULT are identifiers
+    /// in general SQL but treated as constraint keywords here.
+    fn parse_column_constraints(&mut self) -> Result<Vec<ColumnConstraintKind>, ApexError> {
+        let mut constraints = Vec::new();
+        loop {
+            match self.current() {
+                Token::Not => {
+                    self.advance();
+                    // NOT NULL
+                    if matches!(self.current(), Token::Null) {
+                        self.advance();
+                        constraints.push(ColumnConstraintKind::NotNull);
+                    } else {
+                        let (start, _) = self.current_span();
+                        return Err(self.syntax_error(start, "Expected NULL after NOT".to_string()));
+                    }
+                }
+                Token::Identifier(s) if s.to_uppercase() == "PRIMARY" => {
+                    self.advance();
+                    // PRIMARY KEY
+                    if matches!(self.current(), Token::Identifier(ref k) if k.to_uppercase() == "KEY") {
+                        self.advance();
+                        constraints.push(ColumnConstraintKind::PrimaryKey);
+                        // PK implies NOT NULL
+                        if !constraints.contains(&ColumnConstraintKind::NotNull) {
+                            constraints.push(ColumnConstraintKind::NotNull);
+                        }
+                    } else {
+                        let (start, _) = self.current_span();
+                        return Err(self.syntax_error(start, "Expected KEY after PRIMARY".to_string()));
+                    }
+                }
+                Token::Unique => {
+                    self.advance();
+                    constraints.push(ColumnConstraintKind::Unique);
+                }
+                Token::Identifier(s) if s.to_uppercase() == "DEFAULT" => {
+                    self.advance();
+                    // Parse default value (literal)
+                    let val = match self.current().clone() {
+                        Token::IntLit(n) => { self.advance(); Value::Int64(n) }
+                        Token::FloatLit(f) => { self.advance(); Value::Float64(f) }
+                        Token::StringLit(s) => { self.advance(); Value::String(s) }
+                        Token::True => { self.advance(); Value::Bool(true) }
+                        Token::False => { self.advance(); Value::Bool(false) }
+                        Token::Null => { self.advance(); Value::Null }
+                        _ => {
+                            let (start, _) = self.current_span();
+                            return Err(self.syntax_error(start, "Expected literal value after DEFAULT".to_string()));
+                        }
+                    };
+                    constraints.push(ColumnConstraintKind::Default(val));
+                }
+                _ => break,
+            }
+        }
+        Ok(constraints)
     }
 
     /// Parse data type for column definition

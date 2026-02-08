@@ -673,9 +673,18 @@ class ApexClient:
             if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE')):
                 self._validate_table_in_sql(sql)
             
-            # DML within a transaction: route through session-aware execute() binding
-            if getattr(self, '_in_txn', False) and sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE')):
+            # DML/SELECT within a transaction: route through session-aware execute() binding
+            if getattr(self, '_in_txn', False) and sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'SELECT')):
                 result = self._storage.execute(sql)
+                if sql_upper.startswith('SELECT') and isinstance(result, dict) and 'columns' in result and 'rows' in result:
+                    # Convert execute() dict result to columnar format for ResultView
+                    cols = result['columns']
+                    rows = result['rows']
+                    if cols and rows:
+                        col_dict = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
+                        rv = ResultView(lazy_pydict=col_dict)
+                        rv._show_internal_id = show_internal_id
+                        return rv
                 rv = ResultView(data=None)
                 rv._show_internal_id = show_internal_id
                 return rv

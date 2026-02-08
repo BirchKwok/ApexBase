@@ -9728,6 +9728,34 @@ impl ApexExecutor {
             storage.add_column(&col_def.name, col_def.data_type.clone())?;
         }
         
+        // Set constraints on the underlying schema
+        {
+            use crate::query::sql_parser::ColumnConstraintKind;
+            use crate::storage::on_demand::ColumnConstraints;
+            for col_def in columns {
+                if !col_def.constraints.is_empty() {
+                    let default_val = col_def.constraints.iter().find_map(|c| {
+                        if let ColumnConstraintKind::Default(v) = c {
+                            use crate::storage::on_demand::DefaultValue;
+                            Some(match v {
+                                Value::Int64(n) => DefaultValue::Int64(*n),
+                                Value::Float64(f) => DefaultValue::Float64(*f),
+                                Value::String(s) => DefaultValue::String(s.clone()),
+                                Value::Bool(b) => DefaultValue::Bool(*b),
+                                _ => DefaultValue::Null,
+                            })
+                        } else { None }
+                    });
+                    storage.storage.set_column_constraints(&col_def.name, ColumnConstraints {
+                        not_null: col_def.constraints.contains(&ColumnConstraintKind::NotNull),
+                        primary_key: col_def.constraints.contains(&ColumnConstraintKind::PrimaryKey),
+                        unique: col_def.constraints.contains(&ColumnConstraintKind::Unique),
+                        default_value: default_val,
+                    });
+                }
+            }
+        }
+        
         storage.save()?;
         
         Ok(ApexResult::Scalar(0))
@@ -9860,7 +9888,13 @@ impl ApexExecutor {
     }
 
     /// Execute COMMIT for a specific transaction
-    /// Validates OCC conflicts, then applies all buffered writes to storage
+    /// Validates OCC conflicts, writes WAL transaction markers, then applies all buffered writes to storage.
+    ///
+    /// Crash recovery protocol:
+    /// 1. Write TxnBegin to each affected table's WAL
+    /// 2. Apply buffered writes to storage
+    /// 3. Write TxnCommit to each affected table's WAL + flush/sync
+    /// 4. On recovery: only replay DML between TxnBegin..TxnCommit pairs
     pub fn execute_commit_txn(txn_id: u64, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
         let mgr = crate::txn::txn_manager();
 
@@ -9874,21 +9908,72 @@ impl ApexExecutor {
             io::Error::new(io::ErrorKind::Other, format!("Transaction conflict: {}", e))
         })?;
 
-        // Apply buffered writes to storage
-        let mut applied = 0i64;
+        // Collect affected table paths
         let mut affected_tables: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
         for write in &writes {
-            // Track affected table paths for cache invalidation
             let table_name = write.table();
             let table_path = Self::resolve_table_path(table_name, base_dir, default_table_path);
             affected_tables.insert(table_path);
+        }
 
+        // Phase 1: Write TxnBegin to each affected table's WAL
+        for table_path in &affected_tables {
+            if let Ok(backend) = get_cached_backend(table_path) {
+                let _ = backend.storage.wal_write_txn_begin(txn_id);
+            }
+        }
+
+        // Phase 2 (P0-4): Write buffered DML to WAL with txn_id BEFORE applying to storage
+        // This ensures crash recovery can replay committed transactions from WAL.
+        for write in &writes {
+            use crate::txn::context::TxnWrite;
+            let table_name = write.table();
+            let table_path = Self::resolve_table_path(table_name, base_dir, default_table_path);
+            if let Ok(backend) = get_cached_backend(&table_path) {
+                match write {
+                    TxnWrite::Insert { data, row_id, .. } => {
+                        use crate::storage::on_demand::ColumnValue as CV;
+                        let wal_data: std::collections::HashMap<String, CV> = data.iter().map(|(k, v)| {
+                            let cv = match v {
+                                Value::Null => CV::Null,
+                                Value::Bool(b) => CV::Bool(*b),
+                                Value::Int64(i) => CV::Int64(*i),
+                                Value::Int32(i) => CV::Int64(*i as i64),
+                                Value::Float64(f) => CV::Float64(*f),
+                                Value::String(s) => CV::String(s.clone()),
+                                Value::UInt64(u) => CV::Int64(*u as i64),
+                                _ => CV::Null,
+                            };
+                            (k.clone(), cv)
+                        }).collect();
+                        let _ = backend.storage.wal_write_txn_insert(txn_id, *row_id, wal_data);
+                    }
+                    TxnWrite::Delete { row_id, .. } => {
+                        let _ = backend.storage.wal_write_txn_delete(txn_id, *row_id);
+                    }
+                    TxnWrite::Update { .. } => {
+                        // Updates are applied as delta store changes (not WAL-logged individually)
+                    }
+                }
+            }
+        }
+
+        // Phase 3: Apply buffered writes to storage
+        let mut applied = 0i64;
+        for write in &writes {
             let result = Self::apply_txn_write(write, base_dir, default_table_path);
             match result {
                 Ok(count) => applied += count,
                 Err(e) => {
                     eprintln!("Warning: failed to apply txn write: {}", e);
                 }
+            }
+        }
+
+        // Phase 4: Write TxnCommit to each affected table's WAL (flush + optional sync)
+        for table_path in &affected_tables {
+            if let Ok(backend) = get_cached_backend(table_path) {
+                let _ = backend.storage.wal_write_txn_commit(txn_id);
             }
         }
 
@@ -10099,8 +10184,116 @@ impl ApexExecutor {
                 }
                 Ok(ApexResult::Scalar(buffered))
             }
-            SqlStatement::Select(select) => {
-                Self::execute_parsed_multi(SqlStatement::Select(select), base_dir, default_table_path)
+            SqlStatement::Select(ref select) => {
+                // Extract table name from SELECT for overlay lookup
+                let table_name = match &select.from {
+                    Some(crate::query::sql_parser::FromItem::Table { table, .. }) => table.clone(),
+                    _ => "default".to_string(),
+                };
+
+                // Execute SELECT normally against base storage
+                let result = Self::execute_parsed_multi(stmt, base_dir, default_table_path)?;
+
+                // P0-6 Phase A: Overlay buffered writes from this transaction
+                let writes = mgr.with_context(txn_id, |ctx| {
+                    Ok(ctx.write_set().to_vec())
+                })?;
+
+                // Collect inserts and deletes for this table
+                let mut inserted_rows: Vec<&std::collections::HashMap<String, Value>> = Vec::new();
+                let mut deleted_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                let mut updated_rows: Vec<(u64, &std::collections::HashMap<String, Value>)> = Vec::new();
+                for w in &writes {
+                    use crate::txn::context::TxnWrite;
+                    match w {
+                        TxnWrite::Insert { table, data, .. } if table == &table_name => {
+                            inserted_rows.push(data);
+                        }
+                        TxnWrite::Delete { table, row_id, .. } if table == &table_name => {
+                            deleted_ids.insert(*row_id);
+                        }
+                        TxnWrite::Update { table, row_id, new_data, .. } if table == &table_name => {
+                            updated_rows.push((*row_id, new_data));
+                        }
+                        _ => {}
+                    }
+                }
+
+                // If no buffered writes affect this table, return as-is
+                if inserted_rows.is_empty() && deleted_ids.is_empty() && updated_rows.is_empty() {
+                    return Ok(result);
+                }
+
+                // Convert result to record batch and apply overlay
+                let batch = result.to_record_batch()?;
+                let schema = batch.schema();
+                let num_cols = batch.num_columns();
+                let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+
+                // Build row-level representation for overlay
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for row_idx in 0..batch.num_rows() {
+                    // Check if this row is deleted
+                    let mut skip = false;
+                    if !deleted_ids.is_empty() {
+                        if let Some(id_col) = batch.column_by_name("_id") {
+                            let rid = if let Some(a) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                                Some(a.value(row_idx))
+                            } else if let Some(a) = id_col.as_any().downcast_ref::<Int64Array>() {
+                                Some(a.value(row_idx) as u64)
+                            } else { None };
+                            if let Some(rid) = rid {
+                                if deleted_ids.contains(&rid) {
+                                    skip = true;
+                                }
+                            }
+                        }
+                    }
+                    if skip { continue; }
+
+                    let mut row = Vec::with_capacity(num_cols);
+                    for col_idx in 0..num_cols {
+                        row.push(Self::arrow_value_at_col(batch.column(col_idx), row_idx));
+                    }
+
+                    // Apply updates
+                    if !updated_rows.is_empty() {
+                        if let Some(id_col) = batch.column_by_name("_id") {
+                            let rid = if let Some(a) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                                Some(a.value(row_idx))
+                            } else if let Some(a) = id_col.as_any().downcast_ref::<Int64Array>() {
+                                Some(a.value(row_idx) as u64)
+                            } else { None };
+                            if let Some(rid) = rid {
+                                for (uid, new_data) in &updated_rows {
+                                    if rid == *uid {
+                                        for (col, val) in *new_data {
+                                            if let Some(ci) = col_names.iter().position(|n| n == col) {
+                                                row[ci] = val.clone();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    rows.push(row);
+                }
+
+                // Append buffered inserts
+                for insert_data in &inserted_rows {
+                    let mut row = vec![Value::Null; num_cols];
+                    for (col, val) in *insert_data {
+                        if let Some(ci) = col_names.iter().position(|n| n == col) {
+                            row[ci] = val.clone();
+                        }
+                    }
+                    rows.push(row);
+                }
+
+                // Convert back to RecordBatch
+                Self::rows_to_apex_result(&col_names, &rows, &schema)
             }
             SqlStatement::Commit => Self::execute_commit_txn(txn_id, base_dir, default_table_path),
             SqlStatement::Rollback => Self::execute_rollback_txn(txn_id),
@@ -10236,6 +10429,91 @@ impl ApexExecutor {
         invalidate_index_cache(base_dir, table);
 
         Ok(ApexResult::Scalar(0))
+    }
+
+    /// Convert rows of Value back into an ApexResult with a RecordBatch matching the given schema.
+    /// Used by P0-6 read-your-writes overlay.
+    fn rows_to_apex_result(col_names: &[String], rows: &[Vec<Value>], schema: &Arc<arrow::datatypes::Schema>) -> io::Result<ApexResult> {
+        use arrow::array::{ArrayBuilder, Int64Builder, UInt64Builder, Float64Builder, StringBuilder, BooleanBuilder};
+        use arrow::datatypes::DataType;
+
+        let num_rows = rows.len();
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            match field.data_type() {
+                DataType::Int64 => {
+                    let mut builder = Int64Builder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.get(col_idx) {
+                            Some(Value::Int64(v)) => builder.append_value(*v),
+                            Some(Value::Int32(v)) => builder.append_value(*v as i64),
+                            Some(Value::Null) | None => builder.append_null(),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()));
+                }
+                DataType::UInt64 => {
+                    let mut builder = UInt64Builder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.get(col_idx) {
+                            Some(Value::UInt64(v)) => builder.append_value(*v),
+                            Some(Value::Int64(v)) => builder.append_value(*v as u64),
+                            Some(Value::Null) | None => builder.append_null(),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()));
+                }
+                DataType::Float64 => {
+                    let mut builder = Float64Builder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.get(col_idx) {
+                            Some(Value::Float64(v)) => builder.append_value(*v),
+                            Some(Value::Float32(v)) => builder.append_value(*v as f64),
+                            Some(Value::Null) | None => builder.append_null(),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()));
+                }
+                DataType::Utf8 => {
+                    let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 16);
+                    for row in rows {
+                        match row.get(col_idx) {
+                            Some(Value::String(v)) => builder.append_value(v),
+                            Some(Value::Null) | None => builder.append_null(),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()));
+                }
+                DataType::Boolean => {
+                    let mut builder = BooleanBuilder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.get(col_idx) {
+                            Some(Value::Bool(v)) => builder.append_value(*v),
+                            Some(Value::Null) | None => builder.append_null(),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()));
+                }
+                _ => {
+                    // Fallback: null array
+                    let mut builder = StringBuilder::with_capacity(num_rows, 0);
+                    for _ in 0..num_rows {
+                        builder.append_null();
+                    }
+                    arrays.push(Arc::new(builder.finish()));
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_new(schema.clone(), arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(ApexResult::Data(batch))
     }
 
     /// Extract a Value from an Arrow ArrayRef at a given row index (for index building)
@@ -10386,6 +10664,167 @@ impl ApexExecutor {
         
         let rows_inserted = values.len() as i64;
         
+        // Enforce NOT NULL constraints
+        if storage.storage.has_constraints() {
+            for (row_idx, row_values) in values.iter().enumerate() {
+                for (i, value) in row_values.iter().enumerate() {
+                    if i < col_names.len() {
+                        let col_name = &col_names[i];
+                        let cons = storage.storage.get_column_constraints(col_name);
+                        if cons.not_null && matches!(value, Value::Null) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("NOT NULL constraint violated: column '{}' cannot be NULL (row {})", col_name, row_idx + 1),
+                            ));
+                        }
+                    }
+                }
+                // Check for missing NOT NULL columns — allow if DEFAULT is set
+                let schema = storage.get_schema();
+                for (schema_col, _) in &schema {
+                    if !col_names.iter().any(|c| c == schema_col) {
+                        let cons = storage.storage.get_column_constraints(schema_col);
+                        if cons.not_null && cons.default_value.is_none() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("NOT NULL constraint violated: column '{}' has no value and no DEFAULT", schema_col),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Fill in DEFAULT values for missing columns
+        if storage.storage.has_constraints() {
+            let schema = storage.get_schema();
+            let row_count = values.len();
+            for (schema_col, _) in &schema {
+                if !col_names.iter().any(|c| c == schema_col) {
+                    let cons = storage.storage.get_column_constraints(schema_col);
+                    if let Some(ref dv) = cons.default_value {
+                        use crate::storage::on_demand::DefaultValue;
+                        match dv {
+                            DefaultValue::Int64(v) => {
+                                int_columns.entry(schema_col.clone()).or_default().extend(std::iter::repeat(*v).take(row_count));
+                            }
+                            DefaultValue::Float64(v) => {
+                                float_columns.entry(schema_col.clone()).or_default().extend(std::iter::repeat(*v).take(row_count));
+                            }
+                            DefaultValue::String(v) => {
+                                string_columns.entry(schema_col.clone()).or_default().extend(std::iter::repeat(v.clone()).take(row_count));
+                            }
+                            DefaultValue::Bool(v) => {
+                                bool_columns.entry(schema_col.clone()).or_default().extend(std::iter::repeat(*v).take(row_count));
+                            }
+                            DefaultValue::Null => {} // NULL default — no column data needed
+                        }
+                    }
+                }
+            }
+        }
+
+        // Enforce UNIQUE / PRIMARY KEY constraints
+        if storage.storage.has_constraints() {
+            // Collect columns that need uniqueness checks
+            let schema = storage.get_schema();
+            let unique_cols: Vec<String> = schema.iter()
+                .filter(|(name, _)| {
+                    let c = storage.storage.get_column_constraints(name);
+                    c.unique || c.primary_key
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+
+            if !unique_cols.is_empty() {
+                // Read existing values for uniqueness columns
+                let col_refs: Vec<&str> = unique_cols.iter().map(|s| s.as_str()).collect();
+                let existing_batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
+
+                for uc in &unique_cols {
+                    let constraint_kind = if storage.storage.get_column_constraints(uc).primary_key {
+                        "PRIMARY KEY"
+                    } else {
+                        "UNIQUE"
+                    };
+
+                    // Collect new values for this column from the INSERT
+                    let mut new_vals: Vec<Value> = Vec::new();
+                    for row_values in values.iter() {
+                        for (i, value) in row_values.iter().enumerate() {
+                            if i < col_names.len() && col_names[i] == *uc {
+                                new_vals.push(value.clone());
+                            }
+                        }
+                    }
+
+                    // Check duplicates within new values themselves
+                    {
+                        let mut seen = std::collections::HashSet::new();
+                        for v in &new_vals {
+                            if !matches!(v, Value::Null) {
+                                let key = format!("{:?}", v);
+                                if !seen.insert(key) {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!("{} constraint violated: duplicate value in column '{}'", constraint_kind, uc),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    // Check against existing data
+                    if let Some(existing_col) = existing_batch.column_by_name(uc) {
+                        use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray, UInt64Array};
+                        for new_val in &new_vals {
+                            if matches!(new_val, Value::Null) { continue; }
+                            let len = existing_col.len();
+                            for row in 0..len {
+                                if existing_col.is_null(row) { continue; }
+                                let matches = match new_val {
+                                    Value::Int64(v) => {
+                                        existing_col.as_any().downcast_ref::<Int64Array>()
+                                            .map(|a| a.value(row) == *v)
+                                            .or_else(|| existing_col.as_any().downcast_ref::<UInt64Array>()
+                                                .map(|a| a.value(row) as i64 == *v))
+                                            .unwrap_or(false)
+                                    }
+                                    Value::Int32(v) => {
+                                        existing_col.as_any().downcast_ref::<Int64Array>()
+                                            .map(|a| a.value(row) == *v as i64)
+                                            .unwrap_or(false)
+                                    }
+                                    Value::Float64(v) => {
+                                        existing_col.as_any().downcast_ref::<Float64Array>()
+                                            .map(|a| (a.value(row) - v).abs() < f64::EPSILON)
+                                            .unwrap_or(false)
+                                    }
+                                    Value::String(v) => {
+                                        existing_col.as_any().downcast_ref::<StringArray>()
+                                            .map(|a| a.value(row) == v.as_str())
+                                            .unwrap_or(false)
+                                    }
+                                    Value::Bool(v) => {
+                                        existing_col.as_any().downcast_ref::<BooleanArray>()
+                                            .map(|a| a.value(row) == *v)
+                                            .unwrap_or(false)
+                                    }
+                                    _ => false,
+                                };
+                                if matches {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!("{} constraint violated: duplicate value in column '{}'", constraint_kind, uc),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Capture row count before insert for index maintenance
         let pre_insert_count = storage.row_count();
         
@@ -10607,6 +11046,101 @@ impl ApexExecutor {
         
         let updated = updates.len() as i64;
         
+        // Enforce constraints on updated values
+        if updated > 0 && storage.storage.has_constraints() {
+            for (_row_id, update_data) in &updates {
+                for (col_name, value) in update_data {
+                    let cons = storage.storage.get_column_constraints(col_name);
+                    // NOT NULL check
+                    if cons.not_null && matches!(value, Value::Null) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("NOT NULL constraint violated: column '{}' cannot be NULL", col_name),
+                        ));
+                    }
+                }
+            }
+
+            // UNIQUE / PK check: ensure new values don't conflict with existing or other updates
+            let schema = storage.get_schema();
+            let unique_cols: Vec<String> = schema.iter()
+                .filter(|(name, _)| {
+                    let c = storage.storage.get_column_constraints(name);
+                    c.unique || c.primary_key
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+
+            for uc in &unique_cols {
+                let constraint_kind = if storage.storage.get_column_constraints(uc).primary_key {
+                    "PRIMARY KEY"
+                } else {
+                    "UNIQUE"
+                };
+
+                // Collect new values being set for this unique column
+                let updated_row_ids: std::collections::HashSet<u64> = updates.iter()
+                    .filter(|(_, data)| data.contains_key(uc))
+                    .map(|(id, _)| *id)
+                    .collect();
+                let new_vals: Vec<&Value> = updates.iter()
+                    .filter_map(|(_, data)| data.get(uc))
+                    .collect();
+
+                if new_vals.is_empty() { continue; }
+
+                // Check duplicates among new values
+                {
+                    let mut seen = std::collections::HashSet::new();
+                    for v in &new_vals {
+                        if !matches!(v, Value::Null) {
+                            let key = format!("{:?}", v);
+                            if !seen.insert(key) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("{} constraint violated: duplicate value in column '{}'", constraint_kind, uc),
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Check against existing rows (excluding rows being updated)
+                if let Some(existing_col) = batch.column_by_name(uc) {
+                    use arrow::array::{Int64Array as I64A, Float64Array as F64A, StringArray as SA, BooleanArray as BA};
+                    let id_col = batch.column_by_name("_id");
+                    for new_val in &new_vals {
+                        if matches!(new_val, Value::Null) { continue; }
+                        for row in 0..existing_col.len() {
+                            if existing_col.is_null(row) { continue; }
+                            // Skip rows that are being updated (they'll have new values)
+                            if let Some(idc) = &id_col {
+                                let rid = idc.as_any().downcast_ref::<UInt64Array>()
+                                    .map(|a| a.value(row))
+                                    .or_else(|| idc.as_any().downcast_ref::<Int64Array>().map(|a| a.value(row) as u64));
+                                if let Some(rid) = rid {
+                                    if updated_row_ids.contains(&rid) { continue; }
+                                }
+                            }
+                            let matches = match new_val {
+                                Value::Int64(v) => existing_col.as_any().downcast_ref::<I64A>().map(|a| a.value(row) == *v).unwrap_or(false),
+                                Value::String(v) => existing_col.as_any().downcast_ref::<SA>().map(|a| a.value(row) == v.as_str()).unwrap_or(false),
+                                Value::Float64(v) => existing_col.as_any().downcast_ref::<F64A>().map(|a| (a.value(row) - v).abs() < f64::EPSILON).unwrap_or(false),
+                                Value::Bool(v) => existing_col.as_any().downcast_ref::<BA>().map(|a| a.value(row) == *v).unwrap_or(false),
+                                _ => false,
+                            };
+                            if matches {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("{} constraint violated: duplicate value in column '{}'", constraint_kind, uc),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Record cell-level updates in DeltaStore (no delete+insert, no file rewrite)
         for (row_id, update_data) in &updates {
             storage.delta_update_row(*row_id, update_data);
@@ -11591,5 +12125,136 @@ mod tests {
         let count = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
         // is_manager = true when i%10==0 → 500 rows
         assert_eq!(count, 500);
+    }
+
+    // ========== P0-5: Constraint Tests ==========
+
+    /// Helper: parse + execute SQL via multi-table path with a base dir
+    fn exec_multi(sql: &str, base_dir: &Path) -> io::Result<ApexResult> {
+        use crate::query::sql_parser::SqlParser;
+        let stmt = SqlParser::parse(sql).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("{}", e))
+        })?;
+        let default_path = base_dir.join("default.apex");
+        ApexExecutor::execute_parsed_multi(stmt, base_dir, &default_path)
+    }
+
+    /// Helper: assert that a Result is an error containing expected substring
+    fn assert_err_contains(result: io::Result<ApexResult>, expected: &str) {
+        match result {
+            Ok(_) => panic!("Expected error containing '{}', but got Ok", expected),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains(expected), "Expected error containing '{}', got: {}", expected, msg);
+            }
+        }
+    }
+
+    #[test]
+    fn test_constraint_not_null_reject() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE t1 (id INT NOT NULL, name TEXT)", base).unwrap();
+        exec_multi("INSERT INTO t1 (id, name) VALUES (1, 'Alice')", base).unwrap();
+        assert_err_contains(
+            exec_multi("INSERT INTO t1 (id, name) VALUES (NULL, 'Bob')", base),
+            "NOT NULL",
+        );
+    }
+
+    #[test]
+    fn test_constraint_unique_reject() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE t2 (id INT, email TEXT UNIQUE)", base).unwrap();
+        exec_multi("INSERT INTO t2 (id, email) VALUES (1, 'a@b.com')", base).unwrap();
+        assert_err_contains(
+            exec_multi("INSERT INTO t2 (id, email) VALUES (2, 'a@b.com')", base),
+            "UNIQUE",
+        );
+    }
+
+    #[test]
+    fn test_constraint_unique_allows_multiple_nulls() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE t3 (id INT, email TEXT UNIQUE)", base).unwrap();
+        exec_multi("INSERT INTO t3 (id, email) VALUES (1, NULL)", base).unwrap();
+        exec_multi("INSERT INTO t3 (id, email) VALUES (2, NULL)", base).unwrap();
+        let result = exec_multi("SELECT COUNT(*) FROM t3", base).unwrap();
+        let batch = result.to_record_batch().unwrap();
+        assert_eq!(batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 2);
+    }
+
+    #[test]
+    fn test_constraint_primary_key_reject() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE t4 (uid INT PRIMARY KEY, name TEXT)", base).unwrap();
+        exec_multi("INSERT INTO t4 (uid, name) VALUES (1, 'Alice')", base).unwrap();
+        assert_err_contains(
+            exec_multi("INSERT INTO t4 (uid, name) VALUES (1, 'Bob')", base),
+            "PRIMARY KEY",
+        );
+    }
+
+    #[test]
+    fn test_constraint_primary_key_implies_not_null() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE t5 (uid INT PRIMARY KEY, name TEXT)", base).unwrap();
+        assert_err_contains(
+            exec_multi("INSERT INTO t5 (uid, name) VALUES (NULL, 'Alice')", base),
+            "NOT NULL",
+        );
+    }
+
+    #[test]
+    fn test_constraint_default_value_fill() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE t6 (id INT NOT NULL, score INT DEFAULT 100)", base).unwrap();
+        exec_multi("INSERT INTO t6 (id) VALUES (1)", base).unwrap();
+        let result = exec_multi("SELECT score FROM t6 WHERE id = 1", base).unwrap();
+        let batch = result.to_record_batch().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let score = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+        assert_eq!(score, 100);
+    }
+
+    #[test]
+    fn test_constraint_update_not_null_reject() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE t7 (id INT NOT NULL, name TEXT NOT NULL)", base).unwrap();
+        exec_multi("INSERT INTO t7 (id, name) VALUES (1, 'Alice')", base).unwrap();
+        assert_err_contains(
+            exec_multi("UPDATE t7 SET name = NULL WHERE id = 1", base),
+            "NOT NULL",
+        );
+    }
+
+    #[test]
+    fn test_constraint_update_unique_reject() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE t8 (id INT, email TEXT UNIQUE)", base).unwrap();
+        exec_multi("INSERT INTO t8 (id, email) VALUES (1, 'a@b.com')", base).unwrap();
+        exec_multi("INSERT INTO t8 (id, email) VALUES (2, 'c@d.com')", base).unwrap();
+        assert_err_contains(
+            exec_multi("UPDATE t8 SET email = 'a@b.com' WHERE id = 2", base),
+            "UNIQUE",
+        );
+    }
+
+    #[test]
+    fn test_constraint_batch_insert_duplicate_in_batch() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        exec_multi("CREATE TABLE t9 (id INT, email TEXT UNIQUE)", base).unwrap();
+        assert_err_contains(
+            exec_multi("INSERT INTO t9 (id, email) VALUES (1, 'x@y.com'), (2, 'x@y.com')", base),
+            "UNIQUE",
+        );
     }
 }

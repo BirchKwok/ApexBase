@@ -964,6 +964,7 @@ impl ApexStorageImpl {
         let is_rollback = sql_upper == "ROLLBACK" || sql_upper == "ROLLBACK;";
         let current_txn = *self.current_txn_id.read();
         let is_txn_dml = current_txn.is_some() && (is_write_op || sql_upper.starts_with("INSERT"));
+        let is_txn_select = current_txn.is_some() && sql_upper.starts_with("SELECT");
 
         let sql = sql.to_string();
         let base_dir = self.base_dir.clone();
@@ -1002,8 +1003,8 @@ impl ApexStorageImpl {
                 return Ok((vec![], vec![]));
             }
 
-            if is_txn_dml {
-                // Inside a transaction: buffer DML writes
+            if is_txn_dml || is_txn_select {
+                // Inside a transaction: buffer DML writes or read with overlay
                 let txn_id = current_txn.unwrap();
                 let parsed = SqlParser::parse(&sql)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;

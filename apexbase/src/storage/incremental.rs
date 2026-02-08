@@ -11,9 +11,9 @@
 //! data.apex.wal  - WAL file (append-only records)
 //! ```
 //!
-//! WAL Record Format:
+//! WAL Record Format (v2, with CRC32):
 //! ```text
-//! [record_type:u8][timestamp:i64][record_length:u32][record_data...]
+//! [record_type:u8][timestamp:i64][record_length:u32][record_data...][crc32:u32]
 //! ```
 
 use std::collections::HashMap;
@@ -31,7 +31,8 @@ use super::on_demand::{ColumnData, ColumnType, ColumnValue, OnDemandStorage};
 // ============================================================================
 
 const WAL_MAGIC: &[u8; 8] = b"APEXWAL\0";
-const WAL_VERSION: u32 = 1;
+const WAL_VERSION: u32 = 2;
+const WAL_VERSION_V1: u32 = 1;
 const WAL_HEADER_SIZE: usize = 24; // magic(8) + version(4) + next_id(8) + flags(4)
 
 // Record types
@@ -39,6 +40,11 @@ const RECORD_INSERT: u8 = 1;
 const RECORD_DELETE: u8 = 2;
 const RECORD_CHECKPOINT: u8 = 3;
 const RECORD_BATCH_INSERT: u8 = 4;
+const RECORD_TXN_BEGIN: u8 = 5;
+const RECORD_TXN_COMMIT: u8 = 6;
+const RECORD_TXN_ROLLBACK: u8 = 7;
+const RECORD_INSERT_TXN: u8 = 8;   // Insert with txn_id
+const RECORD_DELETE_TXN: u8 = 9;   // Delete with txn_id
 
 // Compaction threshold (number of WAL records before auto-compact)
 const DEFAULT_COMPACTION_THRESHOLD: usize = 10000;
@@ -55,17 +61,32 @@ pub enum WalRecord {
     Insert {
         id: u64,
         data: HashMap<String, ColumnValue>,
+        txn_id: u64, // 0 = auto-commit
     },
     /// Batch insert - more efficient for multiple rows (single WAL record, single I/O)
     BatchInsert {
         start_id: u64,
         rows: Vec<HashMap<String, ColumnValue>>,
+        txn_id: u64,
     },
     Delete {
         id: u64,
+        txn_id: u64,
     },
     Checkpoint {
         row_count: u64,
+    },
+    /// Transaction boundary: marks the start of a transaction in this table's WAL
+    TxnBegin {
+        txn_id: u64,
+    },
+    /// Transaction boundary: marks successful commit — recovery replays DML with this txn_id
+    TxnCommit {
+        txn_id: u64,
+    },
+    /// Transaction boundary: marks rollback — recovery discards DML with this txn_id
+    TxnRollback {
+        txn_id: u64,
     },
 }
 
@@ -110,18 +131,27 @@ impl WalRecord {
         let timestamp = chrono::Utc::now().timestamp();
         
         match self {
-            WalRecord::Insert { id, data } => {
-                buf.push(RECORD_INSERT);
-                buf.extend_from_slice(&timestamp.to_le_bytes());
-                
-                let mut data_buf = Vec::new();
-                data_buf.extend_from_slice(&id.to_le_bytes());
-                Self::write_row(&mut data_buf, data);
-                
-                buf.extend_from_slice(&(data_buf.len() as u32).to_le_bytes());
-                buf.extend_from_slice(&data_buf);
+            WalRecord::Insert { id, data, txn_id } => {
+                if *txn_id != 0 {
+                    buf.push(RECORD_INSERT_TXN);
+                    buf.extend_from_slice(&timestamp.to_le_bytes());
+                    let mut data_buf = Vec::new();
+                    data_buf.extend_from_slice(&id.to_le_bytes());
+                    data_buf.extend_from_slice(&txn_id.to_le_bytes());
+                    Self::write_row(&mut data_buf, data);
+                    buf.extend_from_slice(&(data_buf.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&data_buf);
+                } else {
+                    buf.push(RECORD_INSERT);
+                    buf.extend_from_slice(&timestamp.to_le_bytes());
+                    let mut data_buf = Vec::new();
+                    data_buf.extend_from_slice(&id.to_le_bytes());
+                    Self::write_row(&mut data_buf, data);
+                    buf.extend_from_slice(&(data_buf.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&data_buf);
+                }
             }
-            WalRecord::BatchInsert { start_id, rows } => {
+            WalRecord::BatchInsert { start_id, rows, txn_id: _ } => {
                 buf.push(RECORD_BATCH_INSERT);
                 buf.extend_from_slice(&timestamp.to_le_bytes());
                 
@@ -134,11 +164,19 @@ impl WalRecord {
                 buf.extend_from_slice(&(data_buf.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&data_buf);
             }
-            WalRecord::Delete { id } => {
-                buf.push(RECORD_DELETE);
-                buf.extend_from_slice(&timestamp.to_le_bytes());
-                buf.extend_from_slice(&8u32.to_le_bytes()); // record length
-                buf.extend_from_slice(&id.to_le_bytes());
+            WalRecord::Delete { id, txn_id } => {
+                if *txn_id != 0 {
+                    buf.push(RECORD_DELETE_TXN);
+                    buf.extend_from_slice(&timestamp.to_le_bytes());
+                    buf.extend_from_slice(&16u32.to_le_bytes()); // id + txn_id
+                    buf.extend_from_slice(&id.to_le_bytes());
+                    buf.extend_from_slice(&txn_id.to_le_bytes());
+                } else {
+                    buf.push(RECORD_DELETE);
+                    buf.extend_from_slice(&timestamp.to_le_bytes());
+                    buf.extend_from_slice(&8u32.to_le_bytes());
+                    buf.extend_from_slice(&id.to_le_bytes());
+                }
             }
             WalRecord::Checkpoint { row_count } => {
                 buf.push(RECORD_CHECKPOINT);
@@ -146,13 +184,36 @@ impl WalRecord {
                 buf.extend_from_slice(&8u32.to_le_bytes());
                 buf.extend_from_slice(&row_count.to_le_bytes());
             }
+            WalRecord::TxnBegin { txn_id } => {
+                buf.push(RECORD_TXN_BEGIN);
+                buf.extend_from_slice(&timestamp.to_le_bytes());
+                buf.extend_from_slice(&8u32.to_le_bytes());
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+            }
+            WalRecord::TxnCommit { txn_id } => {
+                buf.push(RECORD_TXN_COMMIT);
+                buf.extend_from_slice(&timestamp.to_le_bytes());
+                buf.extend_from_slice(&8u32.to_le_bytes());
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+            }
+            WalRecord::TxnRollback { txn_id } => {
+                buf.push(RECORD_TXN_ROLLBACK);
+                buf.extend_from_slice(&timestamp.to_le_bytes());
+                buf.extend_from_slice(&8u32.to_le_bytes());
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+            }
         }
+        
+        // Append CRC32 checksum (WAL v2)
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
         
         buf
     }
     
-    /// Deserialize record from bytes
-    pub fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
+    /// Deserialize record from bytes.
+    /// `wal_version` controls CRC verification: v2+ records have a trailing CRC32.
+    pub fn from_bytes_versioned(bytes: &[u8], wal_version: u32) -> io::Result<(Self, usize)> {
         if bytes.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty record"));
         }
@@ -220,7 +281,53 @@ impl WalRecord {
                     row_data.insert(name, value);
                 }
                 
-                WalRecord::Insert { id, data: row_data }
+                WalRecord::Insert { id, data: row_data, txn_id: 0 }
+            }
+            RECORD_INSERT_TXN => {
+                let id = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let txn_id = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                let col_count = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+                
+                let mut pos = 20;
+                let mut row_data = HashMap::new();
+                
+                for _ in 0..col_count {
+                    let name_len = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize;
+                    pos += 2;
+                    let name = std::str::from_utf8(&data[pos..pos+name_len])
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                        .to_string();
+                    pos += name_len;
+                    
+                    let value_type = data[pos];
+                    pos += 1;
+                    
+                    let value = match value_type {
+                        0 => ColumnValue::Null,
+                        1 => { let v = data[pos] != 0; pos += 1; ColumnValue::Bool(v) }
+                        2 => { let v = i64::from_le_bytes(data[pos..pos+8].try_into().unwrap()); pos += 8; ColumnValue::Int64(v) }
+                        3 => { let v = f64::from_le_bytes(data[pos..pos+8].try_into().unwrap()); pos += 8; ColumnValue::Float64(v) }
+                        4 => {
+                            let len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                            pos += 4;
+                            let s = std::str::from_utf8(&data[pos..pos+len])
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?.to_string();
+                            pos += len;
+                            ColumnValue::String(s)
+                        }
+                        5 => {
+                            let len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                            pos += 4;
+                            let b = data[pos..pos+len].to_vec();
+                            pos += len;
+                            ColumnValue::Binary(b)
+                        }
+                        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid value type")),
+                    };
+                    row_data.insert(name, value);
+                }
+                
+                WalRecord::Insert { id, data: row_data, txn_id }
             }
             RECORD_BATCH_INSERT => {
                 let start_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
@@ -286,20 +393,57 @@ impl WalRecord {
                     rows.push(row_data);
                 }
                 
-                WalRecord::BatchInsert { start_id, rows }
+                WalRecord::BatchInsert { start_id, rows, txn_id: 0 }
             }
             RECORD_DELETE => {
                 let id = u64::from_le_bytes(data[0..8].try_into().unwrap());
-                WalRecord::Delete { id }
+                WalRecord::Delete { id, txn_id: 0 }
+            }
+            RECORD_DELETE_TXN => {
+                let id = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let txn_id = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                WalRecord::Delete { id, txn_id }
             }
             RECORD_CHECKPOINT => {
                 let row_count = u64::from_le_bytes(data[0..8].try_into().unwrap());
                 WalRecord::Checkpoint { row_count }
             }
+            RECORD_TXN_BEGIN => {
+                let txn_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                WalRecord::TxnBegin { txn_id }
+            }
+            RECORD_TXN_COMMIT => {
+                let txn_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                WalRecord::TxnCommit { txn_id }
+            }
+            RECORD_TXN_ROLLBACK => {
+                let txn_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                WalRecord::TxnRollback { txn_id }
+            }
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid record type")),
         };
         
-        Ok((record, 13 + record_len))
+        let total_len = 13 + record_len;
+        
+        // WAL v2+: verify CRC32 checksum
+        if wal_version >= WAL_VERSION {
+            if bytes.len() < total_len + 4 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL record truncated (missing CRC)"));
+            }
+            let stored_crc = u32::from_le_bytes(bytes[total_len..total_len+4].try_into().unwrap());
+            let computed_crc = crc32fast::hash(&bytes[..total_len]);
+            if stored_crc != computed_crc {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL record CRC mismatch"));
+            }
+            Ok((record, total_len + 4))
+        } else {
+            Ok((record, total_len))
+        }
+    }
+    
+    /// Deserialize record from bytes (legacy v1, no CRC check)
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<(Self, usize)> {
+        Self::from_bytes_versioned(bytes, WAL_VERSION_V1)
     }
 }
 
@@ -434,6 +578,10 @@ impl WalWriter {
         buf.extend_from_slice(&(data_buf.len() as u32).to_le_bytes());
         buf.extend_from_slice(&data_buf);
         
+        // Append CRC32 checksum (WAL v2)
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        
         self.file.write_all(&buf)?;
         self.record_count += 1;
         Ok(())
@@ -468,6 +616,7 @@ impl WalWriter {
 pub struct WalReader {
     data: Vec<u8>,
     pos: usize,
+    version: u32,
 }
 
 impl WalReader {
@@ -477,6 +626,7 @@ impl WalReader {
             return Ok(Self {
                 data: Vec::new(),
                 pos: WAL_HEADER_SIZE,
+                version: WAL_VERSION,
             });
         }
         
@@ -486,14 +636,17 @@ impl WalReader {
         
         // Verify header
         if data.len() >= WAL_HEADER_SIZE && &data[0..8] == WAL_MAGIC {
+            let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
             Ok(Self {
                 data,
                 pos: WAL_HEADER_SIZE,
+                version,
             })
         } else if data.is_empty() {
             Ok(Self {
                 data: Vec::new(),
                 pos: WAL_HEADER_SIZE,
+                version: WAL_VERSION,
             })
         } else {
             Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid WAL header"))
@@ -505,12 +658,12 @@ impl WalReader {
         let mut records = Vec::new();
         
         while self.pos < self.data.len() {
-            match WalRecord::from_bytes(&self.data[self.pos..]) {
+            match WalRecord::from_bytes_versioned(&self.data[self.pos..], self.version) {
                 Ok((record, len)) => {
                     records.push(record);
                     self.pos += len;
                 }
-                Err(_) => break, // End of valid records
+                Err(_) => break, // End of valid records (truncated or CRC mismatch)
             }
         }
         
@@ -524,6 +677,11 @@ impl WalReader {
         } else {
             0
         }
+    }
+    
+    /// Get WAL version from header
+    pub fn version(&self) -> u32 {
+        self.version
     }
 }
 
@@ -618,7 +776,7 @@ impl IncrementalStorage {
         // Extract deleted IDs from WAL
         let deleted_ids: std::collections::HashSet<u64> = wal_buffer.iter()
             .filter_map(|r| match r {
-                WalRecord::Delete { id } => Some(*id),
+                WalRecord::Delete { id, .. } => Some(*id),
                 _ => None,
             })
             .collect();
@@ -629,7 +787,7 @@ impl IncrementalStorage {
         let mut memory_buffer = HashMap::new();
         let mut memory_ids = Vec::new();
         for record in &wal_buffer {
-            if let WalRecord::Insert { id, data } = record {
+            if let WalRecord::Insert { id, data, .. } = record {
                 if !deleted_ids.contains(id) {
                     memory_ids.push(*id);
                     for (name, value) in data {
@@ -709,7 +867,7 @@ impl IncrementalStorage {
         
         // Append to WAL buffer, file, and memory buffer
         let records: Vec<WalRecord> = rows.iter().zip(ids.iter())
-            .map(|(row, &id)| WalRecord::Insert { id, data: row.clone() })
+            .map(|(row, &id)| WalRecord::Insert { id, data: row.clone(), txn_id: 0 })
             .collect();
         
         {
@@ -837,7 +995,7 @@ impl IncrementalStorage {
     
     /// Delete row by ID - FAST append to WAL
     pub fn delete(&self, id: u64) -> io::Result<bool> {
-        let record = WalRecord::Delete { id };
+        let record = WalRecord::Delete { id, txn_id: 0 };
         
         {
             let mut wal_buffer = self.wal_buffer.write();
@@ -939,7 +1097,7 @@ impl IncrementalStorage {
         let deleted_ids = self.deleted_ids.read();
         let rows: Vec<HashMap<String, ColumnValue>> = wal_buffer.iter()
             .filter_map(|r| match r {
-                WalRecord::Insert { id, data } if !deleted_ids.contains(id) => {
+                WalRecord::Insert { id, data, .. } if !deleted_ids.contains(id) => {
                     Some(data.clone())
                 }
                 _ => None,
@@ -1037,11 +1195,11 @@ mod tests {
         data.insert("age".to_string(), ColumnValue::Int64(30));
         data.insert("score".to_string(), ColumnValue::Float64(95.5));
         
-        let record = WalRecord::Insert { id: 42, data };
+        let record = WalRecord::Insert { id: 42, data, txn_id: 0 };
         let bytes = record.to_bytes();
-        let (parsed, _) = WalRecord::from_bytes(&bytes).unwrap();
+        let (parsed, _) = WalRecord::from_bytes_versioned(&bytes, WAL_VERSION).unwrap();
         
-        if let WalRecord::Insert { id, data } = parsed {
+        if let WalRecord::Insert { id, data, .. } = parsed {
             assert_eq!(id, 42);
             assert_eq!(data.len(), 3);
         } else {

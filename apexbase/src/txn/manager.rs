@@ -89,6 +89,8 @@ pub struct TxnManager {
     snapshot_manager: Arc<SnapshotManager>,
     /// Conflict detector
     conflict_detector: ConflictDetector,
+    /// Per-table version stores for MVCC visibility
+    version_stores: RwLock<HashMap<String, Arc<VersionStore>>>,
     /// Total committed transactions (for monitoring)
     total_committed: AtomicU64,
     /// Total aborted transactions (for monitoring)
@@ -102,6 +104,7 @@ impl TxnManager {
             active_txns: RwLock::new(HashMap::new()),
             snapshot_manager,
             conflict_detector: ConflictDetector::new(),
+            version_stores: RwLock::new(HashMap::new()),
             total_committed: AtomicU64::new(0),
             total_aborted: AtomicU64::new(0),
         }
@@ -110,6 +113,20 @@ impl TxnManager {
     /// Create a new transaction manager with a fresh snapshot manager
     pub fn new_standalone() -> Self {
         Self::new(Arc::new(SnapshotManager::new()))
+    }
+
+    /// Get or create a VersionStore for a table
+    pub fn get_version_store(&self, table: &str) -> Arc<VersionStore> {
+        {
+            let stores = self.version_stores.read();
+            if let Some(store) = stores.get(table) {
+                return Arc::clone(store);
+            }
+        }
+        let mut stores = self.version_stores.write();
+        stores.entry(table.to_string())
+            .or_insert_with(|| Arc::new(VersionStore::new()))
+            .clone()
     }
 
     /// Get reference to the snapshot manager
@@ -210,11 +227,33 @@ impl TxnManager {
         let commit_ts = next_timestamp();
         self.conflict_detector.record_commit(&txn.context, commit_ts);
 
+        // Extract write set for VersionStore recording before removing context
+        let writes = txn.context.write_set().to_vec();
+
         txn.status = TxnStatus::Committed;
         txn.context.set_finished();
         let snapshot_id = txn.snapshot.id;
         txns.remove(&txn_id);
         drop(txns);
+
+        // Record committed writes in per-table VersionStores for MVCC visibility
+        for write in &writes {
+            use crate::txn::context::TxnWrite;
+            match write {
+                TxnWrite::Insert { table, row_id, data, .. } => {
+                    let store = self.get_version_store(table);
+                    store.insert(*row_id, commit_ts, data.clone());
+                }
+                TxnWrite::Delete { table, row_id, .. } => {
+                    let store = self.get_version_store(table);
+                    let _ = store.delete(*row_id, commit_ts);
+                }
+                TxnWrite::Update { table, row_id, new_data, .. } => {
+                    let store = self.get_version_store(table);
+                    let _ = store.update(*row_id, commit_ts, new_data.clone());
+                }
+            }
+        }
 
         self.snapshot_manager.release(snapshot_id);
         self.total_committed.fetch_add(1, Ordering::Relaxed);
@@ -252,6 +291,29 @@ impl TxnManager {
     // Context Access (for read/write operations within a transaction)
     // ========================================================================
 
+    /// Get the snapshot timestamp for a transaction (for MVCC visibility checks)
+    pub fn get_snapshot_ts(&self, txn_id: TxnId) -> io::Result<u64> {
+        let txns = self.active_txns.read();
+        let txn = txns.get(&txn_id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("Transaction {} not found", txn_id))
+        })?;
+        Ok(txn.snapshot.read_ts)
+    }
+
+    /// Check if a row version is visible to a transaction's snapshot
+    pub fn is_visible(&self, txn_id: TxnId, table: &str, row_id: u64) -> io::Result<bool> {
+        let snapshot_ts = self.get_snapshot_ts(txn_id)?;
+        let store = self.get_version_store(table);
+        Ok(store.exists(row_id, snapshot_ts))
+    }
+
+    /// Read a row's visible version for a transaction
+    pub fn read_versioned(&self, txn_id: TxnId, table: &str, row_id: u64) -> io::Result<Option<HashMap<String, crate::data::Value>>> {
+        let snapshot_ts = self.get_snapshot_ts(txn_id)?;
+        let store = self.get_version_store(table);
+        Ok(store.read(row_id, snapshot_ts))
+    }
+
     /// Execute a closure with mutable access to the transaction context
     pub fn with_context<F, R>(&self, txn_id: TxnId, f: F) -> io::Result<R>
     where
@@ -268,15 +330,6 @@ impl TxnManager {
             ));
         }
         f(&mut txn.context)
-    }
-
-    /// Get the snapshot timestamp for a transaction
-    pub fn get_snapshot_ts(&self, txn_id: TxnId) -> io::Result<u64> {
-        let txns = self.active_txns.read();
-        let txn = txns.get(&txn_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Transaction {} not found", txn_id))
-        })?;
-        Ok(txn.snapshot.read_ts)
     }
 
     // ========================================================================
