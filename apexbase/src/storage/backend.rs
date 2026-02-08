@@ -719,6 +719,42 @@ impl TableStorageBackend {
         *self.dirty.write() = false;
         Ok(())
     }
+
+    // ========================================================================
+    // DeltaStore methods (Phase 4.5)
+    // ========================================================================
+
+    /// Record cell-level updates for a row in the delta store.
+    /// This avoids delete+insert for UPDATE operations.
+    pub fn delta_update_row(&self, row_id: u64, values: &std::collections::HashMap<String, crate::data::Value>) {
+        self.storage.delta_update_row(row_id, values);
+    }
+
+    /// Save the delta store to disk.
+    pub fn save_delta_store(&self) -> io::Result<()> {
+        self.storage.save_delta_store()
+    }
+
+    /// Check if the delta store has pending changes.
+    pub fn has_pending_deltas(&self) -> bool {
+        self.storage.has_pending_deltas()
+    }
+
+    /// Check if this backend is in V4 mmap-only mode (no in-memory column data).
+    /// When true, all fast paths that read from in-memory columns should be skipped.
+    pub fn is_mmap_only(&self) -> bool {
+        self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data()
+    }
+
+    /// Check if delta compaction is needed.
+    pub fn needs_delta_compaction(&self) -> bool {
+        self.storage.needs_delta_compaction()
+    }
+
+    /// Compact deltas into the base file (merge updates, apply deletes, rewrite).
+    pub fn compact_deltas(&self) -> io::Result<()> {
+        self.storage.compact_deltas()
+    }
     
     /// Explicitly sync data to disk (fsync)
     /// 
@@ -1377,6 +1413,24 @@ impl TableStorageBackend {
             return self.read_columns_to_arrow(None, 0, Some(0));
         }
 
+        // V4 mmap-only: per-column reads return defaults for empty in-memory columns.
+        // Use the working to_arrow_batch path and filter by indices instead.
+        if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
+            let full_batch = self.read_columns_to_arrow(None, 0, None)?;
+            if full_batch.num_rows() == 0 {
+                return Ok(full_batch);
+            }
+            let indices_arr = arrow::array::UInt32Array::from(
+                row_indices.iter().map(|&i| i as u32).collect::<Vec<_>>()
+            );
+            let taken_columns: Vec<ArrayRef> = full_batch.columns().iter()
+                .map(|col| arrow::compute::take(col.as_ref(), &indices_arr, None)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())))
+                .collect::<io::Result<Vec<_>>>()?;
+            return arrow::record_batch::RecordBatch::try_new(full_batch.schema(), taken_columns)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+        }
+
         let schema = self.schema.read();
         let mut fields: Vec<Field> = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
@@ -1464,6 +1518,25 @@ impl TableStorageBackend {
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
         use std::sync::Arc;
         use crate::data::DataType;
+
+        // V4 mmap-only: read full batch and filter by _id
+        if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
+            let full_batch = self.read_columns_to_arrow(None, 0, None)?;
+            if full_batch.num_rows() == 0 {
+                return Ok(None);
+            }
+            if let Some(id_col) = full_batch.column_by_name("_id") {
+                if let Some(id_arr) = id_col.as_any().downcast_ref::<Int64Array>() {
+                    let mask: arrow::array::BooleanArray = id_arr.iter().map(|v| {
+                        v.map(|v| v == id as i64)
+                    }).collect();
+                    let filtered = arrow::compute::filter_record_batch(&full_batch, &mask)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    return if filtered.num_rows() > 0 { Ok(Some(filtered)) } else { Ok(None) };
+                }
+            }
+            return Ok(None);
+        }
 
         let row_data = match self.storage.read_row_by_id(id, None)? {
             Some(data) => data,
@@ -1569,6 +1642,25 @@ impl TableStorageBackend {
         use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
         use std::sync::Arc;
+
+        // V4 mmap-only: in-memory columns are empty, read full batch and filter in Arrow
+        if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
+            let full_batch = self.read_columns_to_arrow(column_names, 0, None)?;
+            if full_batch.num_rows() == 0 {
+                return Ok(full_batch);
+            }
+            if let Some(col) = full_batch.column_by_name(filter_column) {
+                if let Some(str_arr) = col.as_any().downcast_ref::<StringArray>() {
+                    let mask: arrow::array::BooleanArray = str_arr.iter().map(|v| {
+                        v.map(|s| if filter_eq { s == filter_value } else { s != filter_value })
+                    }).collect();
+                    let filtered = arrow::compute::filter_record_batch(&full_batch, &mask)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    return Ok(filtered);
+                }
+            }
+            return Ok(full_batch);
+        }
 
         let (col_data, matching_indices) = self.storage.read_columns_filtered_string(
             column_names, filter_column, filter_value, filter_eq
@@ -1682,6 +1774,28 @@ impl TableStorageBackend {
         use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
         use std::sync::Arc;
+
+        // V4 mmap-only: fall back to full batch read + Arrow filter
+        if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
+            let full_batch = self.read_columns_to_arrow(column_names, 0, None)?;
+            if full_batch.num_rows() == 0 {
+                return Ok(full_batch);
+            }
+            if let Some(col) = full_batch.column_by_name(filter_column) {
+                if let Some(str_arr) = col.as_any().downcast_ref::<StringArray>() {
+                    let mask: arrow::array::BooleanArray = str_arr.iter().map(|v| {
+                        v.map(|s| if filter_eq { s == filter_value } else { s != filter_value })
+                    }).collect();
+                    let filtered = arrow::compute::filter_record_batch(&full_batch, &mask)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    // Apply offset + limit
+                    let start = offset.min(filtered.num_rows());
+                    let len = limit.min(filtered.num_rows().saturating_sub(start));
+                    return Ok(filtered.slice(start, len));
+                }
+            }
+            return Ok(full_batch);
+        }
 
         let (col_data, matching_indices) = self.storage.read_columns_filtered_string_with_limit(
             column_names, filter_column, filter_value, filter_eq, limit, offset
@@ -1932,6 +2046,13 @@ impl TableStorageBackend {
         use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
         use std::sync::Arc;
+
+        // V4 mmap-only: fall back to full batch read + Arrow filter
+        if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
+            // Delegate to the non-fast-path: read full batch, caller will apply WHERE
+            let full_batch = self.read_columns_to_arrow(column_names, 0, None)?;
+            return Ok(full_batch);
+        }
 
         let (col_data, matching_indices) = self.storage.read_columns_filtered_string_numeric_with_limit(
             column_names, string_column, string_value, numeric_column, numeric_op, numeric_value, limit, offset

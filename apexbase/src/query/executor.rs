@@ -811,8 +811,18 @@ impl ApexExecutor {
                                 if let Some(batch) = backend.read_row_by_id_to_arrow(id)? {
                                     batch
                                 } else {
-                                    // ID not found - return empty batch with schema
-                                    backend.read_columns_to_arrow(None, 0, Some(0))?
+                                    // Not in memory — fall through to general mmap → Arrow → WHERE filter path
+                                    let batch = backend.read_columns_to_arrow(None, 0, None)?;
+                                    if batch.num_rows() == 0 {
+                                        backend.read_columns_to_arrow(None, 0, Some(0))?
+                                    } else {
+                                        // Apply WHERE filter on the mmap-read batch
+                                        let filtered = Self::apply_filter_with_storage(&batch, where_clause, storage_path)?;
+                                        if filtered.num_rows() == 0 {
+                                            return Ok(ApexResult::Empty(filtered.schema()));
+                                        }
+                                        return Ok(ApexResult::Data(Self::apply_projection_with_storage(&filtered, &stmt.columns, Some(storage_path))?));
+                                    }
                                 }
                             } else if let Some(result) = Self::try_fast_filter_group_order(&backend, &stmt)? {
                                 // FAST PATH for Complex (Filter+Group+Order) - biggest optimization
@@ -991,6 +1001,9 @@ impl ApexExecutor {
         use crate::storage::index::index_manager::PredicateHint;
         use crate::query::sql_parser::BinaryOperator;
 
+        // Skip index path for mmap-only: per-row reads would each do a full mmap scan
+        if backend.is_mmap_only() { return Ok(None); }
+
         // Only use index for simple queries: no GROUP BY, no aggregation, no JOIN
         if !stmt.group_by.is_empty() || !stmt.joins.is_empty() {
             return Ok(None);
@@ -1146,6 +1159,13 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         limit: Option<usize>,
     ) -> io::Result<Option<RecordBatch>> {
+        // Skip fast path if delta store has pending updates — the in-memory scan
+        // bypasses DeltaMerger and would return stale data. Fall through to the
+        // standard mmap read path which applies DeltaMerger overlay.
+        if backend.has_pending_deltas() || backend.is_mmap_only() {
+            return Ok(None);
+        }
+
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
@@ -1195,6 +1215,10 @@ impl ApexExecutor {
     ) -> io::Result<Option<RecordBatch>> {
         use crate::query::sql_parser::BinaryOperator;
         
+        if backend.has_pending_deltas() || backend.is_mmap_only() {
+            return Ok(None);
+        }
+
         // Must have LIMIT for early termination benefit
         if stmt.limit.is_none() {
             return Ok(None);
@@ -1307,6 +1331,8 @@ impl ApexExecutor {
     ) -> io::Result<Option<RecordBatch>> {
         use crate::query::sql_parser::BinaryOperator;
         
+        if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
+
         // Must be SELECT * with LIMIT
         if !stmt.is_select_star() || stmt.limit.is_none() {
             return Ok(None);
@@ -1366,6 +1392,8 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
+        if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
+
         use crate::query::AggregateFunc;
         use crate::query::sql_parser::BinaryOperator;
         
@@ -1555,6 +1583,8 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
+        if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
+
         use crate::query::AggregateFunc;
         
         // Must be single GROUP BY column, no WHERE, no ORDER BY
@@ -1666,6 +1696,8 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
+        if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
+
         use crate::query::AggregateFunc;
         
         // Collect unique column names needed for aggregation
@@ -1755,6 +1787,8 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
+        if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
+
         use crate::query::AggregateFunc;
         
         // Must be single GROUP BY column, no WHERE
@@ -2207,6 +2241,8 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
+        if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
+
         use arrow::array::DictionaryArray;
         use arrow::datatypes::UInt32Type;
         use crate::query::AggregateFunc;
@@ -10388,7 +10424,7 @@ impl ApexExecutor {
 
         // For DELETE without WHERE, delete all rows (soft delete)
         if where_clause.is_none() {
-            let storage = TableStorageBackend::open(storage_path)?;
+            let storage = TableStorageBackend::open_for_write(storage_path)?;
             let count = storage.active_row_count() as i64;
             
             // Read _id + indexed columns for index maintenance
@@ -10434,7 +10470,7 @@ impl ApexExecutor {
         }
         
         // Soft delete only marks rows in bitmap
-        let storage = TableStorageBackend::open(storage_path)?;
+        let storage = TableStorageBackend::open_for_write(storage_path)?;
         
         // Extract column names from WHERE clause + indexed columns
         let mut where_cols: Vec<String> = Vec::new();
@@ -10488,7 +10524,7 @@ impl ApexExecutor {
     }
 
     /// Execute UPDATE statement
-    /// Note: UPDATE is implemented as delete + insert for simplicity
+    /// Uses DeltaStore for cell-level updates (no delete+insert, no full file rewrite)
     fn execute_update(
         storage_path: &Path,
         assignments: &[(String, SqlExpr)],
@@ -10514,8 +10550,7 @@ impl ApexExecutor {
             lock.list_indexes().iter().map(|m| m.column_name.clone()).collect()
         };
         
-        // Read ALL columns: UPDATE uses delete+insert, so we need the complete row
-        // to re-insert with updated values. Reading only a subset would lose columns.
+        // Read columns needed for WHERE evaluation + assignments + indexed columns + _id
         let storage = TableStorageBackend::open(storage_path)?;
         let batch = storage.read_columns_to_arrow(None, 0, None)?;
         
@@ -10525,10 +10560,10 @@ impl ApexExecutor {
             BooleanArray::from(vec![true; batch.num_rows()])
         };
         
-        // Collect IDs, original batch row index, old values (for index delete), and new values
-        // (batch_row_idx, row_id, update_data)
-        let mut updates: Vec<(usize, u64, StdHashMap<String, Value>)> = Vec::new();
-        let mut deleted_entries: Vec<(u64, std::collections::HashMap<String, Value>)> = Vec::new();
+        // Collect row IDs and update data for matching rows
+        let mut updates: Vec<(u64, StdHashMap<String, Value>)> = Vec::new();
+        let mut old_index_entries: Vec<(u64, StdHashMap<String, Value>)> = Vec::new();
+        let mut new_index_entries: Vec<(u64, StdHashMap<String, Value>)> = Vec::new();
         
         for i in 0..filter_mask.len() {
             if filter_mask.value(i) {
@@ -10541,60 +10576,66 @@ impl ApexExecutor {
                         continue;
                     };
                     
-                    // Collect old indexed column values for index delete
-                    let mut old_vals = std::collections::HashMap::new();
-                    for cn in &indexed_cols {
-                        if let Some(c) = batch.column_by_name(cn) {
-                            old_vals.insert(cn.clone(), Self::arrow_value_at_col(c, i));
-                        }
-                    }
-                    deleted_entries.push((id, old_vals));
-                    
+                    // Evaluate assignment expressions to get new values
                     let mut update_data: StdHashMap<String, Value> = StdHashMap::new();
                     for (col_name, expr) in assignments {
                         let value = Self::evaluate_expr_to_value(&batch, expr, i)?;
                         update_data.insert(col_name.clone(), value);
                     }
                     
-                    updates.push((i, id, update_data));
+                    // Index maintenance: collect old and new indexed values
+                    if !indexed_cols.is_empty() {
+                        let mut old_vals = StdHashMap::new();
+                        let mut new_vals = StdHashMap::new();
+                        for cn in &indexed_cols {
+                            if let Some(c) = batch.column_by_name(cn) {
+                                let old_val = Self::arrow_value_at_col(c, i);
+                                old_vals.insert(cn.clone(), old_val.clone());
+                                // New value: use update_data if column was updated, else keep old
+                                let new_val = update_data.get(cn).cloned().unwrap_or(old_val);
+                                new_vals.insert(cn.clone(), new_val);
+                            }
+                        }
+                        old_index_entries.push((id, old_vals));
+                        new_index_entries.push((id, new_vals));
+                    }
+                    
+                    updates.push((id, update_data));
                 }
             }
         }
         
         let updated = updates.len() as i64;
-        let schema = batch.schema();
         
-        // Delete old rows first
-        for &(_, id, _) in &updates {
-            storage.delete(id);
+        // Record cell-level updates in DeltaStore (no delete+insert, no file rewrite)
+        for (row_id, update_data) in &updates {
+            storage.delta_update_row(*row_id, update_data);
         }
         
-        // Capture active row count AFTER deletes but BEFORE inserts for index maintenance
-        // Must use active_row_count since read_columns_to_arrow only returns active rows
-        let pre_insert_count = storage.active_row_count();
-        
-        // Insert updated rows
-        for (batch_row_idx, _id, update_data) in updates.into_iter() {
-            let mut row_data = update_data;
-            for field in schema.fields() {
-                let col_name = field.name();
-                if col_name == "_id" || row_data.contains_key(col_name) {
-                    continue;
-                }
-                if let Some(col) = batch.column_by_name(col_name) {
-                    if let Some(val) = Self::get_value_at(col, batch_row_idx) {
-                        row_data.insert(col_name.clone(), val);
+        // Persist delta store and trigger compaction if threshold exceeded
+        if updated > 0 {
+            storage.save_delta_store()?;
+            
+            // Auto-compact when delta count exceeds threshold (20% of base rows or 10k)
+            if storage.needs_delta_compaction() {
+                let _ = storage.compact_deltas();
+            }
+            
+            // Index maintenance: update indexed values
+            if !indexed_cols.is_empty() {
+                Self::notify_index_delete(storage_path, &old_index_entries);
+                // Insert new indexed values directly
+                let (base_dir, table_name) = base_dir_and_table(storage_path);
+                let idx_mgr_arc = get_index_manager(&base_dir, &table_name);
+                let mut idx_mgr = idx_mgr_arc.lock();
+                if !idx_mgr.list_indexes().is_empty() {
+                    for (row_id, col_vals) in &new_index_entries {
+                        let _ = idx_mgr.on_insert(*row_id, col_vals);
                     }
+                    let _ = idx_mgr.save();
                 }
             }
-            storage.insert_rows(&[row_data])?;
         }
-        
-        storage.save()?;
-        
-        // Index maintenance: delete old entries, insert new ones
-        Self::notify_index_delete(storage_path, &deleted_entries);
-        Self::notify_index_insert(storage_path, &storage, pre_insert_count);
         
         // Invalidate cache after write
         invalidate_storage_cache(storage_path);
@@ -10948,7 +10989,7 @@ mod tests {
         // Insert additional batch — force V4 data load via to_arrow_batch
         invalidate_storage_cache(&path);
         let storage = OnDemandStorage::open(&path).unwrap();
-        let _ = storage.to_arrow_batch(None, true); // triggers ensure_v4_loaded
+        let _ = storage.to_arrow_batch(None, true); // reads via mmap path
         let mut int_cols: HashMap<String, Vec<i64>> = HashMap::new();
         let mut float_cols: HashMap<String, Vec<f64>> = HashMap::new();
         let mut string_cols: HashMap<String, Vec<String>> = HashMap::new();

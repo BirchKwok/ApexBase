@@ -168,8 +168,8 @@ impl StorageEngine {
     pub fn invalidate(&self, table_path: &Path) {
         // Use path directly without canonicalize for speed (already absolute in most cases)
         self.cache.write().remove(table_path);
-        self.schema_cache.write().remove(table_path);
         self.insert_cache.write().remove(table_path);
+        self.schema_cache.write().remove(table_path);
         
         // Also invalidate executor cache
         ApexExecutor::invalidate_cache_for_path(table_path);
@@ -398,7 +398,15 @@ impl StorageEngine {
             ids
         } else {
             // Full write: for new tables, schema evolution, or partial columns
-            let backend = self.get_write_backend(table_path, durability)?;
+            // V4 files: use insert backend (metadata-only) since save() uses
+            // append_row_group. open_for_write loads all data which is empty
+            // for V4 mmap-only, causing data loss.
+            let is_v4 = Self::is_v4_file(table_path);
+            let backend = if is_v4 {
+                self.get_insert_backend(table_path, durability)?
+            } else {
+                self.get_write_backend(table_path, durability)?
+            };
             let ids = backend.insert_rows(rows)?;
             backend.save()?;
             
@@ -411,6 +419,21 @@ impl StorageEngine {
         Ok(ids)
     }
     
+    /// Check if a file is V4 format by reading the header version field.
+    #[inline]
+    fn is_v4_file(table_path: &Path) -> bool {
+        // Header: 8-byte magic + 4-byte version
+        let mut buf = [0u8; 12];
+        if let Ok(mut f) = std::fs::File::open(table_path) {
+            use std::io::Read;
+            if f.read_exact(&mut buf).is_ok() {
+                let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+                return version >= 4;
+            }
+        }
+        false
+    }
+
     /// Determine if delta write should be used
     /// 
     /// OPTIMIZED: Uses schema cache to avoid opening backend for every write
@@ -429,6 +452,13 @@ impl StorageEngine {
         
         // Fast path: check file size (empty files should use full write)
         if meta.len() < 256 { // Header is 256 bytes, so smaller means empty/invalid
+            return false;
+        }
+        
+        // V4 files: always use full write (append_row_group) instead of delta writes.
+        // Delta inserts go to a .delta file that the mmap read path doesn't read.
+        // append_row_group is equally efficient and keeps data in the base V4 file.
+        if Self::is_v4_file(table_path) {
             return false;
         }
         
@@ -709,6 +739,14 @@ impl StorageEngine {
         durability: DurabilityLevel,
     ) -> io::Result<()> {
         self.invalidate(table_path);
+        if Self::is_v4_file(table_path) {
+            // V4: modify schema in-memory then update footer only (no data reload)
+            let backend = self.get_insert_backend(table_path, durability)?;
+            backend.rename_column(old_name, new_name)?;
+            backend.storage.update_v4_footer_schema()?;
+            self.invalidate(table_path);
+            return Ok(());
+        }
         let backend = self.get_write_backend(table_path, durability)?;
         backend.rename_column(old_name, new_name)?;
         backend.save()?;

@@ -77,7 +77,7 @@ impl DeltaMerger {
         // Step 3: For each column, apply deletes and overlay updates
         let schema = base.schema();
         let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-
+        
         for (col_idx, field) in schema.fields().iter().enumerate() {
             let col_name = field.name();
             let base_col = base.column(col_idx);
