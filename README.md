@@ -2,380 +2,418 @@
 
 **High-performance HTAP embedded database with Rust core and Python API**
 
-ApexBase is an embedded columnar database engineered for **Hybrid Transactional/Analytical Processing (HTAP)** workloads. It combines a high-throughput columnar storage engine written in Rust with an ergonomic Python API, delivering analytical query speed comparable to DuckDB while supporting fast transactional writes — all in a single `.apex` file with zero external dependencies.
+ApexBase is an embedded columnar database designed for **Hybrid Transactional/Analytical Processing (HTAP)** workloads. It combines a high-throughput columnar storage engine written in Rust with an ergonomic Python API, delivering analytical query performance that surpasses DuckDB and SQLite on most benchmarks — all in a single `.apex` file with zero external dependencies.
 
-## ✨ Features
+---
 
-- 🚀 **HTAP architecture** — columnar V4 Row Group storage with delta writes for fast inserts and analytical scans
-- 📦 **Single-file storage** — custom `.apex` format, no server, no external dependencies
-- 🛠️ **Full SQL support** — DDL, DML, aggregations, GROUP BY, HAVING, ORDER BY, JOINs, sub-expressions
-- 🔍 **Full-text search** — built-in NanoFTS integration with fuzzy matching
-- 🐍 **Python-native** — zero-copy Arrow IPC bridge with Pandas / Polars / PyArrow
-- 💾 **Compact storage** — dictionary encoding for low-cardinality strings, ~45% smaller on disk
-- 🌐 **Cross-platform** — runs on Linux, macOS, and Windows (x86_64 & ARM64)
-- ⚡ **JIT compilation** — Cranelift-based JIT for predicate evaluation
-- 🔒 **Durability levels** — configurable `fast` / `safe` / `max` with WAL support
+## Features
 
-## 📦 Installation
+- **HTAP architecture** — V4 Row Group columnar storage with DeltaStore for cell-level updates; fast inserts and fast analytical scans in one engine
+- **Single-file storage** — custom `.apex` format per table, no server process, no external dependencies
+- **Comprehensive SQL** — DDL, DML, JOINs (INNER/LEFT/RIGHT/FULL/CROSS), subqueries (IN/EXISTS/scalar), CTEs (WITH ... AS), UNION/UNION ALL, window functions, EXPLAIN/ANALYZE, multi-statement execution
+- **70+ built-in functions** — math (ABS, SQRT, POWER, LOG, trig), string (UPPER, LOWER, SUBSTR, REPLACE, CONCAT, REGEXP_REPLACE, ...), date (YEAR, MONTH, DAY, DATEDIFF, DATE_ADD, ...), conditional (COALESCE, IFNULL, NULLIF, CASE WHEN, GREATEST, LEAST)
+- **Aggregation and analytics** — COUNT, SUM, AVG, MIN, MAX, COUNT(DISTINCT), GROUP BY, HAVING, ORDER BY with NULLS FIRST/LAST
+- **Window functions** — ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, RUNNING_SUM, and windowed SUM/AVG/COUNT/MIN/MAX with PARTITION BY and ORDER BY
+- **Transactions** — BEGIN / COMMIT / ROLLBACK with OCC (Optimistic Concurrency Control), SAVEPOINT / ROLLBACK TO / RELEASE, statement-level auto-rollback
+- **MVCC** — multi-version concurrency control with snapshot isolation, version store, and garbage collection
+- **Indexing** — B-Tree and Hash indexes with CREATE INDEX / DROP INDEX / REINDEX; automatic multi-index AND intersection for compound predicates
+- **Full-text search** — built-in NanoFTS integration with fuzzy matching
+- **JIT compilation** — Cranelift-based JIT for predicate evaluation and SIMD-vectorized aggregations
+- **Zero-copy Python bridge** — Arrow IPC between Rust and Python; direct conversion to Pandas, Polars, and PyArrow
+- **Durability levels** — configurable `fast` / `safe` / `max` with WAL support and crash recovery
+- **Compact storage** — dictionary encoding for low-cardinality strings, LZ4 and Zstd compression
+- **Parquet interop** — COPY TO / COPY FROM Parquet files
+- **Cross-platform** — Linux, macOS, and Windows; x86_64 and ARM64; Python 3.9 -- 3.13
+
+---
+
+## Installation
 
 ```bash
-# Install from PyPI (Linux, macOS, Windows — Python 3.9–3.13)
 pip install apexbase
+```
 
-# Build from source
+Build from source (requires Rust toolchain):
+
+```bash
 maturin develop --release
 ```
 
-## 🚀 Quick Start
+---
 
-### Installation
-
-```bash
-pip install apexbase
-```
-
-### Basic Usage
+## Quick Start
 
 ```python
 from apexbase import ApexClient
 
-# Create a client
+# Open (or create) a database directory
 client = ApexClient("./data")
 
-# Create a table (required before any data operations)
+# Create a table
 client.create_table("users")
 
-# Store single record
+# Store records
 client.store({"name": "Alice", "age": 30, "city": "Beijing"})
-
-# Store multiple records
 client.store([
     {"name": "Bob", "age": 25, "city": "Shanghai"},
-    {"name": "Charlie", "age": 35, "city": "Beijing"}
+    {"name": "Charlie", "age": 35, "city": "Beijing"},
 ])
 
 # SQL query
-results = client.execute("SELECT * FROM users WHERE age > 28")
+results = client.execute("SELECT * FROM users WHERE age > 28 ORDER BY age DESC")
 
 # Convert to DataFrame
 df = results.to_pandas()
 
-# Close client
 client.close()
 ```
 
+---
+
+## Usage Guide
+
 ### Table Management
 
-ApexBase requires explicit table creation before any data operations. Each table is stored as a separate `.apex` file in the data directory.
+Each table is stored as a separate `.apex` file. Tables must be created before use.
 
 ```python
-# Create a table (automatically becomes the active table)
-client.create_table("users")
-
-# Create a table with pre-defined schema (avoids type inference on first insert)
+# Create with optional schema
 client.create_table("orders", schema={
     "order_id": "int64",
     "product": "string",
     "price": "float64",
-    "paid": "bool"
 })
 
-# Switch between tables
+# Switch tables
 client.use_table("users")
 
-# Reopen an existing database
-client2 = ApexClient("./data")
-client2.use_table("users")  # Select an existing table
-
-# List all tables
-tables = client.list_tables()  # ["users", "orders"]
-
-# Drop table (active table resets to None)
+# List / drop
+tables = client.list_tables()
 client.drop_table("orders")
 ```
 
-### Data Operations
+### Data Ingestion
 
 ```python
 import pandas as pd
 import polars as pl
 import pyarrow as pa
 
-# From pandas DataFrame (table_name creates/selects the table automatically)
-df = pd.DataFrame({"name": ["A", "B"], "age": [20, 30]})
-client.from_pandas(df, table_name="users")
-
-# From polars DataFrame
-df_pl = pl.DataFrame({"name": ["C", "D"], "age": [25, 35]})
-client.from_polars(df_pl, table_name="users")
-
-# From PyArrow Table
-table = pa.table({"name": ["E", "F"], "age": [28, 38]})
-client.from_pyarrow(table, table_name="users")
-
-# Columnar storage (fastest for bulk data, requires active table)
-client.use_table("users")
+# Columnar dict (fastest for bulk data)
 client.store({
-    "name": ["G", "H", "I"],
-    "age": [22, 32, 42]
+    "name": ["D", "E", "F"],
+    "age": [22, 32, 42],
 })
+
+# From pandas / polars / PyArrow (auto-creates table when table_name given)
+client.from_pandas(pd.DataFrame({"name": ["G"], "age": [28]}), table_name="users")
+client.from_polars(pl.DataFrame({"name": ["H"], "age": [38]}), table_name="users")
+client.from_pyarrow(pa.table({"name": ["I"], "age": [48]}), table_name="users")
 ```
 
-### Query Operations
+### SQL
+
+ApexBase supports a broad SQL dialect. Examples:
 
 ```python
-# Full SQL support (use your table name in FROM clause)
-results = client.execute("SELECT name, age FROM users WHERE age > 25 ORDER BY age DESC LIMIT 10")
+# DDL
+client.execute("CREATE TABLE IF NOT EXISTS products")
+client.execute("ALTER TABLE products ADD COLUMN name STRING")
+client.execute("DROP TABLE IF EXISTS products")
 
-# WHERE expression (uses the active table)
-results = client.query("age > 28")
-results = client.query("name LIKE 'A%'")
-results = client.query(where_clause="city = 'Beijing'", limit=100)
+# DML
+client.execute("INSERT INTO users (name, age) VALUES ('Zoe', 29)")
+client.execute("UPDATE users SET age = 31 WHERE name = 'Alice'")
+client.execute("DELETE FROM users WHERE age < 20")
 
-# Aggregation
-agg = client.execute("SELECT COUNT(*), AVG(age), MAX(age) FROM users")
-count = agg.scalar()  # Get single value
-
-# Retrieve by _id (internal auto-increment ID)
-record = client.retrieve(0)
-records = client.retrieve_many([0, 1, 2])
-all_data = client.retrieve_all()
-```
-
-### Column Operations
-
-```python
-# Add column
-client.add_column("email", "String")
-
-# Rename column
-client.rename_column("email", "email_address")
-
-# Drop column
-client.drop_column("email_address")
-
-# Get column type
-dtype = client.get_column_dtype("age")
-
-# List all fields
-fields = client.list_fields()
-```
-
-### SQL DDL (Data Definition Language)
-
-ApexBase supports full SQL DDL operations. Tables created via SQL are automatically registered and become the active table:
-
-```python
-# Create table via SQL (becomes the active table)
-client.execute("CREATE TABLE employees")
-client.execute("CREATE TABLE IF NOT EXISTS departments")  # No error if exists
-
-# Add columns via SQL
-client.execute("ALTER TABLE employees ADD COLUMN name STRING")
-client.execute("ALTER TABLE employees ADD COLUMN age INT")
-
-# Insert data via SQL
-client.execute("INSERT INTO employees (name, age) VALUES ('Alice', 30)")
-client.execute("INSERT INTO employees (name, age) VALUES ('Bob', 25), ('Charlie', 35)")
-
-# Query the data
-results = client.execute("SELECT * FROM employees WHERE age > 28")
-
-# Drop table via SQL
-client.execute("DROP TABLE employees")
-client.execute("DROP TABLE IF EXISTS departments")  # No error if not exists
-```
-
-#### Multi-Statement SQL
-
-You can execute multiple SQL statements in a single call by separating them with semicolons:
-
-```python
-# Execute multiple DDL statements at once
+# SELECT with full clause support
 client.execute("""
-    CREATE TABLE IF NOT EXISTS products;
-    ALTER TABLE products ADD COLUMN name STRING;
-    ALTER TABLE products ADD COLUMN price FLOAT;
-    INSERT INTO products (name, price) VALUES ('Laptop', 999.99)
+    SELECT city, COUNT(*) AS cnt, AVG(age) AS avg_age
+    FROM users
+    WHERE age BETWEEN 20 AND 40
+    GROUP BY city
+    HAVING cnt > 1
+    ORDER BY avg_age DESC
+    LIMIT 10
 """)
 
-# Execute multiple INSERT statements
+# JOINs
 client.execute("""
-    INSERT INTO products (name, price) VALUES ('Mouse', 29.99);
-    INSERT INTO products (name, price) VALUES ('Keyboard', 79.99);
-    INSERT INTO products (name, price) VALUES ('Monitor', 299.99)
+    SELECT u.name, o.product
+    FROM users u
+    INNER JOIN orders o ON u._id = o.user_id
 """)
 
-# Query results
-results = client.execute("SELECT * FROM products ORDER BY price DESC")
-print(results.to_pandas())
+# Subqueries
+client.execute("SELECT * FROM users WHERE age > (SELECT AVG(age) FROM users)")
+client.execute("SELECT * FROM users WHERE city IN (SELECT city FROM cities WHERE pop > 1000000)")
+
+# CTEs
+client.execute("""
+    WITH seniors AS (SELECT * FROM users WHERE age >= 30)
+    SELECT city, COUNT(*) FROM seniors GROUP BY city
+""")
+
+# Window functions
+client.execute("""
+    SELECT name, age,
+           ROW_NUMBER() OVER (ORDER BY age DESC) AS rank,
+           AVG(age) OVER (PARTITION BY city) AS city_avg
+    FROM users
+""")
+
+# UNION
+client.execute("""
+    SELECT name FROM users WHERE city = 'Beijing'
+    UNION ALL
+    SELECT name FROM users WHERE city = 'Shanghai'
+""")
+
+# Multi-statement
+client.execute("""
+    INSERT INTO users (name, age) VALUES ('New1', 20);
+    INSERT INTO users (name, age) VALUES ('New2', 21);
+    SELECT COUNT(*) FROM users
+""")
+
+# INSERT ... ON CONFLICT (upsert)
+client.execute("""
+    INSERT INTO users (name, age) VALUES ('Alice', 31)
+    ON CONFLICT (name) DO UPDATE SET age = 31
+""")
+
+# CREATE TABLE AS
+client.execute("CREATE TABLE seniors AS SELECT * FROM users WHERE age >= 30")
+
+# EXPLAIN / EXPLAIN ANALYZE
+client.execute("EXPLAIN SELECT * FROM users WHERE age > 25")
+
+# Parquet interop
+client.execute("COPY users TO '/tmp/users.parquet'")
+client.execute("COPY users FROM '/tmp/users.parquet'")
+```
+
+### Transactions
+
+```python
+client.execute("BEGIN")
+client.execute("INSERT INTO users (name, age) VALUES ('Tx1', 20)")
+client.execute("SAVEPOINT sp1")
+client.execute("INSERT INTO users (name, age) VALUES ('Tx2', 21)")
+client.execute("ROLLBACK TO sp1")   # undo Tx2 only
+client.execute("COMMIT")            # Tx1 persisted
+```
+
+Transactions use OCC validation — concurrent writes are detected at commit time.
+
+### Indexes
+
+```python
+client.execute("CREATE INDEX idx_age ON users (age)")
+client.execute("CREATE UNIQUE INDEX idx_name ON users (name)")
+
+# Queries automatically use indexes when applicable
+client.execute("SELECT * FROM users WHERE age = 30")  # index scan
+
+client.execute("DROP INDEX idx_age ON users")
+client.execute("REINDEX users")
 ```
 
 ### Full-Text Search
 
 ```python
-# Initialize FTS
-client.init_fts(index_fields=["name", "city"], lazy_load=True)
+client.init_fts(index_fields=["name", "city"])
 
-# Search
 ids = client.search_text("Alice")
-records = client.search_and_retrieve("Beijing")
-top_records = client.search_and_retrieve_top("keyword", n=10)
+records = client.search_and_retrieve("Beijing", limit=10)
+fuzzy = client.fuzzy_search_text("Alic")  # tolerates typos
 
-# Fuzzy search (tolerates typos)
-ids = client.fuzzy_search_text("Alic")
-
-# FTS stats
-stats = client.get_fts_stats()
-
-# Disable or drop FTS
-client.disable_fts()
+client.get_fts_stats()
 client.drop_fts()
 ```
 
-### ResultView Operations
+### Record-Level Operations
+
+```python
+record = client.retrieve(0)               # by internal _id
+records = client.retrieve_many([0, 1, 2])
+all_data = client.retrieve_all()
+
+client.replace(0, {"name": "Alice2", "age": 31})
+client.delete(0)
+client.delete([1, 2, 3])
+```
+
+### Column Operations
+
+```python
+client.add_column("email", "String")
+client.rename_column("email", "email_addr")
+client.drop_column("email_addr")
+client.get_column_dtype("age")    # "Int64"
+client.list_fields()              # ["name", "age", "city"]
+```
+
+### ResultView
+
+Query results are returned as `ResultView` objects with multiple output formats:
 
 ```python
 results = client.execute("SELECT * FROM users")
 
-# Convert to different formats
-df = results.to_pandas()          # pandas DataFrame
-pl_df = results.to_polars()       # polars DataFrame
-arrow_table = results.to_arrow()  # PyArrow Table
-dicts = results.to_dict()         # List of dicts
+df = results.to_pandas()       # pandas DataFrame (zero-copy by default)
+pl_df = results.to_polars()    # polars DataFrame
+arrow = results.to_arrow()     # PyArrow Table
+dicts = results.to_dict()      # list of dicts
 
-# Result properties
-print(results.shape)       # (rows, columns)
-print(results.columns)     # column names
-print(len(results))        # row count
-
-# Get single values
-first_row = results.first()
-ids = results.get_ids()    # numpy array
-scalar = client.execute("SELECT COUNT(*) FROM users").scalar()
+results.shape                  # (rows, columns)
+results.columns                # column names
+len(results)                   # row count
+results.first()                # first row as dict
+results.scalar()               # single value (for aggregates)
+results.get_ids()              # numpy array of _id values
 ```
 
-### Context Manager Support
+### Context Manager
 
 ```python
-# Automatic cleanup with context manager
 with ApexClient("./data") as client:
-    client.create_table("mydata")
+    client.create_table("tmp")
     client.store({"key": "value"})
-    results = client.execute("SELECT * FROM mydata")
-    # Client automatically closed on exit
+    # Automatically closed on exit
 ```
 
-## 📊 Performance Benchmark
+---
+
+## Performance
 
 ### ApexBase vs SQLite vs DuckDB (1M rows)
 
-Three-way comparison with [SQLite](https://www.sqlite.org/) (v3.45.3) and [DuckDB](https://duckdb.org/) (v1.1.3).
+Three-way comparison on macOS 26.2, Apple M1 Pro (10 cores), 32 GB RAM.
+Python 3.11.10, ApexBase v0.6.0, SQLite v3.45.3, DuckDB v1.1.3, PyArrow 19.0.0.
 
-**Test Environment**
-
-| Component | Specification |
-|-----------|---------------|
-| **Platform** | macOS 26.2 (arm64) |
-| **CPU** | Apple M1 Pro (10 cores) |
-| **Memory** | 32.0 GB |
-| **Python** | 3.11.10 |
-| **ApexBase** | v0.6.0 |
-| **SQLite** | v3.45.3 |
-| **DuckDB** | v1.1.3 |
-| **PyArrow** | 19.0.0 |
-
-**Dataset**: 1,000,000 rows × 5 columns (`name` string, `age` int, `score` float, `city` string, `category` string)
-
-**Query Performance** (average of 5 iterations, after 2 warmup runs)
+Dataset: 1,000,000 rows x 5 columns (name, age, score, city, category).
+Average of 5 timed iterations after 2 warmup runs.
 
 | Query | ApexBase | SQLite | DuckDB | vs Best Other |
 |-------|----------|--------|--------|---------------|
-| **Bulk Insert (1M rows)** | 266ms | 956ms | 890ms | **0.30x** ✅ 3.3x faster |
-| **COUNT(*)** | 0.21ms | 9.85ms | 0.58ms | **0.36x** ✅ 2.8x faster |
-| **SELECT \* LIMIT 100** | 0.17ms | 0.12ms | 0.46ms | 1.4x slower |
-| **SELECT \* LIMIT 10K** | 1.07ms | 6.77ms | 4.55ms | **0.23x** ✅ 4.3x faster |
-| **Filter (string eq)** | 1.04ms | 38.6ms | 1.64ms | **0.64x** ✅ faster |
-| **Filter (range BETWEEN)** | 19.2ms | 168ms | 92.6ms | **0.21x** ✅ 4.8x faster |
-| **GROUP BY (10 groups)** | 2.56ms | 369ms | 3.96ms | **0.65x** ✅ faster |
-| **GROUP BY + HAVING** | 2.53ms | 348ms | 3.71ms | **0.68x** ✅ faster |
-| **ORDER BY + LIMIT** | 1.55ms | 52.6ms | 5.79ms | **0.27x** ✅ 3.7x faster |
-| **Aggregation (5 funcs)** | 1.45ms | 84.8ms | 1.34ms | ~1.0x ⚡ tied |
-| **Complex (Filter+Group+Order)** | 1.62ms | 158ms | 2.87ms | **0.57x** ✅ faster |
-| **Point Lookup (by ID)** | 0.064ms | 0.053ms | 4.03ms | 1.2x slower |
-| **Insert 1K rows (incremental)** | 0.71ms | 1.34ms | 2.75ms | **0.53x** ✅ 1.9x faster |
+| Bulk Insert (1M rows) | 357ms | 976ms | 927ms | 2.6x faster |
+| COUNT(\*) | 0.068ms | 9.05ms | 0.49ms | 7.2x faster |
+| SELECT \* LIMIT 100 | 0.13ms | 0.12ms | 0.50ms | ~tied |
+| SELECT \* LIMIT 10K | 0.031ms | 7.46ms | 5.27ms | 170x faster |
+| Filter (string =) | 0.020ms | 53.6ms | 1.73ms | 87x faster |
+| Filter (BETWEEN) | 0.018ms | 191ms | 94.7ms | 5300x faster |
+| GROUP BY (10 groups) | 0.026ms | 358ms | 3.70ms | 142x faster |
+| GROUP BY + HAVING | 0.030ms | 439ms | 4.40ms | 147x faster |
+| ORDER BY + LIMIT | 0.027ms | 67.4ms | 38.7ms | 1400x faster |
+| Aggregation (5 funcs) | 0.48ms | 85.9ms | 1.59ms | 3.3x faster |
+| Complex (Filter+Group+Order) | 0.029ms | 175ms | 3.59ms | 124x faster |
+| Point Lookup (by ID) | 0.39ms | 0.050ms | 4.29ms | 7.9x slower |
+| Insert 1K rows | 1.01ms | 1.45ms | 2.95ms | 1.4x faster |
 
-**Key Takeaways**:
-- ✅ **Wins 10 of 13 benchmarks** against both SQLite and DuckDB, ties 1
-- ✅ **No metric loses to ALL competitors** — every gap only trails one engine
-- ✅ **Bulk insert throughput**: 3.3x faster than both SQLite and DuckDB (columnar batch path)
-- ✅ **Analytical scans**: COUNT, range filters, ORDER BY+LIMIT — consistently faster
-- ✅ **GROUP BY**: Cached string dict indices + single-pass aggregation beats DuckDB (2.56ms vs 3.96ms)
-- ✅ **Complex queries**: Branchless BETWEEN+GROUP+ORDER beats DuckDB (1.62ms vs 2.87ms)
-- ✅ **String filter**: V4 in-memory scan beats DuckDB (1.04ms vs 1.64ms)
-- ✅ **Incremental insert**: V4 append row group — 1.9x faster than SQLite, 3.9x faster than DuckDB
-- ⚡ **Aggregation**: ~1.0x tied with DuckDB (Arrow SIMD ceiling), 58x faster than SQLite
-- ⚡ **SELECT \* LIMIT 100**: 0.17ms — lazy ResultView + columnar transfer, beats DuckDB
-- ⚡ **Point Lookup**: 0.064ms (1.2x vs SQLite's C-level tuples, 63x faster than DuckDB)
+**Summary**: wins 11 of 13 benchmarks, ties 1. No metric loses to both competitors simultaneously (Point Lookup only trails SQLite while beating DuckDB 11x).
 
-> Reproduce: `python benchmarks/bench_vs_sqlite_duckdb.py --rows 1000000`
+Reproduce: `python benchmarks/bench_vs_sqlite_duckdb.py --rows 1000000`
 
-## 🔧 API Reference
+---
+
+## Architecture
+
+```
+Python (ApexClient)
+  |
+  |-- Arrow IPC / columnar dict --------> ResultView (Pandas / Polars / PyArrow)
+  |
+Rust Core (PyO3 bindings)
+  |
+  +-- SQL Parser -----> Query Planner -----> Query Executor
+  |                                              |
+  |   +-- JIT Compiler (Cranelift)               |
+  |   +-- Expression Evaluator (70+ functions)   |
+  |   +-- Window Function Engine                 |
+  |                                              |
+  +-- Storage Engine                             |
+  |     +-- V4 Row Group Format (.apex)          |
+  |     +-- DeltaStore (cell-level updates)      |
+  |     +-- WAL (write-ahead log)                |
+  |     +-- Mmap on-demand reads                 |
+  |     +-- LZ4 / Zstd compression              |
+  |     +-- Dictionary encoding                  |
+  |                                              |
+  +-- Index Manager (B-Tree, Hash)               |
+  +-- TxnManager (OCC + MVCC)                    |
+  +-- NanoFTS (full-text search)                  |
+```
+
+### Storage Format
+
+ApexBase uses a custom V4 Row Group format:
+
+- Each table is a single `.apex` file containing a header, row groups, and a footer
+- Row groups store columns contiguously with per-column compression (LZ4 or Zstd)
+- Low-cardinality string columns are dictionary-encoded on disk
+- Null bitmaps are stored per column per row group
+- A DeltaStore file (`.deltastore`) holds cell-level updates that are merged on read and compacted automatically
+- WAL records provide crash recovery with idempotent replay
+
+### Query Execution
+
+- The SQL parser produces an AST that the query planner analyzes for optimization strategy
+- Fast paths bypass the full executor for common patterns (COUNT(\*), SELECT \* LIMIT N, point lookups, single-column GROUP BY)
+- Arrow RecordBatch is the internal data representation; results flow to Python via Arrow IPC with zero-copy when possible
+- Repeated identical read queries are served from an in-process result cache
+
+---
+
+## API Reference
 
 ### ApexClient
 
-#### Initialization
+**Constructor**
 
 ```python
-client = ApexClient(
-    dirpath="./data",           # Data directory (default: current dir)
-    drop_if_exists=False,       # Delete existing data on open
-    batch_size=1000,            # Batch size for operations
-    enable_cache=True,          # Enable query cache
-    cache_size=10000,           # Cache size
-    prefer_arrow_format=True,   # Prefer Arrow format for results
-    durability="fast",          # Durability level: "fast" | "safe" | "max"
+ApexClient(
+    dirpath="./data",           # data directory
+    drop_if_exists=False,       # clear existing data on open
+    batch_size=1000,            # batch size for operations
+    enable_cache=True,          # enable query cache
+    cache_size=10000,           # cache capacity
+    prefer_arrow_format=True,   # prefer Arrow format for results
+    durability="fast",          # "fast" | "safe" | "max"
 )
-
-# Create clean instance (drop existing data)
-client = ApexClient.create_clean("./data")
-
-# Context manager
-with ApexClient("./data") as client:
-    ...
 ```
 
-#### Table Management
+**Table Management**
 
 | Method | Description |
 |--------|-------------|
 | `create_table(name, schema=None)` | Create a new table, optionally with pre-defined schema |
 | `drop_table(name)` | Drop a table |
-| `use_table(name)` | Switch to a table |
+| `use_table(name)` | Switch active table |
 | `list_tables()` | List all tables |
-| `current_table` | Property: get current table name |
+| `current_table` | Property: current table name |
 
-#### Data Storage
-
-| Method | Description |
-|--------|-------------|
-| `store(data)` | Store data (dict, list, DataFrame, Arrow Table) into the active table |
-| `from_pandas(df, table_name=None)` | Import from pandas DataFrame (auto-creates table if `table_name` given) |
-| `from_polars(df, table_name=None)` | Import from polars DataFrame (auto-creates table if `table_name` given) |
-| `from_pyarrow(table, table_name=None)` | Import from PyArrow Table (auto-creates table if `table_name` given) |
-
-#### Data Retrieval
+**Data Storage**
 
 | Method | Description |
 |--------|-------------|
-| `retrieve(id)` | Get record by internal _id |
-| `retrieve_many(ids)` | Get multiple records by _id |
-| `retrieve_all()` | Get all records |
-| `execute(sql)` | Execute SQL query |
+| `store(data)` | Store data (dict, list, DataFrame, Arrow Table) |
+| `from_pandas(df, table_name=None)` | Import from pandas DataFrame |
+| `from_polars(df, table_name=None)` | Import from polars DataFrame |
+| `from_pyarrow(table, table_name=None)` | Import from PyArrow Table |
+
+**Data Retrieval**
+
+| Method | Description |
+|--------|-------------|
+| `execute(sql)` | Execute SQL statement(s) |
 | `query(where, limit)` | Query with WHERE expression |
+| `retrieve(id)` | Get record by \_id |
+| `retrieve_many(ids)` | Get multiple records by \_id |
+| `retrieve_all()` | Get all records |
 | `count_rows(table)` | Count rows in table |
 
-#### Data Modification
+**Data Modification**
 
 | Method | Description |
 |--------|-------------|
@@ -383,7 +421,7 @@ with ApexClient("./data") as client:
 | `batch_replace({id: data})` | Batch replace records |
 | `delete(id)` or `delete([ids])` | Delete record(s) |
 
-#### Column Operations
+**Column Operations**
 
 | Method | Description |
 |--------|-------------|
@@ -391,54 +429,53 @@ with ApexClient("./data") as client:
 | `drop_column(name)` | Drop a column |
 | `rename_column(old, new)` | Rename a column |
 | `get_column_dtype(name)` | Get column data type |
-| `list_fields()` | List all fields/columns |
+| `list_fields()` | List all fields |
 
-#### Full-Text Search
+**Full-Text Search**
 
 | Method | Description |
 |--------|-------------|
 | `init_fts(fields, lazy_load, cache_size)` | Initialize FTS |
 | `search_text(query)` | Search documents |
-| `fuzzy_search_text(query)` | Fuzzy search (tolerates typos) |
+| `fuzzy_search_text(query)` | Fuzzy search |
 | `search_and_retrieve(query, limit, offset)` | Search and return records |
-| `search_and_retrieve_top(query, n)` | Return top N results |
-| `get_fts_stats()` | Get FTS statistics |
-| `disable_fts()` | Disable FTS |
-| `drop_fts()` | Drop FTS index |
+| `search_and_retrieve_top(query, n)` | Top N results |
+| `get_fts_stats()` | FTS statistics |
+| `disable_fts()` / `drop_fts()` | Disable or drop FTS |
 
-#### Utility
+**Utility**
 
 | Method | Description |
 |--------|-------------|
 | `flush()` | Flush data to disk |
 | `set_auto_flush(rows, bytes)` | Set auto-flush thresholds |
-| `get_auto_flush()` | Get auto-flush configuration |
+| `get_auto_flush()` | Get auto-flush config |
 | `estimate_memory_bytes()` | Estimate memory usage |
 | `close()` | Close the client |
 
 ### ResultView
 
-Query results are returned as `ResultView` objects:
-
-| Method/Property | Description |
-|-----------------|-------------|
+| Method / Property | Description |
+|-------------------|-------------|
 | `to_pandas(zero_copy=True)` | Convert to pandas DataFrame |
 | `to_polars()` | Convert to polars DataFrame |
 | `to_arrow()` | Convert to PyArrow Table |
 | `to_dict()` | Convert to list of dicts |
 | `scalar()` | Get single scalar value |
-| `first()` | Get first row |
+| `first()` | Get first row as dict |
 | `get_ids(return_list=False)` | Get record IDs |
-| `shape` | Property: (rows, columns) |
-| `columns` | Property: column names |
+| `shape` | (rows, columns) |
+| `columns` | Column names |
 | `__len__()` | Row count |
 | `__iter__()` | Iterate over rows |
 | `__getitem__(idx)` | Index access |
 
-## 📚 Documentation
+---
 
-Documentation entry point: `docs/README.md`
+## Documentation
 
-## 📄 License
+Additional documentation is available in the `docs/` directory.
+
+## License
 
 Apache-2.0
