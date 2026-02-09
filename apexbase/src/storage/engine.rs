@@ -78,6 +78,8 @@ struct SchemaCache {
     row_count: u64,
     /// File modification time when cached
     modified_time: SystemTime,
+    /// Whether this is a V4 format file (cached to avoid repeated header reads)
+    is_v4: bool,
 }
 
 // ============================================================================
@@ -261,6 +263,7 @@ impl StorageEngine {
                 columns: schema_cols,
                 row_count,
                 modified_time: new_modified,
+                is_v4: false,
             });
         }
         
@@ -321,6 +324,7 @@ impl StorageEngine {
                 columns: schema_cols,
                 row_count,
                 modified_time: new_modified,
+                is_v4: false,
             });
         }
         
@@ -381,8 +385,8 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
         
-        // Determine write strategy
-        let use_delta = self.should_use_delta(table_path, rows);
+        // Determine write strategy and V4 status in one pass (avoids double is_v4_file)
+        let (use_delta, is_v4) = self.classify_write(table_path, rows);
         
         let ids = if use_delta {
             // Delta write: memory efficient, schema unchanged
@@ -401,7 +405,6 @@ impl StorageEngine {
             // V4 files: use insert backend (metadata-only) since save() uses
             // append_row_group. open_for_write loads all data which is empty
             // for V4 mmap-only, causing data loss.
-            let is_v4 = Self::is_v4_file(table_path);
             let backend = if is_v4 {
                 self.get_insert_backend(table_path, durability)?
             } else {
@@ -437,83 +440,100 @@ impl StorageEngine {
         false
     }
 
-    /// Determine if delta write should be used
+    /// Classify write operation: returns (use_delta, is_v4)
     /// 
-    /// OPTIMIZED: Uses schema cache to avoid opening backend for every write
-    /// Single metadata() call instead of exists() + metadata() + modified()
+    /// OPTIMIZED: Combines should_use_delta + is_v4_file into a single pass.
+    /// Uses schema cache (with is_v4 field) to avoid repeated file header reads.
     #[inline]
-    fn should_use_delta(&self, table_path: &Path, rows: &[HashMap<String, Value>]) -> bool {
+    fn classify_write(&self, table_path: &Path, rows: &[HashMap<String, Value>]) -> (bool, bool) {
         if rows.is_empty() {
-            return false;
+            return (false, false);
         }
         
         // Single metadata call for existence, size, and modified time
         let meta = match std::fs::metadata(table_path) {
             Ok(m) => m,
-            Err(_) => return false, // File doesn't exist
+            Err(_) => return (false, false), // File doesn't exist
         };
         
         // Fast path: check file size (empty files should use full write)
-        if meta.len() < 256 { // Header is 256 bytes, so smaller means empty/invalid
-            return false;
-        }
-        
-        // V4 files: always use full write (append_row_group) instead of delta writes.
-        // Delta inserts go to a .delta file that the mmap read path doesn't read.
-        // append_row_group is equally efficient and keeps data in the base V4 file.
-        if Self::is_v4_file(table_path) {
-            return false;
+        if meta.len() < 256 {
+            return (false, false);
         }
         
         let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         let cache_key = table_path.to_path_buf();
         
-        // Try to use schema cache first (FAST PATH)
+        // Try schema cache first (FAST PATH — avoids file I/O entirely)
         {
             let schema_cache = self.schema_cache.read();
             if let Some(cached) = schema_cache.get(&cache_key) {
-                if cached.modified_time >= modified && cached.row_count > 0 {
-                    // Use cached schema for comparison
-                    return rows.iter().all(|row| {
-                        let data_cols: std::collections::HashSet<_> = row.keys().cloned().collect();
-                        cached.columns == data_cols
-                    });
+                if cached.modified_time >= modified {
+                    // V4 files always use full write (append_row_group)
+                    if cached.is_v4 {
+                        return (false, true);
+                    }
+                    // Non-V4 with data: check schema match for delta
+                    if cached.row_count > 0 {
+                        let use_delta = rows.iter().all(|row| {
+                            let data_cols: std::collections::HashSet<_> = row.keys().cloned().collect();
+                            cached.columns == data_cols
+                        });
+                        return (use_delta, false);
+                    }
+                    return (false, false);
                 }
             }
         }
         
-        // Cache miss - need to open backend (SLOW PATH)
+        // Cache miss — read V4 status from file header (single file open)
+        let is_v4 = Self::is_v4_file(table_path);
+        
+        // V4 files: always full write, update cache with is_v4 flag
+        if is_v4 {
+            // Lightweight cache update (just V4 flag, no full schema load)
+            let mut schema_cache = self.schema_cache.write();
+            schema_cache.entry(cache_key).or_insert_with(|| SchemaCache {
+                columns: std::collections::HashSet::new(),
+                row_count: 0,
+                modified_time: modified,
+                is_v4: true,
+            }).is_v4 = true;
+            return (false, true);
+        }
+        
+        // Non-V4 cache miss: open backend for schema check (SLOW PATH)
         let backend = match TableStorageBackend::open(table_path) {
             Ok(b) => b,
-            Err(_) => return false,
+            Err(_) => return (false, false),
         };
         
         let row_count = backend.row_count();
         if row_count == 0 {
-            return false;
+            return (false, false);
         }
         
-        // Get schema columns
         let schema_cols: std::collections::HashSet<_> = backend.get_schema()
             .into_iter()
             .map(|(name, _)| name)
             .collect();
         
-        // Update schema cache for future calls
+        // Update schema cache
         {
             let mut schema_cache = self.schema_cache.write();
             schema_cache.insert(cache_key, SchemaCache {
                 columns: schema_cols.clone(),
                 row_count,
                 modified_time: modified,
+                is_v4: false,
             });
         }
         
-        // All rows must have exact same columns as schema (no new, no missing)
-        rows.iter().all(|row| {
+        let use_delta = rows.iter().all(|row| {
             let data_cols: std::collections::HashSet<_> = row.keys().cloned().collect();
             schema_cols == data_cols
-        })
+        });
+        (use_delta, false)
     }
     
     /// Write a single row to a table

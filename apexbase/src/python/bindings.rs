@@ -424,9 +424,14 @@ impl ApexStorageImpl {
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
         
-        // Acquire exclusive write lock
-        let lock_file = Self::acquire_write_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        // Skip file lock for 'fast' durability — StorageEngine handles thread safety
+        // internally via parking_lot::RwLock. File locks only needed for cross-process safety.
+        let lock_file = if durability != DurabilityLevel::Fast {
+            Some(Self::acquire_write_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?)
+        } else {
+            None
+        };
         
         // Use StorageEngine for smart write routing
         let result = py.allow_threads(|| {
@@ -436,8 +441,9 @@ impl ApexStorageImpl {
             Ok::<i64, PyErr>(ids.first().copied().unwrap_or(0) as i64)
         });
         
-        // Release lock
-        Self::release_lock(lock_file);
+        if let Some(lf) = lock_file {
+            Self::release_lock(lf);
+        }
         
         // Invalidate local backend cache (StorageEngine handles its own cache)
         self.invalidate_backend(&table_name);
@@ -469,9 +475,13 @@ impl ApexStorageImpl {
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
         
-        // Acquire exclusive write lock
-        let lock_file = Self::acquire_write_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        // Skip file lock for 'fast' durability
+        let lock_file = if durability != DurabilityLevel::Fast {
+            Some(Self::acquire_write_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?)
+        } else {
+            None
+        };
         
         // Use StorageEngine for smart write routing
         let result = py.allow_threads(|| {
@@ -480,8 +490,9 @@ impl ApexStorageImpl {
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         });
         
-        // Release lock
-        Self::release_lock(lock_file);
+        if let Some(lf) = lock_file {
+            Self::release_lock(lf);
+        }
         
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
@@ -704,9 +715,13 @@ impl ApexStorageImpl {
         let table_name = self.current_table.read().clone();
         let durability = self.durability;
         
-        // Acquire exclusive write lock
-        let lock_file = Self::acquire_write_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        // Skip file lock for 'fast' durability
+        let lock_file = if durability != DurabilityLevel::Fast {
+            Some(Self::acquire_write_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?)
+        } else {
+            None
+        };
         
         // Save a copy of string_columns for FTS indexing (before insert_typed consumes it)
         let string_columns_for_fts = string_columns.clone();
@@ -724,8 +739,9 @@ impl ApexStorageImpl {
             ).map_err(|e| PyIOError::new_err(e.to_string()))
         });
         
-        // Release lock
-        Self::release_lock(lock_file);
+        if let Some(lf) = lock_file {
+            Self::release_lock(lf);
+        }
         
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
@@ -825,16 +841,22 @@ impl ApexStorageImpl {
         let table_name = self.current_table.read().clone();
         let durability = self.durability;
         
-        // Acquire exclusive write lock
-        let lock_file = Self::acquire_write_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        // Skip file lock for 'fast' durability
+        let lock_file = if durability != DurabilityLevel::Fast {
+            Some(Self::acquire_write_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?)
+        } else {
+            None
+        };
         
         // Use StorageEngine for unified delete
         let engine = crate::storage::engine::engine();
         let result = engine.delete_one(&table_path, id as u64, durability)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
-        Self::release_lock(lock_file);
+        if let Some(lf) = lock_file {
+            Self::release_lock(lf);
+        }
         
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
@@ -853,9 +875,13 @@ impl ApexStorageImpl {
         let table_name = self.current_table.read().clone();
         let durability = self.durability;
         
-        // Acquire exclusive write lock
-        let lock_file = Self::acquire_write_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        // Skip file lock for 'fast' durability
+        let lock_file = if durability != DurabilityLevel::Fast {
+            Some(Self::acquire_write_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?)
+        } else {
+            None
+        };
         
         // Use StorageEngine for unified delete
         let engine = crate::storage::engine::engine();
@@ -863,7 +889,9 @@ impl ApexStorageImpl {
         let deleted = engine.delete(&table_path, &ids_u64, durability)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
-        Self::release_lock(lock_file);
+        if let Some(lf) = lock_file {
+            Self::release_lock(lf);
+        }
         
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
@@ -1330,8 +1358,9 @@ impl ApexStorageImpl {
             *self.current_txn_id.write() = new_txn_id;
         }
         
-        // Serialize to IPC format
-        let mut buf = Vec::new();
+        // Serialize to IPC format (pre-allocate buffer to avoid reallocations)
+        let estimated_size = batch.get_array_memory_size() + 512;
+        let mut buf = Vec::with_capacity(estimated_size);
         {
             let mut writer = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
                 .map_err(|e| PyRuntimeError::new_err(format!("IPC writer error: {}", e)))?;
