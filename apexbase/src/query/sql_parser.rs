@@ -78,6 +78,8 @@ pub enum SqlStatement {
     AnalyzeTable { table: String },
     CopyToParquet { table: String, file_path: String },
     CopyFromParquet { table: String, file_path: String },
+    Reindex { table: String },
+    Pragma { name: String, arg: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -1428,17 +1430,19 @@ impl SqlParser {
                             return Err(self.syntax_error(start, "Expected DO after conflict target".to_string()));
                         }
                         // DO UPDATE SET ... or DO NOTHING
-                        let action_kw = self.parse_identifier()?;
-                        let do_update = match action_kw.to_uppercase().as_str() {
-                            "NOTHING" => None,
-                            "UPDATE" => {
-                                self.expect(Token::Set)?;
-                                let assignments = self.parse_assignments()?;
-                                Some(assignments)
-                            }
-                            _ => {
-                                let (start, _) = self.current_span();
-                                return Err(self.syntax_error(start, "Expected UPDATE or NOTHING after DO".to_string()));
+                        let do_update = if matches!(self.current(), Token::Update) {
+                            self.advance();
+                            self.expect(Token::Set)?;
+                            let assignments = self.parse_assignments()?;
+                            Some(assignments)
+                        } else {
+                            let action_kw = self.parse_identifier()?;
+                            match action_kw.to_uppercase().as_str() {
+                                "NOTHING" => None,
+                                _ => {
+                                    let (start, _) = self.current_span();
+                                    return Err(self.syntax_error(start, "Expected UPDATE or NOTHING after DO".to_string()));
+                                }
                             }
                         };
                         Ok(SqlStatement::InsertOnConflict { table, columns, values, conflict_columns, do_update })
@@ -1565,6 +1569,50 @@ impl SqlParser {
                             }
                             let name = self.parse_identifier()?;
                             return Ok(SqlStatement::ReleaseSavepoint { name });
+                        }
+                        "REINDEX" => {
+                            self.advance();
+                            // Optional TABLE keyword
+                            if matches!(self.current(), Token::Table) {
+                                self.advance();
+                            }
+                            let table = self.parse_identifier()?;
+                            return Ok(SqlStatement::Reindex { table });
+                        }
+                        "PRAGMA" => {
+                            self.advance();
+                            let name = self.parse_identifier()?;
+                            // Optional argument: PRAGMA name(arg) or PRAGMA name = arg
+                            let arg = if matches!(self.current(), Token::LParen) {
+                                self.advance();
+                                let a = self.parse_identifier()?;
+                                self.expect(Token::RParen)?;
+                                Some(a)
+                            } else if matches!(self.current(), Token::Eq) {
+                                self.advance();
+                                if let Token::Identifier(ref v) = self.current().clone() {
+                                    let a = v.clone();
+                                    self.advance();
+                                    Some(a)
+                                } else if let Token::StringLit(ref v) = self.current().clone() {
+                                    let a = v.clone();
+                                    self.advance();
+                                    Some(a)
+                                } else if let Token::IntLit(v) = self.current().clone() {
+                                    let a = v.to_string();
+                                    self.advance();
+                                    Some(a)
+                                } else if let Token::FloatLit(v) = self.current().clone() {
+                                    let a = v.to_string();
+                                    self.advance();
+                                    Some(a)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            return Ok(SqlStatement::Pragma { name, arg });
                         }
                         _ => {}
                     }

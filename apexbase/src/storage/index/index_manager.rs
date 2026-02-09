@@ -46,16 +46,54 @@ impl IndexType {
 pub struct IndexMeta {
     /// Index name (unique within a table)
     pub name: String,
-    /// Column name the index is built on
+    /// Column name the index is built on (first column for composite)
     pub column_name: String,
     /// Index type
     pub index_type: IndexType,
     /// Whether it enforces uniqueness
     pub unique: bool,
-    /// Column data type
+    /// Column data type (type of first column for composite)
     pub data_type: DataType,
     /// Creation timestamp
     pub created_at: i64,
+    /// All columns in the index (for composite indexes).
+    /// Empty means single-column (backward compat with old serialized catalogs).
+    #[serde(default)]
+    pub columns: Vec<String>,
+}
+
+impl IndexMeta {
+    /// Get the effective column list (handles backward compat)
+    pub fn effective_columns(&self) -> Vec<&str> {
+        if self.columns.is_empty() {
+            vec![&self.column_name]
+        } else {
+            self.columns.iter().map(|s| s.as_str()).collect()
+        }
+    }
+
+    /// Whether this is a composite (multi-column) index
+    pub fn is_composite(&self) -> bool {
+        self.columns.len() > 1
+    }
+}
+
+/// Build a composite IndexKey from multiple column values.
+/// For single-column, returns the value's key directly.
+/// For multi-column, concatenates as "val1\0val2\0val3" string key.
+fn composite_key(columns: &[String], values: &HashMap<String, Value>) -> Option<IndexKey> {
+    if columns.len() == 1 {
+        values.get(&columns[0]).map(|v| IndexKey::from_value(v))
+    } else {
+        let mut parts: Vec<String> = Vec::with_capacity(columns.len());
+        for col in columns {
+            match values.get(col) {
+                Some(v) => parts.push(v.to_string()),
+                None => return None, // Missing column value
+            }
+        }
+        Some(IndexKey::from_value(&Value::String(parts.join("\0"))))
+    }
 }
 
 // ============================================================================
@@ -242,7 +280,7 @@ impl IndexManager {
     // Index Lifecycle
     // ========================================================================
 
-    /// Create a new index
+    /// Create a new single-column index
     pub fn create_index(
         &mut self,
         name: &str,
@@ -251,6 +289,24 @@ impl IndexManager {
         unique: bool,
         data_type: DataType,
     ) -> io::Result<()> {
+        self.create_index_multi(name, &[column_name.to_string()], index_type, unique, data_type)
+    }
+
+    /// Create a new index (supports single or multi-column)
+    pub fn create_index_multi(
+        &mut self,
+        name: &str,
+        columns: &[String],
+        index_type: IndexType,
+        unique: bool,
+        data_type: DataType,
+    ) -> io::Result<()> {
+        if columns.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Index requires at least one column",
+            ));
+        }
         if self.catalog.contains_key(name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -261,31 +317,35 @@ impl IndexManager {
         // Create index directory if needed
         std::fs::create_dir_all(&self.base_dir)?;
 
+        let first_col = &columns[0];
         let meta = IndexMeta {
             name: name.to_string(),
-            column_name: column_name.to_string(),
+            column_name: first_col.clone(),
             index_type,
             unique,
             data_type,
             created_at: chrono::Utc::now().timestamp(),
+            columns: columns.to_vec(),
         };
 
         // Create the runtime instance
         let index_path = self.index_file_path(name, index_type);
         let instance = match index_type {
             IndexType::BTree => {
-                IndexInstance::BTree(BTreeIndex::with_path(column_name, unique, index_path))
+                IndexInstance::BTree(BTreeIndex::with_path(first_col, unique, index_path))
             }
             IndexType::Hash => {
-                IndexInstance::Hash(HashIndex::with_path(column_name, unique, index_path))
+                IndexInstance::Hash(HashIndex::with_path(first_col, unique, index_path))
             }
         };
 
-        // Register
-        self.column_index_map
-            .entry(column_name.to_string())
-            .or_insert_with(Vec::new)
-            .push(name.to_string());
+        // Register: map each column to this index
+        for col in columns {
+            self.column_index_map
+                .entry(col.clone())
+                .or_insert_with(Vec::new)
+                .push(name.to_string());
+        }
         self.catalog.insert(name.to_string(), meta);
         self.instances.insert(name.to_string(), instance);
         self.dirty = true;
@@ -323,13 +383,22 @@ impl IndexManager {
 
     /// Notify that a row was inserted
     pub fn on_insert(&mut self, row_id: u64, column_values: &HashMap<String, Value>) -> io::Result<()> {
-        for (col_name, value) in column_values {
+        // Collect unique index names that need updating
+        let mut seen_indexes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for col_name in column_values.keys() {
             if let Some(index_names) = self.column_index_map.get(col_name).cloned() {
-                for idx_name in &index_names {
-                    let instance = self.ensure_loaded(idx_name)?;
-                    let key = IndexKey::from_value(value);
-                    instance.insert(key, row_id)?;
+                for idx_name in index_names {
+                    seen_indexes.insert(idx_name);
                 }
+            }
+        }
+        for idx_name in &seen_indexes {
+            let cols = self.catalog.get(idx_name)
+                .map(|m| m.effective_columns().iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            if let Some(key) = composite_key(&cols, column_values) {
+                let instance = self.ensure_loaded(idx_name)?;
+                instance.insert(key, row_id)?;
             }
         }
         Ok(())
@@ -337,13 +406,21 @@ impl IndexManager {
 
     /// Notify that a row was deleted
     pub fn on_delete(&mut self, row_id: u64, column_values: &HashMap<String, Value>) {
-        for (col_name, value) in column_values {
+        let mut seen_indexes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for col_name in column_values.keys() {
             if let Some(index_names) = self.column_index_map.get(col_name).cloned() {
-                for idx_name in &index_names {
-                    if let Some(instance) = self.instances.get_mut(idx_name) {
-                        let key = IndexKey::from_value(value);
-                        instance.remove(&key, row_id);
-                    }
+                for idx_name in index_names {
+                    seen_indexes.insert(idx_name);
+                }
+            }
+        }
+        for idx_name in &seen_indexes {
+            let cols = self.catalog.get(idx_name)
+                .map(|m| m.effective_columns().iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            if let Some(key) = composite_key(&cols, column_values) {
+                if let Some(instance) = self.instances.get_mut(idx_name.as_str()) {
+                    instance.remove(&key, row_id);
                 }
             }
         }

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -63,11 +64,18 @@ pub enum TxnStatus {
 // Active Transaction Entry
 // ============================================================================
 
+/// Default transaction timeout (30 seconds)
+const DEFAULT_TXN_TIMEOUT_SECS: u64 = 30;
+
 /// Tracking entry for an active transaction
 struct ActiveTxn {
     context: TxnContext,
     snapshot: Snapshot,
     status: TxnStatus,
+    started_at: Instant,
+    /// Last activity timestamp — refreshed on every with_context call.
+    /// Timeout is based on idle time (elapsed since last activity), not total age.
+    last_activity: Instant,
 }
 
 // ============================================================================
@@ -98,6 +106,8 @@ pub struct TxnManager {
     total_committed: AtomicU64,
     /// Total aborted transactions (for monitoring)
     total_aborted: AtomicU64,
+    /// Transaction timeout duration
+    txn_timeout: Duration,
 }
 
 impl TxnManager {
@@ -111,6 +121,7 @@ impl TxnManager {
             gc: GarbageCollector::new(),
             total_committed: AtomicU64::new(0),
             total_aborted: AtomicU64::new(0),
+            txn_timeout: Duration::from_secs(DEFAULT_TXN_TIMEOUT_SECS),
         }
     }
 
@@ -153,11 +164,17 @@ impl TxnManager {
         let snapshot = self.snapshot_manager.create_rw_snapshot();
         let context = TxnContext::new(txn_id, snapshot.read_ts, false);
 
+        let now = Instant::now();
         self.active_txns.write().insert(txn_id, ActiveTxn {
             context,
             snapshot: snapshot.clone(),
             status: TxnStatus::Active,
+            started_at: now,
+            last_activity: now,
         });
+
+        // Opportunistically abort timed-out transactions
+        self.abort_timed_out_txns();
 
         txn_id
     }
@@ -168,10 +185,13 @@ impl TxnManager {
         let snapshot = self.snapshot_manager.create_snapshot();
         let context = TxnContext::new(txn_id, snapshot.read_ts, true);
 
+        let now = Instant::now();
         self.active_txns.write().insert(txn_id, ActiveTxn {
             context,
             snapshot: snapshot.clone(),
             status: TxnStatus::Active,
+            started_at: now,
+            last_activity: now,
         });
 
         txn_id
@@ -331,7 +351,8 @@ impl TxnManager {
         Ok(store.read(row_id, snapshot_ts))
     }
 
-    /// Execute a closure with mutable access to the transaction context
+    /// Execute a closure with mutable access to the transaction context.
+    /// Checks for transaction timeout before executing.
     pub fn with_context<F, R>(&self, txn_id: TxnId, f: F) -> io::Result<R>
     where
         F: FnOnce(&mut TxnContext) -> io::Result<R>,
@@ -346,6 +367,23 @@ impl TxnManager {
                 "Transaction is not active",
             ));
         }
+        // Check idle timeout (time since last activity, not total age)
+        if txn.last_activity.elapsed() > self.txn_timeout {
+            txn.status = TxnStatus::Aborted;
+            txn.context.set_finished();
+            self.conflict_detector.record_abort(&txn.context);
+            let snapshot_id = txn.snapshot.id;
+            txns.remove(&txn_id);
+            drop(txns);
+            self.snapshot_manager.release(snapshot_id);
+            self.total_aborted.fetch_add(1, Ordering::Relaxed);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("Transaction {} timed out (idle > {:?})", txn_id, self.txn_timeout),
+            ));
+        }
+        // Refresh last activity timestamp
+        txn.last_activity = Instant::now();
         f(&mut txn.context)
     }
 
@@ -374,6 +412,43 @@ impl TxnManager {
             .get(&txn_id)
             .map(|t| t.status == TxnStatus::Active)
             .unwrap_or(false)
+    }
+
+    /// Check if a specific transaction has timed out
+    pub fn is_timed_out(&self, txn_id: TxnId) -> bool {
+        self.active_txns.read()
+            .get(&txn_id)
+            .map(|t| t.last_activity.elapsed() > self.txn_timeout)
+            .unwrap_or(false)
+    }
+
+    /// Abort all transactions that have exceeded the timeout.
+    /// Called opportunistically from begin() to prevent leaked snapshots.
+    fn abort_timed_out_txns(&self) {
+        let mut txns = self.active_txns.write();
+        let timed_out: Vec<TxnId> = txns.iter()
+            .filter(|(_, t)| t.status == TxnStatus::Active && t.last_activity.elapsed() > self.txn_timeout)
+            .map(|(id, _)| *id)
+            .collect();
+        for txn_id in timed_out {
+            if let Some(txn) = txns.get_mut(&txn_id) {
+                txn.status = TxnStatus::Aborted;
+                txn.context.set_finished();
+                self.conflict_detector.record_abort(&txn.context);
+                let snapshot_id = txn.snapshot.id;
+                // Can't call snapshot_manager.release while holding txns write lock
+                // because release only needs snapshot_manager's own lock.
+                // But since snapshot_manager is separate, this is fine.
+                self.snapshot_manager.release(snapshot_id);
+                self.total_aborted.fetch_add(1, Ordering::Relaxed);
+            }
+            txns.remove(&txn_id);
+        }
+    }
+
+    /// Get the current transaction timeout duration
+    pub fn timeout(&self) -> Duration {
+        self.txn_timeout
     }
 }
 

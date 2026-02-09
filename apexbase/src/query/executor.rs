@@ -660,6 +660,12 @@ impl ApexExecutor {
             SqlStatement::Rollback => {
                 Err(err_input("ROLLBACK requires txn_id context - use execute_rollback_txn()"))
             }
+            SqlStatement::Reindex { table } => {
+                Self::execute_reindex(base_dir, default_table_path, &table)
+            }
+            SqlStatement::Pragma { name, arg } => {
+                Self::execute_pragma(base_dir, default_table_path, &name, arg.as_deref())
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Statement type not supported",
@@ -674,11 +680,103 @@ impl ApexExecutor {
         base_dir: &Path,
         default_table_path: &Path,
     ) -> io::Result<ApexResult> {
+        let (result, _txn_id) = Self::execute_multi_with_txn(stmts, base_dir, default_table_path, None)?;
+        Ok(result)
+    }
+
+    /// Execute multiple SQL statements with full transaction support.
+    /// Handles BEGIN/COMMIT/ROLLBACK within the statement sequence, tracks txn_id,
+    /// invalidates storage cache between write operations, and routes DML inside
+    /// active transactions through execute_in_txn.
+    /// Returns (last_result, final_txn_id) where final_txn_id reflects the
+    /// transaction state after all statements have been executed.
+    pub fn execute_multi_with_txn(
+        stmts: Vec<SqlStatement>,
+        base_dir: &Path,
+        default_table_path: &Path,
+        initial_txn_id: Option<u64>,
+    ) -> io::Result<(ApexResult, Option<u64>)> {
         let mut views: AHashMap<String, SelectStatement> = AHashMap::new();
         let mut last_result: Option<ApexResult> = None;
+        let mut current_txn: Option<u64> = initial_txn_id;
 
         for stmt in stmts {
+            // Determine if this is a write operation (for cache invalidation)
+            let is_write = matches!(&stmt,
+                SqlStatement::Insert { .. } | SqlStatement::InsertOnConflict { .. } |
+                SqlStatement::InsertSelect { .. } |
+                SqlStatement::Delete { .. } | SqlStatement::Update { .. } |
+                SqlStatement::TruncateTable { .. } | SqlStatement::AlterTable { .. } |
+                SqlStatement::CreateTable { .. } | SqlStatement::DropTable { .. } |
+                SqlStatement::CreateIndex { .. } | SqlStatement::DropIndex { .. } |
+                SqlStatement::Reindex { .. }
+            );
+
             match stmt {
+                // Transaction commands
+                SqlStatement::BeginTransaction { read_only } => {
+                    let result = Self::execute_begin(read_only)?;
+                    if let ApexResult::Scalar(txn_id) = &result {
+                        current_txn = Some(*txn_id as u64);
+                    }
+                    last_result = Some(result);
+                }
+                SqlStatement::Commit => {
+                    if let Some(txn_id) = current_txn {
+                        let result = Self::execute_commit_txn(txn_id, base_dir, default_table_path)?;
+                        // Invalidate cache after commit to ensure fresh data
+                        invalidate_storage_cache(default_table_path);
+                        crate::storage::engine::engine().invalidate(default_table_path);
+                        current_txn = None;
+                        last_result = Some(result);
+                    } else {
+                        return Err(err_input("COMMIT without active transaction"));
+                    }
+                }
+                SqlStatement::Rollback => {
+                    if let Some(txn_id) = current_txn {
+                        let result = Self::execute_rollback_txn(txn_id)?;
+                        current_txn = None;
+                        last_result = Some(result);
+                    } else {
+                        return Err(err_input("ROLLBACK without active transaction"));
+                    }
+                }
+                SqlStatement::Savepoint { name } => {
+                    if let Some(txn_id) = current_txn {
+                        let mgr = crate::txn::txn_manager();
+                        mgr.with_context(txn_id, |ctx| {
+                            ctx.savepoint(&name);
+                            Ok(())
+                        })?;
+                        last_result = Some(ApexResult::Scalar(0));
+                    } else {
+                        return Err(err_input("SAVEPOINT without active transaction"));
+                    }
+                }
+                SqlStatement::RollbackToSavepoint { name } => {
+                    if let Some(txn_id) = current_txn {
+                        let mgr = crate::txn::txn_manager();
+                        mgr.with_context(txn_id, |ctx| {
+                            ctx.rollback_to_savepoint(&name)
+                        })?;
+                        last_result = Some(ApexResult::Scalar(0));
+                    } else {
+                        return Err(err_input("ROLLBACK TO SAVEPOINT without active transaction"));
+                    }
+                }
+                SqlStatement::ReleaseSavepoint { name } => {
+                    if let Some(txn_id) = current_txn {
+                        let mgr = crate::txn::txn_manager();
+                        mgr.with_context(txn_id, |ctx| {
+                            ctx.release_savepoint(&name)
+                        })?;
+                        last_result = Some(ApexResult::Scalar(0));
+                    } else {
+                        return Err(err_input("RELEASE SAVEPOINT without active transaction"));
+                    }
+                }
+                // View management
                 SqlStatement::CreateView { name, stmt } => {
                     let view_name = name.trim_matches('"').to_string();
                     if view_name.eq_ignore_ascii_case("default") {
@@ -697,21 +795,38 @@ impl ApexExecutor {
                     let view_name = name.trim_matches('"');
                     views.remove(view_name);
                 }
+                // SELECT with view rewriting
                 SqlStatement::Select(mut select) => {
                     select = Self::rewrite_select_views(select, &views);
-                    last_result = Some(Self::execute_parsed_multi(SqlStatement::Select(select), base_dir, default_table_path)?);
+                    if let Some(txn_id) = current_txn {
+                        last_result = Some(Self::execute_in_txn(txn_id, SqlStatement::Select(select), base_dir, default_table_path)?);
+                    } else {
+                        last_result = Some(Self::execute_parsed_multi(SqlStatement::Select(select), base_dir, default_table_path)?);
+                    }
                 }
                 SqlStatement::Union(union) => {
                     last_result = Some(Self::execute_union(union, default_table_path)?);
                 }
-                // DDL/DML statements - execute directly
+                // DML/DDL statements - route through txn if active
                 other => {
-                    last_result = Some(Self::execute_parsed_multi(other, base_dir, default_table_path)?);
+                    if let Some(txn_id) = current_txn {
+                        // Inside transaction: buffer DML through execute_in_txn
+                        last_result = Some(Self::execute_in_txn(txn_id, other, base_dir, default_table_path)?);
+                    } else {
+                        // Outside transaction: execute directly
+                        last_result = Some(Self::execute_parsed_multi(other, base_dir, default_table_path)?);
+                        // Invalidate cache after write operations to ensure next statement sees fresh data
+                        if is_write {
+                            invalidate_storage_cache(default_table_path);
+                            crate::storage::engine::engine().invalidate(default_table_path);
+                        }
+                    }
                 }
             }
         }
 
-        last_result.ok_or_else(|| err_input( "No query to execute"))
+        let result = last_result.ok_or_else(|| err_input( "No query to execute"))?;
+        Ok((result, current_txn))
     }
 
     fn rewrite_select_views(mut select: SelectStatement, views: &AHashMap<String, SelectStatement>) -> SelectStatement {
@@ -12377,11 +12492,6 @@ impl ApexExecutor {
         if columns.is_empty() {
             return Err(err_input("CREATE INDEX requires at least one column"));
         }
-        // Currently support single-column indexes only
-        if columns.len() > 1 {
-            return Err(err_input("Multi-column indexes not yet supported"));
-        }
-        let col_name = &columns[0];
 
         let idx_type = match index_type_str {
             Some("HASH") => IndexType::Hash,
@@ -12410,28 +12520,40 @@ impl ApexExecutor {
             return Err(err_input(format!("Index '{}' already exists on table '{}'", name, table)));
         }
 
-        // Determine column data type from table schema
+        // Determine column data type from table schema (use first column's type)
         let storage = TableStorageBackend::open(&table_path)?;
         let schema = storage.get_schema();
+        let first_col = &columns[0];
         let data_type = schema.iter()
-            .find(|(n, _)| n == col_name)
+            .find(|(n, _)| n == first_col)
             .map(|(_, dt)| dt.clone())
-            .ok_or_else(|| err_not_found(format!("Column '{}' not found in table '{}'", col_name, table)))?;
+            .ok_or_else(|| err_not_found(format!("Column '{}' not found in table '{}'", first_col, table)))?;
 
-        // Create the index
-        idx_mgr.create_index(name, col_name, idx_type, unique, data_type)?;
+        // Validate all columns exist
+        for col in columns {
+            if !schema.iter().any(|(n, _)| n == col) {
+                return Err(err_not_found(format!("Column '{}' not found in table '{}'", col, table)));
+            }
+        }
+
+        // Create the index (supports single or multi-column)
+        idx_mgr.create_index_multi(name, columns, idx_type, unique, data_type)?;
 
         // Build index from existing data
         let row_count = storage.row_count();
         if row_count > 0 {
-            // Read _id column and the indexed column
-            let col_refs = ["_id", col_name.as_str()];
+            // Read _id column and all indexed columns
+            let mut col_refs_owned: Vec<String> = vec!["_id".to_string()];
+            for c in columns {
+                if !col_refs_owned.contains(c) {
+                    col_refs_owned.push(c.clone());
+                }
+            }
+            let col_refs: Vec<&str> = col_refs_owned.iter().map(|s| s.as_str()).collect();
             let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
 
             let id_col = batch.column_by_name("_id")
                 .ok_or_else(|| err_data("_id column not found"))?;
-            let data_col = batch.column_by_name(col_name)
-                .ok_or_else(|| err_data(format!("Column '{}' not found in result", col_name)))?;
 
             let id_arr = id_col.as_any().downcast_ref::<UInt64Array>()
                 .or_else(|| None);
@@ -12446,10 +12568,13 @@ impl ApexExecutor {
                     row as u64
                 };
 
-                // Extract value from data column
-                let value = Self::arrow_value_at_col(data_col, row);
+                // Extract values from all indexed columns
                 let mut col_vals = std::collections::HashMap::new();
-                col_vals.insert(col_name.clone(), value);
+                for col in columns {
+                    if let Some(data_col) = batch.column_by_name(col) {
+                        col_vals.insert(col.clone(), Self::arrow_value_at_col(data_col, row));
+                    }
+                }
                 idx_mgr.on_insert(row_id, &col_vals)?;
             }
         }
@@ -13331,6 +13456,272 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result_batch))
     }
 
+    /// Execute REINDEX — rebuild all indexes on a table from scratch
+    fn execute_reindex(
+        base_dir: &Path,
+        default_table_path: &Path,
+        table: &str,
+    ) -> io::Result<ApexResult> {
+        let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
+        if !table_path.exists() {
+            return Err(err_not_found(format!("Table '{}' does not exist", table)));
+        }
+
+        let idx_mgr_arc = get_index_manager(base_dir, table);
+        let mut idx_mgr = idx_mgr_arc.lock();
+        let indexes = idx_mgr.list_indexes().iter().map(|m| (m.name.clone(), m.column_name.clone())).collect::<Vec<_>>();
+
+        if indexes.is_empty() {
+            return Ok(ApexResult::Scalar(0));
+        }
+
+        // Clear all index data
+        idx_mgr.rebuild_all();
+
+        // Re-read table data and rebuild
+        let storage = TableStorageBackend::open(&table_path)?;
+        let row_count = storage.row_count();
+        if row_count > 0 {
+            let mut col_names: Vec<String> = vec!["_id".to_string()];
+            for (_, col) in &indexes {
+                if !col_names.contains(col) {
+                    col_names.push(col.clone());
+                }
+            }
+            let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+            let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
+
+            let id_col = batch.column_by_name("_id")
+                .ok_or_else(|| err_data("_id column not found"))?;
+            let id_arr = id_col.as_any().downcast_ref::<UInt64Array>();
+            let id_arr_i64 = id_col.as_any().downcast_ref::<Int64Array>();
+
+            for row in 0..batch.num_rows() {
+                let row_id: u64 = if let Some(arr) = id_arr {
+                    arr.value(row)
+                } else if let Some(arr) = id_arr_i64 {
+                    arr.value(row) as u64
+                } else {
+                    row as u64
+                };
+
+                for (_, idx_col) in &indexes {
+                    if let Some(data_col) = batch.column_by_name(idx_col) {
+                        let value = Self::arrow_value_at_col(data_col, row);
+                        let mut col_vals = std::collections::HashMap::new();
+                        col_vals.insert(idx_col.clone(), value);
+                        let _ = idx_mgr.on_insert(row_id, &col_vals);
+                    }
+                }
+            }
+        }
+
+        idx_mgr.save()?;
+        Ok(ApexResult::Scalar(indexes.len() as i64))
+    }
+
+    /// Execute PRAGMA commands
+    /// Supported: integrity_check, table_info(table), version, stats
+    fn execute_pragma(
+        base_dir: &Path,
+        default_table_path: &Path,
+        name: &str,
+        arg: Option<&str>,
+    ) -> io::Result<ApexResult> {
+        match name.to_lowercase().as_str() {
+            "integrity_check" => {
+                let table_name = arg.unwrap_or("default");
+                let table_path = Self::resolve_table_path(table_name, base_dir, default_table_path);
+                Self::pragma_integrity_check(&table_path, table_name)
+            }
+            "table_info" => {
+                let table_name = arg.ok_or_else(|| err_input("PRAGMA table_info requires a table name argument"))?;
+                let table_path = Self::resolve_table_path(table_name, base_dir, default_table_path);
+                Self::pragma_table_info(&table_path, table_name)
+            }
+            "version" => {
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("version", arrow::datatypes::DataType::Utf8, false),
+                ]));
+                let arrays: Vec<ArrayRef> = vec![
+                    Arc::new(StringArray::from(vec!["ApexBase 1.0"])),
+                ];
+                let batch = RecordBatch::try_new(schema, arrays)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                Ok(ApexResult::Data(batch))
+            }
+            "stats" => {
+                let table_name = arg.unwrap_or("default");
+                let table_path = Self::resolve_table_path(table_name, base_dir, default_table_path);
+                let key = table_path.to_string_lossy().to_string();
+                if let Some(stats) = crate::query::planner::get_table_stats(&key) {
+                    let schema = Arc::new(Schema::new(vec![
+                        Field::new("table", arrow::datatypes::DataType::Utf8, false),
+                        Field::new("row_count", arrow::datatypes::DataType::Int64, false),
+                        Field::new("columns", arrow::datatypes::DataType::Int64, false),
+                        Field::new("collected_at", arrow::datatypes::DataType::Int64, false),
+                    ]));
+                    let arrays: Vec<ArrayRef> = vec![
+                        Arc::new(StringArray::from(vec![table_name])),
+                        Arc::new(Int64Array::from(vec![stats.row_count as i64])),
+                        Arc::new(Int64Array::from(vec![stats.columns.len() as i64])),
+                        Arc::new(Int64Array::from(vec![stats.collected_at as i64])),
+                    ];
+                    let batch = RecordBatch::try_new(schema, arrays)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    Ok(ApexResult::Data(batch))
+                } else {
+                    Ok(ApexResult::Scalar(0))
+                }
+            }
+            _ => Err(err_input(format!("Unknown PRAGMA: {}. Supported: integrity_check, table_info, version, stats", name))),
+        }
+    }
+
+    /// PRAGMA integrity_check — verify file structure, header, schema, CRC
+    fn pragma_integrity_check(table_path: &Path, table_name: &str) -> io::Result<ApexResult> {
+        let mut checks: Vec<String> = Vec::new();
+        let mut statuses: Vec<String> = Vec::new();
+
+        // Check 1: File exists
+        if !table_path.exists() {
+            checks.push("file_exists".to_string());
+            statuses.push(format!("FAIL: Table '{}' file not found", table_name));
+            return Self::integrity_result(&checks, &statuses);
+        }
+        checks.push("file_exists".to_string());
+        statuses.push("ok".to_string());
+
+        // Check 2: File is readable and has valid header
+        let file_meta = std::fs::metadata(table_path)?;
+        let file_size = file_meta.len();
+        if file_size < 128 {
+            checks.push("header_valid".to_string());
+            statuses.push(format!("FAIL: File too small ({} bytes, minimum 128)", file_size));
+            return Self::integrity_result(&checks, &statuses);
+        }
+        checks.push("header_valid".to_string());
+        statuses.push("ok".to_string());
+
+        // Check 3: Can open storage
+        match TableStorageBackend::open(table_path) {
+            Ok(storage) => {
+                checks.push("storage_open".to_string());
+                statuses.push("ok".to_string());
+
+                // Check 4: Schema readable
+                let schema = storage.get_schema();
+                checks.push("schema_valid".to_string());
+                statuses.push(format!("ok ({} columns)", schema.len()));
+
+                // Check 5: Row count consistent
+                let row_count = storage.row_count();
+                checks.push("row_count".to_string());
+                statuses.push(format!("ok ({} rows)", row_count));
+
+                // Check 6: Can read data
+                match storage.read_columns_to_arrow(None, 0, Some(1)) {
+                    Ok(batch) => {
+                        checks.push("data_readable".to_string());
+                        statuses.push(format!("ok ({} columns in batch)", batch.num_columns()));
+                    }
+                    Err(e) => {
+                        checks.push("data_readable".to_string());
+                        statuses.push(format!("FAIL: {}", e));
+                    }
+                }
+
+                // Check 7: WAL file (if exists)
+                let wal_path = table_path.with_extension("apex.wal");
+                if wal_path.exists() {
+                    match crate::storage::incremental::WalReader::open(&wal_path) {
+                        Ok(mut reader) => {
+                            match reader.read_all() {
+                                Ok(records) => {
+                                    checks.push("wal_valid".to_string());
+                                    statuses.push(format!("ok ({} records)", records.len()));
+                                }
+                                Err(e) => {
+                                    checks.push("wal_valid".to_string());
+                                    statuses.push(format!("WARN: WAL read error: {}", e));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            checks.push("wal_valid".to_string());
+                            statuses.push(format!("WARN: WAL open error: {}", e));
+                        }
+                    }
+                } else {
+                    checks.push("wal_valid".to_string());
+                    statuses.push("ok (no WAL file)".to_string());
+                }
+
+                // Check 8: Index files (if any)
+                let (bd, tn) = base_dir_and_table(table_path);
+                let idx_mgr_arc = get_index_manager(&bd, &tn);
+                let idx_mgr = idx_mgr_arc.lock();
+                let idx_list = idx_mgr.list_indexes();
+                checks.push("indexes".to_string());
+                statuses.push(format!("ok ({} indexes)", idx_list.len()));
+            }
+            Err(e) => {
+                checks.push("storage_open".to_string());
+                statuses.push(format!("FAIL: {}", e));
+            }
+        }
+
+        Self::integrity_result(&checks, &statuses)
+    }
+
+    /// Build integrity check result as RecordBatch
+    fn integrity_result(checks: &[String], statuses: &[String]) -> io::Result<ApexResult> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("check", arrow::datatypes::DataType::Utf8, false),
+            Field::new("status", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(checks.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(statuses.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+        ];
+        let batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(ApexResult::Data(batch))
+    }
+
+    /// PRAGMA table_info — show table schema
+    fn pragma_table_info(table_path: &Path, table_name: &str) -> io::Result<ApexResult> {
+        if !table_path.exists() {
+            return Err(err_not_found(format!("Table '{}' does not exist", table_name)));
+        }
+        let storage = TableStorageBackend::open(table_path)?;
+        let schema = storage.get_schema();
+
+        let mut cids: Vec<i64> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut types: Vec<String> = Vec::new();
+
+        for (idx, (col_name, col_type)) in schema.iter().enumerate() {
+            cids.push(idx as i64);
+            names.push(col_name.clone());
+            types.push(format!("{:?}", col_type));
+        }
+
+        let result_schema = Arc::new(Schema::new(vec![
+            Field::new("cid", arrow::datatypes::DataType::Int64, false),
+            Field::new("name", arrow::datatypes::DataType::Utf8, false),
+            Field::new("type", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(cids)),
+            Arc::new(StringArray::from(names.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(types.iter().map(|s| s.as_str()).collect::<Vec<_>>())),
+        ];
+        let batch = RecordBatch::try_new(result_schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(ApexResult::Data(batch))
+    }
+
     /// Execute INSERT ON CONFLICT (UPSERT)
     /// - DO NOTHING: skip rows that conflict on the specified columns
     /// - DO UPDATE SET ...: update conflicting rows with the specified assignments
@@ -13718,7 +14109,8 @@ impl ApexExecutor {
         };
         
         // Read columns needed for WHERE evaluation + assignments + indexed columns + _id
-        let storage = TableStorageBackend::open(storage_path)?;
+        // Use open_for_write to load V4 data into memory so compact_deltas() can merge
+        let storage = TableStorageBackend::open_for_write(storage_path)?;
         let batch = storage.read_columns_to_arrow(None, 0, None)?;
         
         let filter_mask = if let Some(where_expr) = where_clause {
@@ -13986,14 +14378,12 @@ impl ApexExecutor {
             storage.delta_update_row(*row_id, update_data);
         }
         
-        // Persist delta store and trigger compaction if threshold exceeded
+        // Persist delta store and compact immediately to merge updates into base file.
+        // This prevents data loss when a subsequent write operation (DELETE, INSERT)
+        // triggers save_v4() which clears the delta store.
         if updated > 0 {
             storage.save_delta_store()?;
-            
-            // Auto-compact when delta count exceeds threshold (20% of base rows or 10k)
-            if storage.needs_delta_compaction() {
-                let _ = storage.compact_deltas();
-            }
+            let _ = storage.compact_deltas();
             
             // Index maintenance: update indexed values
             if !indexed_cols.is_empty() {

@@ -1255,9 +1255,17 @@ impl ApexStorageImpl {
             self.invalidate_backend(&table_name);
         }
         
-        // For DDL (CREATE/DROP TABLE) and CTE (WITH ...) queries, don't require a current table
+        // Detect multi-statement SQL: contains ';' with non-whitespace content after
+        // Also treat BEGIN/COMMIT/ROLLBACK-containing SQL as multi-statement candidate
+        let is_multi_stmt = {
+            let trimmed = sql.trim().trim_end_matches(';').trim();
+            trimmed.contains(';')
+        };
+        let contains_txn_cmd = sql_upper.contains("BEGIN") || sql_upper.contains("COMMIT") || sql_upper.contains("ROLLBACK");
+        
+        // For DDL, CTE, multi-statement, or txn-containing SQL, don't require a current table
         let is_cte = sql_upper.starts_with("WITH ");
-        let table_path = if is_ddl || is_cte {
+        let table_path = if is_ddl || is_cte || (is_multi_stmt && contains_txn_cmd) {
             self.get_current_table_path().unwrap_or_else(|_| self.base_dir.clone())
         } else {
             self.get_current_table_path()?
@@ -1265,7 +1273,7 @@ impl ApexStorageImpl {
         let base_dir = self.base_dir.clone();
 
         // FAST PATH: SELECT * FROM <table> LIMIT N — build Arrow batch directly from V4
-        if !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT")
+        if !is_multi_stmt && !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT")
             && !sql_upper.contains("WHERE") && !sql_upper.contains("ORDER")
             && !sql_upper.contains("GROUP") && !sql_upper.contains("JOIN") {
             if let Some(limit_str) = sql_upper.rsplit("LIMIT").next() {
@@ -1291,15 +1299,36 @@ impl ApexStorageImpl {
         }
 
         let sql = sql.to_string();
-
-        // Execute query
-        let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
-            let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
-            result.to_record_batch()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-        })?;
+        
+        // For multi-statement SQL with transaction commands, use txn-aware path
+        let current_txn = *self.current_txn_id.read();
+        
+        let (batch, new_txn_id) = if is_multi_stmt {
+            // Multi-statement: parse all and execute with txn support
+            py.allow_threads(|| -> PyResult<(RecordBatch, Option<u64>)> {
+                let stmts = crate::query::sql_parser::SqlParser::parse_multi(&sql)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let (result, final_txn) = ApexExecutor::execute_multi_with_txn(stmts, &base_dir, &table_path, current_txn)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let batch = result.to_record_batch()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                Ok((batch, final_txn))
+            })?
+        } else {
+            // Single statement: standard path
+            let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
+                let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                result.to_record_batch()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })?;
+            (batch, current_txn)
+        };
+        
+        // Update transaction state if changed by multi-statement execution
+        if is_multi_stmt && new_txn_id != current_txn {
+            *self.current_txn_id.write() = new_txn_id;
+        }
         
         // Serialize to IPC format
         let mut buf = Vec::new();
@@ -1313,7 +1342,7 @@ impl ApexStorageImpl {
         }
         
         // Invalidate cached backend AFTER write operations
-        if is_write_op && !table_name.is_empty() {
+        if (is_write_op || is_multi_stmt) && !table_name.is_empty() {
             self.invalidate_backend(&table_name);
         }
         

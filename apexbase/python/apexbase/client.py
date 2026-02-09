@@ -628,12 +628,50 @@ class ApexClient:
         self._check_connection()
         # DDL (CREATE TABLE) is allowed without a table selected
         sql_upper = sql.strip().upper()
-        if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE') or sql_upper.startswith('WITH ')):
-            self._ensure_table_selected()
+        
+        # Detect multi-statement SQL: contains ';' with non-whitespace content after
+        _trimmed = sql.strip().rstrip(';').strip()
+        is_multi_stmt = ';' in _trimmed
+        
+        if not is_multi_stmt:
+            if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE') or sql_upper.startswith('WITH ')):
+                self._ensure_table_selected()
+        else:
+            # Multi-statement: only require table if we have one
+            try:
+                self._ensure_table_selected()
+            except Exception:
+                pass
+        
         with self._lock:
             # Determine if _id should be shown based on SQL (like ApexClient)
             if show_internal_id is None:
                 show_internal_id = self._should_show_internal_id(sql)
+            
+            # MULTI-STATEMENT PATH: route through Arrow IPC which handles
+            # transactions (BEGIN/COMMIT/ROLLBACK) and cache invalidation in Rust
+            if is_multi_stmt:
+                ipc_bytes = self._storage._execute_arrow_ipc(sql)
+                # Sync transaction state: check if BEGIN/COMMIT/ROLLBACK changed txn state
+                su = sql_upper
+                if 'BEGIN' in su or 'COMMIT' in su or 'ROLLBACK' in su:
+                    # Determine final txn state from the SQL sequence
+                    # Last txn command wins
+                    for part in su.split(';'):
+                        part = part.strip()
+                        if part.startswith('BEGIN'):
+                            self._in_txn = True
+                        elif part in ('COMMIT', 'ROLLBACK') or part.startswith('COMMIT') or part == 'ROLLBACK':
+                            self._in_txn = False
+                if su.strip().rstrip(';').strip().startswith('CREATE TABLE'):
+                    self._current_table = self._storage.current_table()
+                reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
+                table = reader.read_all()
+                if table.num_rows == 0:
+                    table = None
+                rv = ResultView(arrow_table=table, data=None)
+                rv._show_internal_id = show_internal_id
+                return rv
             
             # FAST PATH: SELECT * LIMIT N (small N) — direct columnar transfer (no IPC)
             sql_up = sql.strip().upper()
