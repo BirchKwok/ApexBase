@@ -1,0 +1,625 @@
+//! ApexBase V3 On-Demand Columnar Format
+//!
+//! A custom binary file format supporting:
+//! - Column projection: read only required columns
+//! - Row range scan: read only required row ranges  
+//! - Zero-copy reads via pread/mmap
+//! - No external serialization dependencies (bincode-free)
+//!
+//! File Format:
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────┐
+//! │ Header (256 bytes)                                          │
+//! │   - Magic: "APEXV3\0\0" (8 bytes)                           │
+//! │   - Version: u32                                            │
+//! │   - Flags: u32                                              │
+//! │   - Row count: u64                                          │
+//! │   - Column count: u32                                       │
+//! │   - Row group size: u32 (rows per group, default 65536)     │
+//! │   - Schema offset: u64                                      │
+//! │   - Column index offset: u64                                │
+//! │   - ID column offset: u64                                   │
+//! │   - Timestamps, checksum, reserved                          │
+//! ├─────────────────────────────────────────────────────────────┤
+//! │ Schema Block                                                │
+//! │   - For each column: [name_len:u16][name:bytes][type:u8]    │
+//! ├─────────────────────────────────────────────────────────────┤
+//! │ Column Index (32 bytes per column)                          │
+//! │   - data_offset: u64                                        │
+//! │   - data_length: u64                                        │
+//! │   - null_offset: u64                                        │
+//! │   - null_length: u64                                        │
+//! ├─────────────────────────────────────────────────────────────┤
+//! │ ID Column (contiguous u64 array)                            │
+//! ├─────────────────────────────────────────────────────────────┤
+//! │ Column Data Blocks                                          │
+//! │   Per column: [null_bitmap][column_data]                    │
+//! ├─────────────────────────────────────────────────────────────┤
+//! │ Footer (24 bytes)                                           │
+//! │   - Magic: "APEXEND\0"                                      │
+//! │   - Checksum: u32                                           │
+//! │   - File size: u64                                          │
+//! └─────────────────────────────────────────────────────────────┘
+//! ```
+
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::cell::RefCell;
+
+use memmap2::Mmap;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use arrow::record_batch::RecordBatch;
+use arrow::array::ArrayRef;
+
+use super::delta::DeltaStore;
+
+/// Helper for InvalidData errors
+#[inline] fn err_data(msg: impl Into<String>) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, msg.into()) }
+/// Helper for NotFound errors  
+#[inline] fn err_not_found(msg: impl Into<String>) -> io::Error { io::Error::new(io::ErrorKind::NotFound, msg.into()) }
+/// Helper for NotConnected errors
+#[inline] fn err_not_conn(msg: &str) -> io::Error { io::Error::new(io::ErrorKind::NotConnected, msg) }
+/// Helper for InvalidInput errors
+#[inline] fn err_input(msg: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidInput, msg) }
+
+// Thread-local buffer for scattered reads to avoid repeated allocations
+thread_local! {
+    static SCATTERED_READ_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(8192));
+}
+
+// ============================================================================
+// Cross-platform file reading (mmap with pread fallback)
+// ============================================================================
+
+/// Memory-mapped file cache for fast repeated reads
+/// Uses OS page cache for automatic caching
+struct MmapCache {
+    mmap: Option<Mmap>,
+    file_size: u64,
+}
+
+impl MmapCache {
+    fn new() -> Self {
+        Self { mmap: None, file_size: 0 }
+    }
+    
+    /// Get or create mmap for the file
+    fn get_or_create(&mut self, file: &File) -> io::Result<&Mmap> {
+        let metadata = file.metadata()?;
+        let current_size = metadata.len();
+        
+        // Invalidate cache if file size changed
+        if self.mmap.is_none() || self.file_size != current_size {
+            if current_size == 0 {
+                return Err(err_data("Empty file"));
+            }
+            // SAFETY: File must remain open while mmap is in use
+            // We ensure this by keeping mmap in the same struct as file
+            let mmap = unsafe {
+                // On Linux, use MAP_POPULATE for files < 64MB to pre-fault pages
+                // and eliminate page-fault overhead on first access.
+                #[cfg(target_os = "linux")]
+                {
+                    if current_size < 64 * 1024 * 1024 {
+                        memmap2::MmapOptions::new().populate().map(file)?
+                    } else {
+                        Mmap::map(file)?
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                { Mmap::map(file)? }
+            };
+            // On Linux, hint sequential access so the kernel doubles readahead.
+            #[cfg(target_os = "linux")]
+            { let _ = mmap.advise(memmap2::Advice::Sequential); }
+            self.mmap = Some(mmap);
+            self.file_size = current_size;
+        }
+        
+        Ok(self.mmap.as_ref().unwrap())
+    }
+    
+    /// Read bytes at offset using mmap (zero-copy when possible)
+    fn read_at(&mut self, file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        let mmap = self.get_or_create(file)?;
+        let start = offset as usize;
+        let end = start + buf.len();
+        
+        if end > mmap.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Read past EOF: offset={}, len={}, file_size={}", offset, buf.len(), mmap.len())
+            ));
+        }
+        
+        buf.copy_from_slice(&mmap[start..end]);
+        Ok(())
+    }
+    
+    /// Get a slice directly from mmap (true zero-copy)
+    fn slice(&mut self, file: &File, offset: u64, len: usize) -> io::Result<&[u8]> {
+        let mmap = self.get_or_create(file)?;
+        let start = offset as usize;
+        let end = start + len;
+        
+        if end > mmap.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Slice past EOF: offset={}, len={}, file_size={}", offset, len, mmap.len())
+            ));
+        }
+        
+        Ok(&mmap[start..end])
+    }
+    
+    /// Invalidate cache (call after writes)
+    fn invalidate(&mut self) {
+        self.mmap = None;
+        self.file_size = 0;
+    }
+}
+
+/// Cross-platform positioned read (fallback for when mmap is not available)
+#[cfg(unix)]
+fn pread_fallback(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pread_fallback(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut total_read = 0;
+    while total_read < buf.len() {
+        let n = file.seek_read(&mut buf[total_read..], offset + total_read as u64)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
+        }
+        total_read += n;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pread_fallback(file: &mut File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    // Generic fallback using seek + read (not thread-safe)
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(buf)
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const MAGIC_V3: &[u8; 8] = b"APEXV3\0\0";
+const FORMAT_VERSION_V4: u32 = 4;
+const HEADER_SIZE_V3: usize = 256;
+const COLUMN_INDEX_ENTRY_SIZE: usize = 32;
+const DEFAULT_ROW_GROUP_SIZE: u32 = 65536;
+
+// V4 Row Group format constants
+const MAGIC_ROW_GROUP: &[u8; 4] = b"APXG";
+const MAGIC_V4_FOOTER: &[u8; 8] = b"APXFOOT\0";
+/// Size of a serialized RowGroupMeta entry in the footer (8+8+4+8+8+4 = 40 bytes)
+const ROW_GROUP_META_SIZE: usize = 40;
+
+// Per-RG compression flags (stored in RG header byte 28)
+const RG_COMPRESS_NONE: u8 = 0;
+const RG_COMPRESS_LZ4: u8 = 1;
+const RG_COMPRESS_ZSTD: u8 = 2;
+
+/// Minimum RG body size (bytes) to bother compressing.
+/// Below this threshold, compression overhead exceeds savings.
+const COMPRESS_MIN_BODY_SIZE: usize = 512;
+
+// Per-column encoding types (stored as 1-byte prefix when encoding_version=1)
+const COL_ENCODING_PLAIN: u8 = 0;
+const COL_ENCODING_RLE: u8 = 1;
+const COL_ENCODING_BITPACK: u8 = 2;
+
+/// Encode an Int64 column with RLE (Run-Length Encoding).
+/// Format: [count:u64][num_runs:u64][(value:i64, run_len:u32)...]
+/// Returns None if RLE is not beneficial (fewer than 30% compression).
+fn rle_encode_i64(data: &[i64]) -> Option<Vec<u8>> {
+    if data.len() < 16 { return None; }
+    let mut runs: Vec<(i64, u32)> = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let val = data[i];
+        let mut run_len: u32 = 1;
+        while (i + run_len as usize) < data.len() && data[i + run_len as usize] == val {
+            run_len += 1;
+        }
+        runs.push((val, run_len));
+        i += run_len as usize;
+    }
+    // Only use RLE if it saves space: runs * 12 bytes < original count * 8 bytes
+    let rle_size = 16 + runs.len() * 12; // 8 (count) + 8 (num_runs) + runs * (8+4)
+    let plain_size = 8 + data.len() * 8; // 8 (count) + data * 8
+    if rle_size >= (plain_size * 7 / 10) { return None; } // Need at least 30% savings
+    let mut buf = Vec::with_capacity(rle_size);
+    buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&(runs.len() as u64).to_le_bytes());
+    for (val, len) in &runs {
+        buf.extend_from_slice(&val.to_le_bytes());
+        buf.extend_from_slice(&len.to_le_bytes());
+    }
+    Some(buf)
+}
+
+/// Decode RLE-encoded Int64 data back to plain Vec<i64>.
+fn rle_decode_i64(bytes: &[u8]) -> io::Result<(Vec<i64>, usize)> {
+    if bytes.len() < 16 {
+        return Err(err_data("RLE Int64: truncated header"));
+    }
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    let num_runs = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    let body_len = num_runs * 12;
+    if bytes.len() < 16 + body_len {
+        return Err(err_data("RLE Int64: truncated runs"));
+    }
+    let mut result = Vec::with_capacity(count);
+    let mut pos = 16;
+    for _ in 0..num_runs {
+        let val = i64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+        let run_len = u32::from_le_bytes(bytes[pos+8..pos+12].try_into().unwrap()) as usize;
+        result.extend(std::iter::repeat(val).take(run_len));
+        pos += 12;
+    }
+    Ok((result, pos))
+}
+
+/// Encode an Int64 column with Bit-packing.
+/// Format: [count:u64][bit_width:u8][min_value:i64][packed_data...]
+/// Stores (value - min_value) in bit_width bits each.
+/// Returns None if bit-packing doesn't save enough space (need < 48-bit width).
+fn bitpack_encode_i64(data: &[i64]) -> Option<Vec<u8>> {
+    if data.len() < 16 { return None; }
+    let min_val = *data.iter().min()?;
+    let max_val = *data.iter().max()?;
+    if min_val == max_val {
+        // All same value — RLE handles this better
+        return None;
+    }
+    let range = (max_val as u128).wrapping_sub(min_val as u128);
+    if range > u64::MAX as u128 { return None; }
+    let range_u64 = range as u64;
+    let bit_width = 64 - range_u64.leading_zeros(); // bits needed
+    if bit_width == 0 || bit_width >= 48 { return None; } // Need meaningful savings
+    let packed_bits = data.len() as u64 * bit_width as u64;
+    let packed_bytes = ((packed_bits + 7) / 8) as usize;
+    // Header: 8 (count) + 1 (bit_width) + 8 (min_value) = 17 bytes
+    let total_size = 17 + packed_bytes;
+    let plain_size = 8 + data.len() * 8;
+    if total_size >= (plain_size * 7 / 10) { return None; } // Need at least 30% savings
+    let mut buf = Vec::with_capacity(total_size);
+    buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    buf.push(bit_width as u8);
+    buf.extend_from_slice(&min_val.to_le_bytes());
+    // Pack values
+    let mut packed = vec![0u8; packed_bytes];
+    let bw = bit_width as usize;
+    for (i, &val) in data.iter().enumerate() {
+        let delta = (val - min_val) as u64;
+        let bit_offset = i * bw;
+        for b in 0..bw {
+            if (delta >> b) & 1 == 1 {
+                let global_bit = bit_offset + b;
+                packed[global_bit / 8] |= 1 << (global_bit % 8);
+            }
+        }
+    }
+    buf.extend_from_slice(&packed);
+    Some(buf)
+}
+
+/// Decode Bit-packed Int64 data back to plain Vec<i64>.
+fn bitpack_decode_i64(bytes: &[u8]) -> io::Result<(Vec<i64>, usize)> {
+    if bytes.len() < 17 {
+        return Err(err_data("BitPack Int64: truncated header"));
+    }
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    let bit_width = bytes[8] as usize;
+    let min_val = i64::from_le_bytes(bytes[9..17].try_into().unwrap());
+    let packed_bits = count * bit_width;
+    let packed_bytes = (packed_bits + 7) / 8;
+    if bytes.len() < 17 + packed_bytes {
+        return Err(err_data("BitPack Int64: truncated packed data"));
+    }
+    let packed = &bytes[17..17 + packed_bytes];
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        let bit_offset = i * bit_width;
+        let mut delta: u64 = 0;
+        for b in 0..bit_width {
+            let global_bit = bit_offset + b;
+            if (packed[global_bit / 8] >> (global_bit % 8)) & 1 == 1 {
+                delta |= 1u64 << b;
+            }
+        }
+        result.push(min_val.wrapping_add(delta as i64));
+    }
+    Ok((result, 17 + packed_bytes))
+}
+
+/// Encode a Bool column with RLE (Run-Length Encoding).
+/// Format: [count:u64][num_runs:u64][(value:u8, run_len:u32)...]
+/// Bool columns are stored as packed bits; RLE encodes runs of true/false.
+/// Returns None if RLE is not beneficial (fewer than 30% compression).
+fn rle_encode_bool(data: &[u8], len: usize) -> Option<Vec<u8>> {
+    if len < 16 { return None; }
+    let mut runs: Vec<(u8, u32)> = Vec::new();
+    let mut i = 0;
+    while i < len {
+        let val = if (data[i / 8] >> (i % 8)) & 1 == 1 { 1u8 } else { 0u8 };
+        let mut run_len: u32 = 1;
+        while (i + run_len as usize) < len {
+            let next_bit = (data[(i + run_len as usize) / 8] >> ((i + run_len as usize) % 8)) & 1;
+            if (next_bit == 1) != (val == 1) { break; }
+            run_len += 1;
+        }
+        runs.push((val, run_len));
+        i += run_len as usize;
+    }
+    // RLE size: 16 header + 5 per run (1 byte val + 4 byte len)
+    let rle_size = 16 + runs.len() * 5;
+    let plain_size = 8 + (len + 7) / 8; // 8 (count) + packed_bits
+    if rle_size >= (plain_size * 7 / 10) { return None; } // Need ≥30% savings
+    let mut buf = Vec::with_capacity(rle_size);
+    buf.extend_from_slice(&(len as u64).to_le_bytes());
+    buf.extend_from_slice(&(runs.len() as u64).to_le_bytes());
+    for (val, run_len) in &runs {
+        buf.push(*val);
+        buf.extend_from_slice(&run_len.to_le_bytes());
+    }
+    Some(buf)
+}
+
+/// Decode RLE-encoded Bool data back to ColumnData::Bool.
+fn rle_decode_bool(bytes: &[u8]) -> io::Result<(ColumnData, usize)> {
+    if bytes.len() < 16 {
+        return Err(err_data("RLE Bool: truncated header"));
+    }
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    let num_runs = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    let body_len = num_runs * 5;
+    if bytes.len() < 16 + body_len {
+        return Err(err_data("RLE Bool: truncated runs"));
+    }
+    let packed_byte_len = (count + 7) / 8;
+    let mut data = vec![0u8; packed_byte_len];
+    let mut pos = 16;
+    let mut bit_idx = 0;
+    for _ in 0..num_runs {
+        let val = bytes[pos];
+        let run_len = u32::from_le_bytes(bytes[pos+1..pos+5].try_into().unwrap()) as usize;
+        if val == 1 {
+            for j in 0..run_len {
+                let bi = bit_idx + j;
+                data[bi / 8] |= 1 << (bi % 8);
+            }
+        }
+        bit_idx += run_len;
+        pos += 5;
+    }
+    Ok((ColumnData::Bool { data, len: count }, pos))
+}
+
+const COL_ENCODING_RLE_BOOL: u8 = 3;
+
+/// Write a column with encoding prefix: [encoding:u8][encoded_data...]
+/// Tries RLE → Bit-pack → Plain, picks the smallest encoding.
+fn write_column_encoded<W: Write>(col: &ColumnData, col_type: ColumnType, writer: &mut W) -> io::Result<()> {
+    match col {
+        ColumnData::Int64(data) => {
+            // Try RLE first (best for sorted/low-cardinality)
+            if let Some(rle_bytes) = rle_encode_i64(data) {
+                // Try Bit-pack too and pick the smaller
+                if let Some(bp_bytes) = bitpack_encode_i64(data) {
+                    if bp_bytes.len() < rle_bytes.len() {
+                        writer.write_all(&[COL_ENCODING_BITPACK])?;
+                        return writer.write_all(&bp_bytes);
+                    }
+                }
+                writer.write_all(&[COL_ENCODING_RLE])?;
+                return writer.write_all(&rle_bytes);
+            }
+            // Try Bit-pack alone
+            if let Some(bp_bytes) = bitpack_encode_i64(data) {
+                writer.write_all(&[COL_ENCODING_BITPACK])?;
+                return writer.write_all(&bp_bytes);
+            }
+            // Fallback: plain
+            writer.write_all(&[COL_ENCODING_PLAIN])?;
+            col.write_to(writer)
+        }
+        ColumnData::Bool { data, len } => {
+            // Try Bool RLE (best for long runs of true/false)
+            if let Some(rle_bytes) = rle_encode_bool(data, *len) {
+                writer.write_all(&[COL_ENCODING_RLE_BOOL])?;
+                return writer.write_all(&rle_bytes);
+            }
+            writer.write_all(&[COL_ENCODING_PLAIN])?;
+            col.write_to(writer)
+        }
+        _ => {
+            // Other types: always plain
+            writer.write_all(&[COL_ENCODING_PLAIN])?;
+            col.write_to(writer)
+        }
+    }
+}
+
+/// Read a column with encoding prefix: [encoding:u8][encoded_data...]
+/// Returns (ColumnData, bytes_consumed) including the encoding prefix byte.
+fn read_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<(ColumnData, usize)> {
+    if bytes.is_empty() {
+        return Err(err_data("read_column_encoded: empty input"));
+    }
+    let encoding = bytes[0];
+    let data_bytes = &bytes[1..];
+    match encoding {
+        COL_ENCODING_PLAIN => {
+            let (col, consumed) = ColumnData::from_bytes_typed(data_bytes, col_type)?;
+            Ok((col, 1 + consumed))
+        }
+        COL_ENCODING_RLE => {
+            match col_type {
+                ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
+                ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+                ColumnType::Timestamp | ColumnType::Date => {
+                    let (data, consumed) = rle_decode_i64(data_bytes)?;
+                    Ok((ColumnData::Int64(data), 1 + consumed))
+                }
+                _ => {
+                    // RLE for non-integer type — fallback to plain
+                    let (col, consumed) = ColumnData::from_bytes_typed(data_bytes, col_type)?;
+                    Ok((col, 1 + consumed))
+                }
+            }
+        }
+        COL_ENCODING_BITPACK => {
+            match col_type {
+                ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
+                ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+                ColumnType::Timestamp | ColumnType::Date => {
+                    let (data, consumed) = bitpack_decode_i64(data_bytes)?;
+                    Ok((ColumnData::Int64(data), 1 + consumed))
+                }
+                _ => {
+                    let (col, consumed) = ColumnData::from_bytes_typed(data_bytes, col_type)?;
+                    Ok((col, 1 + consumed))
+                }
+            }
+        }
+        COL_ENCODING_RLE_BOOL => {
+            let (col, consumed) = rle_decode_bool(data_bytes)?;
+            Ok((col, 1 + consumed))
+        }
+        _ => Err(err_data(&format!("Unknown column encoding: {}", encoding))),
+    }
+}
+
+/// Skip over an encoded column's data without allocating.
+/// Returns bytes consumed including the encoding prefix byte.
+fn skip_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<usize> {
+    if bytes.is_empty() {
+        return Err(err_data("skip_column_encoded: empty input"));
+    }
+    let encoding = bytes[0];
+    let data_bytes = &bytes[1..];
+    match encoding {
+        COL_ENCODING_PLAIN => {
+            let consumed = ColumnData::skip_bytes_typed(data_bytes, col_type)?;
+            Ok(1 + consumed)
+        }
+        COL_ENCODING_RLE => {
+            // RLE format: [count:u64][num_runs:u64][(value:i64, run_len:u32)...]
+            if data_bytes.len() < 16 {
+                return Err(err_data("skip RLE: truncated header"));
+            }
+            let num_runs = u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
+            Ok(1 + 16 + num_runs * 12)
+        }
+        COL_ENCODING_BITPACK => {
+            // BitPack format: [count:u64][bit_width:u8][min_value:i64][packed...]
+            if data_bytes.len() < 17 {
+                return Err(err_data("skip BitPack: truncated header"));
+            }
+            let count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+            let bit_width = data_bytes[8] as usize;
+            let packed_bytes = (count * bit_width + 7) / 8;
+            Ok(1 + 17 + packed_bytes)
+        }
+        COL_ENCODING_RLE_BOOL => {
+            // Bool RLE format: [count:u64][num_runs:u64][(value:u8, run_len:u32)...]
+            if data_bytes.len() < 16 {
+                return Err(err_data("skip RLE Bool: truncated header"));
+            }
+            let num_runs = u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
+            Ok(1 + 16 + num_runs * 5)
+        }
+        _ => Err(err_data(&format!("skip_column_encoded: unknown encoding {}", encoding))),
+    }
+}
+
+/// Decompress an RG body based on the compression flag.
+/// Returns Ok(None) if uncompressed (caller should use raw bytes),
+/// or Ok(Some(Vec<u8>)) with decompressed data.
+fn decompress_rg_body(compress_flag: u8, compressed: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    match compress_flag {
+        RG_COMPRESS_NONE => Ok(None),
+        RG_COMPRESS_LZ4 => {
+            let decompressed = lz4_flex::decompress_size_prepended(compressed)
+                .map_err(|e| err_data(&format!("LZ4 decompress failed: {}", e)))?;
+            Ok(Some(decompressed))
+        }
+        RG_COMPRESS_ZSTD => {
+            let decompressed = zstd::bulk::decompress(compressed, 256 * 1024 * 1024)
+                .map_err(|e| err_data(&format!("Zstd decompress failed: {}", e)))?;
+            Ok(Some(decompressed))
+        }
+        _ => Err(err_data(&format!("Unknown compression flag: {}", compress_flag))),
+    }
+}
+
+/// Compress an RG body using Zstd (default) with LZ4 fallback.
+/// Returns (compress_flag, compressed_or_original_bytes).
+fn compress_rg_body(body: Vec<u8>) -> (u8, Vec<u8>) {
+    if body.len() < COMPRESS_MIN_BODY_SIZE {
+        return (RG_COMPRESS_NONE, body);
+    }
+    // Try Zstd first (default, better ratio)
+    if let Ok(compressed) = zstd::bulk::compress(&body, 1) {
+        if compressed.len() < body.len() {
+            return (RG_COMPRESS_ZSTD, compressed);
+        }
+    }
+    // Fallback: try LZ4 (faster but lower ratio)
+    let compressed = lz4_flex::compress_prepend_size(&body);
+    if compressed.len() < body.len() {
+        return (RG_COMPRESS_LZ4, compressed);
+    }
+    (RG_COMPRESS_NONE, body)
+}
+
+// Column type identifiers
+const TYPE_NULL: u8 = 0;
+const TYPE_BOOL: u8 = 1;
+const TYPE_INT8: u8 = 2;
+const TYPE_INT16: u8 = 3;
+const TYPE_INT32: u8 = 4;
+const TYPE_INT64: u8 = 5;
+const TYPE_UINT8: u8 = 6;
+const TYPE_UINT16: u8 = 7;
+const TYPE_UINT32: u8 = 8;
+const TYPE_UINT64: u8 = 9;
+const TYPE_FLOAT32: u8 = 10;
+const TYPE_FLOAT64: u8 = 11;
+const TYPE_STRING: u8 = 12;
+const TYPE_BINARY: u8 = 13;
+const TYPE_STRING_DICT: u8 = 14;  // Dictionary-encoded string (DuckDB-style)
+const TYPE_TIMESTAMP: u8 = 15;   // Timestamp (microseconds since Unix epoch)
+const TYPE_DATE: u8 = 16;        // Date (days since Unix epoch)
+
+// ============================================================================
+// Data Types
+// ============================================================================
+
+// Type definitions
+include!("types.rs");
+include!("header.rs");
+
+// OnDemandStorage struct and implementation
+include!("storage_core.rs");
+include!("arrow_io.rs");
+include!("mmap_scan.rs");
+include!("read_write.rs");
+include!("agg_wal.rs");
+
+#[cfg(test)]
+mod tests;
