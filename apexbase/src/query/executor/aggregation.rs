@@ -3558,4 +3558,110 @@ impl ApexExecutor {
         }
     }
 
+    /// FAST PATH: Compute simple aggregates directly from mmap bytes.
+    /// Handles COUNT(*), COUNT(col), SUM(col), AVG(col), MIN(col), MAX(col)
+    /// for numeric columns without WHERE/GROUP BY.
+    /// Caches stats per column to avoid redundant mmap scans.
+    /// Returns None if the query can't be handled by this fast path.
+    pub(crate) fn try_mmap_aggregation(
+        backend: &crate::storage::TableStorageBackend,
+        stmt: &crate::query::SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::{AggregateFunc, SelectColumn};
+        use std::collections::HashMap;
+
+        let active_count = backend.active_row_count() as i64;
+
+        // Pre-compute: collect unique column names, compute stats once per column
+        let mut stats_cache: HashMap<String, (u64, f64, f64, f64)> = HashMap::new();
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate { func, column, distinct, .. } = col {
+                if *distinct { return Ok(None); }
+                if matches!(func, AggregateFunc::Count) {
+                    if column.as_deref() == Some("*") || column.is_none()
+                        || column.as_ref().map(|c| c.chars().next().map(|ch| ch.is_ascii_digit()).unwrap_or(false)).unwrap_or(false)
+                    { continue; }
+                }
+                if let Some(col_name) = column {
+                    if !stats_cache.contains_key(col_name.as_str()) {
+                        if let Some(stats) = backend.compute_column_stats_mmap(col_name)? {
+                            stats_cache.insert(col_name.clone(), stats);
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                } else if !matches!(func, AggregateFunc::Count) {
+                    return Ok(None);
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate { func, column, alias, .. } = col {
+                let fn_name = match func {
+                    AggregateFunc::Count => "COUNT", AggregateFunc::Sum => "SUM",
+                    AggregateFunc::Avg => "AVG", AggregateFunc::Min => "MIN", AggregateFunc::Max => "MAX",
+                };
+                let output_name = alias.clone().unwrap_or_else(|| {
+                    if let Some(c) = column { format!("{}({})", fn_name, c) } else { format!("{}(*)", fn_name) }
+                });
+
+                match func {
+                    AggregateFunc::Count => {
+                        if column.as_deref() == Some("*") || column.is_none()
+                            || column.as_ref().map(|c| c.chars().next().map(|ch| ch.is_ascii_digit()).unwrap_or(false)).unwrap_or(false)
+                        {
+                            fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
+                            arrays.push(Arc::new(Int64Array::from(vec![active_count])));
+                        } else {
+                            let (count, _, _, _) = stats_cache[column.as_ref().unwrap().as_str()];
+                            fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
+                            arrays.push(Arc::new(Int64Array::from(vec![count as i64])));
+                        }
+                    }
+                    AggregateFunc::Sum => {
+                        let (_, sum, _, _) = stats_cache[column.as_ref().unwrap().as_str()];
+                        fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
+                        arrays.push(Arc::new(Float64Array::from(vec![sum])));
+                    }
+                    AggregateFunc::Avg => {
+                        let (count, sum, _, _) = stats_cache[column.as_ref().unwrap().as_str()];
+                        let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+                        fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
+                        arrays.push(Arc::new(Float64Array::from(vec![avg])));
+                    }
+                    AggregateFunc::Min => {
+                        let (count, _, min_val, _) = stats_cache[column.as_ref().unwrap().as_str()];
+                        fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
+                        if count == 0 {
+                            arrays.push(Arc::new(Float64Array::from(vec![None as Option<f64>])));
+                        } else {
+                            arrays.push(Arc::new(Float64Array::from(vec![min_val])));
+                        }
+                    }
+                    AggregateFunc::Max => {
+                        let (count, _, _, max_val) = stats_cache[column.as_ref().unwrap().as_str()];
+                        fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
+                        if count == 0 {
+                            arrays.push(Arc::new(Float64Array::from(vec![None as Option<f64>])));
+                        } else {
+                            arrays.push(Arc::new(Float64Array::from(vec![max_val])));
+                        }
+                    }
+                }
+            }
+        }
+
+        if fields.is_empty() { return Ok(None); }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
 }

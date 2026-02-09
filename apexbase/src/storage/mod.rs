@@ -78,6 +78,8 @@ pub use on_demand::{
     ColumnData,
     ColumnDef,
     FileSchema,
+    // Compression
+    CompressionType,
 };
 
 // Re-export backend types

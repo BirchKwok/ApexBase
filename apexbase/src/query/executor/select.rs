@@ -69,6 +69,19 @@ impl ApexExecutor {
                             matches!(col, SelectColumn::Aggregate { .. })
                                 || matches!(col, SelectColumn::Expression { expr, .. } if Self::expr_contains_aggregate(expr))
                         });
+
+                        // FAST PATH: Direct aggregation for simple numeric aggregates
+                        // Compute COUNT/SUM/AVG/MIN/MAX directly from V4 columns (mmap or in-memory)
+                        if has_aggregation_check
+                            && stmt.where_clause.is_none()
+                            && stmt.group_by.is_empty()
+                            && stmt.joins.is_empty()
+                            && !backend.has_pending_deltas()
+                        {
+                            if let Some(result) = Self::try_mmap_aggregation(&backend, &stmt)? {
+                                return Ok(result);
+                            }
+                        }
                         
                         // Late Materialization for WHERE: SELECT * with WHERE (no ORDER BY)
                         let where_cols = stmt.where_columns();
@@ -92,20 +105,25 @@ impl ApexExecutor {
                         
                         // CBO: Use plan_with_stats() to decide execution strategy.
                         // Skip expensive index checks when CBO recommends full scan or aggregation.
-                        let cbo_strategy = {
-                            let table_key = storage_path.to_string_lossy();
-                            let (bd, tname) = base_dir_and_table(storage_path);
-                            let idx_mgr_arc = get_index_manager(&bd, &tname);
-                            let idx_mgr = idx_mgr_arc.lock();
-                            let sql_stmt = SqlStatement::Select(stmt.clone());
-                            QueryPlanner::plan_with_stats(&sql_stmt, Some(&*idx_mgr), &table_key)
+                        // Also skip CBO entirely for trivial queries (no WHERE = no index possible).
+                        let cbo_skip_index = if stmt.where_clause.is_none() {
+                            true
+                        } else {
+                            let cbo_strategy = {
+                                let table_key = storage_path.to_string_lossy();
+                                let (bd, tname) = base_dir_and_table(storage_path);
+                                let idx_mgr_arc = get_index_manager(&bd, &tname);
+                                let idx_mgr = idx_mgr_arc.lock();
+                                let sql_stmt = SqlStatement::Select(stmt.clone());
+                                QueryPlanner::plan_with_stats(&sql_stmt, Some(&*idx_mgr), &table_key)
+                            };
+                            matches!(
+                                cbo_strategy,
+                                ExecutionStrategy::OlapFullScan
+                                | ExecutionStrategy::OlapAggregation
+                                | ExecutionStrategy::OlapFilteredScan
+                            )
                         };
-                        let cbo_skip_index = matches!(
-                            cbo_strategy,
-                            ExecutionStrategy::OlapFullScan
-                            | ExecutionStrategy::OlapAggregation
-                            | ExecutionStrategy::OlapFilteredScan
-                        );
 
                         // FAST PATH INDEX: Check if WHERE clause can use a secondary index
                         // (skipped when CBO says full scan/aggregation is cheaper)
@@ -154,6 +172,47 @@ impl ApexExecutor {
                                 // FAST PATH 3: Try combined string + numeric filter for multi-condition
                                 } else if let Some(result) = Self::try_fast_multi_condition_filter(&backend, &stmt)? {
                                     result
+                                } else if backend.is_mmap_only() && !backend.has_pending_deltas() {
+                                    // MMAP FAST PATH: byte-level scan + point lookups
+                                    if let Some(where_clause) = &stmt.where_clause {
+                                        let matching_indices = if let Some((col, val)) = Self::extract_string_equality(where_clause) {
+                                            backend.scan_string_filter_mmap(&col, &val, stmt.limit.map(|l| l + stmt.offset.unwrap_or(0)))?
+                                        } else if let Some((col, low, high)) = Self::extract_between_range(where_clause) {
+                                            backend.scan_numeric_range_mmap(&col, low, high, stmt.limit.map(|l| l + stmt.offset.unwrap_or(0)))?
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(indices) = matching_indices {
+                                            if indices.is_empty() {
+                                                return Ok(ApexResult::Empty(Arc::new(Schema::empty())));
+                                            }
+                                            if indices.len() <= 1000 {
+                                                // Small result: point lookups via IDs
+                                                let ids = backend.get_ids_for_global_indices_mmap(&indices)?;
+                                                let mut batches: Vec<RecordBatch> = Vec::new();
+                                                for &id in &ids {
+                                                    if let Some(batch) = backend.read_row_by_id_to_arrow(id)? {
+                                                        batches.push(batch);
+                                                    }
+                                                }
+                                                if batches.is_empty() {
+                                                    return Ok(ApexResult::Empty(Arc::new(Schema::empty())));
+                                                }
+                                                let combined = arrow::compute::concat_batches(&batches[0].schema(), &batches)
+                                                    .map_err(|e| err_data(e.to_string()))?;
+                                                return Ok(ApexResult::Data(combined));
+                                            } else {
+                                                // Large result: full scan + take
+                                                let batch = backend.read_columns_by_indices_to_arrow(&indices)?;
+                                                return Ok(ApexResult::Data(batch));
+                                            }
+                                        }
+                                    }
+                                    let filtered = Self::execute_with_late_materialization(&backend, &stmt, storage_path)?;
+                                    if filtered.num_rows() == 0 {
+                                        return Ok(ApexResult::Empty(filtered.schema()));
+                                    }
+                                    return Ok(ApexResult::Data(filtered));
                                 } else {
                                     // Late materialization for SELECT * WHERE path
                                     // Return directly to avoid applying WHERE filter twice
@@ -687,7 +746,7 @@ impl ApexExecutor {
         // Skip fast path if delta store has pending updates — the in-memory scan
         // bypasses DeltaMerger and would return stale data. Fall through to the
         // standard mmap read path which applies DeltaMerger overlay.
-        if backend.has_pending_deltas() || backend.is_mmap_only() {
+        if backend.has_pending_deltas() {
             return Ok(None);
         }
 
@@ -917,7 +976,7 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
+        if backend.has_pending_deltas() { return Ok(None); }
 
         use crate::query::AggregateFunc;
         use crate::query::sql_parser::BinaryOperator;
@@ -1036,10 +1095,12 @@ impl ApexExecutor {
                 }
             }
             FilterType::Between(filter_col, lo, hi) => {
-                // OPTIMIZED: Use cached dict for O(1) group lookup
-                let raw_results = if let Some((dict_strings, group_ids)) = backend.get_or_build_dict_cache(group_col)? {
+                // OPTIMIZED: Use global cached dict for O(1) group lookup
+                let raw_results = if let Some(dict_arc) = crate::storage::backend::get_global_dict_cache(
+                    backend.path(), group_col, &backend.storage,
+                )? {
                     backend.execute_between_group_agg_cached(
-                        filter_col, *lo, *hi, &dict_strings, &group_ids, agg_col,
+                        filter_col, *lo, *hi, &dict_arc.0, &dict_arc.1, agg_col,
                     )?
                 } else {
                     backend.storage.execute_between_group_agg(
@@ -1108,7 +1169,7 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
+        if backend.has_pending_deltas() { return Ok(None); }
 
         use crate::query::AggregateFunc;
         
@@ -1312,7 +1373,7 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
+        if backend.has_pending_deltas() { return Ok(None); }
 
         use crate::query::AggregateFunc;
         
@@ -1345,17 +1406,20 @@ impl ApexExecutor {
         }
         if agg_info.is_empty() { return Ok(None); }
         
-        // Get or build cached dict
-        let (dict_strings, group_ids) = match backend.get_or_build_dict_cache(group_col)? {
+        // Get or build cached dict (global cache — survives backend reopens)
+        let dict_arc = match crate::storage::backend::get_global_dict_cache(
+            backend.path(), group_col, &backend.storage,
+        )? {
             Some(c) => c,
             None => return Ok(None),
         };
+        let (dict_strings, group_ids) = (dict_arc.0.as_slice(), dict_arc.1.as_slice());
         
         let agg_cols: Vec<(&str, bool)> = agg_info.iter()
             .map(|(col, is_count, _, _)| (*col, *is_count))
             .collect();
         
-        let raw = match backend.execute_group_agg_cached(&dict_strings, &group_ids, &agg_cols)? {
+        let raw = match backend.execute_group_agg_cached(dict_strings, group_ids, &agg_cols)? {
             Some(r) if !r.is_empty() => r,
             _ => return Ok(None),
         };
@@ -1425,6 +1489,20 @@ impl ApexExecutor {
         }
     }
     
+    /// Helper to extract BETWEEN range: col BETWEEN low AND high
+    fn extract_between_range(expr: &SqlExpr) -> Option<(String, f64, f64)> {
+        match expr {
+            SqlExpr::Between { column, low, high, negated } => {
+                if *negated { return None; }
+                let col = column.trim_matches('"').to_string();
+                let low_val = Self::extract_numeric_value(low).ok()?;
+                let high_val = Self::extract_numeric_value(high).ok()?;
+                Some((col, low_val, high_val))
+            }
+            _ => None,
+        }
+    }
+
     /// Helper to extract numeric comparison: col > N, col >= N, col < N, col <= N
     fn extract_numeric_comparison(expr: &SqlExpr) -> Option<(String, String, f64)> {
         use crate::query::sql_parser::BinaryOperator;

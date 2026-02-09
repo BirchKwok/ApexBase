@@ -181,6 +181,87 @@ impl OnDemandStorage {
         Ok(Some(results))
     }
 
+    /// Compute numeric column aggregates from in-memory V4 columns.
+    /// Returns (count, sum, min, max) for the specified column.
+    pub fn compute_column_stats_inmemory(&self, col_name: &str) -> io::Result<Option<(u64, f64, f64, f64)>> {
+        if !self.has_v4_in_memory_data() { return Ok(None); }
+        
+        let schema = self.schema.read();
+        let columns = self.columns.read();
+        let deleted = self.deleted.read();
+        let total_rows = self.ids.read().len();
+        
+        let col_idx = match schema.get_index(col_name) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        if col_idx >= columns.len() { return Ok(None); }
+        
+        let has_deleted = deleted.iter().any(|&b| b != 0);
+        
+        match &columns[col_idx] {
+            ColumnData::Int64(vals) => {
+                let count = vals.len().min(total_rows);
+                if !has_deleted {
+                    let mut sum = 0i64;
+                    let mut min_v = i64::MAX;
+                    let mut max_v = i64::MIN;
+                    for i in 0..count {
+                        let v = unsafe { *vals.get_unchecked(i) };
+                        sum += v;
+                        if v < min_v { min_v = v; }
+                        if v > max_v { max_v = v; }
+                    }
+                    Ok(Some((count as u64, sum as f64, min_v as f64, max_v as f64)))
+                } else {
+                    let mut c = 0u64;
+                    let mut sum = 0i64;
+                    let mut min_v = i64::MAX;
+                    let mut max_v = i64::MIN;
+                    for i in 0..count {
+                        let b = i / 8; let bit = i % 8;
+                        if b < deleted.len() && (deleted[b] >> bit) & 1 != 0 { continue; }
+                        let v = vals[i];
+                        c += 1; sum += v;
+                        if v < min_v { min_v = v; }
+                        if v > max_v { max_v = v; }
+                    }
+                    Ok(Some((c, sum as f64, min_v as f64, max_v as f64)))
+                }
+            }
+            ColumnData::Float64(vals) => {
+                let count = vals.len().min(total_rows);
+                if !has_deleted {
+                    let mut sum = 0.0f64;
+                    let mut min_v = f64::INFINITY;
+                    let mut max_v = f64::NEG_INFINITY;
+                    for i in 0..count {
+                        let v = unsafe { *vals.get_unchecked(i) };
+                        sum += v;
+                        if v < min_v { min_v = v; }
+                        if v > max_v { max_v = v; }
+                    }
+                    Ok(Some((count as u64, sum, min_v, max_v)))
+                } else {
+                    let mut c = 0u64;
+                    let mut sum = 0.0f64;
+                    let mut min_v = f64::INFINITY;
+                    let mut max_v = f64::NEG_INFINITY;
+                    for i in 0..count {
+                        let b = i / 8; let bit = i % 8;
+                        if b < deleted.len() && (deleted[b] >> bit) & 1 != 0 { continue; }
+                        let v = vals[i];
+                        c += 1; sum += v;
+                        if v < min_v { min_v = v; }
+                        if v > max_v { max_v = v; }
+                    }
+                    Ok(Some((c, sum, min_v, max_v)))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Build cached string dictionary indices for a column (row→group_id mapping)
     /// Returns (dict_strings, group_ids) where group_ids[row] = index into dict_strings.
     /// Supports both in-memory and mmap-only paths.

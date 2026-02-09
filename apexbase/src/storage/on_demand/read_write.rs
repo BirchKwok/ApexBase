@@ -1,6 +1,55 @@
 // Insert, delete, read_row_by_id, column management, save, persist
 
 impl OnDemandStorage {
+    /// Read IDs for specific global row indices from mmap.
+    /// Returns Vec<u64> of IDs corresponding to the given indices.
+    pub fn get_ids_for_global_indices_mmap(&self, indices: &[usize]) -> io::Result<Vec<u64>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(vec![]),
+        };
+        // Build RG bounds
+        let mut rg_bounds: Vec<(usize, usize)> = Vec::new();
+        let mut cumulative = 0usize;
+        for rg in &footer.row_groups {
+            let n = rg.row_count as usize;
+            rg_bounds.push((cumulative, cumulative + n));
+            cumulative += n;
+        }
+
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for ID read"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        let mut result = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            let mut found = false;
+            for (rg_i, &(start, end)) in rg_bounds.iter().enumerate() {
+                if idx >= start && idx < end {
+                    let local = idx - start;
+                    let rg_meta = &footer.row_groups[rg_i];
+                    let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+                    if rg_end <= mmap_ref.len() {
+                        let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+                        let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+                        let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+                        let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+                        let off = local * 8;
+                        if off + 8 <= body.len() {
+                            let id = u64::from_le_bytes(body[off..off+8].try_into().unwrap());
+                            result.push(id);
+                            found = true;
+                        }
+                    }
+                    break;
+                }
+            }
+            if !found { result.push(0); }
+        }
+        Ok(result)
+    }
     // ========================================================================
     // Write APIs
     // ========================================================================
@@ -766,17 +815,43 @@ impl OnDemandStorage {
         }
         
         if is_v4 && !self.has_v4_in_memory_data() {
-            // MMAP PATH: scan needed columns from RGs with null bitmaps, extract single row
+            // MMAP PATH: Find the target RG by cumulative row count, scan only that RG
             let col_indices: Vec<usize> = cols_to_read.iter().map(|(idx, _, _)| *idx).collect();
             if let Some(footer) = self.get_or_load_footer()? {
-                let (scanned, _del, col_nulls) = self.scan_columns_mmap_with_nulls(&col_indices, &footer)?;
-                for (out_pos, (_, col_name, _)) in cols_to_read.iter().enumerate() {
-                    if out_pos < scanned.len() {
-                        let mut col = scanned[out_pos].clone();
-                        if out_pos < col_nulls.len() && !col_nulls[out_pos].is_empty() {
-                            col.apply_null_bitmap(&col_nulls[out_pos]);
+                // Find which RG contains row_idx
+                let mut cumulative = 0usize;
+                let mut target_rg_idx = None;
+                let mut local_idx = row_idx;
+                for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+                    let rg_rows = rg_meta.row_count as usize;
+                    if row_idx < cumulative + rg_rows {
+                        local_idx = row_idx - cumulative;
+                        target_rg_idx = Some(rg_i);
+                        break;
+                    }
+                    cumulative += rg_rows;
+                }
+                if let Some(rg_i) = target_rg_idx {
+                    // Create a single-RG footer view for scan
+                    let single_rg_footer = V4Footer {
+                        schema: footer.schema.clone(),
+                        row_groups: vec![footer.row_groups[rg_i].clone()],
+                        zone_maps: if rg_i < footer.zone_maps.len() {
+                            vec![footer.zone_maps[rg_i].clone()]
+                        } else {
+                            vec![]
+                        },
+                    };
+                    let (scanned, _del, col_nulls) = self.scan_columns_mmap_with_nulls(&col_indices, &single_rg_footer)?;
+                    let local_indices = vec![local_idx];
+                    for (out_pos, (_, col_name, _)) in cols_to_read.iter().enumerate() {
+                        if out_pos < scanned.len() {
+                            let mut col = scanned[out_pos].clone();
+                            if out_pos < col_nulls.len() && !col_nulls[out_pos].is_empty() {
+                                col.apply_null_bitmap(&col_nulls[out_pos]);
+                            }
+                            result.insert(col_name.clone(), col.filter_by_indices(&local_indices));
                         }
-                        result.insert(col_name.clone(), col.filter_by_indices(&indices));
                     }
                 }
             }
@@ -798,53 +873,252 @@ impl OnDemandStorage {
         let is_v4 = self.is_v4_format();
         if !is_v4 { return Ok(None); }
         if !self.has_v4_in_memory_data() {
-            // MMAP PATH: delegate to read_row_by_id and convert to Value
-            // Also check null mask to properly return Value::Null
+            // DIRECT MMAP PATH: Navigate RG body bytes, extract single row without
+            // deserializing entire RG. O(columns) instead of O(rows * columns).
             let row_idx = match self.get_row_idx(id) {
                 Some(idx) => idx,
                 None => return Ok(None),
             };
-            if let Some(row_map) = self.read_row_by_id(id, None)? {
-                let mut result = Vec::with_capacity(row_map.len());
-                for (col_name, col_data) in row_map {
-                    // Check null bitmap for this column at this row
-                    let is_null = if col_name != "_id" {
-                        let mask = self.get_null_mask(&col_name, row_idx, 1);
-                        !mask.is_empty() && mask[0]
+            let footer = match self.get_or_load_footer()? {
+                Some(f) => f,
+                None => return Ok(None),
+            };
+            // Find which RG contains row_idx
+            let mut cumulative = 0usize;
+            let mut target_rg_i = None;
+            let mut local_idx = row_idx;
+            for (i, rg) in footer.row_groups.iter().enumerate() {
+                let rg_rows = rg.row_count as usize;
+                if row_idx < cumulative + rg_rows {
+                    local_idx = row_idx - cumulative;
+                    target_rg_i = Some(i);
+                    break;
+                }
+                cumulative += rg_rows;
+            }
+            let rg_i = match target_rg_i {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            let rg_meta = &footer.row_groups[rg_i];
+            let rg_rows = rg_meta.row_count as usize;
+
+            // Get mmap bytes for this RG
+            let file_guard = self.file.read();
+            let file = file_guard.as_ref()
+                .ok_or_else(|| err_not_conn("File not open for point lookup"))?;
+            let mut mmap_guard = self.mmap_cache.write();
+            let mmap_ref = mmap_guard.get_or_create(file)?;
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return Err(err_data("RG extends past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let mut pos = 0usize;
+
+            // Read target ID
+            let id_offset = local_idx * 8;
+            if pos + rg_rows * 8 > body.len() { return Err(err_data("RG IDs truncated")); }
+            let read_id = u64::from_le_bytes(body[id_offset..id_offset+8].try_into().unwrap());
+            pos += rg_rows * 8;
+
+            // Check deletion
+            let del_vec_len = (rg_rows + 7) / 8;
+            if pos + del_vec_len > body.len() { return Err(err_data("RG del vec truncated")); }
+            let is_deleted = (body[pos + local_idx / 8] >> (local_idx % 8)) & 1 == 1;
+            if is_deleted { return Ok(None); }
+            pos += del_vec_len;
+
+            let schema = &footer.schema;
+            let col_count = schema.column_count();
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let mut result = Vec::with_capacity(col_count + 1);
+            result.push(("_id".to_string(), Value::Int64(read_id as i64)));
+
+            for col_idx in 0..col_count {
+                if pos + null_bitmap_len > body.len() { break; }
+                let null_bytes = &body[pos..pos + null_bitmap_len];
+                pos += null_bitmap_len;
+                let is_null = (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1;
+                let col_type = schema.columns[col_idx].1;
+                let col_name = &schema.columns[col_idx].0;
+
+                if is_null {
+                    // Skip column data
+                    let consumed = if encoding_version >= 1 {
+                        skip_column_encoded(&body[pos..], col_type)?
                     } else {
-                        false
+                        ColumnData::skip_bytes_typed(&body[pos..], col_type)?
                     };
-                    let val = if is_null {
-                        Value::Null
-                    } else {
+                    pos += consumed;
+                    result.push((col_name.clone(), Value::Null));
+                    continue;
+                }
+
+                // Extract single value from column data at local_idx
+                let col_bytes = &body[pos..];
+                let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+                let encoding = if encoding_version >= 1 { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                let data_bytes = &col_bytes[enc_offset..];
+
+                let val = match (encoding, col_type) {
+                    (COL_ENCODING_PLAIN, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 |
+                     ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 |
+                     ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date) => {
+                        // Plain Int64: [count:u64][data: count*8]
+                        let off = 8 + local_idx * 8;
+                        if off + 8 <= data_bytes.len() {
+                            Value::Int64(i64::from_le_bytes(data_bytes[off..off+8].try_into().unwrap()))
+                        } else { Value::Null }
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::Float64 | ColumnType::Float32) => {
+                        let off = 8 + local_idx * 8;
+                        if off + 8 <= data_bytes.len() {
+                            Value::Float64(f64::from_le_bytes(data_bytes[off..off+8].try_into().unwrap()))
+                        } else { Value::Null }
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::Bool) => {
+                        // Plain Bool: [len:u64][packed bits]
+                        let byte_off = 8 + local_idx / 8;
+                        let bit = local_idx % 8;
+                        if byte_off < data_bytes.len() {
+                            Value::Bool((data_bytes[byte_off] >> bit) & 1 == 1)
+                        } else { Value::Null }
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::String) => {
+                        // Plain String: [count:u64][offsets:(count+1)*4][data_len:u64][data]
+                        if data_bytes.len() >= 8 {
+                            let count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+                            let off_start = 8 + local_idx * 4;
+                            let off_end = 8 + (local_idx + 1) * 4;
+                            if off_end + 4 <= data_bytes.len() && local_idx < count {
+                                let s = u32::from_le_bytes(data_bytes[off_start..off_start+4].try_into().unwrap()) as usize;
+                                let e = u32::from_le_bytes(data_bytes[off_end..off_end+4].try_into().unwrap()) as usize;
+                                let offsets_end = 8 + (count + 1) * 4;
+                                let data_len_off = offsets_end;
+                                if data_len_off + 8 <= data_bytes.len() {
+                                    let data_start = data_len_off + 8;
+                                    if data_start + e <= data_bytes.len() {
+                                        Value::String(std::str::from_utf8(&data_bytes[data_start + s..data_start + e]).unwrap_or("").to_string())
+                                    } else { Value::Null }
+                                } else { Value::Null }
+                            } else { Value::Null }
+                        } else { Value::Null }
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::Binary) => {
+                        // Plain Binary: same layout as String: [count:u64][offsets:(count+1)*4][data_len:u64][data]
+                        if data_bytes.len() >= 8 {
+                            let count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+                            let off_start = 8 + local_idx * 4;
+                            let off_end = 8 + (local_idx + 1) * 4;
+                            if off_end + 4 <= data_bytes.len() && local_idx < count {
+                                let s = u32::from_le_bytes(data_bytes[off_start..off_start+4].try_into().unwrap()) as usize;
+                                let e = u32::from_le_bytes(data_bytes[off_end..off_end+4].try_into().unwrap()) as usize;
+                                let offsets_end = 8 + (count + 1) * 4;
+                                let data_len_off = offsets_end;
+                                if data_len_off + 8 <= data_bytes.len() {
+                                    let data_start = data_len_off + 8;
+                                    if data_start + e <= data_bytes.len() {
+                                        Value::Binary(data_bytes[data_start + s..data_start + e].to_vec())
+                                    } else { Value::Null }
+                                } else { Value::Null }
+                            } else { Value::Null }
+                        } else { Value::Null }
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::StringDict) => {
+                        // StringDict: [row_count:u64][dict_size:u64][indices:row_count*4][dict_offsets:dict_size*4][dict_data_len:u64][dict_data]
+                        if data_bytes.len() >= 16 {
+                            let row_count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+                            let dict_size = u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
+                            let idx_off = 16 + local_idx * 4;
+                            if idx_off + 4 <= data_bytes.len() && local_idx < row_count {
+                                let dict_idx = u32::from_le_bytes(data_bytes[idx_off..idx_off+4].try_into().unwrap());
+                                if dict_idx == 0 { Value::Null } else {
+                                    let di = (dict_idx - 1) as usize;
+                                    let dict_off_start = 16 + row_count * 4;
+                                    let do_off = dict_off_start + di * 4;
+                                    let do_off_next = dict_off_start + (di + 1) * 4;
+                                    if do_off_next + 4 <= data_bytes.len() && di < dict_size {
+                                        let ds = u32::from_le_bytes(data_bytes[do_off..do_off+4].try_into().unwrap()) as usize;
+                                        let de = u32::from_le_bytes(data_bytes[do_off_next..do_off_next+4].try_into().unwrap()) as usize;
+                                        let dict_data_len_off = dict_off_start + dict_size * 4;
+                                        if dict_data_len_off + 8 <= data_bytes.len() {
+                                            let dict_data_start = dict_data_len_off + 8;
+                                            if dict_data_start + de <= data_bytes.len() {
+                                                Value::String(std::str::from_utf8(&data_bytes[dict_data_start + ds..dict_data_start + de]).unwrap_or("").to_string())
+                                            } else { Value::Null }
+                                        } else { Value::Null }
+                                    } else { Value::Null }
+                                }
+                            } else { Value::Null }
+                        } else { Value::Null }
+                    }
+                    _ => {
+                        // RLE/Bitpack/other: fallback to full decode, extract single value
+                        let (col_data, _consumed) = if encoding_version >= 1 {
+                            read_column_encoded(col_bytes, col_type)?
+                        } else {
+                            ColumnData::from_bytes_typed(col_bytes, col_type)?
+                        };
                         match &col_data {
-                            ColumnData::Int64(v) => if !v.is_empty() { Value::Int64(v[0]) } else { Value::Null },
-                            ColumnData::Float64(v) => if !v.is_empty() { Value::Float64(v[0]) } else { Value::Null },
+                            ColumnData::Int64(v) => if local_idx < v.len() { Value::Int64(v[local_idx]) } else { Value::Null },
+                            ColumnData::Float64(v) => if local_idx < v.len() { Value::Float64(v[local_idx]) } else { Value::Null },
+                            ColumnData::Bool { data, len } => {
+                                if local_idx < *len {
+                                    Value::Bool((data[local_idx / 8] >> (local_idx % 8)) & 1 == 1)
+                                } else { Value::Null }
+                            }
                             ColumnData::String { offsets, data } => {
-                                if offsets.len() > 1 {
-                                    let s = offsets[0] as usize;
-                                    let e = offsets[1] as usize;
+                                let count = offsets.len().saturating_sub(1);
+                                if local_idx < count {
+                                    let s = offsets[local_idx] as usize;
+                                    let e = offsets[local_idx + 1] as usize;
                                     Value::String(std::str::from_utf8(&data[s..e]).unwrap_or("").to_string())
                                 } else { Value::Null }
                             }
-                            ColumnData::Bool { data, len } => {
-                                if *len > 0 { Value::Bool((data[0] & 1) != 0) } else { Value::Null }
-                            }
                             ColumnData::Binary { offsets, data } => {
-                                if offsets.len() > 1 {
-                                    let s = offsets[0] as usize;
-                                    let e = offsets[1] as usize;
+                                let count = offsets.len().saturating_sub(1);
+                                if local_idx < count {
+                                    let s = offsets[local_idx] as usize;
+                                    let e = offsets[local_idx + 1] as usize;
                                     Value::Binary(data[s..e].to_vec())
+                                } else { Value::Null }
+                            }
+                            ColumnData::StringDict { indices, dict_offsets, dict_data, .. } => {
+                                if local_idx < indices.len() {
+                                    let di = indices[local_idx];
+                                    if di == 0 { Value::Null } else {
+                                        let idx = (di - 1) as usize;
+                                        if idx < dict_offsets.len() {
+                                            let s = dict_offsets[idx] as usize;
+                                            let e = if idx + 1 < dict_offsets.len() { dict_offsets[idx + 1] as usize } else { dict_data.len() };
+                                            Value::String(std::str::from_utf8(&dict_data[s..e]).unwrap_or("").to_string())
+                                        } else { Value::Null }
+                                    }
                                 } else { Value::Null }
                             }
                             _ => Value::Null,
                         }
-                    };
-                    result.push((col_name, val));
-                }
-                return Ok(Some(result));
+                    }
+                };
+
+                // Skip full column to advance pos
+                let consumed = if encoding_version >= 1 {
+                    skip_column_encoded(&body[pos..], col_type)?
+                } else {
+                    ColumnData::skip_bytes_typed(&body[pos..], col_type)?
+                };
+                pos += consumed;
+                result.push((col_name.clone(), val));
             }
-            return Ok(None);
+
+            drop(mmap_guard);
+            drop(file_guard);
+            return Ok(Some(result));
         }
         
         let row_idx = match self.get_row_idx(id) {
@@ -933,7 +1207,12 @@ impl OnDemandStorage {
         use crate::data::Value;
         
         let is_v4 = self.is_v4_format();
-        if !is_v4 || !self.has_v4_in_memory_data() { return Ok(None); }
+        if !is_v4 { return Ok(None); }
+        
+        // MMAP PATH: scan from disk if no in-memory data
+        if !self.has_v4_in_memory_data() {
+            return self.read_rows_limit_values_mmap(limit);
+        }
         
         let schema = self.schema.read();
         let columns = self.columns.read();
@@ -1028,6 +1307,14 @@ impl OnDemandStorage {
         }
         
         Ok(Some((col_names, rows)))
+    }
+
+    /// MMAP PATH: Fast SELECT * LIMIT N
+    /// For small limits on mmap-only data, return None to let SQL path use arrow_batch_cache
+    fn read_rows_limit_values_mmap(&self, _limit: usize) -> io::Result<Option<(Vec<String>, Vec<Vec<crate::data::Value>>)>> {
+        // Return None to fall through to SQL execution path which uses
+        // arrow_batch_cache (populated on warmup, subsequent reads are O(1) slice)
+        Ok(None)
     }
 
     /// OPTIMIZED: Read multiple rows by IDs using O(1) index lookups
@@ -1830,8 +2117,8 @@ impl OnDemandStorage {
                 }
             }
             
-            // Compress body (Zstd default, LZ4 fallback)
-            let (compress_flag, disk_body) = compress_rg_body(body_buf);
+            // Compress body using configured compression algorithm
+            let (compress_flag, disk_body) = compress_rg_body(body_buf, self.compression());
             
             // RG header (32 bytes) — byte 28 = compression flag, byte 29 = encoding version
             writer.write_all(MAGIC_ROW_GROUP)?;
@@ -2485,8 +2772,8 @@ impl OnDemandStorage {
             }
         }
         
-        // Compress body (Zstd default, LZ4 fallback)
-        let (compress_flag, disk_body) = compress_rg_body(body_buf);
+        // Compress body using configured compression algorithm
+        let (compress_flag, disk_body) = compress_rg_body(body_buf, self.compression());
         
         // Write RG header (32 bytes) — byte 28 = compression flag
         writer.write_all(MAGIC_ROW_GROUP)?;

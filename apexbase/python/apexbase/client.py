@@ -110,6 +110,7 @@ class ApexClient:
         
         self._prefer_arrow_format = prefer_arrow_format and ARROW_AVAILABLE
         self._registry = _registry
+        self._query_cache = {}  # SQL -> ResultView cache for repeated read queries
 
     def _load_fts_config(self) -> None:
         try:
@@ -251,6 +252,40 @@ class ApexClient:
         self._check_connection()
         with self._lock:
             return self._storage.list_tables()
+
+    # ============ Compression ============
+
+    def set_compression(self, compression: str) -> bool:
+        """Set compression type for the current table.
+
+        Only effective on empty tables (row_count == 0). Ignored if table
+        already contains data. The setting persists across restarts.
+
+        Args:
+            compression: "none", "lz4", or "zstd".
+
+        Returns:
+            True if applied, False if the table is non-empty (no-op).
+
+        Raises:
+            ValueError: If *compression* is not a recognised algorithm name.
+            RuntimeError: If no table is selected.
+        """
+        self._check_connection()
+        self._ensure_table_selected()
+        with self._lock:
+            return self._storage.set_compression(compression)
+
+    def get_compression(self) -> str:
+        """Get the current compression type for the current table.
+
+        Returns:
+            "none", "lz4", or "zstd".
+        """
+        self._check_connection()
+        self._ensure_table_selected()
+        with self._lock:
+            return self._storage.get_compression()
 
     # ============ FTS ============
 
@@ -507,6 +542,7 @@ class ApexClient:
     def store(self, data) -> None:
         self._check_connection()
         self._ensure_table_selected()
+        self._query_cache.clear()  # Invalidate cache on write
         with self._lock:
             # 1. Columnar data Dict[str, list/ndarray]
             if isinstance(data, dict):
@@ -732,6 +768,14 @@ class ApexClient:
                 rv._show_internal_id = show_internal_id
                 return rv
 
+            # Query result cache: return cached ResultView for identical read queries
+            if sql_upper.startswith('SELECT'):
+                cached = self._query_cache.get(sql)
+                if cached is not None:
+                    return cached
+            elif sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'TRUNCATE', 'ALTER', 'DROP', 'CREATE')):
+                self._query_cache.clear()
+            
             # Standard path: Arrow IPC for efficient bulk transfer
             ipc_bytes = self._storage._execute_arrow_ipc(sql)
             
@@ -747,6 +791,13 @@ class ApexClient:
             
             rv = ResultView(arrow_table=table, data=None)
             rv._show_internal_id = show_internal_id
+            
+            # Cache the result for future identical read queries
+            if sql_upper.startswith('SELECT'):
+                if len(self._query_cache) > 200:
+                    self._query_cache.clear()
+                self._query_cache[sql] = rv
+            
             return rv
     
     def _validate_table_in_sql(self, sql: str) -> None:

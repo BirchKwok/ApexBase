@@ -151,6 +151,9 @@ pub struct ApexStorageImpl {
     durability: DurabilityLevel,
     /// Current active transaction ID (None if not in a transaction)
     current_txn_id: RwLock<Option<u64>>,
+    /// Python-level query result cache: SQL -> PyObject
+    /// Caches the FINAL Python dict to avoid all conversion overhead on repeated queries
+    py_query_cache: RwLock<HashMap<String, PyObject>>,
 }
 
 /// Internal Rust-only methods (not exposed to Python)
@@ -414,6 +417,7 @@ impl ApexStorageImpl {
             fts_index_fields: RwLock::new(HashMap::new()),
             durability: durability_level,
             current_txn_id: RwLock::new(None),
+            py_query_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -973,6 +977,21 @@ impl ApexStorageImpl {
             self.get_current_table_path()?
         };
         
+        // PYTHON-LEVEL QUERY RESULT CACHE: return cached PyObject for identical read queries
+        // Cache is invalidated on any write operation
+        if !is_write_op && !is_ddl && sql_upper.starts_with("SELECT") {
+            let cache = self.py_query_cache.read();
+            if let Some(cached_obj) = cache.get(&sql_upper) {
+                return Ok(cached_obj.clone_ref(py));
+            }
+        }
+        
+        // Invalidate py_query_cache on writes
+        if is_write_op || is_ddl {
+            let mut cache = self.py_query_cache.write();
+            cache.clear();
+        }
+        
         // FAST PATH: SELECT * FROM <table> LIMIT N — bypass SQL parse + Arrow, return columnar
         if !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT") 
             && !sql_upper.contains("WHERE") && !sql_upper.contains("ORDER") 
@@ -980,9 +999,30 @@ impl ApexStorageImpl {
             if let Some(limit_str) = sql_upper.rsplit("LIMIT").next() {
                 if let Ok(limit) = limit_str.trim().trim_end_matches(';').parse::<usize>() {
                     if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+                        // Try Arrow batch cache first (O(1) slice, no disk I/O)
+                        if let Ok(batch) = backend.read_columns_to_arrow(None, 0, Some(limit)) {
+                            if batch.num_rows() > 0 {
+                                let out = PyDict::new_bound(py);
+                                let columns_dict = PyDict::new_bound(py);
+                                let schema = batch.schema();
+                                for col_idx in 0..batch.num_columns() {
+                                    let col_name = schema.field(col_idx).name();
+                                    let arr = batch.column(col_idx);
+                                    let col_list = PyList::empty_bound(py);
+                                    for row_idx in 0..batch.num_rows() {
+                                        let val = arrow_value_at(arr, row_idx);
+                                        col_list.append(value_to_py(py, &val)?)?;
+                                    }
+                                    columns_dict.set_item(col_name, col_list)?;
+                                }
+                                out.set_item("columns_dict", columns_dict)?;
+                                out.set_item("rows_affected", 0)?;
+                                return Ok(out.into());
+                            }
+                        }
+                        // Fallback: try in-memory row-based path
                         if let Ok(Some((col_names, row_values))) = backend.storage.read_rows_limit_values(limit) {
                             let out = PyDict::new_bound(py);
-                            // Build columnar dict: {"col_name": [v1, v2, ...], ...}
                             let columns_dict = PyDict::new_bound(py);
                             let num_cols = col_names.len();
                             let num_rows = row_values.len();
@@ -1002,6 +1042,42 @@ impl ApexStorageImpl {
             }
         }
         
+        // FAST PATH: Point lookup SELECT * FROM <table> WHERE _id = X
+        if !is_write_op && sql_upper.starts_with("SELECT") && sql_upper.contains("_ID") {
+            // Extract _id = N pattern from WHERE clause
+            if let Some(id_pos) = sql_upper.find("_ID") {
+                let rest = &sql_upper[id_pos + 3..];
+                let rest = rest.trim_start();
+                if rest.starts_with('=') {
+                    let val_str = rest[1..].trim().trim_end_matches(';');
+                    if let Ok(id) = val_str.parse::<u64>() {
+                        if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+                            if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(id) {
+                                if batch.num_rows() > 0 {
+                                    let out = PyDict::new_bound(py);
+                                    let columns_dict = PyDict::new_bound(py);
+                                    let schema = batch.schema();
+                                    for col_idx in 0..batch.num_columns() {
+                                        let col_name = schema.field(col_idx).name();
+                                        let arr = batch.column(col_idx);
+                                        let col_list = PyList::empty_bound(py);
+                                        for row_idx in 0..batch.num_rows() {
+                                            let val = arrow_value_at(arr, row_idx);
+                                            col_list.append(value_to_py(py, &val)?)?;
+                                        }
+                                        columns_dict.set_item(col_name, col_list)?;
+                                    }
+                                    out.set_item("columns_dict", columns_dict)?;
+                                    out.set_item("rows_affected", 0)?;
+                                    return Ok(out.into());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Transaction handling: intercept BEGIN/COMMIT/ROLLBACK/SAVEPOINT
         let is_begin = sql_upper.starts_with("BEGIN");
         let is_commit = sql_upper == "COMMIT" || sql_upper == "COMMIT;";
@@ -1205,7 +1281,15 @@ impl ApexStorageImpl {
             }
         }
         
-        Ok(out.into())
+        // Cache the result for future identical read queries
+        let result_obj: PyObject = out.into();
+        if !is_write_op && !is_ddl && sql_upper.starts_with("SELECT") {
+            let mut cache = self.py_query_cache.write();
+            if cache.len() > 200 { cache.clear(); }
+            cache.insert(sql_upper.clone(), result_obj.clone_ref(py));
+        }
+        
+        Ok(result_obj)
     }
     
     /// Execute SQL query and return Arrow FFI pointers for zero-copy transfer
@@ -1654,6 +1738,47 @@ impl ApexStorageImpl {
         }
     }
 
+    /// Set compression type for the current table.
+    /// Only effective on empty tables (row_count == 0); ignored if table has data.
+    /// The setting persists across restarts.
+    ///
+    /// Args:
+    ///     compression: "none", "lz4", or "zstd"
+    ///
+    /// Returns:
+    ///     True if applied, False if table is non-empty (no-op)
+    fn set_compression(&self, compression: &str) -> PyResult<bool> {
+        use crate::storage::on_demand::{CompressionType, OnDemandStorage};
+        let comp = CompressionType::from_str_opt(compression)
+            .ok_or_else(|| PyValueError::new_err(
+                format!("Invalid compression type '{}'. Use 'none', 'lz4', or 'zstd'.", compression)
+            ))?;
+        let table_path = self.get_current_table_path()?;
+        let storage = if table_path.exists() {
+            OnDemandStorage::open_with_durability(&table_path, self.durability)
+        } else {
+            OnDemandStorage::create_with_durability(&table_path, self.durability)
+        }.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        storage.set_compression(comp)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Get the current compression type for the current table.
+    ///
+    /// Returns:
+    ///     "none", "lz4", or "zstd"
+    fn get_compression(&self) -> PyResult<String> {
+        use crate::storage::on_demand::OnDemandStorage;
+        let table_path = self.get_current_table_path()?;
+        if table_path.exists() {
+            let storage = OnDemandStorage::open_with_durability(&table_path, self.durability)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(storage.compression().as_str().to_string())
+        } else {
+            Ok("none".to_string())
+        }
+    }
+
     /// Close storage
     fn close(&self) -> PyResult<()> {
         // Clear all cached backends (releases file locks)
@@ -1678,12 +1803,26 @@ impl ApexStorageImpl {
         // ULTRA-FAST PATH: Direct V4 value read - no file lock, no Arrow, no GIL release
         // Skip allow_threads() for sub-0.1ms operations where GIL overhead dominates
         if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+            // Try in-memory path first (fastest)
             if let Ok(Some(vals)) = backend.storage.read_row_by_id_values(id as u64) {
                 let dict = PyDict::new_bound(py);
                 for (k, v) in vals {
                     dict.set_item(k, value_to_py(py, &v)?)?;
                 }
                 return Ok(Some(dict.into()));
+            }
+            // Arrow batch cache path: O(1) index lookup + batch.slice(idx, 1)
+            if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(id as u64) {
+                if batch.num_rows() > 0 {
+                    let dict = PyDict::new_bound(py);
+                    let schema = batch.schema();
+                    for col_idx in 0..batch.num_columns() {
+                        let col_name = schema.field(col_idx).name();
+                        let val = arrow_value_at(batch.column(col_idx), 0);
+                        dict.set_item(col_name.as_str(), value_to_py(py, &val)?)?;
+                    }
+                    return Ok(Some(dict.into()));
+                }
             }
         }
         

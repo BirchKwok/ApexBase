@@ -65,6 +65,9 @@ pub struct OnDemandStorage {
     /// Tracks pending UPDATE changes without rewriting the base file.
     /// On read, DeltaMerger overlays these changes on top of base data.
     delta_store: RwLock<DeltaStore>,
+    /// Row Group body compression algorithm. Default: None (no compression).
+    /// Persisted in header flags bits 0-1. Can only be set on empty tables.
+    compression: std::sync::atomic::AtomicU8,
 }
 
 
@@ -133,6 +136,7 @@ impl OnDemandStorage {
             cached_footer_offset: AtomicU64::new(0),
             v4_footer: RwLock::new(None),
             delta_store: RwLock::new(DeltaStore::new(path)),
+            compression: std::sync::atomic::AtomicU8::new(CompressionType::None as u8),
         };
 
         // Write initial file
@@ -321,6 +325,9 @@ impl OnDemandStorage {
         let final_next_id = recovered_next_id.max(next_id);
         let cached_fo = header.footer_offset;
 
+        // Read compression type from header flags
+        let comp_type = CompressionType::from_flags(header.flags);
+
         Ok(Self {
             path: path.to_path_buf(),
             file: RwLock::new(Some(file)),
@@ -346,6 +353,7 @@ impl OnDemandStorage {
             cached_footer_offset: AtomicU64::new(cached_fo),
             v4_footer: RwLock::new(None),
             delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
+            compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
         })
     }
     
@@ -412,6 +420,35 @@ impl OnDemandStorage {
         }
         
         Ok(false)
+    }
+
+    /// Get the current compression type.
+    pub fn compression(&self) -> CompressionType {
+        match self.compression.load(Ordering::Relaxed) {
+            1 => CompressionType::Lz4,
+            2 => CompressionType::Zstd,
+            _ => CompressionType::None,
+        }
+    }
+
+    /// Set compression type. Only effective on empty tables (row_count == 0).
+    /// The setting is persisted in the header flags and survives restarts.
+    /// Returns Ok(true) if applied, Ok(false) if table is non-empty (no-op).
+    pub fn set_compression(&self, comp: CompressionType) -> io::Result<bool> {
+        if self.active_count.load(Ordering::SeqCst) > 0
+            || self.persisted_row_count.load(Ordering::SeqCst) > 0
+        {
+            return Ok(false);
+        }
+        self.compression.store(comp as u8, Ordering::SeqCst);
+        // Persist to header flags
+        {
+            let mut header = self.header.write();
+            header.flags = (header.flags & !FLAG_COMPRESS_MASK) | comp.to_flags_bits();
+        }
+        // Re-save header to disk
+        self.save()?;
+        Ok(true)
     }
 
     /// Helper: Get file reference or return NotConnected error
@@ -646,6 +683,7 @@ impl OnDemandStorage {
         let row_count = header.row_count; // Cache before moving header
         let column_count = header.column_count as usize;
         let cached_fo = header.footer_offset;
+        let cached_flags = header.flags;
         
         // Empty columns - will be loaded on-demand if needed
         let columns = vec![ColumnData::new(ColumnType::Int64); column_count];
@@ -688,6 +726,7 @@ impl OnDemandStorage {
             cached_footer_offset: AtomicU64::new(cached_fo),
             v4_footer: RwLock::new(None),
             delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
+            compression: std::sync::atomic::AtomicU8::new(CompressionType::from_flags(cached_flags) as u8),
         })
     }
     

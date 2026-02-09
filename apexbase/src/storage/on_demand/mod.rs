@@ -216,6 +216,60 @@ const RG_COMPRESS_ZSTD: u8 = 2;
 /// Below this threshold, compression overhead exceeds savings.
 const COMPRESS_MIN_BODY_SIZE: usize = 512;
 
+// Header flags field: bits 0-1 encode CompressionType
+const FLAG_COMPRESS_MASK: u32 = 0b11;
+const FLAG_COMPRESS_NONE: u32 = 0;
+const FLAG_COMPRESS_LZ4: u32 = 1;
+const FLAG_COMPRESS_ZSTD: u32 = 2;
+
+/// Compression algorithm for Row Group bodies.
+/// Default is `None` (no compression) for maximum read performance.
+/// Can only be changed on empty tables; persisted in header flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionType {
+    /// No compression (default). Best read performance.
+    None,
+    /// LZ4 block compression. Fast with moderate ratio.
+    Lz4,
+    /// Zstd compression (level 1). Better ratio, slower than LZ4.
+    Zstd,
+}
+
+impl CompressionType {
+    fn from_flags(flags: u32) -> Self {
+        match flags & FLAG_COMPRESS_MASK {
+            FLAG_COMPRESS_LZ4 => CompressionType::Lz4,
+            FLAG_COMPRESS_ZSTD => CompressionType::Zstd,
+            _ => CompressionType::None,
+        }
+    }
+
+    fn to_flags_bits(self) -> u32 {
+        match self {
+            CompressionType::None => FLAG_COMPRESS_NONE,
+            CompressionType::Lz4 => FLAG_COMPRESS_LZ4,
+            CompressionType::Zstd => FLAG_COMPRESS_ZSTD,
+        }
+    }
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "none" => Some(CompressionType::None),
+            "lz4" => Some(CompressionType::Lz4),
+            "zstd" | "zstandard" => Some(CompressionType::Zstd),
+            _ => Option::None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompressionType::None => "none",
+            CompressionType::Lz4 => "lz4",
+            CompressionType::Zstd => "zstd",
+        }
+    }
+}
+
 // Per-column encoding types (stored as 1-byte prefix when encoding_version=1)
 const COL_ENCODING_PLAIN: u8 = 0;
 const COL_ENCODING_RLE: u8 = 1;
@@ -454,6 +508,112 @@ fn write_column_encoded<W: Write>(col: &ColumnData, col_type: ColumnType, writer
     }
 }
 
+/// Read only the first `limit` rows from an encoded column.
+/// Returns (partial ColumnData, total bytes consumed for skipping past the full column).
+/// For plain encoding, avoids allocating the full column.
+/// For RLE/bitpack, falls back to full decode then slice.
+fn read_column_encoded_partial(bytes: &[u8], col_type: ColumnType, limit: usize) -> io::Result<(ColumnData, usize)> {
+    if bytes.is_empty() {
+        return Err(err_data("read_column_encoded_partial: empty input"));
+    }
+    let encoding = bytes[0];
+    let data_bytes = &bytes[1..];
+
+    // For non-plain encodings, fall back to full decode + slice
+    if encoding != COL_ENCODING_PLAIN {
+        let (col, consumed) = read_column_encoded(bytes, col_type)?;
+        let sliced = if col.len() > limit { col.slice_range(0, limit) } else { col };
+        return Ok((sliced, consumed));
+    }
+
+    // Plain encoding: read only `limit` rows
+    let total_consumed = 1 + ColumnData::skip_bytes_typed(data_bytes, col_type)?;
+
+    match col_type {
+        ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
+        ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+        ColumnType::Timestamp | ColumnType::Date => {
+            if data_bytes.len() < 8 { return Err(err_data("partial Int64: truncated")); }
+            let count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+            let actual = count.min(limit);
+            let byte_len = actual * 8;
+            if 8 + byte_len > data_bytes.len() { return Err(err_data("partial Int64: data truncated")); }
+            let mut v = vec![0i64; actual];
+            unsafe { std::ptr::copy_nonoverlapping(data_bytes[8..].as_ptr(), v.as_mut_ptr() as *mut u8, byte_len); }
+            Ok((ColumnData::Int64(v), total_consumed))
+        }
+        ColumnType::Float64 | ColumnType::Float32 => {
+            if data_bytes.len() < 8 { return Err(err_data("partial Float64: truncated")); }
+            let count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+            let actual = count.min(limit);
+            let byte_len = actual * 8;
+            if 8 + byte_len > data_bytes.len() { return Err(err_data("partial Float64: data truncated")); }
+            let mut v = vec![0f64; actual];
+            unsafe { std::ptr::copy_nonoverlapping(data_bytes[8..].as_ptr(), v.as_mut_ptr() as *mut u8, byte_len); }
+            Ok((ColumnData::Float64(v), total_consumed))
+        }
+        ColumnType::Bool => {
+            if data_bytes.len() < 8 { return Err(err_data("partial Bool: truncated")); }
+            let len = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+            let actual = len.min(limit);
+            let byte_len = (actual + 7) / 8;
+            if 8 + byte_len > data_bytes.len() { return Err(err_data("partial Bool: data truncated")); }
+            let data = data_bytes[8..8 + byte_len].to_vec();
+            Ok((ColumnData::Bool { data, len: actual }, total_consumed))
+        }
+        ColumnType::String => {
+            if data_bytes.len() < 8 { return Err(err_data("partial String: truncated")); }
+            let count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+            let actual = count.min(limit);
+            let all_offsets_len = (count + 1) * 4;
+            if 8 + all_offsets_len > data_bytes.len() { return Err(err_data("partial String: offsets truncated")); }
+            // Read only first actual+1 offsets
+            let mut offsets = vec![0u32; actual + 1];
+            unsafe { std::ptr::copy_nonoverlapping(data_bytes[8..].as_ptr(), offsets.as_mut_ptr() as *mut u8, (actual + 1) * 4); }
+            let data_len_off = 8 + all_offsets_len;
+            if data_len_off + 8 > data_bytes.len() { return Err(err_data("partial String: data_len truncated")); }
+            let data_start = data_len_off + 8;
+            let base = offsets[0] as usize;
+            let end = offsets[actual] as usize;
+            if data_start + end > data_bytes.len() { return Err(err_data("partial String: data truncated")); }
+            let data = data_bytes[data_start + base..data_start + end].to_vec();
+            // Adjust offsets to be zero-based
+            if base > 0 { for o in offsets.iter_mut() { *o -= base as u32; } }
+            Ok((ColumnData::String { offsets, data }, total_consumed))
+        }
+        ColumnType::StringDict => {
+            if data_bytes.len() < 16 { return Err(err_data("partial StringDict: truncated")); }
+            let row_count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+            let dict_size = u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
+            let actual = row_count.min(limit);
+            // Read only first `actual` indices
+            let all_indices_len = row_count * 4;
+            if 16 + all_indices_len > data_bytes.len() { return Err(err_data("partial StringDict: indices truncated")); }
+            let mut indices = vec![0u32; actual];
+            unsafe { std::ptr::copy_nonoverlapping(data_bytes[16..].as_ptr(), indices.as_mut_ptr() as *mut u8, actual * 4); }
+            // Read full dictionary (small)
+            let dict_off_start = 16 + all_indices_len;
+            let dict_offsets_len = dict_size * 4;
+            if dict_off_start + dict_offsets_len > data_bytes.len() { return Err(err_data("partial StringDict: dict_offsets truncated")); }
+            let mut dict_offsets = vec![0u32; dict_size];
+            unsafe { std::ptr::copy_nonoverlapping(data_bytes[dict_off_start..].as_ptr(), dict_offsets.as_mut_ptr() as *mut u8, dict_offsets_len); }
+            let dict_data_len_off = dict_off_start + dict_offsets_len;
+            if dict_data_len_off + 8 > data_bytes.len() { return Err(err_data("partial StringDict: dict_data_len truncated")); }
+            let dict_data_len = u64::from_le_bytes(data_bytes[dict_data_len_off..dict_data_len_off+8].try_into().unwrap()) as usize;
+            let dict_data_start = dict_data_len_off + 8;
+            if dict_data_start + dict_data_len > data_bytes.len() { return Err(err_data("partial StringDict: dict_data truncated")); }
+            let dict_data = data_bytes[dict_data_start..dict_data_start + dict_data_len].to_vec();
+            Ok((ColumnData::StringDict { indices, dict_offsets, dict_data }, total_consumed))
+        }
+        _ => {
+            // Fallback: full decode + slice
+            let (col, consumed) = ColumnData::from_bytes_typed(data_bytes, col_type)?;
+            let sliced = if col.len() > limit { col.slice_range(0, limit) } else { col };
+            Ok((sliced, 1 + consumed))
+        }
+    }
+}
+
 /// Read a column with encoding prefix: [encoding:u8][encoded_data...]
 /// Returns (ColumnData, bytes_consumed) including the encoding prefix byte.
 fn read_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<(ColumnData, usize)> {
@@ -567,24 +727,30 @@ fn decompress_rg_body(compress_flag: u8, compressed: &[u8]) -> io::Result<Option
     }
 }
 
-/// Compress an RG body using Zstd (default) with LZ4 fallback.
+/// Compress an RG body using the specified compression algorithm.
 /// Returns (compress_flag, compressed_or_original_bytes).
-fn compress_rg_body(body: Vec<u8>) -> (u8, Vec<u8>) {
-    if body.len() < COMPRESS_MIN_BODY_SIZE {
+fn compress_rg_body(body: Vec<u8>, compression: CompressionType) -> (u8, Vec<u8>) {
+    if body.len() < COMPRESS_MIN_BODY_SIZE || matches!(compression, CompressionType::None) {
         return (RG_COMPRESS_NONE, body);
     }
-    // Try Zstd first (default, better ratio)
-    if let Ok(compressed) = zstd::bulk::compress(&body, 1) {
-        if compressed.len() < body.len() {
-            return (RG_COMPRESS_ZSTD, compressed);
+    match compression {
+        CompressionType::None => (RG_COMPRESS_NONE, body),
+        CompressionType::Zstd => {
+            if let Ok(compressed) = zstd::bulk::compress(&body, 1) {
+                if compressed.len() < body.len() {
+                    return (RG_COMPRESS_ZSTD, compressed);
+                }
+            }
+            (RG_COMPRESS_NONE, body)
+        }
+        CompressionType::Lz4 => {
+            let compressed = lz4_flex::compress_prepend_size(&body);
+            if compressed.len() < body.len() {
+                return (RG_COMPRESS_LZ4, compressed);
+            }
+            (RG_COMPRESS_NONE, body)
         }
     }
-    // Fallback: try LZ4 (faster but lower ratio)
-    let compressed = lz4_flex::compress_prepend_size(&body);
-    if compressed.len() < body.len() {
-        return (RG_COMPRESS_LZ4, compressed);
-    }
-    (RG_COMPRESS_NONE, body)
 }
 
 // Column type identifiers

@@ -334,6 +334,7 @@ class ApexBaseBench:
         if os.path.exists(self.db_dir):
             shutil.rmtree(self.db_dir)
         self.client = ApexClient(self.db_dir, drop_if_exists=True)
+        self.client.create_table('default')
 
     def bench_insert(self):
         self.client.store(self.data)

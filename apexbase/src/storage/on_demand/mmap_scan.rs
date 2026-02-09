@@ -1,16 +1,27 @@
 // Mmap scanning, footer loading, column range readers, filter+group+order fast path
 
 impl OnDemandStorage {
-    /// Get the V4 footer, reading it fresh from disk each time.
+    /// Get the V4 footer, using cached version when file hasn't changed.
     /// Returns None for V3 files.
-    /// NOTE: Always re-reads header + footer from disk via a fresh file handle
-    /// to avoid stale cache issues when another storage instance has appended data.
+    /// Cache is invalidated when file size changes (another instance appended data)
+    /// or explicitly via `invalidate_footer_cache()` after writes.
     pub(crate) fn get_or_load_footer(&self) -> io::Result<Option<V4Footer>> {
         let file_len = std::fs::metadata(&self.path)
             .map(|m| m.len())
             .unwrap_or(0);
         if file_len < HEADER_SIZE_V3 as u64 {
             return Ok(None);
+        }
+
+        // Fast path: return cached footer if file size hasn't changed
+        {
+            let cached = self.v4_footer.read();
+            if let Some(ref footer) = *cached {
+                let mc = self.mmap_cache.read();
+                if mc.file_size == file_len {
+                    return Ok(Some(footer.clone()));
+                }
+            }
         }
 
         // Invalidate mmap if file size changed (another instance appended data)
@@ -58,7 +69,10 @@ impl OnDemandStorage {
         drop(mmap);
         drop(file_guard);
 
-        V4Footer::from_bytes(&footer_bytes).map(Some)
+        let footer = V4Footer::from_bytes(&footer_bytes)?;
+        // Cache the footer for subsequent reads
+        *self.v4_footer.write() = Some(footer.clone());
+        Ok(Some(footer))
     }
 
     /// Invalidate the cached V4 footer (call after writes that change the footer).
@@ -239,52 +253,66 @@ impl OnDemandStorage {
                 let col_type = schema.columns[col_idx].1;
 
                 if let Some(&out_pos) = col_idx_to_out.get(&col_idx) {
-                    // Parse this column's data (encoding-aware)
                     let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
-                    let (col_data, consumed) = if encoding_version >= 1 {
-                        read_column_encoded(&body[pos..], col_type)?
-                    } else {
-                        ColumnData::from_bytes_typed(&body[pos..], col_type)?
-                    };
-                    pos += consumed;
 
-                    // Decode StringDict → String for in-memory use
-                    let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
-                        col_data.decode_string_dict()
-                    } else {
-                        col_data
-                    };
-
-                    // Filter by active rows if there are deletes
-                    if has_deletes {
-                        let active_indices: Vec<usize> = (0..rg_rows)
-                            .filter(|&i| (del_bytes[i / 8] >> (i % 8)) & 1 == 0)
-                            .take(rows_to_take)
-                            .collect();
-                        let filtered = col_data.filter_by_indices(&active_indices);
-                        col_accumulators[out_pos].append(&filtered);
-
-                        // Filter null bitmap (per-bit)
-                        for &old_idx in &active_indices {
-                            let ob = old_idx / 8;
-                            let obit = old_idx % 8;
-                            let is_null = ob < null_bytes.len() && (null_bytes[ob] >> obit) & 1 == 1;
+                    // OPTIMIZATION: For LIMIT queries without deletes, use partial column read
+                    // to avoid allocating/copying full column data (e.g., 1M rows → only 100)
+                    if !has_deletes && rows_to_take < rg_rows && encoding_version >= 1 {
+                        let (col_data, consumed) = read_column_encoded_partial(&body[pos..], col_type, rows_to_take)?;
+                        pos += consumed;
+                        let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                            col_data.decode_string_dict()
+                        } else {
+                            col_data
+                        };
+                        col_accumulators[out_pos].append(&col_data);
+                        for i in 0..rows_to_take {
+                            let is_null = (null_bytes[i / 8] >> (i % 8)) & 1 == 1;
                             null_accumulators[out_pos].push(is_null);
                         }
                     } else {
-                        // No deletes — take all rows (up to limit)
-                        if rows_to_take < rg_rows {
-                            let range_data = col_data.slice_range(0, rows_to_take);
-                            col_accumulators[out_pos].append(&range_data);
-                            for i in 0..rows_to_take {
-                                let is_null = (null_bytes[i / 8] >> (i % 8)) & 1 == 1;
+                        // Full column read path
+                        let (col_data, consumed) = if encoding_version >= 1 {
+                            read_column_encoded(&body[pos..], col_type)?
+                        } else {
+                            ColumnData::from_bytes_typed(&body[pos..], col_type)?
+                        };
+                        pos += consumed;
+
+                        let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                            col_data.decode_string_dict()
+                        } else {
+                            col_data
+                        };
+
+                        if has_deletes {
+                            let active_indices: Vec<usize> = (0..rg_rows)
+                                .filter(|&i| (del_bytes[i / 8] >> (i % 8)) & 1 == 0)
+                                .take(rows_to_take)
+                                .collect();
+                            let filtered = col_data.filter_by_indices(&active_indices);
+                            col_accumulators[out_pos].append(&filtered);
+
+                            for &old_idx in &active_indices {
+                                let ob = old_idx / 8;
+                                let obit = old_idx % 8;
+                                let is_null = ob < null_bytes.len() && (null_bytes[ob] >> obit) & 1 == 1;
                                 null_accumulators[out_pos].push(is_null);
                             }
                         } else {
-                            col_accumulators[out_pos].append(&col_data);
-                            for i in 0..rg_rows {
-                                let is_null = (null_bytes[i / 8] >> (i % 8)) & 1 == 1;
-                                null_accumulators[out_pos].push(is_null);
+                            if rows_to_take < rg_rows {
+                                let range_data = col_data.slice_range(0, rows_to_take);
+                                col_accumulators[out_pos].append(&range_data);
+                                for i in 0..rows_to_take {
+                                    let is_null = (null_bytes[i / 8] >> (i % 8)) & 1 == 1;
+                                    null_accumulators[out_pos].push(is_null);
+                                }
+                            } else {
+                                col_accumulators[out_pos].append(&col_data);
+                                for i in 0..rg_rows {
+                                    let is_null = (null_bytes[i / 8] >> (i % 8)) & 1 == 1;
+                                    null_accumulators[out_pos].push(is_null);
+                                }
                             }
                         }
                     }
@@ -1866,6 +1894,810 @@ impl OnDemandStorage {
                 Ok(ColumnData::Int64(vec![0i64; row_indices.len()]))
             }
         }
+    }
+
+    /// Mmap-level string equality scan: find rows where col_name = target_value.
+    /// Scans raw bytes without creating Arrow arrays. Returns global row indices of matches.
+    pub fn scan_string_filter_mmap(&self, col_name: &str, target: &str, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let col_type = schema.columns[col_idx].1;
+        if !matches!(col_type, ColumnType::String | ColumnType::StringDict) { return Ok(None); }
+        let col_count = schema.column_count();
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for string scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        let target_bytes = target.as_bytes();
+        let max_matches = limit.unwrap_or(usize::MAX);
+        let mut matches: Vec<usize> = Vec::new();
+        let mut global_row_offset: usize = 0;
+
+        for rg_meta in &footer.row_groups {
+            if matches.len() >= max_matches { break; }
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 { global_row_offset += rg_rows; continue; }
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() { return Err(err_data("RG extends past EOF")); }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let mut pos = rg_rows * 8; // skip IDs
+            let del_vec_len = (rg_rows + 7) / 8;
+            if pos + del_vec_len > body.len() { return Err(err_data("RG del vec truncated")); }
+            let del_bytes = &body[pos..pos + del_vec_len];
+            let has_deletes = rg_meta.deletion_count > 0;
+            pos += del_vec_len;
+            let null_bitmap_len = (rg_rows + 7) / 8;
+
+            for ci in 0..col_count {
+                if pos + null_bitmap_len > body.len() { break; }
+                let null_bytes = &body[pos..pos + null_bitmap_len];
+                pos += null_bitmap_len;
+                let ct = schema.columns[ci].1;
+
+                if ci == col_idx {
+                    let col_bytes = &body[pos..];
+                    let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+                    let encoding = if encoding_version >= 1 { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                    let data = &col_bytes[enc_offset..];
+
+                    if encoding == COL_ENCODING_PLAIN && matches!(ct, ColumnType::String) && data.len() >= 8 {
+                        let count = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+                        let all_offsets_len = (count + 1) * 4;
+                        if 8 + all_offsets_len <= data.len() {
+                            let data_len_off = 8 + all_offsets_len;
+                            if data_len_off + 8 <= data.len() {
+                                let data_start = data_len_off + 8;
+                                // FAST: cast offset bytes to &[u32] slice (avoids 2M u32::from_le_bytes calls)
+                                let offsets: &[u32] = unsafe {
+                                    std::slice::from_raw_parts(
+                                        data[8..].as_ptr() as *const u32,
+                                        count + 1,
+                                    )
+                                };
+                                let target_len = target_bytes.len();
+                                let n = count.min(rg_rows);
+                                if !has_deletes {
+                                    // Fast path: no deletes, skip deletion check
+                                    for i in 0..n {
+                                        if matches.len() >= max_matches { break; }
+                                        let s = offsets[i] as usize;
+                                        let e = offsets[i + 1] as usize;
+                                        if e - s == target_len {
+                                            let str_start = data_start + s;
+                                            if str_start + target_len <= data.len()
+                                                && &data[str_start..str_start + target_len] == target_bytes {
+                                                matches.push(global_row_offset + i);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    for i in 0..n {
+                                        if matches.len() >= max_matches { break; }
+                                        if (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                        if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                        let s = offsets[i] as usize;
+                                        let e = offsets[i + 1] as usize;
+                                        if e - s == target_len {
+                                            let str_start = data_start + s;
+                                            if str_start + target_len <= data.len()
+                                                && &data[str_start..str_start + target_len] == target_bytes {
+                                                matches.push(global_row_offset + i);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if encoding != COL_ENCODING_PLAIN && matches!(ct, ColumnType::String) {
+                        // Non-PLAIN encoded String: decode then scan
+                        let (col_data, _consumed) = if encoding_version >= 1 {
+                            read_column_encoded(col_bytes, ct)?
+                        } else {
+                            ColumnData::from_bytes_typed(col_bytes, ct)?
+                        };
+                        if let ColumnData::String { offsets, data: str_data } = &col_data {
+                            let count = offsets.len().saturating_sub(1);
+                            for i in 0..count.min(rg_rows) {
+                                if matches.len() >= max_matches { break; }
+                                if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                let s = offsets[i] as usize;
+                                let e = offsets[i + 1] as usize;
+                                if e - s == target_bytes.len() && &str_data[s..e] == target_bytes {
+                                    matches.push(global_row_offset + i);
+                                }
+                            }
+                        }
+                    } else if encoding == COL_ENCODING_PLAIN && matches!(ct, ColumnType::StringDict) && data.len() >= 16 {
+                        // StringDict: find target in dict, then scan indices
+                        let row_count = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+                        let dict_size = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+                        let indices_start = 16usize;
+                        let indices_len = row_count * 4;
+                        let dict_off_start = indices_start + indices_len;
+                        let dict_offsets_len = dict_size * 4;
+                        let dict_data_len_off = dict_off_start + dict_offsets_len;
+                        if dict_data_len_off + 8 <= data.len() {
+                            let dict_data_len = u64::from_le_bytes(data[dict_data_len_off..dict_data_len_off+8].try_into().unwrap()) as usize;
+                            let dict_data_start = dict_data_len_off + 8;
+                            // FAST: cast to &[u32] slices
+                            let dict_offsets: &[u32] = unsafe {
+                                std::slice::from_raw_parts(
+                                    data[dict_off_start..].as_ptr() as *const u32,
+                                    dict_size,
+                                )
+                            };
+                            let indices: &[u32] = unsafe {
+                                std::slice::from_raw_parts(
+                                    data[indices_start..].as_ptr() as *const u32,
+                                    row_count,
+                                )
+                            };
+                            // Find target in dictionary
+                            let target_len = target_bytes.len();
+                            let mut target_dict_idx: Option<u32> = None;
+                            for di in 0..dict_size {
+                                let ds = dict_offsets[di] as usize;
+                                let de = if di + 1 < dict_size { dict_offsets[di + 1] as usize } else { dict_data_len };
+                                if de - ds == target_len && dict_data_start + de <= data.len() {
+                                    if &data[dict_data_start + ds..dict_data_start + de] == target_bytes {
+                                        target_dict_idx = Some((di + 1) as u32);
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(tdi) = target_dict_idx {
+                                let n = row_count.min(rg_rows);
+                                if !has_deletes {
+                                    for i in 0..n {
+                                        if matches.len() >= max_matches { break; }
+                                        if indices[i] == tdi { matches.push(global_row_offset + i); }
+                                    }
+                                } else {
+                                    for i in 0..n {
+                                        if matches.len() >= max_matches { break; }
+                                        if (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                        if indices[i] == tdi { matches.push(global_row_offset + i); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let consumed = if encoding_version >= 1 {
+                    skip_column_encoded(&body[pos..], ct)?
+                } else {
+                    ColumnData::skip_bytes_typed(&body[pos..], ct)?
+                };
+                pos += consumed;
+            }
+            global_row_offset += rg_rows;
+        }
+        drop(mmap_guard);
+        drop(file_guard);
+        Ok(Some(matches))
+    }
+
+    /// Mmap-level numeric range scan: find rows where col_name BETWEEN low AND high.
+    /// Returns global row indices of matches.
+    pub fn scan_numeric_range_mmap(&self, col_name: &str, low: f64, high: f64, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let col_type = schema.columns[col_idx].1;
+        let is_int = matches!(col_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 |
+            ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 |
+            ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date);
+        let is_float = matches!(col_type, ColumnType::Float64 | ColumnType::Float32);
+        if !is_int && !is_float { return Ok(None); }
+        let col_count = schema.column_count();
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for range scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        let max_matches = limit.unwrap_or(usize::MAX);
+        let mut matches: Vec<usize> = Vec::new();
+        let mut global_row_offset: usize = 0;
+
+        for rg_meta in &footer.row_groups {
+            if matches.len() >= max_matches { break; }
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 { global_row_offset += rg_rows; continue; }
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() { return Err(err_data("RG extends past EOF")); }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let mut pos = rg_rows * 8;
+            let del_vec_len = (rg_rows + 7) / 8;
+            if pos + del_vec_len > body.len() { return Err(err_data("RG del vec truncated")); }
+            let del_bytes = &body[pos..pos + del_vec_len];
+            let has_deletes = rg_meta.deletion_count > 0;
+            pos += del_vec_len;
+            let null_bitmap_len = (rg_rows + 7) / 8;
+
+            for ci in 0..col_count {
+                if pos + null_bitmap_len > body.len() { break; }
+                let null_bytes = &body[pos..pos + null_bitmap_len];
+                pos += null_bitmap_len;
+                let ct = schema.columns[ci].1;
+
+                if ci == col_idx {
+                    let col_bytes = &body[pos..];
+                    let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+                    let encoding = if encoding_version >= 1 { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                    let data_slice = &col_bytes[enc_offset..];
+
+                    if encoding == COL_ENCODING_PLAIN && data_slice.len() >= 8 {
+                        let count = u64::from_le_bytes(data_slice[0..8].try_into().unwrap()) as usize;
+                        let values_start = 8usize;
+                        let n = count.min(rg_rows);
+                        if is_int {
+                            let low_i = low.ceil() as i64;
+                            let high_i = high.floor() as i64;
+                            let vals: &[i64] = unsafe {
+                                std::slice::from_raw_parts(
+                                    data_slice[values_start..].as_ptr() as *const i64,
+                                    n.min((data_slice.len() - values_start) / 8),
+                                )
+                            };
+                            if !has_deletes {
+                                for i in 0..vals.len() {
+                                    if matches.len() >= max_matches { break; }
+                                    if vals[i] >= low_i && vals[i] <= high_i { matches.push(global_row_offset + i); }
+                                }
+                            } else {
+                                for i in 0..vals.len() {
+                                    if matches.len() >= max_matches { break; }
+                                    if (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if vals[i] >= low_i && vals[i] <= high_i { matches.push(global_row_offset + i); }
+                                }
+                            }
+                        } else {
+                            let vals: &[f64] = unsafe {
+                                std::slice::from_raw_parts(
+                                    data_slice[values_start..].as_ptr() as *const f64,
+                                    n.min((data_slice.len() - values_start) / 8),
+                                )
+                            };
+                            if !has_deletes {
+                                for i in 0..vals.len() {
+                                    if matches.len() >= max_matches { break; }
+                                    if vals[i] >= low && vals[i] <= high { matches.push(global_row_offset + i); }
+                                }
+                            } else {
+                                for i in 0..vals.len() {
+                                    if matches.len() >= max_matches { break; }
+                                    if (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if vals[i] >= low && vals[i] <= high { matches.push(global_row_offset + i); }
+                                }
+                            }
+                        }
+                    } else {
+                        // Non-PLAIN encoding (RLE, BITPACK, etc.): decode then scan
+                        let (col_data, _consumed) = if encoding_version >= 1 {
+                            read_column_encoded(col_bytes, ct)?
+                        } else {
+                            ColumnData::from_bytes_typed(col_bytes, ct)?
+                        };
+                        match &col_data {
+                            ColumnData::Int64(vals) => {
+                                let low_i = low.ceil() as i64;
+                                let high_i = high.floor() as i64;
+                                for i in 0..vals.len().min(rg_rows) {
+                                    if matches.len() >= max_matches { break; }
+                                    if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if vals[i] >= low_i && vals[i] <= high_i { matches.push(global_row_offset + i); }
+                                }
+                            }
+                            ColumnData::Float64(vals) => {
+                                for i in 0..vals.len().min(rg_rows) {
+                                    if matches.len() >= max_matches { break; }
+                                    if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if vals[i] >= low && vals[i] <= high { matches.push(global_row_offset + i); }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let consumed = if encoding_version >= 1 {
+                    skip_column_encoded(&body[pos..], ct)?
+                } else {
+                    ColumnData::skip_bytes_typed(&body[pos..], ct)?
+                };
+                pos += consumed;
+            }
+            global_row_offset += rg_rows;
+        }
+        drop(mmap_guard);
+        drop(file_guard);
+        Ok(Some(matches))
+    }
+
+    /// Compute numeric column aggregates directly from mmap without Arrow arrays.
+    /// Returns (count, sum, min, max) for the specified column.
+    /// Only works for Int64/Float64 columns in V4 mmap-only mode.
+    pub fn compute_column_stats_mmap(&self, col_name: &str) -> io::Result<Option<(u64, f64, f64, f64)>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let col_type = schema.columns[col_idx].1;
+        let is_int = matches!(col_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 |
+            ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 |
+            ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date);
+        let is_float = matches!(col_type, ColumnType::Float64 | ColumnType::Float32);
+        if !is_int && !is_float { return Ok(None); }
+
+        let col_count = schema.column_count();
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for mmap agg"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        let mut total_count: u64 = 0;
+        let mut total_sum: f64 = 0.0;
+        let mut total_min: f64 = f64::INFINITY;
+        let mut total_max: f64 = f64::NEG_INFINITY;
+
+        for rg_meta in &footer.row_groups {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 { continue; }
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() { return Err(err_data("RG extends past EOF")); }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let mut pos = rg_rows * 8; // skip IDs
+            let del_vec_len = (rg_rows + 7) / 8;
+            if pos + del_vec_len > body.len() { return Err(err_data("RG del vec truncated")); }
+            let del_bytes = &body[pos..pos + del_vec_len];
+            let has_deletes = rg_meta.deletion_count > 0;
+            pos += del_vec_len;
+
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            for ci in 0..col_count {
+                if pos + null_bitmap_len > body.len() { break; }
+                let null_bytes = &body[pos..pos + null_bitmap_len];
+                pos += null_bitmap_len;
+
+                let ct = schema.columns[ci].1;
+                if ci == col_idx {
+                    let col_bytes = &body[pos..];
+                    let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+                    let encoding = if encoding_version >= 1 { col_bytes[0] } else { COL_ENCODING_PLAIN };
+
+                    if encoding == COL_ENCODING_PLAIN {
+                        let data = &col_bytes[enc_offset..];
+                        if data.len() >= 8 {
+                            let count = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+                            let values_start = 8usize;
+                            if is_int {
+                                for i in 0..count.min(rg_rows) {
+                                    if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    let off = values_start + i * 8;
+                                    if off + 8 > data.len() { break; }
+                                    let v = i64::from_le_bytes(data[off..off+8].try_into().unwrap()) as f64;
+                                    total_count += 1;
+                                    total_sum += v;
+                                    if v < total_min { total_min = v; }
+                                    if v > total_max { total_max = v; }
+                                }
+                            } else {
+                                for i in 0..count.min(rg_rows) {
+                                    if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    let off = values_start + i * 8;
+                                    if off + 8 > data.len() { break; }
+                                    let v = f64::from_le_bytes(data[off..off+8].try_into().unwrap());
+                                    if !v.is_nan() {
+                                        total_count += 1;
+                                        total_sum += v;
+                                        if v < total_min { total_min = v; }
+                                        if v > total_max { total_max = v; }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Encoded column: fallback to full decode
+                        let (col_data, _) = if encoding_version >= 1 {
+                            read_column_encoded(col_bytes, ct)?
+                        } else {
+                            ColumnData::from_bytes_typed(col_bytes, ct)?
+                        };
+                        match &col_data {
+                            ColumnData::Int64(vals) => {
+                                for (i, &v) in vals.iter().enumerate() {
+                                    if has_deletes && i < rg_rows && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if i < rg_rows && (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    let fv = v as f64;
+                                    total_count += 1;
+                                    total_sum += fv;
+                                    if fv < total_min { total_min = fv; }
+                                    if fv > total_max { total_max = fv; }
+                                }
+                            }
+                            ColumnData::Float64(vals) => {
+                                for (i, &v) in vals.iter().enumerate() {
+                                    if has_deletes && i < rg_rows && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if i < rg_rows && (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if !v.is_nan() {
+                                        total_count += 1;
+                                        total_sum += v;
+                                        if v < total_min { total_min = v; }
+                                        if v > total_max { total_max = v; }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Skip column data to advance pos
+                let consumed = if encoding_version >= 1 {
+                    skip_column_encoded(&body[pos..], ct)?
+                } else {
+                    ColumnData::skip_bytes_typed(&body[pos..], ct)?
+                };
+                pos += consumed;
+            }
+        }
+
+        if total_count == 0 {
+            return Ok(Some((0, 0.0, 0.0, 0.0)));
+        }
+        Ok(Some((total_count, total_sum, total_min, total_max)))
+    }
+
+    /// Extract specific rows by global indices from mmap, returning an Arrow RecordBatch.
+    /// Navigates each RG body once and extracts only values at target positions.
+    /// Much faster than full-table scan + take for small result sets.
+    pub fn extract_rows_by_indices_to_arrow(&self, indices: &[usize]) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
+        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringBuilder, BooleanBuilder};
+        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use std::sync::Arc;
+
+        if indices.is_empty() {
+            return Ok(Some(arrow::record_batch::RecordBatch::new_empty(Arc::new(Schema::empty()))));
+        }
+
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_count = schema.column_count();
+
+        // Build RG cumulative bounds
+        let mut rg_bounds: Vec<(usize, usize)> = Vec::new();
+        let mut cumulative = 0usize;
+        for rg in &footer.row_groups {
+            let n = rg.row_count as usize;
+            rg_bounds.push((cumulative, cumulative + n));
+            cumulative += n;
+        }
+
+        // Group indices by RG: (output_position, local_index_within_rg)
+        let mut rg_local_indices: Vec<Vec<(usize, usize)>> = vec![Vec::new(); footer.row_groups.len()];
+        for (out_idx, &global_idx) in indices.iter().enumerate() {
+            for (rg_i, &(start, end)) in rg_bounds.iter().enumerate() {
+                if global_idx >= start && global_idx < end {
+                    rg_local_indices[rg_i].push((out_idx, global_idx - start));
+                    break;
+                }
+            }
+        }
+
+        let n_out = indices.len();
+        let mut out_ids: Vec<i64> = vec![0i64; n_out];
+        let mut out_cols: Vec<Vec<Option<crate::data::Value>>> = (0..col_count).map(|_| vec![None; n_out]).collect();
+
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for batch extract"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        for (rg_i, local_pairs) in rg_local_indices.iter().enumerate() {
+            if local_pairs.is_empty() { continue; }
+            let rg_meta = &footer.row_groups[rg_i];
+            let rg_rows = rg_meta.row_count as usize;
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() { return Err(err_data("RG extends past EOF")); }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let mut pos = 0usize;
+
+            // Extract IDs for target rows
+            if rg_rows * 8 <= body.len() {
+                for &(out_idx, local_idx) in local_pairs {
+                    let id_off = local_idx * 8;
+                    if id_off + 8 <= rg_rows * 8 {
+                        out_ids[out_idx] = i64::from_le_bytes(body[id_off..id_off+8].try_into().unwrap());
+                    }
+                }
+            }
+            pos += rg_rows * 8;
+
+            // Skip deletion vector
+            let del_vec_len = (rg_rows + 7) / 8;
+            pos += del_vec_len;
+            let null_bitmap_len = (rg_rows + 7) / 8;
+
+            for ci in 0..col_count {
+                if pos + null_bitmap_len > body.len() { break; }
+                let null_bytes = &body[pos..pos + null_bitmap_len];
+                pos += null_bitmap_len;
+                let ct = schema.columns[ci].1;
+                let col_bytes = &body[pos..];
+                let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+                let encoding = if encoding_version >= 1 && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                let data_bytes = if enc_offset <= col_bytes.len() { &col_bytes[enc_offset..] } else { &[] as &[u8] };
+
+                let extracted = match (encoding, ct) {
+                    (COL_ENCODING_PLAIN, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 |
+                     ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 |
+                     ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date) if data_bytes.len() >= 8 => {
+                        for &(out_idx, local_idx) in local_pairs {
+                            if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                            let off = 8 + local_idx * 8;
+                            if off + 8 <= data_bytes.len() {
+                                out_cols[ci][out_idx] = Some(crate::data::Value::Int64(
+                                    i64::from_le_bytes(data_bytes[off..off+8].try_into().unwrap())
+                                ));
+                            }
+                        }
+                        true
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::Float64 | ColumnType::Float32) if data_bytes.len() >= 8 => {
+                        for &(out_idx, local_idx) in local_pairs {
+                            if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                            let off = 8 + local_idx * 8;
+                            if off + 8 <= data_bytes.len() {
+                                out_cols[ci][out_idx] = Some(crate::data::Value::Float64(
+                                    f64::from_le_bytes(data_bytes[off..off+8].try_into().unwrap())
+                                ));
+                            }
+                        }
+                        true
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::String) if data_bytes.len() >= 8 => {
+                        let count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+                        let offsets_end = 8 + (count + 1) * 4;
+                        let data_len_off = offsets_end;
+                        if data_len_off + 8 <= data_bytes.len() {
+                            let data_start = data_len_off + 8;
+                            for &(out_idx, local_idx) in local_pairs {
+                                if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                                if local_idx < count {
+                                    let s_off = 8 + local_idx * 4;
+                                    let e_off = 8 + (local_idx + 1) * 4;
+                                    if e_off + 4 <= data_bytes.len() {
+                                        let s = u32::from_le_bytes(data_bytes[s_off..s_off+4].try_into().unwrap()) as usize;
+                                        let e = u32::from_le_bytes(data_bytes[e_off..e_off+4].try_into().unwrap()) as usize;
+                                        if data_start + e <= data_bytes.len() {
+                                            out_cols[ci][out_idx] = Some(crate::data::Value::String(
+                                                std::str::from_utf8(&data_bytes[data_start + s..data_start + e]).unwrap_or("").to_string()
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            true
+                        } else { false }
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::StringDict) if data_bytes.len() >= 16 => {
+                        let row_count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+                        let dict_size = u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
+                        let indices_start = 16usize;
+                        let dict_off_start = indices_start + row_count * 4;
+                        let dict_data_len_off = dict_off_start + dict_size * 4;
+                        if dict_data_len_off + 8 <= data_bytes.len() {
+                            let dict_data_len = u64::from_le_bytes(data_bytes[dict_data_len_off..dict_data_len_off+8].try_into().unwrap()) as usize;
+                            let dict_data_start = dict_data_len_off + 8;
+                            for &(out_idx, local_idx) in local_pairs {
+                                if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                                if local_idx < row_count {
+                                    let idx_off = indices_start + local_idx * 4;
+                                    if idx_off + 4 <= data_bytes.len() {
+                                        let dict_idx = u32::from_le_bytes(data_bytes[idx_off..idx_off+4].try_into().unwrap());
+                                        if dict_idx == 0 { continue; }
+                                        let di = (dict_idx - 1) as usize;
+                                        if di < dict_size {
+                                            let ds = u32::from_le_bytes(data_bytes[dict_off_start + di*4..dict_off_start + di*4+4].try_into().unwrap()) as usize;
+                                            let de = if di + 1 < dict_size {
+                                                u32::from_le_bytes(data_bytes[dict_off_start + (di+1)*4..dict_off_start + (di+1)*4+4].try_into().unwrap()) as usize
+                                            } else { dict_data_len };
+                                            if dict_data_start + de <= data_bytes.len() {
+                                                out_cols[ci][out_idx] = Some(crate::data::Value::String(
+                                                    std::str::from_utf8(&data_bytes[dict_data_start + ds..dict_data_start + de]).unwrap_or("").to_string()
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            true
+                        } else { false }
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::Bool) if data_bytes.len() >= 8 => {
+                        for &(out_idx, local_idx) in local_pairs {
+                            if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                            let byte_off = 8 + local_idx / 8;
+                            let bit = local_idx % 8;
+                            if byte_off < data_bytes.len() {
+                                out_cols[ci][out_idx] = Some(crate::data::Value::Bool(
+                                    (data_bytes[byte_off] >> bit) & 1 == 1
+                                ));
+                            }
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+
+                if !extracted {
+                    // Fallback: decode full column and pick values at target indices
+                    let (col_data, _) = if encoding_version >= 1 {
+                        read_column_encoded(col_bytes, ct)?
+                    } else {
+                        ColumnData::from_bytes_typed(col_bytes, ct)?
+                    };
+                    for &(out_idx, local_idx) in local_pairs {
+                        if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                        let val = match &col_data {
+                            ColumnData::Int64(v) => if local_idx < v.len() { Some(crate::data::Value::Int64(v[local_idx])) } else { None },
+                            ColumnData::Float64(v) => if local_idx < v.len() { Some(crate::data::Value::Float64(v[local_idx])) } else { None },
+                            ColumnData::Bool { data, len } => if local_idx < *len {
+                                Some(crate::data::Value::Bool((data[local_idx / 8] >> (local_idx % 8)) & 1 == 1))
+                            } else { None },
+                            ColumnData::String { offsets, data } => {
+                                let cnt = offsets.len().saturating_sub(1);
+                                if local_idx < cnt {
+                                    let s = offsets[local_idx] as usize;
+                                    let e = offsets[local_idx + 1] as usize;
+                                    Some(crate::data::Value::String(std::str::from_utf8(&data[s..e]).unwrap_or("").to_string()))
+                                } else { None }
+                            }
+                            ColumnData::StringDict { indices: idx_arr, dict_offsets, dict_data, .. } => {
+                                if local_idx < idx_arr.len() {
+                                    let di = idx_arr[local_idx];
+                                    if di == 0 { None } else {
+                                        let d = (di - 1) as usize;
+                                        if d < dict_offsets.len() {
+                                            let s = dict_offsets[d] as usize;
+                                            let e = if d + 1 < dict_offsets.len() { dict_offsets[d + 1] as usize } else { dict_data.len() };
+                                            Some(crate::data::Value::String(std::str::from_utf8(&dict_data[s..e]).unwrap_or("").to_string()))
+                                        } else { None }
+                                    }
+                                } else { None }
+                            }
+                            _ => None,
+                        };
+                        if let Some(v) = val { out_cols[ci][out_idx] = Some(v); }
+                    }
+                }
+
+                // Advance pos past this column
+                let consumed = if encoding_version >= 1 {
+                    skip_column_encoded(&body[pos..], ct)?
+                } else {
+                    ColumnData::skip_bytes_typed(&body[pos..], ct)?
+                };
+                pos += consumed;
+            }
+        }
+
+        drop(mmap_guard);
+        drop(file_guard);
+
+        // Build Arrow RecordBatch from collected values
+        let mut fields: Vec<Field> = Vec::with_capacity(col_count + 1);
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_count + 1);
+
+        fields.push(Field::new("_id", ArrowDataType::Int64, false));
+        arrays.push(Arc::new(Int64Array::from(out_ids)));
+
+        for ci in 0..col_count {
+            let col_name = &schema.columns[ci].0;
+            let ct = schema.columns[ci].1;
+            let vals = &out_cols[ci];
+            match ct {
+                ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
+                ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+                ColumnType::Timestamp | ColumnType::Date => {
+                    let arr: Vec<Option<i64>> = vals.iter().map(|v| match v {
+                        Some(crate::data::Value::Int64(n)) => Some(*n),
+                        _ => None,
+                    }).collect();
+                    fields.push(Field::new(col_name, ArrowDataType::Int64, true));
+                    arrays.push(Arc::new(Int64Array::from(arr)));
+                }
+                ColumnType::Float64 | ColumnType::Float32 => {
+                    let arr: Vec<Option<f64>> = vals.iter().map(|v| match v {
+                        Some(crate::data::Value::Float64(n)) => Some(*n),
+                        _ => None,
+                    }).collect();
+                    fields.push(Field::new(col_name, ArrowDataType::Float64, true));
+                    arrays.push(Arc::new(Float64Array::from(arr)));
+                }
+                ColumnType::String | ColumnType::StringDict => {
+                    let mut builder = StringBuilder::with_capacity(n_out, n_out * 16);
+                    for v in vals {
+                        match v {
+                            Some(crate::data::Value::String(s)) => builder.append_value(s),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    fields.push(Field::new(col_name, ArrowDataType::Utf8, true));
+                    arrays.push(Arc::new(builder.finish()) as ArrayRef);
+                }
+                ColumnType::Bool => {
+                    let mut builder = BooleanBuilder::with_capacity(n_out);
+                    for v in vals {
+                        match v {
+                            Some(crate::data::Value::Bool(b)) => builder.append_value(*b),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    fields.push(Field::new(col_name, ArrowDataType::Boolean, true));
+                    arrays.push(Arc::new(builder.finish()) as ArrayRef);
+                }
+                _ => {
+                    let mut builder = StringBuilder::with_capacity(n_out, n_out * 16);
+                    for v in vals {
+                        match v {
+                            Some(crate::data::Value::String(s)) => builder.append_value(s),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    fields.push(Field::new(col_name, ArrowDataType::Utf8, true));
+                    arrays.push(Arc::new(builder.finish()) as ArrayRef);
+                }
+            }
+        }
+
+        let batch_schema = Arc::new(Schema::new(fields));
+        let batch = arrow::record_batch::RecordBatch::try_new(batch_schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(Some(batch))
     }
 
 }
