@@ -16,9 +16,15 @@ use arrow::record_batch::RecordBatch;
 
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::CopyHandler;
-use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::ClientInfo;
+use pgwire::api::portal::Portal;
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::results::{
+    DataRowEncoder, DescribePortalResponse, DescribeResponse, DescribeStatementResponse,
+    FieldFormat, FieldInfo, QueryResponse, Response, Tag,
+};
+use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::store::PortalStore;
+use pgwire::api::{ClientInfo, ClientPortalStore};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
@@ -180,6 +186,124 @@ impl SimpleQueryHandler for ApexBaseHandler {
 // CopyHandler — use default no-op implementations
 #[async_trait]
 impl CopyHandler for ApexBaseHandler {}
+
+// Extended Query Protocol support
+// This allows clients like psql, DBeaver, etc. to use prepared statements.
+#[async_trait]
+impl ExtendedQueryHandler for ApexBaseHandler {
+    type Statement = String;
+    type QueryParser = NoopQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::new(NoopQueryParser::new())
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        _client: &mut C,
+        target: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let sql = &target.statement;
+        if sql.trim().is_empty() || Self::is_write_op(sql) {
+            return Ok(DescribeStatementResponse::new(vec![], vec![]));
+        }
+        // Execute query to discover schema for the JDBC driver
+        match self.execute_query(sql) {
+            Ok(batch) => {
+                let fields = schema_to_field_info(&batch.schema());
+                Ok(DescribeStatementResponse::new(vec![], fields))
+            }
+            Err(_) => Ok(DescribeStatementResponse::new(vec![], vec![])),
+        }
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _client: &mut C,
+        target: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let sql = &target.statement.statement;
+        if sql.trim().is_empty() || Self::is_write_op(sql) {
+            return Ok(DescribePortalResponse::new(vec![]));
+        }
+        match self.execute_query(sql) {
+            Ok(batch) => {
+                let fields = schema_to_field_info(&batch.schema());
+                Ok(DescribePortalResponse::new(fields))
+            }
+            Err(_) => Ok(DescribePortalResponse::new(vec![])),
+        }
+    }
+
+    async fn do_query<'a, 'b: 'a, C>(
+        &'b self,
+        _client: &mut C,
+        portal: &'a Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response<'a>>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let sql = &portal.statement.statement;
+        log::debug!("Extended query: {}", sql);
+
+        if sql.trim().is_empty() {
+            return Ok(Response::EmptyQuery);
+        }
+
+        match self.execute_query(sql) {
+            Ok(batch) => {
+                if Self::is_write_op(sql) {
+                    let rows = batch.num_rows();
+                    let tag = if sql.trim().to_uppercase().starts_with("INSERT") {
+                        Tag::new("INSERT").with_oid(0).with_rows(rows)
+                    } else if sql.trim().to_uppercase().starts_with("DELETE") {
+                        Tag::new("DELETE").with_rows(rows)
+                    } else if sql.trim().to_uppercase().starts_with("UPDATE") {
+                        Tag::new("UPDATE").with_rows(rows)
+                    } else {
+                        Tag::new("OK")
+                    };
+                    Ok(Response::Execution(tag))
+                } else {
+                    let schema = batch.schema();
+                    let field_infos: Vec<FieldInfo> = schema_to_field_info(&schema);
+                    let field_infos = Arc::new(field_infos);
+
+                    let rows = Self::encode_batch_rows(&batch, &field_infos)?;
+                    let data_row_stream = stream::iter(rows);
+                    Ok(Response::Query(QueryResponse::new(
+                        field_infos,
+                        data_row_stream,
+                    )))
+                }
+            }
+            Err(msg) => Err(PgWireError::UserError(Box::new(
+                pgwire::error::ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42000".to_string(),
+                    msg,
+                ),
+            ))),
+        }
+    }
+
+}
 
 // ============================================================================
 // Arrow value encoding helpers

@@ -12,7 +12,6 @@ pub use handler::ApexBaseHandler;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pgwire::api::query::PlaceholderExtendedQueryHandler;
 use pgwire::api::PgWireHandlerFactory;
 use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
@@ -40,13 +39,12 @@ impl Default for ServerConfig {
 /// Server handler factory
 pub struct ApexBaseServerFactory {
     handler: Arc<ApexBaseHandler>,
-    extended_handler: Arc<PlaceholderExtendedQueryHandler>,
 }
 
 impl PgWireHandlerFactory for ApexBaseServerFactory {
     type StartupHandler = ApexBaseHandler;
     type SimpleQueryHandler = ApexBaseHandler;
-    type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
+    type ExtendedQueryHandler = ApexBaseHandler;
     type CopyHandler = ApexBaseHandler;
 
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
@@ -54,7 +52,7 @@ impl PgWireHandlerFactory for ApexBaseServerFactory {
     }
 
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
-        self.extended_handler.clone()
+        self.handler.clone()
     }
 
     fn startup_handler(&self) -> Arc<Self::StartupHandler> {
@@ -71,7 +69,6 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
     let handler = Arc::new(ApexBaseHandler::new(config.data_dir.clone()));
     let factory = Arc::new(ApexBaseServerFactory {
         handler,
-        extended_handler: Arc::new(PlaceholderExtendedQueryHandler),
     });
 
     let addr = format!("{}:{}", config.host, config.port);
