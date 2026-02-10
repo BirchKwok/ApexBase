@@ -23,6 +23,7 @@ ApexBase is an embedded columnar database designed for **Hybrid Transactional/An
 - **Durability levels** — configurable `fast` / `safe` / `max` with WAL support and crash recovery
 - **Compact storage** — dictionary encoding for low-cardinality strings, LZ4 and Zstd compression
 - **Parquet interop** — COPY TO / COPY FROM Parquet files
+- **PostgreSQL wire protocol** — built-in server for DBeaver, psql, DataGrip, pgAdmin, Navicat, and any PostgreSQL-compatible client; two distribution modes (Python CLI or standalone Rust binary)
 - **Cross-platform** — Linux, macOS, and Windows; x86_64 and ARM64; Python 3.9 -- 3.13
 
 ---
@@ -317,6 +318,129 @@ Reproduce: `python benchmarks/bench_vs_sqlite_duckdb.py --rows 1000000`
 
 ---
 
+## PostgreSQL Wire Protocol Server
+
+ApexBase includes a built-in PostgreSQL wire protocol server, allowing you to connect using **DBeaver**, **psql**, **DataGrip**, **pgAdmin**, **Navicat**, and any other tool that supports the PostgreSQL protocol.
+
+### Starting the Server
+
+**Method 1: Python CLI (after `pip install apexbase`)**
+
+```bash
+apexbase-server --dir /path/to/data --port 5432
+```
+
+Options:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dir`, `-d` | `.` | Directory containing `.apex` database files |
+| `--host` | `127.0.0.1` | Host to bind to (use `0.0.0.0` for remote access) |
+| `--port`, `-p` | `5432` | Port to listen on |
+
+**Method 2: Standalone Rust binary (no Python required)**
+
+```bash
+# Build
+cargo build --release --bin apexbase-server --no-default-features --features server
+
+# Run
+./target/release/apexbase-server --dir /path/to/data --port 5432
+```
+
+### Connecting with Database Tools
+
+The server emulates PostgreSQL 15.0, reports a `pg_catalog` and `information_schema` compatible metadata layer, and supports `SimpleQuery` protocol. No username or password is required (authentication is disabled).
+
+#### DBeaver
+
+1. **New Database Connection** → choose **PostgreSQL**
+2. Fill in connection details:
+   - **Host**: `127.0.0.1` (or the `--host` you specified)
+   - **Port**: `5432` (or the `--port` you specified)
+   - **Database**: `apexbase` (any value accepted)
+   - **Authentication**: select **No Authentication** or leave username/password empty
+3. Click **Test Connection** → **Finish**
+4. DBeaver will discover tables and columns automatically via `pg_catalog` / `information_schema`
+
+#### psql
+
+```bash
+psql -h 127.0.0.1 -p 5432 -d apexbase
+```
+
+#### DataGrip / IntelliJ IDEA
+
+1. **Database** tool window → **+** → **Data Source** → **PostgreSQL**
+2. Set **Host**, **Port**, **Database** as above; leave **User** and **Password** empty
+3. Click **Test Connection** → **OK**
+
+#### pgAdmin
+
+1. **Add New Server** → **General** tab: give it a name
+2. **Connection** tab: set **Host** and **Port**; leave **Username** as `postgres` (ignored) and **Password** empty
+3. **Save** — tables appear under **Databases > apexbase > Schemas > public > Tables**
+
+#### Navicat for PostgreSQL
+
+1. **Connection** → **PostgreSQL**
+2. Set **Host**, **Port**; leave **User** and **Password** blank
+3. **Test Connection** → **OK**
+
+#### Other Compatible Tools
+
+Any tool or library that speaks the PostgreSQL wire protocol (libpq) can connect, including:
+
+- **TablePlus**, **Beekeeper Studio**, **Heidisql**
+- **Python**: `psycopg2` / `asyncpg`
+- **Node.js**: `pg` (`node-postgres`)
+- **Go**: `pgx` / `lib/pq`
+- **Rust**: `tokio-postgres` / `sqlx`
+- **Java**: JDBC PostgreSQL driver
+
+Example with `psycopg2`:
+
+```python
+import psycopg2
+
+conn = psycopg2.connect(host="127.0.0.1", port=5432, dbname="apexbase")
+cur = conn.cursor()
+cur.execute("SELECT * FROM users LIMIT 10")
+print(cur.fetchall())
+conn.close()
+```
+
+### Supported SQL over Wire Protocol
+
+The wire protocol server passes SQL directly to the ApexBase query engine. All SQL features listed in [Usage Guide](#usage-guide) are available, including JOINs, CTEs, window functions, transactions, and DDL.
+
+### Metadata Compatibility
+
+The server implements a `pg_catalog` compatibility layer that responds to common catalog queries:
+
+| Catalog / View | Purpose |
+|----------------|---------|
+| `pg_catalog.pg_namespace` | Schema listing |
+| `pg_catalog.pg_database` | Database listing |
+| `pg_catalog.pg_class` | Table discovery |
+| `pg_catalog.pg_attribute` | Column metadata |
+| `pg_catalog.pg_type` | Type information |
+| `pg_catalog.pg_settings` | Server settings |
+| `information_schema.tables` | Standard table listing |
+| `information_schema.columns` | Standard column listing |
+| `SET` / `SHOW` statements | Client configuration probes |
+
+This enables GUI tools to browse tables, inspect columns, and display data types without modification.
+
+### Limitations
+
+- **Extended Query Protocol** (prepared statements with binary parameters) is not yet supported; tools should use the Simple Query protocol
+- **Authentication** is not implemented — the server accepts all connections
+- **SSL/TLS** is not yet supported — use SSH tunneling for remote access if needed
+- **Single-database** — all `.apex` files in the data directory appear as tables under the `public` schema
+
+---
+
 ## Architecture
 
 ```
@@ -343,6 +467,9 @@ Rust Core (PyO3 bindings)
   +-- Index Manager (B-Tree, Hash)               |
   +-- TxnManager (OCC + MVCC)                    |
   +-- NanoFTS (full-text search)                  |
+  +-- PG Wire Protocol Server (pgwire)             |
+      +-- DBeaver / psql / DataGrip / pgAdmin      |
+      +-- pg_catalog & information_schema compat    |
 ```
 
 ### Storage Format
