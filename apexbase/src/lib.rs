@@ -7,10 +7,13 @@ pub mod storage;
 pub mod table;
 pub mod query;
 pub mod data;
+#[cfg(feature = "python")]
 pub mod python;
 pub mod fts;
 pub mod txn;
 pub mod scaling;
+#[cfg(feature = "server")]
+pub mod server;
 
 // Re-export main types
 pub use storage::{ColumnarStorage, ColumnType, ColumnValue, FileSchema};
@@ -18,13 +21,17 @@ pub use table::TableCatalog;
 pub use data::{DataType, Value, Row};
 pub use query::{ApexExecutor, ApexResult};
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 /// Python module entry point
+#[cfg(feature = "python")]
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<python::ApexStorage>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    #[cfg(feature = "server")]
+    m.add_function(pyo3::wrap_pyfunction!(python::start_pg_server, m)?)?;
     Ok(())
 }
 

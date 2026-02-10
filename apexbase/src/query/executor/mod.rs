@@ -163,6 +163,78 @@ const MAX_CACHE_ENTRIES: usize = 64;  // Limit cache to 64 tables
 static STORAGE_CACHE: Lazy<RwLock<AHashMap<PathBuf, (Arc<TableStorageBackend>, std::time::SystemTime, std::time::Instant)>>> = 
     Lazy::new(|| RwLock::new(AHashMap::with_capacity(MAX_CACHE_ENTRIES)));
 
+// ============================================================================
+// Per-table Write Locks — serializes concurrent writes to the same table
+// ============================================================================
+// Two-layer locking for concurrent access safety:
+// Layer 1: parking_lot::Mutex (~10-20ns uncontended) — same-process threads
+// Layer 2: fs2 flock on cached File handle (~0.5μs) — cross-process safety
+//
+// The File handle is opened once and cached, so repeated writes only pay
+// the flock() syscall cost, not open()+flock().
+struct TableLock {
+    mutex: parking_lot::Mutex<()>,
+    file: Option<std::fs::File>,
+}
+
+static TABLE_WRITE_LOCKS: Lazy<RwLock<AHashMap<PathBuf, Arc<TableLock>>>> =
+    Lazy::new(|| RwLock::new(AHashMap::with_capacity(32)));
+
+/// Get or create a per-table lock entry (Mutex + cached fs2 file handle).
+fn get_table_lock(table_path: &Path) -> Arc<TableLock> {
+    // Fast path: read-lock the map
+    {
+        let locks = TABLE_WRITE_LOCKS.read();
+        if let Some(lock) = locks.get(table_path) {
+            return lock.clone();
+        }
+    }
+    // Slow path: create lock + open sidecar .lock file once
+    let lock_path = {
+        let mut p = table_path.to_path_buf();
+        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+        p.set_file_name(format!("{}.lock", name));
+        p
+    };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .ok();
+    let entry = Arc::new(TableLock {
+        mutex: parking_lot::Mutex::new(()),
+        file,
+    });
+    let mut locks = TABLE_WRITE_LOCKS.write();
+    locks.entry(table_path.to_path_buf())
+        .or_insert_with(|| entry.clone());
+    entry
+}
+
+/// Execute a write operation with per-table locking.
+/// Acquires both in-process Mutex and cross-process fs2 flock.
+#[inline]
+fn with_table_write_lock<F, R>(table_path: &Path, f: F) -> io::Result<R>
+where
+    F: FnOnce() -> io::Result<R>,
+{
+    let lock = get_table_lock(table_path);
+    // Layer 1: in-process serialization
+    let _guard = lock.mutex.lock();
+    // Layer 2: cross-process serialization (best-effort, ~0.5μs)
+    if let Some(ref file) = lock.file {
+        use fs2::FileExt;
+        let _ = file.lock_exclusive();
+    }
+    let result = f();
+    // Release cross-process lock immediately
+    if let Some(ref file) = lock.file {
+        use fs2::FileExt;
+        let _ = file.unlock();
+    }
+    result
+}
+
 /// Evict least recently used entries from cache if over limit
 fn evict_lru_cache_entries(cache: &mut AHashMap<PathBuf, (Arc<TableStorageBackend>, std::time::SystemTime, std::time::Instant)>) {
     if cache.len() <= MAX_CACHE_ENTRIES {
@@ -533,22 +605,34 @@ impl ApexExecutor {
             SqlStatement::Select(select) => Self::execute_select(select, storage_path),
             SqlStatement::Union(union) => Self::execute_union(union, storage_path),
             SqlStatement::Insert { values, columns, .. } => {
-                Self::execute_insert(storage_path, columns.as_deref(), &values)
+                with_table_write_lock(storage_path, || {
+                    Self::execute_insert(storage_path, columns.as_deref(), &values)
+                })
             }
             SqlStatement::InsertOnConflict { values, columns, conflict_columns, do_update, .. } => {
-                Self::execute_insert_on_conflict(storage_path, columns.as_deref(), &values, &conflict_columns, do_update.as_deref())
+                with_table_write_lock(storage_path, || {
+                    Self::execute_insert_on_conflict(storage_path, columns.as_deref(), &values, &conflict_columns, do_update.as_deref())
+                })
             }
             SqlStatement::InsertSelect { columns, query, .. } => {
-                Self::execute_insert_select(storage_path, columns.as_deref(), *query, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
+                with_table_write_lock(storage_path, || {
+                    Self::execute_insert_select(storage_path, columns.as_deref(), *query, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
+                })
             }
             SqlStatement::Delete { where_clause, .. } => {
-                Self::execute_delete(storage_path, where_clause.as_ref())
+                with_table_write_lock(storage_path, || {
+                    Self::execute_delete(storage_path, where_clause.as_ref())
+                })
             }
             SqlStatement::Update { assignments, where_clause, .. } => {
-                Self::execute_update(storage_path, &assignments, where_clause.as_ref())
+                with_table_write_lock(storage_path, || {
+                    Self::execute_update(storage_path, &assignments, where_clause.as_ref())
+                })
             }
             SqlStatement::TruncateTable { .. } => {
-                Self::execute_truncate(storage_path)
+                with_table_write_lock(storage_path, || {
+                    Self::execute_truncate(storage_path)
+                })
             }
             SqlStatement::Explain { stmt, analyze } => {
                 Self::execute_explain(*stmt, analyze, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
@@ -585,28 +669,43 @@ impl ApexExecutor {
                 }
             }
             SqlStatement::Union(union) => Self::execute_union(union, default_table_path),
-            // DDL Statements
+            // DDL Statements — acquire per-table write lock for concurrency safety
             SqlStatement::CreateTable { table, columns, if_not_exists } => {
-                Self::execute_create_table(base_dir, &table, &columns, if_not_exists)
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                with_table_write_lock(&table_path, || {
+                    Self::execute_create_table(base_dir, &table, &columns, if_not_exists)
+                })
             }
             SqlStatement::DropTable { table, if_exists } => {
-                Self::execute_drop_table(base_dir, &table, if_exists)
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                with_table_write_lock(&table_path, || {
+                    Self::execute_drop_table(base_dir, &table, if_exists)
+                })
             }
             SqlStatement::AlterTable { table, operation } => {
-                Self::execute_alter_table(base_dir, &table, &operation)
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                with_table_write_lock(&table_path, || {
+                    Self::execute_alter_table(base_dir, &table, &operation)
+                })
             }
             SqlStatement::TruncateTable { table } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
-                Self::execute_truncate(&table_path)
+                with_table_write_lock(&table_path, || {
+                    Self::execute_truncate(&table_path)
+                })
             }
-            // DML Statements
+            // DML Statements — acquire per-table write lock for concurrency safety
             SqlStatement::Insert { table, columns, values } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
-                Self::execute_insert(&table_path, columns.as_deref(), &values)
+                with_table_write_lock(&table_path, || {
+                    Self::execute_insert(&table_path, columns.as_deref(), &values)
+                })
             }
             SqlStatement::InsertOnConflict { table, columns, values, conflict_columns, do_update } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
-                Self::execute_insert_on_conflict(&table_path, columns.as_deref(), &values, &conflict_columns, do_update.as_deref())
+                with_table_write_lock(&table_path, || {
+                    Self::execute_insert_on_conflict(&table_path, columns.as_deref(), &values, &conflict_columns, do_update.as_deref())
+                })
             }
             SqlStatement::AnalyzeTable { table } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
@@ -618,22 +717,33 @@ impl ApexExecutor {
             }
             SqlStatement::CopyFromParquet { table, file_path } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
-                Self::execute_copy_from_parquet(&table_path, &table, &file_path, base_dir.as_ref(), default_table_path.as_ref())
+                with_table_write_lock(&table_path, || {
+                    Self::execute_copy_from_parquet(&table_path, &table, &file_path, base_dir.as_ref(), default_table_path.as_ref())
+                })
             }
             SqlStatement::InsertSelect { table, columns, query } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
-                Self::execute_insert_select(&table_path, columns.as_deref(), *query, base_dir, default_table_path)
+                with_table_write_lock(&table_path, || {
+                    Self::execute_insert_select(&table_path, columns.as_deref(), *query, base_dir, default_table_path)
+                })
             }
             SqlStatement::CreateTableAs { table, query, if_not_exists } => {
-                Self::execute_create_table_as(base_dir, default_table_path, &table, *query, if_not_exists)
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                with_table_write_lock(&table_path, || {
+                    Self::execute_create_table_as(base_dir, default_table_path, &table, *query, if_not_exists)
+                })
             }
             SqlStatement::Delete { table, where_clause } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
-                Self::execute_delete(&table_path, where_clause.as_ref())
+                with_table_write_lock(&table_path, || {
+                    Self::execute_delete(&table_path, where_clause.as_ref())
+                })
             }
             SqlStatement::Update { table, assignments, where_clause } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
-                Self::execute_update(&table_path, &assignments, where_clause.as_ref())
+                with_table_write_lock(&table_path, || {
+                    Self::execute_update(&table_path, &assignments, where_clause.as_ref())
+                })
             }
             // Index Statements
             SqlStatement::CreateIndex { name, table, columns, unique, index_type, if_not_exists } => {
