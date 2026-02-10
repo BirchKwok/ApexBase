@@ -59,6 +59,14 @@ pub fn try_handle_catalog_query(sql: &str, base_dir: &Path) -> Option<RecordBatc
         return Some(make_pg_settings_batch());
     }
 
+    if sql_lower.contains("pg_catalog.pg_tables") || sql_lower.contains("from pg_tables") {
+        return Some(make_pg_tables_batch(base_dir));
+    }
+
+    if sql_lower.contains("pg_stat_user_tables") || sql_lower.contains("pg_stat_all_tables") {
+        return Some(make_pg_stat_tables_batch(base_dir));
+    }
+
     if sql_lower.contains("pg_catalog.pg_am") || sql_lower.contains("from pg_am") {
         return Some(make_empty_batch_with_schema(&[("amname", ArrowDataType::Utf8), ("oid", ArrowDataType::Int32)]));
     }
@@ -77,6 +85,19 @@ pub fn try_handle_catalog_query(sql: &str, base_dir: &Path) -> Option<RecordBatc
 
     if sql_lower.contains("pg_catalog.pg_description") || sql_lower.contains("from pg_description") {
         return Some(make_empty_batch_with_schema(&[("objoid", ArrowDataType::Int32), ("description", ArrowDataType::Utf8)]));
+    }
+
+    // Transaction control: treat as no-ops (auto-commit semantics)
+    // DBeaver/JDBC with autocommit OFF wraps every statement in BEGIN/COMMIT.
+    // Our DDL/DML already auto-commits, so we just acknowledge these.
+    if sql_lower.starts_with("begin")
+        || sql_lower.starts_with("commit")
+        || sql_lower.starts_with("rollback")
+        || sql_lower.starts_with("savepoint")
+        || sql_lower.starts_with("release ")
+        || sql_lower.starts_with("end")
+    {
+        return Some(make_empty_ok_batch());
     }
 
     // SET statements (DBeaver sends these on connect)
@@ -113,7 +134,7 @@ fn make_version_batch() -> RecordBatch {
         Field::new("version", ArrowDataType::Utf8, false),
     ]));
     let array: ArrayRef = Arc::new(StringArray::from(vec![
-        "PostgreSQL 15.0 (ApexBase 1.0.0)",
+        "PostgreSQL 15.0 (ApexBase 1.1.0)",
     ]));
     RecordBatch::try_new(schema, vec![array]).unwrap()
 }
@@ -263,23 +284,124 @@ fn get_table_columns(base_dir: &Path, table_name: &str) -> Vec<(String, ArrowDat
 
 fn make_pg_class_batch(base_dir: &Path) -> RecordBatch {
     let tables = discover_tables(base_dir);
+    let n = tables.len();
 
+    // Comprehensive pg_class schema matching PostgreSQL's catalog structure.
+    // DBeaver queries c.* and expects many of these columns by name.
     let schema = Arc::new(Schema::new(vec![
         Field::new("oid", ArrowDataType::Int32, false),
         Field::new("relname", ArrowDataType::Utf8, false),
         Field::new("relnamespace", ArrowDataType::Int32, false),
-        Field::new("relkind", ArrowDataType::Utf8, false),
+        Field::new("reltype", ArrowDataType::Int32, false),
+        Field::new("reloftype", ArrowDataType::Int32, false),
         Field::new("relowner", ArrowDataType::Int32, false),
+        Field::new("relam", ArrowDataType::Int32, false),
+        Field::new("relfilenode", ArrowDataType::Int32, false),
+        Field::new("reltablespace", ArrowDataType::Int32, false),
+        Field::new("relpages", ArrowDataType::Int32, false),
+        Field::new("reltuples", ArrowDataType::Float64, false),
+        Field::new("relallvisible", ArrowDataType::Int32, false),
+        Field::new("reltoastrelid", ArrowDataType::Int32, false),
+        Field::new("relhasindex", ArrowDataType::Boolean, false),
+        Field::new("relisshared", ArrowDataType::Boolean, false),
+        Field::new("relpersistence", ArrowDataType::Utf8, false),
+        Field::new("relkind", ArrowDataType::Utf8, false),
+        Field::new("relnatts", ArrowDataType::Int32, false),
+        Field::new("relchecks", ArrowDataType::Int32, false),
+        Field::new("relhasrules", ArrowDataType::Boolean, false),
+        Field::new("relhastriggers", ArrowDataType::Boolean, false),
+        Field::new("relhassubclass", ArrowDataType::Boolean, false),
+        Field::new("relrowsecurity", ArrowDataType::Boolean, false),
+        Field::new("relforcerowsecurity", ArrowDataType::Boolean, false),
+        Field::new("relispopulated", ArrowDataType::Boolean, false),
+        Field::new("relreplident", ArrowDataType::Utf8, false),
+        Field::new("relispartition", ArrowDataType::Boolean, false),
     ]));
 
-    let n = tables.len();
-    let oids: ArrayRef = Arc::new(Int32Array::from((0..n as i32).map(|i| 16384 + i).collect::<Vec<_>>()));
-    let names: ArrayRef = Arc::new(StringArray::from(tables));
-    let ns: ArrayRef = Arc::new(Int32Array::from(vec![2200; n])); // public schema
-    let kinds: ArrayRef = Arc::new(StringArray::from(vec!["r"; n])); // regular table
-    let owners: ArrayRef = Arc::new(Int32Array::from(vec![10; n]));
+    let oid_vals: Vec<i32> = (0..n as i32).map(|i| 16384 + i).collect();
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int32Array::from(oid_vals.clone())),                          // oid
+        Arc::new(StringArray::from(tables)),                                   // relname
+        Arc::new(Int32Array::from(vec![2200; n])),                             // relnamespace (public)
+        Arc::new(Int32Array::from(vec![0; n])),                                // reltype
+        Arc::new(Int32Array::from(vec![0; n])),                                // reloftype
+        Arc::new(Int32Array::from(vec![10; n])),                               // relowner
+        Arc::new(Int32Array::from(vec![2; n])),                                // relam (heap)
+        Arc::new(Int32Array::from(oid_vals)),                                  // relfilenode = oid
+        Arc::new(Int32Array::from(vec![0; n])),                                // reltablespace
+        Arc::new(Int32Array::from(vec![0; n])),                                // relpages
+        Arc::new(arrow::array::Float64Array::from(vec![-1.0; n])),             // reltuples (-1 = unknown)
+        Arc::new(Int32Array::from(vec![0; n])),                                // relallvisible
+        Arc::new(Int32Array::from(vec![0; n])),                                // reltoastrelid
+        Arc::new(BooleanArray::from(vec![false; n])),                          // relhasindex
+        Arc::new(BooleanArray::from(vec![false; n])),                          // relisshared
+        Arc::new(StringArray::from(vec!["p"; n])),                             // relpersistence (permanent)
+        Arc::new(StringArray::from(vec!["r"; n])),                             // relkind (regular table)
+        Arc::new(Int32Array::from(vec![0; n])),                                // relnatts (filled below would need per-table)
+        Arc::new(Int32Array::from(vec![0; n])),                                // relchecks
+        Arc::new(BooleanArray::from(vec![false; n])),                          // relhasrules
+        Arc::new(BooleanArray::from(vec![false; n])),                          // relhastriggers
+        Arc::new(BooleanArray::from(vec![false; n])),                          // relhassubclass
+        Arc::new(BooleanArray::from(vec![false; n])),                          // relrowsecurity
+        Arc::new(BooleanArray::from(vec![false; n])),                          // relforcerowsecurity
+        Arc::new(BooleanArray::from(vec![true; n])),                           // relispopulated
+        Arc::new(StringArray::from(vec!["d"; n])),                             // relreplident (default)
+        Arc::new(BooleanArray::from(vec![false; n])),                          // relispartition
+    ];
 
-    RecordBatch::try_new(schema, vec![oids, names, ns, kinds, owners]).unwrap()
+    RecordBatch::try_new(schema, columns).unwrap()
+}
+
+fn make_pg_tables_batch(base_dir: &Path) -> RecordBatch {
+    let tables = discover_tables(base_dir);
+    let n = tables.len();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("schemaname", ArrowDataType::Utf8, false),
+        Field::new("tablename", ArrowDataType::Utf8, false),
+        Field::new("tableowner", ArrowDataType::Utf8, false),
+        Field::new("tablespace", ArrowDataType::Utf8, true),
+        Field::new("hasindexes", ArrowDataType::Boolean, false),
+        Field::new("hasrules", ArrowDataType::Boolean, false),
+        Field::new("hastriggers", ArrowDataType::Boolean, false),
+        Field::new("rowsecurity", ArrowDataType::Boolean, false),
+    ]));
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(vec!["public"; n])),
+        Arc::new(StringArray::from(tables)),
+        Arc::new(StringArray::from(vec!["apex"; n])),
+        Arc::new(StringArray::from(vec![None::<&str>; n])),
+        Arc::new(BooleanArray::from(vec![false; n])),
+        Arc::new(BooleanArray::from(vec![false; n])),
+        Arc::new(BooleanArray::from(vec![false; n])),
+        Arc::new(BooleanArray::from(vec![false; n])),
+    ];
+
+    RecordBatch::try_new(schema, columns).unwrap()
+}
+
+fn make_pg_stat_tables_batch(base_dir: &Path) -> RecordBatch {
+    let tables = discover_tables(base_dir);
+    let n = tables.len();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("relid", ArrowDataType::Int32, false),
+        Field::new("schemaname", ArrowDataType::Utf8, false),
+        Field::new("relname", ArrowDataType::Utf8, false),
+        Field::new("n_live_tup", ArrowDataType::Int64, false),
+        Field::new("n_dead_tup", ArrowDataType::Int64, false),
+    ]));
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int32Array::from((0..n as i32).map(|i| 16384 + i).collect::<Vec<_>>())),
+        Arc::new(StringArray::from(vec!["public"; n])),
+        Arc::new(StringArray::from(tables)),
+        Arc::new(Int64Array::from(vec![0i64; n])),
+        Arc::new(Int64Array::from(vec![0i64; n])),
+    ];
+
+    RecordBatch::try_new(schema, columns).unwrap()
 }
 
 fn make_pg_attribute_batch(base_dir: &Path) -> RecordBatch {

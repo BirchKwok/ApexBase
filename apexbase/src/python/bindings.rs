@@ -1459,6 +1459,29 @@ impl ApexStorageImpl {
             self.invalidate_backend(&table_name);
         }
         
+        // After DROP TABLE, remove the table from table_paths and invalidate backend
+        if sql_upper.starts_with("DROP TABLE") {
+            let rest = sql_upper.strip_prefix("DROP TABLE")
+                .unwrap_or("")
+                .trim();
+            let rest = if rest.starts_with("IF EXISTS") {
+                rest.strip_prefix("IF EXISTS").unwrap_or(rest).trim()
+            } else {
+                rest
+            };
+            if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == ';').next() {
+                let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
+                if !tbl.is_empty() {
+                    self.table_paths.write().remove(&tbl);
+                    self.invalidate_backend(&tbl);
+                    // Clear current table if it was the dropped table
+                    if *self.current_table.read() == tbl {
+                        *self.current_table.write() = String::new();
+                    }
+                }
+            }
+        }
+        
         // After CREATE TABLE, register the new table and set it as current
         if sql_upper.starts_with("CREATE TABLE") {
             let rest = sql_upper.strip_prefix("CREATE TABLE")
@@ -1572,7 +1595,13 @@ impl ApexStorageImpl {
     fn create_table(&self, name: &str, schema: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
         let mut paths = self.table_paths.write();
         if paths.contains_key(name) {
-            return Err(PyValueError::new_err(format!("Table already exists: {}", name)));
+            // Verify the file actually exists on disk (table_paths may be stale after SQL DROP TABLE)
+            let existing_path = self.base_dir.join(format!("{}.apex", name));
+            if existing_path.exists() {
+                return Err(PyValueError::new_err(format!("Table already exists: {}", name)));
+            }
+            // Stale entry — remove it and proceed with creation
+            paths.remove(name);
         }
 
         let table_path = self.base_dir.join(format!("{}.apex", name));

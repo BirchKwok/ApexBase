@@ -6,7 +6,8 @@ impl ApexExecutor {
         // FAST PATH: Pure COUNT(*) without WHERE/GROUP BY - O(1) from metadata
         if Self::is_pure_count_star(&stmt) {
             if !storage_path.exists() {
-                return Ok(ApexResult::Scalar(0));
+                let tbl = storage_path.file_stem().unwrap_or_default().to_string_lossy();
+                return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' does not exist", tbl)));
             }
             let backend = get_cached_backend(storage_path)?;
             let count = backend.active_row_count() as i64;
@@ -43,10 +44,9 @@ impl ApexExecutor {
             }
             Some(FromItem::Table { .. }) => {
                 // Normal table - read from storage
-                // If file doesn't exist (e.g., after drop_if_exists), return empty batch
                 if !storage_path.exists() {
-                    let schema = Arc::new(Schema::empty());
-                    RecordBatch::new_empty(schema)
+                    let tbl = storage_path.file_stem().unwrap_or_default().to_string_lossy();
+                    return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' does not exist", tbl)));
                 } else {
                     let backend = get_cached_backend(storage_path)?;
                     

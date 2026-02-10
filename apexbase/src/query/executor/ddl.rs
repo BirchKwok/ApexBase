@@ -85,10 +85,8 @@ impl ApexExecutor {
     fn execute_drop_table(base_dir: &Path, table: &str, if_exists: bool) -> io::Result<ApexResult> {
         let table_path = base_dir.join(format!("{}.apex", table));
         
-        // Invalidate caches to release file handles and mmaps
+        // Invalidate ALL caches to release file handles and mmaps
         invalidate_storage_cache(&table_path);
-        // On Windows, active mmaps prevent file deletion (OS error 1224)
-        #[cfg(target_os = "windows")]
         crate::storage::engine::engine().invalidate(&table_path);
         
         if !table_path.exists() {
@@ -103,6 +101,20 @@ impl ApexExecutor {
         }
         
         std::fs::remove_file(&table_path)?;
+        
+        // Clean up associated files (WAL, delta, deltastore)
+        let file_stem = table_path.file_name().unwrap_or_default().to_string_lossy();
+        let cleanup_extensions = [
+            format!("{}.wal", file_stem),
+            format!("{}.delta", file_stem),
+            format!("{}.deltastore", file_stem),
+        ];
+        for name in &cleanup_extensions {
+            let path = base_dir.join(name);
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
         
         Ok(ApexResult::Scalar(0))
     }

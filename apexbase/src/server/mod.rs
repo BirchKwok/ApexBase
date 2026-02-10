@@ -82,12 +82,28 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
     println!("  Connect with: psql -h {} -p {}", config.host, config.port);
 
     loop {
-        let incoming = listener.accept().await?;
-        let factory_ref = factory.clone();
-        tokio::spawn(async move {
-            if let Err(e) = process_socket(incoming.0, None, factory_ref).await {
-                log::error!("Connection error: {:?}", e);
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok(incoming) => {
+                        let factory_ref = factory.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = process_socket(incoming.0, None, factory_ref).await {
+                                log::error!("Connection error: {:?}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("Accept error: {:?}", e);
+                    }
+                }
             }
-        });
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nShutting down ApexBase server...");
+                break;
+            }
+        }
     }
+
+    Ok(())
 }

@@ -79,9 +79,34 @@ impl ApexBaseHandler {
         Ok(rows)
     }
 
-    /// Check if SQL is a write operation
+    /// Strip leading SQL comments (-- and /* */) to get the effective SQL start
+    fn strip_sql_comments(sql: &str) -> &str {
+        let mut s = sql.trim();
+        loop {
+            if s.starts_with("--") {
+                // Skip to end of line
+                if let Some(pos) = s.find('\n') {
+                    s = s[pos + 1..].trim();
+                } else {
+                    return ""; // entire string is a comment
+                }
+            } else if s.starts_with("/*") {
+                // Skip to closing */
+                if let Some(pos) = s.find("*/") {
+                    s = s[pos + 2..].trim();
+                } else {
+                    return ""; // unterminated comment
+                }
+            } else {
+                return s;
+            }
+        }
+    }
+
+    /// Check if SQL is a write/command operation (not a SELECT query)
     fn is_write_op(sql: &str) -> bool {
-        let upper = sql.trim().to_uppercase();
+        let effective = Self::strip_sql_comments(sql);
+        let upper = effective.to_uppercase();
         upper.starts_with("INSERT")
             || upper.starts_with("UPDATE")
             || upper.starts_with("DELETE")
@@ -89,6 +114,48 @@ impl ApexBaseHandler {
             || upper.starts_with("DROP")
             || upper.starts_with("ALTER")
             || upper.starts_with("TRUNCATE")
+            || upper.starts_with("BEGIN")
+            || upper.starts_with("COMMIT")
+            || upper.starts_with("ROLLBACK")
+            || upper.starts_with("SAVEPOINT")
+            || upper.starts_with("RELEASE")
+    }
+
+    /// Get the proper PG command tag for a SQL statement
+    fn command_tag(sql: &str, rows: usize) -> Tag {
+        let effective = Self::strip_sql_comments(sql);
+        let upper = effective.to_uppercase();
+        if upper.starts_with("INSERT") {
+            Tag::new("INSERT").with_oid(0).with_rows(rows)
+        } else if upper.starts_with("DELETE") {
+            Tag::new("DELETE").with_rows(rows)
+        } else if upper.starts_with("UPDATE") {
+            Tag::new("UPDATE").with_rows(rows)
+        } else if upper.starts_with("CREATE TABLE") {
+            Tag::new("CREATE TABLE")
+        } else if upper.starts_with("CREATE INDEX") {
+            Tag::new("CREATE INDEX")
+        } else if upper.starts_with("CREATE") {
+            Tag::new("CREATE TABLE")
+        } else if upper.starts_with("DROP TABLE") || upper.starts_with("DROP") {
+            Tag::new("DROP TABLE")
+        } else if upper.starts_with("ALTER") {
+            Tag::new("ALTER TABLE")
+        } else if upper.starts_with("TRUNCATE") {
+            Tag::new("TRUNCATE TABLE")
+        } else if upper.starts_with("BEGIN") {
+            Tag::new("BEGIN")
+        } else if upper.starts_with("COMMIT") {
+            Tag::new("COMMIT")
+        } else if upper.starts_with("ROLLBACK") {
+            Tag::new("ROLLBACK")
+        } else if upper.starts_with("SAVEPOINT") {
+            Tag::new("SAVEPOINT")
+        } else if upper.starts_with("RELEASE") {
+            Tag::new("RELEASE")
+        } else {
+            Tag::new("OK")
+        }
     }
 }
 
@@ -139,16 +206,7 @@ impl SimpleQueryHandler for ApexBaseHandler {
             match self.execute_query(sql) {
                 Ok(batch) => {
                     if Self::is_write_op(sql) {
-                        let rows = batch.num_rows();
-                        let tag = if sql.trim().to_uppercase().starts_with("INSERT") {
-                            Tag::new("INSERT").with_oid(0).with_rows(rows)
-                        } else if sql.trim().to_uppercase().starts_with("DELETE") {
-                            Tag::new("DELETE").with_rows(rows)
-                        } else if sql.trim().to_uppercase().starts_with("UPDATE") {
-                            Tag::new("UPDATE").with_rows(rows)
-                        } else {
-                            Tag::new("OK")
-                        };
+                        let tag = Self::command_tag(sql, batch.num_rows());
                         responses.push(Response::Execution(tag));
                     } else {
                         let schema = batch.schema();
@@ -269,16 +327,7 @@ impl ExtendedQueryHandler for ApexBaseHandler {
         match self.execute_query(sql) {
             Ok(batch) => {
                 if Self::is_write_op(sql) {
-                    let rows = batch.num_rows();
-                    let tag = if sql.trim().to_uppercase().starts_with("INSERT") {
-                        Tag::new("INSERT").with_oid(0).with_rows(rows)
-                    } else if sql.trim().to_uppercase().starts_with("DELETE") {
-                        Tag::new("DELETE").with_rows(rows)
-                    } else if sql.trim().to_uppercase().starts_with("UPDATE") {
-                        Tag::new("UPDATE").with_rows(rows)
-                    } else {
-                        Tag::new("OK")
-                    };
+                    let tag = Self::command_tag(sql, batch.num_rows());
                     Ok(Response::Execution(tag))
                 } else {
                     let schema = batch.schema();

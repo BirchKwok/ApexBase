@@ -649,6 +649,33 @@ impl SqlParser {
                 continue;
             }
 
+            // -- line comment: skip to end of line
+            if c == '-' && i + 1 < len && chars[i + 1] == '-' {
+                i += 2;
+                while i < len && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+
+            // /* block comment */: skip to closing */
+            if c == '/' && i + 1 < len && chars[i + 1] == '*' {
+                i += 2;
+                loop {
+                    if i + 1 >= len {
+                        return Err(ApexError::QueryParseError(
+                            "Unterminated block comment /* ... */".to_string(),
+                        ));
+                    }
+                    if chars[i] == '*' && chars[i + 1] == '/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+
             // Single character tokens
             match c {
                 '*' => { tokens.push(SpannedToken { token: Token::Star, start: i, end: i + 1 }); i += 1; continue; }
