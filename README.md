@@ -320,7 +320,7 @@ with ApexClient("./data") as client:
 ### ApexBase vs SQLite vs DuckDB (1M rows)
 
 Three-way comparison on macOS 26.3, Apple M1 Pro (10 cores), 32 GB RAM.
-Python 3.11.10, ApexBase v1.1.0, SQLite v3.45.3, DuckDB v1.1.3, PyArrow 19.0.0.
+Python 3.11.10, ApexBase v1.2.0, SQLite v3.45.3, DuckDB v1.1.3, PyArrow 19.0.0.
 
 Dataset: 1,000,000 rows × 5 columns (name, age, score, city, category).
 Average of 5 timed iterations after 2 warmup runs.
