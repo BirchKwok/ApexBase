@@ -111,33 +111,57 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result))
     }
 
-    /// Resolve table path from FROM clause
+    /// Resolve table path from FROM clause.
+    /// Delegates to resolve_table_path so that db.table qualified names are handled uniformly.
     fn resolve_from_table_path(stmt: &SelectStatement, base_dir: &Path, default_table_path: &Path) -> std::path::PathBuf {
         if let Some(FromItem::Table { table, .. }) = &stmt.from {
             let table_name = table.trim_matches('"');
-            // For "default" table, use default_table_path
-            if table_name == "default" {
-                return default_table_path.to_path_buf();
-            }
-            // Check if table matches the default table's file stem
-            if let Some(stem) = default_table_path.file_stem() {
-                if stem.to_string_lossy() == table_name {
-                    return default_table_path.to_path_buf();
+            // Check if table matches the default table's file stem (unqualified fast path)
+            if !table_name.contains('.') {
+                if let Some(stem) = default_table_path.file_stem() {
+                    if stem.to_string_lossy() == table_name {
+                        return default_table_path.to_path_buf();
+                    }
                 }
             }
-            // For other tables, resolve from base directory
-            return base_dir.join(format!("{}.apex", table_name));
+            return Self::resolve_table_path(table_name, base_dir, default_table_path);
         }
         // No FROM clause - use default_table_path
         default_table_path.to_path_buf()
     }
 
-    /// Resolve table path from table name
+    /// Resolve table path from table name.
+    /// Supports qualified `database.table` syntax for cross-database queries.
+    /// The root directory (parent of all databases) is retrieved from the
+    /// thread-local QUERY_ROOT_DIR set by Python bindings before execution.
     fn resolve_table_path(table_name: &str, base_dir: &Path, default_table_path: &Path) -> std::path::PathBuf {
-        if table_name == "default" {
+        let clean_name = table_name.trim_matches('"').trim_matches('`');
+
+        // Handle qualified db.table syntax
+        if let Some(dot_pos) = clean_name.find('.') {
+            let db_name = clean_name[..dot_pos].trim();
+            let tbl_name = clean_name[dot_pos + 1..].trim();
+            let safe_tbl: String = tbl_name.chars()
+                .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                .collect();
+            let safe_tbl = if safe_tbl.len() > 200 { &safe_tbl[..200] } else { &safe_tbl };
+
+            // Determine root_dir: from thread-local if available, else base_dir.parent()
+            let root_dir = crate::query::executor::get_query_root_dir()
+                .unwrap_or_else(|| base_dir.parent().unwrap_or(base_dir).to_path_buf());
+
+            let db_dir = if db_name.is_empty() || db_name.eq_ignore_ascii_case("default") {
+                root_dir
+            } else {
+                root_dir.join(db_name)
+            };
+            return db_dir.join(format!("{}.apex", safe_tbl));
+        }
+
+        if clean_name == "default" {
             default_table_path.to_path_buf()
         } else {
-            let safe_name: String = table_name.chars()
+            let safe_name: String = clean_name.chars()
                 .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
                 .collect();
             let truncated_name = if safe_name.len() > 200 { &safe_name[..200] } else { &safe_name };

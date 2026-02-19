@@ -9,6 +9,7 @@ ApexBase is an embedded columnar database designed for **Hybrid Transactional/An
 ## Features
 
 - **HTAP architecture** — V4 Row Group columnar storage with DeltaStore for cell-level updates; fast inserts and fast analytical scans in one engine
+- **Multi-database support** — multiple isolated databases in one directory; cross-database queries with standard `db.table` SQL syntax
 - **Single-file storage** — custom `.apex` format per table, no server process, no external dependencies
 - **Comprehensive SQL** — DDL, DML, JOINs (INNER/LEFT/RIGHT/FULL/CROSS), subqueries (IN/EXISTS/scalar), CTEs (WITH ... AS), UNION/UNION ALL, window functions, EXPLAIN/ANALYZE, multi-statement execution
 - **70+ built-in functions** — math (ABS, SQRT, POWER, LOG, trig), string (UPPER, LOWER, SUBSTR, REPLACE, CONCAT, REGEXP_REPLACE, ...), date (YEAR, MONTH, DAY, DATEDIFF, DATE_ADD, ...), conditional (COALESCE, IFNULL, NULLIF, CASE WHEN, GREATEST, LEAST)
@@ -72,6 +73,33 @@ client.close()
 ---
 
 ## Usage Guide
+
+### Database Management
+
+ApexBase supports multiple isolated databases within a single root directory. Each named database lives in its own subdirectory; the default database uses the root directory.
+
+```python
+# Switch to a named database (creates it if needed)
+client.use_database("analytics")
+
+# Combined: switch database + select/create a table in one call
+client.use(database="analytics", table="events")
+
+# List all databases
+dbs = client.list_databases()  # ["analytics", "default", "hr"]
+
+# Current database
+print(client.current_database)  # "analytics"
+
+# Cross-database SQL — standard db.table syntax
+client.execute("SELECT * FROM default.users")
+client.execute("SELECT u.name, e.event FROM default.users u JOIN analytics.events e ON u.id = e.user_id")
+client.execute("INSERT INTO analytics.events (name) VALUES ('click')")
+client.execute("UPDATE default.users SET age = 31 WHERE name = 'Alice'")
+client.execute("DELETE FROM default.users WHERE age < 18")
+```
+
+All SQL operations (SELECT, INSERT, UPDATE, DELETE, JOIN, CREATE TABLE, DROP TABLE, ALTER TABLE) support `database.table` qualified names, allowing cross-database queries in a single statement.
 
 ### Table Management
 
@@ -290,29 +318,29 @@ with ApexClient("./data") as client:
 
 ### ApexBase vs SQLite vs DuckDB (1M rows)
 
-Three-way comparison on macOS 26.2, Apple M1 Pro (10 cores), 32 GB RAM.
+Three-way comparison on macOS 26.3, Apple M1 Pro (10 cores), 32 GB RAM.
 Python 3.11.10, ApexBase v1.1.0, SQLite v3.45.3, DuckDB v1.1.3, PyArrow 19.0.0.
 
-Dataset: 1,000,000 rows x 5 columns (name, age, score, city, category).
+Dataset: 1,000,000 rows × 5 columns (name, age, score, city, category).
 Average of 5 timed iterations after 2 warmup runs.
 
 | Query | ApexBase | SQLite | DuckDB | vs Best Other |
 |-------|----------|--------|--------|---------------|
-| Bulk Insert (1M rows) | 357ms | 976ms | 927ms | 2.6x faster |
-| COUNT(\*) | 0.068ms | 9.05ms | 0.49ms | 7.2x faster |
-| SELECT \* LIMIT 100 | 0.13ms | 0.12ms | 0.50ms | ~tied |
-| SELECT \* LIMIT 10K | 0.031ms | 7.46ms | 5.27ms | 170x faster |
-| Filter (string =) | 0.020ms | 53.6ms | 1.73ms | 87x faster |
-| Filter (BETWEEN) | 0.018ms | 191ms | 94.7ms | 5300x faster |
-| GROUP BY (10 groups) | 0.026ms | 358ms | 3.70ms | 142x faster |
-| GROUP BY + HAVING | 0.030ms | 439ms | 4.40ms | 147x faster |
-| ORDER BY + LIMIT | 0.027ms | 67.4ms | 38.7ms | 1400x faster |
-| Aggregation (5 funcs) | 0.48ms | 85.9ms | 1.59ms | 3.3x faster |
-| Complex (Filter+Group+Order) | 0.029ms | 175ms | 3.59ms | 124x faster |
-| Point Lookup (by ID) | 0.39ms | 0.050ms | 4.29ms | 7.9x slower |
-| Insert 1K rows | 1.01ms | 1.45ms | 2.95ms | 1.4x faster |
+| Bulk Insert (1M rows) | 329ms | 1.05s | 909ms | **3.2x faster** |
+| COUNT(\*) | 0.068ms | 9.05ms | 0.547ms | **8.0x faster** |
+| SELECT \* LIMIT 100 | 0.149ms | 0.135ms | 0.474ms | ~tied |
+| SELECT \* LIMIT 10K | 0.945ms | 6.93ms | 4.56ms | **4.8x faster** |
+| Filter (string =) | 0.048ms | 42.37ms | 1.70ms | **35x faster** |
+| Filter (BETWEEN) | 0.054ms | 166.82ms | 89.48ms | **1600x faster** |
+| GROUP BY (10 groups) | 0.035ms | 359ms | 3.43ms | **98x faster** |
+| GROUP BY + HAVING | 0.038ms | 364.82ms | 3.86ms | **101x faster** |
+| ORDER BY + LIMIT | 0.038ms | 53.10ms | 5.38ms | **141x faster** |
+| Aggregation (5 funcs) | 0.035ms | 84.51ms | 1.32ms | **38x faster** |
+| Complex (Filter+Group+Order) | 0.038ms | 162.35ms | 3.37ms | **89x faster** |
+| Point Lookup (by ID) | 0.030ms | 0.051ms | 3.32ms | **1.7x faster** |
+| Insert 1K rows | 0.654ms | 1.30ms | 2.99ms | **2.0x faster** |
 
-**Summary**: wins 11 of 13 benchmarks, ties 1. No metric loses to both competitors simultaneously (Point Lookup only trails SQLite while beating DuckDB 11x).
+**Summary**: wins 12 of 13 benchmarks, ties 1. Point Lookup now beats both SQLite and DuckDB.
 
 Reproduce: `python benchmarks/bench_vs_sqlite_duckdb.py --rows 1000000`
 
@@ -437,7 +465,7 @@ This enables GUI tools to browse tables, inspect columns, and display data types
 - **Extended Query Protocol** (prepared statements with binary parameters) is not yet supported; tools should use the Simple Query protocol
 - **Authentication** is not implemented — the server accepts all connections
 - **SSL/TLS** is not yet supported — use SSH tunneling for remote access if needed
-- **Single-database** — all `.apex` files in the data directory appear as tables under the `public` schema
+- **Single-database context** — the wire protocol server operates in the current database context; cross-database SQL (`db.table`) is not yet routed through the wire protocol
 
 ---
 
@@ -510,6 +538,15 @@ ApexClient(
 )
 ```
 
+**Database Management**
+
+| Method | Description |
+|--------|-------------|
+| `use_database(database='default')` | Switch to a named database (creates it if needed) |
+| `use(database='default', table=None)` | Switch database and optionally select/create a table |
+| `list_databases()` | List all databases (`'default'` always included) |
+| `current_database` | Property: current database name |
+
 **Table Management**
 
 | Method | Description |
@@ -517,7 +554,7 @@ ApexClient(
 | `create_table(name, schema=None)` | Create a new table, optionally with pre-defined schema |
 | `drop_table(name)` | Drop a table |
 | `use_table(name)` | Switch active table |
-| `list_tables()` | List all tables |
+| `list_tables()` | List all tables in the current database |
 | `current_table` | Property: current table name |
 
 **Data Storage**

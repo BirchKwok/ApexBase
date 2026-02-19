@@ -54,6 +54,123 @@ client = ApexClient.create_clean("./data")
 
 ---
 
+### Database Management
+
+ApexBase supports multiple isolated databases within a single root directory. Each named database is stored as a subdirectory; the `'default'` database maps to the root directory (backward-compatible).
+
+#### use_database
+```python
+use_database(database: str = 'default') -> ApexClient
+```
+Switch to a named database. Creates the database subdirectory if it does not exist. Resets the current table to `None`.
+
+**Parameters:**
+- `database`: Database name. `'default'` (or `''`) maps to the root directory.
+
+**Returns:** `self` (for method chaining)
+
+**Examples:**
+```python
+# Switch to analytics database
+client.use_database("analytics")
+
+# Switch back to default (root-level tables)
+client.use_database("default")
+
+# Method chaining
+client.use_database("hr").create_table("employees")
+```
+
+---
+
+#### use
+```python
+use(database: str = 'default', table: str = None) -> ApexClient
+```
+Switch to a named database and optionally select or create a table in one call. If `table` is specified and does not exist it is created automatically.
+
+**Parameters:**
+- `database`: Database name (default = root-level).
+- `table`: Table name to select. If `None`, only the database is switched.
+
+**Returns:** `self` (for method chaining)
+
+**Examples:**
+```python
+# Switch database only
+client.use(database="analytics")
+
+# Switch database and select an existing table
+client.use(database="analytics", table="events")
+
+# Switch database and auto-create table if missing
+client.use(database="new_db", table="new_table")
+client.store({"key": "value"})
+```
+
+---
+
+#### list_databases
+```python
+list_databases() -> List[str]
+```
+Return a sorted list of all available databases. `'default'` is always included.
+
+**Example:**
+```python
+dbs = client.list_databases()
+print(dbs)  # ['analytics', 'default', 'hr']
+```
+
+---
+
+#### current_database
+```python
+current_database: str  # Property
+```
+Return the name of the currently active database. Returns `'default'` when operating on root-level tables.
+
+**Example:**
+```python
+client.use_database("analytics")
+print(client.current_database)  # 'analytics'
+```
+
+---
+
+### Cross-Database SQL
+
+All SQL operations support the standard `database.table` qualified name syntax. The active database context only affects unqualified table references; qualified references always resolve to the correct database regardless of context.
+
+**Supported operations:**
+```python
+# SELECT across databases
+client.execute("SELECT * FROM default.users")
+client.execute("SELECT * FROM analytics.events WHERE cnt > 10")
+
+# JOIN across databases
+client.execute("""
+    SELECT u.name, e.event
+    FROM default.users u
+    JOIN analytics.events e ON u.id = e.user_id
+""")
+
+# INSERT into a different database
+client.execute("INSERT INTO analytics.events (name, cnt) VALUES ('click', 1)")
+
+# UPDATE in a different database
+client.execute("UPDATE default.users SET age = 31 WHERE name = 'Alice'")
+
+# DELETE from a different database
+client.execute("DELETE FROM default.users WHERE age < 18")
+
+# DDL across databases
+client.execute("CREATE TABLE analytics.summary (total INT)")
+client.execute("DROP TABLE IF EXISTS analytics.old_table")
+```
+
+---
+
 ### Table Management
 
 #### create_table

@@ -58,8 +58,9 @@ client.close()
 ## Key Features
 
 - **HTAP architecture** — columnar V4 Row Group storage + delta writes for fast inserts
+- **Multi-database support** — multiple isolated databases; cross-database queries with `db.table` SQL syntax
 - **Single-file storage** — custom `.apex` format, no server, no external dependencies
-- **Full SQL support** — DDL, DML, aggregations, GROUP BY, HAVING, ORDER BY, JOINs
+- **Full SQL support** — DDL, DML, aggregations, GROUP BY, HAVING, ORDER BY, JOINs, cross-db queries
 - **DataFrame integration** — native Pandas / Polars / PyArrow support via zero-copy Arrow IPC
 - **Full-text search** — built-in NanoFTS with fuzzy matching
 - **JIT compilation** — Cranelift-based JIT for predicate evaluation
@@ -70,10 +71,10 @@ client.close()
 
 This documentation covers 100% of the public Python API:
 
-- **ApexClient** — all 50+ public methods
+- **ApexClient** — all 50+ public methods including `use_database()`, `use()`, `list_databases()`
 - **ResultView** — all conversion and access methods
 - **Constants** — module-level exports
-- **SQL syntax** — supported SQL operations
+- **SQL syntax** — supported SQL operations including cross-database `db.table` syntax
 
 See [API_REFERENCE.md](API_REFERENCE.md) for complete details.
 
@@ -116,6 +117,9 @@ python benchmarks/bench_vs_sqlite_duckdb.py --rows 1000000
 ## Notes
 
 - Primary API entry: `apexbase.ApexClient`
+- Multi-database: use `use_database(name)` or `use(database=name, table=name)` to switch context
+- Cross-database SQL: `SELECT * FROM db.table`, `JOIN db.table ON ...`, `INSERT INTO db.table ...`
+- Storage layout: `root_dir/<table>.apex` for default db; `root_dir/<db>/<table>.apex` for named dbs
 - Data persistence: single `.apex` file per table per database directory
 - Internal ID: records have auto-increment `_id` field
 - Query preference: use `execute(sql)` for full SQL, `query(where)` for simple filters

@@ -130,10 +130,17 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
 /// - Cross-platform file locking for concurrent access safety
 ///   - Read operations use shared locks (multiple readers allowed)
 ///   - Write operations use exclusive locks (single writer)
+/// - Multi-database support: named databases stored in subdirectories
 #[pyclass(name = "ApexStorage")]
 pub struct ApexStorageImpl {
-    /// Base directory path
-    base_dir: PathBuf,
+    /// Root directory (top-level dir; contains both default tables and named-db subdirs)
+    root_dir: PathBuf,
+    /// Current database name. "" or "default" means root_dir (backward-compat default).
+    /// Named databases (e.g. "analytics") reside at root_dir/analytics/.
+    current_database: RwLock<String>,
+    /// Current base directory = root_dir (default) or root_dir/db_name (named db).
+    /// Updated atomically by use_database_().
+    base_dir: RwLock<PathBuf>,
     /// Table paths (table_name -> path) - lazily populated
     table_paths: RwLock<HashMap<String, PathBuf>>,
     /// Whether table_paths has been fully scanned from directory
@@ -261,9 +268,18 @@ impl ApexStorageImpl {
             ));
         }
         let paths = self.table_paths.read();
-        paths.get(&table_name)
-            .cloned()
-            .ok_or_else(|| PyValueError::new_err(format!("Table not found: {}", table_name)))
+        if let Some(p) = paths.get(&table_name) {
+            return Ok(p.clone());
+        }
+        drop(paths);
+        // Lazy: check disk using current base_dir
+        let base_dir = self.current_base_dir();
+        let p = base_dir.join(format!("{}.apex", table_name));
+        if p.exists() {
+            self.table_paths.write().insert(table_name.clone(), p.clone());
+            return Ok(p);
+        }
+        Err(PyValueError::new_err(format!("Table not found: {}", table_name)))
     }
     
     /// Get both table path and name in one lock acquisition (optimization)
@@ -275,11 +291,21 @@ impl ApexStorageImpl {
                 "No table selected. Call create_table() or use_table() first."
             ));
         }
-        let paths = self.table_paths.read();
-        let path = paths.get(&table_name)
-            .cloned()
-            .ok_or_else(|| PyValueError::new_err(format!("Table not found: {}", table_name)))?;
-        Ok((path, table_name))
+        let path = {
+            let paths = self.table_paths.read();
+            paths.get(&table_name).cloned()
+        };
+        if let Some(p) = path {
+            return Ok((p, table_name));
+        }
+        // Lazy: check disk using current base_dir
+        let base_dir = self.current_base_dir();
+        let p = base_dir.join(format!("{}.apex", table_name));
+        if p.exists() {
+            self.table_paths.write().insert(table_name.clone(), p.clone());
+            return Ok((p, table_name));
+        }
+        Err(PyValueError::new_err(format!("Table not found: {}", table_name)))
     }
     
     /// Get or create cached backend for current table
@@ -352,6 +378,12 @@ impl ApexStorageImpl {
         backends.remove(table_name);
         backends.remove(&format!("{}_insert", table_name));
     }
+
+    /// Return current base directory (root_dir for default db, root_dir/db for named db)
+    #[inline]
+    fn current_base_dir(&self) -> PathBuf {
+        self.base_dir.read().clone()
+    }
 }
 
 #[pymethods]
@@ -379,14 +411,14 @@ impl ApexStorageImpl {
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(&path_obj)
         };
-        let base_dir = abs_path.parent()
+        let root_dir = abs_path.parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
 
         // Handle drop_if_exists
         if drop_if_exists {
             // Remove all .apex files in the directory
-            if let Ok(entries) = fs::read_dir(&base_dir) {
+            if let Ok(entries) = fs::read_dir(&root_dir) {
                 for entry in entries.flatten() {
                     let p = entry.path();
                     if p.extension().map(|e| e == "apex").unwrap_or(false) {
@@ -396,20 +428,20 @@ impl ApexStorageImpl {
             }
             
             // Also remove FTS indexes
-            let fts_dir = base_dir.join("fts_indexes");
+            let fts_dir = root_dir.join("fts_indexes");
             if fts_dir.exists() {
                 let _ = fs::remove_dir_all(&fts_dir);
             }
         }
 
-        let table_paths = HashMap::new();
-        
         // No default table - users must explicitly create or use a table
         // Existing .apex files in the directory are discovered lazily via use_table() or list_tables()
 
         Ok(Self {
-            base_dir,
-            table_paths: RwLock::new(table_paths),
+            root_dir: root_dir.clone(),
+            current_database: RwLock::new(String::new()),
+            base_dir: RwLock::new(root_dir),
+            table_paths: RwLock::new(HashMap::new()),
             tables_scanned: RwLock::new(false),
             cached_backends: RwLock::new(HashMap::new()),
             current_table: RwLock::new(String::new()),
@@ -913,7 +945,11 @@ impl ApexStorageImpl {
         let sql = format!("DELETE FROM {} WHERE {}", table_name, where_clause);
         
         // Execute using ApexExecutor
-        let result = ApexExecutor::execute_with_base_dir(&sql, &self.base_dir, &table_path)
+        let base_dir = self.current_base_dir();
+        crate::query::executor::set_query_root_dir(&self.root_dir);
+        let exec_result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path);
+        crate::query::executor::clear_query_root_dir();
+        let result = exec_result
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
         // Invalidate cached backend since data changed
@@ -938,7 +974,11 @@ impl ApexStorageImpl {
         let sql = format!("DELETE FROM {}", table_name);
         
         // Execute using ApexExecutor
-        let result = ApexExecutor::execute_with_base_dir(&sql, &self.base_dir, &table_path)
+        let base_dir = self.current_base_dir();
+        crate::query::executor::set_query_root_dir(&self.root_dir);
+        let exec_result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path);
+        crate::query::executor::clear_query_root_dir();
+        let result = exec_result
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
         // Invalidate cached backend since data changed
@@ -971,11 +1011,15 @@ impl ApexStorageImpl {
         }
         
         // For DDL (CREATE/DROP TABLE), don't require a current table
-        let table_path = if is_ddl {
-            self.get_current_table_path().unwrap_or_else(|_| self.base_dir.clone())
-        } else {
-            self.get_current_table_path()?
-        };
+        // For DDL, CTE, or queries with no current table (cross-db qualified refs), fall back to base_dir
+        let table_path = self.get_current_table_path().unwrap_or_else(|_| self.current_base_dir());
+        if !is_ddl && !sql_upper.starts_with("WITH ") && table_path == self.current_base_dir() {
+            // Only enforce table selection for plain single-table ops
+            let table_name = self.current_table.read().clone();
+            if table_name.is_empty() && !is_ddl {
+                // Allow it — executor will use qualified table names from SQL
+            }
+        }
         
         // PYTHON-LEVEL QUERY RESULT CACHE: return cached PyObject for identical read queries
         // Cache is invalidated on any write operation
@@ -1147,7 +1191,8 @@ impl ApexStorageImpl {
         let is_txn_select = current_txn.is_some() && sql_upper.starts_with("SELECT");
 
         let sql = sql.to_string();
-        let base_dir = self.base_dir.clone();
+        let base_dir = self.current_base_dir();
+        crate::query::executor::set_query_root_dir(&self.root_dir);
 
         let (columns, rows) = py.allow_threads(|| -> PyResult<(Vec<String>, Vec<Vec<Value>>)> {
             // Transaction-aware execution
@@ -1281,6 +1326,7 @@ impl ApexStorageImpl {
             
             Ok((columns, rows))
         })?;
+        crate::query::executor::clear_query_root_dir();
 
         // Update transaction state after execution
         if is_begin {
@@ -1331,7 +1377,7 @@ impl ApexStorageImpl {
             if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == '(').next() {
                 let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
                 if !tbl.is_empty() {
-                    let tbl_path = self.base_dir.join(format!("{}.apex", tbl));
+                    let tbl_path = self.current_base_dir().join(format!("{}.apex", tbl));
                     self.table_paths.write().insert(tbl.clone(), tbl_path);
                     *self.current_table.write() = tbl;
                 }
@@ -1357,7 +1403,8 @@ impl ApexStorageImpl {
         
         let sql = sql.to_string();
         let table_path = self.get_current_table_path()?;
-        let base_dir = self.base_dir.clone();
+        let base_dir = self.current_base_dir();
+        crate::query::executor::set_query_root_dir(&self.root_dir);
 
         // Execute query in Rust thread pool
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
@@ -1367,6 +1414,7 @@ impl ApexStorageImpl {
             result.to_record_batch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
+        crate::query::executor::clear_query_root_dir();
         
         // Empty result
         if batch.num_rows() == 0 {
@@ -1434,12 +1482,10 @@ impl ApexStorageImpl {
         
         // For DDL, CTE, multi-statement, or txn-containing SQL, don't require a current table
         let is_cte = sql_upper.starts_with("WITH ");
-        let table_path = if is_ddl || is_cte || (is_multi_stmt && contains_txn_cmd) {
-            self.get_current_table_path().unwrap_or_else(|_| self.base_dir.clone())
-        } else {
-            self.get_current_table_path()?
-        };
-        let base_dir = self.base_dir.clone();
+        // Fall back to base_dir when no table is selected (e.g. cross-db qualified queries)
+        let table_path = self.get_current_table_path().unwrap_or_else(|_| self.current_base_dir());
+        let base_dir = self.current_base_dir();
+        crate::query::executor::set_query_root_dir(&self.root_dir);
 
         // FAST PATH: SELECT * FROM <table> LIMIT N — build Arrow batch directly from V4
         if !is_multi_stmt && !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT")
@@ -1552,13 +1598,14 @@ impl ApexStorageImpl {
             if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == '(').next() {
                 let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
                 if !tbl.is_empty() {
-                    let tbl_path = self.base_dir.join(format!("{}.apex", tbl));
+                    let tbl_path = self.current_base_dir().join(format!("{}.apex", tbl));
                     self.table_paths.write().insert(tbl.clone(), tbl_path);
                     *self.current_table.write() = tbl;
                 }
             }
         }
         
+        crate::query::executor::clear_query_root_dir();
         // Return as Python bytes
         Ok(PyBytes::new_bound(py, &buf).into())
     }
@@ -1569,7 +1616,8 @@ impl ApexStorageImpl {
         use arrow::array::{StructArray, Array};
         
         let table_path = self.get_current_table_path()?;
-        let base_dir = self.base_dir.clone();
+        let base_dir = self.current_base_dir();
+        crate::query::executor::set_query_root_dir(&self.root_dir);
         let table_name = self.current_table.read().clone();
         let where_clause = where_clause.to_string();
         
@@ -1630,7 +1678,7 @@ impl ApexStorageImpl {
         }
         
         // Table not in cache - check if it exists on disk (lazy discovery)
-        let table_path = self.base_dir.join(format!("{}.apex", name));
+        let table_path = self.current_base_dir().join(format!("{}.apex", name));
         if table_path.exists() {
             // Add to cache
             self.table_paths.write().insert(name.to_string(), table_path);
@@ -1653,7 +1701,7 @@ impl ApexStorageImpl {
         let mut paths = self.table_paths.write();
         if paths.contains_key(name) {
             // Verify the file actually exists on disk (table_paths may be stale after SQL DROP TABLE)
-            let existing_path = self.base_dir.join(format!("{}.apex", name));
+            let existing_path = self.current_base_dir().join(format!("{}.apex", name));
             if existing_path.exists() {
                 return Err(PyValueError::new_err(format!("Table already exists: {}", name)));
             }
@@ -1661,7 +1709,7 @@ impl ApexStorageImpl {
             paths.remove(name);
         }
 
-        let table_path = self.base_dir.join(format!("{}.apex", name));
+        let table_path = self.current_base_dir().join(format!("{}.apex", name));
         let engine = crate::storage::engine::engine();
 
         if let Some(schema_dict) = schema {
@@ -1704,7 +1752,8 @@ impl ApexStorageImpl {
     fn list_tables(&self) -> Vec<String> {
         // Scan directory for .apex files to ensure we catch tables created via SQL
         let mut tables = Vec::new();
-        if let Ok(entries) = fs::read_dir(&self.base_dir) {
+        let base_dir = self.current_base_dir();
+        if let Ok(entries) = fs::read_dir(&base_dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.extension().and_then(|e| e.to_str()).map(|s| s == "apex").unwrap_or(false) {
@@ -1717,6 +1766,63 @@ impl ApexStorageImpl {
         tables.sort();
         tables.dedup();
         tables
+    }
+
+    // ========== Multi-Database Operations ==========
+
+    /// Switch to a named database (creates its subdirectory if needed).
+    /// "default" or "" means the root directory (backward-compatible default).
+    #[pyo3(name = "use_database_")]
+    fn use_database_(&self, db_name: &str) -> PyResult<()> {
+        let new_base_dir = if db_name.is_empty() || db_name.eq_ignore_ascii_case("default") {
+            self.root_dir.clone()
+        } else {
+            let db_dir = self.root_dir.join(db_name);
+            fs::create_dir_all(&db_dir)
+                .map_err(|e| PyIOError::new_err(format!("Cannot create database '{}': {}", db_name, e)))?;
+            db_dir
+        };
+
+        *self.current_database.write() = db_name.to_string();
+        *self.base_dir.write() = new_base_dir;
+
+        // Clear all per-database caches
+        self.cached_backends.write().clear();
+        self.table_paths.write().clear();
+        *self.tables_scanned.write() = false;
+        *self.current_table.write() = String::new();
+        self.py_query_cache.write().clear();
+
+        Ok(())
+    }
+
+    /// Return the current database name ("" / "default" means root/default).
+    #[pyo3(name = "current_database_")]
+    fn current_database_(&self) -> String {
+        self.current_database.read().clone()
+    }
+
+    /// List all available databases (named subdirectories of root_dir).
+    /// "default" is always included to represent the root-level tables.
+    #[pyo3(name = "list_databases_")]
+    fn list_databases_(&self) -> Vec<String> {
+        let mut dbs = vec!["default".to_string()];
+        if let Ok(entries) = fs::read_dir(&self.root_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                        // Skip hidden dirs and internal dirs
+                        if !name.starts_with('.') && name != "fts_indexes" {
+                            dbs.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        dbs.sort();
+        dbs.dedup();
+        dbs
     }
 
     /// Get row count for current table (excluding deleted rows) using StorageEngine.
@@ -1874,7 +1980,7 @@ impl ApexStorageImpl {
         // On Unix: mmaps remain valid after atomic rename; keep STORAGE_CACHE alive
         // so the 50ms fast path in get_cached_backend skips stat() calls on next retrieve().
         #[cfg(target_os = "windows")]
-        ApexExecutor::invalidate_cache_for_dir(&self.base_dir);
+        ApexExecutor::invalidate_cache_for_dir(&self.current_base_dir());
         Ok(())
     }
     
@@ -1945,7 +2051,8 @@ impl ApexStorageImpl {
         let lock_file = Self::acquire_read_lock(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
-        let base_dir = self.base_dir.clone();
+        let base_dir = self.current_base_dir();
+        crate::query::executor::set_query_root_dir(&self.root_dir);
         let table_name = self.current_table.read().clone();
         
         let result = py.allow_threads(|| -> PyResult<Option<HashMap<String, Value>>> {
@@ -2270,7 +2377,7 @@ impl ApexStorageImpl {
 
         // Ensure manager exists
         if self.fts_manager.read().is_none() {
-            let fts_dir = self.base_dir.join("fts_indexes");
+            let fts_dir = self.current_base_dir().join("fts_indexes");
             let config = FtsConfig {
                 lazy_load,
                 cache_size,

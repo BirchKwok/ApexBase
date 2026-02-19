@@ -29,7 +29,7 @@ POLARS_AVAILABLE = True
 
 # Pre-compiled regex for SQL validation (avoids re-compilation on every query)
 _RE_CREATE_TABLE = re.compile(r"\bcreate\s+(table|view)\b", re.IGNORECASE)
-_RE_FROM_TABLE = re.compile(r"\bfrom\s+(\w+)", re.IGNORECASE)
+_RE_FROM_TABLE = re.compile(r"\bfrom\s+([\w]+(?:\.[\w]+)?)", re.IGNORECASE)
 
 # Try to import nanofts Python library for optimized Arrow import
 try:
@@ -86,6 +86,7 @@ class ApexClient:
         self._lock = threading.RLock()
         
         self._current_table = None  # No default table - user must create/use a table explicitly
+        self._current_database = 'default'  # Active database name ('default' = root dir)
         self._batch_size = batch_size
         self._enable_cache = enable_cache
         self._cache_size = cache_size
@@ -170,6 +171,69 @@ class ApexClient:
     def _ensure_table_selected(self):
         if self._current_table is None:
             raise RuntimeError("No table selected. Call create_table() or use_table() first.")
+
+    # ============ Database Management ============
+
+    def use_database(self, database: str = 'default') -> 'ApexClient':
+        """Switch to a named database. Creates it if it doesn't exist.
+
+        'default' (or '') means the root directory — backward-compatible behaviour.
+        Named databases (e.g. 'analytics') are stored in sub-directories of the
+        root directory and each has its own isolated set of tables.
+
+        Args:
+            database: Database name. Use 'default' for the root-level tables.
+
+        Returns:
+            self (for method chaining)
+        """
+        self._check_connection()
+        with self._lock:
+            self._storage.use_database_(database)
+            self._current_database = database if database else 'default'
+            self._current_table = None
+            self._query_cache.clear()
+        return self
+
+    def use(self, database: str = 'default', table: str = None) -> 'ApexClient':
+        """Switch to a database and optionally select a table within it.
+
+        Combines use_database() + use_table() / create_table() in one call.
+        If the table does not exist in the target database it will be created.
+
+        Args:
+            database: Database name (default = root-level).
+            table: Table name to switch to. If None only the database is switched.
+
+        Returns:
+            self (for method chaining)
+        """
+        self.use_database(database)
+        if table is not None:
+            with self._lock:
+                try:
+                    self.use_table(table)
+                except Exception:
+                    self.create_table(table)
+        return self
+
+    @property
+    def current_database(self) -> str:
+        """Return the currently active database name."""
+        self._check_connection()
+        return self._current_database
+
+    def list_databases(self) -> list:
+        """List all available databases.
+
+        'default' is always included (represents root-level tables).
+        Other entries are named sub-directories inside the root directory.
+
+        Returns:
+            Sorted list of database name strings.
+        """
+        self._check_connection()
+        return self._storage.list_databases_()
 
     # ============ Table Management ============
 
@@ -671,7 +735,13 @@ class ApexClient:
         is_multi_stmt = ';' in _trimmed
         
         if not is_multi_stmt:
-            if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE') or sql_upper.startswith('WITH ')):
+            # Allow execution without a selected table for DDL, CTE, or cross-database queries.
+            # Cross-db queries use qualified db.table references (e.g. FROM default.users,
+            # INSERT INTO analytics.events, UPDATE hr.employees, DELETE FROM default.logs).
+            _qualified = re.search(r'\b\w+\.\w+\b', sql)
+            _has_qualified_ref = bool(_qualified and '.' in _qualified.group(0))
+            if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE')
+                    or sql_upper.startswith('WITH ') or _has_qualified_ref):
                 self._ensure_table_selected()
         else:
             # Multi-statement: only require table if we have one
@@ -853,6 +923,11 @@ class ApexClient:
             return
         
         table_name = m.group(1).lower()
+
+        # Skip validation for qualified db.table names (e.g. "default.users", "analytics.events")
+        # The Rust executor resolves cross-database paths; we cannot validate them here.
+        if '.' in table_name:
+            return
         
         # Fast path: skip expensive list_tables/listdir for known tables
         if self._current_table and table_name == self._current_table.lower():

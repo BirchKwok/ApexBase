@@ -1325,7 +1325,7 @@ impl SqlParser {
                         self.advance();
                         // Check for IF NOT EXISTS
                         let if_not_exists = self.parse_if_not_exists()?;
-                        let table = self.parse_identifier()?;
+                        let table = self.parse_table_name()?;
                         // CTAS: CREATE TABLE name AS SELECT ...
                         if matches!(self.current(), Token::As) {
                             self.advance();
@@ -1384,7 +1384,7 @@ impl SqlParser {
                         self.advance();
                         // Check for IF EXISTS
                         let if_exists = self.parse_if_exists()?;
-                        let table = self.parse_identifier()?;
+                        let table = self.parse_table_name()?;
                         Ok(SqlStatement::DropTable { table, if_exists })
                     }
                     Token::Index => {
@@ -1405,20 +1405,20 @@ impl SqlParser {
             Token::Alter => {
                 self.advance();
                 self.expect(Token::Table)?;
-                let table = self.parse_identifier()?;
+                let table = self.parse_table_name()?;
                 let operation = self.parse_alter_operation()?;
                 Ok(SqlStatement::AlterTable { table, operation })
             }
             Token::Truncate => {
                 self.advance();
                 self.expect(Token::Table)?;
-                let table = self.parse_identifier()?;
+                let table = self.parse_table_name()?;
                 Ok(SqlStatement::TruncateTable { table })
             }
             Token::Insert => {
                 self.advance();
                 self.expect(Token::Into)?;
-                let table = self.parse_identifier()?;
+                let table = self.parse_table_name()?;
                 // Optional column list
                 let columns = if matches!(self.current(), Token::LParen) {
                     // Peek ahead: could be column list followed by VALUES/SELECT,
@@ -1481,7 +1481,7 @@ impl SqlParser {
             Token::Delete => {
                 self.advance();
                 self.expect(Token::From)?;
-                let table = self.parse_identifier()?;
+                let table = self.parse_table_name()?;
                 let where_clause = if matches!(self.current(), Token::Where) {
                     self.advance();
                     Some(self.parse_expr()?)
@@ -1492,7 +1492,7 @@ impl SqlParser {
             }
             Token::Update => {
                 self.advance();
-                let table = self.parse_identifier()?;
+                let table = self.parse_table_name()?;
                 self.expect(Token::Set)?;
                 let assignments = self.parse_assignments()?;
                 let where_clause = if matches!(self.current(), Token::Where) {
@@ -1688,6 +1688,18 @@ impl SqlParser {
             match self.current().clone() {
                 Token::Identifier(table) => {
                     self.advance();
+                    // Check for qualified db.table syntax
+                    let table = if matches!(self.current(), Token::Dot) {
+                        self.advance(); // consume '.'
+                        if let Token::Identifier(tbl) = self.current().clone() {
+                            self.advance();
+                            format!("{}.{}", table, tbl)
+                        } else {
+                            table
+                        }
+                    } else {
+                        table
+                    };
                     // Only consume an identifier as alias if it doesn't look like
                     // a misspelled keyword (e.g., "joinn" should NOT be an alias).
                     // Only apply this heuristic for identifiers >= 4 chars with
@@ -1783,6 +1795,18 @@ impl SqlParser {
             let right = match self.current().clone() {
                 Token::Identifier(table) => {
                     self.advance();
+                    // Check for qualified db.table syntax
+                    let table = if matches!(self.current(), Token::Dot) {
+                        self.advance();
+                        if let Token::Identifier(tbl) = self.current().clone() {
+                            self.advance();
+                            format!("{}.{}", table, tbl)
+                        } else {
+                            table
+                        }
+                    } else {
+                        table
+                    };
                     let alias = if let Token::Identifier(a) = self.current().clone() {
                         self.advance();
                         Some(a)
@@ -2883,6 +2907,18 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                 let (start, _) = self.current_span();
                 Err(self.syntax_error(start, "Expected identifier".to_string()))
             }
+        }
+    }
+
+    /// Parse a (possibly qualified) table name: `table` or `database.table`.
+    fn parse_table_name(&mut self) -> Result<String, ApexError> {
+        let name = self.parse_identifier()?;
+        if matches!(self.current(), Token::Dot) {
+            self.advance(); // consume '.'
+            let tbl = self.parse_identifier()?;
+            Ok(format!("{}.{}", name, tbl))
+        } else {
+            Ok(name)
         }
     }
 

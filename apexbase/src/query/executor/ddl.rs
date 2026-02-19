@@ -6,12 +6,15 @@ impl ApexExecutor {
     /// Execute CREATE TABLE statement
     /// High-performance: O(1) - just creates file header
     fn execute_create_table(
-        base_dir: &Path,
+        table_path: &Path,
         table: &str,
         columns: &[crate::query::sql_parser::ColumnDef],
         if_not_exists: bool,
     ) -> io::Result<ApexResult> {
-        let table_path = base_dir.join(format!("{}.apex", table));
+        // Ensure parent directory exists (needed for named databases)
+        if let Some(parent) = table_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         
         if table_path.exists() {
             if if_not_exists {
@@ -82,12 +85,10 @@ impl ApexExecutor {
 
     /// Execute DROP TABLE statement
     /// High-performance: O(1) - just deletes file
-    fn execute_drop_table(base_dir: &Path, table: &str, if_exists: bool) -> io::Result<ApexResult> {
-        let table_path = base_dir.join(format!("{}.apex", table));
-        
+    fn execute_drop_table(table_path: &Path, table: &str, if_exists: bool) -> io::Result<ApexResult> {
         // Invalidate ALL caches to release file handles and mmaps
-        invalidate_storage_cache(&table_path);
-        crate::storage::engine::engine().invalidate(&table_path);
+        invalidate_storage_cache(table_path);
+        crate::storage::engine::engine().invalidate(table_path);
         
         if !table_path.exists() {
             if if_exists {
@@ -100,9 +101,10 @@ impl ApexExecutor {
             }
         }
         
-        std::fs::remove_file(&table_path)?;
+        std::fs::remove_file(table_path)?;
         
-        // Clean up associated files (WAL, delta, deltastore)
+        // Clean up associated files (WAL, delta, deltastore) in same directory as table
+        let parent_dir = table_path.parent().unwrap_or(table_path);
         let file_stem = table_path.file_name().unwrap_or_default().to_string_lossy();
         let cleanup_extensions = [
             format!("{}.wal", file_stem),
@@ -110,7 +112,7 @@ impl ApexExecutor {
             format!("{}.deltastore", file_stem),
         ];
         for name in &cleanup_extensions {
-            let path = base_dir.join(name);
+            let path = parent_dir.join(name);
             if path.exists() {
                 let _ = std::fs::remove_file(&path);
             }
@@ -121,13 +123,11 @@ impl ApexExecutor {
 
     /// Execute ALTER TABLE statement
     fn execute_alter_table(
-        base_dir: &Path,
+        table_path: &Path,
         table: &str,
         operation: &crate::query::sql_parser::AlterTableOp,
     ) -> io::Result<ApexResult> {
         use crate::query::sql_parser::AlterTableOp;
-        
-        let table_path = base_dir.join(format!("{}.apex", table));
         
         if !table_path.exists() {
             return Err(io::Error::new(

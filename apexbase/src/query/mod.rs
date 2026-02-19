@@ -5,7 +5,7 @@
 mod expr_compiler;
 mod filter;
 pub(crate) mod sql_parser;
-mod executor;
+pub(crate) mod executor;
 pub mod jit;
 pub mod vectorized;
 pub mod multi_column;

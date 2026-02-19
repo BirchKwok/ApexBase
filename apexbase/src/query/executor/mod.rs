@@ -48,6 +48,32 @@ static SQL_PARSE_CACHE: Lazy<RwLock<AHashMap<String, Vec<SqlStatement>>>> =
     Lazy::new(|| RwLock::new(AHashMap::new()));
 
 // ============================================================================
+// Thread-local root directory for multi-database cross-db table resolution
+// Set by Python bindings before calling execute_with_base_dir when a named
+// database is active. Allows resolve_table_path to locate db.table references.
+// ============================================================================
+thread_local! {
+    static QUERY_ROOT_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Set the root directory for the current thread's query context.
+/// Call this before execute_with_base_dir when using named databases.
+pub fn set_query_root_dir(root_dir: &Path) {
+    QUERY_ROOT_DIR.with(|r| *r.borrow_mut() = Some(root_dir.to_path_buf()));
+}
+
+/// Clear the root directory from the current thread's query context.
+pub fn clear_query_root_dir() {
+    QUERY_ROOT_DIR.with(|r| *r.borrow_mut() = None);
+}
+
+/// Get the root directory for the current thread's query context.
+pub fn get_query_root_dir() -> Option<std::path::PathBuf> {
+    QUERY_ROOT_DIR.with(|r| r.borrow().clone())
+}
+
+// ============================================================================
 // Helper functions to reduce code duplication
 // ============================================================================
 
@@ -715,19 +741,19 @@ impl ApexExecutor {
             SqlStatement::CreateTable { table, columns, if_not_exists } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
-                    Self::execute_create_table(base_dir, &table, &columns, if_not_exists)
+                    Self::execute_create_table(&table_path, &table, &columns, if_not_exists)
                 })
             }
             SqlStatement::DropTable { table, if_exists } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
-                    Self::execute_drop_table(base_dir, &table, if_exists)
+                    Self::execute_drop_table(&table_path, &table, if_exists)
                 })
             }
             SqlStatement::AlterTable { table, operation } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
-                    Self::execute_alter_table(base_dir, &table, &operation)
+                    Self::execute_alter_table(&table_path, &table, &operation)
                 })
             }
             SqlStatement::TruncateTable { table } => {
