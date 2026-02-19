@@ -111,6 +111,7 @@ class ApexClient:
         self._prefer_arrow_format = prefer_arrow_format and ARROW_AVAILABLE
         self._registry = _registry
         self._query_cache = {}  # SQL -> ResultView cache for repeated read queries
+        self._has_writes = False  # True after any write; disables _storage.execute() fast paths
 
     def _load_fts_config(self) -> None:
         try:
@@ -724,12 +725,47 @@ class ApexClient:
                         result = self._storage.execute(sql)
                         if result is not None:
                             columns_dict = result.get('columns_dict')
+                            if columns_dict is None and 'columns' in result and 'rows' in result:
+                                cols = result['columns']
+                                rows = result['rows']
+                                columns_dict = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
                             if columns_dict is not None:
                                 rv = ResultView(lazy_pydict=dict(columns_dict))
                                 rv._show_internal_id = show_internal_id
+                                if len(self._query_cache) > 200:
+                                    self._query_cache.clear()
+                                self._query_cache[sql] = rv
                                 return rv
                     except Exception:
                         pass
+
+            # FAST PATH: SELECT * WHERE col = 'val' — bypass pyarrow IPC for small results
+            # Only safe when no writes have occurred (avoids stale data via different backend path)
+            # Only for string equality (single-quoted value); skip numeric range / BETWEEN / IN
+            if (not self._has_writes and sql_up.startswith('SELECT *') and 'WHERE' in sql_up
+                    and 'LIMIT' not in sql_up and 'ORDER' not in sql_up
+                    and 'GROUP' not in sql_up and 'JOIN' not in sql_up
+                    and 'BETWEEN' not in sql_up and ' IN ' not in sql_up
+                    and '>' not in sql_up and '<' not in sql_up
+                    and "'" in sql):
+                try:
+                    result = self._storage.execute(sql)
+                    if result is not None and 'columns' in result and 'rows' in result:
+                        cols = result['columns']
+                        rows = result['rows']
+                        if not rows:
+                            rv = ResultView(data=None)
+                            rv._show_internal_id = show_internal_id
+                            return rv
+                        col_dict = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
+                        rv = ResultView(lazy_pydict=col_dict)
+                        rv._show_internal_id = show_internal_id
+                        if len(self._query_cache) > 200:
+                            self._query_cache.clear()
+                        self._query_cache[sql] = rv
+                        return rv
+                except Exception:
+                    pass
             
             # Transaction commands: route through session-aware execute() binding
             is_txn_cmd = (sql_upper.startswith('BEGIN') or 
@@ -775,6 +811,7 @@ class ApexClient:
                     return cached
             elif sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'TRUNCATE', 'ALTER', 'DROP', 'CREATE')):
                 self._query_cache.clear()
+                self._has_writes = True
             
             # Standard path: Arrow IPC for efficient bulk transfer
             ipc_bytes = self._storage._execute_arrow_ipc(sql)

@@ -992,50 +992,45 @@ impl ApexStorageImpl {
             cache.clear();
         }
         
-        // FAST PATH: SELECT * FROM <table> LIMIT N — bypass SQL parse + Arrow, return columnar
-        if !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT") 
-            && !sql_upper.contains("WHERE") && !sql_upper.contains("ORDER") 
+        // FAST PATH: SELECT * FROM <table> LIMIT N — skip SQL parse, use pread RCIX directly.
+        // Returns columnar dict format (handled by Python client's fast path at line 713).
+        if !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT")
+            && !sql_upper.contains("WHERE") && !sql_upper.contains("ORDER")
             && !sql_upper.contains("GROUP") && !sql_upper.contains("JOIN") {
             if let Some(limit_str) = sql_upper.rsplit("LIMIT").next() {
                 if let Ok(limit) = limit_str.trim().trim_end_matches(';').parse::<usize>() {
                     if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-                        // Try Arrow batch cache first (O(1) slice, no disk I/O)
-                        if let Ok(batch) = backend.read_columns_to_arrow(None, 0, Some(limit)) {
+                        let batch_result = py.allow_threads(|| {
+                            match backend.storage.get_or_load_footer() {
+                                Ok(Some(footer)) => {
+                                    let col_indices: Vec<usize> = (0..footer.schema.column_count()).collect();
+                                    backend.storage.to_arrow_batch_pread_rcix(&col_indices, true, limit)
+                                }
+                                _ => Ok(None),
+                            }
+                        });
+                        if let Ok(Some(batch)) = batch_result {
                             if batch.num_rows() > 0 {
+                                let nrows = batch.num_rows();
                                 let out = PyDict::new_bound(py);
                                 let columns_dict = PyDict::new_bound(py);
                                 let schema = batch.schema();
                                 for col_idx in 0..batch.num_columns() {
                                     let col_name = schema.field(col_idx).name();
                                     let arr = batch.column(col_idx);
-                                    let col_list = PyList::empty_bound(py);
-                                    for row_idx in 0..batch.num_rows() {
-                                        let val = arrow_value_at(arr, row_idx);
-                                        col_list.append(value_to_py(py, &val)?)?;
-                                    }
+                                    // Build all values first, then create PyList in one shot
+                                    let py_vals: Vec<PyObject> = (0..nrows)
+                                        .map(|row_idx| value_to_py(py, &arrow_value_at(arr, row_idx)))
+                                        .collect::<PyResult<Vec<_>>>()?;
+                                    let col_list = PyList::new_bound(py, py_vals);
                                     columns_dict.set_item(col_name, col_list)?;
                                 }
                                 out.set_item("columns_dict", columns_dict)?;
-                                out.set_item("rows_affected", 0)?;
+                                out.set_item("rows_affected", 0i64)?;
+                                let cached: PyObject = out.clone().into();
+                                self.py_query_cache.write().insert(sql_upper.clone(), cached);
                                 return Ok(out.into());
                             }
-                        }
-                        // Fallback: try in-memory row-based path
-                        if let Ok(Some((col_names, row_values))) = backend.storage.read_rows_limit_values(limit) {
-                            let out = PyDict::new_bound(py);
-                            let columns_dict = PyDict::new_bound(py);
-                            let num_cols = col_names.len();
-                            let num_rows = row_values.len();
-                            for col_idx in 0..num_cols {
-                                let col_list = PyList::empty_bound(py);
-                                for row_idx in 0..num_rows {
-                                    col_list.append(value_to_py(py, &row_values[row_idx][col_idx])?)?;
-                                }
-                                columns_dict.set_item(&col_names[col_idx], col_list)?;
-                            }
-                            out.set_item("columns_dict", columns_dict)?;
-                            out.set_item("rows_affected", 0)?;
-                            return Ok(out.into());
                         }
                     }
                 }
@@ -1069,6 +1064,68 @@ impl ApexStorageImpl {
                                     }
                                     out.set_item("columns_dict", columns_dict)?;
                                     out.set_item("rows_affected", 0)?;
+                                    return Ok(out.into());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // FAST PATH: SELECT * WHERE col = 'val' — bypass SQL executor overhead (~1.3ms)
+        // Uses mmap scan directly, same as LIMIT N fast path. Handles string equality only.
+        if !is_write_op && sql_upper.starts_with("SELECT *")
+            && sql_upper.contains("WHERE") && !sql_upper.contains("LIMIT")
+            && !sql_upper.contains("ORDER") && !sql_upper.contains("GROUP")
+            && !sql_upper.contains("JOIN") && !sql_upper.contains("BETWEEN")
+            && !sql_upper.contains(" IN ") && !sql_upper.contains('>')
+            && !sql_upper.contains('<') && sql.contains('\'')
+        {
+            if let Some(where_pos) = sql_upper.find("WHERE") {
+                let after_where = sql[where_pos + 5..].trim().trim_end_matches(';');
+                if let Some(eq_pos) = after_where.find('=') {
+                    let col = after_where[..eq_pos].trim().trim_matches('"').to_string();
+                    let rhs = after_where[eq_pos + 1..].trim();
+                    if !col.contains(' ') && !col.contains('(') && rhs.starts_with('\'') {
+                        if let Some(val_end) = rhs[1..].find('\'') {
+                            let val = rhs[1..1 + val_end].to_string();
+                            if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+                                let scan_result: io::Result<Option<RecordBatch>> = (|| {
+                                    let indices = match backend.scan_string_filter_mmap(&col, &val, None)? {
+                                        Some(v) => v,
+                                        None => return Ok(None),
+                                    };
+                                    if indices.is_empty() {
+                                        Ok(Some(backend.read_columns_to_arrow(None, 0, Some(0))?))
+                                    } else {
+                                        Ok(Some(backend.read_columns_by_indices_to_arrow(&indices)?))
+                                    }
+                                })();
+                                if let Ok(Some(batch)) = scan_result {
+                                    let schema = batch.schema();
+                                    let col_names: Vec<String> = schema.fields().iter()
+                                        .map(|f| f.name().clone()).collect();
+                                    let mut rows_out: Vec<Vec<Value>> = Vec::with_capacity(batch.num_rows());
+                                    for row_idx in 0..batch.num_rows() {
+                                        let mut row: Vec<Value> = Vec::with_capacity(batch.num_columns());
+                                        for col_idx in 0..batch.num_columns() {
+                                            row.push(arrow_value_at(batch.column(col_idx), row_idx));
+                                        }
+                                        rows_out.push(row);
+                                    }
+                                    let out = PyDict::new_bound(py);
+                                    out.set_item("columns", &col_names)?;
+                                    let py_rows = PyList::empty_bound(py);
+                                    for row in &rows_out {
+                                        let py_row = PyList::empty_bound(py);
+                                        for v in row { py_row.append(value_to_py(py, v)?)?; }
+                                        py_rows.append(py_row)?;
+                                    }
+                                    out.set_item("rows", py_rows)?;
+                                    out.set_item("rows_affected", 0)?;
+                                    let mut cache = self.py_query_cache.write();
+                                    cache.insert(sql_upper.clone(), out.clone().into());
                                     return Ok(out.into());
                                 }
                             }
@@ -1810,11 +1867,13 @@ impl ApexStorageImpl {
 
     /// Close storage
     fn close(&self) -> PyResult<()> {
-        // Clear all cached backends (releases file locks)
+        // Clear per-instance cached backends (releases per-instance references)
         self.cached_backends.write().clear();
         
-        // CRITICAL: Invalidate executor cache for all files in base directory
-        // This releases all mmaps on Windows so temp directories can be cleaned up
+        // On Windows: release all mmaps so temp directories can be cleaned up.
+        // On Unix: mmaps remain valid after atomic rename; keep STORAGE_CACHE alive
+        // so the 50ms fast path in get_cached_backend skips stat() calls on next retrieve().
+        #[cfg(target_os = "windows")]
         ApexExecutor::invalidate_cache_for_dir(&self.base_dir);
         Ok(())
     }
@@ -1831,9 +1890,35 @@ impl ApexStorageImpl {
         
         // ULTRA-FAST PATH: Direct V4 value read - no file lock, no Arrow, no GIL release
         // Skip allow_threads() for sub-0.1ms operations where GIL overhead dominates
-        if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-            // Try in-memory path first (fastest)
-            if let Ok(Some(vals)) = backend.storage.read_row_by_id_values(id as u64) {
+        // Use per-instance cached_backends first: no stat() syscalls (~600µs saved vs get_cached_backend_pub).
+        let table_name = self.current_table.read().clone();
+        let maybe_cached = {
+            let cb = self.cached_backends.read();
+            cb.get(&table_name).cloned()
+        };
+        let backend_opt: Option<Arc<TableStorageBackend>> = if let Some(b) = maybe_cached {
+            Some(b)
+        } else if let Ok(b) = crate::query::get_cached_backend_pub(&table_path) {
+            // Populate per-instance cache so next call is zero-syscall
+            self.cached_backends.write().insert(table_name.clone(), Arc::clone(&b));
+            Some(b)
+        } else {
+            None
+        };
+        if let Some(backend) = backend_opt {
+            // Release GIL for all Rust computation; re-acquire only for PyDict construction.
+            // retrieve_rcix: page-cached RCIX read, handles PLAIN/BITPACK/RLE/StringDict.
+            let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(id as u64));
+            if let Ok(Some(vals)) = rcix_result {
+                let dict = PyDict::new_bound(py);
+                for (k, v) in vals {
+                    dict.set_item(k, value_to_py(py, &v)?)?;
+                }
+                return Ok(Some(dict.into()));
+            }
+            // Fallback: may need to (re)create mmap after save_v4 invalidation
+            let vals_result = py.allow_threads(|| backend.storage.read_row_by_id_values(id as u64));
+            if let Ok(Some(vals)) = vals_result {
                 let dict = PyDict::new_bound(py);
                 for (k, v) in vals {
                     dict.set_item(k, value_to_py(py, &v)?)?;
@@ -1841,7 +1926,8 @@ impl ApexStorageImpl {
                 return Ok(Some(dict.into()));
             }
             // Arrow batch cache path: O(1) index lookup + batch.slice(idx, 1)
-            if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(id as u64) {
+            let batch_result = py.allow_threads(|| backend.read_row_by_id_to_arrow(id as u64));
+            if let Ok(Some(batch)) = batch_result {
                 if batch.num_rows() > 0 {
                     let dict = PyDict::new_bound(py);
                     let schema = batch.schema();

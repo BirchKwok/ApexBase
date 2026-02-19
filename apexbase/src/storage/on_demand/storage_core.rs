@@ -68,6 +68,11 @@ pub struct OnDemandStorage {
     /// Row Group body compression algorithm. Default: None (no compression).
     /// Persisted in header flags bits 0-1. Can only be set on empty tables.
     compression: std::sync::atomic::AtomicU8,
+    /// User-space page cache for retrieve_rcix point lookups.
+    /// Caches 4KB file pages as heap memory to avoid mmap page-fault overhead on macOS.
+    /// On-demand: only pages actually accessed are cached (~13 pages = ~52KB per backend).
+    /// Invalidated after every write (save_v4).
+    pub(crate) page_cache: RwLock<HashMap<u64, Box<[u8; 4096]>>>,
 }
 
 
@@ -137,6 +142,7 @@ impl OnDemandStorage {
             v4_footer: RwLock::new(None),
             delta_store: RwLock::new(DeltaStore::new(path)),
             compression: std::sync::atomic::AtomicU8::new(CompressionType::None as u8),
+            page_cache: RwLock::new(HashMap::new()),
         };
 
         // Write initial file
@@ -196,6 +202,7 @@ impl OnDemandStorage {
         let id_count = header.row_count as usize;
         let next_id: u64;
         
+        let mut cached_v4_footer: Option<V4Footer> = None;
         if is_v4 {
             // V4 Row Group format: read schema from footer
             // Read from footer_offset to EOF (V4Footer::from_bytes ignores trailing bytes)
@@ -204,10 +211,11 @@ impl OnDemandStorage {
             let mut footer_bytes = vec![0u8; footer_byte_count];
             mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
             let footer = V4Footer::from_bytes(&footer_bytes)?;
-            schema = footer.schema;
+            schema = footer.schema.clone();
+            cached_v4_footer = Some(footer);
             column_index = Vec::new(); // Not used in V4
             // Use max_id from non-empty RG metadata (row_count may be < max _id after deletes)
-            next_id = footer.row_groups.iter()
+            next_id = cached_v4_footer.as_ref().unwrap().row_groups.iter()
                 .filter(|rg| rg.row_count > 0)
                 .map(|rg| rg.max_id)
                 .max()
@@ -351,9 +359,10 @@ impl OnDemandStorage {
             persisted_row_count: AtomicU64::new(id_count as u64),
             v4_base_loaded: AtomicBool::new(false),
             cached_footer_offset: AtomicU64::new(cached_fo),
-            v4_footer: RwLock::new(None),
+            v4_footer: RwLock::new(cached_v4_footer),
             delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
+            page_cache: RwLock::new(HashMap::new()),
         })
     }
     
@@ -393,6 +402,52 @@ impl OnDemandStorage {
         total
     }
     
+    /// Read bytes from the file using the user-space page cache.
+    /// On cache miss, performs a positioned read (pread) and caches the 4KB page.
+    /// On cache hit, copies bytes from the cached heap page — zero mmap page faults.
+    /// This eliminates repeated soft page faults on macOS for point lookup paths.
+    pub(crate) fn read_cached_bytes(&self, abs_offset: u64, dst: &mut [u8]) -> io::Result<()> {
+        let len = dst.len();
+        if len == 0 { return Ok(()); }
+        let mut written = 0usize;
+        let mut cur_off = abs_offset;
+        while written < len {
+            let page_num = cur_off / 4096;
+            let page_off = (cur_off % 4096) as usize;
+            let to_copy = (len - written).min(4096 - page_off);
+            // Fast path: page is in cache
+            {
+                let cache = self.page_cache.read();
+                if let Some(page) = cache.get(&page_num) {
+                    dst[written..written + to_copy].copy_from_slice(&page[page_off..page_off + to_copy]);
+                    written += to_copy;
+                    cur_off += to_copy as u64;
+                    continue;
+                }
+            }
+            // Cache miss: pread from file and cache the page
+            let mut buf = [0u8; 4096];
+            {
+                let file_guard = self.file.read();
+                let file = file_guard.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "file not open"))?;
+                #[cfg(unix)]
+                { use std::os::unix::fs::FileExt; let _ = file.read_at(&mut buf, page_num * 4096); }
+                #[cfg(windows)]
+                { use std::os::windows::fs::FileExt; let _ = file.seek_read(&mut buf, page_num * 4096); }
+            }
+            dst[written..written + to_copy].copy_from_slice(&buf[page_off..page_off + to_copy]);
+            written += to_copy;
+            cur_off += to_copy as u64;
+            self.page_cache.write().insert(page_num, Box::new(buf));
+        }
+        Ok(())
+    }
+
+    /// Invalidate the user-space page cache. Called after every write (save_v4).
+    pub(crate) fn invalidate_page_cache(&self) {
+        self.page_cache.write().clear();
+    }
+
     /// Check if auto-flush is needed and perform it if so
     /// Returns true if auto-flush was performed
     fn maybe_auto_flush(&self) -> io::Result<bool> {
@@ -727,6 +782,7 @@ impl OnDemandStorage {
             v4_footer: RwLock::new(None),
             delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
             compression: std::sync::atomic::AtomicU8::new(CompressionType::from_flags(cached_flags) as u8),
+            page_cache: RwLock::new(HashMap::new()),
         })
     }
     

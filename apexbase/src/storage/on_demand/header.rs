@@ -293,7 +293,13 @@ impl RgColumnZoneMap {
 /// Only numeric columns (Int64, Float64) have zone maps.
 pub type RgZoneMaps = Vec<Vec<RgColumnZoneMap>>;
 
+/// Row Group Column Offset Index (RCIX): per-RG, per-column byte offsets
+/// of each column's null bitmap start within the uncompressed RG body.
+/// Enables O(1) direct seeks for cold-start LIMIT reads without sequential scan.
+pub type RgColumnOffsets = Vec<Vec<u32>>;
+
 const ZONE_MAP_MAGIC: &[u8; 4] = b"ZMAP";
+const RCIX_MAGIC: &[u8; 4] = b"RCIX";
 
 #[derive(Debug, Clone)]
 pub struct V4Footer {
@@ -301,6 +307,9 @@ pub struct V4Footer {
     pub row_groups: Vec<RowGroupMeta>,
     /// Per-RG per-column zone maps (min/max for numeric columns)
     pub zone_maps: RgZoneMaps,
+    /// Per-RG per-column byte offsets of null bitmaps within the uncompressed RG body.
+    /// Empty when not present (backward compat with older files).
+    pub col_offsets: RgColumnOffsets,
 }
 
 impl V4Footer {
@@ -336,6 +345,18 @@ impl V4Footer {
             }
         }
         
+        // RCIX section: per-RG per-column body offsets for direct-seek reads
+        if !self.col_offsets.is_empty() {
+            buf.extend_from_slice(RCIX_MAGIC);
+            buf.extend_from_slice(&(self.col_offsets.len() as u32).to_le_bytes());
+            for rg_offsets in &self.col_offsets {
+                buf.extend_from_slice(&(rg_offsets.len() as u16).to_le_bytes());
+                for &off in rg_offsets {
+                    buf.extend_from_slice(&off.to_le_bytes());
+                }
+            }
+        }
+
         // Footer size (everything before this field + 8 bytes for size + 8 bytes for magic)
         let footer_size = buf.len() as u64 + 8 + 8;
         buf.extend_from_slice(&footer_size.to_le_bytes());
@@ -408,7 +429,29 @@ impl V4Footer {
             }
         }
         
-        Ok(Self { schema, row_groups, zone_maps })
+        // Try reading RCIX section (backward compat: may not exist)
+        let mut col_offsets: RgColumnOffsets = Vec::new();
+        if pos + 4 <= bytes.len() && &bytes[pos..pos+4] == RCIX_MAGIC {
+            pos += 4;
+            if pos + 4 <= bytes.len() {
+                let rcix_rg_count = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as usize;
+                pos += 4;
+                for _ in 0..rcix_rg_count {
+                    if pos + 2 > bytes.len() { break; }
+                    let ncols = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap()) as usize;
+                    pos += 2;
+                    let mut rg_offs = Vec::with_capacity(ncols);
+                    for _ in 0..ncols {
+                        if pos + 4 > bytes.len() { break; }
+                        rg_offs.push(u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()));
+                        pos += 4;
+                    }
+                    col_offsets.push(rg_offs);
+                }
+            }
+        }
+
+        Ok(Self { schema, row_groups, zone_maps, col_offsets })
     }
     
     /// Total active rows across all Row Groups

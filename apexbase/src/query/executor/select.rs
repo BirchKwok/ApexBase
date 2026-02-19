@@ -186,26 +186,9 @@ impl ApexExecutor {
                                             if indices.is_empty() {
                                                 return Ok(ApexResult::Empty(Arc::new(Schema::empty())));
                                             }
-                                            if indices.len() <= 1000 {
-                                                // Small result: point lookups via IDs
-                                                let ids = backend.get_ids_for_global_indices_mmap(&indices)?;
-                                                let mut batches: Vec<RecordBatch> = Vec::new();
-                                                for &id in &ids {
-                                                    if let Some(batch) = backend.read_row_by_id_to_arrow(id)? {
-                                                        batches.push(batch);
-                                                    }
-                                                }
-                                                if batches.is_empty() {
-                                                    return Ok(ApexResult::Empty(Arc::new(Schema::empty())));
-                                                }
-                                                let combined = arrow::compute::concat_batches(&batches[0].schema(), &batches)
-                                                    .map_err(|e| err_data(e.to_string()))?;
-                                                return Ok(ApexResult::Data(combined));
-                                            } else {
-                                                // Large result: full scan + take
-                                                let batch = backend.read_columns_by_indices_to_arrow(&indices)?;
-                                                return Ok(ApexResult::Data(batch));
-                                            }
+                                            // Use index-based extraction for all result sizes (avoids full table scan)
+                                            let batch = backend.read_columns_by_indices_to_arrow(&indices)?;
+                                            return Ok(ApexResult::Data(batch));
                                         }
                                     }
                                     let filtered = Self::execute_with_late_materialization(&backend, &stmt, storage_path)?;
@@ -235,6 +218,9 @@ impl ApexExecutor {
                         } else if can_late_materialize_where {
                             // FAST PATH 1: Try dictionary-based filter for simple string equality
                             if let Some(result) = Self::try_fast_string_filter(&backend, &stmt)? {
+                                result
+                            // FAST PATH 1b: No-LIMIT string filter (uses mmap scan + late materialization)
+                            } else if let Some(result) = Self::try_fast_string_filter_no_limit(&backend, &stmt)? {
                                 result
                             // FAST PATH 2: Try numeric range filter for BETWEEN
                             } else if let Some(result) = Self::try_fast_numeric_range_filter(&backend, &stmt)? {
@@ -1700,6 +1686,20 @@ impl ApexExecutor {
         let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0)).unwrap_or(0);
         if k == 0 {
             return backend.read_columns_to_arrow(None, 0, Some(0));
+        }
+
+        // MMAP FAST PATH: single ORDER BY column + mmap-only → direct top-K scan without Arrow
+        if backend.is_mmap_only() && stmt.order_by.len() == 1 && !backend.has_pending_deltas() {
+            let clause = &stmt.order_by[0];
+            let col_name = clause.column.trim_matches('"');
+            let actual_col = if let Some(p) = col_name.rfind('.') { &col_name[p+1..] } else { col_name };
+            if let Some(heap) = backend.scan_top_k_indices_mmap(actual_col, k, clause.descending)? {
+                let offset = stmt.offset.unwrap_or(0);
+                let final_indices: Vec<usize> = heap.into_iter().skip(offset).map(|(idx, _)| idx).collect();
+                if !final_indices.is_empty() {
+                    return backend.read_columns_by_indices_to_arrow(&final_indices);
+                }
+            }
         }
 
         // Step 1: Read only columns needed for ORDER BY

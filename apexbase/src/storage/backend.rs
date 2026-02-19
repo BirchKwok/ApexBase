@@ -273,9 +273,6 @@ pub struct TableStorageBackend {
     /// Cached string dictionary indices for GROUP BY acceleration
     /// col_name -> (dict_strings, group_ids)
     dict_cache: RwLock<HashMap<String, (Vec<String>, Vec<u16>)>>,
-    /// Cached full Arrow batch for mmap-only reads (all columns, no limit)
-    /// Invalidated on writes. Avoids re-reading entire table from mmap.
-    arrow_batch_cache: RwLock<Option<arrow::record_batch::RecordBatch>>,
 }
 
 impl TableStorageBackend {
@@ -296,7 +293,6 @@ impl TableStorageBackend {
             row_count: RwLock::new(row_count),
             dirty: RwLock::new(false),
             dict_cache: RwLock::new(HashMap::new()),
-            arrow_batch_cache: RwLock::new(None),
         }
     }
 
@@ -326,7 +322,6 @@ impl TableStorageBackend {
             row_count: RwLock::new(0),
             dirty: RwLock::new(false),
             dict_cache: RwLock::new(HashMap::new()),
-            arrow_batch_cache: RwLock::new(None),
         })
     }
 
@@ -648,7 +643,6 @@ impl TableStorageBackend {
 
         // Invalidate cache (data changed)
         self.cached_columns.write().clear();
-        *self.arrow_batch_cache.write() = None;
         *self.dirty.write() = true;
 
         Ok(ids)
@@ -708,7 +702,6 @@ impl TableStorageBackend {
 
         // Invalidate cache (data changed)
         self.cached_columns.write().clear();
-        *self.arrow_batch_cache.write() = None;
         *self.dirty.write() = true;
 
         Ok(ids)
@@ -769,7 +762,6 @@ impl TableStorageBackend {
 
         // Invalidate cache (data changed)
         self.cached_columns.write().clear();
-        *self.arrow_batch_cache.write() = None;
         *self.dirty.write() = true;
 
         Ok(ids)
@@ -889,7 +881,6 @@ impl TableStorageBackend {
     pub fn delete(&self, id: u64) -> bool {
         let result = self.storage.delete(id);
         if result {
-            *self.arrow_batch_cache.write() = None;
             *self.dirty.write() = true;
         }
         result
@@ -899,7 +890,6 @@ impl TableStorageBackend {
     pub fn delete_batch(&self, ids: &[u64]) -> bool {
         let result = self.storage.delete_batch(ids);
         if result {
-            *self.arrow_batch_cache.write() = None;
             *self.dirty.write() = true;
         }
         result
@@ -942,7 +932,6 @@ impl TableStorageBackend {
             *self.dirty.write() = true;
             // Invalidate cache
             self.cached_columns.write().clear();
-            *self.arrow_batch_cache.write() = None;
             // Update row count
             *self.row_count.write() = self.storage.row_count();
         }
@@ -1030,7 +1019,7 @@ impl TableStorageBackend {
                 return Ok(batch);
             }
         }
-        // Fallback to normal path (uses arrow_batch_cache if available)
+        // Fallback to normal path
         self.read_columns_to_arrow(column_names, 0, None)
     }
 
@@ -1058,96 +1047,23 @@ impl TableStorageBackend {
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
         use std::sync::Arc;
 
-        // For full column reads (start_row=0, row_count=None), check cache first
         let use_cache = start_row == 0 && row_count.is_none();
         
-        // OPTIMIZATION: Arrow batch cache for mmap-only reads
-        // After first full read, subsequent reads use cached batch (avoids re-scanning mmap)
-        if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() && start_row == 0 {
-            let cache = self.arrow_batch_cache.read();
-            if let Some(ref cached) = *cache {
-                if cached.num_rows() > 0 {
-                    if row_count.is_none() && column_names.is_none() {
-                        return Ok(cached.clone());
-                    }
-                    // Project columns from cached batch
-                    if let Some(cols) = column_names {
-                        let schema = cached.schema();
-                        let mut proj_indices: Vec<usize> = Vec::new();
-                        for &col in cols {
-                            if let Some((idx, _)) = schema.column_with_name(col) {
-                                proj_indices.push(idx);
-                            }
-                        }
-                        if !proj_indices.is_empty() {
-                            let projected = cached.project(&proj_indices)
-                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                            if let Some(limit) = row_count {
-                                let actual = limit.min(projected.num_rows());
-                                return Ok(projected.slice(0, actual));
-                            }
-                            return Ok(projected);
-                        }
-                    }
-                    // Slice for limit
-                    if let Some(limit) = row_count {
-                        let actual = limit.min(cached.num_rows());
-                        return Ok(cached.slice(0, actual));
-                    }
-                }
-            }
-            drop(cache);
-        }
-        
-        // OPTIMIZATION: V4 fast path — build Arrow directly from in-memory columns
+        // OPTIMIZATION: V4 fast path — build Arrow directly from in-memory or mmap columns
         // Bypasses read_columns→HashMap→get_null_mask→Vec<bool> pipeline entirely
         if use_cache {
             if let Ok(batch) = self.storage.to_arrow_batch(column_names, 
                 column_names.map(|c| c.contains(&"_id")).unwrap_or(true)) {
                 if batch.num_rows() > 0 || batch.num_columns() > 0 {
-                    // Cache full batch for mmap-only reads
-                    if column_names.is_none() && self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
-                        let mut cache = self.arrow_batch_cache.write();
-                        *cache = Some(batch.clone());
-                    }
                     return Ok(batch);
                 }
             }
         }
         
         // OPTIMIZATION: V4 fast path for LIMIT reads (start_row=0, row_count=Some)
-        // For mmap-only: proactively populate full batch cache on first access
+        // Use to_arrow_batch_with_limit which leverages RCIX for O(1) column seeks —
+        // reads only the needed rows instead of loading the full table.
         if start_row == 0 && row_count.is_some() {
-            if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
-                // Populate cache proactively so subsequent queries are fast
-                let needs_cache = { self.arrow_batch_cache.read().is_none() };
-                if needs_cache {
-                    if let Ok(full_batch) = self.storage.to_arrow_batch(None, true) {
-                        if full_batch.num_rows() > 0 {
-                            let mut cache = self.arrow_batch_cache.write();
-                            *cache = Some(full_batch.clone());
-                            // Return sliced result from full batch
-                            let limit = row_count.unwrap();
-                            let actual = limit.min(full_batch.num_rows());
-                            if let Some(cols) = column_names {
-                                let schema = full_batch.schema();
-                                let mut proj_indices: Vec<usize> = Vec::new();
-                                for &col in cols {
-                                    if let Some((idx, _)) = schema.column_with_name(col) {
-                                        proj_indices.push(idx);
-                                    }
-                                }
-                                if !proj_indices.is_empty() {
-                                    if let Ok(projected) = full_batch.project(&proj_indices) {
-                                        return Ok(projected.slice(0, actual));
-                                    }
-                                }
-                            }
-                            return Ok(full_batch.slice(0, actual));
-                        }
-                    }
-                }
-            }
             let limit = row_count.unwrap();
             if let Ok(batch) = self.storage.to_arrow_batch_with_limit(column_names,
                 column_names.map(|c| c.contains(&"_id")).unwrap_or(true), limit) {
@@ -1567,14 +1483,12 @@ impl TableStorageBackend {
             return self.read_columns_to_arrow(None, 0, Some(0));
         }
 
-        // V4 mmap-only: use batch extraction for small result sets (avoids full-table scan)
+        // V4 mmap-only: always use indexed extraction — never load the full table
         if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
-            if row_indices.len() <= 10000 {
-                if let Some(batch) = self.storage.extract_rows_by_indices_to_arrow(row_indices)? {
-                    return Ok(batch);
-                }
+            if let Some(batch) = self.storage.extract_rows_by_indices_to_arrow(row_indices)? {
+                return Ok(batch);
             }
-            // Fallback for large result sets or if extraction failed
+            // Fallback (extraction returned None) — load full table
             let full_batch = self.read_columns_to_arrow(None, 0, None)?;
             if full_batch.num_rows() == 0 {
                 return Ok(full_batch);
@@ -1795,7 +1709,20 @@ impl TableStorageBackend {
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
         use std::sync::Arc;
 
-        // V4 mmap-only: use Arrow batch cache + SIMD-optimized string comparison
+        // FAST PATH: mmap-native string equality scan + late materialization.
+        // Avoids materializing all rows (which causes ~100ms for 1M unique StringDict strings).
+        // Works for cold backends — scan_string_filter_mmap loads the footer lazily.
+        // Skip when there is in-memory data not yet flushed (would miss pending writes).
+        if filter_eq && !self.has_pending_deltas() {
+            if let Some(indices) = self.storage.scan_string_filter_mmap(filter_column, filter_value, None)? {
+                if indices.is_empty() {
+                    return self.read_columns_to_arrow(column_names, 0, Some(0));
+                }
+                return self.read_columns_by_indices_to_arrow(&indices);
+            }
+        }
+
+        // V4 mmap-only: fall back to full batch read + Arrow filter (for neq or non-V4 format)
         if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
             let full_batch = self.read_columns_to_arrow(column_names, 0, None)?;
             if full_batch.num_rows() == 0 {
@@ -1803,7 +1730,6 @@ impl TableStorageBackend {
             }
             if let Some(col) = full_batch.column_by_name(filter_column) {
                 if let Some(str_arr) = col.as_any().downcast_ref::<StringArray>() {
-                    // For equality filter: use Arrow SIMD comparison
                     use arrow::compute::kernels::cmp;
                     let scalar_arr = StringArray::from(vec![Some(filter_value)]);
                     let scalar = arrow::array::Scalar::new(&scalar_arr);
@@ -1812,25 +1738,6 @@ impl TableStorageBackend {
                     } else {
                         cmp::neq(str_arr, &scalar)
                     }.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                    
-                    // For small result sets (equality on unique column): use slice-based extraction
-                    let true_count = mask.true_count();
-                    if true_count <= 10 && filter_eq {
-                        // Collect matching indices and use concat of slices (avoids full filter scan)
-                        let mut batches: Vec<RecordBatch> = Vec::with_capacity(true_count);
-                        for i in 0..mask.len() {
-                            if mask.value(i) {
-                                batches.push(full_batch.slice(i, 1));
-                            }
-                        }
-                        if batches.is_empty() {
-                            return self.read_columns_to_arrow(column_names, 0, Some(0));
-                        }
-                        let result = arrow::compute::concat_batches(&batches[0].schema(), &batches)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                        return Ok(result);
-                    }
-                    
                     let filtered = arrow::compute::filter_record_batch(&full_batch, &mask)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     return Ok(filtered);
@@ -2204,79 +2111,12 @@ impl TableStorageBackend {
 
     /// Compute numeric column aggregates directly without Arrow arrays.
     /// Returns (count, sum, min, max) for the specified column.
-    /// OPTIMIZATION: Uses Arrow batch cache if available to avoid mmap RG decompression.
     pub fn compute_column_stats_mmap(&self, col_name: &str) -> io::Result<Option<(u64, f64, f64, f64)>> {
-        use arrow::array::{Float64Array, Int64Array, Array};
-        use arrow::datatypes::DataType as ArrowDataType;
-        
-        // Try Arrow batch cache first (O(N) scan of cached array, no disk I/O)
-        {
-            let cache = self.arrow_batch_cache.read();
-            if let Some(ref batch) = *cache {
-                if batch.num_rows() > 0 {
-                    let schema = batch.schema();
-                    if let Some((idx, field)) = schema.column_with_name(col_name) {
-                        let col = batch.column(idx);
-                        match field.data_type() {
-                            ArrowDataType::Int64 => {
-                                if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                                    let vals = arr.values();
-                                    let n = vals.len() as u64;
-                                    let mut sum: f64 = 0.0;
-                                    let mut min_v = i64::MAX;
-                                    let mut max_v = i64::MIN;
-                                    for i in 0..vals.len() {
-                                        let v = unsafe { *vals.get_unchecked(i) };
-                                        sum += v as f64;
-                                        if v < min_v { min_v = v; }
-                                        if v > max_v { max_v = v; }
-                                    }
-                                    return Ok(Some((n, sum, min_v as f64, max_v as f64)));
-                                }
-                            }
-                            ArrowDataType::Float64 => {
-                                if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-                                    let vals = arr.values();
-                                    let n = vals.len() as u64;
-                                    let mut sum: f64 = 0.0;
-                                    let mut min_v = f64::INFINITY;
-                                    let mut max_v = f64::NEG_INFINITY;
-                                    for i in 0..vals.len() {
-                                        let v = unsafe { *vals.get_unchecked(i) };
-                                        sum += v;
-                                        if v < min_v { min_v = v; }
-                                        if v > max_v { max_v = v; }
-                                    }
-                                    return Ok(Some((n, sum, min_v, max_v)));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Populate cache if needed
-        if self.storage.is_v4_format() {
-            let needs_cache = { self.arrow_batch_cache.read().is_none() };
-            if needs_cache {
-                if let Ok(batch) = self.storage.to_arrow_batch(None, true) {
-                    if batch.num_rows() > 0 {
-                        let mut cache = self.arrow_batch_cache.write();
-                        *cache = Some(batch);
-                        drop(cache);
-                        return self.compute_column_stats_mmap(col_name);
-                    }
-                }
-            }
-        }
-        
-        // Fallback: mmap path
+        // mmap path: reads only the requested column via RCIX fast seek
         if let Ok(Some(stats)) = self.storage.compute_column_stats_mmap(col_name) {
             return Ok(Some(stats));
         }
-        // Fallback: in-memory V4 columns
+        // in-memory fallback
         self.storage.compute_column_stats_inmemory(col_name)
     }
 
@@ -2293,6 +2133,11 @@ impl TableStorageBackend {
     /// Mmap-level numeric range scan: find matching row indices without Arrow arrays.
     pub fn scan_numeric_range_mmap(&self, col_name: &str, low: f64, high: f64, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
         self.storage.scan_numeric_range_mmap(col_name, low, high, limit)
+    }
+
+    /// Direct mmap top-K scan: finds top-k row indices without materializing the full Arrow column.
+    pub fn scan_top_k_indices_mmap(&self, col_name: &str, k: usize, descending: bool) -> io::Result<Option<Vec<(usize, f64)>>> {
+        self.storage.scan_top_k_indices_mmap(col_name, k, descending)
     }
 
     /// Get underlying storage for direct access
@@ -2459,242 +2304,19 @@ impl TableStorageBackend {
     }
 
     /// Execute GROUP BY + aggregate using pre-built dict cache.
-    /// OPTIMIZATION: Uses Arrow batch cache if available to avoid mmap RG decompression.
+    /// Delegates directly to storage: uses in-memory path when data is loaded,
+    /// otherwise uses mmap path reading only the needed agg columns via RCIX.
     pub fn execute_group_agg_cached(
         &self, dict_strings: &[String], group_ids: &[u16], agg_cols: &[(&str, bool)],
     ) -> io::Result<Option<Vec<(String, Vec<(f64, i64)>)>>> {
-        use arrow::array::{Float64Array, Int64Array, Array};
-        use arrow::datatypes::DataType as ArrowDataType;
-        
-        // Try Arrow batch cache first (avoids mmap RG decompression)
-        {
-            let cache = self.arrow_batch_cache.read();
-            if let Some(ref batch) = *cache {
-                if batch.num_rows() > 0 {
-                    let num_groups = dict_strings.len();
-                    let num_aggs = agg_cols.len();
-                    let scan_rows = batch.num_rows().min(group_ids.len());
-                    let flat_len = num_groups * num_aggs;
-                    let mut flat_sums = vec![0.0f64; flat_len];
-                    let mut flat_counts = vec![0i64; flat_len];
-                    
-                    // Resolve agg columns — extract raw slices for zero-overhead iteration
-                    let schema = batch.schema();
-                    enum RawSlice<'a> { F64(&'a [f64]), I64(&'a [i64]), CountOnly }
-                    let raw_sources: Vec<RawSlice> = agg_cols.iter().map(|(name, is_count)| {
-                        if *is_count { return RawSlice::CountOnly; }
-                        if let Some((idx, field)) = schema.column_with_name(name) {
-                            let col = batch.column(idx);
-                            match field.data_type() {
-                                ArrowDataType::Float64 => {
-                                    if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-                                        return RawSlice::F64(arr.values());
-                                    }
-                                }
-                                ArrowDataType::Int64 => {
-                                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                                        return RawSlice::I64(arr.values());
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        RawSlice::CountOnly
-                    }).collect();
-                    
-                    // Specialized fast path for single agg column (most common)
-                    if num_aggs == 1 {
-                        match &raw_sources[0] {
-                            RawSlice::F64(vals) => {
-                                for i in 0..scan_rows {
-                                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
-                                    unsafe { *flat_counts.get_unchecked_mut(gid) += 1; }
-                                    unsafe { *flat_sums.get_unchecked_mut(gid) += *vals.get_unchecked(i); }
-                                }
-                            }
-                            RawSlice::I64(vals) => {
-                                for i in 0..scan_rows {
-                                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
-                                    unsafe { *flat_counts.get_unchecked_mut(gid) += 1; }
-                                    unsafe { *flat_sums.get_unchecked_mut(gid) += *vals.get_unchecked(i) as f64; }
-                                }
-                            }
-                            RawSlice::CountOnly => {
-                                for i in 0..scan_rows {
-                                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
-                                    unsafe { *flat_counts.get_unchecked_mut(gid) += 1; }
-                                }
-                            }
-                        }
-                    } else {
-                        for i in 0..scan_rows {
-                            let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
-                            let base = gid * num_aggs;
-                            if base + num_aggs > flat_len { continue; }
-                            for (ai, src) in raw_sources.iter().enumerate() {
-                                unsafe { *flat_counts.get_unchecked_mut(base + ai) += 1; }
-                                match src {
-                                    RawSlice::F64(vals) => unsafe { *flat_sums.get_unchecked_mut(base + ai) += *vals.get_unchecked(i); },
-                                    RawSlice::I64(vals) => unsafe { *flat_sums.get_unchecked_mut(base + ai) += *vals.get_unchecked(i) as f64; },
-                                    RawSlice::CountOnly => {}
-                                }
-                            }
-                        }
-                    }
-                    
-                    let results: Vec<(String, Vec<(f64, i64)>)> = (0..num_groups)
-                        .filter(|&gid| flat_counts[gid * num_aggs] > 0)
-                        .map(|gid| {
-                            let aggs: Vec<(f64, i64)> = (0..num_aggs)
-                                .map(|ai| (flat_sums[gid * num_aggs + ai], flat_counts[gid * num_aggs + ai]))
-                                .collect();
-                            (dict_strings[gid].clone(), aggs)
-                        })
-                        .collect();
-                    
-                    return Ok(Some(results));
-                }
-            }
-        }
-        
-        // Populate Arrow batch cache for future calls
-        if self.storage.is_v4_format() {
-            let needs_cache = { self.arrow_batch_cache.read().is_none() };
-            if needs_cache {
-                if let Ok(batch) = self.storage.to_arrow_batch(None, true) {
-                    if batch.num_rows() > 0 {
-                        let mut cache = self.arrow_batch_cache.write();
-                        *cache = Some(batch);
-                        drop(cache);
-                        // Recurse with cache now populated
-                        return self.execute_group_agg_cached(dict_strings, group_ids, agg_cols);
-                    }
-                }
-            }
-        }
-        
-        // Fallback to storage-level path
         self.storage.execute_group_agg_cached(dict_strings, group_ids, agg_cols)
     }
 
     /// Execute BETWEEN + GROUP BY using pre-built dict cache.
-    /// OPTIMIZATION: Uses Arrow batch cache if available.
+    /// Delegates directly to storage: uses mmap path reading only the needed columns.
     pub fn execute_between_group_agg_cached(
         &self, filter_col: &str, lo: f64, hi: f64, dict_strings: &[String], group_ids: &[u16], agg_col: Option<&str>,
     ) -> io::Result<Option<Vec<(String, f64, i64)>>> {
-        use arrow::array::{Float64Array, Int64Array, Array};
-        use arrow::datatypes::DataType as ArrowDataType;
-        
-        // Try Arrow batch cache first
-        {
-            let cache = self.arrow_batch_cache.read();
-            if let Some(ref batch) = *cache {
-                if batch.num_rows() > 0 {
-                    let schema = batch.schema();
-                    let filter_col_idx = match schema.column_with_name(filter_col) {
-                        Some((idx, _)) => idx,
-                        None => { drop(cache); return self.storage.execute_between_group_agg_cached(filter_col, lo, hi, dict_strings, group_ids, agg_col); }
-                    };
-                    let filter_arr = batch.column(filter_col_idx);
-                    let num_groups = dict_strings.len();
-                    let scan_rows = batch.num_rows().min(group_ids.len());
-                    let mut group_sums = vec![0.0f64; num_groups];
-                    let mut group_counts = vec![0i64; num_groups];
-                    
-                    let agg_f64 = agg_col.and_then(|name| schema.column_with_name(name))
-                        .map(|(idx, _)| batch.column(idx))
-                        .and_then(|col| col.as_any().downcast_ref::<Float64Array>());
-                    let agg_i64 = if agg_f64.is_none() {
-                        agg_col.and_then(|name| schema.column_with_name(name))
-                            .map(|(idx, _)| batch.column(idx))
-                            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
-                    } else { None };
-                    
-                    let lo_i64 = lo as i64;
-                    let hi_i64 = hi as i64;
-                    
-                    // Raw slice access for zero-overhead iteration
-                    let agg_f64_vals = agg_f64.map(|a| a.values().as_ref());
-                    let agg_i64_vals = if agg_f64_vals.is_none() { agg_i64.map(|a| a.values().as_ref()) } else { None };
-                    
-                    if let Some(f_arr) = filter_arr.as_any().downcast_ref::<Int64Array>() {
-                        let filter_vals = f_arr.values();
-                        if let Some(agg_vals) = agg_f64_vals {
-                            for i in 0..scan_rows {
-                                let v = unsafe { *filter_vals.get_unchecked(i) };
-                                if v >= lo_i64 && v <= hi_i64 {
-                                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
-                                    unsafe { *group_counts.get_unchecked_mut(gid) += 1; }
-                                    unsafe { *group_sums.get_unchecked_mut(gid) += *agg_vals.get_unchecked(i); }
-                                }
-                            }
-                        } else if let Some(agg_vals) = agg_i64_vals {
-                            for i in 0..scan_rows {
-                                let v = unsafe { *filter_vals.get_unchecked(i) };
-                                if v >= lo_i64 && v <= hi_i64 {
-                                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
-                                    unsafe { *group_counts.get_unchecked_mut(gid) += 1; }
-                                    unsafe { *group_sums.get_unchecked_mut(gid) += *agg_vals.get_unchecked(i) as f64; }
-                                }
-                            }
-                        } else {
-                            for i in 0..scan_rows {
-                                let v = unsafe { *filter_vals.get_unchecked(i) };
-                                if v >= lo_i64 && v <= hi_i64 {
-                                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
-                                    unsafe { *group_counts.get_unchecked_mut(gid) += 1; }
-                                }
-                            }
-                        }
-                    } else if let Some(f_arr) = filter_arr.as_any().downcast_ref::<Float64Array>() {
-                        let filter_vals = f_arr.values();
-                        if let Some(agg_vals) = agg_f64_vals {
-                            for i in 0..scan_rows {
-                                let v = unsafe { *filter_vals.get_unchecked(i) };
-                                if v >= lo && v <= hi {
-                                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
-                                    unsafe { *group_counts.get_unchecked_mut(gid) += 1; }
-                                    unsafe { *group_sums.get_unchecked_mut(gid) += *agg_vals.get_unchecked(i); }
-                                }
-                            }
-                        } else {
-                            for i in 0..scan_rows {
-                                let v = unsafe { *filter_vals.get_unchecked(i) };
-                                if v >= lo && v <= hi {
-                                    let gid = unsafe { *group_ids.get_unchecked(i) } as usize;
-                                    unsafe { *group_counts.get_unchecked_mut(gid) += 1; }
-                                }
-                            }
-                        }
-                    } else {
-                        drop(cache);
-                        return self.storage.execute_between_group_agg_cached(filter_col, lo, hi, dict_strings, group_ids, agg_col);
-                    }
-                    
-                    let results: Vec<(String, f64, i64)> = (0..num_groups)
-                        .filter(|&gid| group_counts[gid] > 0)
-                        .map(|gid| (dict_strings[gid].clone(), group_sums[gid], group_counts[gid]))
-                        .collect();
-                    return Ok(Some(results));
-                }
-            }
-        }
-        
-        // Populate cache if needed
-        if self.storage.is_v4_format() {
-            let needs_cache = { self.arrow_batch_cache.read().is_none() };
-            if needs_cache {
-                if let Ok(batch) = self.storage.to_arrow_batch(None, true) {
-                    if batch.num_rows() > 0 {
-                        let mut cache = self.arrow_batch_cache.write();
-                        *cache = Some(batch);
-                        drop(cache);
-                        return self.execute_between_group_agg_cached(filter_col, lo, hi, dict_strings, group_ids, agg_col);
-                    }
-                }
-            }
-        }
-        
         self.storage.execute_between_group_agg_cached(filter_col, lo, hi, dict_strings, group_ids, agg_col)
     }
 

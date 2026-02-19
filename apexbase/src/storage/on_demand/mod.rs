@@ -51,6 +51,7 @@ use std::cell::RefCell;
 
 use memmap2::Mmap;
 use parking_lot::RwLock;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use arrow::record_batch::RecordBatch;
 use arrow::array::ArrayRef;
@@ -123,6 +124,12 @@ impl MmapCache {
         Ok(self.mmap.as_ref().unwrap())
     }
     
+    /// Return mmap slice without any syscalls or staleness checks.
+    /// Caller must ensure the mmap is still valid (backend freshness checked by STORAGE_CACHE).
+    pub(crate) fn mmap_slice_unchecked(&self) -> Option<&[u8]> {
+        self.mmap.as_deref()
+    }
+
     /// Read bytes at offset using mmap (zero-copy when possible)
     fn read_at(&mut self, file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
         let mmap = self.get_or_create(file)?;
@@ -400,6 +407,165 @@ fn bitpack_decode_i64(bytes: &[u8]) -> io::Result<(Vec<i64>, usize)> {
     Ok((result, 17 + packed_bytes))
 }
 
+/// Decode a single value at `idx` from BITPACK bytes without allocating the full Vec.
+/// Returns None if out of bounds or malformed.
+pub(super) fn bitpack_decode_at_idx(bytes: &[u8], idx: usize) -> Option<i64> {
+    if bytes.len() < 17 { return None; }
+    let count = u64::from_le_bytes(bytes[0..8].try_into().ok()?) as usize;
+    let bit_width = bytes[8] as usize;
+    let min_val = i64::from_le_bytes(bytes[9..17].try_into().ok()?);
+    if idx >= count { return None; }
+    if bit_width == 0 { return Some(min_val); }
+    let packed_bytes = (count * bit_width + 7) / 8;
+    if bytes.len() < 17 + packed_bytes { return None; }
+    let packed = &bytes[17..17 + packed_bytes];
+    let bit_offset = idx * bit_width;
+    let mut delta: u64 = 0;
+    for b in 0..bit_width {
+        let global_bit = bit_offset + b;
+        if (packed[global_bit / 8] >> (global_bit % 8)) & 1 == 1 {
+            delta |= 1u64 << b;
+        }
+    }
+    Some(min_val.wrapping_add(delta as i64))
+}
+
+/// Compute (sum, min, max, count, bytes_consumed) directly from BITPACK bytes without Vec allocation.
+/// Returns None if input is too short or bit_width is unsupported.
+pub(super) fn bitpack_agg_i64(bytes: &[u8]) -> Option<(i64, i64, i64, usize, usize)> {
+    if bytes.len() < 17 { return None; }
+    let count = u64::from_le_bytes(bytes[0..8].try_into().ok()?) as usize;
+    let bit_width = bytes[8] as usize;
+    let min_val = i64::from_le_bytes(bytes[9..17].try_into().ok()?);
+    if bit_width == 0 {
+        let consumed = 17;
+        return Some((count as i64 * min_val, min_val, min_val, count, consumed));
+    }
+    let packed_bytes = (count * bit_width + 7) / 8;
+    if bytes.len() < 17 + packed_bytes { return None; }
+    let packed = &bytes[17..17 + packed_bytes];
+    let mut sum_delta: u64 = 0;
+    let mut min_delta: u64 = u64::MAX;
+    let mut max_delta: u64 = 0;
+    let mask = (1u64 << bit_width) - 1;
+
+    if bit_width == 6 {
+        // VECTORIZABLE FAST PATH for 6-bit values (age 0-63, packed 8 per 6 bytes).
+        let n_full = count / 8;
+        let mut sums = [0u64; 8];
+        let mut mins = [u64::MAX; 8];
+        let mut maxs = [0u64; 8];
+        for g in 0..n_full {
+            let off = g * 6;
+            if off + 6 > packed.len() { break; }
+            let b = &packed[off..];
+            let word48 = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], 0, 0]);
+            for k in 0..8usize {
+                let delta = (word48 >> (k * 6)) & 0x3Fu64;
+                sums[k] = sums[k].wrapping_add(delta);
+                mins[k] = mins[k].min(delta);
+                maxs[k] = maxs[k].max(delta);
+            }
+        }
+        sum_delta = sums.iter().copied().sum();
+        min_delta = mins.iter().copied().min().unwrap_or(u64::MAX);
+        max_delta = maxs.iter().copied().max().unwrap_or(0);
+        for i in (n_full * 8)..count {
+            let bit_offset = i * 6;
+            let byte_idx = bit_offset / 8;
+            let bit_in_byte = bit_offset % 8;
+            let b0 = packed.get(byte_idx).copied().unwrap_or(0) as u64;
+            let b1 = packed.get(byte_idx + 1).copied().unwrap_or(0) as u64;
+            let delta = ((b0 | (b1 << 8)) >> bit_in_byte) & 0x3F;
+            sum_delta = sum_delta.wrapping_add(delta);
+            min_delta = min_delta.min(delta);
+            max_delta = max_delta.max(delta);
+        }
+    } else if bit_width == 7 {
+        // VECTORIZABLE FAST PATH for 7-bit values (most common: age 0-127).
+        // Process 8 values per 7-byte chunk using a 56-bit word — inner k-loop has
+        // independent accumulators, enabling LLVM to auto-vectorize with SIMD.
+        let n_full = count / 8;
+        let mut sums = [0u64; 8];
+        let mut mins = [u64::MAX; 8];
+        let mut maxs = [0u64; 8];
+        for g in 0..n_full {
+            let off = g * 7;
+            if off + 7 > packed.len() { break; }
+            let b = &packed[off..off + 7];
+            let word56 = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], 0]);
+            for k in 0..8usize {
+                let delta = (word56 >> (k * 7)) & 0x7Fu64;
+                sums[k] = sums[k].wrapping_add(delta);
+                mins[k] = mins[k].min(delta);
+                maxs[k] = maxs[k].max(delta);
+            }
+        }
+        sum_delta = sums.iter().copied().sum();
+        min_delta = mins.iter().copied().min().unwrap_or(u64::MAX);
+        max_delta = maxs.iter().copied().max().unwrap_or(0);
+        // Handle remaining values (0-7 leftover)
+        for i in (n_full * 8)..count {
+            let bit_offset = i * 7;
+            let byte_idx = bit_offset / 8;
+            let bit_in_byte = bit_offset % 8;
+            let b0 = packed[byte_idx] as u64;
+            let b1 = if byte_idx + 1 < packed.len() { packed[byte_idx + 1] as u64 } else { 0 };
+            let delta = ((b0 | (b1 << 8)) >> bit_in_byte) & 0x7F;
+            sum_delta = sum_delta.wrapping_add(delta);
+            min_delta = min_delta.min(delta);
+            max_delta = max_delta.max(delta);
+        }
+    } else if bit_width == 8 {
+        // Trivial: 1 byte per value — vectorizes easily
+        for &b in packed.iter().take(count) {
+            let delta = b as u64;
+            sum_delta = sum_delta.wrapping_add(delta);
+            min_delta = min_delta.min(delta);
+            max_delta = max_delta.max(delta);
+        }
+    } else if bit_width <= 16 {
+        // General word-level fast path — scalar but avoids inner bit-by-bit loop
+        for i in 0..count {
+            let bit_offset = i * bit_width;
+            let byte_idx = bit_offset / 8;
+            let bit_in_byte = bit_offset % 8;
+            let word = unsafe {
+                let p = packed.as_ptr().add(byte_idx);
+                if byte_idx + 3 <= packed.len() {
+                    let b0 = *p as u32; let b1 = *p.add(1) as u32; let b2 = *p.add(2) as u32;
+                    b0 | (b1 << 8) | (b2 << 16)
+                } else if byte_idx + 2 <= packed.len() {
+                    let b0 = *p as u32; let b1 = *p.add(1) as u32; b0 | (b1 << 8)
+                } else if byte_idx < packed.len() { *p as u32 } else { break }
+            };
+            let delta = ((word as u64) >> bit_in_byte) & mask;
+            sum_delta = sum_delta.wrapping_add(delta);
+            min_delta = min_delta.min(delta);
+            max_delta = max_delta.max(delta);
+        }
+    } else {
+        // GENERAL PATH: bit-by-bit extraction for wide values
+        for i in 0..count {
+            let bit_offset = i * bit_width;
+            let mut delta: u64 = 0;
+            for b in 0..bit_width {
+                let global_bit = bit_offset + b;
+                if (packed[global_bit / 8] >> (global_bit % 8)) & 1 == 1 {
+                    delta |= 1u64 << b;
+                }
+            }
+            sum_delta = sum_delta.wrapping_add(delta);
+            if delta < min_delta { min_delta = delta; }
+            if delta > max_delta { max_delta = delta; }
+        }
+    }
+    let sum = (count as i64).wrapping_mul(min_val).wrapping_add(sum_delta as i64);
+    let mn = min_val.wrapping_add(if count > 0 { min_delta as i64 } else { 0 });
+    let mx = min_val.wrapping_add(if count > 0 { max_delta as i64 } else { 0 });
+    Some((sum, mn, mx, count, 17 + packed_bytes))
+}
+
 /// Encode a Bool column with RLE (Run-Length Encoding).
 /// Format: [count:u64][num_runs:u64][(value:u8, run_len:u32)...]
 /// Bool columns are stored as packed bits; RLE encodes runs of true/false.
@@ -519,7 +685,41 @@ fn read_column_encoded_partial(bytes: &[u8], col_type: ColumnType, limit: usize)
     let encoding = bytes[0];
     let data_bytes = &bytes[1..];
 
-    // For non-plain encodings, fall back to full decode + slice
+    // For BITPACK: partial decode — only decode first `limit` values (avoids decoding full RG)
+    if encoding == COL_ENCODING_BITPACK && matches!(col_type,
+        ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
+        ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+        ColumnType::Timestamp | ColumnType::Date)
+    {
+        if data_bytes.len() >= 17 {
+            let count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+            let bit_width = data_bytes[8] as usize;
+            let min_val = i64::from_le_bytes(data_bytes[9..17].try_into().unwrap());
+            let packed_bytes = (count * bit_width + 7) / 8;
+            let total_consumed = 1 + 17 + packed_bytes;
+            let actual = count.min(limit);
+            let mut result = Vec::with_capacity(actual);
+            if bit_width == 0 {
+                result.resize(actual, min_val);
+            } else if 17 + packed_bytes <= data_bytes.len() {
+                let packed = &data_bytes[17..17 + packed_bytes];
+                for i in 0..actual {
+                    let bit_offset = i * bit_width;
+                    let mut delta: u64 = 0;
+                    for b in 0..bit_width {
+                        let global_bit = bit_offset + b;
+                        if (packed[global_bit / 8] >> (global_bit % 8)) & 1 == 1 {
+                            delta |= 1u64 << b;
+                        }
+                    }
+                    result.push(min_val.wrapping_add(delta as i64));
+                }
+            }
+            return Ok((ColumnData::Int64(result), total_consumed));
+        }
+    }
+
+    // For other non-plain encodings, fall back to full decode + slice
     if encoding != COL_ENCODING_PLAIN {
         let (col, consumed) = read_column_encoded(bytes, col_type)?;
         let sliced = if col.len() > limit { col.slice_range(0, limit) } else { col };

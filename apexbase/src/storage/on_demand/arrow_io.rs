@@ -407,8 +407,7 @@ impl OnDemandStorage {
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType, Int64Type, Float64Type};
         use std::sync::Arc;
 
-        // ON-DEMAND MMAP PATH for LIMIT queries
-        // LOCK-FREE: use cached_footer_offset atomic instead of header RwLock.
+        // ON-DEMAND PATH for LIMIT queries
         {
             let is_v4 = self.cached_footer_offset.load(Ordering::Relaxed) > 0;
             if is_v4 {
@@ -416,6 +415,23 @@ impl OnDemandStorage {
                 let has_in_memory_data = !cols.is_empty() && cols.iter().any(|c| c.len() > 0);
                 drop(cols);
                 if !has_in_memory_data {
+                    // PREAD RCIX PATH: reads only the minimal bytes needed (no mmap page faults).
+                    // Falls back to mmap path for multi-RG, compressed, or deleted rows.
+                    let footer_opt = self.v4_footer.read().clone();
+                    if let Some(ref footer) = footer_opt {
+                        let schema = &footer.schema;
+                        let col_indices: Vec<usize> = if let Some(names) = column_names {
+                            names.iter().filter(|&&n| n != "_id")
+                                .filter_map(|&name| schema.get_index(name))
+                                .collect()
+                        } else {
+                            (0..schema.column_count()).collect()
+                        };
+                        if let Ok(Some(batch)) = self.to_arrow_batch_pread_rcix(&col_indices, include_id, limit) {
+                            return Ok(batch);
+                        }
+                    }
+                    // MMAP fallback (multi-RG, deletes, compressed, or unknown encodings)
                     if let Some(batch) = self.to_arrow_batch_mmap(
                         column_names, include_id, Some(limit), true,
                     )? {

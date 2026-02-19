@@ -187,7 +187,80 @@ impl OnDemandStorage {
 
             // Check compression flag at RG header byte 28
             let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
-            
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+            let has_deletes = rg_meta.deletion_count > 0;
+            let rg_active = rg_meta.active_rows() as usize;
+            let rows_to_take = (effective_limit - rows_collected).min(rg_active);
+            let null_bitmap_len = (rg_rows + 7) / 8;
+
+            // === RCIX fast path: O(1) direct seeks for no-compression, no-deletes ===
+            // Skips sequential column scanning — jumps directly to each column via footer index.
+            // For LIMIT 100 with 65536-row RG: touches ~800B of IDs + targeted column pages
+            // instead of scanning 512KB IDs + full column sequence.
+            if compress_flag == RG_COMPRESS_NONE
+                && !has_deletes
+                && encoding_version >= 1
+                && rg_idx < footer.col_offsets.len()
+                && !footer.col_offsets[rg_idx].is_empty()
+            {
+                let rg_body_abs = (rg_meta.offset + 32) as usize;
+                let col_offsets = &footer.col_offsets[rg_idx];
+
+                // Read only first rows_to_take IDs directly from mmap (avoids touching rest)
+                {
+                    let id_end = rg_body_abs + rows_to_take * 8;
+                    if id_end <= mmap_ref.len() {
+                        let id_bytes = &mmap_ref[rg_body_abs..id_end];
+                        for i in 0..rows_to_take {
+                            let id = u64::from_le_bytes(
+                                id_bytes[i * 8..(i + 1) * 8].try_into().unwrap()
+                            );
+                            all_ids.push(id as i64);
+                        }
+                    }
+                }
+
+                // Direct column reads via RCIX — no sequential scan of preceding columns
+                for (out_pos, &col_idx) in col_indices.iter().enumerate() {
+                    if col_idx >= col_offsets.len() {
+                        // Schema evolution: column added after this RG was written
+                        let col_type = schema.columns[col_idx].1;
+                        let default_col = Self::create_default_column(col_type, rows_to_take);
+                        col_accumulators[out_pos].append(&default_col);
+                        null_accumulators[out_pos].extend(std::iter::repeat(true).take(rows_to_take));
+                        continue;
+                    }
+                    let col_abs = rg_body_abs + col_offsets[col_idx] as usize;
+                    if col_abs + null_bitmap_len > mmap_ref.len() {
+                        continue;
+                    }
+                    let null_bytes = &mmap_ref[col_abs..col_abs + null_bitmap_len];
+                    let data_abs = col_abs + null_bitmap_len;
+                    if data_abs >= mmap_ref.len() {
+                        continue;
+                    }
+                    let col_type = schema.columns[col_idx].1;
+                    let (col_data, _) = if rows_to_take < rg_rows {
+                        read_column_encoded_partial(&mmap_ref[data_abs..], col_type, rows_to_take)?
+                    } else {
+                        read_column_encoded(&mmap_ref[data_abs..], col_type)?
+                    };
+                    let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                        col_data.decode_string_dict()
+                    } else {
+                        col_data
+                    };
+                    col_accumulators[out_pos].append(&col_data);
+                    for i in 0..rows_to_take {
+                        null_accumulators[out_pos].push((null_bytes[i / 8] >> (i % 8)) & 1 == 1);
+                    }
+                }
+
+                rows_collected += rows_to_take;
+                continue; // skip sequential scan path below
+            }
+            // === End RCIX fast path ===
+
             // Get the body bytes (after 32-byte RG header), decompressing if needed
             let decompressed_buf = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
             let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_bytes[32..]);
@@ -209,11 +282,6 @@ impl OnDemandStorage {
             let del_bytes = &body[pos..pos + del_vec_len];
             pos += del_vec_len;
 
-            // Build active row mask for this RG
-            let has_deletes = rg_meta.deletion_count > 0;
-            let rg_active = rg_meta.active_rows() as usize;
-            let rows_to_take = (effective_limit - rows_collected).min(rg_active);
-
             // Always collect active IDs from this RG (needed for DeltaMerger overlay)
             {
                 let mut taken = 0;
@@ -234,7 +302,6 @@ impl OnDemandStorage {
             // Build mapping: disk col_idx → output position in col_accumulators
             // This ensures correct data placement regardless of column ordering
             // between the footer schema and the requested column list.
-            let null_bitmap_len = (rg_rows + 7) / 8;
             let col_idx_to_out: HashMap<usize, usize> = col_indices.iter()
                 .enumerate()
                 .map(|(out_pos, &col_idx)| (col_idx, out_pos))
@@ -253,8 +320,6 @@ impl OnDemandStorage {
                 let col_type = schema.columns[col_idx].1;
 
                 if let Some(&out_pos) = col_idx_to_out.get(&col_idx) {
-                    let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
-
                     // OPTIMIZATION: For LIMIT queries without deletes, use partial column read
                     // to avoid allocating/copying full column data (e.g., 1M rows → only 100)
                     if !has_deletes && rows_to_take < rg_rows && encoding_version >= 1 {
@@ -319,7 +384,6 @@ impl OnDemandStorage {
                     rg_filled[out_pos] = true;
                 } else {
                     // Skip this column (no allocation, encoding-aware)
-                    let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
                     let consumed = if encoding_version >= 1 {
                         skip_column_encoded(&body[pos..], col_type)?
                     } else {
@@ -727,7 +791,9 @@ impl OnDemandStorage {
         let mut mmap_guard = self.mmap_cache.write();
         let mmap_ref = mmap_guard.get_or_create(file)?;
 
-        // Build output accumulators
+        // Pre-allocate accumulators to total row count — eliminates 16+ reallocations during RG iteration
+        let total_rows: usize = footer.row_groups.iter().map(|rg| rg.row_count as usize).sum();
+        let total_del_bytes = (total_rows + 7) / 8;
         let mut col_accumulators: Vec<ColumnData> = col_indices.iter()
             .map(|&ci| {
                 let ct = schema.columns[ci].1;
@@ -735,15 +801,17 @@ impl OnDemandStorage {
                 ColumnData::new(acc_type)
             })
             .collect();
-        let mut all_del_bytes: Vec<u8> = Vec::new();
-        let mut col_null_bitmaps: Vec<Vec<u8>> = col_indices.iter().map(|_| Vec::new()).collect();
+        let mut all_del_bytes: Vec<u8> = Vec::with_capacity(total_del_bytes);
+        let mut col_null_bitmaps: Vec<Vec<u8>> = col_indices.iter()
+            .map(|_| Vec::with_capacity(total_del_bytes))
+            .collect();
 
         let col_idx_to_out: HashMap<usize, usize> = col_indices.iter()
             .enumerate()
             .map(|(out_pos, &col_idx)| (col_idx, out_pos))
             .collect();
 
-        for rg_meta in &footer.row_groups {
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
             let rg_rows = rg_meta.row_count as usize;
             if rg_rows == 0 { continue; }
 
@@ -757,7 +825,46 @@ impl OnDemandStorage {
             let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
             let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
             
-            // Get the body bytes (after 32-byte RG header), decompressing if needed
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let del_vec_len = (rg_rows + 7) / 8;
+
+            // RCIX FAST PATH: uncompressed + RCIX available → jump directly to each column
+            // Eliminates sequential skip of unneeded columns (O(1) per column seek).
+            let rcix = footer.col_offsets.get(rg_i).filter(|v| !v.is_empty());
+            if compress_flag == RG_COMPRESS_NONE && encoding_version >= 1 && rcix.is_some() {
+                let body = &rg_bytes[32..];
+                let rg_col_offsets = rcix.unwrap();
+
+                // Deletion vector starts after IDs
+                let del_start = rg_rows * 8;
+                if del_start + del_vec_len <= body.len() {
+                    all_del_bytes.extend_from_slice(&body[del_start..del_start + del_vec_len]);
+                }
+
+                // Read only requested columns using RCIX offsets
+                for (&col_idx, &out_pos) in &col_idx_to_out {
+                    if col_idx >= rg_col_offsets.len() { continue; }
+                    let col_start = rg_col_offsets[col_idx] as usize;
+                    if col_start + null_bitmap_len > body.len() { continue; }
+
+                    col_null_bitmaps[out_pos]
+                        .extend_from_slice(&body[col_start..col_start + null_bitmap_len]);
+
+                    let data_start = col_start + null_bitmap_len;
+                    if data_start > body.len() { continue; }
+                    let col_type = schema.columns[col_idx].1;
+                    let (col_data, _) = read_column_encoded(&body[data_start..], col_type)?;
+                    let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                        col_data.decode_string_dict()
+                    } else {
+                        col_data
+                    };
+                    col_accumulators[out_pos].append(&col_data);
+                }
+                continue; // Skip sequential path
+            }
+
+            // SEQUENTIAL PATH: compressed or no RCIX — decompress and scan all columns
             let decompressed_buf = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
             let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_bytes[32..]);
             let mut pos: usize = 0;
@@ -766,7 +873,6 @@ impl OnDemandStorage {
             pos += rg_rows * 8;
 
             // Read deletion vector
-            let del_vec_len = (rg_rows + 7) / 8;
             if pos + del_vec_len > body.len() {
                 return Err(err_data("RG deletion vector truncated"));
             }
@@ -774,7 +880,6 @@ impl OnDemandStorage {
             pos += del_vec_len;
 
             // Parse columns — read requested, skip others
-            let null_bitmap_len = (rg_rows + 7) / 8;
             for col_idx in 0..col_count {
                 if pos + null_bitmap_len > body.len() { break; }
                 let null_bytes = &body[pos..pos + null_bitmap_len];
@@ -783,7 +888,6 @@ impl OnDemandStorage {
                 let col_type = schema.columns[col_idx].1;
 
                 if let Some(&out_pos) = col_idx_to_out.get(&col_idx) {
-                    // Accumulate null bitmap for this column
                     col_null_bitmaps[out_pos].extend_from_slice(null_bytes);
 
                     let (col_data, consumed) = if encoding_version >= 1 {
@@ -792,8 +896,6 @@ impl OnDemandStorage {
                         ColumnData::from_bytes_typed(&body[pos..], col_type)?
                     };
                     pos += consumed;
-
-                    // Decode StringDict → String
                     let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
                         col_data.decode_string_dict()
                     } else {
@@ -1920,8 +2022,141 @@ impl OnDemandStorage {
         let max_matches = limit.unwrap_or(usize::MAX);
         let mut matches: Vec<usize> = Vec::new();
         let mut global_row_offset: usize = 0;
+        // Build the memmem Finder once (precomputes Boyer-Moore table from target_bytes)
+        let memmem_finder = memchr::memmem::Finder::new(target_bytes);
 
-        for rg_meta in &footer.row_groups {
+        // ── PARALLEL FAST PATH ───────────────────────────────────────────────
+        // For no-limit StringDict scans on uncompressed+RCIX data, scan all RGs
+        // in parallel using Rayon to exploit all CPU cores simultaneously.
+        if limit.is_none() && footer.row_groups.len() > 1
+            && matches!(col_type, ColumnType::StringDict)
+        {
+            // Check whether every RG qualifies for the parallel fast path
+            let all_fast = footer.row_groups.iter().enumerate().all(|(rg_i, rg_meta)| {
+                let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+                if rg_end > mmap_ref.len() { return false; }
+                let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+                let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
+                let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
+                compress_flag == RG_COMPRESS_NONE && enc_ver >= 1
+                    && footer.col_offsets.get(rg_i).map_or(false, |v| v.len() > col_idx)
+            });
+
+            if all_fast {
+                // Cast pointer to usize (Send+Sync) — safe because mmap_guard keeps Mmap
+                // alive for the entire scope and all parallel tasks are read-only.
+                let mmap_ptr: usize = mmap_ref.as_ptr() as usize;
+                let mmap_len: usize = mmap_ref.len();
+
+                // Build per-RG scan descriptors upfront
+                struct RgDesc {
+                    rg_offset: usize, rg_data_size: usize, rg_rows: usize,
+                    global_off: usize, col_rcix: usize, has_deletes: bool,
+                }
+                let mut rg_descs: Vec<RgDesc> = Vec::with_capacity(footer.row_groups.len());
+                let mut off = 0usize;
+                for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+                    rg_descs.push(RgDesc {
+                        rg_offset: rg_meta.offset as usize,
+                        rg_data_size: rg_meta.data_size as usize,
+                        rg_rows: rg_meta.row_count as usize,
+                        global_off: off,
+                        col_rcix: footer.col_offsets[rg_i][col_idx] as usize,
+                        has_deletes: rg_meta.deletion_count > 0,
+                    });
+                    off += rg_meta.row_count as usize;
+                }
+
+                let target_len = target_bytes.len();
+                let all_rg_matches: Vec<Vec<usize>> = rg_descs.par_iter().map(|desc| {
+                    let mmap = unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len) };
+                    let rg_end = desc.rg_offset + desc.rg_data_size;
+                    if rg_end > mmap.len() || rg_end < desc.rg_offset + 32 { return vec![]; }
+                    let rg_bytes = &mmap[desc.rg_offset..rg_end];
+                    let body = &rg_bytes[32..];
+                    let rg_rows = desc.rg_rows;
+                    let null_bitmap_len = (rg_rows + 7) / 8;
+                    let del_vec_len = null_bitmap_len;
+                    let del_start = rg_rows * 8;
+
+                    let col_off = desc.col_rcix;
+                    if col_off + null_bitmap_len > body.len() { return vec![]; }
+                    let col_bytes = &body[col_off + null_bitmap_len..];
+                    if col_bytes.is_empty() { return vec![]; }
+                    let encoding = col_bytes[0];
+                    if encoding != COL_ENCODING_PLAIN { return vec![]; }
+                    let data = &col_bytes[1..];
+                    if data.len() < 16 { return vec![]; }
+
+                    let row_count = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0;8])) as usize;
+                    let dict_size = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0;8])) as usize;
+                    if dict_size == 0 { return vec![]; }
+                    let indices_start = 16usize;
+                    let indices_len = row_count * 4;
+                    let dict_off_start = indices_start + indices_len;
+                    let dict_offsets_len = dict_size * 4;
+                    let dict_data_len_off = dict_off_start + dict_offsets_len;
+                    if dict_data_len_off + 8 > data.len() { return vec![]; }
+                    let dict_data_len = u64::from_le_bytes(
+                        data[dict_data_len_off..dict_data_len_off+8].try_into().unwrap_or([0;8])
+                    ) as usize;
+                    let dict_data_start = dict_data_len_off + 8;
+
+                    let dict_offsets: &[u32] = unsafe {
+                        std::slice::from_raw_parts(
+                            data[dict_off_start..].as_ptr() as *const u32, dict_size)
+                    };
+                    let indices: &[u32] = unsafe {
+                        std::slice::from_raw_parts(
+                            data[indices_start..].as_ptr() as *const u32, row_count)
+                    };
+
+                    // SIMD search target in raw dict data
+                    let raw_end = (dict_data_start + dict_data_len).min(data.len());
+                    let raw_dict = &data[dict_data_start..raw_end];
+                    let finder = memchr::memmem::Finder::new(target_bytes);
+                    let mut target_dict_idx: Option<u32> = None;
+                    let mut search_from = 0usize;
+                    while let Some(rel) = finder.find(&raw_dict[search_from..]) {
+                        let abs = search_from + rel;
+                        if let Ok(di) = dict_offsets.binary_search(&(abs as u32)) {
+                            let de = if di + 1 < dict_size { dict_offsets[di+1] as usize } else { dict_data_len };
+                            if de - abs == target_len {
+                                target_dict_idx = Some((di + 1) as u32);
+                                break;
+                            }
+                        }
+                        search_from += rel + 1;
+                        if search_from >= raw_dict.len() { break; }
+                    }
+
+                    let Some(tdi) = target_dict_idx else { return vec![]; };
+
+                    let n = row_count.min(rg_rows);
+                    let mut local: Vec<usize> = Vec::new();
+                    if !desc.has_deletes {
+                        for i in 0..n {
+                            if indices[i] == tdi { local.push(desc.global_off + i); }
+                        }
+                    } else {
+                        if del_start + del_vec_len > body.len() { return local; }
+                        let del_bytes = &body[del_start..del_start + del_vec_len];
+                        for i in 0..n {
+                            if (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if indices[i] == tdi { local.push(desc.global_off + i); }
+                        }
+                    }
+                    local
+                }).collect();
+
+                // Merge results in RG order (already ordered since RGs are enumerated in order)
+                matches = all_rg_matches.into_iter().flatten().collect();
+                return Ok(Some(matches));
+            }
+        }
+        // ── END PARALLEL FAST PATH ───────────────────────────────────────────
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
             if matches.len() >= max_matches { break; }
             let rg_rows = rg_meta.row_count as usize;
             if rg_rows == 0 { global_row_offset += rg_rows; continue; }
@@ -1932,22 +2167,39 @@ impl OnDemandStorage {
             let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
             let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
             let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
-            let mut pos = rg_rows * 8; // skip IDs
             let del_vec_len = (rg_rows + 7) / 8;
-            if pos + del_vec_len > body.len() { return Err(err_data("RG del vec truncated")); }
-            let del_bytes = &body[pos..pos + del_vec_len];
+            let del_start = rg_rows * 8;
+            if del_start + del_vec_len > body.len() { return Err(err_data("RG del vec truncated")); }
+            let del_bytes = &body[del_start..del_start + del_vec_len];
             let has_deletes = rg_meta.deletion_count > 0;
-            pos += del_vec_len;
             let null_bitmap_len = (rg_rows + 7) / 8;
 
-            for ci in 0..col_count {
-                if pos + null_bitmap_len > body.len() { break; }
-                let null_bytes = &body[pos..pos + null_bitmap_len];
-                pos += null_bitmap_len;
-                let ct = schema.columns[ci].1;
+            // Zone-map skip: if RG has a string-length zone map for this column,
+            // skip the entire RG when target_len is outside [min_len, max_len].
+            // This eliminates scanning 15/16 RGs for typical queries (e.g. 9-char target
+            // in a dataset where only RG0 has 9-char strings).
+            if let Some(zmaps) = footer.zone_maps.get(rg_i) {
+                if let Some(zm) = zmaps.iter().find(|z| z.col_idx as usize == col_idx && !z.is_float) {
+                    let tlen = target_bytes.len() as i64;
+                    if tlen < zm.min_bits || tlen > zm.max_bits {
+                        global_row_offset += rg_rows;
+                        continue;
+                    }
+                }
+            }
 
-                if ci == col_idx {
-                    let col_bytes = &body[pos..];
+            // RCIX fast path: jump directly to target column without scanning all columns
+            let rcix = if compress_flag == RG_COMPRESS_NONE && encoding_version >= 1 {
+                footer.col_offsets.get(rg_i).filter(|v| v.len() > col_idx)
+            } else { None };
+
+            if let Some(rcix) = rcix {
+                let col_off = rcix[col_idx] as usize;
+                if col_off + null_bitmap_len > body.len() { global_row_offset += rg_rows; continue; }
+                let null_bytes = &body[col_off..col_off + null_bitmap_len];
+                let ct = schema.columns[col_idx].1;
+                let col_bytes = &body[col_off + null_bitmap_len..];
+                {
                     let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
                     let encoding = if encoding_version >= 1 { col_bytes[0] } else { COL_ENCODING_PLAIN };
                     let data = &col_bytes[enc_offset..];
@@ -1968,35 +2220,32 @@ impl OnDemandStorage {
                                 };
                                 let target_len = target_bytes.len();
                                 let n = count.min(rg_rows);
-                                if !has_deletes {
-                                    // Fast path: no deletes, skip deletion check
-                                    for i in 0..n {
-                                        if matches.len() >= max_matches { break; }
-                                        let s = offsets[i] as usize;
-                                        let e = offsets[i + 1] as usize;
-                                        if e - s == target_len {
-                                            let str_start = data_start + s;
-                                            if str_start + target_len <= data.len()
-                                                && &data[str_start..str_start + target_len] == target_bytes {
-                                                matches.push(global_row_offset + i);
+                                // FAST: memmem scan raw string data + binary search boundary check
+                                // Replaces O(n) sequential scan with O(scan + k·log n) where k = rare hits
+                                let data_len_val = u64::from_le_bytes(
+                                    data[data_len_off..data_len_off+8].try_into().unwrap_or([0;8])
+                                ) as usize;
+                                let raw_end = (data_start + data_len_val).min(data.len());
+                                let raw_str = &data[data_start..raw_end];
+                                let mut search_from = 0usize;
+                                while let Some(rel) = memmem_finder.find(&raw_str[search_from..]) {
+                                    if matches.len() >= max_matches { break; }
+                                    let abs = search_from + rel;
+                                    // Binary search: find if abs is a valid string start offset
+                                    if let Ok(di) = offsets[..count].binary_search(&(abs as u32)) {
+                                        let end_off = offsets[di + 1] as usize;
+                                        if end_off - abs == target_len && di < n {
+                                            // Verify not deleted / null
+                                            let skip = if has_deletes {
+                                                (del_bytes[di / 8] >> (di % 8)) & 1 == 1
+                                            } else { false };
+                                            if !skip && (null_bytes[di / 8] >> (di % 8)) & 1 == 0 {
+                                                matches.push(global_row_offset + di);
                                             }
                                         }
                                     }
-                                } else {
-                                    for i in 0..n {
-                                        if matches.len() >= max_matches { break; }
-                                        if (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
-                                        if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
-                                        let s = offsets[i] as usize;
-                                        let e = offsets[i + 1] as usize;
-                                        if e - s == target_len {
-                                            let str_start = data_start + s;
-                                            if str_start + target_len <= data.len()
-                                                && &data[str_start..str_start + target_len] == target_bytes {
-                                                matches.push(global_row_offset + i);
-                                            }
-                                        }
-                                    }
+                                    search_from += rel + 1;
+                                    if search_from >= raw_str.len() { break; }
                                 }
                             }
                         }
@@ -2045,18 +2294,24 @@ impl OnDemandStorage {
                                     row_count,
                                 )
                             };
-                            // Find target in dictionary
+                            // Find target in dictionary using SIMD memmem + binary search boundary check
                             let target_len = target_bytes.len();
                             let mut target_dict_idx: Option<u32> = None;
-                            for di in 0..dict_size {
-                                let ds = dict_offsets[di] as usize;
-                                let de = if di + 1 < dict_size { dict_offsets[di + 1] as usize } else { dict_data_len };
-                                if de - ds == target_len && dict_data_start + de <= data.len() {
-                                    if &data[dict_data_start + ds..dict_data_start + de] == target_bytes {
+                            let raw_end = (dict_data_start + dict_data_len).min(data.len());
+                            let raw_dict = &data[dict_data_start..raw_end];
+                            let mut search_from = 0usize;
+                            while let Some(rel) = memmem_finder.find(&raw_dict[search_from..]) {
+                                let abs = search_from + rel;
+                                // Verify exact boundary: binary search for abs in dict_offsets
+                                if let Ok(di) = dict_offsets.binary_search(&(abs as u32)) {
+                                    let de = if di + 1 < dict_size { dict_offsets[di + 1] as usize } else { dict_data_len };
+                                    if de - abs == target_len {
                                         target_dict_idx = Some((di + 1) as u32);
                                         break;
                                     }
                                 }
+                                search_from += rel + 1;
+                                if search_from >= raw_dict.len() { break; }
                             }
                             if let Some(tdi) = target_dict_idx {
                                 let n = row_count.min(rg_rows);
@@ -2076,12 +2331,74 @@ impl OnDemandStorage {
                         }
                     }
                 }
-                let consumed = if encoding_version >= 1 {
-                    skip_column_encoded(&body[pos..], ct)?
-                } else {
-                    ColumnData::skip_bytes_typed(&body[pos..], ct)?
-                };
-                pos += consumed;
+            } else {
+                // Fallback: sequential pos scan for compressed or pre-RCIX row groups
+                let mut pos = del_start + del_vec_len;
+                for ci in 0..col_count {
+                    if pos + null_bitmap_len > body.len() { break; }
+                    let null_bytes = &body[pos..pos + null_bitmap_len];
+                    pos += null_bitmap_len;
+                    let ct = schema.columns[ci].1;
+                    if ci == col_idx {
+                        let col_bytes = &body[pos..];
+                        let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+                        let encoding = if encoding_version >= 1 && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                        let data = if enc_offset <= col_bytes.len() { &col_bytes[enc_offset..] } else { &[] };
+                        if encoding == COL_ENCODING_PLAIN && matches!(ct, ColumnType::String) && data.len() >= 8 {
+                            let count = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+                            let all_offsets_len = (count + 1) * 4;
+                            if 8 + all_offsets_len <= data.len() {
+                                let data_len_off = 8 + all_offsets_len;
+                                if data_len_off + 8 <= data.len() {
+                                    let data_start = data_len_off + 8;
+                                    let offsets: &[u32] = unsafe { std::slice::from_raw_parts(data[8..].as_ptr() as *const u32, count + 1) };
+                                    let tlen = target_bytes.len();
+                                    for i in 0..count.min(rg_rows) {
+                                        if matches.len() >= max_matches { break; }
+                                        if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                        let s = offsets[i] as usize; let e = offsets[i + 1] as usize;
+                                        if e - s == tlen && data_start + e <= data.len() && &data[data_start + s..data_start + e] == target_bytes {
+                                            matches.push(global_row_offset + i);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if encoding == COL_ENCODING_PLAIN && matches!(ct, ColumnType::StringDict) && data.len() >= 16 {
+                            let row_count = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+                            let dict_size = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+                            let dict_off_start = 16 + row_count * 4;
+                            let dict_data_len_off = dict_off_start + dict_size * 4;
+                            if dict_data_len_off + 8 <= data.len() {
+                                let dict_data_len = u64::from_le_bytes(data[dict_data_len_off..dict_data_len_off+8].try_into().unwrap()) as usize;
+                                let dict_data_start = dict_data_len_off + 8;
+                                let dict_offsets: &[u32] = unsafe { std::slice::from_raw_parts(data[dict_off_start..].as_ptr() as *const u32, dict_size) };
+                                let indices: &[u32] = unsafe { std::slice::from_raw_parts(data[16..].as_ptr() as *const u32, row_count) };
+                                let tlen = target_bytes.len();
+                                let mut tdi: Option<u32> = None;
+                                for di in 0..dict_size {
+                                    let ds = dict_offsets[di] as usize;
+                                    let de = if di + 1 < dict_size { dict_offsets[di + 1] as usize } else { dict_data_len };
+                                    if de - ds == tlen && dict_data_start + de <= data.len() && &data[dict_data_start + ds..dict_data_start + de] == target_bytes {
+                                        tdi = Some((di + 1) as u32); break;
+                                    }
+                                }
+                                if let Some(tdi) = tdi {
+                                    for i in 0..row_count.min(rg_rows) {
+                                        if matches.len() >= max_matches { break; }
+                                        if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                        if indices[i] == tdi { matches.push(global_row_offset + i); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let consumed = if encoding_version >= 1 {
+                        skip_column_encoded(&body[pos..], ct)?
+                    } else {
+                        ColumnData::skip_bytes_typed(&body[pos..], ct)?
+                    };
+                    pos += consumed;
+                }
             }
             global_row_offset += rg_rows;
         }
@@ -2118,10 +2435,23 @@ impl OnDemandStorage {
         let mut matches: Vec<usize> = Vec::new();
         let mut global_row_offset: usize = 0;
 
-        for rg_meta in &footer.row_groups {
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
             if matches.len() >= max_matches { break; }
             let rg_rows = rg_meta.row_count as usize;
             if rg_rows == 0 { global_row_offset += rg_rows; continue; }
+
+            // Zone map pruning: skip RG if filter range can't overlap
+            if rg_i < footer.zone_maps.len() {
+                if let Some(zm) = footer.zone_maps[rg_i].iter().find(|z| z.col_idx as usize == col_idx) {
+                    let skip = if zm.is_float {
+                        !zm.may_overlap_float_range(low, high)
+                    } else {
+                        !zm.may_overlap_int_range(low.ceil() as i64, high.floor() as i64)
+                    };
+                    if skip { global_row_offset += rg_rows; continue; }
+                }
+            }
+
             let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
             if rg_end > mmap_ref.len() { return Err(err_data("RG extends past EOF")); }
             let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
@@ -2129,14 +2459,55 @@ impl OnDemandStorage {
             let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
             let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
             let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
-            let mut pos = rg_rows * 8;
             let del_vec_len = (rg_rows + 7) / 8;
-            if pos + del_vec_len > body.len() { return Err(err_data("RG del vec truncated")); }
-            let del_bytes = &body[pos..pos + del_vec_len];
+            let id_section = rg_rows * 8;
+            if id_section + del_vec_len > body.len() { return Err(err_data("RG del vec truncated")); }
+            let del_bytes = &body[id_section..id_section + del_vec_len];
             let has_deletes = rg_meta.deletion_count > 0;
-            pos += del_vec_len;
             let null_bitmap_len = (rg_rows + 7) / 8;
 
+            // RCIX fast path: jump directly to target column offset
+            let rcix_available = rg_i < footer.col_offsets.len()
+                && col_idx < footer.col_offsets[rg_i].len()
+                && compress_flag == RG_COMPRESS_NONE;
+            if rcix_available {
+                let col_body_off = footer.col_offsets[rg_i][col_idx] as usize;
+                if col_body_off + null_bitmap_len > body.len() { global_row_offset += rg_rows; continue; }
+                let null_bytes = &body[col_body_off..col_body_off + null_bitmap_len];
+                let data_start = col_body_off + null_bitmap_len;
+                let col_bytes = &body[data_start..];
+                let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+                let encoding = if encoding_version >= 1 && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                if encoding == COL_ENCODING_PLAIN && col_bytes.len() > enc_offset + 8 {
+                    let payload = &col_bytes[enc_offset..];
+                    let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                    let n = count.min(rg_rows).min((payload.len() - 8) / 8);
+                    if is_int {
+                        let low_i = low.ceil() as i64;
+                        let high_i = high.floor() as i64;
+                        let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const i64, n) };
+                        for i in 0..n {
+                            if matches.len() >= max_matches { break; }
+                            if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if vals[i] >= low_i && vals[i] <= high_i { matches.push(global_row_offset + i); }
+                        }
+                    } else {
+                        let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const f64, n) };
+                        for i in 0..n {
+                            if matches.len() >= max_matches { break; }
+                            if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if vals[i] >= low && vals[i] <= high { matches.push(global_row_offset + i); }
+                        }
+                    }
+                    global_row_offset += rg_rows;
+                    continue;
+                }
+            }
+
+            // Fallback: sequential column scan (compressed or no RCIX)
+            let mut pos = id_section + del_vec_len;
             for ci in 0..col_count {
                 if pos + null_bitmap_len > body.len() { break; }
                 let null_bytes = &body[pos..pos + null_bitmap_len];
@@ -2236,6 +2607,191 @@ impl OnDemandStorage {
         drop(mmap_guard);
         drop(file_guard);
         Ok(Some(matches))
+    }
+
+    /// Direct mmap top-K scan: finds top-k row indices by a numeric column without materializing
+    /// the full Arrow array. Uses RCIX + zone maps for O(N_rows) with O(k) heap in L1 cache.
+    /// Returns Vec<(global_row_idx, value)> sorted in the requested order.
+    pub fn scan_top_k_indices_mmap(
+        &self,
+        col_name: &str,
+        k: usize,
+        descending: bool,
+    ) -> io::Result<Option<Vec<(usize, f64)>>> {
+        if k == 0 { return Ok(Some(vec![])); }
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let col_type = schema.columns[col_idx].1;
+        let is_int = matches!(col_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 |
+            ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 |
+            ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date);
+        let is_float = matches!(col_type, ColumnType::Float64 | ColumnType::Float32);
+        if !is_int && !is_float { return Ok(None); }
+
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for top-k scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        // heap: sorted Vec<(value, global_idx)>; descending → keep k largest
+        let mut heap: Vec<(f64, usize)> = Vec::with_capacity(k + 1);
+        let mut global_offset: usize = 0;
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 { global_offset += rg_rows; continue; }
+
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() { return Err(err_data("RG extends past EOF")); }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let id_section = rg_rows * 8;
+            let del_vec_len = (rg_rows + 7) / 8;
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let has_deletes = rg_meta.deletion_count > 0;
+            let del_bytes = if id_section + del_vec_len <= body.len() {
+                &body[id_section..id_section + del_vec_len]
+            } else { &[] };
+
+            // Get pointer to column data via RCIX if available
+            let col_bytes: &[u8] = if rg_i < footer.col_offsets.len()
+                && col_idx < footer.col_offsets[rg_i].len()
+                && compress_flag == RG_COMPRESS_NONE
+            {
+                let col_body_off = footer.col_offsets[rg_i][col_idx] as usize;
+                let data_start = col_body_off + null_bitmap_len;
+                if data_start > body.len() { global_offset += rg_rows; continue; }
+                &body[data_start..]
+            } else {
+                // Fallback: sequential column scan
+                let mut pos = id_section + del_vec_len;
+                let mut found: &[u8] = &[];
+                for ci in 0..schema.column_count() {
+                    if pos + null_bitmap_len > body.len() { break; }
+                    pos += null_bitmap_len;
+                    if ci == col_idx { found = &body[pos..]; break; }
+                    let consumed = if encoding_version >= 1 {
+                        skip_column_encoded(&body[pos..], schema.columns[ci].1)?
+                    } else {
+                        ColumnData::skip_bytes_typed(&body[pos..], schema.columns[ci].1)?
+                    };
+                    pos += consumed;
+                }
+                found
+            };
+
+            if col_bytes.is_empty() { global_offset += rg_rows; continue; }
+
+            let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+            let encoding = if encoding_version >= 1 && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+
+            if encoding == COL_ENCODING_PLAIN && col_bytes.len() > enc_offset + 8 {
+                let payload = &col_bytes[enc_offset..];
+                let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                let n = count.min(rg_rows).min((payload.len() - 8) / 8);
+
+                macro_rules! topk_scan {
+                    ($vals:expr) => {{
+                        if descending {
+                            // Keep k largest: heap sorted descending, threshold = heap[k-1]
+                            for i in 0..n {
+                                if has_deletes && !del_bytes.is_empty() && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                let val = $vals[i];
+                                if heap.len() < k {
+                                    let pos = heap.partition_point(|(v, _)| *v > val);
+                                    heap.insert(pos, (val, global_offset + i));
+                                } else if val > heap[k - 1].0 {
+                                    let pos = heap.partition_point(|(v, _)| *v > val);
+                                    heap.insert(pos, (val, global_offset + i));
+                                    heap.pop();
+                                }
+                            }
+                        } else {
+                            // Keep k smallest: heap sorted ascending, threshold = heap[k-1]
+                            for i in 0..n {
+                                if has_deletes && !del_bytes.is_empty() && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                let val = $vals[i];
+                                if heap.len() < k {
+                                    let pos = heap.partition_point(|(v, _)| *v < val);
+                                    heap.insert(pos, (val, global_offset + i));
+                                } else if val < heap[k - 1].0 {
+                                    let pos = heap.partition_point(|(v, _)| *v < val);
+                                    heap.insert(pos, (val, global_offset + i));
+                                    heap.pop();
+                                }
+                            }
+                        }
+                    }};
+                }
+
+                if is_float {
+                    let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const f64, n) };
+                    topk_scan!(vals);
+                } else {
+                    let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const i64, n) };
+                    let fvals: Vec<f64> = vals.iter().map(|&v| v as f64).collect();
+                    topk_scan!(fvals);
+                }
+            } else {
+                // Non-PLAIN: decode and scan
+                let (col_data, _) = if encoding_version >= 1 {
+                    read_column_encoded(col_bytes, col_type)?
+                } else {
+                    ColumnData::from_bytes_typed(col_bytes, col_type)?
+                };
+                let fvals: Vec<f64> = match &col_data {
+                    ColumnData::Float64(v) => v.iter().map(|&x| x).collect(),
+                    ColumnData::Int64(v) => v.iter().map(|&x| x as f64).collect(),
+                    _ => { global_offset += rg_rows; continue; }
+                };
+                let n = fvals.len().min(rg_rows);
+                macro_rules! topk_scan2 {
+                    ($vals:expr) => {{
+                        if descending {
+                            for i in 0..n {
+                                if has_deletes && !del_bytes.is_empty() && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                let val = $vals[i];
+                                if heap.len() < k {
+                                    let pos = heap.partition_point(|(v, _)| *v > val);
+                                    heap.insert(pos, (val, global_offset + i));
+                                } else if val > heap[k - 1].0 {
+                                    let pos = heap.partition_point(|(v, _)| *v > val);
+                                    heap.insert(pos, (val, global_offset + i));
+                                    heap.pop();
+                                }
+                            }
+                        } else {
+                            for i in 0..n {
+                                if has_deletes && !del_bytes.is_empty() && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                let val = $vals[i];
+                                if heap.len() < k {
+                                    let pos = heap.partition_point(|(v, _)| *v < val);
+                                    heap.insert(pos, (val, global_offset + i));
+                                } else if val < heap[k - 1].0 {
+                                    let pos = heap.partition_point(|(v, _)| *v < val);
+                                    heap.insert(pos, (val, global_offset + i));
+                                    heap.pop();
+                                }
+                            }
+                        }
+                    }};
+                }
+                topk_scan2!(fvals);
+            }
+            global_offset += rg_rows;
+        }
+        Ok(Some(heap.into_iter().map(|(v, i)| (i, v)).collect()))
     }
 
     /// Compute numeric column aggregates directly from mmap without Arrow arrays.
@@ -2443,7 +2999,7 @@ impl OnDemandStorage {
             let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
             let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
             let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
-            let mut pos = 0usize;
+            let null_bitmap_len = (rg_rows + 7) / 8;
 
             // Extract IDs for target rows
             if rg_rows * 8 <= body.len() {
@@ -2454,19 +3010,28 @@ impl OnDemandStorage {
                     }
                 }
             }
-            pos += rg_rows * 8;
 
-            // Skip deletion vector
-            let del_vec_len = (rg_rows + 7) / 8;
-            pos += del_vec_len;
-            let null_bitmap_len = (rg_rows + 7) / 8;
+            // Use RCIX if available for O(1) per-column access (skip sequential pos scan)
+            let rcix = if compress_flag == RG_COMPRESS_NONE && encoding_version >= 1
+                && rg_i < footer.col_offsets.len() && footer.col_offsets[rg_i].len() >= col_count
+            { Some(&footer.col_offsets[rg_i]) } else { None };
+
+            // Fallback sequential pos (only used when RCIX not available)
+            let mut pos = rg_rows * 8 + (rg_rows + 7) / 8;
 
             for ci in 0..col_count {
-                if pos + null_bitmap_len > body.len() { break; }
-                let null_bytes = &body[pos..pos + null_bitmap_len];
-                pos += null_bitmap_len;
                 let ct = schema.columns[ci].1;
-                let col_bytes = &body[pos..];
+                let (null_bytes, col_bytes) = if let Some(rcix) = rcix {
+                    let col_off = rcix[ci] as usize;
+                    if col_off + null_bitmap_len > body.len() { continue; }
+                    (&body[col_off..col_off + null_bitmap_len], &body[col_off + null_bitmap_len..])
+                } else {
+                    if pos + null_bitmap_len > body.len() { break; }
+                    let nb = &body[pos..pos + null_bitmap_len];
+                    pos += null_bitmap_len;
+                    (nb, &body[pos..])
+                };
+                let col_bytes = col_bytes;
                 let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
                 let encoding = if encoding_version >= 1 && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
                 let data_bytes = if enc_offset <= col_bytes.len() { &col_bytes[enc_offset..] } else { &[] as &[u8] };
@@ -2557,6 +3122,17 @@ impl OnDemandStorage {
                             true
                         } else { false }
                     }
+                    (2u8 /* COL_ENCODING_BITPACK */, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 |
+                     ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 |
+                     ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date) => {
+                        for &(out_idx, local_idx) in local_pairs {
+                            if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                            if let Some(v) = crate::storage::on_demand::bitpack_decode_at_idx(data_bytes, local_idx) {
+                                out_cols[ci][out_idx] = Some(crate::data::Value::Int64(v));
+                            }
+                        }
+                        true
+                    }
                     (COL_ENCODING_PLAIN, ColumnType::Bool) if data_bytes.len() >= 8 => {
                         for &(out_idx, local_idx) in local_pairs {
                             if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
@@ -2615,13 +3191,15 @@ impl OnDemandStorage {
                     }
                 }
 
-                // Advance pos past this column
-                let consumed = if encoding_version >= 1 {
-                    skip_column_encoded(&body[pos..], ct)?
-                } else {
-                    ColumnData::skip_bytes_typed(&body[pos..], ct)?
-                };
-                pos += consumed;
+                // Advance pos past this column (only needed for fallback sequential path)
+                if rcix.is_none() {
+                    let consumed = if encoding_version >= 1 {
+                        skip_column_encoded(&body[pos..], ct)?
+                    } else {
+                        ColumnData::skip_bytes_typed(&body[pos..], ct)?
+                    };
+                    pos += consumed;
+                }
             }
         }
 

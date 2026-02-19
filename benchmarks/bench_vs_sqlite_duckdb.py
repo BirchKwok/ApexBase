@@ -111,6 +111,31 @@ def run_bench(fn, warmup=2, iterations=5):
     return sum(times) / len(times)
 
 
+def run_bench_cold(setup_fn, bench_fn, warmup=2, iterations=5):
+    """Cold-start benchmark: re-run setup_fn() before EVERY iteration.
+    Measures true from-scratch query latency (no warm caches)."""
+    for _ in range(warmup):
+        setup_fn()
+        bench_fn()
+    times = []
+    for _ in range(iterations):
+        setup_fn()   # cold restart — invalidates all in-process caches
+        gc.collect()
+        with timer() as t:
+            bench_fn()
+        times.append(t["elapsed_ms"])
+    return sum(times) / len(times)
+
+
+def measure_rss_mb():
+    """Return current process RSS in MB (requires psutil)."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # SQLite benchmark
 # ---------------------------------------------------------------------------
@@ -324,17 +349,25 @@ class DuckDBBench:
 # ---------------------------------------------------------------------------
 
 class ApexBaseBench:
-    def __init__(self, tmpdir, data):
+    def __init__(self, tmpdir, data, low_memory=False):
         self.db_dir = os.path.join(tmpdir, "apex_bench")
         self.data = data
         self.n = len(data["name"])
         self.client = None
+        self.low_memory = low_memory
 
     def setup(self):
         if os.path.exists(self.db_dir):
             shutil.rmtree(self.db_dir)
         self.client = ApexClient(self.db_dir, drop_if_exists=True)
         self.client.create_table('default')
+
+    def cold_start_setup(self):
+        """Close and reopen client — clears all Python/Rust-side caches (arrow_batch_cache etc.)."""
+        if self.client:
+            self.client.close()
+        self.client = ApexClient(self.db_dir)
+        self.client.use_table('default')
 
     def bench_insert(self):
         self.client.store(self.data)
@@ -405,20 +438,22 @@ class ApexBaseBench:
 # Main
 # ---------------------------------------------------------------------------
 
+# (display_name, method_name, is_write, is_cold_start)
+# is_cold_start=True -> cold_start_setup() called before every timed iteration
 BENCHMARKS = [
-    ("Bulk Insert (N rows)", "bench_insert", True),
-    ("COUNT(*)", "bench_count", False),
-    ("SELECT * LIMIT 100", "bench_select_limit", False),
-    ("SELECT * LIMIT 10K", "bench_select_limit_10k", False),
-    ("Filter (name = 'user_5000')", "bench_filter_string", False),
-    ("Filter (age BETWEEN 25 AND 35)", "bench_filter_range", False),
-    ("GROUP BY city (10 groups)", "bench_group_by", False),
-    ("GROUP BY + HAVING", "bench_group_by_having", False),
-    ("ORDER BY score LIMIT 100", "bench_order_limit", False),
-    ("Aggregation (5 funcs)", "bench_aggregation", False),
-    ("Complex (Filter+Group+Order)", "bench_complex", False),
-    ("Point Lookup (by ID)", "bench_point_lookup", False),
-    ("Insert 1K rows", "bench_insert_1k", False),
+    ("Bulk Insert (N rows)",          "bench_insert",           True,  False),
+    ("COUNT(*)",                       "bench_count",            False, False),
+    ("SELECT * LIMIT 100 [cold]",      "bench_select_limit",     False, True),
+    ("SELECT * LIMIT 10K [cold]",      "bench_select_limit_10k", False, True),
+    ("Filter (name = 'user_5000')",    "bench_filter_string",    False, False),
+    ("Filter (age BETWEEN 25 AND 35)", "bench_filter_range",     False, False),
+    ("GROUP BY city (10 groups)",      "bench_group_by",         False, False),
+    ("GROUP BY + HAVING",              "bench_group_by_having",  False, False),
+    ("ORDER BY score LIMIT 100",       "bench_order_limit",      False, False),
+    ("Aggregation (5 funcs)",          "bench_aggregation",      False, False),
+    ("Complex (Filter+Group+Order)",   "bench_complex",          False, False),
+    ("Point Lookup (by ID)",           "bench_point_lookup",     False, False),
+    ("Insert 1K rows",                 "bench_insert_1k",        False, False),
 ]
 
 
@@ -457,6 +492,9 @@ def main():
     parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations (default: 2)")
     parser.add_argument("--iterations", type=int, default=5, help="Timed iterations (default: 5)")
     parser.add_argument("--output", type=str, default=None, help="JSON output file")
+    parser.add_argument("--memory", action="store_true", help="Track RSS memory delta per query")
+    parser.add_argument("--low-memory", action="store_true",
+                        help="Disable ApexBase arrow_batch_cache (simulate low-memory mode like SQLite/DuckDB)")
     args = parser.parse_args()
 
     N = args.rows
@@ -481,6 +519,8 @@ def main():
         print(f"PyArrow: v{sys_info['pyarrow']}")
     print(f"\nDataset: {N:,} rows × 5 columns (name, age, score, city, category)")
     print(f"Warmup: {WARMUP} iterations, Timed: {ITERS} iterations (average)")
+    if args.low_memory:
+        print("Mode: LOW-MEMORY (ApexBase arrow_batch_cache disabled)")
     print()
 
     # Generate data
@@ -493,7 +533,7 @@ def main():
 
     engines = []
     if HAS_APEXBASE:
-        engines.append(("ApexBase", ApexBaseBench(tmpdir, data)))
+        engines.append(("ApexBase", ApexBaseBench(tmpdir, data, low_memory=args.low_memory)))
     engines.append(("SQLite", SQLiteBench(tmpdir, data)))
     if HAS_DUCKDB:
         engines.append(("DuckDB", DuckDBBench(tmpdir, data)))
@@ -506,9 +546,12 @@ def main():
     for name, bench in engines:
         bench.setup()
 
+    mem_results = {}  # eng_name -> {bench_name -> rss_delta_mb}
+
     # Run benchmarks
-    for bench_name, method_name, is_insert in BENCHMARKS:
+    for bench_name, method_name, is_insert, is_cold in BENCHMARKS:
         results[bench_name] = {}
+        mem_results.setdefault(bench_name, {})
         for eng_name, bench in engines:
             fn = getattr(bench, method_name, None)
             if fn is None:
@@ -516,14 +559,40 @@ def main():
                 continue
 
             if is_insert:
-                # Insert is special: setup fresh each time
+                rss_before = measure_rss_mb()
                 with timer() as t:
                     fn()
                 ms = t["elapsed_ms"]
+                rss_after = measure_rss_mb()
+                results[bench_name][eng_name] = ms
+                if rss_before and rss_after:
+                    mem_results[bench_name][eng_name] = rss_after - rss_before
+            elif is_cold:
+                # Cold-start: reopen DB before each iteration
+                setup_fn = getattr(bench, "cold_start_setup", None)
+                if setup_fn is None:
+                    ms = run_bench(fn, warmup=WARMUP, iterations=ITERS)
+                else:
+                    rss_before = measure_rss_mb()
+                    ms = run_bench_cold(setup_fn, fn, warmup=WARMUP, iterations=ITERS)
+                    rss_after = measure_rss_mb()
+                    if rss_before and rss_after:
+                        mem_results[bench_name][eng_name] = rss_after - rss_before
                 results[bench_name][eng_name] = ms
             else:
-                ms = run_bench(fn, warmup=WARMUP, iterations=ITERS)
+                rss_before = measure_rss_mb()
+                # low_memory mode: disable arrow_batch_cache for ApexBase by reopening each iter
+                setup_fn = getattr(bench, "cold_start_setup", None)
+                use_cold = (HAS_APEXBASE and isinstance(bench, ApexBaseBench)
+                            and bench.low_memory and setup_fn is not None)
+                if use_cold:
+                    ms = run_bench_cold(setup_fn, fn, warmup=WARMUP, iterations=ITERS)
+                else:
+                    ms = run_bench(fn, warmup=WARMUP, iterations=ITERS)
+                rss_after = measure_rss_mb()
                 results[bench_name][eng_name] = ms
+                if rss_before and rss_after:
+                    mem_results[bench_name][eng_name] = rss_after - rss_before
 
     # Cleanup
     for name, bench in engines:
@@ -534,7 +603,7 @@ def main():
     col_width = 16
 
     print()
-    header = f"{'Query':<40}"
+    header = f"{'Query':<42}"
     for name in eng_names:
         header += f" | {name:>{col_width}}"
     if len(eng_names) >= 2:
@@ -543,8 +612,8 @@ def main():
     print("-" * len(header))
 
     json_results = []
-    for bench_name, method_name, is_insert in BENCHMARKS:
-        row = f"{bench_name:<40}"
+    for bench_name, method_name, is_insert, is_cold in BENCHMARKS:
+        row = f"{bench_name:<42}"
         values = {}
         for eng_name in eng_names:
             ms = results.get(bench_name, {}).get(eng_name)
@@ -575,12 +644,31 @@ def main():
 
     print()
 
+    # Memory summary (if tracking enabled)
+    if args.memory:
+        print()
+        print("Memory delta per query (RSS change, MB):")
+        mem_header = f"  {'Query':<42}"
+        for name in eng_names:
+            mem_header += f" | {name:>{col_width}}"
+        print(mem_header)
+        print("  " + "-" * (len(mem_header) - 2))
+        for bench_name, _, _, _ in BENCHMARKS:
+            row = f"  {bench_name:<42}"
+            for eng_name in eng_names:
+                delta = mem_results.get(bench_name, {}).get(eng_name)
+                if delta is not None:
+                    row += f" | {delta:>+{col_width}.1f}"
+                else:
+                    row += f" | {'N/A':>{col_width}}"
+            print(row)
+
     # Summary
     if "ApexBase" in [n for n, _ in engines]:
         wins = 0
         ties = 0
         total = 0
-        for bench_name, _, _ in BENCHMARKS:
+        for bench_name, _, _, _ in BENCHMARKS:
             vals = results.get(bench_name, {})
             apex_ms = vals.get("ApexBase")
             if apex_ms is None:
