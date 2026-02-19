@@ -14,6 +14,8 @@ pub mod txn;
 pub mod scaling;
 #[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "flight")]
+pub mod flight;
 
 // Re-export main types
 pub use storage::{ColumnarStorage, ColumnType, ColumnValue, FileSchema};
@@ -32,6 +34,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     #[cfg(feature = "server")]
     m.add_function(pyo3::wrap_pyfunction!(python::start_pg_server, m)?)?;
+    #[cfg(feature = "flight")]
+    m.add_function(pyo3::wrap_pyfunction!(python::start_flight_server, m)?)?;
     Ok(())
 }
 

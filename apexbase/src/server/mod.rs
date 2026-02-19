@@ -86,6 +86,7 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
             result = listener.accept() => {
                 match result {
                     Ok(incoming) => {
+                        let _ = incoming.0.set_nodelay(true);
                         let factory_ref = factory.clone();
                         tokio::spawn(async move {
                             if let Err(e) = process_socket(incoming.0, None, factory_ref).await {

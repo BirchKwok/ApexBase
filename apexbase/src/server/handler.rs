@@ -2,9 +2,12 @@
 //!
 //! Bridges pgwire's SimpleQueryHandler to ApexBase's ApexExecutor.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use async_trait::async_trait;
 use futures::stream;
@@ -35,7 +38,7 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use crate::query::{ApexExecutor, ApexResult};
 use super::pg_catalog;
-use super::types::schema_to_field_info;
+use super::types::{schema_to_field_info, schema_to_field_info_binary};
 
 /// Client metadata key for tracking current database per connection
 const METADATA_KEY_DB: &str = "apex_current_db";
@@ -44,11 +47,31 @@ const METADATA_KEY_DB: &str = "apex_current_db";
 pub struct ApexBaseHandler {
     /// Root directory containing .apex database files and named-database subdirs
     base_dir: PathBuf,
+    /// Schema cache: SQL template → Arc<Vec<FieldInfo>>.
+    /// Avoids re-executing queries in do_describe_statement just to get column schema.
+    schema_cache: RwLock<HashMap<String, Arc<Vec<FieldInfo>>>>,
 }
 
 impl ApexBaseHandler {
     pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        Self {
+            base_dir,
+            schema_cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Look up cached schema for a SQL string.
+    fn cached_schema(&self, sql: &str) -> Option<Arc<Vec<FieldInfo>>> {
+        self.schema_cache.read().get(sql).cloned()
+    }
+
+    /// Store schema in cache after successful execution.
+    fn cache_schema(&self, sql: &str, fields: Arc<Vec<FieldInfo>>) {
+        let mut cache = self.schema_cache.write();
+        if cache.len() > 512 {
+            cache.clear();
+        }
+        cache.insert(sql.to_string(), fields);
     }
 
     /// Compute effective base_dir for a given database name.
@@ -103,15 +126,19 @@ impl ApexBaseHandler {
             .unwrap_or_else(|| "default".to_string())
     }
 
-    /// Encode a RecordBatch row data into Vec of encoded rows
+    /// Encode a RecordBatch into a Vec of encoded DataRows.
+    /// Columns are extracted once outside the row loop to avoid repeated Arc deref.
     fn encode_batch_rows(batch: &RecordBatch, field_infos: &Arc<Vec<FieldInfo>>) -> PgWireResult<Vec<PgWireResult<pgwire::messages::data::DataRow>>> {
-        let mut rows = Vec::with_capacity(batch.num_rows());
+        let num_rows = batch.num_rows();
         let num_cols = batch.num_columns();
+        let mut rows = Vec::with_capacity(num_rows);
 
-        for row_idx in 0..batch.num_rows() {
+        // Pre-extract all column refs once — avoids repeated batch.column() + Arc clone per row
+        let cols: Vec<&ArrayRef> = (0..num_cols).map(|i| batch.column(i)).collect();
+
+        for row_idx in 0..num_rows {
             let mut encoder = DataRowEncoder::new(field_infos.clone());
-            for col_idx in 0..num_cols {
-                let col = batch.column(col_idx);
+            for col in &cols {
                 encode_arrow_value(&mut encoder, col, row_idx)?;
             }
             rows.push(encoder.finish());
@@ -258,8 +285,8 @@ impl SimpleQueryHandler for ApexBaseHandler {
                         responses.push(Response::Execution(tag));
                     } else {
                         let schema = batch.schema();
-                        let field_infos: Vec<FieldInfo> = schema_to_field_info(&schema);
-                        let field_infos = Arc::new(field_infos);
+                        let field_infos: Arc<Vec<FieldInfo>> = Arc::new(schema_to_field_info(&schema));
+                        self.cache_schema(sql, field_infos.clone());
 
                         let rows = Self::encode_batch_rows(&batch, &field_infos)?;
                         let data_row_stream = stream::iter(rows);
@@ -331,6 +358,11 @@ impl ExtendedQueryHandler for ApexBaseHandler {
             return Ok(DescribeStatementResponse::new(param_types, vec![]));
         }
 
+        // Check schema cache first — avoids executing the query a second time just for schema
+        if let Some(cached) = self.cached_schema(sql) {
+            return Ok(DescribeStatementResponse::new(param_types, (*cached).clone()));
+        }
+
         // Substitute dummy NULLs for parameters to discover result schema
         let dummy_params: Vec<Option<Bytes>> = vec![None; param_count];
         let eval_sql = substitute_parameters(
@@ -345,6 +377,8 @@ impl ExtendedQueryHandler for ApexBaseHandler {
         match self.execute_query_with_db(&eval_sql, &current_db) {
             Ok(batch) => {
                 let fields = schema_to_field_info(&batch.schema());
+                let fields_arc = Arc::new(fields.clone());
+                self.cache_schema(sql, fields_arc);
                 Ok(DescribeStatementResponse::new(param_types, fields))
             }
             Err(_) => Ok(DescribeStatementResponse::new(param_types, vec![])),
@@ -375,10 +409,17 @@ impl ExtendedQueryHandler for ApexBaseHandler {
         )
         .unwrap_or_else(|_| sql.clone());
 
+        // Check schema cache first (keyed by SQL template, not bound eval_sql)
+        if let Some(cached) = self.cached_schema(sql) {
+            return Ok(DescribePortalResponse::new((*cached).clone()));
+        }
+
         let current_db = Self::current_db_from_metadata(client);
         match self.execute_query_with_db(&eval_sql, &current_db) {
             Ok(batch) => {
                 let fields = schema_to_field_info(&batch.schema());
+                let fields_arc = Arc::new(fields.clone());
+                self.cache_schema(sql, fields_arc);
                 Ok(DescribePortalResponse::new(fields))
             }
             Err(_) => Ok(DescribePortalResponse::new(vec![])),
@@ -415,6 +456,8 @@ impl ExtendedQueryHandler for ApexBaseHandler {
         log::debug!("Extended query (substituted): {}", sql);
 
         let current_db = Self::current_db_from_metadata(_client);
+        // Check if client requested binary result format
+        let want_binary = matches!(portal.result_column_format, Format::UnifiedBinary);
         match self.execute_query_with_db(sql, &current_db) {
             Ok(batch) => {
                 if Self::is_write_op(sql) {
@@ -422,8 +465,15 @@ impl ExtendedQueryHandler for ApexBaseHandler {
                     Ok(Response::Execution(tag))
                 } else {
                     let schema = batch.schema();
-                    let field_infos: Vec<FieldInfo> = schema_to_field_info(&schema);
-                    let field_infos = Arc::new(field_infos);
+                    let field_infos: Arc<Vec<FieldInfo>> = Arc::new(if want_binary {
+                        schema_to_field_info_binary(&schema)
+                    } else {
+                        schema_to_field_info(&schema)
+                    });
+                    // Cache text-format schema by raw_sql template for describe_statement reuse
+                    if !want_binary {
+                        self.cache_schema(raw_sql, field_infos.clone());
+                    }
 
                     let rows = Self::encode_batch_rows(&batch, &field_infos)?;
                     let data_row_stream = stream::iter(rows);

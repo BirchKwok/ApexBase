@@ -23,20 +23,23 @@ pub fn arrow_to_pg_type(dt: &ArrowDataType) -> Type {
     }
 }
 
-/// Build a list of FieldInfo from an Arrow Schema
+/// Build a list of FieldInfo from an Arrow Schema (text format, default for Simple Query)
 pub fn schema_to_field_info(schema: &arrow::datatypes::Schema) -> Vec<FieldInfo> {
+    schema_to_field_info_fmt(schema, FieldFormat::Text)
+}
+
+/// Build a list of FieldInfo from an Arrow Schema with explicit format per field.
+pub fn schema_to_field_info_binary(schema: &arrow::datatypes::Schema) -> Vec<FieldInfo> {
+    schema_to_field_info_fmt(schema, FieldFormat::Binary)
+}
+
+fn schema_to_field_info_fmt(schema: &arrow::datatypes::Schema, fmt: FieldFormat) -> Vec<FieldInfo> {
     schema
         .fields()
         .iter()
         .map(|field| {
             let pg_type = arrow_to_pg_type(field.data_type());
-            FieldInfo::new(
-                field.name().clone(),
-                None,
-                None,
-                pg_type,
-                FieldFormat::Text,
-            )
+            FieldInfo::new(field.name().clone(), None, None, pg_type, fmt)
         })
         .collect()
 }

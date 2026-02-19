@@ -38,12 +38,14 @@ dev = ["pytest>=7.0.0", "maturin>=1.4.0"]
 
 [project.scripts]
 apexbase-server = "apexbase.server_cli:main"
+apexbase-flight = "apexbase.flight_cli:main"
+apexbase-serve  = "apexbase.serve_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/BirchKwok/ApexBase"
 Repository = "https://github.com/BirchKwok/ApexBase"
 
 [tool.maturin]
-features = ["pyo3/extension-module", "server"]
+features = ["pyo3/extension-module", "server", "flight"]
 python-source = "apexbase/python"
 module-name = "apexbase._core"
