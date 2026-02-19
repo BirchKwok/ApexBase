@@ -25,6 +25,7 @@ ApexBase is an embedded columnar database designed for **Hybrid Transactional/An
 - **Compact storage** — dictionary encoding for low-cardinality strings, LZ4 and Zstd compression
 - **Parquet interop** — COPY TO / COPY FROM Parquet files
 - **PostgreSQL wire protocol** — built-in server for DBeaver, psql, DataGrip, pgAdmin, Navicat, and any PostgreSQL-compatible client; two distribution modes (Python CLI or standalone Rust binary)
+- **Arrow Flight gRPC server** — high-performance columnar data transfer over HTTP/2; streams Arrow IPC RecordBatch directly, 4–7× faster than PG wire for large result sets; accessible via `pyarrow.flight`, Go arrow, Java arrow, and any Arrow Flight client
 - **Cross-platform** — Linux, macOS, and Windows; x86_64 and ARM64; Python 3.9 -- 3.13
 
 ---
@@ -346,6 +347,40 @@ Reproduce: `python benchmarks/bench_vs_sqlite_duckdb.py --rows 1000000`
 
 ---
 
+## Server Protocols
+
+ApexBase ships two complementary server protocols for external access:
+
+| Protocol | Port | Best for | Binary / CLI |
+|----------|------|----------|--------------|
+| **PG Wire** | 5432 | DBeaver, psql, DataGrip, BI tools | `apexbase-server` |
+| **Arrow Flight** | 50051 | Python (pyarrow), Go, Java, Spark | `apexbase-flight` |
+
+### Combined Launcher (Both Servers at Once)
+
+```bash
+# Start PG Wire + Arrow Flight simultaneously
+apexbase-serve --dir /path/to/data
+
+# Custom ports
+apexbase-serve --dir /path/to/data --pg-port 5432 --flight-port 50051
+
+# Disable one server
+apexbase-serve --dir /path/to/data --no-flight   # PG Wire only
+apexbase-serve --dir /path/to/data --no-pg       # Arrow Flight only
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dir`, `-d` | `.` | Directory containing `.apex` database files |
+| `--host` | `127.0.0.1` | Bind host for both servers |
+| `--pg-port` | `5432` | PostgreSQL Wire port |
+| `--flight-port` | `50051` | Arrow Flight gRPC port |
+| `--no-pg` | — | Disable PG Wire server |
+| `--no-flight` | — | Disable Arrow Flight server |
+
+---
+
 ## PostgreSQL Wire Protocol Server
 
 ApexBase includes a built-in PostgreSQL wire protocol server, allowing you to connect using **DBeaver**, **psql**, **DataGrip**, **pgAdmin**, **Navicat**, and any other tool that supports the PostgreSQL protocol.
@@ -460,12 +495,93 @@ The server implements a `pg_catalog` compatibility layer that responds to common
 
 This enables GUI tools to browse tables, inspect columns, and display data types without modification.
 
+### Supported Protocol Features
+
+| Feature | Status |
+|---------|--------|
+| Simple Query Protocol | ✅ Fully supported |
+| Extended Query Protocol (prepared statements) | ✅ Supported — schema cached, binary format for psycopg3 |
+| Cross-database SQL (`db.table`) | ✅ Supported — `USE dbname` / `\c dbname` to switch context |
+| `pg_catalog` / `information_schema` | ✅ Compatible layer for GUI tools |
+| All ApexBase SQL (JOINs, CTEs, window functions, DDL) | ✅ Full pass-through to query engine |
+
 ### Limitations
 
-- **Extended Query Protocol** (prepared statements with binary parameters) is not yet supported; tools should use the Simple Query protocol
-- **Authentication** is not implemented — the server accepts all connections
-- **SSL/TLS** is not yet supported — use SSH tunneling for remote access if needed
-- **Single-database context** — the wire protocol server operates in the current database context; cross-database SQL (`db.table`) is not yet routed through the wire protocol
+- **Authentication** is not implemented — the server accepts all connections regardless of username/password
+- **SSL/TLS** is not supported — use an SSH tunnel (`ssh -L 5432:127.0.0.1:5432 user@host`) for remote access
+
+---
+
+## Arrow Flight gRPC Server
+
+Arrow Flight sends Arrow IPC RecordBatch directly over gRPC (HTTP/2), bypassing per-row text serialization entirely. It is **4–7× faster than PG wire for large result sets** (10K+ rows).
+
+| Query | PG Wire | Arrow Flight | Speedup |
+|-------|---------|--------------|--------|
+| SELECT 10K rows | 5.1ms | 0.7ms | **7× faster** |
+| BETWEEN (~33K rows) | 22ms | 5.6ms | **4× faster** |
+| Single row / point lookup | ~7.5ms | ~7.9ms | equal |
+
+### Starting the Flight Server
+
+**Python CLI:**
+
+```bash
+apexbase-flight --dir /path/to/data --port 50051
+```
+
+**Standalone Rust binary:**
+
+```bash
+cargo build --release --bin apexbase-flight --no-default-features --features flight
+./target/release/apexbase-flight --dir /path/to/data --port 50051
+```
+
+### Python Client
+
+```python
+import pyarrow.flight as fl
+import pandas as pd
+
+client = fl.connect("grpc://127.0.0.1:50051")
+
+# SELECT — returns Arrow Table
+table = client.do_get(fl.Ticket(b"SELECT * FROM users LIMIT 10000")).read_all()
+df = table.to_pandas()              # zero-copy to pandas
+pl_df = pl.from_arrow(table)        # zero-copy to polars
+
+# DML / DDL
+client.do_action(fl.Action("sql", b"INSERT INTO users (name, age) VALUES ('Alice', 30)"))
+client.do_action(fl.Action("sql", b"CREATE TABLE logs (event STRING, ts INT64)"))
+
+# List available actions
+for action in client.list_actions():
+    print(action.type, "—", action.description)
+```
+
+### When to Use Arrow Flight vs PG Wire
+
+| Scenario | Recommendation |
+|----------|---------------|
+| DBeaver / Tableau / BI tools | **PG Wire** (only option) |
+| Python + small queries (<100 rows) | **Native API** (fastest, in-process) |
+| Python + large queries (10K+ rows, remote) | **Arrow Flight** (4–7× faster than PG wire) |
+| Go / Java / Spark workers | **Arrow Flight** (native Arrow support) |
+| Local Python (same machine) | **Native API** (`ApexClient.execute()`) |
+
+### PyO3 Python API
+
+Both servers are also accessible as blocking Python functions (released GIL):
+
+```python
+import threading
+from apexbase._core import start_pg_server, start_flight_server
+
+t1 = threading.Thread(target=start_pg_server,     args=("/data", "0.0.0.0", 5432),  daemon=True)
+t2 = threading.Thread(target=start_flight_server, args=("/data", "0.0.0.0", 50051), daemon=True)
+t1.start()
+t2.start()
+```
 
 ---
 
@@ -496,8 +612,12 @@ Rust Core (PyO3 bindings)
   +-- TxnManager (OCC + MVCC)                    |
   +-- NanoFTS (full-text search)                  |
   +-- PG Wire Protocol Server (pgwire)             |
-      +-- DBeaver / psql / DataGrip / pgAdmin      |
-      +-- pg_catalog & information_schema compat    |
+  |   +-- DBeaver / psql / DataGrip / pgAdmin      |
+  |   +-- pg_catalog & information_schema compat    |
+  |                                                 |
+  +-- Arrow Flight gRPC Server (tonic + HTTP/2)     |
+      +-- pyarrow.flight / Go / Java / Spark        |
+      +-- Arrow IPC — zero serialization overhead   |
 ```
 
 ### Storage Format
