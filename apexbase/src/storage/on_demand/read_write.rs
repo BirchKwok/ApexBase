@@ -1295,6 +1295,7 @@ impl OnDemandStorage {
                     Arc::new(Int64Array::from(vals))
                 }
                 _ => return Ok(None), // unknown encoding — caller falls to mmap path
+                }
             };
             fields.push(Field::new(col_name.as_str(), arrow_dt, has_nulls));
             arrays.push(arr);

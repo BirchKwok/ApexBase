@@ -570,20 +570,15 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         }
     }
     
-    // Cache miss, stale, or delta exists - need to open fresh
-    if has_delta {
-        // Drop the file handle before compaction (write path opens its own handle)
-        drop(file);
+    // Open backend — reuse pre-opened file when no delta (saves File::open + DeltaStore stat)
+    let backend = Arc::new(if has_delta {
+        drop(file); // release read handle before write path opens its own
         let storage = TableStorageBackend::open_for_write(path)?;
         storage.compact()?;
         invalidate_storage_cache(path);
-    }
-
-    // Open backend — reuse pre-opened file when no delta (saves File::open + DeltaStore stat)
-    let backend = Arc::new(if !has_delta {
-        TableStorageBackend::open_with_file(path, file, file_len)?
-    } else {
         TableStorageBackend::open(path)?
+    } else {
+        TableStorageBackend::open_with_file(path, file, file_len)?
     });
     
     // Use current time as modified (avoid extra metadata call after compaction)
