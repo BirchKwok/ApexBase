@@ -536,7 +536,7 @@ impl ApexStorageImpl {
         let ids = result?;
 
         // Index in FTS if enabled (batch operation - only if FTS manager exists)
-        // OPTIMIZED: Use add_documents_columnar for best performance (no HashMap overhead)
+        // OPTIMIZED: Use add_documents_arrow_str (🥈 ~3.3M docs/s, zero-copy &str path)
         {
             let mgr = self.fts_manager.read();
             if mgr.is_some() {
@@ -567,43 +567,34 @@ impl ApexStorageImpl {
                         };
                         
                         if !fields_to_index.is_empty() {
-                            // Collect columnar data for each field
                             let num_docs = ids.len();
+                            // Build columnar String data — direct per-field lookup, no per-doc HashMap
                             let mut columns: Vec<(String, Vec<String>)> = fields_to_index
                                 .iter()
                                 .map(|f| (f.clone(), Vec::with_capacity(num_docs)))
                                 .collect();
                             
-                            // Build columnar data (while GIL is held)
                             for (i, item) in data.iter().enumerate() {
                                 if i >= ids.len() { break; }
-                                
                                 if let Ok(dict) = item.downcast::<PyDict>() {
-                                    // Create a map of field -> value for this document
-                                    let mut field_values: HashMap<String, String> = HashMap::new();
-                                    for (key, value) in dict.iter() {
-                                        if let Ok(key_str) = key.extract::<String>() {
-                                            if key_str != "_id" {
-                                                if let Ok(s) = value.extract::<String>() {
-                                                    field_values.insert(key_str, s);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    
-                                    // Add value for each indexed field
                                     for (field_idx, field_name) in fields_to_index.iter().enumerate() {
-                                        let value = field_values.get(field_name).cloned().unwrap_or_default();
+                                        let value = dict.get_item(field_name)
+                                            .ok().flatten()
+                                            .and_then(|v| v.extract::<String>().ok())
+                                            .unwrap_or_default();
                                         columns[field_idx].1.push(value);
                                     }
                                 }
                             }
                             
-                            // Use add_documents_columnar for best performance (release GIL)
-                            if !columns.is_empty() && columns[0].1.len() > 0 {
-                                let doc_ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
+                            // 🥈 add_documents_arrow_str: zero-copy &str slices, ~3.3M docs/s
+                            if !columns.is_empty() && !columns[0].1.is_empty() {
+                                let doc_ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+                                let columns_ref: Vec<(String, Vec<&str>)> = columns.iter()
+                                    .map(|(name, vals)| (name.clone(), vals.iter().map(|s| s.as_str()).collect()))
+                                    .collect();
                                 let _ = py.allow_threads(|| {
-                                    engine.add_documents_columnar(doc_ids_u64, columns)
+                                    engine.add_documents_arrow_str(&doc_ids_u32, columns_ref)
                                 });
                             }
                         }
@@ -784,7 +775,7 @@ impl ApexStorageImpl {
         
         let ids = result?;
         
-        // Index in FTS if enabled - OPTIMIZED: Use add_documents_columnar
+        // Index in FTS if enabled - OPTIMIZED: Use add_documents_arrow_str (🥈 zero-copy &str path)
         {
             let mgr = self.fts_manager.read();
             if mgr.is_some() {
@@ -800,19 +791,19 @@ impl ApexStorageImpl {
                         };
                         
                         if !string_field_names.is_empty() {
-                            // Build columns for FTS
-                            let mut fts_columns: Vec<(String, Vec<String>)> = Vec::new();
-                            for field_name in &string_field_names {
-                                if let Some(values) = string_columns_for_fts.get(field_name) {
-                                    fts_columns.push((field_name.clone(), values.clone()));
-                                }
-                            }
+                            // Build owned String columns, then convert to &str for zero-copy call
+                            let fts_columns: Vec<(String, Vec<String>)> = string_field_names.iter()
+                                .filter_map(|f| string_columns_for_fts.get(f).map(|v| (f.clone(), v.clone())))
+                                .collect();
                             
-                            // Use add_documents_columnar for best performance
+                            // 🥈 add_documents_arrow_str: zero-copy &str slices, ~3.3M docs/s
                             if !fts_columns.is_empty() {
-                                let doc_ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
+                                let doc_ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+                                let columns_ref: Vec<(String, Vec<&str>)> = fts_columns.iter()
+                                    .map(|(name, vals)| (name.clone(), vals.iter().map(|s| s.as_str()).collect()))
+                                    .collect();
                                 let _ = py.allow_threads(|| {
-                                    engine.add_documents_columnar(doc_ids_u64, fts_columns)
+                                    engine.add_documents_arrow_str(&doc_ids_u32, columns_ref)
                                 });
                             }
                         }
@@ -861,10 +852,13 @@ impl ApexStorageImpl {
             return Ok(());
         }
         
-        // Index the document
+        // 🥇 Index the document via add_documents_arrow_texts (pre-joined text, zero-copy &str)
         if let Some(m) = mgr.as_ref() {
             if let Ok(engine) = m.get_engine(&table_name) {
-                let _ = engine.add_document(id as u64, fields);
+                // Pre-join all field values into a single text (fastest path for single doc)
+                let joined = fields.values().cloned().collect::<Vec<_>>().join(" ");
+                let doc_id = id as u32;
+                let _ = engine.add_documents_arrow_texts(&[doc_id], &[joined.as_str()]);
             }
         }
         
@@ -2540,6 +2534,37 @@ impl ApexStorageImpl {
         Ok(())
     }
     
+    /// Bulk index columnar string data into FTS (no storage write, GIL released)
+    #[pyo3(name = "_fts_index_columns")]
+    fn fts_index_columns(
+        &self,
+        py: Python<'_>,
+        ids: Vec<i64>,
+        columns: HashMap<String, Vec<String>>,
+    ) -> PyResult<usize> {
+        if ids.is_empty() || columns.is_empty() {
+            return Ok(0);
+        }
+        let table_name = self.current_table.read().clone();
+        let mgr = self.fts_manager.read();
+        if let Some(m) = mgr.as_ref() {
+            if let Ok(engine) = m.get_engine(&table_name) {
+                let count = ids.len();
+                let doc_ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+                // Build owned Vec<String> columns then borrow as &str — zero extra copy
+                let owned: Vec<(String, Vec<String>)> = columns.into_iter().collect();
+                let columns_ref: Vec<(String, Vec<&str>)> = owned.iter()
+                    .map(|(name, vals)| (name.clone(), vals.iter().map(|s| s.as_str()).collect()))
+                    .collect();
+                py.allow_threads(|| {
+                    let _ = engine.add_documents_arrow_str(&doc_ids_u32, columns_ref);
+                });
+                return Ok(count);
+            }
+        }
+        Ok(0)
+    }
+
     /// Get FTS stats
     fn get_fts_stats(&self) -> PyResult<Option<(usize, usize)>> {
         let table_name = self.current_table.read().clone();

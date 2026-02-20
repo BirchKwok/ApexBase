@@ -31,13 +31,6 @@ POLARS_AVAILABLE = True
 _RE_CREATE_TABLE = re.compile(r"\bcreate\s+(table|view)\b", re.IGNORECASE)
 _RE_FROM_TABLE = re.compile(r"\bfrom\s+([\w]+(?:\.[\w]+)?)", re.IGNORECASE)
 
-# Try to import nanofts Python library for optimized Arrow import
-try:
-    import nanofts
-    NANOFTS_PYTHON_AVAILABLE = True
-except ImportError:
-    NANOFTS_PYTHON_AVAILABLE = False
-
 
 class ApexClient:
     """
@@ -397,10 +390,7 @@ class ApexClient:
         return self
 
     def _fts_index_from_arrow(self, table: pa.Table, id_column: str = 'id', text_columns: List[str] = None) -> int:
-        """Use nanofts Python library's from_arrow for zero-copy FTS indexing.
-        
-        This is the fastest method for building FTS index from Arrow data.
-        Uses nanofts's optimized Arrow import path.
+        """Index FTS from an Arrow table using the Rust nanofts engine.
         
         Args:
             table: PyArrow Table with data
@@ -410,49 +400,38 @@ class ApexClient:
         Returns:
             Number of documents indexed
         """
-        if not NANOFTS_PYTHON_AVAILABLE:
-            raise ImportError("nanofts Python library not available. "
-                            "Install with: pip install nanofts")
-        
         self._check_connection()
         table_name = self._current_table
         
         if not self._is_fts_enabled(table_name):
             raise ValueError(f"FTS not enabled for table '{table_name}'. Call init_fts() first.")
         
-        # Get FTS index path
-        fts_dir = Path(self._dirpath) / "fts_indexes"
-        fts_dir.mkdir(parents=True, exist_ok=True)
-        index_path = fts_dir / f"{table_name}.nfts"
-        
-        # Get index fields configuration
         fts_config = self._fts_tables.get(table_name, {})
         if text_columns is None:
             text_columns = fts_config.get('index_fields')
         
-        # Create nanofts engine directly
-        cfg = fts_config.get('config', {}) if isinstance(fts_config, dict) else {}
-        engine = nanofts.create_engine(
-            index_file=str(index_path),
-            track_doc_terms=True,
-            lazy_load=bool(cfg.get('lazy_load', False)),
-            cache_size=int(cfg.get('cache_size', 10000)),
-        )
-        
-        # Use nanofts's optimized from_arrow method (zero-copy)
-        # If id_column doesn't exist in table, use the first column as id
         if id_column not in table.column_names:
             id_column = table.column_names[0]
         
-        count = engine.from_arrow(table, id_column=id_column, text_columns=text_columns)
+        # Determine text columns to index
+        if text_columns:
+            cols = [c for c in text_columns if c in table.column_names]
+        else:
+            import pyarrow as pa
+            cols = [c for c in table.column_names if c != id_column
+                    and pa.types.is_string(table.schema.field(c).type)]
         
-        # Flush to disk
-        engine.flush()
+        if not cols:
+            return 0
         
+        ids = table.column(id_column).to_pylist()
+        columns = {c: [str(v) if v is not None else '' for v in table.column(c).to_pylist()] for c in cols}
+        count = self._storage._fts_index_columns(ids, columns)
+        self._storage._fts_flush()
         return count
 
     def _fts_index_from_pandas(self, df: pd.DataFrame, id_column: str = 'id', text_columns: List[str] = None) -> int:
-        """Use nanofts Python library's from_pandas for zero-copy FTS indexing.
+        """Index FTS from a Pandas DataFrame using the Rust nanofts engine.
         
         Args:
             df: Pandas DataFrame with data
@@ -462,45 +441,33 @@ class ApexClient:
         Returns:
             Number of documents indexed
         """
-        if not NANOFTS_PYTHON_AVAILABLE:
-            raise ImportError("nanofts Python library not available. "
-                            "Install with: pip install nanofts")
-        
         self._check_connection()
         table_name = self._current_table
         
         if not self._is_fts_enabled(table_name):
             raise ValueError(f"FTS not enabled for table '{table_name}'. Call init_fts() first.")
         
-        # Get FTS index path
-        fts_dir = Path(self._dirpath) / "fts_indexes"
-        fts_dir.mkdir(parents=True, exist_ok=True)
-        index_path = fts_dir / f"{table_name}.nfts"
-        
-        # Get index fields configuration
         fts_config = self._fts_tables.get(table_name, {})
         if text_columns is None:
             text_columns = fts_config.get('index_fields')
         
-        # Create nanofts engine directly
-        cfg = fts_config.get('config', {}) if isinstance(fts_config, dict) else {}
-        engine = nanofts.create_engine(
-            index_file=str(index_path),
-            track_doc_terms=True,
-            lazy_load=bool(cfg.get('lazy_load', False)),
-            cache_size=int(cfg.get('cache_size', 10000)),
-        )
-        
-        # Use nanofts's optimized from_pandas method
-        # If id_column doesn't exist in df, use the first column as id
         if id_column not in df.columns:
             id_column = df.columns[0]
         
-        count = engine.from_pandas(df, id_column=id_column, text_columns=text_columns)
+        # Determine text columns to index
+        if text_columns:
+            cols = [c for c in text_columns if c in df.columns]
+        else:
+            cols = [c for c in df.columns if c != id_column
+                    and df[c].dtype == object]
         
-        # Flush to disk
-        engine.flush()
+        if not cols:
+            return 0
         
+        ids = df[id_column].tolist()
+        columns = {c: df[c].fillna('').astype(str).tolist() for c in cols}
+        count = self._storage._fts_index_columns(ids, columns)
+        self._storage._fts_flush()
         return count
 
     def disable_fts(self, table_name: str = None) -> 'ApexClient':

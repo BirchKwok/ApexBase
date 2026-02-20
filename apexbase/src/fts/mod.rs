@@ -50,7 +50,7 @@ impl Default for FtsConfig {
             min_term_length: 2,
             fuzzy_threshold: 0.7,
             fuzzy_max_distance: 2,
-            track_doc_terms: true,
+            track_doc_terms: false,
             lazy_load: false,
             cache_size: 10000,
         }
@@ -91,7 +91,8 @@ impl FtsEngine {
         // Create engine config
         let engine_config = EngineConfig::persistent(path.to_str().unwrap_or(""))
             .with_lazy_load(config.lazy_load)
-            .with_cache_size(config.cache_size);
+            .with_cache_size(config.cache_size)
+            .with_track_doc_terms(config.track_doc_terms);
         
         let engine = UnifiedEngine::new(engine_config)?;
         
@@ -147,27 +148,19 @@ impl FtsEngine {
     
     /// Add documents with pre-concatenated text (fastest path - no HashMap overhead)
     /// 
-    /// This is the optimal method when text is already joined.
-    /// Uses nanofts 0.3.2 columnar API for maximum performance.
-    /// 
     /// # Arguments
     /// * `doc_ids` - Vector of document IDs
     /// * `texts` - Vector of text content (same length as doc_ids)
     pub fn add_documents_texts(&self, doc_ids: Vec<u64>, texts: Vec<String>) -> FtsResult<()> {
         let guard = self.engine.read();
         if let Some(ref engine) = *guard {
-            // Convert u64 doc_ids to u32 for nanofts
             let doc_ids_u32: Vec<u32> = doc_ids.into_iter().map(|id| id as u32).collect();
-            // Use nanofts columnar text API (no HashMap overhead!)
             engine.add_documents_texts(doc_ids_u32, texts)?;
         }
         Ok(())
     }
     
-    /// Add documents with columnar data (no string joining needed!)
-    /// 
-    /// This is the most efficient method when you have separate columns.
-    /// nanofts will internally join the field values.
+    /// Add documents with columnar data (owned Strings)
     /// 
     /// # Arguments
     /// * `doc_ids` - Vector of document IDs
@@ -177,6 +170,36 @@ impl FtsEngine {
         if let Some(ref engine) = *guard {
             let doc_ids_u32: Vec<u32> = doc_ids.into_iter().map(|id| id as u32).collect();
             engine.add_documents_columnar(doc_ids_u32, columns)?;
+        }
+        Ok(())
+    }
+    
+    /// 🥇 Fastest path: add documents with pre-joined text as &str slices (zero-copy)
+    /// 
+    /// ~3.4M docs/s. Use when text fields are already concatenated.
+    /// 
+    /// # Arguments
+    /// * `doc_ids` - Slice of u32 document IDs
+    /// * `texts` - Slice of &str text (same length as doc_ids)
+    pub fn add_documents_arrow_texts(&self, doc_ids: &[u32], texts: &[&str]) -> FtsResult<()> {
+        let guard = self.engine.read();
+        if let Some(ref engine) = *guard {
+            engine.add_documents_arrow_texts(doc_ids, texts)?;
+        }
+        Ok(())
+    }
+    
+    /// 🥈 Second fastest: multi-column &str slices (zero-copy, Arrow-format)
+    /// 
+    /// ~3.3M docs/s. Use when data comes from columnar sources (Arrow, Parquet, DataFrame).
+    /// 
+    /// # Arguments
+    /// * `doc_ids` - Slice of u32 document IDs
+    /// * `columns` - Vec of (field_name, Vec<&str>) column data
+    pub fn add_documents_arrow_str(&self, doc_ids: &[u32], columns: Vec<(String, Vec<&str>)>) -> FtsResult<()> {
+        let guard = self.engine.read();
+        if let Some(ref engine) = *guard {
+            engine.add_documents_arrow_str(doc_ids, columns)?;
         }
         Ok(())
     }
