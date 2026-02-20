@@ -364,35 +364,35 @@ Three-way comparison on macOS 26.3, Apple arm (10 cores), 32 GB RAM.
 Python 3.11.10, ApexBase v1.5.0, SQLite v3.45.3, DuckDB v1.1.3, PyArrow v19.0.0.
 
 Dataset: 1,000,000 rows × 5 columns (name, age, score, city, category).
-Average of 15 timed iterations after 5 warmup runs.
+Average of 5 timed iterations after 2 warmup runs.
 
 | Query | ApexBase | SQLite | DuckDB | vs Best Other |
 |-------|----------|--------|--------|---------------|
-| Bulk Insert (1M rows) | 292ms | 891ms | 872ms | **3.0x faster** |
-| COUNT(\*) | 0.044ms | 8.46ms | 0.520ms | **12x faster** |
-| SELECT \* LIMIT 100 [cold] ¹ | 0.123ms | 0.089ms | 0.391ms | ~tied |
-| SELECT \* LIMIT 10K [cold] | 0.877ms | 6.44ms | 4.28ms | **4.9x faster** |
-| Filter (name = 'user\_5000') | 0.037ms | 40.62ms | 1.63ms | **44x faster** |
-| Filter (age BETWEEN 25 AND 35) | 0.024ms | 161ms | 86.19ms | **>3500x faster** |
-| GROUP BY city (10 groups) | 0.026ms | 348ms | 3.09ms | **119x faster** |
-| GROUP BY + HAVING | 0.028ms | 351ms | 2.98ms | **106x faster** |
-| ORDER BY score LIMIT 100 | 0.028ms | 51.39ms | 5.07ms | **181x faster** |
-| Aggregation (5 funcs) | 0.028ms | 83.85ms | 1.24ms | **44x faster** |
-| Complex (Filter+Group+Order) | 0.030ms | 157ms | 2.43ms | **81x faster** |
-| Point Lookup (by \_id) | 0.026ms | 0.043ms | 3.01ms | **1.7x faster** |
-| Insert 1K rows | 0.601ms | 1.29ms | 2.61ms | **2.1x faster** |
-| SELECT \* → pandas (full scan) | 0.677ms | 1160ms | 182ms | **268x faster** |
-| GROUP BY city, category (100 grp) | 0.023ms | 686ms | 5.46ms | **237x faster** |
-| LIKE filter (name LIKE 'user\_1%') | 33.12ms | 132ms | 54.22ms | **1.6x faster** |
-| Multi-cond (age>30 AND score>50) | 0.032ms | 344ms | 191ms | **>5000x faster** |
-| ORDER BY city, score DESC LIMIT 100 | 0.030ms | 72.31ms | 7.30ms | **243x faster** |
-| COUNT(DISTINCT city) | 0.031ms | 92.54ms | 4.21ms | **136x faster** |
-| IN filter (city IN 3 cities) | 0.033ms | 321ms | 158ms | **>4000x faster** |
-| UPDATE rows (age = 25) | 297ms | 39.93ms | 16.83ms | 17.7x slower |
+| Bulk Insert (1M rows) | 273ms | 905ms | 863ms | **3.3x faster** |
+| COUNT(\*) | 0.049ms | 8.26ms | 0.512ms | **10x faster** |
+| SELECT \* LIMIT 100 [cold] ¹ | 0.113ms | 0.101ms | 0.470ms | 1.1x slower |
+| SELECT \* LIMIT 10K [cold] | 0.917ms | 6.53ms | 4.51ms | **4.9x faster** |
+| Filter (name = 'user\_5000') | 0.035ms | 38.56ms | 1.58ms | **45x faster** |
+| Filter (age BETWEEN 25 AND 35) | 0.026ms | 155ms | 88.32ms | **>3000x faster** |
+| GROUP BY city (10 groups) | 0.040ms | 344ms | 2.69ms | **67x faster** |
+| GROUP BY + HAVING | 0.026ms | 358ms | 2.99ms | **115x faster** |
+| ORDER BY score LIMIT 100 | 0.029ms | 50.29ms | 4.59ms | **158x faster** |
+| Aggregation (5 funcs) | 0.034ms | 78.22ms | 1.07ms | **31x faster** |
+| Complex (Filter+Group+Order) | 0.028ms | 152ms | 2.34ms | **84x faster** |
+| Point Lookup (by \_id) | 0.026ms | 0.039ms | 2.51ms | **1.5x faster** |
+| Insert 1K rows | 0.602ms | 1.32ms | 2.44ms | **2.2x faster** |
+| SELECT \* → pandas (full scan) | 0.605ms | 1100ms | 162ms | **268x faster** |
+| GROUP BY city, category (100 grp) | 0.017ms | 646ms | 4.14ms | **244x faster** |
+| LIKE filter (name LIKE 'user\_1%') | 28.18ms | 129ms | 52.55ms | **1.9x faster** |
+| Multi-cond (age>30 AND score>50) | 0.033ms | 323ms | 189ms | **>5000x faster** |
+| ORDER BY city, score DESC LIMIT 100 | 0.026ms | 65.62ms | 6.00ms | **231x faster** |
+| COUNT(DISTINCT city) | 0.026ms | 84.02ms | 3.23ms | **124x faster** |
+| IN filter (city IN 3 cities) | 0.029ms | 294ms | 153ms | **>5000x faster** |
+| UPDATE rows (age = 25) | 207ms | 36.03ms | 14.35ms | 14.4x slower |
 
 **Summary**: wins 19 of 21 benchmarks. Slower on UPDATE (disk-flush dominated) and cold SELECT \* LIMIT 100¹.
 
-> ¹ **Cold-start note**: ApexBase re-opens from disk on every iteration; SQLite reuses a warm connection. ApexBase true cold-start without GC interference: **0.027ms** — 4× faster than SQLite's warm 0.089ms.
+> ¹ **Cold-start note**: ApexBase re-opens from disk on every iteration; SQLite reuses a warm connection. ApexBase true cold-start without GC interference: **0.027ms** — 4× faster than SQLite's warm 0.101ms.
 
 Reproduce: `python benchmarks/bench_vs_sqlite_duckdb.py --rows 1000000`
 
