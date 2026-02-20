@@ -334,6 +334,13 @@ impl TableStorageBackend {
         Ok(Self::from_storage(path, storage))
     }
 
+    /// Open for reading only using a pre-opened File and known file_len.
+    /// Saves 2 syscalls vs open(): skips internal File::open + DeltaStore stat.
+    pub fn open_with_file(path: &Path, file: std::fs::File, file_len: u64) -> io::Result<Self> {
+        let storage = OnDemandStorage::open_for_read_with_file(path, file, file_len)?;
+        Ok(Self::from_storage(path, storage))
+    }
+
     pub fn open_or_create(path: &Path) -> io::Result<Self> {
         Self::open_or_create_with_durability(path, super::DurabilityLevel::Fast)
     }

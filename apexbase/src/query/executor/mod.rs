@@ -12,6 +12,7 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
     UInt64Array, RecordBatch,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use arrow::compute::{self, SortOptions};
 use arrow::compute::kernels::cmp;
 use arrow::compute::kernels::numeric as arith;
@@ -192,8 +193,24 @@ where
 // Uses LRU eviction when cache exceeds MAX_CACHE_ENTRIES
 const MAX_CACHE_ENTRIES: usize = 64;  // Limit cache to 64 tables
 
-static STORAGE_CACHE: Lazy<RwLock<AHashMap<PathBuf, (Arc<TableStorageBackend>, std::time::SystemTime, std::time::Instant)>>> = 
+type CacheEntry = (Arc<TableStorageBackend>, std::time::SystemTime, Arc<AtomicU64>);
+static STORAGE_CACHE: Lazy<RwLock<AHashMap<PathBuf, CacheEntry>>> =
     Lazy::new(|| RwLock::new(AHashMap::with_capacity(MAX_CACHE_ENTRIES)));
+
+/// Returns current time as nanoseconds since UNIX_EPOCH (fits in u64 until year 2554)
+#[inline(always)]
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+/// Returns nanoseconds elapsed since a stored timestamp
+#[inline(always)]
+fn nanos_elapsed(stored: u64) -> u64 {
+    now_nanos().saturating_sub(stored)
+}
 
 // ============================================================================
 // Per-table Write Locks — serializes concurrent writes to the same table
@@ -268,22 +285,16 @@ where
 }
 
 /// Evict least recently used entries from cache if over limit
-fn evict_lru_cache_entries(cache: &mut AHashMap<PathBuf, (Arc<TableStorageBackend>, std::time::SystemTime, std::time::Instant)>) {
+fn evict_lru_cache_entries(cache: &mut AHashMap<PathBuf, CacheEntry>) {
     if cache.len() <= MAX_CACHE_ENTRIES {
         return;
     }
-    
-    // Find the entry with oldest access time
-    let entries_to_remove = cache.len() - MAX_CACHE_ENTRIES + 1; // Remove a few extra to avoid frequent eviction
-    let mut access_times: Vec<(PathBuf, std::time::Instant)> = cache
+    let entries_to_remove = cache.len() - MAX_CACHE_ENTRIES + 1;
+    let mut access_times: Vec<(PathBuf, u64)> = cache
         .iter()
-        .map(|(k, (_, _, access))| (k.clone(), *access))
+        .map(|(k, (_, _, access))| (k.clone(), access.load(Ordering::Relaxed)))
         .collect();
-    
-    // Sort by access time (oldest first)
     access_times.sort_by_key(|(_, t)| *t);
-    
-    // Remove oldest entries
     for (path, _) in access_times.into_iter().take(entries_to_remove) {
         cache.remove(&path);
     }
@@ -484,9 +495,7 @@ impl ZoneMap {
 /// CRITICAL: Must be called before any write operation to release mmap on Windows
 #[inline]
 pub fn invalidate_storage_cache(path: &Path) {
-    // Use path directly - avoid expensive canonicalize (already absolute in most cases)
-    let mut cache = STORAGE_CACHE.write();
-    cache.remove(path);
+    STORAGE_CACHE.write().remove(path);
 }
 
 /// Invalidate all storage cache entries under a directory
@@ -510,30 +519,26 @@ pub fn get_cached_backend_pub(path: &Path) -> io::Result<Arc<TableStorageBackend
 /// Auto-compacts delta files before reading to ensure data consistency
 #[inline]
 fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
-    // Use path directly - avoid expensive canonicalize (already absolute)
     let cache_key = path.to_path_buf();
 
     // FASTEST PATH: if backend was validated within last 500ms, skip ALL stat() syscalls.
-    // Safe for single-process use: writes always call invalidate_storage_cache() before
-    // modifying the file, so stale cached entries are always evicted before the next read.
-    // Also refreshes last_access to keep the window alive across benchmark iterations.
+    // Uses AtomicU64 for last_access so no write-lock is needed on the warm hit path.
     {
         let cache = STORAGE_CACHE.read();
         if let Some((backend, _, last_access)) = cache.get(&cache_key) {
-            if last_access.elapsed().as_millis() < 500 {
+            if nanos_elapsed(last_access.load(Ordering::Relaxed)) < 500_000_000 {
                 let backend_clone = Arc::clone(backend);
-                drop(cache);
-                // Refresh last_access so subsequent calls within 500ms also hit fast path
-                if let Some(entry) = STORAGE_CACHE.write().get_mut(&cache_key) {
-                    entry.2 = std::time::Instant::now();
-                }
+                // Refresh last_access atomically — no write lock needed
+                last_access.store(now_nanos(), Ordering::Relaxed);
                 return Ok(backend_clone);
             }
         }
     }
 
-    // Get main file metadata (single syscall for existence + modified time)
-    let metadata = std::fs::metadata(path)?;
+    // Open the file once — gives us both existence check and metadata without a separate stat()
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    let file_len = metadata.len();
     let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     
     // Check for delta file - combine path construction with existence check
@@ -555,32 +560,31 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     
     // Try read from cache first (only if no delta file pending)
     if !has_delta {
-        // Check cache and update access time if found
-        let mut cache = STORAGE_CACHE.write();
-        if let Some((backend, cached_time, _)) = cache.get(&cache_key) {
+        let cache = STORAGE_CACHE.read();
+        if let Some((backend, cached_time, last_access)) = cache.get(&cache_key) {
             if *cached_time >= effective_modified {
                 let backend_clone = Arc::clone(backend);
-                // Update access time for LRU tracking
-                if let Some(entry) = cache.get_mut(&cache_key) {
-                    entry.2 = std::time::Instant::now();
-                }
+                last_access.store(now_nanos(), Ordering::Relaxed);
                 return Ok(backend_clone);
             }
         }
     }
     
     // Cache miss, stale, or delta exists - need to open fresh
-    // If delta exists, compact it first
     if has_delta {
-        // Open for write to trigger compaction
+        // Drop the file handle before compaction (write path opens its own handle)
+        drop(file);
         let storage = TableStorageBackend::open_for_write(path)?;
         storage.compact()?;
-        // Delta is now merged, invalidate cache
         invalidate_storage_cache(path);
     }
-    
-    // Open backend (now with compacted data)
-    let backend = Arc::new(TableStorageBackend::open(path)?);
+
+    // Open backend — reuse pre-opened file when no delta (saves File::open + DeltaStore stat)
+    let backend = Arc::new(if !has_delta {
+        TableStorageBackend::open_with_file(path, file, file_len)?
+    } else {
+        TableStorageBackend::open(path)?
+    });
     
     // Use current time as modified (avoid extra metadata call after compaction)
     let new_modified = if has_delta {
@@ -591,9 +595,8 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     
     {
         let mut cache = STORAGE_CACHE.write();
-        // Evict LRU entries if cache is full
         evict_lru_cache_entries(&mut cache);
-        cache.insert(cache_key, (Arc::clone(&backend), new_modified, std::time::Instant::now()));
+        cache.insert(cache_key, (Arc::clone(&backend), new_modified, Arc::new(AtomicU64::new(now_nanos()))));
     }
     
     Ok(backend)
@@ -667,6 +670,42 @@ impl ApexExecutor {
 
     /// Execute a SQL query with multi-table support (for JOINs)
     pub fn execute_with_base_dir(sql: &str, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+        // PRE-PARSE FAST PATH: SELECT COUNT(*) FROM <table> — bypass SQL parser entirely.
+        // Handles the most common metadata query without any tokenization overhead.
+        {
+            let s = sql.trim();
+            if s.len() <= 200 {
+                let su = s.to_ascii_uppercase();
+                if su.starts_with("SELECT COUNT(*) FROM ")
+                    && !su.contains("WHERE") && !su.contains("GROUP")
+                    && !su.contains("HAVING") && !su.contains("JOIN")
+                    && !su.contains("DISTINCT")
+                {
+                    let after_from = su["SELECT COUNT(*) FROM ".len()..].trim();
+                    let table_name_upper = after_from.trim_end_matches(';').trim();
+                    if !table_name_upper.is_empty() && !table_name_upper.contains(' ') {
+                        let default_stem = default_table_path.file_stem()
+                            .and_then(|s| s.to_str()).unwrap_or("");
+                        let table_path = if table_name_upper.eq_ignore_ascii_case(default_stem) {
+                            default_table_path.to_path_buf()
+                        } else {
+                            base_dir.join(format!("{}.apex", table_name_upper.to_lowercase()))
+                        };
+                        if let Ok(backend) = get_cached_backend(&table_path) {
+                            let count = backend.active_row_count() as i64;
+                            let schema = Arc::new(Schema::new(vec![
+                                Field::new("COUNT(*)", ArrowDataType::Int64, false),
+                            ]));
+                            let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
+                            let batch = RecordBatch::try_new(schema, vec![array])
+                                .map_err(|e| err_data(e.to_string()))?;
+                            return Ok(ApexResult::Data(batch));
+                        }
+                    }
+                }
+            }
+        }
+
         // Support multi-statement execution (e.g., CREATE VIEW; SELECT ...; DROP VIEW;)
         // Parse as multi-statement unconditionally to avoid relying on string heuristics.
         let stmts = {

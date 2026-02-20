@@ -1149,15 +1149,18 @@ impl OnDemandStorage {
             let null_flags: Vec<bool> = (0..n).map(|i| (null_bytes[i/8] >> (i%8)) & 1 == 1).collect();
             let has_nulls = null_flags.iter().any(|&b| b);
 
-            // encoding byte
+            // Read encoding byte + data payload in ONE call starting at data_start.
+            // enc[0] = encoding, rest = payload. Saves one read_cached_bytes call per column.
             let data_start = col_abs + null_bitmap_len as u64;
-            let mut enc = [0u8; 1];
-            self.read_cached_bytes(data_start, &mut enc)?;
-            let encoding = enc[0];
-            let payload = data_start + 1;
 
             let arrow_dt;
-            let arr: arrow::array::ArrayRef = match (encoding, col_type) {
+            let arr: arrow::array::ArrayRef = {
+                // Peek at encoding byte with a small read covering enc + header
+                let mut enc_buf = [0u8; 1];
+                self.read_cached_bytes(data_start, &mut enc_buf)?;
+                let encoding = enc_buf[0];
+                let payload = data_start + 1;
+                match (encoding, col_type) {
                 (0, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
                  ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
                  ColumnType::Timestamp | ColumnType::Date) => {

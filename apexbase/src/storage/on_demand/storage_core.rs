@@ -205,8 +205,8 @@ impl OnDemandStorage {
         let mut cached_v4_footer: Option<V4Footer> = None;
         if is_v4 {
             // V4 Row Group format: read schema from footer
-            // Read from footer_offset to EOF (V4Footer::from_bytes ignores trailing bytes)
-            let file_len = std::fs::metadata(path)?.len();
+            // Use already-open file handle to avoid a second fs::metadata() syscall
+            let file_len = file.metadata()?.len();
             let footer_byte_count = (file_len - header.footer_offset) as usize;
             let mut footer_bytes = vec![0u8; footer_byte_count];
             mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
@@ -366,6 +366,110 @@ impl OnDemandStorage {
         })
     }
     
+    /// Open for reading only, reusing a pre-opened File and known file_len.
+    /// Skips DeltaStore::load (saves 1 stat syscall) and internal File::open (saves 1 open syscall).
+    /// For pure read paths only — DeltaStore is initialized empty (no pending updates).
+    pub fn open_for_read_with_file(
+        path: &Path,
+        file: File,
+        file_len: u64,
+    ) -> io::Result<Self> {
+        let mut mmap_cache = MmapCache::new();
+
+        let mut header_bytes = [0u8; HEADER_SIZE_V3];
+        mmap_cache.read_at(&file, &mut header_bytes, 0)?;
+        let header = OnDemandHeader::from_bytes(&header_bytes)?;
+
+        let is_v4 = header.footer_offset > 0;
+        let schema: OnDemandSchema;
+        let column_index: Vec<ColumnIndexEntry>;
+        let id_count = header.row_count as usize;
+        let next_id: u64;
+        let mut cached_v4_footer: Option<V4Footer> = None;
+
+        if is_v4 {
+            let footer_byte_count = (file_len - header.footer_offset) as usize;
+            let mut footer_bytes = vec![0u8; footer_byte_count];
+            mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
+            let footer = V4Footer::from_bytes(&footer_bytes)?;
+            schema = footer.schema.clone();
+            cached_v4_footer = Some(footer);
+            column_index = Vec::new();
+            next_id = cached_v4_footer.as_ref().unwrap().row_groups.iter()
+                .filter(|rg| rg.row_count > 0)
+                .map(|rg| rg.max_id)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
+        } else {
+            let schema_size = header.column_index_offset - header.schema_offset;
+            let mut schema_bytes = vec![0u8; schema_size as usize];
+            mmap_cache.read_at(&file, &mut schema_bytes, header.schema_offset)?;
+            schema = OnDemandSchema::from_bytes(&schema_bytes)?;
+            let index_size = header.column_count as usize * COLUMN_INDEX_ENTRY_SIZE;
+            let mut index_bytes = vec![0u8; index_size];
+            mmap_cache.read_at(&file, &mut index_bytes, header.column_index_offset)?;
+            let mut ci = Vec::with_capacity(header.column_count as usize);
+            for i in 0..header.column_count as usize {
+                let start = i * COLUMN_INDEX_ENTRY_SIZE;
+                let entry = ColumnIndexEntry::from_bytes(&index_bytes[start..start + COLUMN_INDEX_ENTRY_SIZE]);
+                ci.push(entry);
+            }
+            column_index = ci;
+            next_id = if id_count > 0 {
+                let mut id_buf = vec![0u8; id_count * 8];
+                if mmap_cache.read_at(&file, &mut id_buf, header.id_column_offset).is_ok() {
+                    let mut max_id = 0u64;
+                    for i in 0..id_count {
+                        let id = u64::from_le_bytes(id_buf[i*8..(i+1)*8].try_into().unwrap_or([0u8; 8]));
+                        if id > max_id { max_id = id; }
+                    }
+                    max_id + 1
+                } else { header.row_count }
+            } else { 0 };
+        }
+
+        let columns: Vec<ColumnData> = schema.columns.iter()
+            .map(|(_, col_type)| ColumnData::new(*col_type))
+            .collect();
+        let nulls = vec![Vec::new(); header.column_count as usize];
+        let deleted_len = (id_count + 7) / 8;
+        let deleted = vec![0u8; deleted_len];
+        let cached_fo = header.footer_offset;
+        let comp_type = CompressionType::from_flags(header.flags);
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: RwLock::new(Some(file)),
+            mmap_cache: RwLock::new(mmap_cache),
+            header: RwLock::new(header),
+            schema: RwLock::new(schema),
+            column_index: RwLock::new(column_index),
+            columns: RwLock::new(columns),
+            ids: RwLock::new(Vec::new()),
+            next_id: AtomicU64::new(next_id),
+            nulls: RwLock::new(nulls),
+            deleted: RwLock::new(deleted),
+            id_to_idx: RwLock::new(None),
+            active_count: AtomicU64::new(id_count as u64),
+            durability: super::DurabilityLevel::Fast,
+            wal_writer: RwLock::new(None),
+            wal_buffer: RwLock::new(Vec::new()),
+            auto_flush_rows: AtomicU64::new(10000),
+            auto_flush_bytes: AtomicU64::new(500 * 1024 * 1024),
+            pending_rows: AtomicU64::new(0),
+            persisted_row_count: AtomicU64::new(id_count as u64),
+            v4_base_loaded: AtomicBool::new(false),
+            cached_footer_offset: AtomicU64::new(cached_fo),
+            v4_footer: RwLock::new(cached_v4_footer),
+            // Skip DeltaStore::load — pure read path, no pending updates.
+            // DeltaStore will be lazily populated if a write is ever attempted on this backend.
+            delta_store: RwLock::new(DeltaStore::new(path)),
+            compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
+            page_cache: RwLock::new(HashMap::new()),
+        })
+    }
+
     /// Set auto-flush thresholds for automatic persistence
     /// * `rows` - Auto-flush when pending rows exceed this count (0 = disabled)
     /// * `bytes` - Auto-flush when estimated memory exceeds this size (0 = disabled)

@@ -1029,7 +1029,30 @@ impl ApexStorageImpl {
             let mut cache = self.py_query_cache.write();
             cache.clear();
         }
-        
+
+        // FAST PATH: SELECT COUNT(*) FROM <table> — bypass SQL parser + executor entirely.
+        // Returns count directly from metadata (active_row_count atomic load).
+        // NOTE: result intentionally not cached (count changes on writes).
+        if !is_write_op && sql_upper.starts_with("SELECT COUNT(*) FROM ")
+            && !sql_upper.contains("WHERE") && !sql_upper.contains("GROUP")
+            && !sql_upper.contains("HAVING") && !sql_upper.contains("JOIN")
+            && !sql_upper.contains("DISTINCT")
+        {
+            let after_from = sql_upper["SELECT COUNT(*) FROM ".len()..].trim();
+            let tname = after_from.trim_end_matches(';').trim();
+            if !tname.is_empty() && !tname.contains(' ') {
+                if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+                    let count = backend.active_row_count() as i64;
+                    let out = PyDict::new_bound(py);
+                    out.set_item("columns", PyList::new_bound(py, ["COUNT(*)"]))?;
+                    let row = PyList::new_bound(py, [count]);
+                    out.set_item("rows", PyList::new_bound(py, [row]))?;
+                    out.set_item("rows_affected", 0i64)?;
+                    return Ok(out.into());
+                }
+            }
+        }
+
         // FAST PATH: SELECT * FROM <table> LIMIT N — skip SQL parse, use pread RCIX directly.
         // Returns columnar dict format (handled by Python client's fast path at line 713).
         if !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT")
@@ -1049,18 +1072,13 @@ impl ApexStorageImpl {
                         });
                         if let Ok(Some(batch)) = batch_result {
                             if batch.num_rows() > 0 {
-                                let nrows = batch.num_rows();
                                 let out = PyDict::new_bound(py);
                                 let columns_dict = PyDict::new_bound(py);
                                 let schema = batch.schema();
                                 for col_idx in 0..batch.num_columns() {
                                     let col_name = schema.field(col_idx).name();
                                     let arr = batch.column(col_idx);
-                                    // Build all values first, then create PyList in one shot
-                                    let py_vals: Vec<PyObject> = (0..nrows)
-                                        .map(|row_idx| value_to_py(py, &arrow_value_at(arr, row_idx)))
-                                        .collect::<PyResult<Vec<_>>>()?;
-                                    let col_list = PyList::new_bound(py, py_vals);
+                                    let col_list = arrow_col_to_pylist(py, arr)?;
                                     columns_dict.set_item(col_name, col_list)?;
                                 }
                                 out.set_item("columns_dict", columns_dict)?;
@@ -2589,6 +2607,72 @@ impl ApexStorageImpl {
             }
         } else {
             Ok(None)
+        }
+    }
+}
+
+/// Batch-convert an Arrow column to a Python list. Single downcast per column.
+/// Much faster than calling arrow_value_at() per element (no per-row dispatch/downcast/Value alloc).
+fn arrow_col_to_pylist(py: Python<'_>, arr: &arrow::array::ArrayRef) -> PyResult<PyObject> {
+    use arrow::array::*;
+    use arrow::datatypes::DataType as ArrowDT;
+    use pyo3::types::PyList;
+    let n = arr.len();
+    match arr.data_type() {
+        ArrowDT::Int64 => {
+            let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+            let has_nulls = a.null_count() > 0;
+            if !has_nulls {
+                Ok(PyList::new_bound(py, a.values().iter().take(n)).into())
+            } else {
+                let list = PyList::empty_bound(py);
+                for i in 0..n {
+                    if a.is_null(i) { list.append(py.None())?; } else { list.append(a.value(i))?; }
+                }
+                Ok(list.into())
+            }
+        }
+        ArrowDT::Float64 => {
+            let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
+            let has_nulls = a.null_count() > 0;
+            if !has_nulls {
+                Ok(PyList::new_bound(py, a.values().iter().take(n)).into())
+            } else {
+                let list = PyList::empty_bound(py);
+                for i in 0..n {
+                    if a.is_null(i) { list.append(py.None())?; } else { list.append(a.value(i))?; }
+                }
+                Ok(list.into())
+            }
+        }
+        ArrowDT::Utf8 => {
+            let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
+            let list = PyList::empty_bound(py);
+            for i in 0..n {
+                if a.is_null(i) {
+                    list.append(py.None())?;
+                } else {
+                    let s = a.value(i);
+                    if s == "\x00__NULL__\x00" { list.append(py.None())?; } else { list.append(s)?; }
+                }
+            }
+            Ok(list.into())
+        }
+        ArrowDT::Boolean => {
+            let a = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let list = PyList::empty_bound(py);
+            for i in 0..n {
+                if a.is_null(i) { list.append(py.None())?; } else { list.append(a.value(i))?; }
+            }
+            Ok(list.into())
+        }
+        _ => {
+            // Fallback: per-element generic path
+            let list = PyList::empty_bound(py);
+            for i in 0..n {
+                list.append(value_to_py(py, &arrow_value_at(arr, i))?)?;
+            }
+            Ok(list.into())
         }
     }
 }

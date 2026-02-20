@@ -232,6 +232,45 @@ class SQLiteBench:
         )
         self.conn.commit()
 
+    def bench_full_scan_pandas(self):
+        if HAS_PANDAS:
+            return pd.read_sql("SELECT * FROM bench", self.conn)
+        return self.conn.execute("SELECT * FROM bench").fetchall()
+
+    def bench_group_by_2cols(self):
+        return self.conn.execute(
+            "SELECT city, category, COUNT(*), AVG(score) FROM bench GROUP BY city, category"
+        ).fetchall()
+
+    def bench_filter_like(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE name LIKE 'user_1%'"
+        ).fetchall()
+
+    def bench_filter_multi_cond(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE age > 30 AND score > 50.0"
+        ).fetchall()
+
+    def bench_order_by_multi(self):
+        return self.conn.execute(
+            "SELECT * FROM bench ORDER BY city ASC, score DESC LIMIT 100"
+        ).fetchall()
+
+    def bench_count_distinct(self):
+        return self.conn.execute(
+            "SELECT COUNT(DISTINCT city) FROM bench"
+        ).fetchone()[0]
+
+    def bench_filter_in(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"
+        ).fetchall()
+
+    def bench_update_1k(self):
+        self.conn.execute("UPDATE bench SET score = 50.0 WHERE age = 25")
+        self.conn.commit()
+
     def close(self):
         if self.conn:
             self.conn.close()
@@ -339,6 +378,44 @@ class DuckDBBench:
             rows = [(f"new_{i}", 25, 50.0, "Beijing", "Books") for i in range(1000)]
             self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
 
+    def bench_full_scan_pandas(self):
+        if HAS_PANDAS:
+            return self.conn.execute("SELECT * FROM bench").df()
+        return self.conn.execute("SELECT * FROM bench").fetchall()
+
+    def bench_group_by_2cols(self):
+        return self.conn.execute(
+            "SELECT city, category, COUNT(*), AVG(score) FROM bench GROUP BY city, category"
+        ).fetchall()
+
+    def bench_filter_like(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE name LIKE 'user_1%'"
+        ).fetchall()
+
+    def bench_filter_multi_cond(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE age > 30 AND score > 50.0"
+        ).fetchall()
+
+    def bench_order_by_multi(self):
+        return self.conn.execute(
+            "SELECT * FROM bench ORDER BY city ASC, score DESC LIMIT 100"
+        ).fetchall()
+
+    def bench_count_distinct(self):
+        return self.conn.execute(
+            "SELECT COUNT(DISTINCT city) FROM bench"
+        ).fetchone()[0]
+
+    def bench_filter_in(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"
+        ).fetchall()
+
+    def bench_update_1k(self):
+        self.conn.execute("UPDATE bench SET score = 50.0 WHERE age = 25")
+
     def close(self):
         if self.conn:
             self.conn.close()
@@ -429,6 +506,47 @@ class ApexBaseBench:
         }
         self.client.store(data_1k)
 
+    def bench_full_scan_pandas(self):
+        result = self.client.execute("SELECT * FROM default")
+        if HAS_PANDAS:
+            return result.to_pandas()
+        return result
+
+    def bench_group_by_2cols(self):
+        return self.client.execute(
+            "SELECT city, category, COUNT(*), AVG(score) FROM default GROUP BY city, category"
+        )
+
+    def bench_filter_like(self):
+        return self.client.execute(
+            "SELECT * FROM default WHERE name LIKE 'user_1%'"
+        )
+
+    def bench_filter_multi_cond(self):
+        return self.client.execute(
+            "SELECT * FROM default WHERE age > 30 AND score > 50.0"
+        )
+
+    def bench_order_by_multi(self):
+        return self.client.execute(
+            "SELECT * FROM default ORDER BY city ASC, score DESC LIMIT 100"
+        )
+
+    def bench_count_distinct(self):
+        return self.client.execute(
+            "SELECT COUNT(DISTINCT city) FROM default"
+        )
+
+    def bench_filter_in(self):
+        return self.client.execute(
+            "SELECT * FROM default WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"
+        )
+
+    def bench_update_1k(self):
+        return self.client.execute(
+            "UPDATE default SET score = 50.0 WHERE age = 25"
+        )
+
     def close(self):
         if self.client:
             self.client.close()
@@ -441,19 +559,28 @@ class ApexBaseBench:
 # (display_name, method_name, is_write, is_cold_start)
 # is_cold_start=True -> cold_start_setup() called before every timed iteration
 BENCHMARKS = [
-    ("Bulk Insert (N rows)",          "bench_insert",           True,  False),
-    ("COUNT(*)",                       "bench_count",            False, False),
-    ("SELECT * LIMIT 100 [cold]",      "bench_select_limit",     False, True),
-    ("SELECT * LIMIT 10K [cold]",      "bench_select_limit_10k", False, True),
-    ("Filter (name = 'user_5000')",    "bench_filter_string",    False, False),
-    ("Filter (age BETWEEN 25 AND 35)", "bench_filter_range",     False, False),
-    ("GROUP BY city (10 groups)",      "bench_group_by",         False, False),
-    ("GROUP BY + HAVING",              "bench_group_by_having",  False, False),
-    ("ORDER BY score LIMIT 100",       "bench_order_limit",      False, False),
-    ("Aggregation (5 funcs)",          "bench_aggregation",      False, False),
-    ("Complex (Filter+Group+Order)",   "bench_complex",          False, False),
-    ("Point Lookup (by ID)",           "bench_point_lookup",     False, False),
-    ("Insert 1K rows",                 "bench_insert_1k",        False, False),
+    ("Bulk Insert (N rows)",             "bench_insert",           True,  False),
+    ("COUNT(*)",                         "bench_count",            False, False),
+    ("SELECT * LIMIT 100 [cold]",        "bench_select_limit",     False, True),
+    ("SELECT * LIMIT 10K [cold]",        "bench_select_limit_10k", False, True),
+    ("Filter (name = 'user_5000')",      "bench_filter_string",    False, False),
+    ("Filter (age BETWEEN 25 AND 35)",   "bench_filter_range",     False, False),
+    ("GROUP BY city (10 groups)",        "bench_group_by",         False, False),
+    ("GROUP BY + HAVING",                "bench_group_by_having",  False, False),
+    ("ORDER BY score LIMIT 100",         "bench_order_limit",      False, False),
+    ("Aggregation (5 funcs)",            "bench_aggregation",      False, False),
+    ("Complex (Filter+Group+Order)",     "bench_complex",          False, False),
+    ("Point Lookup (by ID)",             "bench_point_lookup",     False, False),
+    ("Insert 1K rows",                   "bench_insert_1k",        False, False),
+    # --- New cases ---
+    ("SELECT * -> pandas (full scan)",   "bench_full_scan_pandas", False, False),
+    ("GROUP BY city,category (100 grp)","bench_group_by_2cols",   False, False),
+    ("LIKE filter (name LIKE user_1%)",  "bench_filter_like",      False, False),
+    ("Multi-cond (age>30 AND score>50)", "bench_filter_multi_cond",False, False),
+    ("ORDER BY city,score DESC LIMIT100","bench_order_by_multi",   False, False),
+    ("COUNT(DISTINCT city)",             "bench_count_distinct",   False, False),
+    ("IN filter (city IN 3 cities)",     "bench_filter_in",        False, False),
+    ("UPDATE rows (age=25, idempotent)", "bench_update_1k",        False, False),
 ]
 
 

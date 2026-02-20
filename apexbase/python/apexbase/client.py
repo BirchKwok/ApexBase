@@ -30,6 +30,10 @@ POLARS_AVAILABLE = True
 # Pre-compiled regex for SQL validation (avoids re-compilation on every query)
 _RE_CREATE_TABLE = re.compile(r"\bcreate\s+(table|view)\b", re.IGNORECASE)
 _RE_FROM_TABLE = re.compile(r"\bfrom\s+([\w]+(?:\.[\w]+)?)", re.IGNORECASE)
+_RE_QUALIFIED_REF = re.compile(r"\b\w+\.\w+\b")
+_RE_SELECT_FROM = re.compile(r"\bselect\b(.*?)\bfrom\b", re.IGNORECASE | re.DOTALL)
+_RE_AGGREGATE_FUNC = re.compile(r"\b(count|sum|avg|min|max)\s*\(", re.IGNORECASE)
+_RE_EXPLICIT_ID = re.compile(r"(^|[^\w])(_id|\"_id\")([^\w]|$)|\._id([^\w]|$)", re.IGNORECASE)
 
 
 
@@ -706,7 +710,7 @@ class ApexClient:
             # Allow execution without a selected table for DDL, CTE, or cross-database queries.
             # Cross-db queries use qualified db.table references (e.g. FROM default.users,
             # INSERT INTO analytics.events, UPDATE hr.employees, DELETE FROM default.logs).
-            _qualified = re.search(r'\b\w+\.\w+\b', sql)
+            _qualified = _RE_QUALIFIED_REF.search(sql)
             _has_qualified_ref = bool(_qualified and '.' in _qualified.group(0))
             if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE')
                     or sql_upper.startswith('WITH ') or _has_qualified_ref):
@@ -749,13 +753,12 @@ class ApexClient:
                 return rv
             
             # FAST PATH: SELECT * LIMIT N (small N) — direct columnar transfer (no IPC)
-            sql_up = sql.strip().upper()
-            if (sql_up.startswith('SELECT *') and 'LIMIT' in sql_up
-                    and 'WHERE' not in sql_up and 'ORDER' not in sql_up
-                    and 'GROUP' not in sql_up and 'JOIN' not in sql_up):
+            if (sql_upper.startswith('SELECT *') and 'LIMIT' in sql_upper
+                    and 'WHERE' not in sql_upper and 'ORDER' not in sql_upper
+                    and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper):
                 # Extract limit value — only use columnar path for small limits
                 try:
-                    limit_val = int(sql_up.rsplit('LIMIT', 1)[1].strip().rstrip(';'))
+                    limit_val = int(sql_upper.rsplit('LIMIT', 1)[1].strip().rstrip(';'))
                 except (ValueError, IndexError):
                     limit_val = 999999
                 if limit_val <= 500:
@@ -768,7 +771,7 @@ class ApexClient:
                                 rows = result['rows']
                                 columns_dict = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
                             if columns_dict is not None:
-                                rv = ResultView(lazy_pydict=dict(columns_dict))
+                                rv = ResultView(lazy_pydict=columns_dict)
                                 rv._show_internal_id = show_internal_id
                                 if len(self._query_cache) > 200:
                                     self._query_cache.clear()
@@ -780,11 +783,11 @@ class ApexClient:
             # FAST PATH: SELECT * WHERE col = 'val' — bypass pyarrow IPC for small results
             # Only safe when no writes have occurred (avoids stale data via different backend path)
             # Only for string equality (single-quoted value); skip numeric range / BETWEEN / IN
-            if (not self._has_writes and sql_up.startswith('SELECT *') and 'WHERE' in sql_up
-                    and 'LIMIT' not in sql_up and 'ORDER' not in sql_up
-                    and 'GROUP' not in sql_up and 'JOIN' not in sql_up
-                    and 'BETWEEN' not in sql_up and ' IN ' not in sql_up
-                    and '>' not in sql_up and '<' not in sql_up
+            if (not self._has_writes and sql_upper.startswith('SELECT *') and 'WHERE' in sql_upper
+                    and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+                    and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+                    and 'BETWEEN' not in sql_upper and ' IN ' not in sql_upper
+                    and '>' not in sql_upper and '<' not in sql_upper
                     and "'" in sql):
                 try:
                     result = self._storage.execute(sql)
@@ -915,7 +918,7 @@ class ApexClient:
             return False
         
         # Check if _id is explicitly in SELECT clause
-        m = re.search(r"\bselect\b(.*?)\bfrom\b", sql, flags=re.IGNORECASE | re.DOTALL)
+        m = _RE_SELECT_FROM.search(sql)
         if not m:
             return False
         
@@ -924,9 +927,9 @@ class ApexClient:
         # Check for explicit _id reference (not in aggregate functions)
         def has_explicit_id(item: str) -> bool:
             s = item.strip()
-            if re.search(r"\b(count|sum|avg|min|max)\s*\(", s, flags=re.IGNORECASE):
+            if _RE_AGGREGATE_FUNC.search(s):
                 return False
-            return bool(re.search(r"(^|[^\w])(_id|\"_id\")([^\w]|$)|\._id([^\w]|$)", s, flags=re.IGNORECASE))
+            return bool(_RE_EXPLICIT_ID.search(s))
         
         # Split select items handling parentheses
         items = []
