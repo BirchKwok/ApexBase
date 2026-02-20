@@ -504,23 +504,85 @@ client.close()
 
 ## Full-Text Search
 
-### Basic FTS
+FTS is available via two interfaces. The SQL interface (recommended) works over Python, PG Wire, and Arrow Flight. The Python API provides direct programmatic access.
+
+> See [FTS_GUIDE.md](FTS_GUIDE.md) for the complete reference.
+
+### SQL Interface (Recommended)
+
+```python
+client = ApexClient("./data")
+client.create_table("articles")
+
+# 1. Create the FTS index via SQL DDL
+client.execute("CREATE FTS INDEX ON articles (title, content)")
+
+# 2. Insert data — rows are indexed automatically
+client.store([
+    {"title": "Python Tutorial",     "content": "Learn Python programming"},
+    {"title": "Rust Guide",          "content": "Systems programming with Rust"},
+    {"title": "Database Design",     "content": "Designing efficient databases"},
+    {"title": "Machine Learning",    "content": "Deep learning with PyTorch"},
+])
+
+# 3. MATCH — all query terms must appear
+results = client.execute("SELECT * FROM articles WHERE MATCH('python')")
+print(results.to_pandas())
+#    _id            title                    content
+# 0    0  Python Tutorial  Learn Python programming
+
+# 4. FUZZY_MATCH — tolerates typos
+results = client.execute("SELECT * FROM articles WHERE FUZZY_MATCH('progaming')")
+
+# 5. Combine FTS with other predicates
+results = client.execute("""
+    SELECT title FROM articles
+    WHERE MATCH('programming') AND _id > 0
+    ORDER BY _id DESC LIMIT 5
+""")
+
+# 6. FTS + aggregation
+n = client.execute("SELECT COUNT(*) FROM articles WHERE MATCH('python')").scalar()
+print(f"Python articles: {n}")
+
+# 7. Manage indexes
+client.execute("SHOW FTS INDEXES")
+client.execute("ALTER FTS INDEX ON articles DISABLE")   # suspend, keep files
+client.execute("CREATE FTS INDEX ON articles (title)")  # re-enable
+client.execute("DROP FTS INDEX ON articles")            # remove + delete files
+
+client.close()
+```
+
+### FTS with Options
+
+```python
+# Large index: lazy loading + bigger cache
+client.execute("""
+    CREATE FTS INDEX ON logs (message, source)
+    WITH (lazy_load=true, cache_size=100000)
+""")
+
+# Cross-interface: after init, PG Wire and Arrow Flight can use MATCH() too
+# (No extra configuration needed — FTS registry is global in the Rust executor)
+```
+
+### Python API (Alternative)
 
 ```python
 client = ApexClient("./data")
 client.create_table("docs")
 
-# Add documents
 client.store([
     {"title": "Python Tutorial", "content": "Learn Python programming"},
-    {"title": "Rust Guide", "content": "Systems programming with Rust"},
-    {"title": "Database Design", "content": "Designing efficient databases"}
+    {"title": "Rust Guide",      "content": "Systems programming with Rust"},
+    {"title": "Database Design", "content": "Designing efficient databases"},
 ])
 
-# Initialize FTS
+# Initialize FTS (also registers with global SQL executor)
 client.init_fts(index_fields=["title", "content"])
 
-# Search - returns numpy array of IDs
+# Search — returns numpy array of _ids
 ids = client.search_text("Python")
 print(f"Found {len(ids)} documents")
 
@@ -535,15 +597,12 @@ top_results = client.search_and_retrieve_top("database", n=5)
 # Fuzzy search (tolerates typos)
 ids = client.fuzzy_search_text("progamming")  # Note typo
 
-# Get FTS stats
+# Stats
 stats = client.get_fts_stats()
 print(f"Documents: {stats['doc_count']}, Terms: {stats['term_count']}")
 
-# Disable FTS (keeps index files)
-client.disable_fts()
-
-# Drop FTS (disables and deletes index files)
-client.drop_fts()
+client.disable_fts()   # suspend (keep files)
+client.drop_fts()      # remove (delete files)
 
 client.close()
 ```

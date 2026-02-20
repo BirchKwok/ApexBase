@@ -251,16 +251,57 @@ client.execute("REINDEX users")
 
 ### Full-Text Search
 
+ApexBase ships a native full-text search engine (NanoFTS) integrated directly into the SQL executor. FTS is available through **all interfaces** — Python API, PostgreSQL Wire, and Arrow Flight — without any Python-side middleware.
+
+#### SQL interface (recommended)
+
 ```python
-client.init_fts(index_fields=["name", "city"])
+# 1. Create the FTS index via SQL DDL
+client.execute("CREATE FTS INDEX ON articles (title, content)")
 
-ids = client.search_text("Alice")
-records = client.search_and_retrieve("Beijing", limit=10)
-fuzzy = client.fuzzy_search_text("Alic")  # tolerates typos
+# Optional: specify lazy loading and cache size
+client.execute("CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)")
 
-client.get_fts_stats()
-client.drop_fts()
+# 2. Query using MATCH() / FUZZY_MATCH() in WHERE
+results = client.execute("SELECT * FROM articles WHERE MATCH('rust programming')")
+results = client.execute("SELECT title, content FROM articles WHERE FUZZY_MATCH('pytohn')")
+
+# Combine with other predicates
+results = client.execute("""
+    SELECT * FROM articles
+    WHERE MATCH('machine learning') AND published_at > '2024-01-01'
+    ORDER BY _id DESC LIMIT 20
+""")
+
+# FTS also works in aggregations
+count = client.execute("SELECT COUNT(*) FROM articles WHERE MATCH('deep learning')")
+
+# Manage indexes
+client.execute("SHOW FTS INDEXES")           # list all FTS-enabled tables
+client.execute("ALTER FTS INDEX ON articles DISABLE")  # disable, keep files
+client.execute("DROP FTS INDEX ON articles") # remove index + delete files
 ```
+
+#### Python API (alternative)
+
+```python
+# Initialize FTS for current table
+client.use_table("articles")
+client.init_fts(index_fields=["title", "content"])
+
+# Search
+ids    = client.search_text("database")
+fuzzy  = client.fuzzy_search_text("databse")   # tolerates typos
+recs   = client.search_and_retrieve("python", limit=10)
+top5   = client.search_and_retrieve_top("neural network", n=5)
+
+# Lifecycle
+client.get_fts_stats()
+client.disable_fts()   # suspend without deleting files
+client.drop_fts()      # remove index + delete files
+```
+
+> **Tip:** The SQL interface (`MATCH()` / `FUZZY_MATCH()`) works over PG Wire and Arrow Flight without any extra setup; the Python API methods are Python-process-only.
 
 ### Record-Level Operations
 
@@ -320,7 +361,7 @@ with ApexClient("./data") as client:
 ### ApexBase vs SQLite vs DuckDB (1M rows)
 
 Three-way comparison on macOS 26.3, Apple M1 Pro (10 cores), 32 GB RAM.
-Python 3.11.10, ApexBase v1.2.0, SQLite v3.45.3, DuckDB v1.1.3, PyArrow 19.0.0.
+Python 3.11.10, ApexBase v1.3.0, SQLite v3.45.3, DuckDB v1.1.3, PyArrow 19.0.0.
 
 Dataset: 1,000,000 rows × 5 columns (name, age, score, city, category).
 Average of 5 timed iterations after 2 warmup runs.

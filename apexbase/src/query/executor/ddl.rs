@@ -696,4 +696,181 @@ impl ApexExecutor {
         Ok(ApexResult::Scalar(inserted as i64))
     }
 
+    // ========== FTS DDL Handlers ==========
+
+    /// Path of the FTS config JSON file for a given database directory.
+    fn fts_config_path(base_dir: &Path) -> PathBuf {
+        base_dir.join("fts_config.json")
+    }
+
+    /// Read the fts_config.json as a serde_json::Value (object).  Returns empty object if missing.
+    fn read_fts_config(base_dir: &Path) -> serde_json::Value {
+        let path = Self::fts_config_path(base_dir);
+        if !path.exists() {
+            return serde_json::Value::Object(serde_json::Map::new());
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+            Err(_) => serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    /// Write the fts_config.json from a serde_json::Value.
+    fn write_fts_config(base_dir: &Path, cfg: &serde_json::Value) {
+        let path = Self::fts_config_path(base_dir);
+        if let Ok(s) = serde_json::to_string(cfg) {
+            let _ = std::fs::write(path, s);
+        }
+    }
+
+    /// CREATE FTS INDEX ON table [(col1, col2)] [WITH (lazy_load=.., cache_size=..)]
+    pub(super) fn execute_create_fts_index(
+        base_dir: &Path,
+        table: &str,
+        fields: Option<&[String]>,
+        lazy_load: bool,
+        cache_size: usize,
+    ) -> io::Result<ApexResult> {
+        use crate::fts::{FtsConfig, FtsManager};
+
+        // Update fts_config.json
+        let mut cfg = Self::read_fts_config(base_dir);
+        let obj = cfg.as_object_mut().ok_or_else(|| err_input("Corrupt fts_config.json"))?;
+        let table_cfg = serde_json::json!({
+            "enabled": true,
+            "index_fields": fields.map(|f| serde_json::json!(f)).unwrap_or(serde_json::Value::Null),
+            "config": {
+                "lazy_load": lazy_load,
+                "cache_size": cache_size
+            }
+        });
+        obj.insert(table.to_string(), table_cfg);
+        Self::write_fts_config(base_dir, &cfg);
+
+        // Ensure FtsManager for this base_dir exists and the engine for this table is created
+        let fts_cfg = FtsConfig {
+            lazy_load,
+            cache_size,
+            ..FtsConfig::default()
+        };
+        let fts_dir = base_dir.join("fts_indexes");
+        let mgr = {
+            let existing = crate::query::executor::get_fts_manager(base_dir);
+            match existing {
+                Some(m) => m,
+                None => {
+                    let m = std::sync::Arc::new(FtsManager::new(&fts_dir, fts_cfg));
+                    crate::query::executor::register_fts_manager(base_dir, m.clone());
+                    m
+                }
+            }
+        };
+        // Warm up the engine (creates it if not present)
+        let _ = mgr.get_engine(table);
+
+        let fields_desc = fields
+            .map(|f| f.join(", "))
+            .unwrap_or_else(|| "all string cols".to_string());
+        let msg = format!("FTS index created on '{}' (fields: {})", table, fields_desc);
+
+        // Return a one-row status RecordBatch
+        use arrow::array::StringArray;
+        use arrow::datatypes::{Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new("status", ArrowDataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema, vec![std::sync::Arc::new(StringArray::from(vec![msg.as_str()]))])
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(ApexResult::Data(batch))
+    }
+
+    /// DROP FTS INDEX ON table — remove config entry and delete index files
+    pub(super) fn execute_drop_fts_index(base_dir: &Path, table: &str) -> io::Result<ApexResult> {
+        // Update config
+        let mut cfg = Self::read_fts_config(base_dir);
+        if let Some(obj) = cfg.as_object_mut() {
+            obj.remove(table);
+        }
+        Self::write_fts_config(base_dir, &cfg);
+
+        // Remove from FTS manager if present
+        if let Some(mgr) = crate::query::executor::get_fts_manager(base_dir) {
+            let _ = mgr.remove_engine(table, true);
+        }
+
+        let msg = format!("FTS index dropped for table '{}'", table);
+        use arrow::array::StringArray;
+        use arrow::datatypes::{Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new("status", ArrowDataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema, vec![std::sync::Arc::new(StringArray::from(vec![msg.as_str()]))])
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(ApexResult::Data(batch))
+    }
+
+    /// ALTER FTS INDEX ON table DISABLE — mark disabled, keep files
+    pub(super) fn execute_alter_fts_index_disable(base_dir: &Path, table: &str) -> io::Result<ApexResult> {
+        let mut cfg = Self::read_fts_config(base_dir);
+        if let Some(obj) = cfg.as_object_mut() {
+            if let Some(entry) = obj.get_mut(table) {
+                if let Some(map) = entry.as_object_mut() {
+                    map.insert("enabled".to_string(), serde_json::Value::Bool(false));
+                }
+            }
+        }
+        Self::write_fts_config(base_dir, &cfg);
+
+        let msg = format!("FTS index disabled for table '{}' (index files kept)", table);
+        use arrow::array::StringArray;
+        use arrow::datatypes::{Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new("status", ArrowDataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema, vec![std::sync::Arc::new(StringArray::from(vec![msg.as_str()]))])
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(ApexResult::Data(batch))
+    }
+
+    /// SHOW FTS INDEXES — list all FTS-enabled tables for this database
+    pub(super) fn execute_show_fts_indexes(base_dir: &Path) -> io::Result<ApexResult> {
+        use arrow::array::{BooleanArray, Int64Array, StringArray};
+        use arrow::datatypes::{Field, Schema};
+
+        let cfg = Self::read_fts_config(base_dir);
+        let obj = cfg.as_object().cloned().unwrap_or_default();
+
+        let mut tables: Vec<String> = Vec::new();
+        let mut enabled_list: Vec<bool> = Vec::new();
+        let mut fields_list: Vec<String> = Vec::new();
+        let mut lazy_list: Vec<bool> = Vec::new();
+        let mut cache_list: Vec<i64> = Vec::new();
+
+        for (tname, entry) in &obj {
+            let enabled = entry.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            let fields = entry.get("index_fields")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+                .unwrap_or_else(|| "(all string cols)".to_string());
+            let inner = entry.get("config");
+            let lazy = inner.and_then(|c| c.get("lazy_load")).and_then(|v| v.as_bool()).unwrap_or(false);
+            let cache = inner.and_then(|c| c.get("cache_size")).and_then(|v| v.as_i64()).unwrap_or(10000);
+
+            tables.push(tname.clone());
+            enabled_list.push(enabled);
+            fields_list.push(fields);
+            lazy_list.push(lazy);
+            cache_list.push(cache);
+        }
+
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("table",      ArrowDataType::Utf8,    false),
+            Field::new("enabled",    ArrowDataType::Boolean, false),
+            Field::new("fields",     ArrowDataType::Utf8,    false),
+            Field::new("lazy_load",  ArrowDataType::Boolean, false),
+            Field::new("cache_size", ArrowDataType::Int64,   false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![
+            std::sync::Arc::new(StringArray::from(tables)),
+            std::sync::Arc::new(BooleanArray::from(enabled_list)),
+            std::sync::Arc::new(StringArray::from(fields_list)),
+            std::sync::Arc::new(BooleanArray::from(lazy_list)),
+            std::sync::Arc::new(Int64Array::from(cache_list)),
+        ]).map_err(|e| err_data(e.to_string()))?;
+        Ok(ApexResult::Data(batch))
+    }
 }

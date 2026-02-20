@@ -535,6 +535,94 @@ print(fields)  # ['_id', 'name', 'age', 'city']
 
 ### Full-Text Search
 
+FTS is implemented natively in Rust and available through all interfaces (Python API, PG Wire, Arrow Flight). The recommended way to manage and query FTS indexes is via SQL.
+
+#### FTS SQL DDL and Query Reference
+
+| Statement | Description |
+|-----------|-------------|
+| `CREATE FTS INDEX ON table (col1, col2)` | Create FTS index on specified columns |
+| `CREATE FTS INDEX ON table` | Create FTS index on all string columns |
+| `CREATE FTS INDEX ON table WITH (opt=val)` | Create with options |
+| `DROP FTS INDEX ON table` | Drop index and delete files |
+| `ALTER FTS INDEX ON table DISABLE` | Disable index, keep files |
+| `SHOW FTS INDEXES` | List all FTS-enabled tables |
+| `WHERE MATCH('query')` | Exact / ranked full-text search |
+| `WHERE FUZZY_MATCH('query')` | Fuzzy / typo-tolerant search |
+
+**`CREATE FTS INDEX`**
+```sql
+CREATE FTS INDEX ON table_name [(col1, col2, ...)] [WITH (lazy_load=bool, cache_size=N)]
+```
+- `(col1, col2)` — optional column list; omit to index all string columns
+- `lazy_load` — defer loading index into RAM until first search (default `false`)
+- `cache_size` — LRU cache entries for the index (default `10000`)
+
+```python
+client.execute("CREATE FTS INDEX ON articles (title, content)")
+client.execute("CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)")
+```
+
+**`DROP FTS INDEX`**
+```sql
+DROP FTS INDEX ON table_name
+```
+Removes the index entry and deletes the `.nfts` index files from disk.
+
+**`ALTER FTS INDEX ... DISABLE`**
+```sql
+ALTER FTS INDEX ON table_name DISABLE
+```
+Marks the index as disabled in the configuration without deleting files. The index can be re-enabled by running `CREATE FTS INDEX ON table_name` again.
+
+**`SHOW FTS INDEXES`**
+```sql
+SHOW FTS INDEXES
+```
+Returns a result set with columns: `table`, `enabled`, `fields`, `lazy_load`, `cache_size`.
+
+```python
+result = client.execute("SHOW FTS INDEXES")
+df = result.to_pandas()
+#    table  enabled          fields  lazy_load  cache_size
+# articles     True  title, content      False       10000
+```
+
+**`MATCH('query')`**
+
+Used in `WHERE` clauses to filter rows whose indexed text contains all query terms.
+
+```python
+# Simple search
+client.execute("SELECT * FROM articles WHERE MATCH('python tutorial')")
+
+# Combined with other conditions
+client.execute("""
+    SELECT title, content FROM articles
+    WHERE MATCH('machine learning') AND year >= 2023
+    ORDER BY _id DESC
+    LIMIT 10
+""")
+
+# Aggregations
+client.execute("SELECT COUNT(*) FROM articles WHERE MATCH('rust')")
+```
+
+**`FUZZY_MATCH('query')`**
+
+Like `MATCH()` but tolerates typos and spelling variations.
+
+```python
+client.execute("SELECT * FROM articles WHERE FUZZY_MATCH('pytohn')")   # matches 'python'
+client.execute("SELECT * FROM articles WHERE FUZZY_MATCH('databse')")  # matches 'database'
+```
+
+> **Note:** `MATCH()` / `FUZZY_MATCH()` require a FTS index to exist for the queried table. Use `CREATE FTS INDEX ON table` first. The SQL interface works over all transports (Python, PG Wire, Arrow Flight).
+
+---
+
+#### Python API
+
 #### init_fts
 ```python
 init_fts(

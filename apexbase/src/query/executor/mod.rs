@@ -332,8 +332,44 @@ fn invalidate_index_cache_dir(dir: &Path) {
     INDEX_CACHE.write().retain(|path, _| !path.starts_with(dir));
 }
 
+// ============================================================================
+// Global FTS Manager Cache
+// ============================================================================
+// Key: base_dir path (one FtsManager per database directory)
+// FtsManager internally manages one FtsEngine per table
+static FTS_MANAGER_CACHE: Lazy<RwLock<AHashMap<PathBuf, Arc<crate::fts::FtsManager>>>> =
+    Lazy::new(|| RwLock::new(AHashMap::with_capacity(8)));
+
+/// Return the FtsManager for a base_dir if one has been registered.
+pub fn get_fts_manager(base_dir: &Path) -> Option<Arc<crate::fts::FtsManager>> {
+    FTS_MANAGER_CACHE.read().get(base_dir).cloned()
+}
+
+/// Register (or replace) the FtsManager for a base_dir.
+/// Called by Python `_init_fts()` and by the `CREATE FTS INDEX` DDL handler.
+pub fn register_fts_manager(base_dir: &Path, manager: Arc<crate::fts::FtsManager>) {
+    FTS_MANAGER_CACHE.write().insert(base_dir.to_path_buf(), manager);
+}
+
+/// Get or lazily create a FtsManager for a base_dir.
+/// Creates the manager with default config; actual per-table engine is created on demand.
+fn get_or_create_fts_manager(base_dir: &Path) -> Arc<crate::fts::FtsManager> {
+    if let Some(mgr) = FTS_MANAGER_CACHE.read().get(base_dir).cloned() {
+        return mgr;
+    }
+    let fts_dir = base_dir.join("fts_indexes");
+    let mgr = Arc::new(crate::fts::FtsManager::new(&fts_dir, crate::fts::FtsConfig::default()));
+    FTS_MANAGER_CACHE.write().entry(base_dir.to_path_buf()).or_insert_with(|| mgr.clone());
+    mgr
+}
+
 /// Derive (base_dir, table_name) from a storage_path like /data/users.apex
 fn base_dir_and_table(storage_path: &Path) -> (PathBuf, String) {
+    base_dir_and_table_pub(storage_path)
+}
+
+/// Public (crate-visible) version for use in submodules.
+pub(crate) fn base_dir_and_table_pub(storage_path: &Path) -> (PathBuf, String) {
     let base_dir = storage_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let table_name = storage_path.file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -843,6 +879,19 @@ impl ApexExecutor {
             }
             SqlStatement::Pragma { name, arg } => {
                 Self::execute_pragma(base_dir, default_table_path, &name, arg.as_deref())
+            }
+            // FTS DDL Statements
+            SqlStatement::CreateFtsIndex { table, fields, lazy_load, cache_size } => {
+                Self::execute_create_fts_index(base_dir, &table, fields.as_deref(), lazy_load, cache_size)
+            }
+            SqlStatement::DropFtsIndex { table } => {
+                Self::execute_drop_fts_index(base_dir, &table)
+            }
+            SqlStatement::AlterFtsIndexDisable { table } => {
+                Self::execute_alter_fts_index_disable(base_dir, &table)
+            }
+            SqlStatement::ShowFtsIndexes => {
+                Self::execute_show_fts_indexes(base_dir)
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,

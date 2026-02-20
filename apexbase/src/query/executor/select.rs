@@ -2,7 +2,16 @@
 
 impl ApexExecutor {
     /// Execute SELECT statement with base_dir for proper subquery table resolution
-    fn execute_select_with_base_dir(stmt: SelectStatement, storage_path: &Path, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+    fn execute_select_with_base_dir(mut stmt: SelectStatement, storage_path: &Path, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+        // Resolve MATCH()/FUZZY_MATCH() predicates to _id IN (...) before anything else
+        if let Some(ref wc) = stmt.where_clause {
+            if Self::expr_has_fts_match(wc) {
+                let (_, table_name) = crate::query::executor::base_dir_and_table_pub(storage_path);
+                let resolved = Self::resolve_fts_in_expr(stmt.where_clause.take().unwrap(), base_dir, &table_name)?;
+                stmt.where_clause = Some(resolved);
+            }
+        }
+
         // FAST PATH: Pure COUNT(*) without WHERE/GROUP BY - O(1) from metadata
         if Self::is_pure_count_star(&stmt) {
             if !storage_path.exists() {
@@ -2216,4 +2225,70 @@ impl ApexExecutor {
         }
     }
 
+    // ========== FTS Helper: resolve MATCH()/FUZZY_MATCH() to _id IN (...) ==========
+
+    /// Recursively replace every `FtsMatch { query, fuzzy }` node in an expression with
+    /// `In { column: "_id", values: [matching doc ids] }`.  Requires the FtsManager to
+    /// be registered for `base_dir` (via `register_fts_manager` or `CREATE FTS INDEX`).
+    fn resolve_fts_in_expr(expr: SqlExpr, base_dir: &Path, table_name: &str) -> io::Result<SqlExpr> {
+        match expr {
+            SqlExpr::FtsMatch { query, fuzzy } => {
+                let mgr = crate::query::executor::get_fts_manager(base_dir)
+                    .ok_or_else(|| io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("FTS not initialised for this database. Run CREATE FTS INDEX ON {} first.", table_name),
+                    ))?;
+                let engine = mgr.get_engine(table_name)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                let ids: Vec<u64> = if fuzzy {
+                    engine.fuzzy_search(&query, 1)
+                        .map(|r| r.iter().map(|id| id as u64).collect())
+                        .unwrap_or_default()
+                } else {
+                    engine.search_ids(&query)
+                        .unwrap_or_default()
+                };
+                if ids.is_empty() {
+                    // _id < 0  — guaranteed empty (all valid _id are >= 0)
+                    Ok(SqlExpr::BinaryOp {
+                        left:  Box::new(SqlExpr::Column("_id".to_string())),
+                        op:    crate::query::sql_parser::BinaryOperator::Lt,
+                        right: Box::new(SqlExpr::Literal(crate::data::Value::Int64(0))),
+                    })
+                } else {
+                    let values: Vec<crate::data::Value> = ids.into_iter()
+                        .map(|id| crate::data::Value::Int64(id as i64))
+                        .collect();
+                    Ok(SqlExpr::In { column: "_id".to_string(), values, negated: false })
+                }
+            }
+            SqlExpr::BinaryOp { left, op, right } => {
+                Ok(SqlExpr::BinaryOp {
+                    left:  Box::new(Self::resolve_fts_in_expr(*left,  base_dir, table_name)?),
+                    op,
+                    right: Box::new(Self::resolve_fts_in_expr(*right, base_dir, table_name)?),
+                })
+            }
+            SqlExpr::UnaryOp { op, expr } => {
+                Ok(SqlExpr::UnaryOp { op, expr: Box::new(Self::resolve_fts_in_expr(*expr, base_dir, table_name)?) })
+            }
+            SqlExpr::Paren(inner) => {
+                Ok(SqlExpr::Paren(Box::new(Self::resolve_fts_in_expr(*inner, base_dir, table_name)?)))
+            }
+            // All other variants have no nested SqlExpr that could contain FtsMatch
+            other => Ok(other),
+        }
+    }
+
+    /// Return true iff `expr` contains at least one `FtsMatch` node.
+    fn expr_has_fts_match(expr: &SqlExpr) -> bool {
+        match expr {
+            SqlExpr::FtsMatch { .. } => true,
+            SqlExpr::BinaryOp { left, right, .. } =>
+                Self::expr_has_fts_match(left) || Self::expr_has_fts_match(right),
+            SqlExpr::UnaryOp { expr, .. } => Self::expr_has_fts_match(expr),
+            SqlExpr::Paren(inner) => Self::expr_has_fts_match(inner),
+            _ => false,
+        }
+    }
 }

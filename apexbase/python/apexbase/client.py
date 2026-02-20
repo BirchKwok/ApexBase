@@ -32,6 +32,7 @@ _RE_CREATE_TABLE = re.compile(r"\bcreate\s+(table|view)\b", re.IGNORECASE)
 _RE_FROM_TABLE = re.compile(r"\bfrom\s+([\w]+(?:\.[\w]+)?)", re.IGNORECASE)
 
 
+
 class ApexClient:
     """
     ApexClient - High-performance embedded database client
@@ -696,7 +697,7 @@ class ApexClient:
         self._check_connection()
         # DDL (CREATE TABLE) is allowed without a table selected
         sql_upper = sql.strip().upper()
-        
+
         # Detect multi-statement SQL: contains ';' with non-whitespace content after
         _trimmed = sql.strip().rstrip(';').strip()
         is_multi_stmt = ';' in _trimmed

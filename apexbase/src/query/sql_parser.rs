@@ -80,6 +80,11 @@ pub enum SqlStatement {
     CopyFromParquet { table: String, file_path: String },
     Reindex { table: String },
     Pragma { name: String, arg: Option<String> },
+    // FTS DDL Statements
+    CreateFtsIndex { table: String, fields: Option<Vec<String>>, lazy_load: bool, cache_size: usize },
+    DropFtsIndex { table: String },
+    AlterFtsIndexDisable { table: String },
+    ShowFtsIndexes,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +227,8 @@ pub enum SqlExpr {
     Between { column: String, low: Box<SqlExpr>, high: Box<SqlExpr>, negated: bool },
     /// IS NULL / IS NOT NULL
     IsNull { column: String, negated: bool },
+    /// FTS: MATCH('query') or FUZZY_MATCH('query') in WHERE clause
+    FtsMatch { query: String, fuzzy: bool },
     /// Function call
     Function { name: String, args: Vec<SqlExpr> },
     /// CAST(expr AS TYPE)
@@ -415,6 +422,7 @@ impl SelectStatement {
             SqlExpr::UnaryOp { expr, .. } => {
                 Self::extract_columns_from_expr(expr, columns);
             }
+            SqlExpr::FtsMatch { .. } => {} // FTS — no column to extract
             SqlExpr::Like { column, .. } | 
             SqlExpr::Regexp { column, .. } |
             SqlExpr::In { column, .. } |
@@ -1343,6 +1351,54 @@ impl SqlParser {
                         };
                         Ok(SqlStatement::CreateTable { table, columns, if_not_exists })
                     }
+                    Token::Identifier(ref fts_kw) if fts_kw.to_uppercase() == "FTS" && !unique => {
+                        // CREATE FTS INDEX ON table [(col1, col2)] [WITH (opt=val, ...)]
+                        self.advance(); // consume FTS
+                        // Expect INDEX keyword (as identifier or Token::Index)
+                        match self.current().clone() {
+                            Token::Index => { self.advance(); }
+                            Token::Identifier(ref s) if s.to_uppercase() == "INDEX" => { self.advance(); }
+                            other => return Err(ApexError::QueryParseError(
+                                format!("Expected INDEX after CREATE FTS, got {:?}", other)
+                            )),
+                        }
+                        self.expect(Token::On)?;
+                        let table = self.parse_identifier()?;
+                        // Optional column list
+                        let fields = if matches!(self.current(), Token::LParen) {
+                            self.advance();
+                            let cols = self.parse_identifier_list()?;
+                            self.expect(Token::RParen)?;
+                            Some(cols)
+                        } else { None };
+                        // Optional WITH (key=value, ...)
+                        let mut lazy_load = false;
+                        let mut cache_size: usize = 10000;
+                        if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "WITH") {
+                            self.advance();
+                            self.expect(Token::LParen)?;
+                            loop {
+                                let key = self.parse_identifier()?.to_lowercase();
+                                self.expect(Token::Eq)?;
+                                let val = match self.current().clone() {
+                                    Token::Identifier(v) => { self.advance(); v }
+                                    Token::IntLit(n) => { self.advance(); n.to_string() }
+                                    Token::True => { self.advance(); "true".to_string() }
+                                    Token::False => { self.advance(); "false".to_string() }
+                                    other => return Err(ApexError::QueryParseError(format!("Expected value in WITH options, got {:?}", other))),
+                                };
+                                match key.as_str() {
+                                    "lazy_load" => lazy_load = matches!(val.to_lowercase().as_str(), "true" | "1"),
+                                    "cache_size" => cache_size = val.parse().unwrap_or(10000),
+                                    _ => {}
+                                }
+                                if !matches!(self.current(), Token::Comma) { break; }
+                                self.advance();
+                            }
+                            self.expect(Token::RParen)?;
+                        }
+                        return Ok(SqlStatement::CreateFtsIndex { table, fields, lazy_load, cache_size });
+                    }
                     Token::Index => {
                         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col1[, col2, ...]) [USING HASH|BTREE]
                         self.advance();
@@ -1387,6 +1443,20 @@ impl SqlParser {
                         let table = self.parse_table_name()?;
                         Ok(SqlStatement::DropTable { table, if_exists })
                     }
+                    Token::Identifier(ref fts_kw) if fts_kw.to_uppercase() == "FTS" => {
+                        // DROP FTS INDEX ON table
+                        self.advance(); // consume FTS
+                        match self.current().clone() {
+                            Token::Index => { self.advance(); }
+                            Token::Identifier(ref s) if s.to_uppercase() == "INDEX" => { self.advance(); }
+                            other => return Err(ApexError::QueryParseError(
+                                format!("Expected INDEX after DROP FTS, got {:?}", other)
+                            )),
+                        }
+                        self.expect(Token::On)?;
+                        let table = self.parse_identifier()?;
+                        Ok(SqlStatement::DropFtsIndex { table })
+                    }
                     Token::Index => {
                         // DROP INDEX [IF EXISTS] name ON table
                         self.advance();
@@ -1404,6 +1474,27 @@ impl SqlParser {
             }
             Token::Alter => {
                 self.advance();
+                // Detect ALTER FTS INDEX ON table DISABLE
+                if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "FTS") {
+                    self.advance(); // consume FTS
+                    match self.current().clone() {
+                        Token::Index => { self.advance(); }
+                        Token::Identifier(ref s) if s.to_uppercase() == "INDEX" => { self.advance(); }
+                        other => return Err(ApexError::QueryParseError(
+                            format!("Expected INDEX after ALTER FTS, got {:?}", other)
+                        )),
+                    }
+                    self.expect(Token::On)?;
+                    let table = self.parse_identifier()?;
+                    // Expect DISABLE
+                    match self.current().clone() {
+                        Token::Identifier(ref s) if s.to_uppercase() == "DISABLE" => { self.advance(); }
+                        other => return Err(ApexError::QueryParseError(
+                            format!("Expected DISABLE after ALTER FTS INDEX ON table, got {:?}", other)
+                        )),
+                    }
+                    return Ok(SqlStatement::AlterFtsIndexDisable { table });
+                }
                 self.expect(Token::Table)?;
                 let table = self.parse_table_name()?;
                 let operation = self.parse_alter_operation()?;
@@ -1596,6 +1687,25 @@ impl SqlParser {
                             }
                             let name = self.parse_identifier()?;
                             return Ok(SqlStatement::ReleaseSavepoint { name });
+                        }
+                        "SHOW" => {
+                            self.advance();
+                            // SHOW FTS INDEXES
+                            match self.current().clone() {
+                                Token::Identifier(ref s) if s.to_uppercase() == "FTS" => {
+                                    self.advance();
+                                    // consume INDEXES or INDEX
+                                    if matches!(self.current(), Token::Index)
+                                        || matches!(self.current(), Token::Identifier(ref s2) if s2.to_uppercase() == "INDEXES" || s2.to_uppercase() == "INDEX")
+                                    {
+                                        self.advance();
+                                    }
+                                    return Ok(SqlStatement::ShowFtsIndexes);
+                                }
+                                other => return Err(ApexError::QueryParseError(
+                                    format!("Expected FTS after SHOW, got {:?}", other)
+                                )),
+                            }
                         }
                         "REINDEX" => {
                             self.advance();
@@ -2849,7 +2959,21 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
             Token::Identifier(name) => {
                 self.advance();
 
+                // Intercept MATCH('text') and FUZZY_MATCH('text') before generic function call
                 if matches!(self.current(), Token::LParen) {
+                    let upper = name.to_uppercase();
+                    if upper == "MATCH" || upper == "FUZZY_MATCH" {
+                        let fuzzy = upper == "FUZZY_MATCH";
+                        self.advance(); // consume '('
+                        let query = match self.current().clone() {
+                            Token::StringLit(s) => { self.advance(); s }
+                            other => return Err(ApexError::QueryParseError(
+                                format!("MATCH() requires a string literal, got {:?}", other)
+                            )),
+                        };
+                        self.expect(Token::RParen)?;
+                        return Ok(SqlExpr::FtsMatch { query, fuzzy });
+                    }
                     return self.parse_function_call_from_name(name);
                 }
 

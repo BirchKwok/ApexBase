@@ -9,6 +9,7 @@ Complete documentation for ApexBase — a high-performance HTAP embedded databas
 | [Quick Start](QUICK_START.md) | Get started in 5 minutes |
 | [API Reference](API_REFERENCE.md) | Complete API documentation (100% coverage) |
 | [Examples](EXAMPLES.md) | Code examples and use cases |
+| [FTS Guide](FTS_GUIDE.md) | Full-text search SQL reference and examples |
 | [Storage Architecture](STORAGE_ARCHITECTURE.md) | V4 Row Group format, engine internals |
 | [HTAP Roadmap](HTAP_ROADMAP.md) | Roadmap and current status |
 | [Root README](../README.md) | Project overview, benchmarks, installation |
@@ -70,7 +71,7 @@ client.close()
 - **Single-file storage** — custom `.apex` format, no server, no external dependencies
 - **Full SQL support** — DDL, DML, aggregations, GROUP BY, HAVING, ORDER BY, JOINs, cross-db queries
 - **DataFrame integration** — native Pandas / Polars / PyArrow support via zero-copy Arrow IPC
-- **Full-text search** — built-in NanoFTS with fuzzy matching
+- **Full-text search** — SQL-native NanoFTS (`MATCH` / `FUZZY_MATCH` in `WHERE`; `CREATE / DROP / SHOW FTS INDEX`); works over PG Wire and Arrow Flight
 - **JIT compilation** — Cranelift-based JIT for predicate evaluation
 - **Durability** — configurable `fast` / `safe` / `max` with WAL support
 - **PostgreSQL wire protocol** — connect DBeaver, psql, DataGrip, pgAdmin, Navicat, and any libpq client
@@ -96,6 +97,7 @@ docs/
 ├── QUICK_START.md            # 5-minute quick start guide
 ├── API_REFERENCE.md          # Complete API reference (100% coverage)
 ├── EXAMPLES.md               # Real-world usage examples
+├── FTS_GUIDE.md              # Full-text search SQL reference and guide
 ├── STORAGE_ARCHITECTURE.md   # V4 Row Group format, engine design
 └── HTAP_ROADMAP.md           # Roadmap and status
 

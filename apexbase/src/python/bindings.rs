@@ -150,8 +150,8 @@ pub struct ApexStorageImpl {
     cached_backends: RwLock<HashMap<String, Arc<TableStorageBackend>>>,
     /// Current table name
     current_table: RwLock<String>,
-    /// FTS Manager (optional)
-    fts_manager: RwLock<Option<FtsManager>>,
+    /// FTS Manager (optional) — Arc so it can be shared with the global SQL executor registry
+    fts_manager: RwLock<Option<Arc<FtsManager>>>,
     /// FTS index field names per table
     fts_index_fields: RwLock<HashMap<String, Vec<String>>>,
     /// Durability level for ACID guarantees
@@ -445,7 +445,7 @@ impl ApexStorageImpl {
             tables_scanned: RwLock::new(false),
             cached_backends: RwLock::new(HashMap::new()),
             current_table: RwLock::new(String::new()),
-            fts_manager: RwLock::new(None),
+            fts_manager: RwLock::new(None::<Arc<FtsManager>>),
             fts_index_fields: RwLock::new(HashMap::new()),
             durability: durability_level,
             current_txn_id: RwLock::new(None),
@@ -2377,8 +2377,16 @@ impl ApexStorageImpl {
                 cache_size,
                 ..FtsConfig::default()
             };
-            let manager = FtsManager::new(&fts_dir, config);
+            let manager = Arc::new(FtsManager::new(&fts_dir, config));
+            // Register with the global SQL executor registry (enables MATCH() in PG Wire / Arrow Flight)
+            crate::query::executor::register_fts_manager(&self.current_base_dir(), manager.clone());
             *self.fts_manager.write() = Some(manager);
+        } else {
+            // Already initialized — ensure global registry is up to date
+            let mgr_arc = self.fts_manager.read().clone();
+            if let Some(m) = mgr_arc {
+                crate::query::executor::register_fts_manager(&self.current_base_dir(), m);
+            }
         }
 
         // Touch/create engine for current table
