@@ -994,5 +994,296 @@ class TestFTSEdgeCases:
             client.close()
 
 
+class TestFTSSQLSync:
+    """Test SQL-driven FTS sync: backfill on CREATE, INSERT/DELETE sync, ALTER ENABLE backfill,
+    and SHOW FTS INDEXES cross-database support."""
+
+    def test_create_fts_index_backfills_existing_rows(self):
+        """CREATE FTS INDEX on a non-empty table should index all existing rows."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE articles (title TEXT, body TEXT, views INT)")
+            client.execute("INSERT INTO articles (title, body, views) VALUES ('Hello World', 'intro doc', 1)")
+            client.execute("INSERT INTO articles (title, body, views) VALUES ('Rust Lang', 'systems doc', 2)")
+            client.execute("INSERT INTO articles (title, body, views) VALUES ('Python Tips', 'scripting doc', 3)")
+
+            result = client.execute("CREATE FTS INDEX ON articles")
+            status = result.to_pandas()["status"][0]
+            assert "3 rows indexed" in status, f"Expected 3 rows indexed, got: {status}"
+
+            # Verify all three rows are searchable after backfill
+            df = client.execute("SELECT * FROM articles WHERE MATCH('Rust')").to_pandas()
+            assert len(df) == 1
+            assert df.iloc[0]["title"] == "Rust Lang"
+
+            df2 = client.execute("SELECT * FROM articles WHERE MATCH('doc')").to_pandas()
+            assert len(df2) == 3
+
+            client.close()
+
+    def test_create_fts_index_on_empty_table(self):
+        """CREATE FTS INDEX on an empty table should succeed with 0 rows indexed."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE docs (content TEXT)")
+
+            result = client.execute("CREATE FTS INDEX ON docs")
+            status = result.to_pandas()["status"][0]
+            assert "0 rows indexed" in status, f"Expected 0 rows indexed, got: {status}"
+
+            client.close()
+
+    def test_create_fts_index_with_specific_fields_backfills(self):
+        """CREATE FTS INDEX ON table (col) should only index the specified field."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE docs (title TEXT, body TEXT)")
+            client.execute("INSERT INTO docs (title, body) VALUES ('alpha term', 'beta term')")
+
+            result = client.execute("CREATE FTS INDEX ON docs (title)")
+            status = result.to_pandas()["status"][0]
+            assert "1 rows indexed" in status
+
+            # title field indexed → match
+            df = client.execute("SELECT * FROM docs WHERE MATCH('alpha')").to_pandas()
+            assert len(df) == 1
+
+            client.close()
+
+    def test_sql_insert_syncs_fts(self):
+        """SQL INSERT into a table with an active FTS index should auto-index new rows."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE news (headline TEXT, summary TEXT)")
+            client.execute("CREATE FTS INDEX ON news")
+
+            # Insert after index creation
+            client.execute("INSERT INTO news (headline, summary) VALUES ('Breaking News', 'something happened')")
+            client.execute("INSERT INTO news (headline, summary) VALUES ('Sports Update', 'team won')")
+
+            df = client.execute("SELECT * FROM news WHERE MATCH('Breaking')").to_pandas()
+            assert len(df) == 1
+            assert df.iloc[0]["headline"] == "Breaking News"
+
+            df2 = client.execute("SELECT * FROM news WHERE MATCH('team')").to_pandas()
+            assert len(df2) == 1
+
+            client.close()
+
+    def test_sql_insert_multiple_rows_syncs_fts(self):
+        """Multi-row SQL INSERT should index all new rows in FTS."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE items (name TEXT)")
+            client.execute("CREATE FTS INDEX ON items")
+
+            client.execute("INSERT INTO items (name) VALUES ('apple'), ('banana'), ('cherry')")
+
+            for fruit in ["apple", "banana", "cherry"]:
+                df = client.execute(f"SELECT * FROM items WHERE MATCH('{fruit}')").to_pandas()
+                assert len(df) == 1, f"Expected 1 result for '{fruit}', got {len(df)}"
+
+            client.close()
+
+    def test_sql_delete_syncs_fts(self):
+        """SQL DELETE should remove deleted rows from the FTS index."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE posts (title TEXT, category TEXT)")
+            client.execute("INSERT INTO posts (title, category) VALUES ('Machine Learning', 'tech')")
+            client.execute("INSERT INTO posts (title, category) VALUES ('Deep Learning', 'tech')")
+            client.execute("INSERT INTO posts (title, category) VALUES ('Cooking Recipes', 'food')")
+            client.execute("CREATE FTS INDEX ON posts")
+
+            # Verify all indexed
+            df = client.execute("SELECT * FROM posts WHERE MATCH('Learning')").to_pandas()
+            assert len(df) == 2
+
+            # Delete one row
+            client.execute("DELETE FROM posts WHERE title = 'Machine Learning'")
+
+            # Should no longer appear in FTS results
+            df = client.execute("SELECT * FROM posts WHERE MATCH('Machine')").to_pandas()
+            assert len(df) == 0, f"Deleted row still found in FTS: {df}"
+
+            # Other row should still be indexed
+            df2 = client.execute("SELECT * FROM posts WHERE MATCH('Deep')").to_pandas()
+            assert len(df2) == 1
+
+            client.close()
+
+    def test_sql_delete_all_rows_syncs_fts(self):
+        """DELETE without WHERE (delete all) should remove all rows from FTS index."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE logs (message TEXT)")
+            client.execute("INSERT INTO logs (message) VALUES ('error occurred'), ('warning raised'), ('info logged')")
+            client.execute("CREATE FTS INDEX ON logs")
+
+            df = client.execute("SELECT * FROM logs WHERE MATCH('error')").to_pandas()
+            assert len(df) == 1
+
+            client.execute("DELETE FROM logs")
+
+            df = client.execute("SELECT * FROM logs WHERE MATCH('error')").to_pandas()
+            assert len(df) == 0, "FTS still returns results after DELETE all"
+
+            client.close()
+
+    def test_alter_fts_index_enable_backfills(self):
+        """ALTER FTS INDEX ON table ENABLE should backfill rows inserted while FTS was disabled."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE wiki (title TEXT, content TEXT)")
+            client.execute("INSERT INTO wiki (title, content) VALUES ('Initial', 'first entry')")
+            client.execute("CREATE FTS INDEX ON wiki")
+
+            # Disable FTS
+            client.execute("ALTER FTS INDEX ON wiki DISABLE")
+
+            # Insert while disabled (will NOT be indexed)
+            client.execute("INSERT INTO wiki (title, content) VALUES ('Added While Disabled', 'absent content')")
+
+            # Re-enable — should backfill ALL rows (including the missed one)
+            result = client.execute("ALTER FTS INDEX ON wiki ENABLE")
+            status = result.to_pandas()["status"][0]
+            assert "rows indexed" in status, f"Expected rows indexed message, got: {status}"
+
+            # The row added while disabled should now be findable
+            df = client.execute("SELECT * FROM wiki WHERE MATCH('absent')").to_pandas()
+            assert len(df) == 1, f"Row inserted while disabled not found after re-enable: {df}"
+
+            # Original row should also be findable
+            df2 = client.execute("SELECT * FROM wiki WHERE MATCH('first')").to_pandas()
+            assert len(df2) == 1
+
+            client.close()
+
+    def test_alter_fts_index_enable_on_fresh_table(self):
+        """ALTER FTS INDEX ON table ENABLE on a table with no prior index should create and backfill."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE catalog (name TEXT, description TEXT)")
+            client.execute("INSERT INTO catalog (name, description) VALUES ('Widget A', 'blue widget')")
+            client.execute("INSERT INTO catalog (name, description) VALUES ('Widget B', 'red widget')")
+
+            result = client.execute("ALTER FTS INDEX ON catalog ENABLE")
+            status = result.to_pandas()["status"][0]
+            assert "rows indexed" in status
+
+            df = client.execute("SELECT * FROM catalog WHERE MATCH('blue')").to_pandas()
+            assert len(df) == 1
+            assert df.iloc[0]["name"] == "Widget A"
+
+            client.close()
+
+    def test_show_fts_indexes_has_database_column(self):
+        """SHOW FTS INDEXES must include a 'database' column."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE t1 (content TEXT)")
+            client.execute("CREATE FTS INDEX ON t1")
+
+            result = client.execute("SHOW FTS INDEXES")
+            df = result.to_pandas()
+
+            assert "database" in df.columns, f"Missing 'database' column. Columns: {list(df.columns)}"
+            assert "table" in df.columns
+            assert "enabled" in df.columns
+            assert "fields" in df.columns
+            assert "lazy_load" in df.columns
+            assert "cache_size" in df.columns
+
+            # At least one row for 't1'
+            assert len(df) >= 1
+            assert "t1" in df["table"].values
+
+            client.close()
+
+    def test_show_fts_indexes_reflects_enabled_state(self):
+        """SHOW FTS INDEXES should accurately reflect enabled/disabled state."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE docs (content TEXT)")
+            client.execute("CREATE FTS INDEX ON docs")
+
+            df = client.execute("SHOW FTS INDEXES").to_pandas()
+            row = df[df["table"] == "docs"].iloc[0]
+            assert row["enabled"] is True or row["enabled"] == True
+
+            client.execute("ALTER FTS INDEX ON docs DISABLE")
+
+            df2 = client.execute("SHOW FTS INDEXES").to_pandas()
+            row2 = df2[df2["table"] == "docs"].iloc[0]
+            assert row2["enabled"] is False or row2["enabled"] == False
+
+            client.execute("ALTER FTS INDEX ON docs ENABLE")
+
+            df3 = client.execute("SHOW FTS INDEXES").to_pandas()
+            row3 = df3[df3["table"] == "docs"].iloc[0]
+            assert row3["enabled"] is True or row3["enabled"] == True
+
+            client.close()
+
+    def test_show_fts_indexes_multiple_tables(self):
+        """SHOW FTS INDEXES should list all tables that have FTS configured."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE t1 (a TEXT)")
+            client.execute("CREATE TABLE t2 (b TEXT)")
+            client.execute("CREATE TABLE t3 (c TEXT)")
+            client.execute("CREATE FTS INDEX ON t1")
+            client.execute("CREATE FTS INDEX ON t2")
+            client.execute("CREATE FTS INDEX ON t3")
+
+            df = client.execute("SHOW FTS INDEXES").to_pandas()
+            tables = set(df["table"].values)
+            assert {"t1", "t2", "t3"}.issubset(tables)
+
+            client.close()
+
+    def test_fts_insert_then_delete_consistency(self):
+        """INSERT then DELETE for the same row should leave FTS consistent."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE events (name TEXT, type TEXT)")
+            client.execute("CREATE FTS INDEX ON events")
+
+            client.execute("INSERT INTO events (name, type) VALUES ('Launch', 'product')")
+            client.execute("INSERT INTO events (name, type) VALUES ('Conference', 'meetup')")
+
+            # Verify both indexed
+            df = client.execute("SELECT * FROM events WHERE MATCH('Launch')").to_pandas()
+            assert len(df) == 1
+
+            # Delete the inserted row
+            client.execute("DELETE FROM events WHERE name = 'Launch'")
+
+            # Should not appear in FTS
+            df2 = client.execute("SELECT * FROM events WHERE MATCH('Launch')").to_pandas()
+            assert len(df2) == 0
+
+            # Other row untouched
+            df3 = client.execute("SELECT * FROM events WHERE MATCH('Conference')").to_pandas()
+            assert len(df3) == 1
+
+            client.close()
+
+    def test_fts_backfill_respects_index_fields(self):
+        """Backfill on CREATE FTS INDEX ON table (col) should only index specified columns."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.execute("CREATE TABLE products (name TEXT, secret TEXT)")
+            client.execute("INSERT INTO products (name, secret) VALUES ('visible item', 'hidden data')")
+
+            client.execute("CREATE FTS INDEX ON products (name)")
+
+            # 'name' field is indexed → should find
+            df = client.execute("SELECT * FROM products WHERE MATCH('visible')").to_pandas()
+            assert len(df) == 1
+
+            client.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

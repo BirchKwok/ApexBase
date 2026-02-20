@@ -927,6 +927,148 @@ impl ApexExecutor {
         let _ = idx_mgr.save();
     }
 
+    /// Notify FTS index about newly inserted rows.
+    /// Called after SQL INSERT completes. Indexes new rows' string columns in FTS.
+    fn notify_fts_insert(storage_path: &Path, storage: &TableStorageBackend, start_row_count: u64) {
+        use arrow::array::{Int64Array, StringArray, UInt64Array};
+
+        let (base_dir, table_name) = base_dir_and_table(storage_path);
+
+        // Check if FTS is enabled for this table via config
+        let cfg = Self::read_fts_config(&base_dir);
+        let table_cfg = cfg.as_object().and_then(|o| o.get(&table_name));
+        let enabled = table_cfg
+            .and_then(|e| e.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(false);
+        if !enabled {
+            return;
+        }
+
+        let fields: Option<Vec<String>> = table_cfg
+            .and_then(|e| e.get("index_fields"))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+
+        // Get or create FTS manager for this database
+        let mgr_arc = {
+            if let Some(m) = get_fts_manager(&base_dir) {
+                m
+            } else {
+                let lazy_load = table_cfg.and_then(|e| e.get("config")).and_then(|c| c.get("lazy_load")).and_then(|v| v.as_bool()).unwrap_or(false);
+                let cache_size = table_cfg.and_then(|e| e.get("config")).and_then(|c| c.get("cache_size")).and_then(|v| v.as_u64()).unwrap_or(10000) as usize;
+                let fts_dir = base_dir.join("fts_indexes");
+                let fts_cfg = crate::fts::FtsConfig { lazy_load, cache_size, ..crate::fts::FtsConfig::default() };
+                let m = std::sync::Arc::new(crate::fts::FtsManager::new(&fts_dir, fts_cfg));
+                crate::query::executor::register_fts_manager(&base_dir, m.clone());
+                m
+            }
+        };
+
+        let engine = match mgr_arc.get_engine(&table_name) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        // Determine string columns to index
+        let schema = storage.get_schema();
+        let string_cols: Vec<String> = if let Some(f) = &fields {
+            f.clone()
+        } else {
+            schema.iter()
+                .filter(|(_, dt)| matches!(dt, crate::data::DataType::String))
+                .map(|(n, _)| n.clone())
+                .collect()
+        };
+        if string_cols.is_empty() {
+            return;
+        }
+
+        let new_count = storage.row_count();
+        if new_count <= start_row_count {
+            return;
+        }
+
+        let mut col_names = vec!["_id".to_string()];
+        col_names.extend(string_cols.iter().cloned());
+        col_names.sort();
+        col_names.dedup();
+        let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+
+        let batch = match storage.read_columns_to_arrow(Some(&col_refs), 0, None) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        let id_col = match batch.column_by_name("_id") {
+            Some(c) => c,
+            None => return,
+        };
+
+        let start = start_row_count as usize;
+        let mut ids: Vec<u64> = Vec::new();
+        let mut col_data: Vec<Vec<String>> = vec![Vec::new(); string_cols.len()];
+
+        for row in start..batch.num_rows() {
+            let rid = if let Some(arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                arr.value(row)
+            } else if let Some(arr) = id_col.as_any().downcast_ref::<Int64Array>() {
+                arr.value(row) as u64
+            } else {
+                continue;
+            };
+            ids.push(rid);
+            for (ci, col_name) in string_cols.iter().enumerate() {
+                let val = batch.column_by_name(col_name)
+                    .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                    .map(|arr| if arr.is_null(row) { String::new() } else { arr.value(row).to_string() })
+                    .unwrap_or_default();
+                col_data[ci].push(val);
+            }
+        }
+
+        if ids.is_empty() {
+            return;
+        }
+
+        let columns: Vec<(String, Vec<String>)> = string_cols.into_iter().zip(col_data).collect();
+        let _ = engine.add_documents_columnar(ids, columns);
+        let _ = engine.flush();
+    }
+
+    /// Notify FTS index about deleted rows.
+    /// Called after SQL DELETE completes. Removes deleted doc IDs from FTS index.
+    fn notify_fts_delete(storage_path: &Path, deleted_entries: &[(u64, std::collections::HashMap<String, Value>)]) {
+        if deleted_entries.is_empty() {
+            return;
+        }
+        let (base_dir, table_name) = base_dir_and_table(storage_path);
+
+        // Check if FTS is enabled for this table
+        let cfg = Self::read_fts_config(&base_dir);
+        let enabled = cfg.as_object()
+            .and_then(|o| o.get(&table_name))
+            .and_then(|e| e.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+
+        // Only sync if manager is already registered (avoid creating one just for a delete)
+        let mgr_arc = match get_fts_manager(&base_dir) {
+            Some(m) => m,
+            None => return,
+        };
+
+        let engine = match mgr_arc.get_engine(&table_name) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        let ids: Vec<u64> = deleted_entries.iter().map(|(id, _)| *id).collect();
+        let _ = engine.remove_documents(&ids);
+        let _ = engine.flush();
+    }
+
     // ========== DML Execution Methods ==========
 
     /// Execute INSERT statement
@@ -1323,7 +1465,9 @@ impl ApexExecutor {
         
         // Update indexes for newly inserted rows
         Self::notify_index_insert(storage_path, &storage, pre_insert_count);
-        
+        // Update FTS index for newly inserted rows
+        Self::notify_fts_insert(storage_path, &storage, pre_insert_count);
+
         // Invalidate cache after write to ensure subsequent reads get fresh data
         invalidate_storage_cache(storage_path);
         invalidate_table_stats(&storage_path.to_string_lossy());
@@ -2040,6 +2184,7 @@ impl ApexExecutor {
             }
             storage.save()?;
             Self::notify_index_delete(storage_path, &deleted_entries);
+            Self::notify_fts_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
             invalidate_table_stats(&storage_path.to_string_lossy());
             return Ok(ApexResult::Scalar(count));
@@ -2134,6 +2279,7 @@ impl ApexExecutor {
         if deleted > 0 {
             storage.save()?;
             Self::notify_index_delete(storage_path, &deleted_entries);
+            Self::notify_fts_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
             invalidate_table_stats(&storage_path.to_string_lossy());
         }

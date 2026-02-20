@@ -890,6 +890,9 @@ impl ApexExecutor {
             SqlStatement::AlterFtsIndexDisable { table } => {
                 Self::execute_alter_fts_index_disable(base_dir, &table)
             }
+            SqlStatement::AlterFtsIndexEnable { table } => {
+                Self::execute_alter_fts_index_enable(base_dir, &table)
+            }
             SqlStatement::ShowFtsIndexes => {
                 Self::execute_show_fts_indexes(base_dir)
             }

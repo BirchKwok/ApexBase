@@ -768,10 +768,13 @@ impl ApexExecutor {
         // Warm up the engine (creates it if not present)
         let _ = mgr.get_engine(table);
 
+        // Back-fill existing rows into FTS index
+        let backfilled = Self::fts_backfill_table(base_dir, table, fields, &mgr).unwrap_or(0);
+
         let fields_desc = fields
             .map(|f| f.join(", "))
             .unwrap_or_else(|| "all string cols".to_string());
-        let msg = format!("FTS index created on '{}' (fields: {})", table, fields_desc);
+        let msg = format!("FTS index created on '{}' (fields: {}, {} rows indexed)", table, fields_desc, backfilled);
 
         // Return a one-row status RecordBatch
         use arrow::array::StringArray;
@@ -780,6 +783,89 @@ impl ApexExecutor {
         let batch = RecordBatch::try_new(schema, vec![std::sync::Arc::new(StringArray::from(vec![msg.as_str()]))])
             .map_err(|e| err_data(e.to_string()))?;
         Ok(ApexResult::Data(batch))
+    }
+
+    /// Back-fill existing table rows into an FTS engine.
+    /// Reads all rows with their string columns and adds them to the FTS index.
+    /// Returns the number of rows indexed.
+    fn fts_backfill_table(
+        base_dir: &Path,
+        table: &str,
+        fields: Option<&[String]>,
+        mgr: &crate::fts::FtsManager,
+    ) -> io::Result<usize> {
+        use arrow::array::{Int64Array, StringArray, UInt64Array};
+
+        let table_path = base_dir.join(format!("{}.apex", table));
+        if !table_path.exists() {
+            return Ok(0);
+        }
+
+        let engine = mgr.get_engine(table).map_err(|e| err_data(e.to_string()))?;
+
+        let storage = crate::storage::TableStorageBackend::open(&table_path)?;
+        let schema = storage.get_schema();
+
+        // Determine which string columns to index
+        let string_cols: Vec<String> = if let Some(f) = fields {
+            f.to_vec()
+        } else {
+            schema.iter()
+                .filter(|(_, dt)| matches!(dt, crate::data::DataType::String))
+                .map(|(n, _)| n.clone())
+                .collect()
+        };
+
+        if string_cols.is_empty() {
+            return Ok(0);
+        }
+
+        // Read _id + string columns
+        let mut col_names = vec!["_id".to_string()];
+        col_names.extend(string_cols.iter().cloned());
+        col_names.sort();
+        col_names.dedup();
+        let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+
+        let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
+        if batch.num_rows() == 0 {
+            return Ok(0);
+        }
+
+        // Extract row IDs
+        let id_col = match batch.column_by_name("_id") {
+            Some(c) => c,
+            None => return Ok(0),
+        };
+        let ids: Vec<u64> = if let Some(arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
+            (0..arr.len()).map(|i| arr.value(i)).collect()
+        } else if let Some(arr) = id_col.as_any().downcast_ref::<Int64Array>() {
+            (0..arr.len()).map(|i| arr.value(i) as u64).collect()
+        } else {
+            return Ok(0);
+        };
+
+        // Build columnar data for FTS
+        let mut columns: Vec<(String, Vec<String>)> = Vec::new();
+        for col_name in &string_cols {
+            if let Some(col) = batch.column_by_name(col_name) {
+                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    let vals: Vec<String> = (0..arr.len())
+                        .map(|i| if arr.is_null(i) { String::new() } else { arr.value(i).to_string() })
+                        .collect();
+                    columns.push((col_name.clone(), vals));
+                }
+            }
+        }
+
+        if columns.is_empty() {
+            return Ok(0);
+        }
+
+        let count = ids.len();
+        engine.add_documents_columnar(ids, columns).map_err(|e| err_data(e.to_string()))?;
+        engine.flush().map_err(|e| err_data(e.to_string()))?;
+        Ok(count)
     }
 
     /// DROP FTS INDEX ON table — remove config entry and delete index files
@@ -797,6 +883,63 @@ impl ApexExecutor {
         }
 
         let msg = format!("FTS index dropped for table '{}'", table);
+        use arrow::array::StringArray;
+        use arrow::datatypes::{Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new("status", ArrowDataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema, vec![std::sync::Arc::new(StringArray::from(vec![msg.as_str()]))])
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(ApexResult::Data(batch))
+    }
+
+    /// ALTER FTS INDEX ON table ENABLE — mark enabled and back-fill missing rows
+    pub(super) fn execute_alter_fts_index_enable(base_dir: &Path, table: &str) -> io::Result<ApexResult> {
+        use crate::fts::{FtsConfig, FtsManager};
+
+        // Update fts_config.json: set enabled = true
+        let mut cfg = Self::read_fts_config(base_dir);
+        let obj = cfg.as_object_mut().ok_or_else(|| err_input("Corrupt fts_config.json"))?;
+        if let Some(entry) = obj.get_mut(table) {
+            if let Some(map) = entry.as_object_mut() {
+                map.insert("enabled".to_string(), serde_json::Value::Bool(true));
+            }
+        } else {
+            obj.insert(table.to_string(), serde_json::json!({
+                "enabled": true,
+                "index_fields": null,
+                "config": { "lazy_load": false, "cache_size": 10000 }
+            }));
+        }
+        Self::write_fts_config(base_dir, &cfg);
+
+        // Re-read to get the per-table settings
+        let cfg2 = Self::read_fts_config(base_dir);
+        let entry = cfg2.as_object().and_then(|o| o.get(table));
+        let lazy_load = entry.and_then(|e| e.get("config")).and_then(|c| c.get("lazy_load")).and_then(|v| v.as_bool()).unwrap_or(false);
+        let cache_size = entry.and_then(|e| e.get("config")).and_then(|c| c.get("cache_size")).and_then(|v| v.as_u64()).unwrap_or(10000) as usize;
+        let fields: Option<Vec<String>> = entry
+            .and_then(|e| e.get("index_fields"))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+
+        // Get or create FTS manager
+        let fts_dir = base_dir.join("fts_indexes");
+        let fts_cfg = FtsConfig { lazy_load, cache_size, ..FtsConfig::default() };
+        let mgr = {
+            let existing = crate::query::executor::get_fts_manager(base_dir);
+            match existing {
+                Some(m) => m,
+                None => {
+                    let m = std::sync::Arc::new(FtsManager::new(&fts_dir, fts_cfg));
+                    crate::query::executor::register_fts_manager(base_dir, m.clone());
+                    m
+                }
+            }
+        };
+
+        // Back-fill all rows into FTS (safe to re-index already-indexed rows)
+        let backfilled = Self::fts_backfill_table(base_dir, table, fields.as_deref(), &mgr).unwrap_or(0);
+
+        let msg = format!("FTS index enabled for '{}' ({} rows indexed)", table, backfilled);
         use arrow::array::StringArray;
         use arrow::datatypes::{Field, Schema};
         let schema = std::sync::Arc::new(Schema::new(vec![Field::new("status", ArrowDataType::Utf8, false)]));
@@ -826,38 +969,68 @@ impl ApexExecutor {
         Ok(ApexResult::Data(batch))
     }
 
-    /// SHOW FTS INDEXES — list all FTS-enabled tables for this database
+    /// SHOW FTS INDEXES — list FTS-configured tables for this database and all named sub-databases
     pub(super) fn execute_show_fts_indexes(base_dir: &Path) -> io::Result<ApexResult> {
         use arrow::array::{BooleanArray, Int64Array, StringArray};
         use arrow::datatypes::{Field, Schema};
 
-        let cfg = Self::read_fts_config(base_dir);
-        let obj = cfg.as_object().cloned().unwrap_or_default();
-
+        let mut databases: Vec<String> = Vec::new();
         let mut tables: Vec<String> = Vec::new();
         let mut enabled_list: Vec<bool> = Vec::new();
         let mut fields_list: Vec<String> = Vec::new();
         let mut lazy_list: Vec<bool> = Vec::new();
         let mut cache_list: Vec<i64> = Vec::new();
 
-        for (tname, entry) in &obj {
-            let enabled = entry.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-            let fields = entry.get("index_fields")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
-                .unwrap_or_else(|| "(all string cols)".to_string());
-            let inner = entry.get("config");
-            let lazy = inner.and_then(|c| c.get("lazy_load")).and_then(|v| v.as_bool()).unwrap_or(false);
-            let cache = inner.and_then(|c| c.get("cache_size")).and_then(|v| v.as_i64()).unwrap_or(10000);
+        // Helper closure to add entries from a config object
+        let mut add_from_config = |db_name: &str, obj: &serde_json::Map<String, serde_json::Value>| {
+            for (tname, entry) in obj {
+                let enabled = entry.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                let fields = entry.get("index_fields")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+                    .unwrap_or_else(|| "(all string cols)".to_string());
+                let inner = entry.get("config");
+                let lazy = inner.and_then(|c| c.get("lazy_load")).and_then(|v| v.as_bool()).unwrap_or(false);
+                let cache = inner.and_then(|c| c.get("cache_size")).and_then(|v| v.as_i64()).unwrap_or(10000);
+                databases.push(db_name.to_string());
+                tables.push(tname.clone());
+                enabled_list.push(enabled);
+                fields_list.push(fields);
+                lazy_list.push(lazy);
+                cache_list.push(cache);
+            }
+        };
 
-            tables.push(tname.clone());
-            enabled_list.push(enabled);
-            fields_list.push(fields);
-            lazy_list.push(lazy);
-            cache_list.push(cache);
+        // Current database (default / root)
+        let cfg = Self::read_fts_config(base_dir);
+        if let Some(obj) = cfg.as_object() {
+            add_from_config("default", obj);
+        }
+
+        // Named sub-databases (immediate subdirectories that have fts_config.json)
+        if let Ok(entries) = std::fs::read_dir(base_dir) {
+            let mut sub_dirs: Vec<(String, std::path::PathBuf)> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    if !p.is_dir() { return None; }
+                    let name = p.file_name()?.to_string_lossy().into_owned();
+                    if name == "fts_indexes" { return None; }
+                    let sub_cfg = p.join("fts_config.json");
+                    if sub_cfg.exists() { Some((name, p)) } else { None }
+                })
+                .collect();
+            sub_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+            for (db_name, db_path) in sub_dirs {
+                let sub_cfg = Self::read_fts_config(&db_path);
+                if let Some(obj) = sub_cfg.as_object() {
+                    add_from_config(&db_name, obj);
+                }
+            }
         }
 
         let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("database",   ArrowDataType::Utf8,    false),
             Field::new("table",      ArrowDataType::Utf8,    false),
             Field::new("enabled",    ArrowDataType::Boolean, false),
             Field::new("fields",     ArrowDataType::Utf8,    false),
@@ -865,6 +1038,7 @@ impl ApexExecutor {
             Field::new("cache_size", ArrowDataType::Int64,   false),
         ]));
         let batch = RecordBatch::try_new(schema, vec![
+            std::sync::Arc::new(StringArray::from(databases)),
             std::sync::Arc::new(StringArray::from(tables)),
             std::sync::Arc::new(BooleanArray::from(enabled_list)),
             std::sync::Arc::new(StringArray::from(fields_list)),

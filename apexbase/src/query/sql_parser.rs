@@ -84,6 +84,7 @@ pub enum SqlStatement {
     CreateFtsIndex { table: String, fields: Option<Vec<String>>, lazy_load: bool, cache_size: usize },
     DropFtsIndex { table: String },
     AlterFtsIndexDisable { table: String },
+    AlterFtsIndexEnable { table: String },
     ShowFtsIndexes,
 }
 
@@ -1486,14 +1487,20 @@ impl SqlParser {
                     }
                     self.expect(Token::On)?;
                     let table = self.parse_identifier()?;
-                    // Expect DISABLE
+                    // Expect ENABLE or DISABLE
                     match self.current().clone() {
-                        Token::Identifier(ref s) if s.to_uppercase() == "DISABLE" => { self.advance(); }
+                        Token::Identifier(ref s) if s.to_uppercase() == "DISABLE" => {
+                            self.advance();
+                            return Ok(SqlStatement::AlterFtsIndexDisable { table });
+                        }
+                        Token::Identifier(ref s) if s.to_uppercase() == "ENABLE" => {
+                            self.advance();
+                            return Ok(SqlStatement::AlterFtsIndexEnable { table });
+                        }
                         other => return Err(ApexError::QueryParseError(
-                            format!("Expected DISABLE after ALTER FTS INDEX ON table, got {:?}", other)
+                            format!("Expected ENABLE or DISABLE after ALTER FTS INDEX ON table, got {:?}", other)
                         )),
                     }
-                    return Ok(SqlStatement::AlterFtsIndexDisable { table });
                 }
                 self.expect(Token::Table)?;
                 let table = self.parse_table_name()?;
