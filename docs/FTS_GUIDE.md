@@ -11,7 +11,7 @@ ApexBase integrates a high-performance full-text search engine ([NanoFTS](https:
 3. [DDL Reference](#ddl-reference)
    - [CREATE FTS INDEX](#create-fts-index)
    - [DROP FTS INDEX](#drop-fts-index)
-   - [ALTER FTS INDEX DISABLE](#alter-fts-index-disable)
+   - [ALTER FTS INDEX DISABLE / ENABLE](#alter-fts-index-disable--enable)
    - [SHOW FTS INDEXES](#show-fts-indexes)
 4. [Query Reference](#query-reference)
    - [MATCH()](#match)
@@ -22,7 +22,7 @@ ApexBase integrates a high-performance full-text search engine ([NanoFTS](https:
 8. [Lifecycle and Storage](#lifecycle-and-storage)
 9. [Configuration Options](#configuration-options)
 10. [Performance Tips](#performance-tips)
-11. [Limitations](#limitations)
+11. [Known Constraints](#known-constraints)
 
 ---
 
@@ -105,8 +105,8 @@ CREATE FTS INDEX ON table_name
 **Effect:**
 - Registers the table in `fts_config.json` with `enabled = true`.
 - Creates (or opens) the NanoFTS engine for the table under `{dir}/fts_indexes/{table}.nfts`.
-- New documents stored via `store()` / `INSERT` are indexed automatically from this point.
-- Existing documents are **not** back-filled automatically — use `init_fts()` Python API or re-insert data if back-filling is needed.
+- **Existing rows are back-filled automatically** — all rows already in the table are indexed immediately. The status message reports the number of rows indexed.
+- New documents stored via `store()` / `INSERT` are indexed automatically on every write.
 
 **Column list (optional)**
 
@@ -164,25 +164,38 @@ client.execute("DROP FTS INDEX ON articles")
 
 ---
 
-### ALTER FTS INDEX DISABLE
+### ALTER FTS INDEX DISABLE / ENABLE
 
+**Disable:**
 ```sql
 ALTER FTS INDEX ON table_name DISABLE
 ```
 
 **Effect:**
 - Sets `enabled = false` in `fts_config.json`.
-- **Does not** delete index files — the index can be re-activated by running `CREATE FTS INDEX ON table_name` again.
-- Useful when temporarily suspending FTS to avoid write overhead during a bulk load.
+- **Does not** delete index files.
+- While disabled, SQL `INSERT` / `DELETE` writes are **not** synced to the FTS index.
+- Useful when temporarily suspending FTS to avoid write overhead during a large bulk load.
+
+**Enable:**
+```sql
+ALTER FTS INDEX ON table_name ENABLE
+```
+
+**Effect:**
+- Sets `enabled = true` in `fts_config.json`.
+- **Back-fills all rows** currently in the table into the FTS index (idempotent — re-indexing already-indexed rows is safe).
+- Rows inserted while FTS was disabled are caught up automatically during the enable step.
+- Returns a status message with the number of rows indexed.
 
 ```python
 # Disable while doing a large bulk import
 client.execute("ALTER FTS INDEX ON articles DISABLE")
 
-# ... bulk import ...
+# ... bulk import — rows are NOT synced to FTS during this window ...
 
-# Re-enable
-client.execute("CREATE FTS INDEX ON articles (title, content)")
+# Re-enable: back-fills all rows, including those inserted while disabled
+client.execute("ALTER FTS INDEX ON articles ENABLE")
 ```
 
 ---
@@ -193,24 +206,26 @@ client.execute("CREATE FTS INDEX ON articles (title, content)")
 SHOW FTS INDEXES
 ```
 
-Returns a result set describing all FTS-enabled tables in the current database.
+Returns a result set describing all FTS-configured tables across **all databases** rooted at the server directory.
 
 **Result columns:**
 
 | Column | Type | Description |
 |--------|------|-------------|
+| `database` | string | Database name (`default` for the root directory, or the sub-database name) |
 | `table` | string | Table name |
 | `enabled` | bool | Whether FTS is currently active |
-| `fields` | string | Indexed columns (comma-separated) |
+| `fields` | string | Indexed columns (comma-separated, or `(all string cols)`) |
 | `lazy_load` | bool | Lazy-load mode |
 | `cache_size` | int | LRU cache size |
 
 ```python
 df = client.execute("SHOW FTS INDEXES").to_pandas()
 print(df)
-#       table  enabled          fields  lazy_load  cache_size
-# 0  articles     True  title, content      False       10000
-# 1      wiki     True  (all string cols)    False      200000
+#   database     table  enabled          fields  lazy_load  cache_size
+# 0  default  articles     True  title, content      False       10000
+# 1  default      wiki     True  (all string cols)   False      200000
+# 2   shopdb  products     True            name      False       10000
 ```
 
 ---
@@ -470,9 +485,6 @@ Typical values:
 
 ---
 
-## Limitations
+## Known Constraints
 
-- **No back-fill on CREATE.** Running `CREATE FTS INDEX ON table` does not index existing rows. For existing data, use `client.init_fts()` via the Python API (which reads and re-indexes all existing rows).
-- **Deletion sync.** Deleted rows are removed from the FTS index by the Python `_fts_remove()` path. SQL `DELETE` statements do not currently sync to the FTS index — re-create the index if stale results appear after heavy deletions.
-- **Single-database scope.** `SHOW FTS INDEXES` lists indexes for the currently active database directory only.
 - **No ranking scores.** `MATCH()` returns a boolean filter (matched / not matched). Document ranking scores are not exposed in SQL; use the Python `search_text()` API for ranked result ordering.

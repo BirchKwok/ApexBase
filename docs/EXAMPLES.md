@@ -546,10 +546,10 @@ n = client.execute("SELECT COUNT(*) FROM articles WHERE MATCH('python')").scalar
 print(f"Python articles: {n}")
 
 # 7. Manage indexes
-client.execute("SHOW FTS INDEXES")
-client.execute("ALTER FTS INDEX ON articles DISABLE")   # suspend, keep files
-client.execute("CREATE FTS INDEX ON articles (title)")  # re-enable
-client.execute("DROP FTS INDEX ON articles")            # remove + delete files
+client.execute("SHOW FTS INDEXES")                       # lists all databases
+client.execute("ALTER FTS INDEX ON articles DISABLE")    # suspend, keep files
+client.execute("ALTER FTS INDEX ON articles ENABLE")     # resume + back-fill missed rows
+client.execute("DROP FTS INDEX ON articles")             # remove + delete files
 
 client.close()
 ```

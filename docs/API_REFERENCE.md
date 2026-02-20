@@ -545,8 +545,9 @@ FTS is implemented natively in Rust and available through all interfaces (Python
 | `CREATE FTS INDEX ON table` | Create FTS index on all string columns |
 | `CREATE FTS INDEX ON table WITH (opt=val)` | Create with options |
 | `DROP FTS INDEX ON table` | Drop index and delete files |
-| `ALTER FTS INDEX ON table DISABLE` | Disable index, keep files |
-| `SHOW FTS INDEXES` | List all FTS-enabled tables |
+| `ALTER FTS INDEX ON table DISABLE` | Suspend indexing, keep files |
+| `ALTER FTS INDEX ON table ENABLE` | Resume indexing and back-fill any missed rows |
+| `SHOW FTS INDEXES` | List FTS-configured tables across all databases |
 | `WHERE MATCH('query')` | Exact / ranked full-text search |
 | `WHERE FUZZY_MATCH('query')` | Fuzzy / typo-tolerant search |
 
@@ -573,19 +574,25 @@ Removes the index entry and deletes the `.nfts` index files from disk.
 ```sql
 ALTER FTS INDEX ON table_name DISABLE
 ```
-Marks the index as disabled in the configuration without deleting files. The index can be re-enabled by running `CREATE FTS INDEX ON table_name` again.
+Suspends FTS write-sync (INSERT / DELETE no longer update the index). Index files are kept on disk. Use `ALTER FTS INDEX ... ENABLE` to resume.
+
+**`ALTER FTS INDEX ... ENABLE`**
+```sql
+ALTER FTS INDEX ON table_name ENABLE
+```
+Resumes FTS write-sync and **back-fills all rows** currently in the table, including any rows inserted while FTS was disabled.
 
 **`SHOW FTS INDEXES`**
 ```sql
 SHOW FTS INDEXES
 ```
-Returns a result set with columns: `table`, `enabled`, `fields`, `lazy_load`, `cache_size`.
+Returns a result set with columns: `database`, `table`, `enabled`, `fields`, `lazy_load`, `cache_size`. Lists indexes across the root directory and all named sub-databases.
 
 ```python
 result = client.execute("SHOW FTS INDEXES")
 df = result.to_pandas()
-#    table  enabled          fields  lazy_load  cache_size
-# articles     True  title, content      False       10000
+#   database     table  enabled          fields  lazy_load  cache_size
+#    default  articles     True  title, content      False       10000
 ```
 
 **`MATCH('query')`**
