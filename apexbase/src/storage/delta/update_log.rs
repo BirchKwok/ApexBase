@@ -241,10 +241,9 @@ impl DeltaStore {
             column_name: column_name.to_string(),
             new_value,
             txn_id,
-            timestamp: chrono::Utc::now().timestamp(),
+            timestamp: 0,
         };
 
-        self.log.push(record.clone());
         self.updates
             .entry(row_id)
             .or_insert_with(HashMap::new)
@@ -256,6 +255,29 @@ impl DeltaStore {
     pub fn update_row(&mut self, row_id: u64, values: &HashMap<String, Value>) {
         for (col, val) in values {
             self.update_cell(row_id, col, val.clone());
+        }
+    }
+
+    /// Batch update multiple rows in a single call (avoids repeated lock acquisitions).
+    /// All updates share one txn_id block for efficiency.
+    pub fn batch_update_rows(&mut self, batch: &[(u64, &str, Value)]) {
+        for (row_id, column_name, new_value) in batch {
+            let txn_id = self.next_txn_id;
+            self.next_txn_id += 1;
+            let record = DeltaRecord {
+                row_id: *row_id,
+                column_name: column_name.to_string(),
+                new_value: new_value.clone(),
+                txn_id,
+                timestamp: 0,
+            };
+            self.updates
+                .entry(*row_id)
+                .or_insert_with(HashMap::new)
+                .insert(column_name.to_string(), record);
+        }
+        if !batch.is_empty() {
+            self.dirty = true;
         }
     }
 
@@ -293,12 +315,12 @@ impl DeltaStore {
 
     /// Number of pending update records
     pub fn update_count(&self) -> usize {
-        self.log.len()
+        self.updates.values().map(|m| m.len()).sum()
     }
 
     /// Whether the delta store is empty (no pending changes)
     pub fn is_empty(&self) -> bool {
-        self.delete_bitmap.is_empty() && self.log.is_empty()
+        self.delete_bitmap.is_empty() && self.updates.is_empty()
     }
 
     /// Get delete bitmap reference
@@ -327,9 +349,15 @@ impl DeltaStore {
             std::fs::create_dir_all(parent)?;
         }
 
+        // Persist only the COLLAPSED updates (one record per unique (row, col) pair).
+        // This prevents unbounded log growth across repeated UPDATE calls on the same rows.
+        let collapsed_log: Vec<DeltaRecord> = self.updates.values()
+            .flat_map(|col_map| col_map.values().cloned())
+            .collect();
+
         let persisted = DeltaStorePersisted {
             delete_bitmap: self.delete_bitmap.clone(),
-            log: self.log.clone(),
+            log: collapsed_log,
             next_txn_id: self.next_txn_id,
         };
 
@@ -348,6 +376,7 @@ impl DeltaStore {
         self.delete_bitmap.clear();
         self.updates.clear();
         self.log.clear();
+        self.next_txn_id = 1;
         self.dirty = true;
     }
 

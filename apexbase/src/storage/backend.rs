@@ -791,6 +791,23 @@ impl TableStorageBackend {
         self.storage.delta_update_row(row_id, values);
     }
 
+    /// Batch update multiple rows in a single lock acquisition.
+    pub fn delta_batch_update_rows(&self, batch: &[(u64, &str, crate::data::Value)]) {
+        self.storage.delta_batch_update_rows(batch);
+    }
+
+    /// Scan a numeric column for rows in [low, high] and return matching row IDs.
+    pub fn scan_numeric_range_with_ids(&self, col_name: &str, low: f64, high: f64) -> io::Result<Option<Vec<u64>>> {
+        self.storage.scan_numeric_range_with_ids(col_name, low, high)
+    }
+
+    /// Single-pass scan+write: find WHERE column matches and overwrite SET column in-place.
+    /// Returns Some(count) if successful, None if fallback to DeltaStore needed.
+    pub fn scan_and_update_inplace(&self, where_col: &str, low: f64, high: f64,
+        set_col: &str, new_value_bytes: &[u8; 8]) -> io::Result<Option<i64>> {
+        self.storage.scan_and_update_inplace(where_col, low, high, set_col, new_value_bytes)
+    }
+
     /// Save the delta store to disk.
     pub fn save_delta_store(&self) -> io::Result<()> {
         self.storage.save_delta_store()

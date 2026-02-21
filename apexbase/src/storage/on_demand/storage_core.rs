@@ -912,6 +912,20 @@ impl OnDemandStorage {
         self.delta_store.write().update_row(row_id, values);
     }
 
+    /// Batch update multiple rows in a single lock acquisition.
+    /// `batch` is a slice of (row_id, col_name, new_value) triples.
+    pub fn delta_batch_update_rows(&self, batch: &[(u64, &str, crate::data::Value)]) {
+        if !batch.is_empty() {
+            self.delta_store.write().batch_update_rows(batch);
+        }
+    }
+
+    /// Scan a numeric column for rows in [low, high] and return their row IDs directly.
+    /// Returns None if not applicable (V3 file, column not found, etc.).
+    pub fn scan_numeric_range_with_ids(&self, col_name: &str, low: f64, high: f64) -> io::Result<Option<Vec<u64>>> {
+        self.scan_numeric_range_mmap_with_ids(col_name, low, high)
+    }
+
     /// Check if the delta store has any pending changes.
     pub fn has_pending_deltas(&self) -> bool {
         !self.delta_store.read().is_empty()

@@ -2609,6 +2609,374 @@ impl OnDemandStorage {
         Ok(Some(matches))
     }
 
+    /// Scan a numeric WHERE column and write new values to a SET column in-place, in one pass.
+    /// Only works when both columns use PLAIN encoding and RGs are uncompressed (RCIX required).
+    /// Returns Some(count) of rows updated, or None if conditions not met (caller falls back).
+    pub fn scan_and_update_inplace(
+        &self,
+        where_col: &str,
+        low: f64,
+        high: f64,
+        set_col: &str,
+        new_value_bytes: &[u8; 8], // raw little-endian bytes of the new value (f64 or i64)
+    ) -> io::Result<Option<i64>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let where_idx = match schema.get_index(where_col) { Some(i) => i, None => return Ok(None) };
+        let set_idx   = match schema.get_index(set_col)   { Some(i) => i, None => return Ok(None) };
+        let where_type = schema.columns[where_idx].1;
+        let is_int = matches!(where_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 |
+            ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 |
+            ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date);
+        let is_float = matches!(where_type, ColumnType::Float64 | ColumnType::Float32);
+        if !is_int && !is_float { return Ok(None); }
+        // Require RCIX for both columns in all row groups
+        let n_rgs = footer.row_groups.len();
+        if footer.col_offsets.len() < n_rgs { return Ok(None); }
+        let low_i = low.ceil() as i64;
+        let high_i = high.floor() as i64;
+        let mut total_updated: i64 = 0;
+
+        // Need read-write access: open separate write handle
+        let write_file = std::fs::OpenOptions::new().read(true).write(true).open(&self.path)?;
+
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref().ok_or_else(|| err_not_conn("File not open"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 { continue; }
+            // Zone map pruning for WHERE column
+            if rg_i < footer.zone_maps.len() {
+                if let Some(zm) = footer.zone_maps[rg_i].iter().find(|z| z.col_idx as usize == where_idx) {
+                    let skip = if zm.is_float { !zm.may_overlap_float_range(low, high) }
+                               else { !zm.may_overlap_int_range(low_i, high_i) };
+                    if skip { continue; }
+                }
+            }
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() { return Ok(None); }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { 1 };
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+            // Require uncompressed + RCIX for in-place write
+            if compress_flag != RG_COMPRESS_NONE { return Ok(None); }
+            if rg_i >= footer.col_offsets.len() { return Ok(None); }
+            let rg_col_offsets = &footer.col_offsets[rg_i];
+            if where_idx >= rg_col_offsets.len() || set_idx >= rg_col_offsets.len() { return Ok(None); }
+
+            let body = &rg_bytes[32..];
+            let del_vec_len = (rg_rows + 7) / 8;
+            let null_bitmap_len = del_vec_len;
+            let id_section = rg_rows * 8;
+            if id_section + del_vec_len > body.len() { continue; }
+            let del_bytes = &body[id_section..id_section + del_vec_len];
+            let has_deletes = rg_meta.deletion_count > 0;
+
+            // Read WHERE column (any encoding — decode it)
+            let where_col_off = rg_col_offsets[where_idx] as usize;
+            if where_col_off + null_bitmap_len > body.len() { continue; }
+            let where_null = &body[where_col_off..where_col_off + null_bitmap_len];
+            let where_col_bytes = &body[where_col_off + null_bitmap_len..];
+
+            // Decode WHERE column values (supports PLAIN, BITPACK, RLE)
+            let where_vals_int: Vec<i64>;
+            let where_vals_flt: Vec<f64>;
+            enum WhereVals<'a> { Int(&'a [i64]), Flt(&'a [f64]) }
+            let where_vals: WhereVals<'_>;
+            let n: usize;
+
+            if is_int {
+                // Try zero-copy PLAIN path first
+                let enc = if encoding_version >= 1 && !where_col_bytes.is_empty() { where_col_bytes[0] } else { COL_ENCODING_PLAIN };
+                if enc == COL_ENCODING_PLAIN {
+                    let payload = &where_col_bytes[1..];
+                    if payload.len() < 8 { continue; }
+                    let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                    let nn = count.min(rg_rows).min((payload.len() - 8) / 8);
+                    let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const i64, nn) };
+                    n = nn;
+                    where_vals = WhereVals::Int(vals);
+                    where_vals_int = Vec::new();
+                    where_vals_flt = Vec::new();
+                } else {
+                    // Decode (BITPACK, RLE, etc.)
+                    let (col_data, _) = read_column_encoded(where_col_bytes, where_type)?;
+                    match col_data {
+                        ColumnData::Int64(v) => {
+                            let nn = v.len().min(rg_rows);
+                            n = nn;
+                            where_vals_int = v;
+                            where_vals_flt = Vec::new();
+                            where_vals = WhereVals::Int(&where_vals_int[..nn]);
+                        }
+                        _ => continue,
+                    }
+                }
+            } else {
+                let enc = if encoding_version >= 1 && !where_col_bytes.is_empty() { where_col_bytes[0] } else { COL_ENCODING_PLAIN };
+                if enc == COL_ENCODING_PLAIN {
+                    let payload = &where_col_bytes[1..];
+                    if payload.len() < 8 { continue; }
+                    let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                    let nn = count.min(rg_rows).min((payload.len() - 8) / 8);
+                    let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const f64, nn) };
+                    n = nn;
+                    where_vals = WhereVals::Flt(vals);
+                    where_vals_int = Vec::new();
+                    where_vals_flt = Vec::new();
+                } else {
+                    let (col_data, _) = read_column_encoded(where_col_bytes, where_type)?;
+                    match col_data {
+                        ColumnData::Float64(v) => {
+                            let nn = v.len().min(rg_rows);
+                            n = nn;
+                            where_vals_flt = v;
+                            where_vals_int = Vec::new();
+                            where_vals = WhereVals::Flt(&where_vals_flt[..nn]);
+                        }
+                        _ => continue,
+                    }
+                }
+            };
+
+            // Verify SET column is PLAIN (required for in-place overwrite)
+            let set_col_off = rg_col_offsets[set_idx] as usize;
+            if set_col_off + null_bitmap_len > body.len() { continue; }
+            let set_data = &body[set_col_off + null_bitmap_len..];
+            let set_enc = if encoding_version >= 1 && !set_data.is_empty() { set_data[0] } else { COL_ENCODING_PLAIN };
+            if set_enc != COL_ENCODING_PLAIN { return Ok(None); }
+
+            // File offset of SET column's value array:
+            // rg_meta.offset (RG start) + 32 (RG header) + set_col_off + null_bitmap_len + 1 (enc byte) + 8 (count)
+            let values_file_offset = (rg_meta.offset as usize + 32 + set_col_off + null_bitmap_len + 1 + 8) as u64;
+
+            // Read the current SET column values into a buffer, patch in memory, then bulk-write
+            // This replaces N individual write_at syscalls with 1 read + 1 write per RG.
+            use std::os::unix::fs::FileExt;
+            let value_buf_len = n * 8;
+            let mut value_buf = vec![0u8; value_buf_len];
+            write_file.read_at(&mut value_buf, values_file_offset)?;
+
+            let mut rg_updated = 0i64;
+            match where_vals {
+                WhereVals::Int(vals) => {
+                    for i in 0..n {
+                        if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                        if (where_null[i/8] >> (i%8)) & 1 == 1 { continue; }
+                        if vals[i] >= low_i && vals[i] <= high_i {
+                            value_buf[i*8..i*8+8].copy_from_slice(new_value_bytes);
+                            rg_updated += 1;
+                        }
+                    }
+                }
+                WhereVals::Flt(vals) => {
+                    for i in 0..n {
+                        if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                        if (where_null[i/8] >> (i%8)) & 1 == 1 { continue; }
+                        if vals[i] >= low && vals[i] <= high {
+                            value_buf[i*8..i*8+8].copy_from_slice(new_value_bytes);
+                            rg_updated += 1;
+                        }
+                    }
+                }
+            }
+            if rg_updated > 0 {
+                write_file.write_at(&value_buf, values_file_offset)?;
+                total_updated += rg_updated;
+            }
+        }
+        drop(mmap_guard);
+        drop(file_guard);
+        Ok(Some(total_updated))
+    }
+
+    /// Scan a numeric column for rows in [low, high] and return their row IDs directly.
+    /// Unlike scan_numeric_range_mmap which returns global row indices, this reads IDs
+    /// from the row group body in the same pass — avoids a separate _id column read.
+    /// Also checks the delta store for overridden values on already-updated rows.
+    pub fn scan_numeric_range_mmap_with_ids(
+        &self,
+        col_name: &str,
+        low: f64,
+        high: f64,
+    ) -> io::Result<Option<Vec<u64>>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let col_type = schema.columns[col_idx].1;
+        let is_int = matches!(col_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 |
+            ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 |
+            ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date);
+        let is_float = matches!(col_type, ColumnType::Float64 | ColumnType::Float32);
+        if !is_int && !is_float { return Ok(None); }
+
+        let col_count = schema.column_count();
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for range+id scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        let low_i = low.ceil() as i64;
+        let high_i = high.floor() as i64;
+        let mut result: Vec<u64> = Vec::new();
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 { continue; }
+
+            // Zone map pruning
+            if rg_i < footer.zone_maps.len() {
+                if let Some(zm) = footer.zone_maps[rg_i].iter().find(|z| z.col_idx as usize == col_idx) {
+                    let skip = if zm.is_float {
+                        !zm.may_overlap_float_range(low, high)
+                    } else {
+                        !zm.may_overlap_int_range(low_i, high_i)
+                    };
+                    if skip { continue; }
+                }
+            }
+
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() { return Err(err_data("RG extends past EOF")); }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+
+            let id_section = rg_rows * 8;
+            let del_vec_len = (rg_rows + 7) / 8;
+            let null_bitmap_len = del_vec_len;
+            if id_section + del_vec_len > body.len() { continue; }
+
+            // Read IDs in bulk (zero-copy cast)
+            let ids: &[u64] = unsafe {
+                std::slice::from_raw_parts(body.as_ptr() as *const u64, rg_rows)
+            };
+            let del_bytes = &body[id_section..id_section + del_vec_len];
+            let has_deletes = rg_meta.deletion_count > 0;
+
+            // RCIX fast path: jump directly to target column
+            let rcix_available = rg_i < footer.col_offsets.len()
+                && col_idx < footer.col_offsets[rg_i].len()
+                && compress_flag == RG_COMPRESS_NONE;
+            if rcix_available {
+                let col_body_off = footer.col_offsets[rg_i][col_idx] as usize;
+                if col_body_off + null_bitmap_len > body.len() { continue; }
+                let null_bytes = &body[col_body_off..col_body_off + null_bitmap_len];
+                let data_start = col_body_off + null_bitmap_len;
+                let col_bytes = &body[data_start..];
+                let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+                let encoding = if encoding_version >= 1 && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                if encoding == COL_ENCODING_PLAIN && col_bytes.len() > enc_offset + 8 {
+                    let payload = &col_bytes[enc_offset..];
+                    let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                    let n = count.min(rg_rows).min((payload.len() - 8) / 8);
+                    if is_int {
+                        let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const i64, n) };
+                        for i in 0..n {
+                            if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if vals[i] >= low_i && vals[i] <= high_i { result.push(ids[i]); }
+                        }
+                    } else {
+                        let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const f64, n) };
+                        for i in 0..n {
+                            if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if vals[i] >= low && vals[i] <= high { result.push(ids[i]); }
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // Sequential fallback: scan columns until we reach col_idx
+            let mut pos = id_section + del_vec_len;
+            for ci in 0..col_count {
+                if pos + null_bitmap_len > body.len() { break; }
+                let null_bytes = &body[pos..pos + null_bitmap_len];
+                pos += null_bitmap_len;
+                let ct = schema.columns[ci].1;
+                if ci == col_idx {
+                    let col_bytes = &body[pos..];
+                    let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+                    let encoding = if encoding_version >= 1 && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                    let data_slice = &col_bytes[enc_offset..];
+                    if encoding == COL_ENCODING_PLAIN && data_slice.len() >= 8 {
+                        let count = u64::from_le_bytes(data_slice[0..8].try_into().unwrap()) as usize;
+                        let n = count.min(rg_rows);
+                        if is_int {
+                            let vals: &[i64] = unsafe {
+                                std::slice::from_raw_parts(data_slice[8..].as_ptr() as *const i64, n.min((data_slice.len()-8)/8))
+                            };
+                            for i in 0..vals.len() {
+                                if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                if vals[i] >= low_i && vals[i] <= high_i { result.push(ids[i]); }
+                            }
+                        } else {
+                            let vals: &[f64] = unsafe {
+                                std::slice::from_raw_parts(data_slice[8..].as_ptr() as *const f64, n.min((data_slice.len()-8)/8))
+                            };
+                            for i in 0..vals.len() {
+                                if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                if vals[i] >= low && vals[i] <= high { result.push(ids[i]); }
+                            }
+                        }
+                    } else {
+                        let (col_data, _) = if encoding_version >= 1 {
+                            read_column_encoded(col_bytes, ct)?
+                        } else {
+                            ColumnData::from_bytes_typed(col_bytes, ct)?
+                        };
+                        match &col_data {
+                            ColumnData::Int64(vals) => {
+                                for i in 0..vals.len().min(rg_rows) {
+                                    if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                    if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                    if vals[i] >= low_i && vals[i] <= high_i { result.push(ids[i]); }
+                                }
+                            }
+                            ColumnData::Float64(vals) => {
+                                for i in 0..vals.len().min(rg_rows) {
+                                    if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                    if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                    if vals[i] >= low && vals[i] <= high { result.push(ids[i]); }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    break; // Found and processed the target column, move to next RG
+                }
+                let consumed = if encoding_version >= 1 {
+                    skip_column_encoded(&body[pos..], ct)?
+                } else {
+                    ColumnData::skip_bytes_typed(&body[pos..], ct)?
+                };
+                pos += consumed;
+            }
+        }
+        drop(mmap_guard);
+        drop(file_guard);
+        Ok(Some(result))
+    }
+
     /// Direct mmap top-K scan: finds top-k row indices by a numeric column without materializing
     /// the full Arrow array. Uses RCIX + zone maps for O(N_rows) with O(k) heap in L1 cache.
     /// Returns Vec<(global_row_idx, value)> sorted in the requested order.

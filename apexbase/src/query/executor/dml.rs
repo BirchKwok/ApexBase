@@ -2320,6 +2320,52 @@ impl ApexExecutor {
         // open_for_write (e.g., DELETE), which is safe because of Fix B.
         let storage = TableStorageBackend::open(storage_path)?;
 
+        // ── Mmap super-fast path ─────────────────────────────────────────────────
+        // For: all-literal SET + simple numeric WHERE + no constraints + no indexes.
+        // Uses scan_and_update_inplace: single pass per SET column, writes directly to
+        // the base .apex file — no DeltaStore serialization, no Arrow batch, no bincode.
+        if indexed_cols.is_empty() && !storage.storage.has_constraints() {
+            let all_lit = assignments.iter().all(|(_, e)| matches!(e, SqlExpr::Literal(_)));
+            if all_lit {
+                if let Some((where_col, low, high)) = where_clause.and_then(|w| Self::extract_numeric_range_from_where(w)) {
+                    // Safety: if WHERE column has delta-store overrides, skip fast path
+                    let where_col_clean = {
+                        let ds = storage.storage.delta_store();
+                        !ds.all_updates().values().any(|m| m.contains_key(&where_col))
+                    };
+                    if where_col_clean {
+                        // Try in-place write for each SET column
+                        let mut all_inplace = true;
+                        let mut inplace_count: i64 = 0;
+                        for (col_name, expr) in assignments {
+                            if let SqlExpr::Literal(v) = expr {
+                                let bytes_opt = match v {
+                                    Value::Float64(f) => Some(f.to_le_bytes()),
+                                    Value::Int64(i)   => Some(i.to_le_bytes()),
+                                    _ => None,
+                                };
+                                if let Some(bytes) = bytes_opt {
+                                    match storage.scan_and_update_inplace(&where_col, low, high, col_name, &bytes)? {
+                                        Some(n) => { inplace_count = n; }
+                                        None    => { all_inplace = false; break; }
+                                    }
+                                } else {
+                                    all_inplace = false; break;
+                                }
+                            }
+                        }
+                        if all_inplace {
+                            // In-place write succeeded — invalidate executor cache so next read rebuilds
+                            invalidate_storage_cache(storage_path);
+                            invalidate_table_stats(&storage_path.to_string_lossy());
+                            return Ok(ApexResult::Scalar(inplace_count));
+                        }
+                    }
+                }
+            }
+        }
+        // ── End mmap super-fast path ─────────────────────────────────────────────
+
         // COLUMN PROJECTION: only read the columns we actually need.
         // For a simple UPDATE SET col=literal WHERE other_col=val, this is just
         // [_id, WHERE-col] instead of all columns — a significant I/O reduction.
@@ -2370,49 +2416,120 @@ impl ApexExecutor {
             BooleanArray::from(vec![true; batch.num_rows()])
         };
         
-        // Collect row IDs and update data for matching rows
+        // Collect row IDs and update data for matching rows.
+        // Hoist column_by_name + downcast outside the hot loop to avoid O(N) repeated lookups.
         let mut updates: Vec<(u64, StdHashMap<String, Value>)> = Vec::new();
         let mut old_index_entries: Vec<(u64, StdHashMap<String, Value>)> = Vec::new();
         let mut new_index_entries: Vec<(u64, StdHashMap<String, Value>)> = Vec::new();
-        
-        for i in 0..filter_mask.len() {
-            if filter_mask.value(i) {
-                if let Some(id_col) = batch.column_by_name("_id") {
-                    let id = if let Some(id_arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
-                        id_arr.value(i)
-                    } else if let Some(id_arr) = id_col.as_any().downcast_ref::<Int64Array>() {
-                        id_arr.value(i) as u64
-                    } else {
-                        continue;
-                    };
-                    
-                    // Evaluate assignment expressions to get new values
-                    let mut update_data: StdHashMap<String, Value> = StdHashMap::new();
-                    for (col_name, expr) in assignments {
-                        let value = Self::evaluate_expr_to_value(&batch, expr, i)?;
-                        update_data.insert(col_name.clone(), value);
-                    }
-                    
-                    // Index maintenance: collect old and new indexed values
-                    if !indexed_cols.is_empty() {
-                        let mut old_vals = StdHashMap::new();
-                        let mut new_vals = StdHashMap::new();
-                        for cn in &indexed_cols {
-                            if let Some(c) = batch.column_by_name(cn) {
-                                let old_val = Self::arrow_value_at_col(c, i);
-                                old_vals.insert(cn.clone(), old_val.clone());
-                                // New value: use update_data if column was updated, else keep old
-                                let new_val = update_data.get(cn).cloned().unwrap_or(old_val);
-                                new_vals.insert(cn.clone(), new_val);
-                            }
-                        }
-                        old_index_entries.push((id, old_vals));
-                        new_index_entries.push((id, new_vals));
-                    }
-                    
-                    updates.push((id, update_data));
+
+        // Pre-extract _id array once (avoids column_by_name + downcast inside hot loop)
+        enum IdArray<'a> { U64(&'a UInt64Array), I64(&'a Int64Array) }
+        let id_array: Option<IdArray<'_>> = batch.column_by_name("_id").and_then(|c| {
+            if let Some(a) = c.as_any().downcast_ref::<UInt64Array>() {
+                Some(IdArray::U64(a))
+            } else {
+                c.as_any().downcast_ref::<Int64Array>().map(IdArray::I64)
+            }
+        });
+        let id_array = match id_array {
+            Some(a) => a,
+            None => return Err(io::Error::new(io::ErrorKind::InvalidData, "_id column not found")),
+        };
+
+        // Pre-evaluate assignments that are pure literals (SET col = literal) — avoids
+        // per-row evaluate_expr_to_value calls for the common case.
+        let all_literals = assignments.iter().all(|(_, e)| matches!(e, SqlExpr::Literal(_)));
+        let literal_update: Option<StdHashMap<String, Value>> = if all_literals {
+            let mut m = StdHashMap::with_capacity(assignments.len());
+            for (col_name, expr) in assignments {
+                if let SqlExpr::Literal(v) = expr {
+                    m.insert(col_name.clone(), v.clone());
                 }
             }
+            Some(m)
+        } else {
+            None
+        };
+
+        // Pre-extract index columns arrays to avoid repeated column_by_name in loop
+        let indexed_col_arrays: Vec<(&str, &ArrayRef)> = if !indexed_cols.is_empty() {
+            indexed_cols.iter()
+                .filter_map(|cn| batch.column_by_name(cn).map(|c| (cn.as_str(), c)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // ── Fast path: all-literal SET + no constraints + no indexes ───────────
+        // Avoids building per-row HashMap for each matched row.
+        if let Some(ref lit) = literal_update {
+            if indexed_col_arrays.is_empty() && !storage.storage.has_constraints() {
+                // Collect matching row IDs (no HashMap allocation per row)
+                let mut matched_ids: Vec<u64> = Vec::new();
+                for i in 0..filter_mask.len() {
+                    if filter_mask.value(i) {
+                        let id = match &id_array {
+                            IdArray::U64(a) => a.value(i),
+                            IdArray::I64(a) => a.value(i) as u64,
+                        };
+                        matched_ids.push(id);
+                    }
+                }
+                let updated = matched_ids.len() as i64;
+                if updated > 0 {
+                    // Build flat batch directly without per-row HashMap
+                    let mut flat_batch: Vec<(u64, &str, Value)> =
+                        Vec::with_capacity(matched_ids.len() * lit.len());
+                    for id in &matched_ids {
+                        for (col, val) in lit {
+                            flat_batch.push((*id, col.as_str(), val.clone()));
+                        }
+                    }
+                    storage.delta_batch_update_rows(&flat_batch);
+                    storage.save_delta_store()?;
+                }
+                invalidate_storage_cache(storage_path);
+                invalidate_table_stats(&storage_path.to_string_lossy());
+                return Ok(ApexResult::Scalar(updated));
+            }
+        }
+        // ── End fast path ───────────────────────────────────────────────────────
+
+        for i in 0..filter_mask.len() {
+            if !filter_mask.value(i) { continue; }
+
+            let id = match &id_array {
+                IdArray::U64(a) => a.value(i),
+                IdArray::I64(a) => a.value(i) as u64,
+            };
+
+            // Evaluate assignment expressions to get new values
+            let update_data: StdHashMap<String, Value> = if let Some(ref lit) = literal_update {
+                lit.clone()
+            } else {
+                let mut m = StdHashMap::with_capacity(assignments.len());
+                for (col_name, expr) in assignments {
+                    let value = Self::evaluate_expr_to_value(&batch, expr, i)?;
+                    m.insert(col_name.clone(), value);
+                }
+                m
+            };
+
+            // Index maintenance: collect old and new indexed values
+            if !indexed_col_arrays.is_empty() {
+                let mut old_vals = StdHashMap::with_capacity(indexed_col_arrays.len());
+                let mut new_vals = StdHashMap::with_capacity(indexed_col_arrays.len());
+                for (cn, c) in &indexed_col_arrays {
+                    let old_val = Self::arrow_value_at_col(c, i);
+                    let new_val = update_data.get(*cn).cloned().unwrap_or_else(|| old_val.clone());
+                    old_vals.insert(cn.to_string(), old_val);
+                    new_vals.insert(cn.to_string(), new_val);
+                }
+                old_index_entries.push((id, old_vals));
+                new_index_entries.push((id, new_vals));
+            }
+
+            updates.push((id, update_data));
         }
         
         let updated = updates.len() as i64;
@@ -2624,9 +2741,17 @@ impl ApexExecutor {
             }
         }
 
-        // Record cell-level updates in DeltaStore (no delete+insert, no file rewrite)
-        for (row_id, update_data) in &updates {
-            storage.delta_update_row(*row_id, update_data);
+        // Record cell-level updates in DeltaStore in a single batch (one lock acquisition).
+        {
+            let mut batch: Vec<(u64, &str, Value)> = Vec::with_capacity(
+                updates.iter().map(|(_, m)| m.len()).sum()
+            );
+            for (row_id, update_data) in &updates {
+                for (col, val) in update_data {
+                    batch.push((*row_id, col.as_str(), val.clone()));
+                }
+            }
+            storage.delta_batch_update_rows(&batch);
         }
         
         // Persist delta store to disk for crash safety.
@@ -2657,6 +2782,55 @@ impl ApexExecutor {
         invalidate_table_stats(&storage_path.to_string_lossy());
         
         Ok(ApexResult::Scalar(updated))
+    }
+
+    /// Try to extract a simple numeric range from a WHERE clause for the mmap fast path.
+    /// Returns (col_name, low, high) for patterns like:
+    ///   col = N           → (col, N, N)
+    ///   col > N           → (col, N+ε, +∞)
+    ///   col >= N          → (col, N, +∞)
+    ///   col < N           → (col, -∞, N-ε)
+    ///   col <= N          → (col, -∞, N)
+    ///   col BETWEEN A AND B → (col, A, B)
+    fn extract_numeric_range_from_where(expr: &SqlExpr) -> Option<(String, f64, f64)> {
+        match expr {
+            SqlExpr::Between { column, low, high, negated: false } => {
+                let lo = Self::literal_to_f64(low)?;
+                let hi = Self::literal_to_f64(high)?;
+                Some((column.trim_matches('"').to_string(), lo, hi))
+            }
+            SqlExpr::BinaryOp { left, op, right } => {
+                let (col, val, flipped) = if let SqlExpr::Column(c) = left.as_ref() {
+                    if let Some(v) = Self::literal_to_f64(right) {
+                        (c.trim_matches('"').to_string(), v, false)
+                    } else { return None; }
+                } else if let SqlExpr::Column(c) = right.as_ref() {
+                    if let Some(v) = Self::literal_to_f64(left) {
+                        (c.trim_matches('"').to_string(), v, true)
+                    } else { return None; }
+                } else { return None; };
+                let inf = f64::INFINITY;
+                let ninf = f64::NEG_INFINITY;
+                let tiny = 0.5; // integer step for integer columns
+                match op {
+                    BinaryOperator::Eq => Some((col, val, val)),
+                    BinaryOperator::Gt => if !flipped { Some((col, val + tiny, inf)) } else { Some((col, ninf, val - tiny)) },
+                    BinaryOperator::Ge => if !flipped { Some((col, val, inf)) }        else { Some((col, ninf, val)) },
+                    BinaryOperator::Lt => if !flipped { Some((col, ninf, val - tiny)) } else { Some((col, val + tiny, inf)) },
+                    BinaryOperator::Le => if !flipped { Some((col, ninf, val)) }        else { Some((col, val, inf)) },
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn literal_to_f64(expr: &SqlExpr) -> Option<f64> {
+        match expr {
+            SqlExpr::Literal(Value::Int64(v)) => Some(*v as f64),
+            SqlExpr::Literal(Value::Float64(v)) => Some(*v),
+            _ => None,
+        }
     }
 
     /// Collect all column names referenced in a SqlExpr (used for column projection).
