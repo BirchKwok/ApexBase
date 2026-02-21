@@ -1164,4 +1164,3 @@ use std::collections::HashMap;
         // BETWEEN 200..300 does NOT overlap [10,100]
         assert!(!zm.may_overlap_int_range(200, 300));
     }
-}

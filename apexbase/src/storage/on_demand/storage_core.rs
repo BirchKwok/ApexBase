@@ -462,9 +462,8 @@ impl OnDemandStorage {
             v4_base_loaded: AtomicBool::new(false),
             cached_footer_offset: AtomicU64::new(cached_fo),
             v4_footer: RwLock::new(cached_v4_footer),
-            // Skip DeltaStore::load — pure read path, no pending updates.
-            // DeltaStore will be lazily populated if a write is ever attempted on this backend.
-            delta_store: RwLock::new(DeltaStore::new(path)),
+            // Load DeltaStore from disk so DeltaMerger can apply pending UPDATE deltas on reads.
+            delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
             page_cache: RwLock::new(HashMap::new()),
         })
@@ -1060,8 +1059,104 @@ impl OnDemandStorage {
             }
         }
 
-        // Full rewrite (save_v4 clears delta store)
-        self.save_v4()
+        // Full rewrite, then clear delta store (updates are now baked into base file)
+        self.save_v4()?;
+        self.clear_delta_store()
+    }
+
+    /// Apply any pending delta store updates/deletes to already-loaded in-memory columns.
+    /// Must be called AFTER load_all_columns_into_memory() so self.ids/columns/deleted are populated.
+    /// This ensures save_v4() always writes the correct (post-update) values and can safely
+    /// clear the delta store afterwards.
+    fn apply_pending_deltas_in_place(&self) {
+        let ds = self.delta_store.read();
+        if ds.is_empty() {
+            return;
+        }
+        let all_updates = ds.all_updates().clone();
+        let delete_bitmap = ds.delete_bitmap().clone();
+        drop(ds);
+
+        if !delete_bitmap.is_empty() {
+            let ids = self.ids.read();
+            let mut deleted = self.deleted.write();
+            for (idx, id) in ids.iter().enumerate() {
+                if delete_bitmap.is_deleted(*id) {
+                    let byte_idx = idx / 8;
+                    let bit_idx = idx % 8;
+                    if byte_idx >= deleted.len() {
+                        deleted.resize(byte_idx + 1, 0);
+                    }
+                    deleted[byte_idx] |= 1 << bit_idx;
+                }
+            }
+        }
+
+        if !all_updates.is_empty() {
+            let ids = self.ids.read();
+            let schema = self.schema.read();
+            let mut columns = self.columns.write();
+
+            let id_to_idx: ahash::AHashMap<u64, usize> = ids.iter()
+                .enumerate()
+                .map(|(i, &id)| (id, i))
+                .collect();
+
+            for (row_id, col_updates) in &all_updates {
+                if let Some(&row_idx) = id_to_idx.get(row_id) {
+                    for (col_name, record) in col_updates {
+                        if let Some(col_idx) = schema.get_index(col_name) {
+                            if col_idx < columns.len() {
+                                match &record.new_value {
+                                    crate::data::Value::Int64(v) => {
+                                        if let ColumnData::Int64(ref mut data) = columns[col_idx] {
+                                            if row_idx < data.len() { data[row_idx] = *v; }
+                                        }
+                                    }
+                                    crate::data::Value::Float64(v) => {
+                                        if let ColumnData::Float64(ref mut data) = columns[col_idx] {
+                                            if row_idx < data.len() { data[row_idx] = *v; }
+                                        }
+                                    }
+                                    crate::data::Value::String(s) => {
+                                        if let ColumnData::String { offsets, data } = &mut columns[col_idx] {
+                                            let mut strings: Vec<String> = Vec::with_capacity(offsets.len().saturating_sub(1));
+                                            for i in 0..offsets.len().saturating_sub(1) {
+                                                let start = offsets[i] as usize;
+                                                let end = offsets[i + 1] as usize;
+                                                if i == row_idx {
+                                                    strings.push(s.clone());
+                                                } else {
+                                                    strings.push(String::from_utf8_lossy(&data[start..end]).to_string());
+                                                }
+                                            }
+                                            data.clear();
+                                            offsets.clear();
+                                            offsets.push(0);
+                                            for st in &strings {
+                                                data.extend_from_slice(st.as_bytes());
+                                                offsets.push(data.len() as u32);
+                                            }
+                                        }
+                                    }
+                                    crate::data::Value::Bool(v) => {
+                                        if let ColumnData::Bool { data, .. } = &mut columns[col_idx] {
+                                            let byte_idx = row_idx / 8;
+                                            let bit_idx = row_idx % 8;
+                                            if byte_idx < data.len() {
+                                                if *v { data[byte_idx] |= 1 << bit_idx; }
+                                                else { data[byte_idx] &= !(1 << bit_idx); }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Get the maximum ID from a delta file (for computing next_id on open)
@@ -1177,7 +1272,12 @@ impl OnDemandStorage {
         // V4 files: load all RG data into memory for write operations
         if header.footer_offset > 0 {
             drop(header);
-            return self.open_v4_data();
+            self.open_v4_data()?;
+            // Apply any pending delta store updates so save_v4() bakes them in correctly.
+            // Without this, a subsequent save() would write pre-update values to disk and
+            // then clear the delta store, permanently losing the updates.
+            self.apply_pending_deltas_in_place();
+            return Ok(());
         }
         
         let schema = self.schema.read();

@@ -722,4 +722,3 @@ use super::*;
             assert_eq!(cons.foreign_key, Some(("parent".to_string(), "id".to_string())));
         }
     }
-}

@@ -416,22 +416,28 @@ impl OnDemandStorage {
                 drop(cols);
                 if !has_in_memory_data {
                     // PREAD RCIX PATH: reads only the minimal bytes needed (no mmap page faults).
-                    // Falls back to mmap path for multi-RG, compressed, or deleted rows.
-                    let footer_opt = self.v4_footer.read().clone();
-                    if let Some(ref footer) = footer_opt {
-                        let schema = &footer.schema;
-                        let col_indices: Vec<usize> = if let Some(names) = column_names {
-                            names.iter().filter(|&&n| n != "_id")
-                                .filter_map(|&name| schema.get_index(name))
-                                .collect()
-                        } else {
-                            (0..schema.column_count()).collect()
-                        };
-                        if let Ok(Some(batch)) = self.to_arrow_batch_pread_rcix(&col_indices, include_id, limit) {
-                            return Ok(batch);
+                    // Falls back to mmap path for multi-RG, compressed, deleted rows, or pending deltas.
+                    // Skip pread when DeltaStore has pending updates: pread reads raw bytes and does
+                    // NOT apply DeltaMerger, so it would return stale (pre-update) values.
+                    let has_pending_deltas = !self.delta_store.read().is_empty();
+                    if !has_pending_deltas {
+                        let footer_opt = self.v4_footer.read().clone();
+                        if let Some(ref footer) = footer_opt {
+                            let schema = &footer.schema;
+                            let col_indices: Vec<usize> = if let Some(names) = column_names {
+                                names.iter().filter(|&&n| n != "_id")
+                                    .filter_map(|&name| schema.get_index(name))
+                                    .collect()
+                            } else {
+                                (0..schema.column_count()).collect()
+                            };
+                            if let Ok(Some(batch)) = self.to_arrow_batch_pread_rcix(&col_indices, include_id, limit) {
+                                return Ok(batch);
+                            }
                         }
                     }
-                    // MMAP fallback (multi-RG, deletes, compressed, or unknown encodings)
+                    // MMAP path: handles multi-RG, deletes, compressed, unknown encodings,
+                    // and applies DeltaMerger overlay for pending cell-level updates.
                     if let Some(batch) = self.to_arrow_batch_mmap(
                         column_names, include_id, Some(limit), true,
                     )? {

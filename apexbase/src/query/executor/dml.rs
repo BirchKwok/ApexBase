@@ -2314,10 +2314,55 @@ impl ApexExecutor {
             lock.list_indexes().iter().map(|m| m.column_name.clone()).collect()
         };
         
-        // Read columns needed for WHERE evaluation + assignments + indexed columns + _id
-        // Use open_for_write to load V4 data into memory so compact_deltas() can merge
-        let storage = TableStorageBackend::open_for_write(storage_path)?;
-        let batch = storage.read_columns_to_arrow(None, 0, None)?;
+        // Use open (mmap-only) — avoids loading ALL columns into memory.
+        // DeltaStore updates are applied lazily at read time (DeltaMerger) and
+        // merged into the base file via apply_pending_deltas_in_place() on next
+        // open_for_write (e.g., DELETE), which is safe because of Fix B.
+        let storage = TableStorageBackend::open(storage_path)?;
+
+        // COLUMN PROJECTION: only read the columns we actually need.
+        // For a simple UPDATE SET col=literal WHERE other_col=val, this is just
+        // [_id, WHERE-col] instead of all columns — a significant I/O reduction.
+        // Also, if DeltaStore has no entries for the projected columns (e.g. previous
+        // UPDATEs only changed a different column), DeltaMerger is effectively a no-op.
+        let has_constraints = storage.storage.has_constraints();
+        let set_col_refs: Vec<String> = assignments.iter()
+            .flat_map(|(_, expr)| Self::collect_column_refs(expr))
+            .collect();
+        let unique_pk_cols: Vec<String> = if has_constraints {
+            let schema = storage.get_schema();
+            schema.iter()
+                .filter(|(name, _)| {
+                    let c = storage.storage.get_column_constraints(name);
+                    c.unique || c.primary_key
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        } else {
+            vec![]
+        };
+        let total_schema_cols = storage.get_schema().len() + 1; // +1 for _id
+        let mut needed_cols: Vec<String> = vec!["_id".to_string()];
+        if let Some(where_expr) = where_clause {
+            for c in Self::collect_column_refs(where_expr) {
+                if !needed_cols.iter().any(|x| x == &c) { needed_cols.push(c); }
+            }
+        }
+        for c in &set_col_refs {
+            if !needed_cols.iter().any(|x| x == c) { needed_cols.push(c.clone()); }
+        }
+        for c in &indexed_cols {
+            if !needed_cols.iter().any(|x| x == c) { needed_cols.push(c.clone()); }
+        }
+        for c in &unique_pk_cols {
+            if !needed_cols.iter().any(|x| x == c) { needed_cols.push(c.clone()); }
+        }
+        let batch = if needed_cols.len() < total_schema_cols {
+            let refs: Vec<&str> = needed_cols.iter().map(|s| s.as_str()).collect();
+            storage.read_columns_to_arrow(Some(&refs), 0, None)?
+        } else {
+            storage.read_columns_to_arrow(None, 0, None)?
+        };
         
         let filter_mask = if let Some(where_expr) = where_clause {
             Self::evaluate_predicate(&batch, where_expr)?
@@ -2584,13 +2629,13 @@ impl ApexExecutor {
             storage.delta_update_row(*row_id, update_data);
         }
         
-        // Persist delta store and compact immediately to merge updates into base file.
-        // This prevents data loss when a subsequent write operation (DELETE, INSERT)
-        // triggers save_v4() which clears the delta store.
+        // Persist delta store to disk for crash safety.
+        // No compact_deltas() needed: pending deltas are applied at read time via
+        // DeltaMerger, and baked into the base file via apply_pending_deltas_in_place()
+        // on the next open_for_write (e.g., DELETE). Safe because of Fix B.
         if updated > 0 {
             storage.save_delta_store()?;
-            let _ = storage.compact_deltas();
-            
+
             // Index maintenance: update indexed values
             if !indexed_cols.is_empty() {
                 Self::notify_index_delete(storage_path, &old_index_entries);
@@ -2612,6 +2657,50 @@ impl ApexExecutor {
         invalidate_table_stats(&storage_path.to_string_lossy());
         
         Ok(ApexResult::Scalar(updated))
+    }
+
+    /// Collect all column names referenced in a SqlExpr (used for column projection).
+    fn collect_column_refs(expr: &SqlExpr) -> Vec<String> {
+        let mut refs = Vec::new();
+        Self::collect_column_refs_inner(expr, &mut refs);
+        refs
+    }
+
+    fn collect_column_refs_inner(expr: &SqlExpr, refs: &mut Vec<String>) {
+        match expr {
+            SqlExpr::Column(name) => refs.push(name.trim_matches('"').to_string()),
+            SqlExpr::BinaryOp { left, right, .. } => {
+                Self::collect_column_refs_inner(left, refs);
+                Self::collect_column_refs_inner(right, refs);
+            }
+            SqlExpr::UnaryOp { expr, .. } => Self::collect_column_refs_inner(expr, refs),
+            SqlExpr::Like { column, .. } | SqlExpr::Regexp { column, .. } |
+            SqlExpr::In { column, .. } | SqlExpr::InSubquery { column, .. } |
+            SqlExpr::IsNull { column, .. } => refs.push(column.trim_matches('"').to_string()),
+            SqlExpr::Between { column, low, high, .. } => {
+                refs.push(column.trim_matches('"').to_string());
+                Self::collect_column_refs_inner(low, refs);
+                Self::collect_column_refs_inner(high, refs);
+            }
+            SqlExpr::Case { when_then, else_expr } => {
+                for (cond, then) in when_then {
+                    Self::collect_column_refs_inner(cond, refs);
+                    Self::collect_column_refs_inner(then, refs);
+                }
+                if let Some(e) = else_expr { Self::collect_column_refs_inner(e, refs); }
+            }
+            SqlExpr::Function { args, .. } => {
+                for a in args { Self::collect_column_refs_inner(a, refs); }
+            }
+            SqlExpr::Cast { expr, .. } | SqlExpr::Paren(expr) => {
+                Self::collect_column_refs_inner(expr, refs);
+            }
+            SqlExpr::ArrayIndex { array, index } => {
+                Self::collect_column_refs_inner(array, refs);
+                Self::collect_column_refs_inner(index, refs);
+            }
+            _ => {}
+        }
     }
 
     /// Get a value from an Arrow array at a specific row index
