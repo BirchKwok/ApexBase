@@ -1611,7 +1611,7 @@ impl TableStorageBackend {
     /// OPTIMIZED: Read a single row by ID using O(1) index lookup
     /// Much faster than WHERE _id = X which scans all data
     pub fn read_row_by_id_to_arrow(&self, id: u64) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray, NullArray};
+        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
         use std::sync::Arc;
         use crate::data::DataType;

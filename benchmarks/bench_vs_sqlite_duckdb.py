@@ -298,6 +298,43 @@ class SQLiteBench:
         self.conn.execute("UPDATE bench SET score = 50.0 WHERE age = 25")
         self.conn.commit()
 
+    def bench_delete_1k(self):
+        rows = [(f"del_{i}", 99, 99.0, "Beijing", "Books") for i in range(1000)]
+        self.conn.executemany(
+            "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+            rows,
+        )
+        self.conn.commit()
+        self.conn.execute("DELETE FROM bench WHERE age = 99")
+        self.conn.commit()
+
+    def bench_window_row_number(self):
+        return self.conn.execute(
+            "SELECT name, city, score, "
+            "ROW_NUMBER() OVER (PARTITION BY city ORDER BY score DESC) as rn "
+            "FROM bench LIMIT 1000"
+        ).fetchall()
+
+    def bench_fts_build(self):
+        try:
+            self.conn.execute("DROP TABLE IF EXISTS bench_fts")
+            self.conn.execute("""
+                CREATE VIRTUAL TABLE bench_fts
+                USING fts5(name, city, category, content='bench', content_rowid='_id')
+            """)
+            self.conn.execute("INSERT INTO bench_fts(bench_fts) VALUES('rebuild')")
+            self.conn.commit()
+            self._fts_ready = True
+        except Exception:
+            self._fts_ready = False
+
+    def bench_fts_search(self):
+        if not getattr(self, '_fts_ready', False):
+            return None
+        return self.conn.execute(
+            "SELECT rowid FROM bench_fts WHERE bench_fts MATCH 'Electronics'"
+        ).fetchall()
+
     def close(self):
         if self.conn:
             self.conn.close()
@@ -443,6 +480,50 @@ class DuckDBBench:
     def bench_update_1k(self):
         self.conn.execute("UPDATE bench SET score = 50.0 WHERE age = 25")
 
+    def bench_delete_1k(self):
+        if HAS_PANDAS:
+            df = pd.DataFrame({
+                "name": [f"del_{i}" for i in range(1000)],
+                "age": [99] * 1000,
+                "score": [99.0] * 1000,
+                "city": ["Beijing"] * 1000,
+                "category": ["Books"] * 1000,
+            })
+            self.conn.execute("INSERT INTO bench SELECT * FROM df")
+        else:
+            rows = [(f"del_{i}", 99, 99.0, "Beijing", "Books") for i in range(1000)]
+            self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
+        self.conn.execute("DELETE FROM bench WHERE age = 99")
+
+    def bench_window_row_number(self):
+        return self.conn.execute(
+            "SELECT name, city, score, "
+            "ROW_NUMBER() OVER (PARTITION BY city ORDER BY score DESC) as rn "
+            "FROM bench LIMIT 1000"
+        ).fetchall()
+
+    def bench_fts_build(self):
+        try:
+            self.conn.execute("INSTALL fts")
+            self.conn.execute("LOAD fts")
+            self.conn.execute(
+                "PRAGMA create_fts_index('bench', 'rowid', 'name', 'city', 'category')"
+            )
+            self._fts_ready = True
+        except Exception:
+            self._fts_ready = False
+
+    def bench_fts_search(self):
+        if not getattr(self, '_fts_ready', False):
+            return None
+        try:
+            return self.conn.execute(
+                "SELECT * FROM bench "
+                "WHERE fts_main_bench.match_bm25(rowid, 'Electronics') IS NOT NULL"
+            ).fetchall()
+        except Exception:
+            return None
+
     def close(self):
         if self.conn:
             self.conn.close()
@@ -574,6 +655,48 @@ class ApexBaseBench:
             "UPDATE default SET score = 50.0 WHERE age = 25"
         )
 
+    def bench_delete_1k(self):
+        data = {
+            "name": [f"del_{i}" for i in range(1000)],
+            "age": [99] * 1000,
+            "score": [99.0] * 1000,
+            "city": ["Beijing"] * 1000,
+            "category": ["Books"] * 1000,
+        }
+        self.client.store(data)
+        self.client.execute("DELETE FROM default WHERE age = 99")
+
+    def bench_window_row_number(self):
+        return self.client.execute(
+            "SELECT name, city, score, "
+            "ROW_NUMBER() OVER (PARTITION BY city ORDER BY score DESC) as rn "
+            "FROM default LIMIT 1000"
+        )
+
+    def bench_fts_build(self):
+        try:
+            # Close + reopen to clear the executor STORAGE_CACHE before backfill,
+            # ensuring CREATE FTS INDEX reads fresh row data from disk.
+            self.client.close()
+            self.client = ApexClient(self.db_dir)
+            self.client.use_table('default')
+            self.client.execute(
+                "CREATE FTS INDEX ON default (name, city, category)"
+            )
+            self.client._fts_tables['default'] = {
+                'enabled': True,
+                'index_fields': ['name', 'city', 'category'],
+                'config': {'lazy_load': False, 'cache_size': 10000},
+            }
+            self._fts_ready = True
+        except Exception:
+            self._fts_ready = False
+
+    def bench_fts_search(self):
+        if not getattr(self, '_fts_ready', False):
+            return None
+        return self.client.search_text('Electronics')
+
     def close(self):
         if self.client:
             self.client.close()
@@ -611,6 +734,11 @@ BENCHMARKS = [
     ("COUNT(DISTINCT city)",             "bench_count_distinct",   False, False, False),
     ("IN filter (city IN 3 cities)",     "bench_filter_in",        False, False, False),
     ("UPDATE rows (age=25, idempotent)", "bench_update_1k",        False, False, False),
+    # --- Delete / Window / FTS ---
+    ("DELETE 1K rows (insert+delete cycle)", "bench_delete_1k",    False, False, False),
+    ("Window ROW_NUMBER PARTITION BY city",  "bench_window_row_number", False, False, False),
+    ("FTS Index Build (name,city,category)", "bench_fts_build",    True,  False, False),
+    ("FTS Search ('Electronics')",           "bench_fts_search",   False, False, False),
 ]
 
 

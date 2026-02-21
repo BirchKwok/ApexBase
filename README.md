@@ -391,8 +391,15 @@ Average of 5 timed iterations after 2 warmup runs.
 | COUNT(DISTINCT city) | 0.035ms | 92.58ms | 4.51ms | **129x faster** |
 | IN filter (city IN 3 cities) | 0.038ms | 327ms | 161ms | **>4000x faster** |
 | UPDATE rows (age = 25) | 8.51ms | 39.48ms | 17.17ms | **2.0x faster** |
+| DELETE 1K rows | 137ms | 39ms | 3.6ms | 38x slower† |
+| Window ROW_NUMBER (cached) | 0.035ms | 502ms | 47ms | **>1000x faster** |
+| FTS Index Build (1M rows) | 2.28s | 1.47s | 1.16s | 2.0x slower‡ |
+| FTS Search ('Electronics') | 0.124ms | 21ms | 23ms | **>170x faster** |
 
-**Summary**: wins all 23 of 23 benchmarks. "Cold" = fresh DB open per iteration; "warm" = cached backend.
+**Summary**: wins 25 of 27 benchmarks (25W / 0T / 2L). "Cold" = fresh DB open per iteration; "warm" = cached backend.
+
+† DELETE triggers full-table rewrite for MVCC safety; DuckDB uses in-place deletion.  
+‡ FTS index build time; search latency is 170x faster once built.
 
 Cold comparison is fair: all three engines measured without gc.collect() interference.
 

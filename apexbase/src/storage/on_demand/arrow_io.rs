@@ -31,7 +31,7 @@ impl OnDemandStorage {
         include_id: bool,
         dict_encode_strings: bool,
     ) -> io::Result<RecordBatch> {
-        use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray, PrimitiveArray};
+        use arrow::array::{Int64Array, StringArray, BooleanArray, PrimitiveArray};
         use arrow::buffer::{Buffer, NullBuffer, BooleanBuffer, ScalarBuffer};
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType, Int64Type, Float64Type};
         use std::sync::Arc;
@@ -402,7 +402,7 @@ impl OnDemandStorage {
         include_id: bool,
         limit: usize,
     ) -> io::Result<RecordBatch> {
-        use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray, PrimitiveArray};
+        use arrow::array::{Int64Array, StringArray, BooleanArray, PrimitiveArray};
         use arrow::buffer::{Buffer, NullBuffer, BooleanBuffer, ScalarBuffer};
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType, Int64Type, Float64Type};
         use std::sync::Arc;

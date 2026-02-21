@@ -96,7 +96,7 @@ impl OnDemandStorage {
         row_limit: Option<usize>,
         dict_encode_strings: bool,
     ) -> io::Result<Option<RecordBatch>> {
-        use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray, PrimitiveArray};
+        use arrow::array::{Int64Array, StringArray, BooleanArray, PrimitiveArray};
         use arrow::buffer::{Buffer, NullBuffer, BooleanBuffer, ScalarBuffer};
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType, Int64Type, Float64Type};
         use std::sync::Arc;
@@ -1092,8 +1092,7 @@ impl OnDemandStorage {
         limit: usize,
         offset: usize,
     ) -> io::Result<Option<RecordBatch>> {
-        use crate::query::AggregateFunc;
-        use arrow::array::{Int64Array, Float64Array, StringArray, UInt32Array};
+        use arrow::array::{Int64Array, StringArray};
         use arrow::datatypes::{Field, Schema, DataType as ArrowDataType};
         use std::collections::BinaryHeap;
         use std::cmp::Ordering;
@@ -2641,7 +2640,7 @@ impl OnDemandStorage {
         let mut total_updated: i64 = 0;
 
         // Need read-write access: open separate write handle
-        let write_file = std::fs::OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let mut write_file = std::fs::OpenOptions::new().read(true).write(true).open(&self.path)?;
 
         let file_guard = self.file.read();
         let file = file_guard.as_ref().ok_or_else(|| err_not_conn("File not open"))?;
@@ -2758,10 +2757,11 @@ impl OnDemandStorage {
 
             // Read the current SET column values into a buffer, patch in memory, then bulk-write
             // This replaces N individual write_at syscalls with 1 read + 1 write per RG.
-            use std::os::unix::fs::FileExt;
+            use std::io::{Read, Seek, SeekFrom, Write};
             let value_buf_len = n * 8;
             let mut value_buf = vec![0u8; value_buf_len];
-            write_file.read_at(&mut value_buf, values_file_offset)?;
+            write_file.seek(SeekFrom::Start(values_file_offset))?;
+            write_file.read_exact(&mut value_buf)?;
 
             let mut rg_updated = 0i64;
             match where_vals {
@@ -2787,7 +2787,8 @@ impl OnDemandStorage {
                 }
             }
             if rg_updated > 0 {
-                write_file.write_at(&value_buf, values_file_offset)?;
+                write_file.seek(SeekFrom::Start(values_file_offset))?;
+                write_file.write_all(&value_buf)?;
                 total_updated += rg_updated;
             }
         }
