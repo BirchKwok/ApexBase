@@ -4,6 +4,47 @@
 
 ApexBase is an embedded columnar database designed for **Hybrid Transactional/Analytical Processing (HTAP)** workloads. It combines a high-throughput columnar storage engine written in Rust with an ergonomic Python API, delivering analytical query performance that surpasses DuckDB and SQLite on most benchmarks — all in a single `.apex` file with zero external dependencies.
 
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Usage Guide](#usage-guide)
+  - [Database Management](#database-management)
+  - [Table Management](#table-management)
+  - [Data Ingestion](#data-ingestion)
+  - [SQL](#sql)
+  - [Transactions](#transactions)
+  - [Indexes](#indexes)
+  - [Full-Text Search](#full-text-search)
+  - [Record-Level Operations](#record-level-operations)
+  - [Column Operations](#column-operations)
+  - [ResultView](#resultview)
+  - [Context Manager](#context-manager)
+- [Performance](#performance)
+- [Server Protocols](#server-protocols)
+  - [Combined Launcher (Both Servers at Once)](#combined-launcher-both-servers-at-once)
+- [PostgreSQL Wire Protocol Server](#postgresql-wire-protocol-server)
+  - [Starting the Server](#starting-the-server)
+  - [Connecting with Database Tools](#connecting-with-database-tools)
+  - [Supported SQL over Wire Protocol](#supported-sql-over-wire-protocol)
+  - [Metadata Compatibility](#metadata-compatibility)
+  - [Supported Protocol Features](#supported-protocol-features)
+  - [Limitations](#limitations)
+- [Arrow Flight gRPC Server](#arrow-flight-grpc-server)
+  - [Starting the Flight Server](#starting-the-flight-server)
+  - [Python Client](#python-client)
+  - [When to Use Arrow Flight vs PG Wire](#when-to-use-arrow-flight-vs-pg-wire)
+  - [PyO3 Python API](#pyo3-python-api)
+- [Architecture](#architecture)
+  - [Storage Format](#storage-format)
+  - [Query Execution](#query-execution)
+- [API Reference](#api-reference)
+  - [ApexClient](#apexclient)
+  - [ResultView](#resultview-1)
+- [Documentation](#documentation)
+- [License](#license)
+
 ---
 
 ## Features
