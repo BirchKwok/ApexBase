@@ -592,7 +592,7 @@ class ApexClient:
                     return
         
             # 2. PyArrow Table - Convert to columnar dict for optimized storage
-            if ARROW_AVAILABLE and hasattr(data, 'schema'):
+            if ARROW_AVAILABLE and pa is not None and isinstance(data, pa.Table):
                 # Convert Arrow Table to columnar dict for zero-copy path
                 columns = {}
                 for name in data.column_names:
