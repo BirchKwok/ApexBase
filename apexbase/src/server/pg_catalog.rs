@@ -134,7 +134,7 @@ fn make_version_batch() -> RecordBatch {
         Field::new("version", ArrowDataType::Utf8, false),
     ]));
     let array: ArrayRef = Arc::new(StringArray::from(vec![
-        "PostgreSQL 15.0 (ApexBase 1.6.0)",
+        "PostgreSQL 15.0 (ApexBase 1.7.0)",
     ]));
     RecordBatch::try_new(schema, vec![array]).unwrap()
 }

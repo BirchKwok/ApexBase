@@ -1164,3 +1164,151 @@ use std::collections::HashMap;
         // BETWEEN 200..300 does NOT overlap [10,100]
         assert!(!zm.may_overlap_int_range(200, 300));
     }
+
+    /// FTS index build timing test — mirrors the Python bench_fts_build benchmark.
+    ///
+    /// Run with:
+    ///   cargo test --release bench_fts_index_build_1m -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_fts_index_build_1m() {
+        use arrow::array::{StringArray, UInt64Array, Int64Array};
+        use crate::fts::{FtsConfig, FtsEngine};
+        use crate::storage::TableStorageBackend;
+
+        const N: usize = 1_000_000;
+        let cities = ["Beijing", "Shanghai", "Guangzhou", "Shenzhen", "Hangzhou",
+                       "Nanjing", "Chengdu", "Wuhan", "Xian", "Qingdao"];
+        let categories = ["Electronics", "Clothing", "Food", "Sports", "Books",
+                           "Home", "Auto", "Health", "Travel", "Gaming"];
+
+        // Simple LCG matching Python's random.Random(42) sequence shape
+        let mut s: u64 = 6364136223846793005u64.wrapping_mul(42).wrapping_add(1);
+        let mut lcg = || -> u64 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s >> 33
+        };
+
+        eprintln!("\n[FTS_BENCH] Generating {} rows ...", N);
+        let t_gen = std::time::Instant::now();
+        let mut names: Vec<String>  = Vec::with_capacity(N);
+        let mut ages:  Vec<i64>     = Vec::with_capacity(N);
+        let mut scores: Vec<f64>    = Vec::with_capacity(N);
+        let mut city_vals: Vec<String>  = Vec::with_capacity(N);
+        let mut cat_vals:  Vec<String>  = Vec::with_capacity(N);
+        for i in 0..N {
+            names.push(format!("user_{}", i));
+            ages.push((18 + lcg() % 63) as i64);
+            scores.push((lcg() % 10001) as f64 / 100.0);
+            city_vals.push(cities[(lcg() % 10) as usize].to_string());
+            cat_vals.push(categories[(lcg() % 10) as usize].to_string());
+        }
+        eprintln!("[FTS_BENCH] data gen:          {:>10.2?}", t_gen.elapsed());
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bench.apex");
+
+        // ── Phase 0: write 1M rows to storage ──────────────────────────────
+        let t_write = std::time::Instant::now();
+        let storage = OnDemandStorage::create(&path).unwrap();
+        storage.insert_typed(
+            HashMap::from([("age".to_string(), ages)]),
+            HashMap::from([("score".to_string(), scores)]),
+            HashMap::from([
+                ("name".to_string(),     names),
+                ("city".to_string(),     city_vals),
+                ("category".to_string(), cat_vals),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+        ).unwrap();
+        storage.save().unwrap();
+        eprintln!("[FTS_BENCH] write 1M rows:     {:>10.2?}", t_write.elapsed());
+
+        // ── Phase 1: read_columns_to_arrow ─────────────────────────────────
+        let storage_r = TableStorageBackend::open(&path).unwrap();
+        let t_read = std::time::Instant::now();
+        let batch = storage_r.read_columns_to_arrow(
+            Some(&["_id", "name", "city", "category"]), 0, None
+        ).unwrap();
+        let t_read_elapsed = t_read.elapsed();
+        eprintln!("[FTS_BENCH] read_columns_to_arrow ({} rows): {:>10.2?}",
+                  batch.num_rows(), t_read_elapsed);
+
+        // ── Phase 2: build columnar Vec<String> (current path) ─────────────
+        let t_build = std::time::Instant::now();
+        let ids: Vec<u64> = {
+            let col = batch.column_by_name("_id").unwrap();
+            if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+                (0..a.len()).map(|i| a.value(i)).collect()
+            } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+                (0..a.len()).map(|i| a.value(i) as u64).collect()
+            } else { vec![] }
+        };
+        let mut owned_cols: Vec<(String, Vec<String>)> = Vec::new();
+        for col_name in &["name", "city", "category"] {
+            if let Some(col) = batch.column_by_name(col_name) {
+                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    let vals: Vec<String> = (0..arr.len())
+                        .map(|i| if arr.is_null(i) { String::new() } else { arr.value(i).to_string() })
+                        .collect();
+                    owned_cols.push((col_name.to_string(), vals));
+                }
+            }
+        }
+        eprintln!("[FTS_BENCH] build Vec<String>: {:>10.2?}", t_build.elapsed());
+
+        // ── Phase 3a: add_documents_columnar (Vec<String>) ─────────────────
+        let fts_dir = dir.path().join("fts_indexes");
+        std::fs::create_dir_all(&fts_dir).unwrap();
+        let engine_a = FtsEngine::new(fts_dir.join("bench_a.nfts"), FtsConfig::default()).unwrap();
+        let t_index_a = std::time::Instant::now();
+        engine_a.add_documents_columnar(ids.clone(), owned_cols).unwrap();
+        eprintln!("[FTS_BENCH] add_documents_columnar (Vec<String>): {:>10.2?}", t_index_a.elapsed());
+
+        let t_flush_a = std::time::Instant::now();
+        engine_a.flush().unwrap();
+        eprintln!("[FTS_BENCH] flush (Vec<String>): {:>10.2?}", t_flush_a.elapsed());
+
+        // ── Phase 3b: add_documents_arrow_str (&str slices, no alloc) ──────
+        let t_build_b = std::time::Instant::now();
+        let ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+        let mut arrow_cols: Vec<(String, Vec<&str>)> = Vec::new();
+        for col_name in &["name", "city", "category"] {
+            if let Some(col) = batch.column_by_name(col_name) {
+                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    let vals: Vec<&str> = (0..arr.len())
+                        .map(|i| if arr.is_null(i) { "" } else { arr.value(i) })
+                        .collect();
+                    arrow_cols.push((col_name.to_string(), vals));
+                }
+            }
+        }
+        eprintln!("[FTS_BENCH] build Vec<&str>:   {:>10.2?}", t_build_b.elapsed());
+
+        let engine_b = FtsEngine::new(fts_dir.join("bench_b.nfts"), FtsConfig::default()).unwrap();
+        let t_index_b = std::time::Instant::now();
+        engine_b.add_documents_arrow_str(&ids_u32, arrow_cols).unwrap();
+        eprintln!("[FTS_BENCH] add_documents_arrow_str (&str):      {:>10.2?}", t_index_b.elapsed());
+
+        let t_flush_b = std::time::Instant::now();
+        engine_b.flush().unwrap();
+        eprintln!("[FTS_BENCH] flush (&str):       {:>10.2?}", t_flush_b.elapsed());
+
+        // ── End-to-end: CREATE FTS INDEX via ApexExecutor ──────────────────
+        let _ = std::fs::remove_dir_all(&fts_dir);
+        drop(storage_r);
+        let t_total = std::time::Instant::now();
+        ApexExecutor::execute(
+            "CREATE FTS INDEX ON bench (name, city, category)",
+            &path,
+        ).unwrap();
+        let t_total_elapsed = t_total.elapsed();
+        eprintln!("[FTS_BENCH] CREATE FTS INDEX total (ApexExecutor): {:>10.2?}", t_total_elapsed);
+
+        eprintln!("\n[FTS_BENCH] Summary:");
+        eprintln!("  read_columns_to_arrow : {:.2?}", t_read_elapsed);
+        eprintln!("  add_documents_columnar: {:.2?}  (current path, Vec<String>)", t_index_a.elapsed());
+        eprintln!("  add_documents_arrow_str:{:.2?}  (optimized path, &str)", t_index_b.elapsed());
+        eprintln!("  CREATE FTS INDEX total: {:.2?}  (end-to-end via executor)", t_total_elapsed);
+    }

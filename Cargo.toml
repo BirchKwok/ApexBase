@@ -1,6 +1,6 @@
 [package]
 name = "apexbase"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 authors = ["Birch Kwok <birchkwok@gmail.com>"]
 description = "High-performance HTAP embedded database with Rust core"
@@ -95,7 +95,7 @@ zstd = "0.13"
 once_cell = "1.19"
 
 # Full-text search engine (native Rust integration)
-nanofts = "0.5.0"
+nanofts = "0.6.0"
 
 # JIT compilation for query expressions (Cranelift)
 cranelift = "0.116"
@@ -114,6 +114,10 @@ clap = { version = "4", features = ["derive"], optional = true }
 # Arrow Flight gRPC server (optional — enabled for flight binary)
 arrow-flight = { version = "57", optional = true }
 tonic = { version = "0.14", features = ["transport"], optional = true }
+
+[[example]]
+name = "bench_fts"
+path = "examples/bench_fts.rs"
 
 [[bin]]
 name = "apexbase-server"

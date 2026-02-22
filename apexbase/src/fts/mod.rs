@@ -283,6 +283,28 @@ impl FtsEngine {
         }
         Ok(())
     }
+
+    /// Start an asynchronous flush. Returns immediately after making data searchable in memory;
+    /// actual disk write (fsync) runs in a background thread.
+    /// Use `wait_flush()` if you need to confirm durability.
+    pub fn flush_async(&self) -> FtsResult<()> {
+        let guard = self.engine.read();
+        if let Some(ref engine) = *guard {
+            engine.flush_async()?;
+        }
+        Ok(())
+    }
+
+    /// Wait for a previously started `flush_async()` to complete.
+    /// Returns the number of terms flushed, or 0 if no background flush is pending.
+    pub fn wait_flush(&self) -> FtsResult<usize> {
+        let guard = self.engine.read();
+        if let Some(ref engine) = *guard {
+            Ok(engine.wait_flush()?)
+        } else {
+            Ok(0)
+        }
+    }
     
     /// Compact the index (apply deletions and optimize storage)
     pub fn compact(&self) -> FtsResult<()> {

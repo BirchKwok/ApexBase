@@ -864,7 +864,7 @@ impl ApexExecutor {
 
         let count = ids.len();
         engine.add_documents_columnar(ids, columns).map_err(|e| err_data(e.to_string()))?;
-        engine.flush().map_err(|e| err_data(e.to_string()))?;
+        engine.flush_async().map_err(|e| err_data(e.to_string()))?;
         Ok(count)
     }
 
