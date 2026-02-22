@@ -154,6 +154,20 @@ def run_bench_nogc(fn, warmup=2, iterations=5):
     return sum(times) / len(times)
 
 
+def run_bench_with_setup(setup_fn, bench_fn, warmup=2, iterations=5):
+    """Per-iteration setup WITHOUT cold-start (no DB reopen). Times only bench_fn."""
+    for _ in range(warmup):
+        setup_fn()
+        bench_fn()
+    times = []
+    for _ in range(iterations):
+        setup_fn()
+        t0 = time.perf_counter()
+        bench_fn()
+        times.append((time.perf_counter() - t0) * 1000)
+    return sum(times) / len(times)
+
+
 def measure_rss_mb():
     """Return current process RSS in MB (requires psutil)."""
     try:
@@ -305,6 +319,18 @@ class SQLiteBench:
             rows,
         )
         self.conn.commit()
+        self.conn.execute("DELETE FROM bench WHERE age = 99")
+        self.conn.commit()
+
+    def bench_delete_1k_setup(self):
+        rows = [(f"del_{i}", 99, 99.0, "Beijing", "Books") for i in range(1000)]
+        self.conn.executemany(
+            "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+            rows,
+        )
+        self.conn.commit()
+
+    def bench_delete_1k_only(self):
         self.conn.execute("DELETE FROM bench WHERE age = 99")
         self.conn.commit()
 
@@ -495,6 +521,23 @@ class DuckDBBench:
             self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
         self.conn.execute("DELETE FROM bench WHERE age = 99")
 
+    def bench_delete_1k_setup(self):
+        if HAS_PANDAS:
+            df = pd.DataFrame({
+                "name": [f"del_{i}" for i in range(1000)],
+                "age": [99] * 1000,
+                "score": [99.0] * 1000,
+                "city": ["Beijing"] * 1000,
+                "category": ["Books"] * 1000,
+            })
+            self.conn.execute("INSERT INTO bench SELECT * FROM df")
+        else:
+            rows = [(f"del_{i}", 99, 99.0, "Beijing", "Books") for i in range(1000)]
+            self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
+
+    def bench_delete_1k_only(self):
+        self.conn.execute("DELETE FROM bench WHERE age = 99")
+
     def bench_window_row_number(self):
         return self.conn.execute(
             "SELECT name, city, score, "
@@ -666,6 +709,19 @@ class ApexBaseBench:
         self.client.store(data)
         self.client.execute("DELETE FROM default WHERE age = 99")
 
+    def bench_delete_1k_setup(self):
+        data = {
+            "name": [f"del_{i}" for i in range(1000)],
+            "age": [99] * 1000,
+            "score": [99.0] * 1000,
+            "city": ["Beijing"] * 1000,
+            "category": ["Books"] * 1000,
+        }
+        self.client.store(data)
+
+    def bench_delete_1k_only(self):
+        self.client.execute("DELETE FROM default WHERE age = 99")
+
     def bench_window_row_number(self):
         return self.client.execute(
             "SELECT name, city, score, "
@@ -706,39 +762,41 @@ class ApexBaseBench:
 # Main
 # ---------------------------------------------------------------------------
 
-# (display_name, method_name, is_write, is_cold, is_warm_nogc)
-# is_cold=True     -> cold_start_setup() per iter, no gc
+# (display_name, method_name, is_write, is_cold, is_warm_nogc, setup_method)
+# is_cold=True      -> cold_start_setup() per iter (DB reopen), no gc
 # is_warm_nogc=True -> warm cached backend, no gc
+# setup_method      -> if not None, call bench.{setup_method}() before each timed iter
 BENCHMARKS = [
-    ("Bulk Insert (N rows)",             "bench_insert",           True,  False, False),
-    ("COUNT(*)",                         "bench_count",            False, False, False),
-    ("SELECT * LIMIT 100 [cold]",        "bench_select_limit",     False, True,  False),
-    ("SELECT * LIMIT 100 [warm]",        "bench_select_limit",     False, False, True),
-    ("SELECT * LIMIT 10K [cold]",        "bench_select_limit_10k", False, True,  False),
-    ("SELECT * LIMIT 10K [warm]",        "bench_select_limit_10k", False, False, True),
-    ("Filter (name = 'user_5000')",      "bench_filter_string",    False, False, False),
-    ("Filter (age BETWEEN 25 AND 35)",   "bench_filter_range",     False, False, False),
-    ("GROUP BY city (10 groups)",        "bench_group_by",         False, False, False),
-    ("GROUP BY + HAVING",                "bench_group_by_having",  False, False, False),
-    ("ORDER BY score LIMIT 100",         "bench_order_limit",      False, False, False),
-    ("Aggregation (5 funcs)",            "bench_aggregation",      False, False, False),
-    ("Complex (Filter+Group+Order)",     "bench_complex",          False, False, False),
-    ("Point Lookup (by ID)",             "bench_point_lookup",     False, False, False),
-    ("Insert 1K rows",                   "bench_insert_1k",        False, False, False),
+    ("Bulk Insert (N rows)",             "bench_insert",           True,  False, False, None),
+    ("COUNT(*)",                         "bench_count",            False, False, False, None),
+    ("SELECT * LIMIT 100 [cold]",        "bench_select_limit",     False, True,  False, None),
+    ("SELECT * LIMIT 100 [warm]",        "bench_select_limit",     False, False, True,  None),
+    ("SELECT * LIMIT 10K [cold]",        "bench_select_limit_10k", False, True,  False, None),
+    ("SELECT * LIMIT 10K [warm]",        "bench_select_limit_10k", False, False, True,  None),
+    ("Filter (name = 'user_5000')",      "bench_filter_string",    False, False, False, None),
+    ("Filter (age BETWEEN 25 AND 35)",   "bench_filter_range",     False, False, False, None),
+    ("GROUP BY city (10 groups)",        "bench_group_by",         False, False, False, None),
+    ("GROUP BY + HAVING",                "bench_group_by_having",  False, False, False, None),
+    ("ORDER BY score LIMIT 100",         "bench_order_limit",      False, False, False, None),
+    ("Aggregation (5 funcs)",            "bench_aggregation",      False, False, False, None),
+    ("Complex (Filter+Group+Order)",     "bench_complex",          False, False, False, None),
+    ("Point Lookup (by ID)",             "bench_point_lookup",     False, False, False, None),
+    ("Insert 1K rows",                   "bench_insert_1k",        False, False, False, None),
     # --- New cases ---
-    ("SELECT * -> pandas (full scan)",   "bench_full_scan_pandas", False, False, False),
-    ("GROUP BY city,category (100 grp)","bench_group_by_2cols",   False, False, False),
-    ("LIKE filter (name LIKE user_1%)",  "bench_filter_like",      False, False, False),
-    ("Multi-cond (age>30 AND score>50)", "bench_filter_multi_cond",False, False, False),
-    ("ORDER BY city,score DESC LIMIT100","bench_order_by_multi",   False, False, False),
-    ("COUNT(DISTINCT city)",             "bench_count_distinct",   False, False, False),
-    ("IN filter (city IN 3 cities)",     "bench_filter_in",        False, False, False),
-    ("UPDATE rows (age=25, idempotent)", "bench_update_1k",        False, False, False),
+    ("SELECT * -> pandas (full scan)",   "bench_full_scan_pandas", False, False, False, None),
+    ("GROUP BY city,category (100 grp)","bench_group_by_2cols",   False, False, False, None),
+    ("LIKE filter (name LIKE user_1%)",  "bench_filter_like",      False, False, False, None),
+    ("Multi-cond (age>30 AND score>50)", "bench_filter_multi_cond",False, False, False, None),
+    ("ORDER BY city,score DESC LIMIT100","bench_order_by_multi",   False, False, False, None),
+    ("COUNT(DISTINCT city)",             "bench_count_distinct",   False, False, False, None),
+    ("IN filter (city IN 3 cities)",     "bench_filter_in",        False, False, False, None),
+    ("UPDATE rows (age=25, idempotent)", "bench_update_1k",        False, False, False, None),
     # --- Delete / Window / FTS ---
-    ("DELETE 1K rows (insert+delete cycle)", "bench_delete_1k",    False, False, False),
-    ("Window ROW_NUMBER PARTITION BY city",  "bench_window_row_number", False, False, False),
-    ("FTS Index Build (name,city,category)", "bench_fts_build",    True,  False, False),
-    ("FTS Search ('Electronics')",           "bench_fts_search",   False, False, False),
+    ("Store+DELETE 1K (combined)",           "bench_delete_1k",         False, False, False, None),
+    ("DELETE 1K [pure delete only]",         "bench_delete_1k_only",    False, False, False, "bench_delete_1k_setup"),
+    ("Window ROW_NUMBER PARTITION BY city",  "bench_window_row_number", False, False, False, None),
+    ("FTS Index Build (name,city,category)", "bench_fts_build",         True,  False, False, None),
+    ("FTS Search ('Electronics')",           "bench_fts_search",        False, False, False, None),
 ]
 
 
@@ -834,7 +892,7 @@ def main():
     mem_results = {}  # bench_name -> {eng_name: rss_delta_mb}
 
     # Run benchmarks
-    for bench_name, method_name, is_insert, is_cold, is_warm_nogc in BENCHMARKS:
+    for bench_name, method_name, is_insert, is_cold, is_warm_nogc, setup_method in BENCHMARKS:
         results[bench_name] = {}
         mem_results.setdefault(bench_name, {})
         for eng_name, bench in engines:
@@ -854,13 +912,13 @@ def main():
                     mem_results[bench_name][eng_name] = rss_after - rss_before
             elif is_cold:
                 # Cold-start (no gc): reopen DB before each iteration
-                setup_fn = getattr(bench, "cold_start_setup", None)
-                if setup_fn is None:
+                cold_setup_fn = getattr(bench, "cold_start_setup", None)
+                if cold_setup_fn is None:
                     # Engine has no cold_start_setup — run warm no-gc
                     ms = run_bench_nogc(fn, warmup=WARMUP, iterations=ITERS)
                 else:
                     rss_before = measure_rss_mb()
-                    ms = run_bench_cold_nogc(setup_fn, fn, warmup=WARMUP, iterations=ITERS)
+                    ms = run_bench_cold_nogc(cold_setup_fn, fn, warmup=WARMUP, iterations=ITERS)
                     rss_after = measure_rss_mb()
                     if rss_before and rss_after:
                         mem_results[bench_name][eng_name] = rss_after - rss_before
@@ -873,14 +931,26 @@ def main():
                 results[bench_name][eng_name] = ms
                 if rss_before and rss_after:
                     mem_results[bench_name][eng_name] = rss_after - rss_before
+            elif setup_method is not None:
+                # Per-iteration setup (e.g. pre-insert rows before timing delete)
+                per_setup_fn = getattr(bench, setup_method, None)
+                if per_setup_fn is None:
+                    results[bench_name][eng_name] = None
+                    continue
+                rss_before = measure_rss_mb()
+                ms = run_bench_with_setup(per_setup_fn, fn, warmup=WARMUP, iterations=ITERS)
+                rss_after = measure_rss_mb()
+                results[bench_name][eng_name] = ms
+                if rss_before and rss_after:
+                    mem_results[bench_name][eng_name] = rss_after - rss_before
             else:
                 rss_before = measure_rss_mb()
                 # low_memory mode: disable arrow_batch_cache for ApexBase by reopening each iter
-                setup_fn = getattr(bench, "cold_start_setup", None)
+                cold_setup_fn = getattr(bench, "cold_start_setup", None)
                 use_cold = (HAS_APEXBASE and isinstance(bench, ApexBaseBench)
-                            and bench.low_memory and setup_fn is not None)
+                            and bench.low_memory and cold_setup_fn is not None)
                 if use_cold:
-                    ms = run_bench_cold_nogc(setup_fn, fn, warmup=WARMUP, iterations=ITERS)
+                    ms = run_bench_cold_nogc(cold_setup_fn, fn, warmup=WARMUP, iterations=ITERS)
                 else:
                     ms = run_bench(fn, warmup=WARMUP, iterations=ITERS)
                 rss_after = measure_rss_mb()
@@ -906,7 +976,7 @@ def main():
     print("-" * len(header))
 
     json_results = []
-    for bench_name, method_name, is_insert, is_cold, is_warm_nogc in BENCHMARKS:
+    for bench_name, method_name, is_insert, is_cold, is_warm_nogc, setup_method in BENCHMARKS:
         row = f"{bench_name:<42}"
         values = {}
         for eng_name in eng_names:
@@ -947,7 +1017,7 @@ def main():
             mem_header += f" | {name:>{col_width}}"
         print(mem_header)
         print("  " + "-" * (len(mem_header) - 2))
-        for bench_name, _, _, _, _ in BENCHMARKS:
+        for bench_name, _, _, _, _, _ in BENCHMARKS:
             row = f"  {bench_name:<42}"
             for eng_name in eng_names:
                 delta = mem_results.get(bench_name, {}).get(eng_name)
@@ -962,7 +1032,7 @@ def main():
         wins = 0
         ties = 0
         total = 0
-        for bench_name, _, _, _, _ in BENCHMARKS:
+        for bench_name, _, _, _, _, _ in BENCHMARKS:
             vals = results.get(bench_name, {})
             apex_ms = vals.get("ApexBase")
             if apex_ms is None:

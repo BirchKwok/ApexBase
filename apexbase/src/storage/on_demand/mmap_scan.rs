@@ -2835,6 +2835,8 @@ impl OnDemandStorage {
         for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
             let rg_rows = rg_meta.row_count as usize;
             if rg_rows == 0 { continue; }
+            // Skip fully-deleted row groups — zone maps may still show overlap
+            if rg_meta.active_rows() == 0 { continue; }
 
             // Zone map pruning
             if rg_i < footer.zone_maps.len() {
@@ -2901,6 +2903,36 @@ impl OnDemandStorage {
                     }
                     continue;
                 }
+                // RCIX encoding-aware range pruning: read min/max from encoding header
+                // without allocating, skip RG if range can't overlap [low_i, high_i].
+                if is_int {
+                    let data = &col_bytes[enc_offset..];
+                    let can_skip = if encoding == COL_ENCODING_BITPACK && data.len() >= 17 {
+                        // Header: [count:u64][bit_width:u8][min_value:i64]
+                        let bit_width = data[8] as u32;
+                        let min_val = i64::from_le_bytes(data[9..17].try_into().unwrap());
+                        let max_val = if bit_width == 0 { min_val }
+                                      else { min_val.saturating_add(((1u64 << bit_width) - 1) as i64) };
+                        max_val < low_i || min_val > high_i
+                    } else if encoding == COL_ENCODING_RLE && data.len() >= 16 {
+                        // Header: [count:u64][num_runs:u64][(value:i64,run_len:u32)...]
+                        let num_runs = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+                        let mut rle_min = i64::MAX;
+                        let mut rle_max = i64::MIN;
+                        let mut ok = true;
+                        for r in 0..num_runs {
+                            let off = 16 + r * 12;
+                            if off + 8 > data.len() { ok = false; break; }
+                            let v = i64::from_le_bytes(data[off..off+8].try_into().unwrap());
+                            if v < rle_min { rle_min = v; }
+                            if v > rle_max { rle_max = v; }
+                        }
+                        ok && (rle_max < low_i || rle_min > high_i)
+                    } else {
+                        false
+                    };
+                    if can_skip { continue; }
+                }
             }
 
             // Sequential fallback: scan columns until we reach col_idx
@@ -2938,6 +2970,32 @@ impl OnDemandStorage {
                             }
                         }
                     } else {
+                        // Range pruning before full decode: read min/max from encoding
+                        // header without allocating to skip RGs with no matching values.
+                        if is_int && encoding_version >= 1 {
+                            let data = &col_bytes[enc_offset..];
+                            let can_skip = if encoding == COL_ENCODING_BITPACK && data.len() >= 17 {
+                                let bit_width = data[8] as u32;
+                                let min_val = i64::from_le_bytes(data[9..17].try_into().unwrap());
+                                let max_val = if bit_width == 0 { min_val }
+                                              else { min_val.saturating_add(((1u64 << bit_width) - 1) as i64) };
+                                max_val < low_i || min_val > high_i
+                            } else if encoding == COL_ENCODING_RLE && data.len() >= 16 {
+                                let num_runs = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+                                let mut rle_min = i64::MAX;
+                                let mut rle_max = i64::MIN;
+                                let mut ok = true;
+                                for r in 0..num_runs {
+                                    let off = 16 + r * 12;
+                                    if off + 8 > data.len() { ok = false; break; }
+                                    let v = i64::from_le_bytes(data[off..off+8].try_into().unwrap());
+                                    if v < rle_min { rle_min = v; }
+                                    if v > rle_max { rle_max = v; }
+                                }
+                                ok && (rle_max < low_i || rle_min > high_i)
+                            } else { false };
+                            if can_skip { break; }
+                        }
                         let (col_data, _) = if encoding_version >= 1 {
                             read_column_encoded(col_bytes, ct)?
                         } else {

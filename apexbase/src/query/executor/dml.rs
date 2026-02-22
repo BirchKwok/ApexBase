@@ -2214,12 +2214,16 @@ impl ApexExecutor {
                     }
                     return Ok(ApexResult::Scalar(deleted));
                 }
-                // Inplace path unavailable (compressed/no-RCIX) — fall back to scan+batch
+                // Inplace path unavailable (non-PLAIN encoding) — scan for IDs then use
+                // ID-based inplace delete (binary search, no 1M-entry id_to_idx HashMap build)
                 if let Some(all_rids) = storage.scan_numeric_range_mmap_with_ids(&col, low, high)? {
                     let deleted = all_rids.len() as i64;
                     if deleted > 0 {
-                        storage.delete_batch(&all_rids);
-                        storage.save_delete_only()?;
+                        if storage.delete_ids_inplace_v4(&all_rids)?.is_none() {
+                            // Compressed RGs: full in-memory fallback
+                            storage.delete_batch(&all_rids);
+                            storage.save_delete_only()?;
+                        }
                         invalidate_storage_cache(storage_path);
                         invalidate_table_stats(&storage_path.to_string_lossy());
                     }
@@ -2230,8 +2234,10 @@ impl ApexExecutor {
                     let all_rids = storage.get_ids_for_global_indices_mmap(&indices)?;
                     let deleted = all_rids.len() as i64;
                     if deleted > 0 {
-                        storage.delete_batch(&all_rids);
-                        storage.save_delete_only()?;
+                        if storage.delete_ids_inplace_v4(&all_rids)?.is_none() {
+                            storage.delete_batch(&all_rids);
+                            storage.save_delete_only()?;
+                        }
                         invalidate_storage_cache(storage_path);
                         invalidate_table_stats(&storage_path.to_string_lossy());
                     }

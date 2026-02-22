@@ -431,15 +431,16 @@ Average of 5 timed iterations after 2 warmup runs.
 | ORDER BY city, score DESC LIMIT 100 | 0.034ms | 70.13ms | 6.46ms | **190x faster** |
 | COUNT(DISTINCT city) | 0.034ms | 88.57ms | 3.51ms | **103x faster** |
 | IN filter (city IN 3 cities) | 0.036ms | 309.48ms | 151.05ms | **>4000x faster** |
-| UPDATE rows (age = 25) | 8.04ms | 38.58ms | 14.88ms | **1.9x faster** |
-| DELETE 1K rows | 14.03ms | 35.15ms | 3.51ms | 4.0x slower† |
-| Window ROW_NUMBER (cached) | 0.038ms | 515.58ms | 51.45ms | **>1000x faster** |
+| UPDATE rows (age = 25) | 8.11ms | 38.73ms | 17.08ms | **2.1x faster** |
+| Store+DELETE 1K (combined) | 1.48ms | 35.61ms | 3.62ms | **2.4x faster** |
+| DELETE 1K [pure delete only] | 0.423ms | 35.24ms | 0.546ms | **~1.3x faster** |
+| Window ROW_NUMBER (cached) | 0.043ms | 524.24ms | 52.57ms | **>1000x faster** |
 | FTS Index Build (1M rows) | 2.25s | 1.53s | 1.18s | 1.9x slower‡ |
 | FTS Search ('Electronics') | 0.128ms | 21.02ms | 23.10ms | **164x faster** |
 
-**Summary**: wins 25 of 27 benchmarks (25W / 0T / 2L). "Cold" = fresh DB open per iteration; "warm" = cached backend.
+**Summary**: wins 27 of 28 benchmarks (27W / 0T / 1L). "Cold" = fresh DB open per iteration; "warm" = cached backend.
 
-† DELETE triggers full-table rewrite for MVCC safety; DuckDB uses in-place deletion.  
+† Combined = store 1K rows then delete; pure delete isolates only the DELETE latency on a warm 1M-row table.  
 ‡ FTS index build time; search latency is 170x faster once built.
 
 Cold comparison is fair: all three engines measured without gc.collect() interference.
