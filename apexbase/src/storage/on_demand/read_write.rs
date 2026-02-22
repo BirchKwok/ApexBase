@@ -565,6 +565,11 @@ impl OnDemandStorage {
             }
             for (name, values) in string_columns {
                 if let Some(idx) = schema.get_index(&name) {
+                    // StringDict columns are pre-initialized from schema type but push_string
+                    // only works on String variant; convert in-place before appending.
+                    if matches!(columns[idx], ColumnData::StringDict { .. }) {
+                        columns[idx] = ColumnData::new(ColumnType::String);
+                    }
                     for v in &values {
                         columns[idx].push_string(v);
                     }
@@ -3227,6 +3232,400 @@ impl OnDemandStorage {
         *self.file.write() = Some(new_file);
 
         Ok(())
+    }
+
+    /// Save after deletion-only operations (no new rows inserted).
+    ///
+    /// This bypasses the broken logic in `save()` which conflates "IDs loaded from disk
+    /// for deletion lookup" with "truly new rows needing append". After a deletion-only
+    /// operation on a V4 mmap-only file, `ids` may be populated (by `ensure_ids_loaded_v4`)
+    /// even though no new rows exist, causing `save()` to fall through to a full `save_v4()`
+    /// rewrite. This method calls `save_deletion_vectors()` directly: O(num_RGs) random
+    /// writes instead of a full O(all_data) rewrite.
+    ///
+    /// For compressed files (where deletion vectors are embedded in the compressed body),
+    /// falls back to loading all data + `save_v4()`.
+    pub fn save_delete_only(&self) -> io::Result<()> {
+        let header = self.header.read();
+        let is_v4 = header.version == FORMAT_VERSION_V4 && header.footer_offset > 0;
+        drop(header);
+
+        if !is_v4 {
+            // Non-V4: fall through to normal save
+            return self.save();
+        }
+
+        // Check if any RG is compressed — compressed RGs embed the deletion vector inside
+        // the compressed body, so we cannot update it in-place.
+        // NOTE: get_or_load_footer() acquires mmap_cache.write() internally; call it BEFORE
+        // acquiring mmap_cache ourselves to avoid deadlock.
+        let footer_opt = self.get_or_load_footer()?;
+        let has_compression = if let Some(footer) = footer_opt {
+            let file_guard = self.file.read();
+            if let Some(file) = file_guard.as_ref() {
+                let mut mmap = self.mmap_cache.write();
+                if let Ok(mmap_ref) = mmap.get_or_create(file) {
+                    footer.row_groups.iter().any(|rg| {
+                        if rg.row_count == 0 { return false; }
+                        let rg_start = rg.offset as usize;
+                        rg_start + 32 <= mmap_ref.len()
+                            && mmap_ref[rg_start + 28] != RG_COMPRESS_NONE
+                    })
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if has_compression {
+            // Compressed: must load all columns before full rewrite
+            self.load_all_columns_into_memory()?;
+            self.pending_rows.store(0, Ordering::SeqCst);
+            let result = self.save_v4();
+            if result.is_ok() {
+                let _ = self.clear_delta_store();
+                self.checkpoint_wal();
+            }
+            result
+        } else {
+            // Uncompressed: fast in-place deletion vector update (O(num_RGs) writes)
+            if self.has_pending_deltas() {
+                let _ = self.save_delta_store();
+            }
+            self.save_deletion_vectors()
+        }
+    }
+
+    /// Single-pass scan + mark deleted + save for numeric predicates.
+    /// Returns `Some(newly_deleted_count)` on success, `None` if fast path unavailable
+    /// (non-V4, compressed RGs, or column not found).
+    ///
+    /// Unlike delete_batch() + save_delete_only(), this never builds an id_to_idx HashMap.
+    /// Instead it works directly with flat row indices derived from the mmap scan,
+    /// merging new deletions with the on-disk deletion vector in one pass.
+    pub fn delete_where_numeric_range_inplace(&self, col_name: &str, low: f64, high: f64) -> io::Result<Option<i64>> {
+        let header = self.header.read();
+        let is_v4 = header.version == FORMAT_VERSION_V4 && header.footer_offset > 0;
+        let footer_offset = header.footer_offset;
+        drop(header);
+        if !is_v4 { return Ok(None); }
+
+        // Load footer (acquires mmap_cache internally — must be before we take our own lock)
+        let footer_opt = self.get_or_load_footer()?;
+        let mut footer = match footer_opt { Some(f) => f, None => return Ok(None) };
+
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) { Some(i) => i, None => return Ok(None) };
+        let col_type = schema.columns[col_idx].1;
+        let is_int = matches!(col_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 |
+            ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 |
+            ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date);
+        let is_float = matches!(col_type, ColumnType::Float64 | ColumnType::Float32);
+        if !is_int && !is_float { return Ok(None); }
+        let low_i = low.ceil() as i64;
+        let high_i = high.floor() as i64;
+
+        // Per-RG: (del_vec_offset, new_del_bytes) for RGs that had new deletions
+        struct RgWrite { del_vec_offset: u64, del_bytes: Vec<u8>, new_del_count: u32 }
+        let mut rg_writes: Vec<(usize, RgWrite)> = Vec::new(); // (rg_i, write)
+        let mut newly_deleted: i64 = 0;
+        let mut new_total_active: u64 = 0;
+        let mut can_fast_delete = true;
+
+        {
+            let file_guard = self.file.read();
+            let file = match file_guard.as_ref() { Some(f) => f, None => return Ok(None) };
+            let mut mmap = self.mmap_cache.write();
+            let mmap_ref = match mmap.get_or_create(file) { Ok(m) => m, Err(_) => return Ok(None) };
+
+            'rg_loop: for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+                let rg_rows = rg_meta.row_count as usize;
+                if rg_rows == 0 { continue; }
+                let del_vec_len = (rg_rows + 7) / 8;
+                let null_bitmap_len = del_vec_len;
+
+                // Skip fully-deleted RGs — nothing more can be deleted
+                if rg_meta.deletion_count as usize == rg_rows {
+                    // all rows already deleted, active_rows = 0
+                    continue;
+                }
+
+                // Zone map pruning
+                if rg_i < footer.zone_maps.len() {
+                    if let Some(zm) = footer.zone_maps[rg_i].iter().find(|z| z.col_idx as usize == col_idx) {
+                        let skip = if zm.is_float { !zm.may_overlap_float_range(low, high) }
+                                   else { !zm.may_overlap_int_range(low_i, high_i) };
+                        if skip {
+                            new_total_active += rg_meta.active_rows() as u64;
+                            continue;
+                        }
+                    }
+                }
+
+                let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+                if rg_end > mmap_ref.len() { can_fast_delete = false; break 'rg_loop; }
+
+                // Compressed RGs cannot be in-place updated — fall back
+                if mmap_ref.len() >= rg_meta.offset as usize + 29
+                    && mmap_ref[rg_meta.offset as usize + 28] != RG_COMPRESS_NONE
+                {
+                    can_fast_delete = false;
+                    break 'rg_loop;
+                }
+
+                let body = &mmap_ref[(rg_meta.offset as usize + 32)..rg_end];
+                let id_section = rg_rows * 8;
+                if id_section + del_vec_len > body.len() { can_fast_delete = false; break 'rg_loop; }
+
+                // Require RCIX col_offsets — without them we can't find the target column
+                let rcix_ok = rg_i < footer.col_offsets.len() && col_idx < footer.col_offsets[rg_i].len();
+                if !rcix_ok { can_fast_delete = false; break 'rg_loop; }
+
+                let encoding_version = if mmap_ref.len() > rg_meta.offset as usize + 29 {
+                    mmap_ref[rg_meta.offset as usize + 29]
+                } else { 0 };
+
+                let col_body_off = footer.col_offsets[rg_i][col_idx] as usize;
+                if col_body_off + null_bitmap_len > body.len() { can_fast_delete = false; break 'rg_loop; }
+                let null_bytes = &body[col_body_off..col_body_off + null_bitmap_len];
+                let data_start = col_body_off + null_bitmap_len;
+                let col_bytes = &body[data_start..];
+                let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+                let encoding = if encoding_version >= 1 && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+
+                // Only handle PLAIN encoding — any other encoding falls back to general path
+                if encoding != COL_ENCODING_PLAIN || col_bytes.len() <= enc_offset + 8 {
+                    can_fast_delete = false;
+                    break 'rg_loop;
+                }
+
+                let del_bytes_src = &body[id_section..id_section + del_vec_len];
+                let mut del_bytes = del_bytes_src.to_vec();
+                let has_deletes = rg_meta.deletion_count > 0;
+                let mut rg_newly_deleted: i64 = 0;
+
+                let payload = &col_bytes[enc_offset..];
+                let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                let n = count.min(rg_rows).min((payload.len().saturating_sub(8)) / 8);
+                if is_int {
+                    let vals: &[i64] = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const i64, n) };
+                    for i in 0..n {
+                        if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                        if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                        if vals[i] >= low_i && vals[i] <= high_i {
+                            del_bytes[i/8] |= 1 << (i%8);
+                            rg_newly_deleted += 1;
+                        }
+                    }
+                } else {
+                    let vals: &[f64] = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const f64, n) };
+                    for i in 0..n {
+                        if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                        if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                        if vals[i] >= low && vals[i] <= high {
+                            del_bytes[i/8] |= 1 << (i%8);
+                            rg_newly_deleted += 1;
+                        }
+                    }
+                }
+
+                newly_deleted += rg_newly_deleted;
+                let new_del_count = if rg_newly_deleted > 0 {
+                    del_bytes.iter().map(|b| b.count_ones()).sum::<u32>()
+                } else {
+                    rg_meta.deletion_count
+                };
+                new_total_active += (rg_rows as u32 - new_del_count) as u64;
+
+                // Only enqueue a write if this RG actually had new deletions
+                if rg_newly_deleted > 0 {
+                    let del_vec_offset = rg_meta.offset + 32 + (rg_rows as u64 * 8);
+                    rg_writes.push((rg_i, RgWrite { del_vec_offset, del_bytes, new_del_count }));
+                }
+            }
+        }
+
+        if !can_fast_delete {
+            return Ok(None);
+        }
+        if newly_deleted == 0 {
+            return Ok(Some(0));
+        }
+
+        // Reuse the already-parsed footer (no re-read from disk needed)
+        let mut footer_mut = footer;
+
+        // Close mmap before writing
+        self.mmap_cache.write().invalidate();
+        self.invalidate_page_cache();
+        *self.file.write() = None;
+        crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
+
+        let mut file = OpenOptions::new().write(true).open(&self.path)?;
+
+        // Only write RGs that had actual new deletions
+        for (rg_i, wr) in &rg_writes {
+            file.seek(SeekFrom::Start(wr.del_vec_offset))?;
+            let rg_rows = footer_mut.row_groups[*rg_i].row_count as usize;
+            let del_vec_len = (rg_rows + 7) / 8;
+            file.write_all(&wr.del_bytes[..del_vec_len])?;
+            footer_mut.row_groups[*rg_i].deletion_count = wr.new_del_count;
+        }
+
+        // Rewrite footer
+        file.seek(SeekFrom::Start(footer_offset))?;
+        let new_footer_bytes = footer_mut.to_bytes();
+        file.write_all(&new_footer_bytes)?;
+        let new_end = footer_offset + new_footer_bytes.len() as u64;
+        file.set_len(new_end)?;
+        file.flush()?;
+
+        // Update header row_count
+        {
+            let mut hdr = self.header.write();
+            hdr.row_count = new_total_active;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&hdr.to_bytes())?;
+        }
+        file.flush()?;
+        drop(file);
+
+        // Reopen for reading
+        *self.file.write() = Some(File::open(&self.path)?);
+
+        Ok(Some(newly_deleted))
+    }
+
+    /// Delete rows by their IDs directly from mmap — bypasses the id_to_idx HashMap.
+    /// Reads each RG's ID section via mmap and uses binary search to locate target rows.
+    /// Only RGs with new deletions are written back.
+    /// Returns `Some(newly_deleted)` on success, `None` if fast path unavailable.
+    pub fn delete_ids_inplace_v4(&self, ids: &[u64]) -> io::Result<Option<i64>> {
+        if ids.is_empty() { return Ok(Some(0)); }
+
+        let header = self.header.read();
+        let is_v4 = header.version == FORMAT_VERSION_V4 && header.footer_offset > 0;
+        let footer_offset = header.footer_offset;
+        drop(header);
+        if !is_v4 { return Ok(None); }
+
+        let footer_opt = self.get_or_load_footer()?;
+        let mut footer = match footer_opt { Some(f) => f, None => return Ok(None) };
+
+        let mut sorted_ids = ids.to_vec();
+        sorted_ids.sort_unstable();
+
+        struct RgWrite { del_vec_offset: u64, del_bytes: Vec<u8>, new_del_count: u32 }
+        let mut rg_writes: Vec<(usize, RgWrite)> = Vec::new();
+        let mut newly_deleted: i64 = 0;
+        let mut new_total_active: u64 = 0;
+
+        {
+            let file_guard = self.file.read();
+            let file = match file_guard.as_ref() { Some(f) => f, None => return Ok(None) };
+            let mut mmap = self.mmap_cache.write();
+            let mmap_ref = match mmap.get_or_create(file) { Ok(m) => m, Err(_) => return Ok(None) };
+
+            for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+                let rg_rows = rg_meta.row_count as usize;
+                if rg_rows == 0 { continue; }
+                if rg_meta.deletion_count as usize == rg_rows { continue; }
+
+                let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+                if rg_end > mmap_ref.len() { return Ok(None); }
+                if mmap_ref.len() >= rg_meta.offset as usize + 29
+                    && mmap_ref[rg_meta.offset as usize + 28] != RG_COMPRESS_NONE
+                {
+                    return Ok(None);
+                }
+
+                let body_start = rg_meta.offset as usize + 32;
+                let ids_size = rg_rows * 8;
+                let del_vec_len = (rg_rows + 7) / 8;
+                if body_start + ids_size + del_vec_len > rg_end { return Ok(None); }
+
+                let rg_ids: &[u64] = unsafe {
+                    std::slice::from_raw_parts(
+                        mmap_ref[body_start..body_start + ids_size].as_ptr() as *const u64,
+                        rg_rows,
+                    )
+                };
+
+                // Quick range check (IDs are monotonically increasing within each RG)
+                let lo = sorted_ids.partition_point(|&x| x < rg_ids[0]);
+                let hi = sorted_ids.partition_point(|&x| x <= rg_ids[rg_rows - 1]);
+                if lo >= hi {
+                    new_total_active += rg_meta.active_rows() as u64;
+                    continue;
+                }
+
+                let del_bytes_src = &mmap_ref[body_start + ids_size .. body_start + ids_size + del_vec_len];
+                let mut del_bytes = del_bytes_src.to_vec();
+                let mut rg_newly_deleted: i64 = 0;
+
+                for &target_id in &sorted_ids[lo..hi] {
+                    if let Ok(pos) = rg_ids.binary_search(&target_id) {
+                        if (del_bytes[pos / 8] >> (pos % 8)) & 1 == 0 {
+                            del_bytes[pos / 8] |= 1 << (pos % 8);
+                            rg_newly_deleted += 1;
+                        }
+                    }
+                }
+
+                newly_deleted += rg_newly_deleted;
+                let new_del_count = if rg_newly_deleted > 0 {
+                    del_bytes.iter().map(|b| b.count_ones()).sum::<u32>()
+                } else {
+                    rg_meta.deletion_count
+                };
+                new_total_active += (rg_rows as u32 - new_del_count) as u64;
+
+                if rg_newly_deleted > 0 {
+                    let del_vec_offset = rg_meta.offset + 32 + ids_size as u64;
+                    rg_writes.push((rg_i, RgWrite { del_vec_offset, del_bytes, new_del_count }));
+                }
+            }
+        }
+
+        if newly_deleted == 0 { return Ok(Some(0)); }
+
+        let mut footer_mut = footer;
+        self.mmap_cache.write().invalidate();
+        self.invalidate_page_cache();
+        *self.file.write() = None;
+        crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
+
+        let mut file = OpenOptions::new().write(true).open(&self.path)?;
+
+        for (rg_i, wr) in &rg_writes {
+            file.seek(SeekFrom::Start(wr.del_vec_offset))?;
+            let del_vec_len = (footer_mut.row_groups[*rg_i].row_count as usize + 7) / 8;
+            file.write_all(&wr.del_bytes[..del_vec_len])?;
+            footer_mut.row_groups[*rg_i].deletion_count = wr.new_del_count;
+        }
+
+        file.seek(SeekFrom::Start(footer_offset))?;
+        let new_footer_bytes = footer_mut.to_bytes();
+        file.write_all(&new_footer_bytes)?;
+        let new_end = footer_offset + new_footer_bytes.len() as u64;
+        file.set_len(new_end)?;
+        file.flush()?;
+
+        {
+            let mut hdr = self.header.write();
+            hdr.row_count = new_total_active;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&hdr.to_bytes())?;
+        }
+        file.flush()?;
+        drop(file);
+
+        *self.file.write() = Some(File::open(&self.path)?);
+        Ok(Some(newly_deleted))
     }
 
     /// Write a new Row Group to disk without modifying in-memory state.

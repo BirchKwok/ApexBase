@@ -379,6 +379,14 @@ impl TableStorageBackend {
         Ok(Self::from_storage(path, storage))
     }
     
+    /// Open for DELETE operations — mmap only, does NOT load column data into memory.
+    /// Used by execute_delete to avoid the expensive load_all_columns_into_memory() + save_v4()
+    /// cycle. Deletion vectors are updated in-place via save_delete_only().
+    pub fn open_for_delete(path: &Path) -> io::Result<Self> {
+        // Regular open: V4 files stay in mmap-only mode (no load_all_columns_into_memory)
+        Self::open(path)
+    }
+
     pub fn open_for_schema_change(path: &Path) -> io::Result<Self> {
         Self::open_for_schema_change_with_durability(path, super::DurabilityLevel::Fast)
     }
@@ -777,6 +785,15 @@ impl TableStorageBackend {
     /// Save changes to disk
     pub fn save(&self) -> io::Result<()> {
         self.storage.save()?;
+        *self.dirty.write() = false;
+        Ok(())
+    }
+
+    /// Save after deletion-only operations.
+    /// For uncompressed V4 files: O(num_RGs) in-place deletion vector writes instead of
+    /// a full O(all_data) rewrite. For compressed files, falls back to full rewrite.
+    pub fn save_delete_only(&self) -> io::Result<()> {
+        self.storage.save_delete_only()?;
         *self.dirty.write() = false;
         Ok(())
     }
@@ -1737,11 +1754,15 @@ impl TableStorageBackend {
         // Avoids materializing all rows (which causes ~100ms for 1M unique StringDict strings).
         // Works for cold backends — scan_string_filter_mmap loads the footer lazily.
         // Skip when there is in-memory data not yet flushed (would miss pending writes).
+        eprintln!("[DBG rcfs] filter_eq={} pending_deltas={} col={} val={}", filter_eq, self.has_pending_deltas(), filter_column, filter_value);
         if filter_eq && !self.has_pending_deltas() {
-            if let Some(indices) = self.storage.scan_string_filter_mmap(filter_column, filter_value, None)? {
+            let scan_res = self.storage.scan_string_filter_mmap(filter_column, filter_value, None)?;
+            eprintln!("[DBG rcfs] scan_result={:?}", scan_res.as_ref().map(|v| v.len()));
+            if let Some(indices) = scan_res {
                 if indices.is_empty() {
                     return self.read_columns_to_arrow(column_names, 0, Some(0));
                 }
+                eprintln!("[DBG rcfs] calling read_columns_by_indices with {} indices", indices.len());
                 return self.read_columns_by_indices_to_arrow(&indices);
             }
         }
@@ -2152,6 +2173,33 @@ impl TableStorageBackend {
     /// Mmap-level string equality scan: find matching row indices without Arrow arrays.
     pub fn scan_string_filter_mmap(&self, col_name: &str, target: &str, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
         self.storage.scan_string_filter_mmap(col_name, target, limit)
+    }
+
+    /// Numeric range scan returning matching row IDs directly (not indices).
+    /// Uses zone maps to prune Row Groups — O(matching_RGs) not O(all_rows).
+    pub fn scan_numeric_range_mmap_with_ids(&self, col_name: &str, low: f64, high: f64) -> io::Result<Option<Vec<u64>>> {
+        self.storage.scan_numeric_range_mmap_with_ids(col_name, low, high)
+    }
+
+    /// Single-pass scan + mark deleted + save for numeric predicates.
+    /// Returns `Some(deleted_count)` on success, `None` if fast path unavailable.
+    /// Never builds an id_to_idx HashMap — works directly with flat row indices.
+    pub fn delete_where_numeric_range_inplace(&self, col_name: &str, low: f64, high: f64) -> io::Result<Option<i64>> {
+        let result = self.storage.delete_where_numeric_range_inplace(col_name, low, high)?;
+        if result.is_some() {
+            *self.dirty.write() = false; // written directly to disk
+        }
+        Ok(result)
+    }
+
+    /// Delete rows by IDs using mmap binary search — bypasses the id_to_idx HashMap.
+    /// Returns `Some(newly_deleted)` on success, `None` if fast path unavailable.
+    pub fn delete_ids_inplace_v4(&self, ids: &[u64]) -> io::Result<Option<i64>> {
+        let result = self.storage.delete_ids_inplace_v4(ids)?;
+        if result.is_some() {
+            *self.dirty.write() = false;
+        }
+        Ok(result)
     }
 
     /// Mmap-level numeric range scan: find matching row indices without Arrow arrays.

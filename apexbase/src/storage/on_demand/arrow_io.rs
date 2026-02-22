@@ -1670,6 +1670,30 @@ impl OnDemandStorage {
                     }
                 }
             }
+            ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                // Pre-compute which dict entries (1-based) match the filter value.
+                // Entry 0 means null/empty; real entries start at index 1.
+                let dict_len = dict_offsets.len().saturating_sub(1);
+                let matching_dict: Vec<bool> = (0..dict_len).map(|i| {
+                    let start = dict_offsets[i] as usize;
+                    let end = dict_offsets[i + 1] as usize;
+                    let s = if end <= dict_data.len() { &dict_data[start..end] } else { &[] };
+                    let m = s == filter_bytes;
+                    if filter_eq { m } else { !m }
+                }).collect();
+                for (i, &dict_idx) in indices.iter().enumerate() {
+                    if has_deleted {
+                        let b = i / 8; let bit = i % 8;
+                        if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { continue; }
+                    }
+                    // dict_idx is 1-based; 0 = null
+                    let matches = dict_idx > 0 && {
+                        let actual = (dict_idx - 1) as usize;
+                        actual < matching_dict.len() && matching_dict[actual]
+                    };
+                    if matches { matching_indices.push(i); }
+                }
+            }
             _ => return Ok((HashMap::new(), Vec::new())),
         }
         

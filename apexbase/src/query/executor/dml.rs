@@ -2088,11 +2088,18 @@ impl ApexExecutor {
         invalidate_storage_cache(storage_path);
         
         // Collect indexed column names for this table (for index maintenance)
+        // Use effective_columns() to include ALL columns of composite indexes,
+        // not just the first column (column_name), so composite_key() can find the full key.
         let indexed_cols: Vec<String> = {
             let (bd, tn) = base_dir_and_table(storage_path);
             let mgr = get_index_manager(&bd, &tn);
             let lock = mgr.lock();
-            lock.list_indexes().iter().map(|m| m.column_name.clone()).collect()
+            let mut cols: Vec<String> = lock.list_indexes().iter()
+                .flat_map(|m| m.effective_columns().into_iter().map(|s| s.to_string()))
+                .collect();
+            cols.sort();
+            cols.dedup();
+            cols
         };
 
         // FOREIGN KEY enforcement: check if any child tables reference this table
@@ -2143,7 +2150,7 @@ impl ApexExecutor {
                     }
                 }
             }
-            let storage = TableStorageBackend::open_for_write(storage_path)?;
+            let storage = TableStorageBackend::open_for_delete(storage_path)?;
             let count = storage.active_row_count() as i64;
             
             // Read _id + indexed columns for index maintenance
@@ -2155,6 +2162,7 @@ impl ApexExecutor {
             let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
 
             let mut deleted_entries: Vec<(u64, std::collections::HashMap<String, Value>)> = Vec::new();
+            let mut all_rids: Vec<u64> = Vec::new();
             if let Some(id_col) = batch.column_by_name("_id") {
                 if let Some(id_arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
                     for i in 0..id_arr.len() {
@@ -2166,7 +2174,7 @@ impl ApexExecutor {
                             }
                         }
                         deleted_entries.push((rid, vals));
-                        storage.delete(rid);
+                        all_rids.push(rid);
                     }
                 } else if let Some(id_arr) = id_col.as_any().downcast_ref::<Int64Array>() {
                     for i in 0..id_arr.len() {
@@ -2178,11 +2186,12 @@ impl ApexExecutor {
                             }
                         }
                         deleted_entries.push((rid, vals));
-                        storage.delete(rid);
+                        all_rids.push(rid);
                     }
                 }
             }
-            storage.save()?;
+            storage.delete_batch(&all_rids);
+            storage.save_delete_only()?;
             Self::notify_index_delete(storage_path, &deleted_entries);
             Self::notify_fts_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
@@ -2190,9 +2199,48 @@ impl ApexExecutor {
             return Ok(ApexResult::Scalar(count));
         }
         
-        // Soft delete only marks rows in bitmap
-        let storage = TableStorageBackend::open_for_write(storage_path)?;
-        
+        // Soft delete: use mmap-only open (no full column load) + in-place deletion vector update
+        let storage = TableStorageBackend::open_for_delete(storage_path)?;
+
+        // ── Fast scan path: simple numeric/string predicate, no FK, no indexes ──
+        // Numeric: delete_where_numeric_range_inplace — single pass, no id_to_idx HashMap.
+        // String:  scan_string_filter_mmap → get_ids → delete_batch + save_delete_only.
+        if fk_children.is_empty() && indexed_cols.is_empty() {
+            if let Some((col, low, high)) = Self::extract_numeric_range_from_where(where_clause.unwrap()) {
+                if let Some(deleted) = storage.delete_where_numeric_range_inplace(&col, low, high)? {
+                    if deleted > 0 {
+                        invalidate_storage_cache(storage_path);
+                        invalidate_table_stats(&storage_path.to_string_lossy());
+                    }
+                    return Ok(ApexResult::Scalar(deleted));
+                }
+                // Inplace path unavailable (compressed/no-RCIX) — fall back to scan+batch
+                if let Some(all_rids) = storage.scan_numeric_range_mmap_with_ids(&col, low, high)? {
+                    let deleted = all_rids.len() as i64;
+                    if deleted > 0 {
+                        storage.delete_batch(&all_rids);
+                        storage.save_delete_only()?;
+                        invalidate_storage_cache(storage_path);
+                        invalidate_table_stats(&storage_path.to_string_lossy());
+                    }
+                    return Ok(ApexResult::Scalar(deleted));
+                }
+            } else if let Some((col, val)) = Self::extract_string_equality(where_clause.unwrap()) {
+                if let Some(indices) = storage.scan_string_filter_mmap(&col, &val, None)? {
+                    let all_rids = storage.get_ids_for_global_indices_mmap(&indices)?;
+                    let deleted = all_rids.len() as i64;
+                    if deleted > 0 {
+                        storage.delete_batch(&all_rids);
+                        storage.save_delete_only()?;
+                        invalidate_storage_cache(storage_path);
+                        invalidate_table_stats(&storage_path.to_string_lossy());
+                    }
+                    return Ok(ApexResult::Scalar(deleted));
+                }
+            }
+        }
+        // ── End fast scan path ──
+
         // Extract column names from WHERE clause + indexed columns + FK-referenced columns
         let mut where_cols: Vec<String> = Vec::new();
         Self::collect_columns_from_expr(where_clause.unwrap(), &mut where_cols);
@@ -2250,12 +2298,13 @@ impl ApexExecutor {
             }
         }
 
-        // Count and delete matching rows, collect entries for index maintenance
+        // Collect matching row IDs and index values for batch deletion
         let mut deleted = 0i64;
         let mut deleted_entries: Vec<(u64, std::collections::HashMap<String, Value>)> = Vec::new();
-        for i in 0..filter_mask.len() {
-            if filter_mask.value(i) {
-                if let Some(id_col) = batch.column_by_name("_id") {
+        let mut all_rids: Vec<u64> = Vec::new();
+        if let Some(id_col) = batch.column_by_name("_id") {
+            for i in 0..filter_mask.len() {
+                if filter_mask.value(i) {
                     let rid = if let Some(id_arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
                         Some(id_arr.value(i))
                     } else if let Some(id_arr) = id_col.as_any().downcast_ref::<Int64Array>() {
@@ -2269,7 +2318,7 @@ impl ApexExecutor {
                             }
                         }
                         deleted_entries.push((rid, vals));
-                        storage.delete(rid);
+                        all_rids.push(rid);
                         deleted += 1;
                     }
                 }
@@ -2277,7 +2326,17 @@ impl ApexExecutor {
         }
         
         if deleted > 0 {
-            storage.save()?;
+            // Fast path: no FK/index notifications — use mmap binary-search delete
+            // (bypasses the id_to_idx HashMap build in delete_batch)
+            let used_inplace = if fk_children.is_empty() && indexed_cols.is_empty() {
+                storage.delete_ids_inplace_v4(&all_rids)?.is_some()
+            } else {
+                false
+            };
+            if !used_inplace {
+                storage.delete_batch(&all_rids);
+                storage.save_delete_only()?;
+            }
             Self::notify_index_delete(storage_path, &deleted_entries);
             Self::notify_fts_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
@@ -2307,11 +2366,17 @@ impl ApexExecutor {
         invalidate_storage_cache(storage_path);
         
         // Collect indexed column names for index maintenance
+        // Use effective_columns() to include ALL columns of composite indexes.
         let indexed_cols: Vec<String> = {
             let (bd, tn) = base_dir_and_table(storage_path);
             let mgr = get_index_manager(&bd, &tn);
             let lock = mgr.lock();
-            lock.list_indexes().iter().map(|m| m.column_name.clone()).collect()
+            let mut cols: Vec<String> = lock.list_indexes().iter()
+                .flat_map(|m| m.effective_columns().into_iter().map(|s| s.to_string()))
+                .collect();
+            cols.sort();
+            cols.dedup();
+            cols
         };
         
         // Use open (mmap-only) — avoids loading ALL columns into memory.

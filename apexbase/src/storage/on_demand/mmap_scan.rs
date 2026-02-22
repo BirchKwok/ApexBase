@@ -747,12 +747,10 @@ impl OnDemandStorage {
         drop(mmap_guard);
         drop(file_guard);
 
-        // Update deletion bitmap
-        {
-            let mut deleted = self.deleted.write();
-            if deleted.is_empty() && !deleted_acc.is_empty() {
-                *deleted = deleted_acc;
-            }
+        // Update deletion bitmap — always overwrite on first load (ids were empty above).
+        // The pre-allocated zeros in self.deleted must not shadow the real on-disk state.
+        if !deleted_acc.is_empty() {
+            *self.deleted.write() = deleted_acc;
         }
 
         // Update next_id

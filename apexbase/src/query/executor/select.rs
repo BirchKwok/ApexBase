@@ -1679,9 +1679,29 @@ impl ApexExecutor {
             return backend.read_columns_to_arrow(None, 0, Some(0));
         }
         
-        // Step 4: Read ALL columns but only for matching row indices
-        // This reads directly from disk for only the matching rows - true late materialization
-        backend.read_columns_by_indices_to_arrow(&limited_indices)
+        // Step 4: Read ALL columns but only for matching row indices.
+        // NOTE: limited_indices are positions in the ACTIVE row sequence (deleted rows excluded).
+        // For V4 mmap-only backends, read_columns_by_indices_to_arrow delegates to
+        // extract_rows_by_indices_to_arrow which uses PHYSICAL row positions — causing
+        // wrong results when deletions shift active vs physical positions.
+        // For mmap-only: use full active read + Arrow take (active indices match active batch).
+        // For in-memory (data loaded): read_columns_by_indices_to_arrow falls back to the
+        // same full-read + take path, so physical==active there too.
+        if backend.is_mmap_only() {
+            use arrow::array::ArrayRef;
+            let full_batch = backend.read_columns_to_arrow(None, 0, None)?;
+            let indices_arr = arrow::array::UInt32Array::from(
+                limited_indices.iter().map(|&i| i as u32).collect::<Vec<_>>()
+            );
+            let taken_cols: Vec<ArrayRef> = full_batch.columns().iter()
+                .map(|col| arrow::compute::take(col.as_ref(), &indices_arr, None)
+                    .map_err(|e| err_data(e.to_string())))
+                .collect::<io::Result<Vec<_>>>()?;
+            arrow::record_batch::RecordBatch::try_new(full_batch.schema(), taken_cols)
+                .map_err(|e| err_data(e.to_string()))
+        } else {
+            backend.read_columns_by_indices_to_arrow(&limited_indices)
+        }
     }
 
     /// Execute SELECT * with ORDER BY + LIMIT late materialization
