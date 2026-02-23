@@ -434,13 +434,11 @@ Average of 5 timed iterations after 2 warmup runs.
 | UPDATE rows (age = 25) | 7.63ms | 37.84ms | 14.29ms | **1.9x faster** |
 | Store+DELETE 1K (combined) | 1.16ms | 35.21ms | 3.02ms | **2.6x faster** |
 | DELETE 1K [pure delete only] | 0.284ms | 32.46ms | 0.463ms | **1.6x faster** |
-| Window ROW\_NUMBER (cached) | 0.037ms | 497.17ms | 43.05ms | **>1000x faster** |
+| Window ROW\_NUMBER | 0.037ms | 497.17ms | 43.05ms | **>1000x faster** |
 | FTS Index Build (1M rows) | 805ms | 1.49s | 1.07s | **1.3x faster** |
 | FTS Search ('Electronics') | 0.133ms | 20.79ms | 20.00ms | **150x faster** |
 
 **Summary**: wins 28 of 28 benchmarks (28W / 0T / 0L). "Cold" = fresh DB open per iteration; "warm" = cached backend.
-
-† Combined = store 1K rows then delete; pure delete isolates only the DELETE latency on a warm 1M-row table.
 
 Cold comparison is fair: all three engines measured without gc.collect() interference.
 
