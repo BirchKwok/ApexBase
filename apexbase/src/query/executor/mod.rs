@@ -1131,11 +1131,16 @@ impl ApexExecutor {
         select
     }
 
-    /// Execute SELECT statement (legacy - uses storage_path for subqueries too)
+    /// Execute SELECT statement (resolves FROM table path relative to storage_path's directory)
     fn execute_select(stmt: SelectStatement, storage_path: &Path) -> io::Result<ApexResult> {
-        // Delegate to the base_dir version, using storage_path's parent as base_dir
         let base_dir = storage_path.parent().unwrap_or(storage_path);
-        Self::execute_select_with_base_dir(stmt, storage_path, base_dir, storage_path)
+        // Resolve the actual table path from the FROM clause so UNION/subquery sides use the right table
+        let actual_path = if let Some(FromItem::Table { ref table, .. }) = stmt.from {
+            Self::resolve_table_path(table, base_dir, storage_path)
+        } else {
+            storage_path.to_path_buf()
+        };
+        Self::execute_select_with_base_dir(stmt, &actual_path, base_dir, storage_path)
     }
 
 }

@@ -2,6 +2,46 @@
 
 impl ApexExecutor {
 
+    /// Resolve ORDER BY column names against SELECT list aliases.
+    /// Maps expressions like `SUM(amount)` to their output column name (e.g. `total`)
+    /// so ORDER BY works correctly when aggregate columns are aliased.
+    fn resolve_order_by_cols(
+        columns: &[crate::query::SelectColumn],
+        order_by: &[crate::query::OrderByClause],
+    ) -> Vec<crate::query::OrderByClause> {
+        use crate::query::{SelectColumn, AggregateFunc};
+        order_by.iter().map(|clause| {
+            let name_up = clause.column.to_uppercase();
+            // Try to match against SELECT aggregate columns
+            for sel_col in columns {
+                if let SelectColumn::Aggregate { func, column, alias, .. } = sel_col {
+                    let fn_str = match func {
+                        AggregateFunc::Sum   => "SUM",
+                        AggregateFunc::Count => "COUNT",
+                        AggregateFunc::Avg   => "AVG",
+                        AggregateFunc::Min   => "MIN",
+                        AggregateFunc::Max   => "MAX",
+                    };
+                    let col_part = column.as_deref().unwrap_or("*");
+                    let default_name = format!("{}({})", fn_str, col_part);
+                    if default_name.to_uppercase() == name_up {
+                        let out_name = if let Some(a) = alias {
+                            a.clone()
+                        } else {
+                            default_name
+                        };
+                        return crate::query::OrderByClause {
+                            column: out_name,
+                            descending: clause.descending,
+                            nulls_first: clause.nulls_first,
+                        };
+                    }
+                }
+            }
+            clause.clone()
+        }).collect()
+    }
+
     /// Apply ORDER BY clause
     /// OPTIMIZATION: Use parallel sort for large datasets (>100K rows) using Rayon
     fn apply_order_by(
@@ -532,22 +572,38 @@ impl ApexExecutor {
             match col {
                 SelectColumn::Column(name) => {
                     let col_name = name.trim_matches('"');
-                    let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+                    // Try full qualified name first (e.g., 'b.name' for self-join),
+                    // then fall back to bare name.
+                    let bare_col = if let Some(dot_pos) = col_name.rfind('.') {
                         &col_name[dot_pos + 1..]
                     } else {
                         col_name
                     };
-                    if !added_columns.contains(actual_col) {
-                        if let Some(array) = batch.column_by_name(actual_col) {
-                            fields.push(Field::new(actual_col, array.data_type().clone(), true));
-                            arrays.push(array.clone());
-                            added_columns.insert(actual_col.to_string());
-                        }
+                    let (out_name, array) = if let Some(arr) = batch.column_by_name(col_name) {
+                        (bare_col, arr)
+                    } else if let Some(arr) = batch.column_by_name(bare_col) {
+                        (bare_col, arr)
+                    } else {
+                        continue;
+                    };
+                    if !added_columns.contains(out_name) {
+                        fields.push(Field::new(out_name, array.data_type().clone(), true));
+                        arrays.push(array.clone());
+                        added_columns.insert(out_name.to_string());
                     }
                 }
                 SelectColumn::ColumnAlias { column, alias } => {
                     let col_name = column.trim_matches('"');
-                    if let Some(array) = batch.column_by_name(col_name) {
+                    // Try full qualified name first (for self-join disambiguation),
+                    // then bare name.
+                    let bare_col = if let Some(dot_pos) = col_name.rfind('.') {
+                        &col_name[dot_pos + 1..]
+                    } else {
+                        col_name
+                    };
+                    let array = batch.column_by_name(col_name)
+                        .or_else(|| batch.column_by_name(bare_col));
+                    if let Some(array) = array {
                         fields.push(Field::new(alias, array.data_type().clone(), true));
                         arrays.push(array.clone());
                         added_columns.insert(alias.clone());
@@ -823,35 +879,53 @@ impl ApexExecutor {
     /// For example, GROUP BY YEAR(date) evaluates YEAR(date) for each row and adds a
     /// column named "YEAR(date)" to the batch so the grouping logic can use it.
     fn materialize_group_by_exprs(batch: &RecordBatch, stmt: &SelectStatement) -> io::Result<RecordBatch> {
-        let mut has_exprs = false;
-        for expr_opt in &stmt.group_by_exprs {
-            if expr_opt.is_some() {
-                has_exprs = true;
-                break;
-            }
-        }
-        if !has_exprs {
-            return Ok(batch.clone());
-        }
-        
-        // Evaluate each expression and add as a new column
         let mut fields: Vec<Field> = batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
         let mut arrays: Vec<ArrayRef> = (0..batch.num_columns()).map(|i| batch.column(i).clone()).collect();
-        
+        let mut added_any = false;
+
+        // 1. Evaluate explicit expression-based GROUP BY columns (e.g., YEAR(date))
         for (i, expr_opt) in stmt.group_by_exprs.iter().enumerate() {
             if let Some(expr) = expr_opt {
                 let col_name = &stmt.group_by[i];
-                // Skip if column already exists in batch (shouldn't happen, but safety check)
-                if batch.column_by_name(col_name).is_some() {
-                    continue;
-                }
+                if batch.column_by_name(col_name).is_some() { continue; }
                 let result_array = Self::evaluate_expr_to_array(batch, expr)?;
                 let dt = result_array.data_type().clone();
                 fields.push(Field::new(col_name, dt, true));
                 arrays.push(result_array);
+                added_any = true;
             }
         }
-        
+
+        // 2. Resolve GROUP BY aliases: if a GROUP BY name is not in the batch but
+        //    matches a SELECT alias, evaluate that SELECT expression.
+        for gb_name in &stmt.group_by {
+            let trimmed = gb_name.trim_matches('"');
+            if batch.column_by_name(trimmed).is_some() { continue; }
+            // Already added above?
+            if fields.iter().any(|f| f.name() == trimmed) { continue; }
+            // Look for a SELECT column with this alias
+            for sel_col in &stmt.columns {
+                match sel_col {
+                    SelectColumn::Expression { expr, alias: Some(alias) } if alias == trimmed => {
+                        let result_array = Self::evaluate_expr_to_array(batch, expr)?;
+                        let dt = result_array.data_type().clone();
+                        fields.push(Field::new(trimmed, dt, true));
+                        arrays.push(result_array);
+                        added_any = true;
+                        break;
+                    }
+                    SelectColumn::Aggregate { alias: Some(alias), .. } if alias == trimmed => {
+                        // GROUP BY on an aggregate alias is not meaningful, skip
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if !added_any {
+            return Ok(batch.clone());
+        }
         let schema = Arc::new(Schema::new(fields));
         RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
@@ -867,6 +941,13 @@ impl ApexExecutor {
         use crate::query::vectorized::{execute_vectorized_group_by, VectorizedHashAgg};
         use crate::query::AggregateFunc;
         
+        // If group column has NULLs, fall back to incremental path which handles null keys
+        if let Some(col) = batch.column_by_name(group_col_name) {
+            if col.null_count() > 0 {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "null group key"));
+            }
+        }
+
         // OPTIMIZATION: For DictionaryArray columns, use direct indexing (much faster)
         if let Some(col) = batch.column_by_name(group_col_name) {
             use arrow::array::DictionaryArray;
@@ -1115,21 +1196,27 @@ impl ApexExecutor {
                 .map_err(|e| err_data( e.to_string()))?;
         }
         
-        // Apply ORDER BY if present
+        // Apply ORDER BY if present (resolve aggregate expressions to output column names first)
         if !stmt.order_by.is_empty() {
-            result_batch = Self::apply_order_by(&result_batch, &stmt.order_by)?;
+            let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+            result_batch = Self::apply_order_by(&result_batch, &resolved_ob)?;
         }
-        
         
         Ok(ApexResult::Data(result_batch))
     }
-
+    
     /// Check if we can use incremental aggregation (no DISTINCT, no complex expressions)
     fn can_use_incremental_aggregation(stmt: &SelectStatement) -> bool {
         for col in &stmt.columns {
             match col {
-                SelectColumn::Aggregate { distinct, .. } => {
+                SelectColumn::Aggregate { func, column, distinct, .. } => {
                     if *distinct { return false; }
+                    // COUNT(col) with specific col needs null-aware path
+                    if matches!(func, crate::query::AggregateFunc::Count) {
+                        if let Some(c) = column {
+                            if c != "*" && c != "1" { return false; }
+                        }
+                    }
                 }
                 SelectColumn::Expression { .. } => {
                     return false; // Expressions may need row access
@@ -1364,9 +1451,10 @@ impl ApexExecutor {
                 .map_err(|e| err_data( e.to_string()))?;
         }
         
-        // Apply ORDER BY if present
+        // Apply ORDER BY if present (resolve aggregate expressions to output column names first)
         if !stmt.order_by.is_empty() {
-            result_batch = Self::apply_order_by(&result_batch, &stmt.order_by)?;
+            let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+            result_batch = Self::apply_order_by(&result_batch, &resolved_ob)?;
         }
         
         Ok(ApexResult::Data(result_batch))
@@ -1392,6 +1480,13 @@ impl ApexExecutor {
         let mut mins_int: Vec<Option<i64>> = vec![None; range];
         let mut maxs_int: Vec<Option<i64>> = vec![None; range];
         let mut first_rows: Vec<usize> = vec![usize::MAX; range];
+        // Separate state for NULL-key rows
+        let mut null_count: i64 = 0;
+        let mut null_sum_int: i64 = 0;
+        let mut null_sum_float: f64 = 0.0;
+        let mut null_min_int: Option<i64> = None;
+        let mut null_max_int: Option<i64> = None;
+        let mut null_first_row: usize = usize::MAX;
         
         // Find aggregate column
         let mut agg_col_int: Option<&Int64Array> = None;
@@ -1420,7 +1515,23 @@ impl ApexExecutor {
         
         // Single pass aggregation with direct indexing
         for row_idx in 0..num_rows {
-            if group_col.is_null(row_idx) { continue; }
+            if group_col.is_null(row_idx) {
+                // NULL key: track separately
+                null_count += 1;
+                if null_first_row == usize::MAX { null_first_row = row_idx; }
+                if let Some(int_arr) = agg_col_int {
+                    if !int_arr.is_null(row_idx) {
+                        let val = int_arr.value(row_idx);
+                        null_sum_int = null_sum_int.wrapping_add(val);
+                        null_min_int = Some(null_min_int.map_or(val, |m: i64| m.min(val)));
+                        null_max_int = Some(null_max_int.map_or(val, |m: i64| m.max(val)));
+                    }
+                }
+                if let Some(float_arr) = agg_col_float {
+                    if !float_arr.is_null(row_idx) { null_sum_float += float_arr.value(row_idx); }
+                }
+                continue;
+            }
             let group_val = group_col.value(row_idx) as usize - min_val;
             
             counts[group_val] += 1;
@@ -1457,22 +1568,64 @@ impl ApexExecutor {
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_else(|| "group".to_string());
         
-        let group_values: Vec<i64> = active_groups.iter()
-            .map(|&i| (i + min_val) as i64)
-            .collect();
-        result_fields.push(Field::new(&group_col_name, ArrowDataType::Int64, false));
-        result_arrays.push(Arc::new(Int64Array::from(group_values)));
+        // Build group key array including optional NULL group
+        let has_null_group = null_count > 0;
+        let total_groups = active_groups.len() + if has_null_group { 1 } else { 0 };
+        let _ = total_groups; // suppress warning
+        {
+            // Build Int64 array with possible null entry
+            let mut key_vals: Vec<Option<i64>> = active_groups.iter()
+                .map(|&i| Some((i + min_val) as i64))
+                .collect();
+            if has_null_group { key_vals.push(None); }
+            result_fields.push(Field::new(&group_col_name, ArrowDataType::Int64, true));
+            result_arrays.push(Arc::new(Int64Array::from(key_vals)));
+        }
         
         // Add aggregate columns
         for col in &stmt.columns {
             if let SelectColumn::Aggregate { func, column, alias, .. } = col {
                 let field_name = alias.clone().unwrap_or_else(|| format!("{}({})", func.to_string(), column.as_deref().unwrap_or("*")));
                 match func {
-                    AggregateFunc::Count => { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, false)); result_arrays.push(Arc::new(Int64Array::from(active_groups.iter().map(|&i| counts[i]).collect::<Vec<_>>()))); }
-                    AggregateFunc::Sum => { if agg_col_int.is_some() { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true)); result_arrays.push(Arc::new(Int64Array::from(active_groups.iter().map(|&i| sums_int[i]).collect::<Vec<_>>()))); } else { result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(active_groups.iter().map(|&i| sums_float[i]).collect::<Vec<_>>()))); } }
-                    AggregateFunc::Avg => { result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true)); result_arrays.push(Arc::new(Float64Array::from(active_groups.iter().map(|&i| if counts[i] > 0 { if agg_col_int.is_some() { sums_int[i] as f64 / counts[i] as f64 } else { sums_float[i] / counts[i] as f64 } } else { 0.0 }).collect::<Vec<_>>()))); }
-                    AggregateFunc::Min => { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true)); result_arrays.push(Arc::new(Int64Array::from(active_groups.iter().map(|&i| mins_int[i]).collect::<Vec<_>>()))); }
-                    AggregateFunc::Max => { result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true)); result_arrays.push(Arc::new(Int64Array::from(active_groups.iter().map(|&i| maxs_int[i]).collect::<Vec<_>>()))); }
+                    AggregateFunc::Count => {
+                        let mut vals: Vec<i64> = active_groups.iter().map(|&i| counts[i]).collect();
+                        if has_null_group { vals.push(null_count); }
+                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, false));
+                        result_arrays.push(Arc::new(Int64Array::from(vals)));
+                    }
+                    AggregateFunc::Sum => {
+                        if agg_col_int.is_some() {
+                            let mut vals: Vec<i64> = active_groups.iter().map(|&i| sums_int[i]).collect();
+                            if has_null_group { vals.push(null_sum_int); }
+                            result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
+                            result_arrays.push(Arc::new(Int64Array::from(vals)));
+                        } else {
+                            let mut vals: Vec<f64> = active_groups.iter().map(|&i| sums_float[i]).collect();
+                            if has_null_group { vals.push(null_sum_float); }
+                            result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
+                            result_arrays.push(Arc::new(Float64Array::from(vals)));
+                        }
+                    }
+                    AggregateFunc::Avg => {
+                        let mut vals: Vec<f64> = active_groups.iter().map(|&i| {
+                            if counts[i] > 0 { if agg_col_int.is_some() { sums_int[i] as f64 / counts[i] as f64 } else { sums_float[i] / counts[i] as f64 } } else { 0.0 }
+                        }).collect();
+                        if has_null_group { vals.push(if null_count > 0 { if agg_col_int.is_some() { null_sum_int as f64 / null_count as f64 } else { null_sum_float / null_count as f64 } } else { 0.0 }); }
+                        result_fields.push(Field::new(&field_name, ArrowDataType::Float64, true));
+                        result_arrays.push(Arc::new(Float64Array::from(vals)));
+                    }
+                    AggregateFunc::Min => {
+                        let mut vals: Vec<Option<i64>> = active_groups.iter().map(|&i| mins_int[i]).collect();
+                        if has_null_group { vals.push(null_min_int); }
+                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
+                        result_arrays.push(Arc::new(Int64Array::from(vals)));
+                    }
+                    AggregateFunc::Max => {
+                        let mut vals: Vec<Option<i64>> = active_groups.iter().map(|&i| maxs_int[i]).collect();
+                        if has_null_group { vals.push(null_max_int); }
+                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
+                        result_arrays.push(Arc::new(Int64Array::from(vals)));
+                    }
                 }
             }
         }
@@ -1480,7 +1633,10 @@ impl ApexExecutor {
         let schema = Arc::new(Schema::new(result_fields));
         let mut result_batch = RecordBatch::try_new(schema, result_arrays).map_err(|e| err_data(e.to_string()))?;
         if let Some(having_expr) = &stmt.having { let mask = Self::evaluate_predicate(&result_batch, having_expr)?; result_batch = compute::filter_record_batch(&result_batch, &mask).map_err(|e| err_data(e.to_string()))?; }
-        if !stmt.order_by.is_empty() { result_batch = Self::apply_order_by(&result_batch, &stmt.order_by)?; }
+        if !stmt.order_by.is_empty() {
+            let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+            result_batch = Self::apply_order_by(&result_batch, &resolved_ob)?;
+        }
         Ok(ApexResult::Data(result_batch))
     }
     
@@ -2252,8 +2408,9 @@ impl ApexExecutor {
                     
                     // Apply ORDER BY with top-k optimization
                     if !stmt.order_by.is_empty() {
+                        let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
                         let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
-                        result = Self::apply_order_by_topk(&result, &stmt.order_by, k)?;
+                        result = Self::apply_order_by_topk(&result, &resolved_ob, k)?;
                     }
                     
                     // Apply LIMIT + OFFSET
@@ -2580,8 +2737,9 @@ impl ApexExecutor {
         
         // Apply ORDER BY with top-k optimization if LIMIT is present
         if !stmt.order_by.is_empty() {
+            let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
             let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
-            result = Self::apply_order_by_topk(&result, &stmt.order_by, k)?;
+            result = Self::apply_order_by_topk(&result, &resolved_ob, k)?;
         }
         
         // Apply LIMIT + OFFSET
@@ -2744,7 +2902,8 @@ impl ApexExecutor {
 
         // Apply ORDER BY if present
         if !stmt.order_by.is_empty() {
-            result = Self::apply_order_by(&result, &stmt.order_by)?;
+            let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+            result = Self::apply_order_by(&result, &resolved_ob)?;
         }
 
         Ok(ApexResult::Data(result))

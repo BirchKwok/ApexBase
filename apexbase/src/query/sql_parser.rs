@@ -88,11 +88,15 @@ pub enum SqlStatement {
     ShowFtsIndexes,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetOpType { Union, Intersect, Except }
+
 #[derive(Debug, Clone)]
 pub struct UnionStatement {
     pub left: Box<SqlStatement>,
     pub right: Box<SqlStatement>,
     pub all: bool,
+    pub set_op: SetOpType,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -539,7 +543,7 @@ enum Token {
     Over,
     Partition,
     Join, Left, Right, Full, Inner, Outer, Cross, On,
-    Union, All,
+    Union, Intersect, Except, All,
     Exists,
     Cast,
     Case, When, Then, Else, End,
@@ -850,6 +854,8 @@ impl SqlParser {
                     "CROSS" => Token::Cross,
                     "ON" => Token::On,
                     "UNION" => Token::Union,
+                    "INTERSECT" => Token::Intersect,
+                    "EXCEPT" => Token::Except,
                     "ALL" => Token::All,
                     "EXISTS" => Token::Exists,
                     "CAST" => Token::Cast,
@@ -1230,8 +1236,14 @@ impl SqlParser {
                 // Those trailing clauses belong to UNION result if a UNION follows.
                 let mut stmt = SqlStatement::Select(self.parse_select_part()?);
 
-                // UNION chain
-                while matches!(self.current(), Token::Union) {
+                // UNION / INTERSECT / EXCEPT chain
+                while matches!(self.current(), Token::Union | Token::Intersect | Token::Except) {
+                    let set_op = match self.current() {
+                        Token::Union => SetOpType::Union,
+                        Token::Intersect => SetOpType::Intersect,
+                        Token::Except => SetOpType::Except,
+                        _ => unreachable!(),
+                    };
                     self.advance();
                     let all = if matches!(self.current(), Token::All) {
                         self.advance();
@@ -1242,7 +1254,7 @@ impl SqlParser {
 
                     if !matches!(self.current(), Token::Select) {
                         let (start, _) = self.current_span();
-                        return Err(self.syntax_error(start, "Expected SELECT after UNION".to_string()));
+                        return Err(self.syntax_error(start, "Expected SELECT after set operation".to_string()));
                     }
                     let right = SqlStatement::Select(self.parse_select_part()?);
 
@@ -1250,6 +1262,7 @@ impl SqlParser {
                         left: Box::new(stmt),
                         right: Box::new(right),
                         all,
+                        set_op,
                         order_by: Vec::new(),
                         limit: None,
                         offset: None,
@@ -2021,20 +2034,29 @@ impl SqlParser {
     }
 
     fn parse_alias_identifier(&mut self) -> Option<String> {
-        match self.current() {
-            Token::Identifier(name) => {
-                let name = name.clone();
-                self.advance();
-                Some(name)
-            }
-            // Allow keyword aliases, e.g. COUNT(1) count
+        let alias = match self.current() {
+            Token::Identifier(name) => { let n = name.clone(); self.advance(); Some(n) }
+            // Allow keyword aliases, e.g. COUNT(1) count, FIRST_VALUE(...) first
             Token::Count => { self.advance(); Some("count".to_string()) }
             Token::Sum => { self.advance(); Some("sum".to_string()) }
             Token::Avg => { self.advance(); Some("avg".to_string()) }
             Token::Min => { self.advance(); Some("min".to_string()) }
             Token::Max => { self.advance(); Some("max".to_string()) }
+            Token::First => { self.advance(); Some("first".to_string()) }
+            Token::Last => { self.advance(); Some("last".to_string()) }
+            Token::Order => { self.advance(); Some("order".to_string()) }
+            Token::Group => { self.advance(); Some("group".to_string()) }
+            Token::By => { self.advance(); Some("by".to_string()) }
+            Token::Asc => { self.advance(); Some("asc".to_string()) }
+            Token::Desc => { self.advance(); Some("desc".to_string()) }
+            Token::Nulls => { self.advance(); Some("nulls".to_string()) }
+            Token::Is => { self.advance(); Some("is".to_string()) }
+            Token::In => { self.advance(); Some("in".to_string()) }
+            Token::Not => { self.advance(); Some("not".to_string()) }
+            Token::Null => { self.advance(); Some("null".to_string()) }
             _ => None,
-        }
+        };
+        alias
     }
 
     /// Parse a column reference, supporting qualified names like t.col.
@@ -2466,43 +2488,87 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
     let mut clauses = Vec::new();
 
     loop {
-        if matches!(self.current(), Token::Identifier(_)) {
-            let column = self.parse_column_ref()?;
-            
-            let descending = if matches!(self.current(), Token::Desc) {
-                self.advance();
-                true
-            } else if matches!(self.current(), Token::Asc) {
-                self.advance();
-                false
-            } else {
-                // Default ASC
-                if matches!(self.current(), Token::Asc) {
-                    self.advance();
-                }
-                false
-            };
-            
-            // SQL:2023 NULLS FIRST/LAST
-            let nulls_first = if matches!(self.current(), Token::Nulls) {
-                self.advance();
-                if matches!(self.current(), Token::First) {
-                    self.advance();
-                    Some(true)
-                } else if matches!(self.current(), Token::Last) {
-                    self.advance();
-                    Some(false)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            
-            clauses.push(OrderByClause { column, descending, nulls_first });
-        } else {
+        // Accept: identifier, or aggregate function token (SUM/COUNT/AVG/MIN/MAX) followed by (...)
+        let is_agg_func = matches!(self.current(),
+            Token::Sum | Token::Count | Token::Avg | Token::Min | Token::Max);
+        let is_ident = matches!(self.current(), Token::Identifier(_));
+        let is_int_lit = matches!(self.current(), Token::IntLit(_));
+
+        if !is_ident && !is_agg_func && !is_int_lit {
             break;
         }
+
+        let column = if is_agg_func {
+            // Parse SUM(col) / COUNT(*) / etc. as a string for the ORDER BY clause
+            let func_name = match self.current() {
+                Token::Sum => "SUM",
+                Token::Count => "COUNT",
+                Token::Avg => "AVG",
+                Token::Min => "MIN",
+                Token::Max => "MAX",
+                _ => unreachable!(),
+            }.to_string();
+            self.advance();
+            // Consume parenthesised argument(s) as opaque text
+            let mut depth = 0usize;
+            let mut arg = String::new();
+            if matches!(self.current(), Token::LParen) {
+                self.advance();
+                depth = 1;
+                while depth > 0 {
+                    match self.current() {
+                        Token::LParen => { depth += 1; arg.push('('); self.advance(); }
+                        Token::RParen => {
+                            depth -= 1;
+                            if depth > 0 { arg.push(')'); }
+                            self.advance();
+                        }
+                        Token::Star => { arg.push('*'); self.advance(); }
+                        Token::Identifier(s) => { arg.push_str(s); self.advance(); }
+                        Token::Comma => { arg.push(','); self.advance(); }
+                        _ => { self.advance(); }
+                    }
+                }
+            }
+            format!("{}({})", func_name, arg.trim())
+        } else if is_int_lit {
+            // Positional ORDER BY like ORDER BY 1
+            if let Token::IntLit(n) = self.current() {
+                let s = n.to_string();
+                self.advance();
+                s
+            } else { break; }
+        } else {
+            self.parse_column_ref()?
+        };
+
+        let descending = if matches!(self.current(), Token::Desc) {
+            self.advance();
+            true
+        } else if matches!(self.current(), Token::Asc) {
+            self.advance();
+            false
+        } else {
+            false
+        };
+
+        // SQL:2023 NULLS FIRST/LAST
+        let nulls_first = if matches!(self.current(), Token::Nulls) {
+            self.advance();
+            if matches!(self.current(), Token::First) {
+                self.advance();
+                Some(true)
+            } else if matches!(self.current(), Token::Last) {
+                self.advance();
+                Some(false)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        clauses.push(OrderByClause { column, descending, nulls_first });
 
         if matches!(self.current(), Token::Comma) {
             self.advance();

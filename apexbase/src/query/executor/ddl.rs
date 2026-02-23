@@ -502,7 +502,11 @@ impl ApexExecutor {
             .unwrap_or_default();
         
         match main {
-            SqlStatement::Cte { name: inner_name, column_aliases: inner_aliases, body: inner_body, main: inner_main, recursive: inner_recursive } => {
+            SqlStatement::Cte { name: inner_name, column_aliases: inner_aliases, body: mut inner_body, main: inner_main, recursive: inner_recursive } => {
+                // Rewrite outer CTE references inside inner CTE's body (chained CTEs)
+                if let SqlStatement::Select(ref mut sel) = *inner_body {
+                    Self::rewrite_cte_references_in_select(sel, name, &temp_table_name);
+                }
                 Ok(Self::execute_cte(&inner_name, &inner_aliases, *inner_body, *inner_main, inner_recursive, base_dir, temp_path))
             }
             SqlStatement::Select(mut select) => {

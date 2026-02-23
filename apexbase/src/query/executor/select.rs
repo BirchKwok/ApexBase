@@ -338,23 +338,27 @@ impl ApexExecutor {
             return Self::execute_group_by(&filtered, &stmt);
         }
 
-        // Apply ORDER BY with LIMIT optimization (top-k heap sort)
-        let limited = if !stmt.order_by.is_empty() {
-            let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
-            let sorted = Self::apply_order_by_topk(&filtered, &stmt.order_by, k)?;
-            Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset)?
-        } else {
-            Self::apply_limit_offset(&filtered, stmt.limit, stmt.offset)?
-        };
-
-        // Apply projection (SELECT columns) - pass storage_path for scalar subqueries
-        let projected = Self::apply_projection_with_storage(&limited, &stmt.columns, Some(storage_path))?;
-
-        // Apply DISTINCT if specified
+        // For DISTINCT: sort without top-k limit, project, deduplicate, then limit
+        // For non-DISTINCT: apply top-k sort + limit, then project
         let result = if stmt.distinct {
-            Self::deduplicate_batch(&projected)?
+            let sorted = if !stmt.order_by.is_empty() {
+                Self::apply_order_by(&filtered, &stmt.order_by)?
+            } else {
+                filtered
+            };
+            let projected = Self::apply_projection_with_storage(&sorted, &stmt.columns, Some(storage_path))?;
+            let deduped = Self::deduplicate_batch(&projected)?;
+            Self::apply_limit_offset(&deduped, stmt.limit, stmt.offset)?
         } else {
-            projected
+            // Apply ORDER BY with LIMIT optimization (top-k heap sort)
+            let limited = if !stmt.order_by.is_empty() {
+                let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+                let sorted = Self::apply_order_by_topk(&filtered, &stmt.order_by, k)?;
+                Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset)?
+            } else {
+                Self::apply_limit_offset(&filtered, stmt.limit, stmt.offset)?
+            };
+            Self::apply_projection_with_storage(&limited, &stmt.columns, Some(storage_path))?
         };
 
         Ok(ApexResult::Data(result))
@@ -1257,18 +1261,31 @@ impl ApexExecutor {
         let batch = RecordBatch::try_new(schema, arrays)
             .map_err(|e| err_data(e.to_string()))?;
         
-        if let Some(having) = &stmt.having {
-            // Apply having filter
+        let mut result = if let Some(having) = &stmt.having {
             let mask = Self::evaluate_predicate(&batch, having)?;
             let filtered = arrow::compute::filter_record_batch(&batch, &mask)
                 .map_err(|e| err_data(e.to_string()))?;
             if filtered.num_rows() == 0 {
                 return Ok(Some(ApexResult::Empty(filtered.schema())));
             }
-            return Ok(Some(ApexResult::Data(filtered)));
+            filtered
+        } else {
+            batch
+        };
+
+        // Apply ORDER BY with aggregate expression resolver
+        if !stmt.order_by.is_empty() {
+            let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+            let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            result = Self::apply_order_by_topk(&result, &resolved_ob, k)?;
         }
-        
-        Ok(Some(ApexResult::Data(batch)))
+
+        // Apply LIMIT + OFFSET
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            result = Self::apply_limit_offset(&result, stmt.limit, stmt.offset)?;
+        }
+
+        Ok(Some(ApexResult::Data(result)))
     }
 
     /// V4 FAST PATH: Simple aggregation (no GROUP BY, no WHERE)
@@ -1284,10 +1301,19 @@ impl ApexExecutor {
         // Collect unique column names needed for aggregation
         let mut unique_cols: Vec<String> = Vec::new();
         for col in &stmt.columns {
-            if let SelectColumn::Aggregate { column, distinct, .. } = col {
+            if let SelectColumn::Aggregate { func, column, distinct, .. } = col {
                 if *distinct { return Ok(None); } // DISTINCT needs full scan
                 let name = column.as_deref().unwrap_or("*");
                 if name == "_id" { return Ok(None); } // _id stored separately
+                // COUNT(col) and AVG(col) must exclude NULLs: the storage fast path
+                // returns total-row-count which would be wrong when NULLs are present.
+                // Fall back to the full Arrow scan which respects null_count().
+                let is_star_or_const = name == "*" || name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+                if !is_star_or_const {
+                    if matches!(func, AggregateFunc::Count | AggregateFunc::Avg) {
+                        return Ok(None);
+                    }
+                }
                 if !unique_cols.contains(&name.to_string()) {
                     unique_cols.push(name.to_string());
                 }

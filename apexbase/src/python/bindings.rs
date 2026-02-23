@@ -161,6 +161,10 @@ pub struct ApexStorageImpl {
     /// Python-level query result cache: SQL -> PyObject
     /// Caches the FINAL Python dict to avoid all conversion overhead on repeated queries
     py_query_cache: RwLock<HashMap<String, PyObject>>,
+    /// Auto-flush row threshold (struct-level so it survives backend cache invalidation)
+    auto_flush_rows: RwLock<u64>,
+    /// Auto-flush byte threshold (struct-level so it survives backend cache invalidation)
+    auto_flush_bytes: RwLock<u64>,
 }
 
 /// Internal Rust-only methods (not exposed to Python)
@@ -450,6 +454,8 @@ impl ApexStorageImpl {
             durability: durability_level,
             current_txn_id: RwLock::new(None),
             py_query_cache: RwLock::new(HashMap::new()),
+            auto_flush_rows: RwLock::new(0),
+            auto_flush_bytes: RwLock::new(0),
         })
     }
 
@@ -772,6 +778,11 @@ impl ApexStorageImpl {
         
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
+        // On Windows, engine.insert_cache holds a mmap'd backend after write_typed.
+        // Clearing it ensures set_len() in subsequent transaction-commit delete paths succeeds
+        // (ERROR_USER_MAPPED_FILE / os error 1224 is triggered when any mmap is open).
+        #[cfg(target_os = "windows")]
+        crate::storage::engine::engine().invalidate(&table_path);
         
         let ids = result?;
         
@@ -1906,13 +1917,15 @@ impl ApexStorageImpl {
     /// - bytes: Auto-flush when estimated memory exceeds this size (0 = disabled)
     #[pyo3(signature = (rows = 0, bytes = 0))]
     fn set_auto_flush(&self, rows: u64, bytes: u64) -> PyResult<()> {
+        // Persist at struct level so thresholds survive backend cache invalidation
+        *self.auto_flush_rows.write() = rows;
+        *self.auto_flush_bytes.write() = bytes;
+        // Also apply to cached backend if present
         let mut backends = self.cached_backends.write();
         let table_name = self.current_table.read().clone();
-        
         if let Some(backend) = backends.get_mut(&table_name) {
             backend.set_auto_flush(rows, bytes);
         }
-        
         Ok(())
     }
     
@@ -1920,26 +1933,27 @@ impl ApexStorageImpl {
     /// 
     /// Returns a tuple of (rows_threshold, bytes_threshold)
     fn get_auto_flush(&self) -> PyResult<(u64, u64)> {
-        let backends = self.cached_backends.read();
-        let table_name = self.current_table.read().clone();
-        
-        if let Some(backend) = backends.get(&table_name) {
-            Ok(backend.get_auto_flush())
-        } else {
-            Ok((0, 0))
-        }
+        Ok((*self.auto_flush_rows.read(), *self.auto_flush_bytes.read()))
     }
     
     /// Get estimated memory usage in bytes
     fn estimate_memory_bytes(&self) -> PyResult<u64> {
         let backends = self.cached_backends.read();
         let table_name = self.current_table.read().clone();
-        
         if let Some(backend) = backends.get(&table_name) {
-            Ok(backend.estimate_memory_bytes())
-        } else {
-            Ok(0)
+            let mem = backend.estimate_memory_bytes();
+            if mem > 0 {
+                return Ok(mem);
+            }
         }
+        // No in-memory data (flushed to disk): estimate from file size
+        drop(backends);
+        if let Ok(table_path) = self.get_current_table_path() {
+            if let Ok(meta) = std::fs::metadata(&table_path) {
+                return Ok(meta.len());
+            }
+        }
+        Ok(0)
     }
 
     /// Set compression type for the current table.
@@ -2110,10 +2124,11 @@ impl ApexStorageImpl {
         }
         
         let table_path = self.get_current_table_path()?;
+        let table_name = self.current_table.read().clone();
         let ids_str = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
         
         let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
-            let sql = format!("SELECT * FROM data WHERE _id IN ({})", ids_str);
+            let sql = format!("SELECT * FROM {} WHERE _id IN ({})", table_name, ids_str);
             let result = ApexExecutor::execute(&sql, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             
@@ -2148,9 +2163,11 @@ impl ApexStorageImpl {
     /// Retrieve all records
     fn retrieve_all(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
         let table_path = self.get_current_table_path()?;
+        let table_name = self.current_table.read().clone();
         
         let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
-            let sql = "SELECT * FROM data";
+            let sql = format!("SELECT * FROM {}", table_name);
+            let sql = sql.as_str();
             let result = ApexExecutor::execute(sql, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             
@@ -2186,12 +2203,13 @@ impl ApexStorageImpl {
     #[pyo3(signature = (where_clause, limit=None))]
     fn query(&self, py: Python<'_>, where_clause: &str, limit: Option<usize>) -> PyResult<Vec<PyObject>> {
         let table_path = self.get_current_table_path()?;
+        let table_name = self.current_table.read().clone();
         
         let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
             let sql = if let Some(lim) = limit {
-                format!("SELECT * FROM data WHERE {} LIMIT {}", where_clause, lim)
+                format!("SELECT * FROM {} WHERE {} LIMIT {}", table_name, where_clause, lim)
             } else {
-                format!("SELECT * FROM data WHERE {}", where_clause)
+                format!("SELECT * FROM {} WHERE {}", table_name, where_clause)
             };
             
             let result = ApexExecutor::execute(&sql, &table_path)

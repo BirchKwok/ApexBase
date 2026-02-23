@@ -1,46 +1,107 @@
 // Window functions, UNION execution
 
 impl ApexExecutor {
-    /// Execute UNION statement
+    /// Execute UNION / INTERSECT / EXCEPT statement
     fn execute_union(union: UnionStatement, storage_path: &Path) -> io::Result<ApexResult> {
-        // Execute left side
+        use crate::query::SetOpType;
+
         let left_result = Self::execute_parsed(*union.left, storage_path)?;
         let left_batch = left_result.to_record_batch()?;
 
-        // Execute right side
         let right_result = Self::execute_parsed(*union.right, storage_path)?;
         let right_batch = right_result.to_record_batch()?;
 
-        // Ensure schemas are compatible
         if left_batch.num_columns() != right_batch.num_columns() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "UNION requires same number of columns",
+                "Set operation requires same number of columns",
             ));
         }
 
-        // Concatenate the batches
-        let combined = Self::concat_batches(&left_batch, &right_batch)?;
-
-        let mut result = if union.all {
-            // UNION ALL - keep all rows
-            combined
-        } else {
-            // UNION - remove duplicates
-            Self::deduplicate_batch(&combined)?
+        let mut result = match union.set_op {
+            SetOpType::Union => {
+                let combined = Self::concat_batches(&left_batch, &right_batch)?;
+                if union.all { combined } else { Self::deduplicate_batch(&combined)? }
+            }
+            SetOpType::Intersect => {
+                // Keep rows from left that also appear in right (deduplicated)
+                Self::intersect_batches(&left_batch, &right_batch, union.all)?
+            }
+            SetOpType::Except => {
+                // Keep rows from left that do NOT appear in right (deduplicated)
+                Self::except_batches(&left_batch, &right_batch, union.all)?
+            }
         };
 
-        // Apply ORDER BY if present
         if !union.order_by.is_empty() {
             result = Self::apply_order_by(&result, &union.order_by)?;
         }
-
-        // Apply LIMIT/OFFSET if present
         if union.limit.is_some() || union.offset.is_some() {
             result = Self::apply_limit_offset(&result, union.limit, union.offset)?;
         }
 
         Ok(ApexResult::Data(result))
+    }
+
+    /// INTERSECT: rows in left that also appear in right
+    fn intersect_batches(left: &RecordBatch, right: &RecordBatch, all: bool) -> io::Result<RecordBatch> {
+        // Build a hash set of right rows
+        let right_hashes: std::collections::HashSet<u64> = (0..right.num_rows())
+            .map(|i| Self::hash_row(right, i))
+            .collect();
+
+        let mut keep: Vec<u32> = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for i in 0..left.num_rows() {
+            let h = Self::hash_row(left, i);
+            if right_hashes.contains(&h) {
+                if all || seen.insert(h) {
+                    keep.push(i as u32);
+                }
+            }
+        }
+        Self::take_rows(left, &keep)
+    }
+
+    /// EXCEPT: rows in left that do NOT appear in right
+    fn except_batches(left: &RecordBatch, right: &RecordBatch, all: bool) -> io::Result<RecordBatch> {
+        let right_hashes: std::collections::HashSet<u64> = (0..right.num_rows())
+            .map(|i| Self::hash_row(right, i))
+            .collect();
+
+        let mut keep: Vec<u32> = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for i in 0..left.num_rows() {
+            let h = Self::hash_row(left, i);
+            if !right_hashes.contains(&h) {
+                if all || seen.insert(h) {
+                    keep.push(i as u32);
+                }
+            }
+        }
+        Self::take_rows(left, &keep)
+    }
+
+    /// Hash all column values in a single row to a u64 fingerprint
+    fn hash_row(batch: &RecordBatch, row: usize) -> u64 {
+        use std::hash::Hasher;
+        let mut hasher = AHasher::default();
+        for col in batch.columns() {
+            hasher.write_u64(Self::hash_array_value_fast(col, row));
+        }
+        hasher.finish()
+    }
+
+    /// Take rows by index from a RecordBatch
+    fn take_rows(batch: &RecordBatch, indices: &[u32]) -> io::Result<RecordBatch> {
+        use arrow::array::UInt32Array;
+        let idx_arr = UInt32Array::from(indices.to_vec());
+        let cols: Vec<ArrayRef> = batch.columns().iter()
+            .map(|col| compute::take(col.as_ref(), &idx_arr, None)
+                .map_err(|e| err_data(e.to_string())))
+            .collect::<io::Result<Vec<_>>>()?;
+        RecordBatch::try_new(batch.schema(), cols)
+            .map_err(|e| err_data(e.to_string()))
     }
 
     /// Concatenate two record batches
@@ -300,7 +361,7 @@ impl ApexExecutor {
         }
     }
 
-    /// Execute window function (ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD)
+    /// Execute window function (ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD, SUM, AVG, etc.)
     fn execute_window_function(batch: &RecordBatch, stmt: &SelectStatement) -> io::Result<ApexResult> {
         // Collect window specs: (func_name, args, partition_by, order_by, output_name)
         let mut window_specs: Vec<(String, Vec<String>, Vec<String>, Vec<crate::query::OrderByClause>, String)> = Vec::new();
@@ -311,8 +372,7 @@ impl ApexExecutor {
             if let SelectColumn::WindowFunction { name, args, partition_by, order_by, alias } = col {
                 let upper = name.to_uppercase();
                 if !supported.contains(&upper.as_str()) {
-                    return Err(err_input( 
-                        format!("Unsupported window function: {}", name)));
+                    return Err(err_input(format!("Unsupported window function: {}", name)));
                 }
                 let out_name = alias.clone().unwrap_or_else(|| name.to_lowercase());
                 window_specs.push((upper, args.clone(), partition_by.clone(), order_by.clone(), out_name));
@@ -320,410 +380,302 @@ impl ApexExecutor {
         }
 
         if window_specs.is_empty() {
-            return Err(err_input( "No window function found"));
+            return Err(err_input("No window function found"));
         }
 
-        let (func_name, func_args, partition_by, order_by, _) = &window_specs[0];
-
-        // Group rows by partition key (using AHashMap for speed)
         let num_rows = batch.num_rows();
-        let mut groups: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(num_rows / 10 + 1);
-        
-        // Pre-fetch partition column references
-        let partition_col_refs: Vec<Option<&ArrayRef>> = partition_by.iter()
-            .map(|col_name| batch.column_by_name(col_name.trim_matches('"')))
-            .collect();
-        
-        for row_idx in 0..num_rows {
-            let mut hasher = AHasher::default();
-            for col_opt in &partition_col_refs {
-                if let Some(col) = col_opt {
-                    hasher.write_u64(Self::hash_array_value_fast(col, row_idx));
-                }
-            }
-            let key = hasher.finish();
-            groups.entry(key).or_insert_with(|| Vec::with_capacity(16)).push(row_idx);
-        }
+        let num_specs = window_specs.len();
+        // Per-spec nullable output: int (rank/row_number) or float (sum/avg/lag)
+        let mut per_int: Vec<Vec<Option<i64>>> = vec![vec![None; num_rows]; num_specs];
+        let mut per_flt: Vec<Vec<Option<f64>>> = vec![vec![None; num_rows]; num_specs];
+        let mut use_float: Vec<bool> = vec![false; num_specs];
 
-        // Build window function result arrays (one for int, one for float)
-        let mut window_values: Vec<i64> = vec![0; batch.num_rows()];
-        let mut window_float_values: Vec<f64> = vec![0.0; batch.num_rows()];
-        // Determine if the window function operates on a float column
-        let value_funcs = ["SUM", "AVG", "MIN", "MAX", "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE", "RUNNING_SUM"];
-        let is_value_func = value_funcs.contains(&func_name.as_str());
-        let src_col_name = if is_value_func { func_args.get(0).map(|s| s.trim_matches('"').to_string()) } else { None };
-        // AVG always returns float regardless of source column type
-        let use_float = if func_name == "AVG" {
-            true
-        } else if let Some(ref cn) = src_col_name {
-            batch.column_by_name(cn).map(|c| c.as_any().downcast_ref::<Float64Array>().is_some()).unwrap_or(false)
-        } else {
-            false
-        };
-        
-        for (_, mut indices) in groups {
-            // Sort within partition by ORDER BY
-            let order_col = if !order_by.is_empty() {
-                let order_col_name = order_by[0].column.trim_matches('"');
-                let desc = order_by[0].descending;
-                
-                if let Some(col) = batch.column_by_name(order_col_name) {
-                    indices.sort_by(|&a, &b| {
-                        let cmp = Self::compare_array_values(col, a, b);
-                        if desc { cmp.reverse() } else { cmp }
-                    });
-                    Some(col.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            
-            // Compute window values based on function type
-            match func_name.as_str() {
-                "ROW_NUMBER" => {
-                    for (pos, &row_idx) in indices.iter().enumerate() {
-                        window_values[row_idx] = (pos + 1) as i64;
+        for (spec_idx, (func_name, func_args, partition_by, order_by, _)) in window_specs.iter().enumerate() {
+            let src_col_name = func_args.get(0).map(|s| s.trim_matches('"').to_string());
+            let is_float_src = src_col_name.as_deref().and_then(|cn| batch.column_by_name(cn))
+                .map_or(false, |c| c.as_any().downcast_ref::<Float64Array>().is_some());
+            use_float[spec_idx] = is_float_src || matches!(func_name.as_str(), "AVG" | "PERCENT_RANK" | "CUME_DIST");
+
+            // Build partition groups
+            let mut groups: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(num_rows / 10 + 1);
+            let part_cols: Vec<Option<&ArrayRef>> = partition_by.iter()
+                .map(|cn| batch.column_by_name(cn.trim_matches('"')))
+                .collect();
+            for row_idx in 0..num_rows {
+                let mut hasher = AHasher::default();
+                for col_opt in &part_cols {
+                    if let Some(col) = col_opt {
+                        hasher.write_u64(Self::hash_array_value_fast(col, row_idx));
                     }
                 }
-                "RANK" => {
-                    let mut rank = 1i64;
-                    let mut prev_idx: Option<usize> = None;
-                    for (pos, &row_idx) in indices.iter().enumerate() {
-                        if let Some(prev) = prev_idx {
-                            if let Some(ref col) = order_col {
-                                if Self::compare_array_values(col, prev, row_idx) != std::cmp::Ordering::Equal {
+                let key = if partition_by.is_empty() { 0 } else { hasher.finish() };
+                groups.entry(key).or_insert_with(|| Vec::with_capacity(16)).push(row_idx);
+            }
+
+            for (_, mut indices) in groups {
+                // Sort within partition by ORDER BY
+                let order_col: Option<ArrayRef> = if !order_by.is_empty() {
+                    let ocn = order_by[0].column.trim_matches('"');
+                    let desc = order_by[0].descending;
+                    batch.column_by_name(ocn).map(|c| {
+                        indices.sort_by(|&a, &b| {
+                            let cmp = Self::compare_array_values(c, a, b);
+                            if desc { cmp.reverse() } else { cmp }
+                        });
+                        c.clone()
+                    })
+                } else { None };
+
+                match func_name.as_str() {
+                    "ROW_NUMBER" => {
+                        for (pos, &row_idx) in indices.iter().enumerate() {
+                            per_int[spec_idx][row_idx] = Some((pos + 1) as i64);
+                        }
+                    }
+                    "RANK" => {
+                        let mut rank = 1i64;
+                        let mut prev: Option<usize> = None;
+                        for (pos, &row_idx) in indices.iter().enumerate() {
+                            if let (Some(p), Some(ref col)) = (prev, &order_col) {
+                                if Self::compare_array_values(col, p, row_idx) != std::cmp::Ordering::Equal {
                                     rank = (pos + 1) as i64;
                                 }
                             }
+                            per_int[spec_idx][row_idx] = Some(rank);
+                            prev = Some(row_idx);
                         }
-                        window_values[row_idx] = rank;
-                        prev_idx = Some(row_idx);
                     }
-                }
-                "DENSE_RANK" => {
-                    let mut rank = 1i64;
-                    let mut prev_idx: Option<usize> = None;
-                    for &row_idx in &indices {
-                        if let Some(prev) = prev_idx {
-                            if let Some(ref col) = order_col {
-                                if Self::compare_array_values(col, prev, row_idx) != std::cmp::Ordering::Equal {
+                    "DENSE_RANK" => {
+                        let mut rank = 1i64;
+                        let mut prev: Option<usize> = None;
+                        for &row_idx in &indices {
+                            if let (Some(p), Some(ref col)) = (prev, &order_col) {
+                                if Self::compare_array_values(col, p, row_idx) != std::cmp::Ordering::Equal {
                                     rank += 1;
                                 }
                             }
+                            per_int[spec_idx][row_idx] = Some(rank);
+                            prev = Some(row_idx);
                         }
-                        window_values[row_idx] = rank;
-                        prev_idx = Some(row_idx);
                     }
-                }
-                "NTILE" => {
-                    let n = 4i64; // Default to 4 buckets
-                    let count = indices.len() as i64;
-                    for (pos, &row_idx) in indices.iter().enumerate() {
-                        let bucket = (pos as i64 * n / count) + 1;
-                        window_values[row_idx] = bucket.min(n);
-                    }
-                }
-                "PERCENT_RANK" => {
-                    let count = indices.len();
-                    if count <= 1 {
-                        for &row_idx in &indices {
-                            window_values[row_idx] = 0;
-                        }
-                    } else {
-                        let mut rank = 1i64;
-                        let mut prev_idx: Option<usize> = None;
+                    "NTILE" => {
+                        let n = func_args.get(0).and_then(|s| s.parse::<i64>().ok()).unwrap_or(4);
+                        let count = indices.len() as i64;
                         for (pos, &row_idx) in indices.iter().enumerate() {
-                            if let Some(prev) = prev_idx {
-                                if let Some(ref col) = order_col {
-                                    if Self::compare_array_values(col, prev, row_idx) != std::cmp::Ordering::Equal {
-                                        rank = (pos + 1) as i64;
+                            per_int[spec_idx][row_idx] = Some(((pos as i64 * n / count) + 1).min(n));
+                        }
+                    }
+                    "PERCENT_RANK" => {
+                        let count = indices.len();
+                        let mut rank = 1i64;
+                        let mut prev: Option<usize> = None;
+                        for (pos, &row_idx) in indices.iter().enumerate() {
+                            if let (Some(p), Some(ref col)) = (prev, &order_col) {
+                                if Self::compare_array_values(col, p, row_idx) != std::cmp::Ordering::Equal {
+                                    rank = (pos + 1) as i64;
+                                }
+                            }
+                            let pct = if count <= 1 { 0.0 } else { (rank - 1) as f64 / (count - 1) as f64 };
+                            per_flt[spec_idx][row_idx] = Some(pct);
+                            prev = Some(row_idx);
+                        }
+                    }
+                    "CUME_DIST" => {
+                        let count = indices.len();
+                        let mut rank = 0usize;
+                        let mut same = 1usize;
+                        let mut prev: Option<usize> = None;
+                        for (pos, &row_idx) in indices.iter().enumerate() {
+                            if let (Some(p), Some(ref col)) = (prev, &order_col) {
+                                if Self::compare_array_values(col, p, row_idx) == std::cmp::Ordering::Equal {
+                                    same += 1;
+                                } else { rank = pos; same = 1; }
+                            }
+                            per_flt[spec_idx][row_idx] = Some((rank + same) as f64 / count as f64);
+                            prev = Some(row_idx);
+                        }
+                    }
+                    "LAG" => {
+                        let offset = func_args.get(1).and_then(|s| s.trim_start_matches("Int64(").trim_end_matches(')').parse().ok()).unwrap_or(1usize);
+                        let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                        if let Some(src_col) = batch.column_by_name(col_name) {
+                            if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
+                                for (pos, &ri) in indices.iter().enumerate() {
+                                    per_flt[spec_idx][ri] = if pos >= offset {
+                                        let pr = indices[pos - offset];
+                                        if fa.is_null(pr) { None } else { Some(fa.value(pr)) }
+                                    } else { None };
+                                }
+                            } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
+                                for (pos, &ri) in indices.iter().enumerate() {
+                                    per_int[spec_idx][ri] = if pos >= offset {
+                                        let pr = indices[pos - offset];
+                                        if ia.is_null(pr) { None } else { Some(ia.value(pr)) }
+                                    } else { None };
+                                }
+                            }
+                        }
+                    }
+                    "LEAD" => {
+                        let offset = func_args.get(1).and_then(|s| s.trim_start_matches("Int64(").trim_end_matches(')').parse().ok()).unwrap_or(1usize);
+                        let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                        let len = indices.len();
+                        if let Some(src_col) = batch.column_by_name(col_name) {
+                            if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
+                                for (pos, &ri) in indices.iter().enumerate() {
+                                    per_flt[spec_idx][ri] = if pos + offset < len {
+                                        let nr = indices[pos + offset];
+                                        if fa.is_null(nr) { None } else { Some(fa.value(nr)) }
+                                    } else { None };
+                                }
+                            } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
+                                for (pos, &ri) in indices.iter().enumerate() {
+                                    per_int[spec_idx][ri] = if pos + offset < len {
+                                        let nr = indices[pos + offset];
+                                        if ia.is_null(nr) { None } else { Some(ia.value(nr)) }
+                                    } else { None };
+                                }
+                            }
+                        }
+                    }
+                    "FIRST_VALUE" => {
+                        let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                        if let Some(src_col) = batch.column_by_name(col_name) {
+                            let fr = indices[0];
+                            if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
+                                let v = if fa.is_null(fr) { None } else { Some(fa.value(fr)) };
+                                for &ri in &indices { per_flt[spec_idx][ri] = v; }
+                            } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
+                                let v = if ia.is_null(fr) { None } else { Some(ia.value(fr)) };
+                                for &ri in &indices { per_int[spec_idx][ri] = v; }
+                            }
+                        }
+                    }
+                    "LAST_VALUE" => {
+                        let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                        if let Some(src_col) = batch.column_by_name(col_name) {
+                            let lr = indices[indices.len() - 1];
+                            if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
+                                let v = if fa.is_null(lr) { None } else { Some(fa.value(lr)) };
+                                for &ri in &indices { per_flt[spec_idx][ri] = v; }
+                            } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
+                                let v = if ia.is_null(lr) { None } else { Some(ia.value(lr)) };
+                                for &ri in &indices { per_int[spec_idx][ri] = v; }
+                            }
+                        }
+                    }
+                    "SUM" => {
+                        let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                        if let Some(src_col) = batch.column_by_name(col_name) {
+                            if !order_by.is_empty() {
+                                // Running (cumulative) sum when ORDER BY is present
+                                if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
+                                    let mut running = 0.0f64;
+                                    for &ri in &indices {
+                                        if !fa.is_null(ri) { running += fa.value(ri); }
+                                        per_flt[spec_idx][ri] = Some(running);
+                                    }
+                                } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
+                                    let mut running = 0i64;
+                                    for &ri in &indices {
+                                        if !ia.is_null(ri) { running += ia.value(ri); }
+                                        per_int[spec_idx][ri] = Some(running);
                                     }
                                 }
-                            }
-                            // Store rank * 1000 to preserve precision as i64
-                            let pct = ((rank - 1) as f64 / (count - 1) as f64 * 1000.0) as i64;
-                            window_values[row_idx] = pct;
-                            prev_idx = Some(row_idx);
-                        }
-                    }
-                }
-                "CUME_DIST" => {
-                    let count = indices.len();
-                    let mut rank = 0i64;
-                    let mut prev_idx: Option<usize> = None;
-                    let mut same_count = 1;
-                    
-                    for (pos, &row_idx) in indices.iter().enumerate() {
-                        if let Some(prev) = prev_idx {
-                            if let Some(ref col) = order_col {
-                                if Self::compare_array_values(col, prev, row_idx) == std::cmp::Ordering::Equal {
-                                    same_count += 1;
-                                } else {
-                                    rank = pos as i64;
-                                    same_count = 1;
-                                }
-                            }
-                        }
-                        // Store as percentage * 1000
-                        let cume = (((rank + same_count) as f64 / count as f64) * 1000.0) as i64;
-                        window_values[row_idx] = cume;
-                        prev_idx = Some(row_idx);
-                    }
-                }
-                "LAG" => {
-                    // LAG(column, offset, default) - get value from previous row
-                    let offset = if func_args.len() > 1 {
-                        func_args[1].trim_start_matches("Int64(").trim_end_matches(')').parse().unwrap_or(1)
-                    } else { 1usize };
-                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                    
-                    if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
-                            for (pos, &row_idx) in indices.iter().enumerate() {
-                                if pos >= offset {
-                                    let prev_row = indices[pos - offset];
-                                    window_float_values[row_idx] = if float_arr.is_null(prev_row) { 0.0 } else { float_arr.value(prev_row) };
-                                } else {
-                                    window_float_values[row_idx] = 0.0;
-                                }
-                            }
-                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
-                            for (pos, &row_idx) in indices.iter().enumerate() {
-                                if pos >= offset {
-                                    let prev_row = indices[pos - offset];
-                                    window_values[row_idx] = if int_arr.is_null(prev_row) { 0 } else { int_arr.value(prev_row) };
-                                } else {
-                                    window_values[row_idx] = 0;
+                            } else {
+                                // Total partition sum when no ORDER BY
+                                if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
+                                    let total: f64 = indices.iter().filter_map(|&i| if fa.is_null(i) { None } else { Some(fa.value(i)) }).sum();
+                                    for &ri in &indices { per_flt[spec_idx][ri] = Some(total); }
+                                } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
+                                    let total: i64 = indices.iter().filter_map(|&i| if ia.is_null(i) { None } else { Some(ia.value(i)) }).sum();
+                                    for &ri in &indices { per_int[spec_idx][ri] = Some(total); }
                                 }
                             }
                         }
                     }
-                }
-                "LEAD" => {
-                    // LEAD(column, offset, default) - get value from next row
-                    let offset = if func_args.len() > 1 {
-                        func_args[1].trim_start_matches("Int64(").trim_end_matches(')').parse().unwrap_or(1)
-                    } else { 1usize };
-                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                    
-                    if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
-                            let len = indices.len();
-                            for (pos, &row_idx) in indices.iter().enumerate() {
-                                if pos + offset < len {
-                                    let next_row = indices[pos + offset];
-                                    window_float_values[row_idx] = if float_arr.is_null(next_row) { 0.0 } else { float_arr.value(next_row) };
-                                } else {
-                                    window_float_values[row_idx] = 0.0;
-                                }
-                            }
-                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
-                            let len = indices.len();
-                            for (pos, &row_idx) in indices.iter().enumerate() {
-                                if pos + offset < len {
-                                    let next_row = indices[pos + offset];
-                                    window_values[row_idx] = if int_arr.is_null(next_row) { 0 } else { int_arr.value(next_row) };
-                                } else {
-                                    window_values[row_idx] = 0;
-                                }
+                    "RUNNING_SUM" => {
+                        let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                        if let Some(src_col) = batch.column_by_name(col_name) {
+                            if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
+                                let mut running = 0.0f64;
+                                for &ri in &indices { if !fa.is_null(ri) { running += fa.value(ri); } per_flt[spec_idx][ri] = Some(running); }
+                            } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
+                                let mut running = 0i64;
+                                for &ri in &indices { if !ia.is_null(ri) { running += ia.value(ri); } per_int[spec_idx][ri] = Some(running); }
                             }
                         }
                     }
-                }
-                "FIRST_VALUE" => {
-                    // FIRST_VALUE(column) - get first value in partition
-                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                    if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
-                            let first_row = indices[0];
-                            let first_val = if float_arr.is_null(first_row) { 0.0 } else { float_arr.value(first_row) };
-                            for &row_idx in &indices {
-                                window_float_values[row_idx] = first_val;
-                            }
-                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
-                            let first_row = indices[0];
-                            let first_val = if int_arr.is_null(first_row) { 0 } else { int_arr.value(first_row) };
-                            for &row_idx in &indices {
-                                window_values[row_idx] = first_val;
+                    "AVG" => {
+                        let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                        if let Some(src_col) = batch.column_by_name(col_name) {
+                            if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
+                                let vals: Vec<f64> = indices.iter().filter_map(|&i| if fa.is_null(i) { None } else { Some(fa.value(i)) }).collect();
+                                let avg = if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 };
+                                for &ri in &indices { per_flt[spec_idx][ri] = Some(avg); }
+                            } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
+                                let vals: Vec<i64> = indices.iter().filter_map(|&i| if ia.is_null(i) { None } else { Some(ia.value(i)) }).collect();
+                                let avg = if vals.is_empty() { 0.0 } else { vals.iter().sum::<i64>() as f64 / vals.len() as f64 };
+                                for &ri in &indices { per_flt[spec_idx][ri] = Some(avg); }
                             }
                         }
                     }
-                }
-                "LAST_VALUE" => {
-                    // LAST_VALUE(column) - get last value in partition
-                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                    if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
-                            let last_row = indices[indices.len() - 1];
-                            let last_val = if float_arr.is_null(last_row) { 0.0 } else { float_arr.value(last_row) };
-                            for &row_idx in &indices {
-                                window_float_values[row_idx] = last_val;
-                            }
-                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
-                            let last_row = indices[indices.len() - 1];
-                            let last_val = if int_arr.is_null(last_row) { 0 } else { int_arr.value(last_row) };
-                            for &row_idx in &indices {
-                                window_values[row_idx] = last_val;
+                    "COUNT" => {
+                        let cnt = indices.len() as i64;
+                        for &ri in &indices { per_int[spec_idx][ri] = Some(cnt); }
+                    }
+                    "MIN" => {
+                        let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                        if let Some(src_col) = batch.column_by_name(col_name) {
+                            if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
+                                let mv = indices.iter().filter_map(|&i| if fa.is_null(i) { None } else { Some(fa.value(i)) }).fold(f64::INFINITY, f64::min);
+                                let mv = if mv == f64::INFINITY { None } else { Some(mv) };
+                                for &ri in &indices { per_flt[spec_idx][ri] = mv; }
+                            } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
+                                let mv = indices.iter().filter_map(|&i| if ia.is_null(i) { None } else { Some(ia.value(i)) }).min();
+                                for &ri in &indices { per_int[spec_idx][ri] = mv; }
                             }
                         }
                     }
-                }
-                "SUM" => {
-                    // SUM(column) OVER - running sum in partition
-                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                    if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
-                            let total: f64 = indices.iter()
-                                .filter_map(|&i| if float_arr.is_null(i) { None } else { Some(float_arr.value(i)) })
-                                .sum();
-                            for &row_idx in &indices {
-                                window_float_values[row_idx] = total;
-                            }
-                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
-                            let total: i64 = indices.iter()
-                                .filter_map(|&i| if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) })
-                                .sum();
-                            for &row_idx in &indices {
-                                window_values[row_idx] = total;
+                    "MAX" => {
+                        let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                        if let Some(src_col) = batch.column_by_name(col_name) {
+                            if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
+                                let mv = indices.iter().filter_map(|&i| if fa.is_null(i) { None } else { Some(fa.value(i)) }).fold(f64::NEG_INFINITY, f64::max);
+                                let mv = if mv == f64::NEG_INFINITY { None } else { Some(mv) };
+                                for &ri in &indices { per_flt[spec_idx][ri] = mv; }
+                            } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
+                                let mv = indices.iter().filter_map(|&i| if ia.is_null(i) { None } else { Some(ia.value(i)) }).max();
+                                for &ri in &indices { per_int[spec_idx][ri] = mv; }
                             }
                         }
                     }
-                }
-                "AVG" => {
-                    // AVG(column) OVER - average in partition (always returns float)
-                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                    if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
-                            let vals: Vec<f64> = indices.iter()
-                                .filter_map(|&i| if float_arr.is_null(i) { None } else { Some(float_arr.value(i)) })
-                                .collect();
-                            let avg = if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 };
-                            for &row_idx in &indices {
-                                window_float_values[row_idx] = avg;
-                            }
-                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
-                            let vals: Vec<i64> = indices.iter()
-                                .filter_map(|&i| if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) })
-                                .collect();
-                            let avg = if vals.is_empty() { 0.0 } else { vals.iter().sum::<i64>() as f64 / vals.len() as f64 };
-                            for &row_idx in &indices {
-                                window_float_values[row_idx] = avg;
+                    "NTH_VALUE" => {
+                        let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
+                        let n = func_args.get(1).and_then(|s| s.trim_start_matches("Int64(").trim_end_matches(')').parse::<usize>().ok()).unwrap_or(1);
+                        if let Some(src_col) = batch.column_by_name(col_name) {
+                            if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
+                                let v = if n > 0 && n <= indices.len() {
+                                    let nr = indices[n-1]; if fa.is_null(nr) { None } else { Some(fa.value(nr)) }
+                                } else { None };
+                                for &ri in &indices { per_flt[spec_idx][ri] = v; }
+                            } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
+                                let v = if n > 0 && n <= indices.len() {
+                                    let nr = indices[n-1]; if ia.is_null(nr) { None } else { Some(ia.value(nr)) }
+                                } else { None };
+                                for &ri in &indices { per_int[spec_idx][ri] = v; }
                             }
                         }
                     }
+                    _ => {}
                 }
-                "COUNT" => {
-                    // COUNT(*) OVER - count rows in partition
-                    let count = indices.len() as i64;
-                    for &row_idx in &indices {
-                        window_values[row_idx] = count;
-                    }
-                }
-                "MIN" => {
-                    // MIN(column) OVER - minimum in partition
-                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                    if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
-                            let min_val = indices.iter()
-                                .filter_map(|&i| if float_arr.is_null(i) { None } else { Some(float_arr.value(i)) })
-                                .fold(f64::INFINITY, f64::min);
-                            let min_val = if min_val == f64::INFINITY { 0.0 } else { min_val };
-                            for &row_idx in &indices {
-                                window_float_values[row_idx] = min_val;
-                            }
-                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
-                            let min_val = indices.iter()
-                                .filter_map(|&i| if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) })
-                                .min()
-                                .unwrap_or(0);
-                            for &row_idx in &indices {
-                                window_values[row_idx] = min_val;
-                            }
-                        }
-                    }
-                }
-                "MAX" => {
-                    // MAX(column) OVER - maximum in partition
-                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                    if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
-                            let max_val = indices.iter()
-                                .filter_map(|&i| if float_arr.is_null(i) { None } else { Some(float_arr.value(i)) })
-                                .fold(f64::NEG_INFINITY, f64::max);
-                            let max_val = if max_val == f64::NEG_INFINITY { 0.0 } else { max_val };
-                            for &row_idx in &indices {
-                                window_float_values[row_idx] = max_val;
-                            }
-                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
-                            let max_val = indices.iter()
-                                .filter_map(|&i| if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) })
-                                .max()
-                                .unwrap_or(0);
-                            for &row_idx in &indices {
-                                window_values[row_idx] = max_val;
-                            }
-                        }
-                    }
-                }
-                "RUNNING_SUM" => {
-                    // RUNNING_SUM(column) OVER - cumulative sum (rows unbounded preceding to current)
-                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                    if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
-                            let mut running = 0.0f64;
-                            for &row_idx in &indices {
-                                if !float_arr.is_null(row_idx) {
-                                    running += float_arr.value(row_idx);
-                                }
-                                window_float_values[row_idx] = running;
-                            }
-                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
-                            let mut running = 0i64;
-                            for &row_idx in &indices {
-                                if !int_arr.is_null(row_idx) {
-                                    running += int_arr.value(row_idx);
-                                }
-                                window_values[row_idx] = running;
-                            }
-                        }
-                    }
-                }
-                "NTH_VALUE" => {
-                    // NTH_VALUE(column, n) - get nth value in partition
-                    let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                    let n = if func_args.len() > 1 {
-                        func_args[1].trim_start_matches("Int64(").trim_end_matches(')').parse().unwrap_or(1usize)
-                    } else { 1usize };
-                    
-                    if let Some(src_col) = batch.column_by_name(col_name) {
-                        if let Some(float_arr) = src_col.as_any().downcast_ref::<Float64Array>() {
-                            let nth_val = if n > 0 && n <= indices.len() {
-                                let nth_row = indices[n - 1];
-                                if float_arr.is_null(nth_row) { 0.0 } else { float_arr.value(nth_row) }
-                            } else { 0.0 };
-                            for &row_idx in &indices {
-                                window_float_values[row_idx] = nth_val;
-                            }
-                        } else if let Some(int_arr) = src_col.as_any().downcast_ref::<Int64Array>() {
-                            let nth_val = if n > 0 && n <= indices.len() {
-                                let nth_row = indices[n - 1];
-                                if int_arr.is_null(nth_row) { 0 } else { int_arr.value(nth_row) }
-                            } else { 0 };
-                            for &row_idx in &indices {
-                                window_values[row_idx] = nth_val;
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+            } // end groups loop
+        } // end spec loop
 
-        // Build result with original columns plus window function result
+        // Build result with original columns + window function result columns
         let mut result_fields: Vec<Field> = Vec::new();
         let mut result_arrays: Vec<ArrayRef> = Vec::new();
+        let mut spec_idx = 0usize;
 
         for col in &stmt.columns {
             match col {
@@ -749,13 +701,14 @@ impl ApexExecutor {
                 }
                 SelectColumn::WindowFunction { name, alias, .. } => {
                     let out_name = alias.clone().unwrap_or_else(|| name.to_lowercase());
-                    if use_float {
-                        result_fields.push(Field::new(&out_name, ArrowDataType::Float64, false));
-                        result_arrays.push(Arc::new(Float64Array::from(window_float_values.clone())));
+                    if use_float[spec_idx] {
+                        result_fields.push(Field::new(&out_name, ArrowDataType::Float64, true));
+                        result_arrays.push(Arc::new(Float64Array::from(per_flt[spec_idx].clone())));
                     } else {
-                        result_fields.push(Field::new(&out_name, ArrowDataType::Int64, false));
-                        result_arrays.push(Arc::new(Int64Array::from(window_values.clone())));
+                        result_fields.push(Field::new(&out_name, ArrowDataType::Int64, true));
+                        result_arrays.push(Arc::new(Int64Array::from(per_int[spec_idx].clone())));
                     }
+                    spec_idx += 1;
                 }
                 _ => {}
             }
@@ -763,7 +716,7 @@ impl ApexExecutor {
 
         let schema = Arc::new(Schema::new(result_fields));
         let result = RecordBatch::try_new(schema, result_arrays)
-            .map_err(|e| err_data( e.to_string()))?;
+            .map_err(|e| err_data(e.to_string()))?;
 
         Ok(ApexResult::Data(result))
     }

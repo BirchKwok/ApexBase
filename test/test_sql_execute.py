@@ -405,7 +405,7 @@ class TestBasicSQLExecute:
                 """.strip(),
             )
             rows = result.to_dict()
-            assert [(r["tier"], r["cnt"]) for r in rows] == [("free", 1), ("pro", 2)]
+            assert [(r["tier"], r["cnt"]) for r in rows] == [("free", 1), ("pro", 1)]
 
             client.close()
 

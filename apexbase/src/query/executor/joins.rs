@@ -47,17 +47,27 @@ impl ApexExecutor {
             if join_clause.join_type == JoinType::Cross {
                 result_batch = Self::cross_join(&result_batch, &right_batch)?;
             } else {
-                // Extract join keys from ON condition
-                let (left_key, right_key) = Self::extract_join_keys(&join_clause.on)?;
+                // Extract join keys from ON condition (supports AND with extra filter)
+                let (left_key, right_key, extra_filter) = Self::extract_join_keys_with_filter(&join_clause.on)?;
+                let right_alias = match &join_clause.right {
+                    FromItem::Table { alias, .. } => alias.clone(),
+                    _ => None,
+                };
 
-                // Perform the join
-                result_batch = Self::hash_join(
+                // Perform the join (passing right alias for self-join column naming)
+                result_batch = Self::hash_join_aliased(
                     &result_batch,
                     &right_batch,
                     &left_key,
                     &right_key,
                     &join_clause.join_type,
+                    right_alias.as_deref(),
                 )?;
+
+                // Apply extra ON predicates (non-equality conditions from AND)
+                if let Some(filter) = extra_filter {
+                    result_batch = Self::apply_filter_with_storage(&result_batch, &filter, default_table_path)?;
+                }
             }
         }
 
@@ -269,18 +279,87 @@ impl ApexExecutor {
     /// Extract join keys from ON condition (expects simple equality: left.col = right.col)
     fn extract_join_keys(on_expr: &SqlExpr) -> io::Result<(String, String)> {
         use crate::query::sql_parser::BinaryOperator;
-        
         match on_expr {
             SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
                 let left_col = Self::extract_column_name(left)?;
                 let right_col = Self::extract_column_name(right)?;
                 Ok((left_col, right_col))
             }
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "JOIN ON clause must be a simple equality (e.g., a.id = b.id)",
-            )),
+            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "JOIN ON clause must be a simple equality")),
         }
+    }
+
+    /// Extract join keys from ON condition, returning an optional extra filter for non-equality predicates.
+    /// Supports compound AND: ON a.id=b.id AND a.x<b.x → key=(id,id), filter=a.x<b.x
+    fn extract_join_keys_with_filter(on_expr: &SqlExpr) -> io::Result<(String, String, Option<SqlExpr>)> {
+        use crate::query::sql_parser::BinaryOperator;
+        match on_expr {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                let left_col = Self::extract_column_name(left)?;
+                let right_col = Self::extract_column_name(right)?;
+                Ok((left_col, right_col, None))
+            }
+            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                // Try left as equality predicate, right as extra filter
+                if let Ok((lk, rk)) = Self::extract_join_keys(left) {
+                    return Ok((lk, rk, Some(*right.clone())));
+                }
+                // Try right as equality predicate, left as extra filter
+                if let Ok((lk, rk)) = Self::extract_join_keys(right) {
+                    return Ok((lk, rk, Some(*left.clone())));
+                }
+                Err(io::Error::new(io::ErrorKind::Unsupported, "No equijoin condition found in AND ON clause"))
+            }
+            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "JOIN ON clause must be a simple equality (e.g., a.id = b.id)")),
+        }
+    }
+
+    /// Wrapper around hash_join that supports an optional right-table alias for column naming.
+    /// When alias is provided, duplicate columns are named '{alias}.{col}' instead of '{col}_right'.
+    fn hash_join_aliased(
+        left: &RecordBatch,
+        right: &RecordBatch,
+        left_key: &str,
+        right_key: &str,
+        join_type: &JoinType,
+        right_alias: Option<&str>,
+    ) -> io::Result<RecordBatch> {
+        if right_alias.is_none() {
+            return Self::hash_join(left, right, left_key, right_key, join_type);
+        }
+        let alias = right_alias.unwrap();
+        // Rename conflicting right columns to '{alias}.{col}' before joining
+        // so that projection of 'b.name' finds the right-side column directly.
+        let right_renamed = Self::prefix_conflicting_columns(right, left, right_key, alias)?;
+        // Use right_key (bare name) — it now exists in right_renamed under the same name
+        Self::hash_join(left, &right_renamed, left_key, right_key, join_type)
+    }
+
+    /// Prefix columns in `right` that conflict with `left` (except the join key) with `{alias}.`
+    fn prefix_conflicting_columns(
+        right: &RecordBatch,
+        left: &RecordBatch,
+        join_key: &str,
+        alias: &str,
+    ) -> io::Result<RecordBatch> {
+        let left_name_vec: Vec<String> = left.schema().fields()
+            .iter().map(|f| f.name().clone()).collect();
+        let left_names: std::collections::HashSet<&str> = left_name_vec.iter().map(|s| s.as_str()).collect();
+        let mut fields: Vec<arrow::datatypes::Field> = Vec::new();
+        let mut arrays: Vec<arrow::array::ArrayRef> = Vec::new();
+        for (i, field) in right.schema().fields().iter().enumerate() {
+            let name = field.name();
+            let new_name = if name != join_key && left_names.contains(name.as_str()) {
+                format!("{}.{}", alias, name)
+            } else {
+                name.clone()
+            };
+            fields.push(arrow::datatypes::Field::new(&new_name, field.data_type().clone(), field.is_nullable()));
+            arrays.push(right.column(i).clone());
+        }
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
+        RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
     /// Extract column name from expression (handles table.column and column)

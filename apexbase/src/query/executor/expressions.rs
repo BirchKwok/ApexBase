@@ -455,7 +455,8 @@ impl ApexExecutor {
             // Decorrelation: try to convert correlated EXISTS to hash semi-join.
             // Pattern: WHERE inner_col = outer_col (simple equality correlation)
             // Instead of executing subquery N times, execute once and hash-join.
-            if let Some(result) = Self::try_decorrelate_exists(batch, stmt, &outer_cols, &subquery_path)? {
+            // Use Ok(...) swallowing: if decorrelation fails/has complex predicates, fall through.
+            if let Ok(Some(result)) = Self::try_decorrelate_exists(batch, stmt, &outer_cols, &subquery_path) {
                 return Ok(result);
             }
             
@@ -498,6 +499,20 @@ impl ApexExecutor {
             None => return Ok(None),
         };
         
+        // If remaining_pred still contains outer refs, can't decorrelate safely — fall back.
+        if let Some(ref remaining) = remaining_pred {
+            let mut remaining_refs = Vec::new();
+            Self::collect_outer_refs_from_expr(remaining, &outer_refs.iter().map(|s| {
+                if let Some(d) = s.rfind('.') { s[d+1..].to_string() } else { s.clone() }
+            }).collect::<Vec<_>>(), "", &mut remaining_refs);
+            // Also check with full qualified names
+            let mut remaining_refs2 = Vec::new();
+            Self::collect_outer_refs_from_expr(remaining, &outer_refs.iter().map(|s| s.clone()).collect::<Vec<_>>(), "", &mut remaining_refs2);
+            if !remaining_refs.is_empty() || !remaining_refs2.is_empty() {
+                return Ok(None);
+            }
+        }
+
         // Build decorrelated subquery: SELECT inner_col FROM ... WHERE remaining_pred
         let mut decorrelated = stmt.clone();
         decorrelated.columns = vec![SelectColumn::Column(inner_col.clone())];
@@ -1054,16 +1069,17 @@ impl ApexExecutor {
         match expr {
             SqlExpr::Column(name) => {
                 let col_name = name.trim_matches('"');
-                // Strip table alias prefix if present (e.g., "o.user_id" -> "user_id")
-                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+                // Try full qualified name first (e.g., "b.name" for self-join disambiguation),
+                // then fall back to bare name (e.g., "name" for "a.name" / "t.col").
+                let bare_col = if let Some(dot_pos) = col_name.rfind('.') {
                     &col_name[dot_pos + 1..]
                 } else {
                     col_name
                 };
                 batch
-                    .column_by_name(actual_col)
+                    .column_by_name(col_name)
                     .cloned()
-                    .or_else(|| batch.column_by_name(col_name).cloned())
+                    .or_else(|| batch.column_by_name(bare_col).cloned())
                     .ok_or_else(|| io::Error::new(
                         io::ErrorKind::NotFound,
                         format!("Column '{}' not found", col_name),
@@ -1089,6 +1105,32 @@ impl ApexExecutor {
             }
             SqlExpr::ArrayIndex { array, index } => {
                 Self::evaluate_array_index(batch, array, index)
+            }
+            SqlExpr::UnaryOp { op, expr: inner } => {
+                use crate::query::sql_parser::UnaryOperator;
+                match op {
+                    UnaryOperator::Minus => {
+                        let arr = Self::evaluate_expr_to_array(batch, inner)?;
+                        if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+                            let negated: Vec<Option<i64>> = (0..int_arr.len())
+                                .map(|i| if int_arr.is_null(i) { None } else { Some(-int_arr.value(i)) })
+                                .collect();
+                            Ok(Arc::new(Int64Array::from(negated)) as ArrayRef)
+                        } else if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
+                            let negated: Vec<Option<f64>> = (0..float_arr.len())
+                                .map(|i| if float_arr.is_null(i) { None } else { Some(-float_arr.value(i)) })
+                                .collect();
+                            Ok(Arc::new(Float64Array::from(negated)) as ArrayRef)
+                        } else {
+                            Err(io::Error::new(io::ErrorKind::Unsupported,
+                                "Unary minus only supported for numeric types"))
+                        }
+                    }
+                    UnaryOperator::Not => {
+                        Err(io::Error::new(io::ErrorKind::Unsupported,
+                            "NOT operator not supported as expression"))
+                    }
+                }
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1225,24 +1267,53 @@ impl ApexExecutor {
     fn evaluate_arithmetic_op_arrays(left: &ArrayRef, right: &ArrayRef, op: &crate::query::sql_parser::BinaryOperator) -> io::Result<ArrayRef> {
         use crate::query::sql_parser::BinaryOperator;
         use arrow::compute::kernels::numeric;
-        
+        use arrow::datatypes::DataType;
+
+        // Helper: coerce both sides to Float64Array
+        fn to_f64(arr: &ArrayRef) -> io::Result<Float64Array> {
+            match arr.data_type() {
+                DataType::Float64 => Ok(arr.as_any().downcast_ref::<Float64Array>().unwrap().clone()),
+                DataType::Int64 => {
+                    let ia = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+                    Ok(Float64Array::from_iter(ia.iter().map(|v| v.map(|x| x as f64))))
+                }
+                _ => Err(err_data(format!("Cannot coerce {:?} to Float64", arr.data_type()))),
+            }
+        }
+
+        let left_is_float = matches!(left.data_type(), DataType::Float64 | DataType::Float32);
+        let right_is_float = matches!(right.data_type(), DataType::Float64 | DataType::Float32);
+
+        if left_is_float || right_is_float {
+            let l = to_f64(left)?;
+            let r = to_f64(right)?;
+            let result: ArrayRef = match op {
+                BinaryOperator::Add => Arc::new(numeric::add(&l, &r).map_err(|e| err_data(e.to_string()))?),
+                BinaryOperator::Sub => Arc::new(numeric::sub(&l, &r).map_err(|e| err_data(e.to_string()))?),
+                BinaryOperator::Mul => Arc::new(numeric::mul(&l, &r).map_err(|e| err_data(e.to_string()))?),
+                BinaryOperator::Div => Arc::new(numeric::div(&l, &r).map_err(|e| err_data(e.to_string()))?),
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Unsupported arithmetic operator: {:?}", op))),
+            };
+            return Ok(result);
+        }
+
         let result: ArrayRef = match op {
             BinaryOperator::Add => Arc::new(numeric::add(
-                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?,
-                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?
-            ).map_err(|e| err_data( e.to_string()))?),
+                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data("Expected Int64"))?,
+                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data("Expected Int64"))?
+            ).map_err(|e| err_data(e.to_string()))?),
             BinaryOperator::Sub => Arc::new(numeric::sub(
-                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?,
-                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?
-            ).map_err(|e| err_data( e.to_string()))?),
+                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data("Expected Int64"))?,
+                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data("Expected Int64"))?
+            ).map_err(|e| err_data(e.to_string()))?),
             BinaryOperator::Mul => Arc::new(numeric::mul(
-                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?,
-                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?
-            ).map_err(|e| err_data( e.to_string()))?),
+                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data("Expected Int64"))?,
+                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data("Expected Int64"))?
+            ).map_err(|e| err_data(e.to_string()))?),
             BinaryOperator::Div => Arc::new(numeric::div(
-                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?,
-                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data( "Expected Int64"))?
-            ).map_err(|e| err_data( e.to_string()))?),
+                left.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data("Expected Int64"))?,
+                right.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err_data("Expected Int64"))?
+            ).map_err(|e| err_data(e.to_string()))?),
             _ => return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Unsupported arithmetic operator: {:?}", op),

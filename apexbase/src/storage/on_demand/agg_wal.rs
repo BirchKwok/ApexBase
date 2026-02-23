@@ -25,6 +25,7 @@ impl OnDemandStorage {
         
         let schema = self.schema.read();
         let deleted = self.deleted.read();
+        let nulls = self.nulls.read();
         let total_rows = columns.first().map(|c| c.len()).unwrap_or(0);
         
         let has_deleted = deleted.iter().any(|&b| b != 0);
@@ -32,6 +33,15 @@ impl OnDemandStorage {
         if has_deleted { return Ok(None); }
         
         let active_count = total_rows as i64;
+
+        // Helper: check if row i is NULL using the null bitmap (bit=1 means null)
+        #[inline]
+        fn is_null_at(bitmap: &[u8], i: usize) -> bool {
+            let byte_idx = i / 8;
+            let bit_idx = i % 8;
+            byte_idx < bitmap.len() && (bitmap[byte_idx] >> bit_idx) & 1 == 1
+        }
+
         let mut results: Vec<(i64, f64, f64, f64, bool)> = Vec::with_capacity(agg_cols.len());
         
         for &col_name in agg_cols {
@@ -46,42 +56,55 @@ impl OnDemandStorage {
             };
             if col_idx >= columns.len() { return Ok(None); }
             
+            // Get the null bitmap for this column (empty = no nulls)
+            let null_bm: &[u8] = if col_idx < nulls.len() { &nulls[col_idx] } else { &[] };
+            let has_nulls = !null_bm.is_empty() && null_bm.iter().any(|&b| b != 0);
+
             match &columns[col_idx] {
                 ColumnData::Int64(vals) => {
-                    let byte_len = vals.len() * std::mem::size_of::<i64>();
-                    let buffer = unsafe {
-                        Buffer::from_custom_allocation(
-                            std::ptr::NonNull::new_unchecked(vals.as_ptr() as *mut u8),
-                            byte_len,
-                            Arc::new(()),
-                        )
-                    };
-                    let arr = PrimitiveArray::<Int64Type>::new(
-                        ScalarBuffer::new(buffer, 0, vals.len()), None,
-                    );
-                    let sum = arrow::compute::sum(&arr).unwrap_or(0);
-                    let min_v = arrow::compute::min(&arr).unwrap_or(i64::MAX);
-                    let max_v = arrow::compute::max(&arr).unwrap_or(i64::MIN);
-                    drop(arr);
-                    results.push((vals.len() as i64, sum as f64, min_v as f64, max_v as f64, true));
+                    if !has_nulls {
+                        // Fast path: no nulls — use SIMD sum
+                        let sum: i64 = vals.iter().sum();
+                        let min_v = vals.iter().copied().min().unwrap_or(i64::MAX);
+                        let max_v = vals.iter().copied().max().unwrap_or(i64::MIN);
+                        results.push((vals.len() as i64, sum as f64, min_v as f64, max_v as f64, true));
+                    } else {
+                        let mut count = 0i64;
+                        let mut sum = 0i64;
+                        let mut min_v = i64::MAX;
+                        let mut max_v = i64::MIN;
+                        for (i, &v) in vals.iter().enumerate() {
+                            if !is_null_at(null_bm, i) {
+                                count += 1;
+                                sum += v;
+                                if v < min_v { min_v = v; }
+                                if v > max_v { max_v = v; }
+                            }
+                        }
+                        results.push((count, sum as f64, min_v as f64, max_v as f64, true));
+                    }
                 }
                 ColumnData::Float64(vals) => {
-                    let byte_len = vals.len() * std::mem::size_of::<f64>();
-                    let buffer = unsafe {
-                        Buffer::from_custom_allocation(
-                            std::ptr::NonNull::new_unchecked(vals.as_ptr() as *mut u8),
-                            byte_len,
-                            Arc::new(()),
-                        )
-                    };
-                    let arr = PrimitiveArray::<Float64Type>::new(
-                        ScalarBuffer::new(buffer, 0, vals.len()), None,
-                    );
-                    let sum = arrow::compute::sum(&arr).unwrap_or(0.0);
-                    let min_v = arrow::compute::min(&arr).unwrap_or(f64::INFINITY);
-                    let max_v = arrow::compute::max(&arr).unwrap_or(f64::NEG_INFINITY);
-                    drop(arr);
-                    results.push((vals.len() as i64, sum, min_v, max_v, false));
+                    if !has_nulls {
+                        let sum: f64 = vals.iter().sum();
+                        let min_v = vals.iter().copied().fold(f64::INFINITY, f64::min);
+                        let max_v = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        results.push((vals.len() as i64, sum, min_v, max_v, false));
+                    } else {
+                        let mut count = 0i64;
+                        let mut sum = 0.0f64;
+                        let mut min_v = f64::INFINITY;
+                        let mut max_v = f64::NEG_INFINITY;
+                        for (i, &v) in vals.iter().enumerate() {
+                            if !is_null_at(null_bm, i) {
+                                count += 1;
+                                sum += v;
+                                if v < min_v { min_v = v; }
+                                if v > max_v { max_v = v; }
+                            }
+                        }
+                        results.push((count, sum, min_v, max_v, false));
+                    }
                 }
                 _ => { results.push((active_count, 0.0, 0.0, 0.0, false)); }
             }
@@ -234,12 +257,13 @@ impl OnDemandStorage {
                     let col_off = rcix[col_idx] as usize;
                     let data_start = col_off + null_bitmap_len;
                     if data_start >= body.len() { continue; }
+                    let null_bm = if col_off + null_bitmap_len <= body.len() { &body[col_off..col_off + null_bitmap_len] } else { &[] };
                     let col_type = schema.columns[col_idx].1;
                     let (col_data, _) = read_column_encoded(&body[data_start..], col_type)?;
                     match &col_data {
-                        ColumnData::Int64(v) => { col_is_int[ci] = true; for &x in v { col_counts[ci] += 1; col_sums[ci] += x as f64; let xf = x as f64; if xf < col_mins[ci] { col_mins[ci] = xf; } if xf > col_maxs[ci] { col_maxs[ci] = xf; } } }
-                        ColumnData::Float64(v) => { for &x in v { col_counts[ci] += 1; col_sums[ci] += x; if x < col_mins[ci] { col_mins[ci] = x; } if x > col_maxs[ci] { col_maxs[ci] = x; } } }
-                        _ => { col_counts[ci] += col_data.len() as i64; } // COUNT on non-numeric col
+                        ColumnData::Int64(v) => { col_is_int[ci] = true; for (i, &x) in v.iter().enumerate() { if !((null_bm.get(i/8).copied().unwrap_or(0) >> (i%8)) & 1 != 0) { col_counts[ci] += 1; col_sums[ci] += x as f64; let xf = x as f64; if xf < col_mins[ci] { col_mins[ci] = xf; } if xf > col_maxs[ci] { col_maxs[ci] = xf; } } } }
+                        ColumnData::Float64(v) => { for (i, &x) in v.iter().enumerate() { if !((null_bm.get(i/8).copied().unwrap_or(0) >> (i%8)) & 1 != 0) { col_counts[ci] += 1; col_sums[ci] += x; if x < col_mins[ci] { col_mins[ci] = x; } if x > col_maxs[ci] { col_maxs[ci] = x; } } } }
+                        _ => { col_counts[ci] += col_data.len() as i64; }
                     }
                 }
                 continue;
@@ -265,16 +289,19 @@ impl OnDemandStorage {
                     match col_type {
                         ColumnType::Float64 | ColumnType::Float32 => {
                             let n = count.min(rg_rows).min(raw.len() / 8);
-                            let vals = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f64, n) };
-                            if !has_deleted {
+                            let vals: Vec<f64> = raw.chunks_exact(8).take(n).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+                            let null_bm = if col_off + null_bitmap_len <= body.len() { &body[col_off..col_off + null_bitmap_len] } else { &[][..] };
+                            let has_col_nulls = null_bm.iter().any(|&b| b != 0);
+                            if !has_deleted && !has_col_nulls {
                                 let s: f64 = vals.iter().sum();
                                 let mn = vals.iter().copied().fold(col_mins[ci], f64::min);
                                 let mx = vals.iter().copied().fold(col_maxs[ci], f64::max);
                                 col_counts[ci] += n as i64; col_sums[ci] += s; col_mins[ci] = mn; col_maxs[ci] = mx;
                             } else {
-                                let del = &body[del_start_body..del_start_body + del_vec_len];
+                                let del: &[u8] = if has_deleted { &body[del_start_body..del_start_body + del_vec_len] } else { &[] };
                                 for (i, &v) in vals.iter().enumerate() {
-                                    if (del[i / 8] >> (i % 8)) & 1 != 0 { continue; }
+                                    if has_deleted && (del[i / 8] >> (i % 8)) & 1 != 0 { continue; }
+                                    if has_col_nulls && (null_bm.get(i/8).copied().unwrap_or(0) >> (i%8)) & 1 != 0 { continue; }
                                     col_counts[ci] += 1; col_sums[ci] += v;
                                     if v < col_mins[ci] { col_mins[ci] = v; } if v > col_maxs[ci] { col_maxs[ci] = v; }
                                 }
@@ -285,9 +312,11 @@ impl OnDemandStorage {
                         ColumnType::Timestamp | ColumnType::Date => {
                             col_is_int[ci] = true;
                             let n = count.min(rg_rows).min(raw.len() / 8);
-                            let vals = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i64, n) };
-                            if !has_deleted {
-                                // Separate passes for SIMD auto-vectorization (LLVM can vectorize each individually)
+                            let vals: Vec<i64> = raw.chunks_exact(8).take(n).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+                            let null_bm = if col_off + null_bitmap_len <= body.len() { &body[col_off..col_off + null_bitmap_len] } else { &[][..] };
+                            let has_col_nulls = null_bm.iter().any(|&b| b != 0);
+                            if !has_deleted && !has_col_nulls {
+                                // Fast path: no deletes, no nulls
                                 let s: i64 = vals.iter().copied().sum();
                                 let mn = vals.iter().copied().min().unwrap_or(i64::MAX);
                                 let mx = vals.iter().copied().max().unwrap_or(i64::MIN);
@@ -295,9 +324,10 @@ impl OnDemandStorage {
                                 if (mn as f64) < col_mins[ci] { col_mins[ci] = mn as f64; }
                                 if (mx as f64) > col_maxs[ci] { col_maxs[ci] = mx as f64; }
                             } else {
-                                let del = &body[del_start_body..del_start_body + del_vec_len];
+                                let del: &[u8] = if has_deleted { &body[del_start_body..del_start_body + del_vec_len] } else { &[] };
                                 for (i, &v) in vals.iter().enumerate() {
-                                    if (del[i / 8] >> (i % 8)) & 1 != 0 { continue; }
+                                    if has_deleted && (del[i / 8] >> (i % 8)) & 1 != 0 { continue; }
+                                    if has_col_nulls && (null_bm.get(i/8).copied().unwrap_or(0) >> (i%8)) & 1 != 0 { continue; }
                                     col_counts[ci] += 1; col_sums[ci] += v as f64;
                                     let vf = v as f64;
                                     if vf < col_mins[ci] { col_mins[ci] = vf; } if vf > col_maxs[ci] { col_maxs[ci] = vf; }
@@ -731,7 +761,7 @@ impl OnDemandStorage {
                                 let n = count.min(rg_rows).min(rg_n).min((payload.len() - 8) / 8);
                                 let col_type = schema.columns[col_idx].1;
                                 if matches!(col_type, ColumnType::Float64 | ColumnType::Float32) {
-                                    let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const f64, n) };
+                                    let vals: Vec<f64> = payload[8..].chunks_exact(8).take(n).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
                                     if !has_deleted {
                                         for i in 0..n { let gid = unsafe { *gids_slice.get_unchecked(i) } as usize; unsafe { *flat_counts.get_unchecked_mut(gid) += 1; *flat_sums.get_unchecked_mut(gid) += *vals.get_unchecked(i); } }
                                     } else {
@@ -739,7 +769,7 @@ impl OnDemandStorage {
                                     }
                                     rg_row_offset += rg_rows; continue;
                                 } else if matches!(col_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64) {
-                                    let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const i64, n) };
+                                    let vals: Vec<i64> = payload[8..].chunks_exact(8).take(n).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
                                     if !has_deleted {
                                         for i in 0..n { let gid = unsafe { *gids_slice.get_unchecked(i) } as usize; unsafe { *flat_counts.get_unchecked_mut(gid) += 1; *flat_sums.get_unchecked_mut(gid) += *vals.get_unchecked(i) as f64; } }
                                     } else {
@@ -759,7 +789,7 @@ impl OnDemandStorage {
                 }
                 // MULTI-AGG STREAMING: pre-load all agg column slices for this RG, single-pass hot loop
                 // Enumerate each agg col: get PLAIN zero-copy slice or bail to outer fallback
-                enum RgColSlice<'b> { Count, F64(&'b [f64]), I64(&'b [i64]) }
+                enum RgColSlice { Count, F64(Vec<f64>), I64(Vec<i64>) }
                 let mut rg_slices: Vec<RgColSlice> = Vec::with_capacity(num_aggs);
                 let mut ok = true;
                 for (ai, &opt_col_idx) in agg_col_indices.iter().enumerate() {
@@ -777,9 +807,9 @@ impl OnDemandStorage {
                     let col_type = schema.columns[col_idx].1;
                     let n = cnt.min(rg_rows).min((payload.len() - 8) / 8);
                     if matches!(col_type, ColumnType::Float64 | ColumnType::Float32) {
-                        rg_slices.push(RgColSlice::F64(unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const f64, n) }));
+                        rg_slices.push(RgColSlice::F64(payload[8..].chunks_exact(8).take(n).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect()));
                     } else if matches!(col_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64) {
-                        rg_slices.push(RgColSlice::I64(unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const i64, n) }));
+                        rg_slices.push(RgColSlice::I64(payload[8..].chunks_exact(8).take(n).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect()));
                     } else { ok = false; break; }
                 }
                 if ok && !has_deleted {
@@ -1167,7 +1197,7 @@ impl OnDemandStorage {
                 };
 
                 // Get agg column via zero-copy PLAIN slice or fallback decode
-                enum AggBuf { None, F64ZC(*const f64, usize), I64ZC(*const i64, usize), Owned(ColumnData) }
+                enum AggBuf { None, F64(Vec<f64>), I64(Vec<i64>), Owned(ColumnData) }
                 let agg_buf: AggBuf = match agg_idx {
                     None => AggBuf::None,
                     Some(ai) if ai == filter_idx => AggBuf::None,
@@ -1182,10 +1212,10 @@ impl OnDemandStorage {
                                 let col_type = schema.columns[ai].1;
                                 if matches!(col_type, ColumnType::Float64 | ColumnType::Float32) {
                                     let n = count.min(rg_rows).min((payload.len() - 8) / 8);
-                                    AggBuf::F64ZC(payload[8..].as_ptr() as *const f64, n)
+                                    AggBuf::F64(payload[8..].chunks_exact(8).take(n).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect())
                                 } else if matches!(col_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64) {
                                     let n = count.min(rg_rows).min((payload.len() - 8) / 8);
-                                    AggBuf::I64ZC(payload[8..].as_ptr() as *const i64, n)
+                                    AggBuf::I64(payload[8..].chunks_exact(8).take(n).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect())
                                 } else {
                                     let (ad, _) = read_column_encoded(&body[a_data_start..], col_type)?;
                                     AggBuf::Owned(ad)
@@ -1200,18 +1230,12 @@ impl OnDemandStorage {
                         } else { AggBuf::None }
                     }
                 };
-                // Expose as slices (zero-copy or owned)
-                let (agg_f64_zc_ptr, agg_f64_zc_n): (Option<*const f64>, usize) = if let AggBuf::F64ZC(p, n) = &agg_buf { (Some(*p), *n) } else { (None, 0) };
-                let (agg_i64_zc_ptr, agg_i64_zc_n): (Option<*const i64>, usize) = if let AggBuf::I64ZC(p, n) = &agg_buf { (Some(*p), *n) } else { (None, 0) };
+                // Expose as slices (owned or decoded)
                 let agg_data_owned = if let AggBuf::Owned(ref cd) = agg_buf { Some(cd) } else { None };
                 let agg_f64_own = agg_data_owned.and_then(|acd| match acd { ColumnData::Float64(v) => Some(v.as_slice()), _ => None });
                 let agg_i64_own = agg_data_owned.and_then(|acd| match acd { ColumnData::Int64(v) => Some(v.as_slice()), _ => None });
-                let agg_f64: Option<&[f64]> = if let Some(p) = agg_f64_zc_ptr {
-                    Some(unsafe { std::slice::from_raw_parts(p, agg_f64_zc_n) })
-                } else { agg_f64_own };
-                let agg_i64: Option<&[i64]> = if let Some(p) = agg_i64_zc_ptr {
-                    Some(unsafe { std::slice::from_raw_parts(p, agg_i64_zc_n) })
-                } else { agg_i64_own };
+                let agg_f64: Option<&[f64]> = if let AggBuf::F64(ref v) = agg_buf { Some(v.as_slice()) } else { agg_f64_own };
+                let agg_i64: Option<&[i64]> = if let AggBuf::I64(ref v) = agg_buf { Some(v.as_slice()) } else { agg_i64_own };
                 let (agg_f64, agg_i64) = if agg_idx == Some(filter_idx) {
                     // Same column as filter — derive from decoded data (non-BITPACK fallback)
                     match filter_data_owned.as_ref() {

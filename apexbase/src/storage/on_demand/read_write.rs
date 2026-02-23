@@ -3212,8 +3212,12 @@ impl OnDemandStorage {
         file.seek(SeekFrom::Start(footer_offset))?;
         let new_footer_bytes = footer.to_bytes();
         file.write_all(&new_footer_bytes)?;
-        // Truncate in case new footer is shorter (shouldn't happen, but safety)
+        // Truncate in case new footer is shorter (shouldn't happen in deletion-only paths).
+        // Skipped on Windows: set_len fails with ERROR_USER_MAPPED_FILE (os error 1224) when
+        // any mmap is open. Footer size never changes in deletion-only operations, so this
+        // is a safe no-op to skip.
         let new_end = footer_offset + new_footer_bytes.len() as u64;
+        #[cfg(not(target_os = "windows"))]
         file.set_len(new_end)?;
         file.flush()?;
 
@@ -3411,22 +3415,23 @@ impl OnDemandStorage {
                 let payload = &col_bytes[enc_offset..];
                 let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
                 let n = count.min(rg_rows).min((payload.len().saturating_sub(8)) / 8);
+                let vals_raw = &payload[8..];
                 if is_int {
-                    let vals: &[i64] = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const i64, n) };
                     for i in 0..n {
                         if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
                         if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                        if vals[i] >= low_i && vals[i] <= high_i {
+                        let v = i64::from_le_bytes(vals_raw[i*8..(i+1)*8].try_into().unwrap());
+                        if v >= low_i && v <= high_i {
                             del_bytes[i/8] |= 1 << (i%8);
                             rg_newly_deleted += 1;
                         }
                     }
                 } else {
-                    let vals: &[f64] = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const f64, n) };
                     for i in 0..n {
                         if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
                         if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                        if vals[i] >= low && vals[i] <= high {
+                        let v = f64::from_le_bytes(vals_raw[i*8..(i+1)*8].try_into().unwrap());
+                        if v >= low && v <= high {
                             del_bytes[i/8] |= 1 << (i%8);
                             rg_newly_deleted += 1;
                         }
@@ -3480,7 +3485,9 @@ impl OnDemandStorage {
         file.seek(SeekFrom::Start(footer_offset))?;
         let new_footer_bytes = footer_mut.to_bytes();
         file.write_all(&new_footer_bytes)?;
+        // Footer size is identical (deletion counts only); skip set_len on Windows.
         let new_end = footer_offset + new_footer_bytes.len() as u64;
+        #[cfg(not(target_os = "windows"))]
         file.set_len(new_end)?;
         file.flush()?;
 
@@ -3611,7 +3618,9 @@ impl OnDemandStorage {
         file.seek(SeekFrom::Start(footer_offset))?;
         let new_footer_bytes = footer_mut.to_bytes();
         file.write_all(&new_footer_bytes)?;
+        // Footer size is identical (deletion counts only); skip set_len on Windows.
         let new_end = footer_offset + new_footer_bytes.len() as u64;
+        #[cfg(not(target_os = "windows"))]
         file.set_len(new_end)?;
         file.flush()?;
 
@@ -3619,7 +3628,7 @@ impl OnDemandStorage {
             let mut hdr = self.header.write();
             hdr.row_count = new_total_active;
             file.seek(SeekFrom::Start(0))?;
-            file.write_all(&hdr.to_bytes())?;
+            file.write_all(&hdr.to_bytes())?
         }
         file.flush()?;
         drop(file);
@@ -3869,23 +3878,42 @@ impl OnDemandStorage {
     }
 
     fn write_col_stats_sidecar(&self, schema: &OnDemandSchema, columns: &[ColumnData]) {
+        let nulls = self.nulls.read();
+        // Helper: bit=1 means NULL
+        #[inline]
+        fn is_null_at(bm: &[u8], i: usize) -> bool {
+            let b = i / 8; let bit = i % 8;
+            b < bm.len() && (bm[b] >> bit) & 1 == 1
+        }
         let mut buf: Vec<u8> = Vec::with_capacity(512);
         buf.extend_from_slice(b"APEXSTAT");
         let mut entries: Vec<(String, i64, f64, f64, f64, bool)> = Vec::new();
         for (ci, (name, ctype)) in schema.columns.iter().enumerate() {
             let col = match columns.get(ci) { Some(c) => c, None => continue };
+            let null_bm: &[u8] = if ci < nulls.len() { &nulls[ci] } else { &[] };
+            let has_nulls = !null_bm.is_empty() && null_bm.iter().any(|&b| b != 0);
             match (ctype, col) {
                 (ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
                  ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
                  ColumnType::Timestamp | ColumnType::Date, ColumnData::Int64(vals)) if !vals.is_empty() => {
-                    let (mut s, mut mn, mut mx) = (0i64, i64::MAX, i64::MIN);
-                    for &v in vals { s = s.wrapping_add(v); if v < mn { mn = v; } if v > mx { mx = v; } }
-                    entries.push((name.clone(), vals.len() as i64, s as f64, mn as f64, mx as f64, true));
+                    let (mut cnt, mut s, mut mn, mut mx) = (0i64, 0i64, i64::MAX, i64::MIN);
+                    for (i, &v) in vals.iter().enumerate() {
+                        if has_nulls && is_null_at(null_bm, i) { continue; }
+                        cnt += 1; s = s.wrapping_add(v); if v < mn { mn = v; } if v > mx { mx = v; }
+                    }
+                    if cnt > 0 {
+                        entries.push((name.clone(), cnt, s as f64, mn as f64, mx as f64, true));
+                    }
                 }
                 (ColumnType::Float64 | ColumnType::Float32, ColumnData::Float64(vals)) if !vals.is_empty() => {
-                    let (mut s, mut mn, mut mx) = (0.0f64, f64::INFINITY, f64::NEG_INFINITY);
-                    for &v in vals { s += v; if v < mn { mn = v; } if v > mx { mx = v; } }
-                    entries.push((name.clone(), vals.len() as i64, s, mn, mx, false));
+                    let (mut cnt, mut s, mut mn, mut mx) = (0i64, 0.0f64, f64::INFINITY, f64::NEG_INFINITY);
+                    for (i, &v) in vals.iter().enumerate() {
+                        if has_nulls && is_null_at(null_bm, i) { continue; }
+                        cnt += 1; s += v; if v < mn { mn = v; } if v > mx { mx = v; }
+                    }
+                    if cnt > 0 {
+                        entries.push((name.clone(), cnt, s, mn, mx, false));
+                    }
                 }
                 _ => {}
             }
