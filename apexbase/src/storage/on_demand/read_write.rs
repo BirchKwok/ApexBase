@@ -2469,6 +2469,10 @@ impl OnDemandStorage {
         let file = OpenOptions::new()
             .write(true).create(true).truncate(true)
             .open(&tmp_path)?;
+        // On Windows, larger write buffers reduce syscall overhead significantly.
+        #[cfg(windows)]
+        let mut writer = BufWriter::with_capacity(2 * 1024 * 1024, file);
+        #[cfg(not(windows))]
         let mut writer = BufWriter::with_capacity(256 * 1024, file);
         
         // Phase 1: Build filtered (active) data under read guards.
@@ -2837,12 +2841,13 @@ impl OnDemandStorage {
             self.next_id.store(candidate, Ordering::SeqCst);
         }
         
-        let file = File::open(&self.path)?;
+        let file = open_for_sequential_read(&self.path)?;
         *self.file.write() = Some(file);
         
-        // On Linux, eagerly create the mmap so the next read avoids lazy-creation overhead.
-        // This is safe because the file was just written and is in a consistent state.
-        #[cfg(target_os = "linux")]
+        // On Linux and Windows, eagerly create the mmap so the next read avoids lazy-creation
+        // overhead. On Linux this eliminates lazy mmap setup; on Windows this triggers the
+        // prefault loop in MmapCache::get_or_create so subsequent queries avoid page faults.
+        #[cfg(any(target_os = "linux", windows))]
         {
             let file_guard = self.file.read();
             if let Some(f) = file_guard.as_ref() {
@@ -3108,7 +3113,7 @@ impl OnDemandStorage {
 
         // Reopen file handle
         drop(file);
-        let file = File::open(&self.path)?;
+        let file = open_for_sequential_read(&self.path)?;
         *self.file.write() = Some(file);
 
         Ok(())
@@ -3232,8 +3237,7 @@ impl OnDemandStorage {
         drop(file);
 
         // Reopen file handle
-        let new_file = File::open(&self.path)?;
-        *self.file.write() = Some(new_file);
+        *self.file.write() = Some(open_for_sequential_read(&self.path)?);
 
         Ok(())
     }
@@ -3502,7 +3506,7 @@ impl OnDemandStorage {
         drop(file);
 
         // Reopen for reading
-        *self.file.write() = Some(File::open(&self.path)?);
+        *self.file.write() = Some(open_for_sequential_read(&self.path)?);
 
         Ok(Some(newly_deleted))
     }
@@ -3633,7 +3637,7 @@ impl OnDemandStorage {
         file.flush()?;
         drop(file);
 
-        *self.file.write() = Some(File::open(&self.path)?);
+        *self.file.write() = Some(open_for_sequential_read(&self.path)?);
         Ok(Some(newly_deleted))
     }
 
@@ -3805,7 +3809,7 @@ impl OnDemandStorage {
         drop(writer);
         
         // Reopen file
-        let new_file = File::open(&self.path)?;
+        let new_file = open_for_sequential_read(&self.path)?;
         *self.file.write() = Some(new_file);
         
         // Update persisted count (disk now has more rows)

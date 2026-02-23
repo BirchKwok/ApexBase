@@ -466,6 +466,9 @@ impl WalWriter {
             .truncate(true)
             .open(path)?;
         
+        #[cfg(windows)]
+        let mut writer = BufWriter::with_capacity(512 * 1024, file);
+        #[cfg(not(windows))]
         let mut writer = BufWriter::with_capacity(64 * 1024, file);
         
         // Write header
@@ -512,9 +515,13 @@ impl WalWriter {
             0
         };
         
+        #[cfg(windows)]
+        let buf_writer = BufWriter::with_capacity(512 * 1024, file);
+        #[cfg(not(windows))]
+        let buf_writer = BufWriter::with_capacity(64 * 1024, file);
         Ok(Self {
             path: path.to_path_buf(),
-            file: BufWriter::with_capacity(64 * 1024, file),
+            file: buf_writer,
             record_count,
         })
     }

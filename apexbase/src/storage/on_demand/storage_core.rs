@@ -185,7 +185,7 @@ impl OnDemandStorage {
             let _ = std::fs::remove_file(&ds_tmp);
         }
         
-        let file = File::open(path)?;
+        let file = open_for_sequential_read(path)?;
         
         // Create mmap cache and use it for initial reads
         let mut mmap_cache = MmapCache::new();
@@ -710,7 +710,7 @@ impl OnDemandStorage {
         
         // Quick V4 check: V4 files don't have V3 offsets, use general open path
         {
-            let file = File::open(path)?;
+            let file = open_for_sequential_read(path)?;
             let mut mc = MmapCache::new();
             let mut hb = [0u8; HEADER_SIZE_V3];
             mc.read_at(&file, &mut hb, 0)?;
@@ -720,7 +720,7 @@ impl OnDemandStorage {
             }
         }
         
-        let file = File::open(path)?;
+        let file = open_for_sequential_read(path)?;
         let mut mmap_cache = MmapCache::new();
         
         // Read header only

@@ -117,6 +117,20 @@ impl MmapCache {
             // On Linux, hint sequential access so the kernel doubles readahead.
             #[cfg(target_os = "linux")]
             { let _ = mmap.advise(memmap2::Advice::Sequential); }
+            // On Windows: pre-fault pages by touching every 4KB to eliminate first-access
+            // page faults during queries. Windows has no equivalent of MAP_POPULATE or
+            // MADV_SEQUENTIAL, so we warm the TLB manually for small files.
+            // For large files (>=64MB), the I/O cost of touching all pages exceeds the benefit.
+            #[cfg(windows)]
+            if current_size < 64 * 1024 * 1024 {
+                let ptr = mmap.as_ptr();
+                let len = mmap.len();
+                let mut i = 0usize;
+                while i < len {
+                    unsafe { let _ = ptr.add(i).read_volatile(); }
+                    i += 4096;
+                }
+            }
             self.mmap = Some(mmap);
             self.file_size = current_size;
         }
@@ -168,6 +182,24 @@ impl MmapCache {
         self.mmap = None;
         self.file_size = 0;
     }
+}
+
+/// Open a file optimised for sequential access.
+/// On Windows, adds FILE_FLAG_SEQUENTIAL_SCAN (0x08000000) so the OS doubles
+/// read-ahead and avoids random-access caching overhead.
+/// On Linux/macOS, equivalent to `File::open` (mmap + MADV_SEQUENTIAL handles this).
+pub(crate) fn open_for_sequential_read(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    { File::open(path) }
 }
 
 /// Cross-platform positioned read (fallback for when mmap is not available)

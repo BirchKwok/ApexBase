@@ -6,6 +6,20 @@ impl OnDemandStorage {
     /// Cache is invalidated when file size changes (another instance appended data)
     /// or explicitly via `invalidate_footer_cache()` after writes.
     pub(crate) fn get_or_load_footer(&self) -> io::Result<Option<V4Footer>> {
+        // Fast path: if mmap is valid (file_size > 0) and footer is cached, return immediately
+        // without any syscall. mmap_cache is always invalidated after writes, so file_size == 0
+        // when stale. This avoids a metadata() syscall on every query — especially costly on Windows
+        // where NtQueryAttributesFile requires a kernel transition + security descriptor check.
+        {
+            let mc = self.mmap_cache.read();
+            if mc.file_size > 0 {
+                let cached = self.v4_footer.read();
+                if cached.is_some() {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
         let file_len = std::fs::metadata(&self.path)
             .map(|m| m.len())
             .unwrap_or(0);
@@ -13,7 +27,7 @@ impl OnDemandStorage {
             return Ok(None);
         }
 
-        // Fast path: return cached footer if file size hasn't changed
+        // Secondary check: return cached footer if mmap size still matches
         {
             let cached = self.v4_footer.read();
             if let Some(ref footer) = *cached {
@@ -37,7 +51,7 @@ impl OnDemandStorage {
             let fg = self.file.read();
             if fg.is_none() {
                 drop(fg);
-                if let Ok(f) = File::open(&self.path) {
+                if let Ok(f) = open_for_sequential_read(&self.path) {
                     *self.file.write() = Some(f);
                 }
             }
