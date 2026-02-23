@@ -1,5 +1,49 @@
 // Mmap scanning, footer loading, column range readers, filter+group+order fast path
 
+/// Safe: cast byte slice to &[i64]. Falls back to owned Vec when pointer is not 8-byte aligned.
+#[inline(always)]
+fn bytes_as_i64_slice(bytes: &[u8], n: usize) -> std::borrow::Cow<'_, [i64]> {
+    let ptr = bytes.as_ptr();
+    if ptr as usize % 8 == 0 && bytes.len() >= n * 8 {
+        std::borrow::Cow::Borrowed(unsafe { std::slice::from_raw_parts(ptr as *const i64, n) })
+    } else {
+        std::borrow::Cow::Owned((0..n).map(|i| i64::from_le_bytes(bytes[i*8..i*8+8].try_into().unwrap())).collect())
+    }
+}
+
+/// Safe: cast byte slice to &[f64]. Falls back to owned Vec when pointer is not 8-byte aligned.
+#[inline(always)]
+fn bytes_as_f64_slice(bytes: &[u8], n: usize) -> std::borrow::Cow<'_, [f64]> {
+    let ptr = bytes.as_ptr();
+    if ptr as usize % 8 == 0 && bytes.len() >= n * 8 {
+        std::borrow::Cow::Borrowed(unsafe { std::slice::from_raw_parts(ptr as *const f64, n) })
+    } else {
+        std::borrow::Cow::Owned((0..n).map(|i| f64::from_le_bytes(bytes[i*8..i*8+8].try_into().unwrap())).collect())
+    }
+}
+
+/// Safe: cast byte slice to &[u64]. Falls back to owned Vec when pointer is not 8-byte aligned.
+#[inline(always)]
+fn bytes_as_u64_slice(bytes: &[u8], n: usize) -> std::borrow::Cow<'_, [u64]> {
+    let ptr = bytes.as_ptr();
+    if ptr as usize % 8 == 0 && bytes.len() >= n * 8 {
+        std::borrow::Cow::Borrowed(unsafe { std::slice::from_raw_parts(ptr as *const u64, n) })
+    } else {
+        std::borrow::Cow::Owned((0..n).map(|i| u64::from_le_bytes(bytes[i*8..i*8+8].try_into().unwrap())).collect())
+    }
+}
+
+/// Safe: cast byte slice to &[u32]. Falls back to owned Vec when pointer is not 4-byte aligned.
+#[inline(always)]
+fn bytes_as_u32_slice(bytes: &[u8], n: usize) -> std::borrow::Cow<'_, [u32]> {
+    let ptr = bytes.as_ptr();
+    if ptr as usize % 4 == 0 && bytes.len() >= n * 4 {
+        std::borrow::Cow::Borrowed(unsafe { std::slice::from_raw_parts(ptr as *const u32, n) })
+    } else {
+        std::borrow::Cow::Owned((0..n).map(|i| u32::from_le_bytes(bytes[i*4..i*4+4].try_into().unwrap())).collect())
+    }
+}
+
 impl OnDemandStorage {
     /// Get the V4 footer, using cached version when file hasn't changed.
     /// Returns None for V3 files.
@@ -2113,14 +2157,10 @@ impl OnDemandStorage {
                     ) as usize;
                     let dict_data_start = dict_data_len_off + 8;
 
-                    let dict_offsets: &[u32] = unsafe {
-                        std::slice::from_raw_parts(
-                            data[dict_off_start..].as_ptr() as *const u32, dict_size)
-                    };
-                    let indices: &[u32] = unsafe {
-                        std::slice::from_raw_parts(
-                            data[indices_start..].as_ptr() as *const u32, row_count)
-                    };
+                    let dict_offsets_cow = bytes_as_u32_slice(&data[dict_off_start..], dict_size);
+                    let dict_offsets: &[u32] = &dict_offsets_cow;
+                    let indices_cow = bytes_as_u32_slice(&data[indices_start..], row_count);
+                    let indices: &[u32] = &indices_cow;
 
                     // SIMD search target in raw dict data
                     let raw_end = (dict_data_start + dict_data_len).min(data.len());
@@ -2223,12 +2263,8 @@ impl OnDemandStorage {
                             if data_len_off + 8 <= data.len() {
                                 let data_start = data_len_off + 8;
                                 // FAST: cast offset bytes to &[u32] slice (avoids 2M u32::from_le_bytes calls)
-                                let offsets: &[u32] = unsafe {
-                                    std::slice::from_raw_parts(
-                                        data[8..].as_ptr() as *const u32,
-                                        count + 1,
-                                    )
-                                };
+                                let offsets_cow = bytes_as_u32_slice(&data[8..], count + 1);
+                                let offsets: &[u32] = &offsets_cow;
                                 let target_len = target_bytes.len();
                                 let n = count.min(rg_rows);
                                 // FAST: memmem scan raw string data + binary search boundary check
@@ -2293,18 +2329,10 @@ impl OnDemandStorage {
                             let dict_data_len = u64::from_le_bytes(data[dict_data_len_off..dict_data_len_off+8].try_into().unwrap()) as usize;
                             let dict_data_start = dict_data_len_off + 8;
                             // FAST: cast to &[u32] slices
-                            let dict_offsets: &[u32] = unsafe {
-                                std::slice::from_raw_parts(
-                                    data[dict_off_start..].as_ptr() as *const u32,
-                                    dict_size,
-                                )
-                            };
-                            let indices: &[u32] = unsafe {
-                                std::slice::from_raw_parts(
-                                    data[indices_start..].as_ptr() as *const u32,
-                                    row_count,
-                                )
-                            };
+                            let dict_offsets_cow = bytes_as_u32_slice(&data[dict_off_start..], dict_size);
+                            let dict_offsets: &[u32] = &dict_offsets_cow;
+                            let indices_cow = bytes_as_u32_slice(&data[indices_start..], row_count);
+                            let indices: &[u32] = &indices_cow;
                             // Find target in dictionary using SIMD memmem + binary search boundary check
                             let target_len = target_bytes.len();
                             let mut target_dict_idx: Option<u32> = None;
@@ -2362,7 +2390,7 @@ impl OnDemandStorage {
                                 let data_len_off = 8 + all_offsets_len;
                                 if data_len_off + 8 <= data.len() {
                                     let data_start = data_len_off + 8;
-                                    let offsets: &[u32] = unsafe { std::slice::from_raw_parts(data[8..].as_ptr() as *const u32, count + 1) };
+                                    let offsets = bytes_as_u32_slice(&data[8..], count + 1);
                                     let tlen = target_bytes.len();
                                     for i in 0..count.min(rg_rows) {
                                         if matches.len() >= max_matches { break; }
@@ -2382,8 +2410,8 @@ impl OnDemandStorage {
                             if dict_data_len_off + 8 <= data.len() {
                                 let dict_data_len = u64::from_le_bytes(data[dict_data_len_off..dict_data_len_off+8].try_into().unwrap()) as usize;
                                 let dict_data_start = dict_data_len_off + 8;
-                                let dict_offsets: &[u32] = unsafe { std::slice::from_raw_parts(data[dict_off_start..].as_ptr() as *const u32, dict_size) };
-                                let indices: &[u32] = unsafe { std::slice::from_raw_parts(data[16..].as_ptr() as *const u32, row_count) };
+                                let dict_offsets = bytes_as_u32_slice(&data[dict_off_start..], dict_size);
+                                let indices = bytes_as_u32_slice(&data[16..], row_count);
                                 let tlen = target_bytes.len();
                                 let mut tdi: Option<u32> = None;
                                 for di in 0..dict_size {
@@ -2496,7 +2524,7 @@ impl OnDemandStorage {
                     if is_int {
                         let low_i = low.ceil() as i64;
                         let high_i = high.floor() as i64;
-                        let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const i64, n) };
+                        let vals = bytes_as_i64_slice(&payload[8..], n);
                         for i in 0..n {
                             if matches.len() >= max_matches { break; }
                             if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
@@ -2504,7 +2532,7 @@ impl OnDemandStorage {
                             if vals[i] >= low_i && vals[i] <= high_i { matches.push(global_row_offset + i); }
                         }
                     } else {
-                        let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const f64, n) };
+                        let vals = bytes_as_f64_slice(&payload[8..], n);
                         for i in 0..n {
                             if matches.len() >= max_matches { break; }
                             if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
@@ -2538,12 +2566,8 @@ impl OnDemandStorage {
                         if is_int {
                             let low_i = low.ceil() as i64;
                             let high_i = high.floor() as i64;
-                            let vals: &[i64] = unsafe {
-                                std::slice::from_raw_parts(
-                                    data_slice[values_start..].as_ptr() as *const i64,
-                                    n.min((data_slice.len() - values_start) / 8),
-                                )
-                            };
+                            let nn = n.min((data_slice.len() - values_start) / 8);
+                            let vals = bytes_as_i64_slice(&data_slice[values_start..], nn);
                             if !has_deletes {
                                 for i in 0..vals.len() {
                                     if matches.len() >= max_matches { break; }
@@ -2557,12 +2581,8 @@ impl OnDemandStorage {
                                 }
                             }
                         } else {
-                            let vals: &[f64] = unsafe {
-                                std::slice::from_raw_parts(
-                                    data_slice[values_start..].as_ptr() as *const f64,
-                                    n.min((data_slice.len() - values_start) / 8),
-                                )
-                            };
+                            let nn = n.min((data_slice.len() - values_start) / 8);
+                            let vals = bytes_as_f64_slice(&data_slice[values_start..], nn);
                             if !has_deletes {
                                 for i in 0..vals.len() {
                                     if matches.len() >= max_matches { break; }
@@ -2710,11 +2730,11 @@ impl OnDemandStorage {
                     if payload.len() < 8 { continue; }
                     let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
                     let nn = count.min(rg_rows).min((payload.len() - 8) / 8);
-                    let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const i64, nn) };
+                    let vals_cow = bytes_as_i64_slice(&payload[8..], nn);
                     n = nn;
-                    where_vals = WhereVals::Int(vals);
-                    where_vals_int = Vec::new();
+                    where_vals_int = vals_cow.into_owned();
                     where_vals_flt = Vec::new();
+                    where_vals = WhereVals::Int(&where_vals_int[..nn]);
                 } else {
                     // Decode (BITPACK, RLE, etc.)
                     let (col_data, _) = read_column_encoded(where_col_bytes, where_type)?;
@@ -2736,11 +2756,11 @@ impl OnDemandStorage {
                     if payload.len() < 8 { continue; }
                     let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
                     let nn = count.min(rg_rows).min((payload.len() - 8) / 8);
-                    let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const f64, nn) };
+                    let vals_cow = bytes_as_f64_slice(&payload[8..], nn);
                     n = nn;
-                    where_vals = WhereVals::Flt(vals);
+                    where_vals_flt = vals_cow.into_owned();
                     where_vals_int = Vec::new();
-                    where_vals_flt = Vec::new();
+                    where_vals = WhereVals::Flt(&where_vals_flt[..nn]);
                 } else {
                     let (col_data, _) = read_column_encoded(where_col_bytes, where_type)?;
                     match col_data {
@@ -2877,10 +2897,9 @@ impl OnDemandStorage {
             let null_bitmap_len = del_vec_len;
             if id_section + del_vec_len > body.len() { continue; }
 
-            // Read IDs in bulk (zero-copy cast)
-            let ids: &[u64] = unsafe {
-                std::slice::from_raw_parts(body.as_ptr() as *const u64, rg_rows)
-            };
+            // Read IDs in bulk
+            let ids_cow = bytes_as_u64_slice(body, rg_rows);
+            let ids: &[u64] = &ids_cow;
             let del_bytes = &body[id_section..id_section + del_vec_len];
             let has_deletes = rg_meta.deletion_count > 0;
 
@@ -2901,14 +2920,14 @@ impl OnDemandStorage {
                     let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
                     let n = count.min(rg_rows).min((payload.len() - 8) / 8);
                     if is_int {
-                        let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const i64, n) };
+                        let vals = bytes_as_i64_slice(&payload[8..], n);
                         for i in 0..n {
                             if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
                             if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
                             if vals[i] >= low_i && vals[i] <= high_i { result.push(ids[i]); }
                         }
                     } else {
-                        let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const f64, n) };
+                        let vals = bytes_as_f64_slice(&payload[8..], n);
                         for i in 0..n {
                             if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
                             if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
@@ -2965,18 +2984,16 @@ impl OnDemandStorage {
                         let count = u64::from_le_bytes(data_slice[0..8].try_into().unwrap()) as usize;
                         let n = count.min(rg_rows);
                         if is_int {
-                            let vals: &[i64] = unsafe {
-                                std::slice::from_raw_parts(data_slice[8..].as_ptr() as *const i64, n.min((data_slice.len()-8)/8))
-                            };
+                            let nn = n.min((data_slice.len()-8)/8);
+                            let vals = bytes_as_i64_slice(&data_slice[8..], nn);
                             for i in 0..vals.len() {
                                 if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
                                 if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
                                 if vals[i] >= low_i && vals[i] <= high_i { result.push(ids[i]); }
                             }
                         } else {
-                            let vals: &[f64] = unsafe {
-                                std::slice::from_raw_parts(data_slice[8..].as_ptr() as *const f64, n.min((data_slice.len()-8)/8))
-                            };
+                            let nn = n.min((data_slice.len()-8)/8);
+                            let vals = bytes_as_f64_slice(&data_slice[8..], nn);
                             for i in 0..vals.len() {
                                 if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
                                 if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
@@ -3175,12 +3192,26 @@ impl OnDemandStorage {
                 }
 
                 if is_float {
-                    let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const f64, n) };
-                    topk_scan!(vals);
+                    let ptr = payload[8..].as_ptr();
+                    if ptr as usize % std::mem::align_of::<f64>() == 0 {
+                        let vals = unsafe { std::slice::from_raw_parts(ptr as *const f64, n) };
+                        topk_scan!(vals);
+                    } else {
+                        let data = &payload[8..8 + n * 8];
+                        let vals: Vec<f64> = (0..n).map(|i| f64::from_le_bytes(data[i*8..i*8+8].try_into().unwrap())).collect();
+                        topk_scan!(vals);
+                    }
                 } else {
-                    let vals = unsafe { std::slice::from_raw_parts(payload[8..].as_ptr() as *const i64, n) };
-                    let fvals: Vec<f64> = vals.iter().map(|&v| v as f64).collect();
-                    topk_scan!(fvals);
+                    let ptr = payload[8..].as_ptr();
+                    if ptr as usize % std::mem::align_of::<i64>() == 0 {
+                        let vals = unsafe { std::slice::from_raw_parts(ptr as *const i64, n) };
+                        let fvals: Vec<f64> = vals.iter().map(|&v| v as f64).collect();
+                        topk_scan!(fvals);
+                    } else {
+                        let data = &payload[8..8 + n * 8];
+                        let fvals: Vec<f64> = (0..n).map(|i| i64::from_le_bytes(data[i*8..i*8+8].try_into().unwrap()) as f64).collect();
+                        topk_scan!(fvals);
+                    }
                 }
             } else {
                 // Non-PLAIN: decode and scan

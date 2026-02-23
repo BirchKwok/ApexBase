@@ -7,13 +7,10 @@ This module provides the ApexClient class that wraps ApexStorage with on-demand 
 import os
 import re
 import threading
-import time
+
 import json
-import shutil
-import tempfile
-import weakref
-import atexit
-from typing import List, Dict, Union, Optional, Literal
+
+from typing import List, Dict, Union, Optional
 from pathlib import Path
 import numpy as np
 
@@ -706,6 +703,13 @@ class ApexClient:
         _trimmed = sql.strip().rstrip(';').strip()
         is_multi_stmt = ';' in _trimmed
         
+        # ULTRA-EARLY CACHE CHECK: skip _RE_QUALIFIED_REF regex and all validation on warm hits
+        # _query_cache is a plain dict; no lock needed for reads (GIL-protected in CPython)
+        if not is_multi_stmt and sql_upper.startswith('SELECT'):
+            _cached = self._query_cache.get(sql)
+            if _cached is not None:
+                return _cached
+
         if not is_multi_stmt:
             # Allow execution without a selected table for DDL, CTE, or cross-database queries.
             # Cross-db queries use qualified db.table references (e.g. FROM default.users,
@@ -721,7 +725,7 @@ class ApexClient:
                 self._ensure_table_selected()
             except Exception:
                 pass
-        
+
         with self._lock:
             # Determine if _id should be shown based on SQL (like ApexClient)
             if show_internal_id is None:
@@ -752,6 +756,35 @@ class ApexClient:
                 rv._show_internal_id = show_internal_id
                 return rv
             
+            # FAST PATH: SELECT * WHERE _id = N — primary key lookup via retrieve_rcix in Rust.
+            # Not gated on _has_writes: retrieve_rcix reads current storage state unconditionally.
+            # Result IS cached; next write will call _query_cache.clear() invalidating it.
+            if (sql_upper.startswith('SELECT')
+                    and ('WHERE _ID =' in sql_upper or 'WHERE _ID=' in sql_upper)
+                    and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+                    and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper):
+                try:
+                    result = self._storage.execute(sql)
+                    if result is not None:
+                        columns_dict = result.get('columns_dict')
+                        if columns_dict is None and 'columns' in result and 'rows' in result:
+                            cols = result['columns']
+                            rows = result['rows']
+                            if not rows:
+                                rv = ResultView(data=None)
+                                rv._show_internal_id = show_internal_id
+                                return rv
+                            columns_dict = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
+                        if columns_dict is not None:
+                            rv = ResultView(lazy_pydict=columns_dict)
+                            rv._show_internal_id = show_internal_id
+                            if len(self._query_cache) > 200:
+                                self._query_cache.clear()
+                            self._query_cache[sql] = rv
+                            return rv
+                except Exception:
+                    pass
+
             # FAST PATH: SELECT * LIMIT N (small N) — direct columnar transfer (no IPC)
             if (sql_upper.startswith('SELECT *') and 'LIMIT' in sql_upper
                     and 'WHERE' not in sql_upper and 'ORDER' not in sql_upper
@@ -985,8 +1018,7 @@ class ApexClient:
     def retrieve(self, id_: int) -> Optional[dict]:
         self._check_connection()
         self._ensure_table_selected()
-        with self._lock:
-            return self._storage.retrieve(id_)
+        return self._storage.retrieve(id_)
 
     def retrieve_many(self, ids: List[int]) -> 'ResultView':
         self._check_connection()

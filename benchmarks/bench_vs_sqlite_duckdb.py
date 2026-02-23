@@ -645,7 +645,10 @@ class ApexBaseBench:
         )
 
     def bench_point_lookup(self):
-        return self.client.retrieve(5000)
+        return self.client.execute(
+            "SELECT * FROM default WHERE _id = 5000"
+        )
+        # return self.client.retrieve(5000)
 
     def bench_insert_1k(self):
         data_1k = {

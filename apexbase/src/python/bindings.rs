@@ -1114,6 +1114,21 @@ impl ApexStorageImpl {
                     let val_str = rest[1..].trim().trim_end_matches(';');
                     if let Ok(id) = val_str.parse::<u64>() {
                         if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+                            // Primary: retrieve_rcix — page cache, zero Arrow allocation
+                            let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(id));
+                            if let Ok(Some(vals)) = rcix_result {
+                                let out = PyDict::new_bound(py);
+                                let columns_dict = PyDict::new_bound(py);
+                                for (col_name, val) in &vals {
+                                    let col_list = PyList::empty_bound(py);
+                                    col_list.append(value_to_py(py, val)?)?;
+                                    columns_dict.set_item(col_name.as_str(), col_list)?;
+                                }
+                                out.set_item("columns_dict", columns_dict)?;
+                                out.set_item("rows_affected", 0)?;
+                                return Ok(out.into());
+                            }
+                            // Fallback: Arrow batch path (compressed RG or no RCIX index)
                             if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(id) {
                                 if batch.num_rows() > 0 {
                                     let out = PyDict::new_bound(py);
