@@ -12,9 +12,18 @@ impl ApexExecutor {
             }
         }
 
+        // FAST PATH: explode_rename(topk_distance(col,[q],k,'m'), "name1", "name2") FROM table
+        // Single-pass O(n log k) topk that generates k rows with 2 user-named columns.
+        if let Some((col, query, k, metric, names)) = Self::detect_topk_explode(&stmt) {
+            let result = Self::execute_topk_explode(storage_path, col, query, k, metric, names)?;
+            return Ok(ApexResult::Data(result));
+        }
+
         // FAST PATH: Pure COUNT(*) without WHERE/GROUP BY - O(1) from metadata
         // Skip for TableFunction sources (read_csv/read_parquet/read_json) — no stored backend.
-        let from_is_table_fn = matches!(&stmt.from, Some(FromItem::TableFunction { .. }));
+        // Also skip for TopkDistance — it has different row semantics.
+        let from_is_table_fn = matches!(&stmt.from,
+            Some(FromItem::TableFunction { .. }) | Some(FromItem::TopkDistance { .. }));
         if !from_is_table_fn && Self::is_pure_count_star(&stmt) {
             if !storage_path.exists() {
                 let tbl = storage_path.file_stem().unwrap_or_default().to_string_lossy();
@@ -39,6 +48,9 @@ impl ApexExecutor {
         
         // Check for derived table (FROM subquery) - resolve table path from subquery's FROM clause
         let batch = match &stmt.from {
+            Some(FromItem::TopkDistance { col, query, k, metric, .. }) => {
+                Self::execute_topk_distance(storage_path, col, query, *k, metric)?
+            }
             Some(FromItem::TableFunction { func, file, options, .. }) => {
                 Self::read_table_function(func, file, options)?
             }
@@ -2408,6 +2420,229 @@ impl ApexExecutor {
             // All other variants have no nested SqlExpr that could contain FtsMatch
             other => Ok(other),
         }
+    }
+
+    /// Detect `SELECT explode_rename(topk_distance(col,[q],k,'m'), "n1","n2") FROM table`.
+    /// Returns `(col, query, k, metric, names)` if the pattern matches, else `None`.
+    fn detect_topk_explode(stmt: &SelectStatement) -> Option<(&str, &[f64], usize, &str, &[String])> {
+        // Must have a real FROM table (not None / subquery / table-function)
+        if !matches!(&stmt.from, Some(FromItem::Table { .. })) {
+            return None;
+        }
+        // Exactly one SELECT column that is an Expression wrapping ExplodeRename(TopkDistance)
+        if stmt.columns.len() == 1 {
+            if let SelectColumn::Expression {
+                expr: SqlExpr::ExplodeRename { inner, names },
+                ..
+            } = &stmt.columns[0]
+            {
+                if let SqlExpr::TopkDistance { col, query, k, metric } = inner.as_ref() {
+                    return Some((col.as_str(), query.as_slice(), *k, metric.as_str(), names.as_slice()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Execute `explode_rename(topk_distance(col,[q],k,'m'), "name1","name2")`.
+    ///
+    /// Returns a RecordBatch with exactly 2 columns:
+    /// - `names[0]`: Int64 — the `_id` values of the top-k rows
+    /// - `names[1]`: Float64 — the corresponding distances
+    ///
+    /// The result has k rows, sorted ascending by distance.
+    fn execute_topk_explode(
+        storage_path: &Path,
+        col: &str,
+        query: &[f64],
+        k: usize,
+        metric: &str,
+        names: &[String],
+    ) -> io::Result<RecordBatch> {
+        use crate::query::vector_ops::{topk_heap_direct, DistanceMetric};
+        use arrow::array::{BinaryArray, Float64Array, Int64Array};
+
+        if !storage_path.exists() {
+            let tbl = storage_path.file_stem().unwrap_or_default().to_string_lossy();
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("topk_distance: table '{}' does not exist", tbl),
+            ));
+        }
+
+        let metric_enum = DistanceMetric::from_str(metric).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("topk_distance: unknown metric '{}'", metric),
+            )
+        })?;
+
+        let query_f32: Vec<f32> = query.iter().map(|&x| x as f32).collect();
+
+        let backend = get_cached_backend(storage_path)?;
+        let full_batch = backend.read_columns_to_arrow(None, 0, None)?;
+
+        // Output schema: names[0]=Int64(_id), names[1]=Float64(dist)
+        let id_field   = Field::new(&names[0], ArrowDataType::Int64,   false);
+        let dist_field = Field::new(&names[1], ArrowDataType::Float64, false);
+        let out_schema = Arc::new(Schema::new(vec![id_field, dist_field]));
+
+        if full_batch.num_rows() == 0 {
+            return RecordBatch::try_new(
+                out_schema,
+                vec![
+                    Arc::new(Int64Array::from(Vec::<i64>::new()))   as ArrayRef,
+                    Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
+                ],
+            )
+            .map_err(|e| err_data(e.to_string()));
+        }
+
+        let bin_col = full_batch.column_by_name(col).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("topk_distance: column '{}' not found", col),
+            )
+        })?;
+        let bin_arr = bin_col.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("topk_distance: column '{}' is not a binary (vector) column", col),
+            )
+        })?;
+
+        // Fused O(n log k) heap
+        let topk = topk_heap_direct(bin_arr, &query_f32, k, metric_enum);
+
+        // Look up _id for each top-k row index
+        let id_col = full_batch.column_by_name("_id");
+        let ids: Vec<i64> = topk
+            .iter()
+            .map(|(row_idx, _)| {
+                if let Some(id_arr) = &id_col {
+                    if let Some(arr) = id_arr.as_any().downcast_ref::<arrow::array::Int64Array>() {
+                        return arr.value(*row_idx);
+                    }
+                }
+                *row_idx as i64
+            })
+            .collect();
+        let dists: Vec<f64> = topk.iter().map(|(_, d)| *d as f64).collect();
+
+        RecordBatch::try_new(
+            out_schema,
+            vec![
+                Arc::new(Int64Array::from(ids))    as ArrayRef,
+                Arc::new(Float64Array::from(dists)) as ArrayRef,
+            ],
+        )
+        .map_err(|e| err_data(e.to_string()))
+    }
+
+    /// Execute `TOPK_DISTANCE(col, [vec], k, 'metric')` table function.
+    ///
+    /// Algorithm (O(n log k)):
+    /// 1. Read the full RecordBatch from storage.
+    /// 2. Locate the binary vector column `col`.
+    /// 3. Run `topk_heap_direct` — single-pass fused distance + max-heap.
+    /// 4. Gather only the top-k rows via `arrow::compute::take`.
+    /// 5. Append a `dist` (Float64) column with the computed distances.
+    fn execute_topk_distance(
+        storage_path: &Path,
+        col: &str,
+        query: &[f64],
+        k: usize,
+        metric: &str,
+    ) -> io::Result<RecordBatch> {
+        use crate::query::vector_ops::{topk_heap_direct, DistanceMetric};
+        use arrow::array::{BinaryArray, Float64Array, UInt32Array};
+        use arrow::compute;
+        use arrow::datatypes::DataType as ArrowDT;
+
+        if !storage_path.exists() {
+            let tbl = storage_path.file_stem().unwrap_or_default().to_string_lossy();
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("topk_distance: table '{}' does not exist", tbl),
+            ));
+        }
+
+        let metric_enum = DistanceMetric::from_str(metric).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("topk_distance: unknown metric '{}'", metric),
+            )
+        })?;
+
+        let query_f32: Vec<f32> = query.iter().map(|&x| x as f32).collect();
+
+        let backend = get_cached_backend(storage_path)?;
+        let full_batch = backend.read_columns_to_arrow(None, 0, None)?;
+
+        // Build the schema with the extra `dist` column
+        let mut fields: Vec<Field> = full_batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (**f).clone())
+            .collect();
+        fields.push(Field::new("dist", ArrowDT::Float64, false));
+        let out_schema = Arc::new(Schema::new(fields));
+
+        if full_batch.num_rows() == 0 {
+            let empty_cols: Vec<ArrayRef> = out_schema
+                .fields()
+                .iter()
+                .map(|f| arrow::array::new_empty_array(f.data_type()))
+                .collect();
+            return RecordBatch::try_new(out_schema, empty_cols)
+                .map_err(|e| err_data(e.to_string()));
+        }
+
+        let bin_col = full_batch.column_by_name(col).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("topk_distance: column '{}' not found", col),
+            )
+        })?;
+
+        let bin_arr = bin_col
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("topk_distance: column '{}' is not a binary (vector) column", col),
+                )
+            })?;
+
+        // Fused single-pass: compute distances + maintain max-heap of size k
+        let topk = topk_heap_direct(bin_arr, &query_f32, k, metric_enum);
+
+        if topk.is_empty() {
+            let empty_cols: Vec<ArrayRef> = out_schema
+                .fields()
+                .iter()
+                .map(|f| arrow::array::new_empty_array(f.data_type()))
+                .collect();
+            return RecordBatch::try_new(out_schema, empty_cols)
+                .map_err(|e| err_data(e.to_string()));
+        }
+
+        // Gather only the top-k rows from the full batch
+        let take_indices =
+            UInt32Array::from(topk.iter().map(|(i, _)| *i as u32).collect::<Vec<_>>());
+        let distances: Vec<f64> = topk.iter().map(|(_, d)| *d as f64).collect();
+
+        let mut new_cols: Vec<ArrayRef> = Vec::with_capacity(full_batch.num_columns() + 1);
+        for col_arr in full_batch.columns() {
+            let taken = compute::take(col_arr.as_ref(), &take_indices, None)
+                .map_err(|e| err_data(e.to_string()))?;
+            new_cols.push(taken);
+        }
+        new_cols.push(Arc::new(Float64Array::from(distances)) as ArrayRef);
+
+        RecordBatch::try_new(out_schema, new_cols).map_err(|e| err_data(e.to_string()))
     }
 
     /// Return true iff `expr` contains at least one `FtsMatch` node.

@@ -238,6 +238,10 @@ impl ApexExecutor {
                             let alias_str = alias.as_ref().map(|a| format!(" AS {}", a)).unwrap_or_default();
                             plan_lines.push(format!("  Scan: {}('{}'){}", func, file, alias_str));
                         }
+                        FromItem::TopkDistance { col, k, metric, alias, .. } => {
+                            let alias_str = alias.as_ref().map(|a| format!(" AS {}", a)).unwrap_or_default();
+                            plan_lines.push(format!("  Scan: topk_distance({}, k={}, metric='{}'){}", col, k, metric, alias_str));
+                        }
                     }
                 }
                 // JOINs
@@ -253,6 +257,7 @@ impl ApexExecutor {
                         FromItem::Table { table, .. } => table.clone(),
                         FromItem::Subquery { alias, .. } => format!("(subquery) {}", alias),
                         FromItem::TableFunction { func, file, .. } => format!("{}('{}')", func, file),
+                        FromItem::TopkDistance { col, k, metric, .. } => format!("topk_distance({}, k={}, metric='{}')", col, k, metric),
                     };
                     plan_lines.push(format!("  {}: {}", jt, table_name));
                 }

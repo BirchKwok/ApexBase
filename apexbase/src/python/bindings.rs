@@ -2652,6 +2652,75 @@ impl ApexStorageImpl {
         Ok(0)
     }
 
+    /// Heap-based TopK vector distance search — O(n log k), faster than ORDER BY + LIMIT.
+    ///
+    /// Builds a `SELECT * FROM topk_distance(col, [q], k, 'metric')` SQL and executes
+    /// it via Arrow FFI for zero-copy result transfer.
+    ///
+    /// Parameters:
+    /// - col: name of the binary vector column
+    /// - query_bytes: raw little-endian float32 bytes of the query vector
+    /// - k: number of nearest neighbours to return
+    /// - metric: distance metric name ("l2", "cosine", "dot", "l1", "linf", "l2_squared")
+    ///
+    /// Returns (schema_ptr, array_ptr) for PyArrow import, or (0, 0) for empty result.
+    #[pyo3(name = "_topk_distance_ffi")]
+    fn topk_distance_ffi(
+        &self,
+        py: Python<'_>,
+        col: &str,
+        query_bytes: &[u8],
+        k: usize,
+        metric: &str,
+    ) -> PyResult<(usize, usize)> {
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        use arrow::array::{StructArray, Array};
+        use crate::query::vector_ops::bytes_to_query_vec_f32;
+
+        let query = bytes_to_query_vec_f32(query_bytes).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "_topk_distance_ffi: query_bytes must be raw little-endian float32 bytes",
+            )
+        })?;
+
+        let q_str = query
+            .iter()
+            .map(|v| format!("{:.7}", v))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT * FROM topk_distance({}, [{}], {}, '{}')",
+            col, q_str, k, metric
+        );
+
+        let base_dir = self.current_base_dir();
+        let table_path = self.get_current_table_path()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        crate::query::executor::set_query_root_dir(&self.root_dir);
+
+        let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
+            let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            result
+                .to_record_batch()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        crate::query::executor::clear_query_root_dir();
+
+        if batch.num_rows() == 0 {
+            return Ok((0, 0));
+        }
+
+        let struct_array: StructArray = batch.into();
+        let array_data = struct_array.to_data();
+        let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&array_data)
+            .map_err(|e| PyRuntimeError::new_err(format!("FFI export failed: {}", e)))?;
+
+        let schema_ptr = Box::into_raw(Box::new(ffi_schema)) as usize;
+        let array_ptr  = Box::into_raw(Box::new(ffi_array))  as usize;
+        Ok((schema_ptr, array_ptr))
+    }
+
     /// Get FTS stats
     fn get_fts_stats(&self) -> PyResult<Option<(usize, usize)>> {
         let table_name = self.current_table.read().clone();

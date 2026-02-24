@@ -411,6 +411,73 @@ pub fn topk_indices_desc(distances: &Float64Array, k: usize) -> Vec<usize> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Fused TopK: single-pass compute + heap, O(n log k)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Single-pass TopK directly on a `BinaryArray` of stored vectors.
+///
+/// Fuses SIMD distance computation with max-heap maintenance in **one**
+/// sequential pass — no intermediate `Float64Array` allocation for all rows.
+/// O(n log k) time, O(k) extra space.
+///
+/// Returns `Vec<(row_index, f32_distance)>` sorted **ascending** (nearest first).
+pub fn topk_heap_direct(
+    col: &BinaryArray,
+    query: &[f32],
+    k: usize,
+    metric: DistanceMetric,
+) -> Vec<(usize, f32)> {
+    use std::collections::BinaryHeap;
+    use std::cmp::Ordering;
+
+    if k == 0 || col.len() == 0 || query.is_empty() {
+        return vec![];
+    }
+    let k_capped = k.min(col.len());
+    let expected_bytes = query.len() * 4;
+
+    // Max-heap of (f32_bits, row_idx).
+    // IEEE-754 positive f32 bit patterns sort identically to the float values,
+    // so direct bit comparison is correct for non-NaN, non-negative distances.
+    #[derive(Copy, Clone)]
+    struct Entry(u32, usize);
+    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
+    impl Eq         for Entry {}
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) }
+    }
+    impl Ord for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+
+    let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+
+    for i in 0..col.len() {
+        if col.is_null(i) { continue; }
+        let bytes = col.value(i);
+        if bytes.len() != expected_bytes { continue; }
+        // SAFETY: length == query.len()*4, bytes are valid LE f32 values.
+        let vec = unsafe { bytes_to_f32(bytes) };
+        let dist = metric.compute(vec, query);
+        if dist.is_nan() { continue; }
+        let bits = dist.to_bits();
+        if heap.len() < k_capped {
+            heap.push(Entry(bits, i));
+        } else if let Some(&Entry(top_bits, _)) = heap.peek() {
+            if bits < top_bits {
+                heap.pop();
+                heap.push(Entry(bits, i));
+            }
+        }
+    }
+
+    let mut result: Vec<(usize, f32)> = heap
+        .into_iter()
+        .map(|Entry(b, i)| (i, f32::from_bits(b)))
+        .collect();
+    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    result
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Python-side vector encoding helpers (used by bindings.rs)
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -30,6 +30,9 @@ impl ApexExecutor {
             Some(FromItem::TableFunction { func, file, options, .. }) => {
                 Self::read_table_function(func, file, options)?
             }
+            Some(FromItem::TopkDistance { col, query, k, metric, .. }) => {
+                Self::execute_topk_distance(default_table_path, col, query, *k, metric)?
+            }
             None => {
                 let left_backend = get_cached_backend(default_table_path)?;
                 left_backend.read_columns_to_arrow(None, 0, None)?
@@ -58,6 +61,9 @@ impl ApexExecutor {
                 }
                 FromItem::TableFunction { func, file, options, .. } => {
                     Self::read_table_function(func, file, options)?
+                }
+                FromItem::TopkDistance { col, query, k, metric, .. } => {
+                    Self::execute_topk_distance(default_table_path, col, query, *k, metric)?
                 }
             };
 

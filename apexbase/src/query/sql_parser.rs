@@ -121,6 +121,14 @@ pub enum FromItem {
         options: Vec<(String, String)>,
         alias: Option<String>,
     },
+    /// `TOPK_DISTANCE(col, [q1,q2,...], k, 'metric')` — heap-based vector TopK.
+    TopkDistance {
+        col: String,
+        query: Vec<f64>,
+        k: usize,
+        metric: String,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -259,6 +267,10 @@ pub enum SqlExpr {
     ArrayIndex { array: Box<SqlExpr>, index: Box<SqlExpr> },
     /// Array literal: [1.0, 2.0, 3.0]  (used for vector distance queries)
     ArrayLiteral(Vec<f64>),
+    /// topk_distance(col, [q], k, 'metric') — whole-column TopK used inside explode_rename
+    TopkDistance { col: String, query: Vec<f64>, k: usize, metric: String },
+    /// explode_rename(topk_distance_expr, "name1", "name2") — expands TopK pairs into k rows
+    ExplodeRename { inner: Box<SqlExpr>, names: Vec<String> },
 }
 
 /// Binary operators
@@ -1922,8 +1934,43 @@ impl SqlParser {
                 Token::Identifier(table) => {
                     self.advance();
                     let upper = table.to_uppercase();
+                    // TOPK_DISTANCE(col, [vec], k, 'metric') — heap-based vector TopK table function
+                    if upper == "TOPK_DISTANCE" && matches!(self.current(), Token::LParen) {
+                        self.advance(); // consume '('
+                        let col = self.parse_identifier()?;
+                        self.expect(Token::Comma)?;
+                        let query_expr = self.parse_expr()?;
+                        let query = match query_expr {
+                            SqlExpr::ArrayLiteral(v) => v,
+                            _ => return Err(ApexError::QueryParseError(
+                                "topk_distance: second argument must be an array literal [f1, f2, ...]".to_string(),
+                            )),
+                        };
+                        self.expect(Token::Comma)?;
+                        let k = match self.current().clone() {
+                            Token::IntLit(n) => { self.advance(); n as usize }
+                            other => return Err(ApexError::QueryParseError(
+                                format!("topk_distance: third argument must be integer k, got {:?}", other),
+                            )),
+                        };
+                        self.expect(Token::Comma)?;
+                        let metric = match self.current().clone() {
+                            Token::StringLit(s) => { self.advance(); s }
+                            other => return Err(ApexError::QueryParseError(
+                                format!("topk_distance: fourth argument must be a metric string, got {:?}", other),
+                            )),
+                        };
+                        self.expect(Token::RParen)?;
+                        let alias = if matches!(self.current(), Token::As) {
+                            self.advance();
+                            Some(self.parse_identifier()?)
+                        } else if let Token::Identifier(a) = self.current().clone() {
+                            if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) { None }
+                            else { self.advance(); Some(a) }
+                        } else { None };
+                        Some(FromItem::TopkDistance { col, query, k, metric, alias })
                     // Check for table function: read_csv(...), read_parquet(...), read_json(...)
-                    if matches!(upper.as_str(), "READ_CSV" | "READ_PARQUET" | "READ_JSON")
+                    } else if matches!(upper.as_str(), "READ_CSV" | "READ_PARQUET" | "READ_JSON")
                         && matches!(self.current(), Token::LParen)
                     {
                         self.advance(); // consume '('
@@ -2094,6 +2141,29 @@ impl SqlParser {
             }
 
             let right = match self.current().clone() {
+                Token::LParen => {
+                    // JOIN (SELECT ...) alias
+                    self.advance(); // consume '('
+                    if !matches!(self.current(), Token::Select) {
+                        return Err(ApexError::QueryParseError(
+                            "Expected SELECT inside JOIN subquery parentheses".to_string(),
+                        ));
+                    }
+                    let sub = self.parse_select_internal(true)?;
+                    self.expect(Token::RParen)?;
+                    let alias = if matches!(self.current(), Token::As) {
+                        self.advance();
+                        self.parse_identifier()?
+                    } else if let Token::Identifier(a) = self.current().clone() {
+                        self.advance();
+                        a
+                    } else {
+                        return Err(ApexError::QueryParseError(
+                            "JOIN subquery requires an alias".to_string(),
+                        ));
+                    };
+                    FromItem::Subquery { stmt: Box::new(crate::query::SqlStatement::Select(sub)), alias }
+                }
                 Token::Identifier(table) => {
                     self.advance();
                     let upper = table.to_uppercase();
@@ -2943,6 +3013,58 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
 
     fn parse_function_call_from_name(&mut self, name: String) -> Result<SqlExpr, ApexError> {
         self.expect(Token::LParen)?;
+        let upper = name.to_uppercase();
+
+        // topk_distance(col, [q1,q2,...], k, 'metric')
+        if upper == "TOPK_DISTANCE" {
+            let col = self.parse_identifier()?;
+            self.expect(Token::Comma)?;
+            let query = match self.parse_expr()? {
+                SqlExpr::ArrayLiteral(v) => v,
+                _ => return Err(ApexError::QueryParseError(
+                    "topk_distance: second argument must be an array literal [f1, f2, ...]".to_string(),
+                )),
+            };
+            self.expect(Token::Comma)?;
+            let k = match self.current().clone() {
+                Token::IntLit(n) => { self.advance(); n as usize }
+                other => return Err(ApexError::QueryParseError(
+                    format!("topk_distance: third argument must be integer k, got {:?}", other),
+                )),
+            };
+            self.expect(Token::Comma)?;
+            let metric = match self.current().clone() {
+                Token::StringLit(s) => { self.advance(); s }
+                other => return Err(ApexError::QueryParseError(
+                    format!("topk_distance: fourth argument must be a metric string, got {:?}", other),
+                )),
+            };
+            self.expect(Token::RParen)?;
+            return Ok(SqlExpr::TopkDistance { col, query, k, metric });
+        }
+
+        // explode_rename(topk_expr, "name1", "name2", ...)
+        if upper == "EXPLODE_RENAME" {
+            let inner = self.parse_expr()?;
+            let mut names: Vec<String> = Vec::new();
+            while matches!(self.current(), Token::Comma) {
+                self.advance();
+                match self.current().clone() {
+                    Token::StringLit(s) => { self.advance(); names.push(s); }
+                    other => return Err(ApexError::QueryParseError(
+                        format!("explode_rename: column names must be string literals, got {:?}", other),
+                    )),
+                }
+            }
+            if names.len() < 2 {
+                return Err(ApexError::QueryParseError(
+                    "explode_rename: requires at least 2 column name arguments".to_string(),
+                ));
+            }
+            self.expect(Token::RParen)?;
+            return Ok(SqlExpr::ExplodeRename { inner: Box::new(inner), names });
+        }
+
         let mut args = Vec::new();
         // Special-case COUNT(*) in expression contexts (e.g. HAVING COUNT(*) > 1).
         // In SELECT list we have separate aggregate parsing that already handles COUNT(*),

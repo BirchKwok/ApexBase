@@ -161,7 +161,6 @@ class ApexClient:
         
         self._prefer_arrow_format = prefer_arrow_format and ARROW_AVAILABLE
         self._registry = _registry
-        self._query_cache = {}  # SQL -> ResultView cache for repeated read queries
         self._has_writes = False  # True after any write; disables _storage.execute() fast paths
 
     def _load_fts_config(self) -> None:
@@ -242,7 +241,6 @@ class ApexClient:
             self._storage.use_database_(database)
             self._current_database = database if database else 'default'
             self._current_table = None
-            self._query_cache.clear()
         return self
 
     def use(self, database: str = 'default', table: str = None) -> 'ApexClient':
@@ -631,7 +629,6 @@ class ApexClient:
     def store(self, data) -> None:
         self._check_connection()
         self._ensure_table_selected()
-        self._query_cache.clear()  # Invalidate cache on write
         with self._lock:
             # 1. Columnar data Dict[str, list/ndarray]
             if isinstance(data, dict):
@@ -783,13 +780,6 @@ class ApexClient:
         _trimmed = sql.strip().rstrip(';').strip()
         is_multi_stmt = ';' in _trimmed
         
-        # ULTRA-EARLY CACHE CHECK: skip _RE_QUALIFIED_REF regex and all validation on warm hits
-        # _query_cache is a plain dict; no lock needed for reads (GIL-protected in CPython)
-        if not is_multi_stmt and sql_upper.startswith('SELECT'):
-            _cached = self._query_cache.get(sql)
-            if _cached is not None:
-                return _cached
-
         # FAST PATH: table-function queries (read_csv / read_parquet / read_json).
         # Skip all table-existence checks, lock, and DML routing — go straight to Arrow FFI.
         if (not is_multi_stmt and sql_upper.startswith('SELECT')
@@ -879,9 +869,6 @@ class ApexClient:
                         if columns_dict is not None:
                             rv = ResultView(lazy_pydict=columns_dict)
                             rv._show_internal_id = show_internal_id
-                            if len(self._query_cache) > 200:
-                                self._query_cache.clear()
-                            self._query_cache[sql] = rv
                             return rv
                 except Exception:
                     pass
@@ -907,9 +894,6 @@ class ApexClient:
                             if columns_dict is not None:
                                 rv = ResultView(lazy_pydict=columns_dict)
                                 rv._show_internal_id = show_internal_id
-                                if len(self._query_cache) > 200:
-                                    self._query_cache.clear()
-                                self._query_cache[sql] = rv
                                 return rv
                     except Exception:
                         pass
@@ -935,9 +919,6 @@ class ApexClient:
                         col_dict = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
                         rv = ResultView(lazy_pydict=col_dict)
                         rv._show_internal_id = show_internal_id
-                        if len(self._query_cache) > 200:
-                            self._query_cache.clear()
-                        self._query_cache[sql] = rv
                         return rv
                 except Exception:
                     pass
@@ -979,13 +960,7 @@ class ApexClient:
                 rv._show_internal_id = show_internal_id
                 return rv
 
-            # Query result cache: return cached ResultView for identical read queries
-            if sql_upper.startswith('SELECT'):
-                cached = self._query_cache.get(sql)
-                if cached is not None:
-                    return cached
-            elif sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'TRUNCATE', 'ALTER', 'DROP', 'CREATE')):
-                self._query_cache.clear()
+            if sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'TRUNCATE', 'ALTER', 'DROP', 'CREATE')):
                 self._has_writes = True
             
             # Fast path: Arrow C Data Interface (zero-copy, no serialization)
@@ -1015,15 +990,59 @@ class ApexClient:
             
             rv = ResultView(arrow_table=table, data=None)
             rv._show_internal_id = show_internal_id
-            
-            # Cache the result for future identical read queries
-            if sql_upper.startswith('SELECT'):
-                if len(self._query_cache) > 200:
-                    self._query_cache.clear()
-                self._query_cache[sql] = rv
-            
             return rv
-    
+
+    def topk_distance(
+        self,
+        col: str,
+        query,
+        k: int = 10,
+        metric: str = 'l2',
+        id_col: str = '_id',
+        dist_col: str = 'dist',
+    ) -> 'ResultView':
+        """Heap-based TopK vector distance search: O(n log k), faster than ORDER BY + LIMIT.
+
+        Executes::
+
+            SELECT explode_rename(topk_distance(col, [q], k, 'metric'), "id_col", "dist_col")
+            FROM <current_table>
+
+        Returns k rows with two columns: ``id_col`` (the ``_id`` values of the nearest
+        rows) and ``dist_col`` (their distances), sorted ascending by distance.
+
+        The result can be used directly or joined back to the original table::
+
+            results = client.topk_distance('vec', query, k=10)
+            # results has columns: _id, dist
+
+        Args:
+            col: Name of the binary vector column to search.
+            query: Query vector — list, tuple, or numpy array of floats.
+            k: Number of nearest neighbours to return (default 10).
+            metric: Distance metric. Accepted values:
+                ``'l2'`` / ``'euclidean'``,
+                ``'l2_squared'``,
+                ``'l1'`` / ``'manhattan'``,
+                ``'linf'`` / ``'chebyshev'``,
+                ``'cosine'`` / ``'cosine_distance'``,
+                ``'dot'`` / ``'inner_product'``.
+            id_col: Name for the output ``_id`` column (default ``'_id'``).
+            dist_col: Name for the output distance column (default ``'dist'``).
+
+        Returns:
+            ResultView with ``id_col`` and ``dist_col`` columns, sorted nearest first.
+        """
+        self._check_connection()
+        self._ensure_table_selected()
+        q_str = ','.join(f'{float(v):.7g}' for v in (query.tolist() if hasattr(query, 'tolist') else query))
+        sql = (
+            f"SELECT explode_rename(topk_distance({col}, [{q_str}], {k}, '{metric}'), "
+            f"'{id_col}', '{dist_col}') "
+            f"FROM {self._current_table}"
+        )
+        return self.execute(sql)
+
     def _validate_table_in_sql(self, sql: str) -> None:
         """Validate that table names in SQL exist (skip for multi-statement SQL)"""
         # Skip validation for multi-statement SQL (contains CREATE TABLE/VIEW)
@@ -1041,8 +1060,8 @@ class ApexClient:
         
         table_name = m.group(1).lower()
 
-        # Skip validation for table functions: read_csv, read_json, read_parquet
-        if table_name in ('read_csv', 'read_json', 'read_parquet'):
+        # Skip validation for table functions: read_csv, read_json, read_parquet, topk_distance
+        if table_name in ('read_csv', 'read_json', 'read_parquet', 'topk_distance'):
             return
 
         # Skip validation for qualified db.table names (e.g. "default.users", "analytics.events")
