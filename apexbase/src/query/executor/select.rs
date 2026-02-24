@@ -13,7 +13,9 @@ impl ApexExecutor {
         }
 
         // FAST PATH: Pure COUNT(*) without WHERE/GROUP BY - O(1) from metadata
-        if Self::is_pure_count_star(&stmt) {
+        // Skip for TableFunction sources (read_csv/read_parquet/read_json) — no stored backend.
+        let from_is_table_fn = matches!(&stmt.from, Some(FromItem::TableFunction { .. }));
+        if !from_is_table_fn && Self::is_pure_count_star(&stmt) {
             if !storage_path.exists() {
                 let tbl = storage_path.file_stem().unwrap_or_default().to_string_lossy();
                 return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' does not exist", tbl)));
@@ -41,10 +43,16 @@ impl ApexExecutor {
                 Self::read_table_function(func, file, options)?
             }
             Some(FromItem::Subquery { stmt: sub_stmt, .. }) => {
-                // Resolve the actual table path from the subquery's FROM clause
-                let sub_path = Self::resolve_from_table_path(sub_stmt, base_dir, default_table_path);
-                let sub_result = Self::execute_select_with_base_dir(*sub_stmt.clone(), &sub_path, base_dir, default_table_path)?;
-                sub_result.to_record_batch()?
+                match sub_stmt.as_ref() {
+                    crate::query::SqlStatement::Select(sel) => {
+                        let sub_path = Self::resolve_from_table_path(sel, base_dir, default_table_path);
+                        Self::execute_select_with_base_dir(sel.clone(), &sub_path, base_dir, default_table_path)?.to_record_batch()?
+                    }
+                    crate::query::SqlStatement::Union(u) => {
+                        Self::execute_union(u.clone(), base_dir, default_table_path)?.to_record_batch()?
+                    }
+                    _ => return Err(err_input("Subquery must be SELECT or set operation")),
+                }
             }
             None => {
                 // No FROM clause (e.g., SELECT 1, 1) — create a single-row virtual batch
@@ -336,8 +344,8 @@ impl ApexExecutor {
             return Self::execute_aggregation(&filtered, &stmt);
         }
 
-        // Handle GROUP BY
-        if has_aggregation && !stmt.group_by.is_empty() {
+        // Handle GROUP BY (also triggered by HAVING even without SELECT aggregates)
+        if !stmt.group_by.is_empty() && (has_aggregation || stmt.having.is_some()) {
             return Self::execute_group_by(&filtered, &stmt);
         }
 

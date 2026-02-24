@@ -16,10 +16,16 @@ impl ApexExecutor {
                 left_backend.read_columns_to_arrow(None, 0, None)?
             }
             Some(FromItem::Subquery { stmt: sub_stmt, .. }) => {
-                // Execute subquery (VIEW) to get source data
-                let sub_path = Self::resolve_from_table_path(sub_stmt, base_dir, default_table_path);
-                let sub_result = Self::execute_select_with_base_dir(*sub_stmt.clone(), &sub_path, base_dir, default_table_path)?;
-                sub_result.to_record_batch()?
+                match sub_stmt.as_ref() {
+                    crate::query::SqlStatement::Select(sel) => {
+                        let sub_path = Self::resolve_from_table_path(sel, base_dir, default_table_path);
+                        Self::execute_select_with_base_dir(sel.clone(), &sub_path, base_dir, default_table_path)?.to_record_batch()?
+                    }
+                    crate::query::SqlStatement::Union(u) => {
+                        Self::execute_union(u.clone(), base_dir, default_table_path)?.to_record_batch()?
+                    }
+                    _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Subquery must be SELECT or set operation")),
+                }
             }
             Some(FromItem::TableFunction { func, file, options, .. }) => {
                 Self::read_table_function(func, file, options)?
@@ -39,10 +45,16 @@ impl ApexExecutor {
                     right_backend.read_columns_to_arrow(None, 0, None)?
                 }
                 FromItem::Subquery { stmt: sub_stmt, .. } => {
-                    // Execute subquery (VIEW) to get source data
-                    let sub_path = Self::resolve_from_table_path(sub_stmt, base_dir, default_table_path);
-                    let sub_result = Self::execute_select_with_base_dir(*sub_stmt.clone(), &sub_path, base_dir, default_table_path)?;
-                    sub_result.to_record_batch()?
+                    match sub_stmt.as_ref() {
+                        crate::query::SqlStatement::Select(sel) => {
+                            let sub_path = Self::resolve_from_table_path(sel, base_dir, default_table_path);
+                            Self::execute_select_with_base_dir(sel.clone(), &sub_path, base_dir, default_table_path)?.to_record_batch()?
+                        }
+                        crate::query::SqlStatement::Union(u) => {
+                            Self::execute_union(u.clone(), base_dir, default_table_path)?.to_record_batch()?
+                        }
+                        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Subquery must be SELECT or set operation")),
+                    }
                 }
                 FromItem::TableFunction { func, file, options, .. } => {
                     Self::read_table_function(func, file, options)?

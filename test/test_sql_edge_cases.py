@@ -64,6 +64,82 @@ class TestSetOperations:
         rv = xfail_sql(self.c, "SELECT val FROM a EXCEPT SELECT val FROM b ORDER BY val")
         assert [r['val'] for r in rv] == [1, 4]
 
+    def test_union_with_order_by_limit(self):
+        rv = xfail_sql(self.c, "SELECT val FROM a UNION SELECT val FROM b ORDER BY val LIMIT 3")
+        assert len(rv) == 3
+        vals = [r['val'] for r in rv]
+        assert vals == sorted(vals)
+
+    def test_union_with_order_by_offset(self):
+        rv = xfail_sql(self.c, "SELECT val FROM a UNION SELECT val FROM b ORDER BY val LIMIT 3 OFFSET 2")
+        assert len(rv) == 3
+        vals = [r['val'] for r in rv]
+        assert vals == sorted(vals)
+
+    def test_intersect_empty_result(self):
+        self.c.execute("CREATE TABLE c (val INT)")
+        self.c.execute("INSERT INTO c VALUES (99),(100)")
+        rv = xfail_sql(self.c, "SELECT val FROM a INTERSECT SELECT val FROM c ORDER BY val")
+        assert len(rv) == 0
+
+    def test_except_no_overlap_returns_all_left(self):
+        self.c.execute("CREATE TABLE d (val INT)")
+        self.c.execute("INSERT INTO d VALUES (99),(100)")
+        rv = xfail_sql(self.c, "SELECT val FROM a EXCEPT SELECT val FROM d ORDER BY val")
+        assert [r['val'] for r in rv] == [1, 2, 3, 4]
+
+    def test_union_all_count(self):
+        rv = xfail_sql(self.c, "SELECT COUNT(*) FROM (SELECT val FROM a UNION ALL SELECT val FROM b) t")
+        assert rv.scalar() == 8
+
+    def test_self_union_dedup(self):
+        rv = xfail_sql(self.c, "SELECT val FROM a UNION SELECT val FROM a ORDER BY val")
+        assert [r['val'] for r in rv] == [1, 2, 3, 4]
+
+    def test_self_union_all_doubles(self):
+        rv = xfail_sql(self.c, "SELECT val FROM a UNION ALL SELECT val FROM a ORDER BY val")
+        assert len(rv) == 8
+
+
+class TestSetOperationsMultiCol:
+    def setup_method(self):
+        self.d = tempfile.mkdtemp()
+        self.c = ApexClient(dirpath=self.d)
+        self.c.execute("CREATE TABLE x (id INT, name STRING)")
+        self.c.execute("INSERT INTO x (id, name) VALUES (1,'Alice'),(2,'Bob'),(3,'Carol')")
+        self.c.execute("CREATE TABLE y (id INT, name STRING)")
+        self.c.execute("INSERT INTO y (id, name) VALUES (2,'Bob'),(3,'Carol'),(4,'Dave')")
+
+    def teardown_method(self):
+        self.c.close()
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_union_multi_col_dedup(self):
+        rv = xfail_sql(self.c, "SELECT id, name FROM x UNION SELECT id, name FROM y ORDER BY id")
+        ids = [r['id'] for r in rv]
+        assert ids == [1, 2, 3, 4]
+        assert len(ids) == len(set(ids))
+
+    def test_union_all_multi_col_count(self):
+        rv = xfail_sql(self.c, "SELECT id, name FROM x UNION ALL SELECT id, name FROM y ORDER BY id")
+        assert len(rv) == 6
+
+    def test_intersect_multi_col(self):
+        rv = xfail_sql(self.c, "SELECT id, name FROM x INTERSECT SELECT id, name FROM y ORDER BY id")
+        ids = [r['id'] for r in rv]
+        assert ids == [2, 3]
+
+    def test_except_multi_col(self):
+        rv = xfail_sql(self.c, "SELECT id, name FROM x EXCEPT SELECT id, name FROM y ORDER BY id")
+        ids = [r['id'] for r in rv]
+        assert ids == [1]
+
+    def test_union_string_values_dedup(self):
+        rv = xfail_sql(self.c, "SELECT name FROM x UNION SELECT name FROM y ORDER BY name")
+        names = [r['name'] for r in rv]
+        assert names == ['Alice', 'Bob', 'Carol', 'Dave']
+        assert len(names) == len(set(names))
+
 
 # ============================================================
 # Subqueries

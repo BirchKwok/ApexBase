@@ -9,11 +9,13 @@ Comprehensive examples covering 100% of the ApexBase Python API.
 3. [SQL DDL Operations](#sql-ddl-operations)
 4. [Data Import](#data-import)
 5. [Querying Data](#querying-data)
-6. [Column Operations](#column-operations)
-7. [Full-Text Search](#full-text-search)
-8. [Data Modification](#data-modification)
-9. [Utility Methods](#utility-methods)
-10. [Advanced Usage](#advanced-usage)
+6. [File Reading Table Functions](#file-reading-table-functions)
+7. [Set Operations](#set-operations)
+8. [Column Operations](#column-operations)
+9. [Full-Text Search](#full-text-search)
+10. [Data Modification](#data-modification)
+11. [Utility Methods](#utility-methods)
+12. [Advanced Usage](#advanced-usage)
 
 ---
 
@@ -826,6 +828,236 @@ with ApexClient("./analytics", durability="safe") as client:
     
 # Client automatically closed
 ```
+
+---
+
+## File Reading Table Functions
+
+Read external files directly inside a SQL `FROM` clause — no data import or table creation needed. The full SQL engine (WHERE, GROUP BY, ORDER BY, LIMIT, JOIN, UNION) applies to the result.
+
+### read_csv
+
+```python
+from apexbase import ApexClient
+import tempfile, os
+
+client = ApexClient(tempfile.mkdtemp())
+
+# Minimal — auto-infers comma delimiter and header row
+df = client.execute("SELECT * FROM read_csv('/path/to/file.csv')").to_pandas()
+
+# Tab-separated values
+df = client.execute("SELECT * FROM read_csv('/path/to/file.tsv', delimiter='\t')").to_pandas()
+
+# No header row (columns named col0, col1, ...)
+df = client.execute("SELECT * FROM read_csv('/path/to/raw.csv', header=false)").to_pandas()
+
+# Filter and aggregate on the file
+result = client.execute("""
+    SELECT region, COUNT(*) AS orders, SUM(revenue) AS total_rev
+    FROM read_csv('/data/sales_2024.csv')
+    WHERE revenue > 0
+    GROUP BY region
+    ORDER BY total_rev DESC
+    LIMIT 20
+""")
+for row in result:
+    print(row)
+
+# Read into Arrow Table (zero-copy)
+table = client.execute("SELECT * FROM read_csv('/data/large.csv')").to_arrow()
+
+# Read into polars DataFrame
+import polars as pl
+df = client.execute("SELECT * FROM read_csv('/data/data.csv')").to_polars()
+```
+
+### read_parquet
+
+```python
+# Schema is taken from the Parquet file's own metadata
+df = client.execute("SELECT * FROM read_parquet('/data/events.parquet')").to_pandas()
+
+# Projection (only read needed columns)
+df = client.execute("""
+    SELECT user_id, event_type, ts
+    FROM read_parquet('/data/events.parquet')
+    WHERE event_type = 'purchase'
+""").to_pandas()
+
+# Aggregate directly
+result = client.execute("""
+    SELECT event_type, COUNT(*) AS cnt, AVG(amount) AS avg_amount
+    FROM read_parquet('/data/transactions.parquet')
+    GROUP BY event_type
+    ORDER BY cnt DESC
+""")
+
+# To Arrow — zero-copy from mmap
+import pyarrow as pa
+table = client.execute("SELECT * FROM read_parquet('/data/wide.parquet')").to_arrow()
+```
+
+### read_json
+
+```python
+# NDJSON (one JSON object per line — .json, .jsonl, .ndjson)
+df = client.execute("SELECT * FROM read_json('/data/logs.ndjson')").to_pandas()
+
+# pandas-exported JSON (df.to_json(orient='columns') or orient='split')
+df = client.execute("SELECT * FROM read_json('/data/export.json')").to_pandas()
+
+# Filter and aggregate
+result = client.execute("""
+    SELECT level, COUNT(*) AS cnt
+    FROM read_json('/data/app_logs.json')
+    WHERE level IN ('ERROR', 'WARN')
+    GROUP BY level
+    ORDER BY cnt DESC
+""")
+```
+
+### Combining file reads with tables and set operations
+
+```python
+client.create_table("users")
+client.store([{"id": 1, "email": "alice@example.com"}, {"id": 2, "email": "bob@example.com"}])
+
+# JOIN: enrich stored users with scores from a file
+result = client.execute("""
+    SELECT u.email, s.score
+    FROM users u
+    JOIN read_csv('/data/scores.csv') s ON u.id = s.user_id
+    WHERE s.score >= 80
+    ORDER BY s.score DESC
+""")
+
+# UNION ALL: merge stored table with new rows from a file
+result = client.execute("""
+    SELECT email FROM users
+    UNION ALL
+    SELECT email FROM read_csv('/data/new_signups.csv')
+""")
+
+# EXCEPT: remove unsubscribed addresses from the list
+result = client.execute("""
+    SELECT email FROM users
+    EXCEPT
+    SELECT email FROM read_csv('/data/unsubscribed.csv')
+""")
+```
+
+**read_csv options summary:**
+
+| Option | Default | Aliases | Description |
+|--------|---------|---------|-------------|
+| `header` | `true` | — | `false` or `0` to treat first row as data |
+| `delimiter` | `,` | `delim`, `sep` | Single-character field separator |
+
+---
+
+## Set Operations
+
+Set operations combine result sets from two `SELECT` statements. Both sides must produce the same number of columns.
+
+### UNION — deduplicated
+
+```python
+client.execute("CREATE TABLE a (val INT)")
+client.execute("INSERT INTO a VALUES (1),(2),(3),(4)")
+client.execute("CREATE TABLE b (val INT)")
+client.execute("INSERT INTO b VALUES (2),(3),(5),(6)")
+
+# UNION removes duplicates — result: [1, 2, 3, 4, 5, 6]
+result = client.execute("""
+    SELECT val FROM a
+    UNION
+    SELECT val FROM b
+    ORDER BY val
+""")
+assert [r['val'] for r in result] == [1, 2, 3, 4, 5, 6]
+```
+
+### UNION ALL — all rows including duplicates
+
+```python
+# UNION ALL keeps duplicates — result: 8 rows (2, 3 appear twice)
+result = client.execute("""
+    SELECT val FROM a
+    UNION ALL
+    SELECT val FROM b
+    ORDER BY val
+""")
+assert len(result) == 8
+```
+
+### INTERSECT — rows in both sides
+
+```python
+# INTERSECT returns rows present in both a and b — result: [2, 3]
+result = client.execute("""
+    SELECT val FROM a
+    INTERSECT
+    SELECT val FROM b
+    ORDER BY val
+""")
+assert [r['val'] for r in result] == [2, 3]
+```
+
+### EXCEPT — rows only in left side
+
+```python
+# EXCEPT returns rows in a that are NOT in b — result: [1, 4]
+result = client.execute("""
+    SELECT val FROM a
+    EXCEPT
+    SELECT val FROM b
+    ORDER BY val
+""")
+assert [r['val'] for r in result] == [1, 4]
+```
+
+### Practical examples
+
+```python
+# Find customers who both placed an order AND have a wishlist entry
+result = client.execute("""
+    SELECT user_id FROM orders
+    INTERSECT
+    SELECT user_id FROM wishlist
+""")
+
+# Find customers who ordered but have NO open support ticket
+result = client.execute("""
+    SELECT user_id FROM orders
+    EXCEPT
+    SELECT user_id FROM support_tickets WHERE status = 'open'
+""")
+
+# Combine users from two separate databases
+result = client.execute("""
+    SELECT name, email FROM default.users
+    UNION
+    SELECT name, email FROM analytics.trial_users
+    ORDER BY name
+""")
+
+# Set operations work with read_csv too
+result = client.execute("""
+    SELECT email FROM subscribers
+    EXCEPT
+    SELECT email FROM read_csv('/data/bounced_emails.csv')
+""")
+```
+
+### Quick reference
+
+| Operation | Duplicates | Returns |
+|-----------|-----------|------|
+| `UNION` | removed | rows in left **or** right |
+| `UNION ALL` | kept | all rows from both sides |
+| `INTERSECT` | removed | rows in left **and** right |
+| `EXCEPT` | removed | rows in left but **not** right |
 
 ---
 

@@ -112,7 +112,7 @@ pub enum FromItem {
         alias: Option<String>,
     },
     Subquery {
-        stmt: Box<SelectStatement>,
+        stmt: Box<SqlStatement>,
         alias: String,
     },
     TableFunction {
@@ -1987,16 +1987,39 @@ impl SqlParser {
                 Token::LParen => {
                     self.advance();
 
-                    // Derived table: FROM (SELECT ...) alias
-                    // For now, only allow a SELECT (no UNION) inside.
+                    // Derived table: FROM (SELECT ... [UNION/INTERSECT/EXCEPT SELECT ...]) alias
                     if !matches!(self.current(), Token::Select) {
                         let (start, _) = self.current_span();
                         return Err(self.syntax_error(start, "Expected SELECT after FROM (".to_string()));
                     }
-                    let sub = self.parse_select_internal(true)?;
+                    let sub = self.parse_select_part()?;
+                    let mut sub_sql = SqlStatement::Select(sub);
+                    // Allow set-operation chains inside the derived table
+                    while matches!(self.current(), Token::Union | Token::Intersect | Token::Except) {
+                        let set_op = match self.current() {
+                            Token::Union => SetOpType::Union,
+                            Token::Intersect => SetOpType::Intersect,
+                            Token::Except => SetOpType::Except,
+                            _ => unreachable!(),
+                        };
+                        self.advance();
+                        let all = if matches!(self.current(), Token::All) { self.advance(); true } else { false };
+                        if !matches!(self.current(), Token::Select) {
+                            let (start, _) = self.current_span();
+                            return Err(self.syntax_error(start, "Expected SELECT after set operation".to_string()));
+                        }
+                        let right = SqlStatement::Select(self.parse_select_part()?);
+                        sub_sql = SqlStatement::Union(UnionStatement {
+                            left: Box::new(sub_sql), right: Box::new(right), all, set_op,
+                            order_by: Vec::new(), limit: None, offset: None,
+                        });
+                    }
                     self.expect(Token::RParen)?;
 
-                    let alias = if let Token::Identifier(a) = self.current().clone() {
+                    let alias = if matches!(self.current(), Token::As) {
+                        self.advance();
+                        self.parse_identifier()?
+                    } else if let Token::Identifier(a) = self.current().clone() {
                         self.advance();
                         a
                     } else {
@@ -2006,7 +2029,7 @@ impl SqlParser {
                     };
 
                     Some(FromItem::Subquery {
-                        stmt: Box::new(sub),
+                        stmt: Box::new(sub_sql),
                         alias,
                     })
                 }
@@ -2063,25 +2086,60 @@ impl SqlParser {
             let right = match self.current().clone() {
                 Token::Identifier(table) => {
                     self.advance();
-                    // Check for qualified db.table syntax
-                    let table = if matches!(self.current(), Token::Dot) {
-                        self.advance();
-                        if let Token::Identifier(tbl) = self.current().clone() {
+                    let upper = table.to_uppercase();
+                    // Check for table function: read_csv(...), read_parquet(...), read_json(...)
+                    if matches!(upper.as_str(), "READ_CSV" | "READ_PARQUET" | "READ_JSON")
+                        && matches!(self.current(), Token::LParen)
+                    {
+                        self.advance(); // consume '('
+                        let file = match self.current().clone() {
+                            Token::StringLit(s) => { self.advance(); s }
+                            other => return Err(ApexError::QueryParseError(format!(
+                                "Expected file path string in {}(), got {:?}", table, other
+                            ))),
+                        };
+                        let mut options: Vec<(String, String)> = Vec::new();
+                        while matches!(self.current(), Token::Comma) {
                             self.advance();
-                            format!("{}.{}", table, tbl)
-                        } else {
-                            table
+                            let key = self.parse_identifier()?.to_lowercase();
+                            self.expect(Token::Eq)?;
+                            let val = match self.current().clone() {
+                                Token::StringLit(s) => { self.advance(); s }
+                                Token::Identifier(s) => { self.advance(); s }
+                                Token::IntLit(n) => { self.advance(); n.to_string() }
+                                Token::FloatLit(f) => { self.advance(); f.to_string() }
+                                Token::True => { self.advance(); "true".to_string() }
+                                Token::False => { self.advance(); "false".to_string() }
+                                other => return Err(ApexError::QueryParseError(format!(
+                                    "Expected option value, got {:?}", other
+                                ))),
+                            };
+                            options.push((key, val));
                         }
+                        self.expect(Token::RParen)?;
+                        let alias = if matches!(self.current(), Token::As) {
+                            self.advance();
+                            Some(self.parse_identifier()?)
+                        } else if let Token::Identifier(a) = self.current().clone() {
+                            if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) { None }
+                            else { self.advance(); Some(a) }
+                        } else { None };
+                        FromItem::TableFunction { func: upper, file, options, alias }
                     } else {
-                        table
-                    };
-                    let alias = if let Token::Identifier(a) = self.current().clone() {
-                        self.advance();
-                        Some(a)
-                    } else {
-                        None
-                    };
-                    FromItem::Table { table, alias }
+                        // Regular table — check for qualified db.table syntax
+                        let table = if matches!(self.current(), Token::Dot) {
+                            self.advance();
+                            if let Token::Identifier(tbl) = self.current().clone() {
+                                self.advance();
+                                format!("{}.{}", table, tbl)
+                            } else { table }
+                        } else { table };
+                        let alias = if let Token::Identifier(a) = self.current().clone() {
+                            self.advance();
+                            Some(a)
+                        } else { None };
+                        FromItem::Table { table, alias }
+                    }
                 }
                 _ => {
                     return Err(ApexError::QueryParseError("Expected table name after JOIN".to_string()));

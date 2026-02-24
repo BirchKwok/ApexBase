@@ -856,23 +856,177 @@ impl ApexExecutor {
                 trimmed.to_string()
             }
         }).collect();
-        
+
+        // If HAVING references aggregates that are not in the SELECT list (e.g.
+        // "SELECT city … HAVING COUNT(*) > 1"), inject them as extra SELECT columns
+        // so every GROUP-BY sub-path can materialise the value for filter evaluation.
+        // We strip the extra columns from the final result after HAVING is applied.
+        let select_col_count = stmt.columns.len();
+        let extra_agg_count;
+        let owned_stmt: SelectStatement;
+        let effective_stmt: &SelectStatement;
+        if let Some(having_expr) = &stmt.having {
+            let extras = Self::collect_having_extra_aggs(having_expr, &stmt.columns);
+            if !extras.is_empty() {
+                extra_agg_count = extras.len();
+                let mut s = stmt.clone();
+                for (func, col) in extras {
+                    use crate::query::AggregateFunc;
+                    let fn_name = match func {
+                        AggregateFunc::Count => "COUNT",
+                        AggregateFunc::Sum   => "SUM",
+                        AggregateFunc::Avg   => "AVG",
+                        AggregateFunc::Min   => "MIN",
+                        AggregateFunc::Max   => "MAX",
+                    };
+                    let alias = format!("{}({})", fn_name, col.as_deref().unwrap_or("*"));
+                    s.columns.push(crate::query::SelectColumn::Aggregate {
+                        func,
+                        column: col,
+                        distinct: false,
+                        alias: Some(alias),
+                    });
+                }
+                owned_stmt = s;
+                effective_stmt = &owned_stmt;
+            } else {
+                extra_agg_count = 0;
+                effective_stmt = stmt;
+                owned_stmt = stmt.clone(); // unused but required for lifetime
+            }
+        } else {
+            extra_agg_count = 0;
+            effective_stmt = stmt;
+            owned_stmt = stmt.clone(); // unused but required for lifetime
+        }
+
         // Check if we can use fast path: only simple aggregates (COUNT, SUM, AVG, MIN, MAX)
         // without DISTINCT, expressions, or HAVING that needs row access
-        let can_use_incremental = Self::can_use_incremental_aggregation(stmt);
+        let can_use_incremental = Self::can_use_incremental_aggregation(effective_stmt);
         
-        if can_use_incremental {
+        let mut result = if can_use_incremental {
             // Try vectorized execution for single-column GROUP BY
             if group_cols.len() == 1 {
-                if let Ok(result) = Self::execute_group_by_vectorized(&batch, stmt, &group_cols[0]) {
-                    return Ok(result);
+                if let Ok(r) = Self::execute_group_by_vectorized(&batch, effective_stmt, &group_cols[0]) {
+                    r
+                } else {
+                    Self::execute_group_by_incremental(&batch, effective_stmt, &group_cols)?
+                }
+            } else {
+                Self::execute_group_by_incremental(&batch, effective_stmt, &group_cols)?
+            }
+        } else {
+            // Fall back to full row-index based aggregation for complex cases
+            Self::execute_group_by_with_indices(&batch, effective_stmt, &group_cols)?
+        };
+
+        // Strip the extra HAVING-only aggregate columns we injected above
+        if extra_agg_count > 0 {
+            if let ApexResult::Data(ref rb) = result {
+                let keep = select_col_count.min(rb.num_columns());
+                let new_schema = Arc::new(Schema::new(
+                    rb.schema().fields()[..keep].iter().map(|f| f.as_ref().clone()).collect::<Vec<_>>(),
+                ));
+                let new_arrays: Vec<ArrayRef> = (0..keep).map(|i| rb.column(i).clone()).collect();
+                match RecordBatch::try_new(new_schema, new_arrays) {
+                    Ok(trimmed) => result = ApexResult::Data(trimmed),
+                    Err(e) => return Err(err_data(e.to_string())),
                 }
             }
-            return Self::execute_group_by_incremental(&batch, stmt, &group_cols);
         }
-        
-        // Fall back to full row-index based aggregation for complex cases
-        Self::execute_group_by_with_indices(&batch, stmt, &group_cols)
+
+        Ok(result)
+    }
+
+    /// Collect aggregate functions referenced in a HAVING expression that are NOT
+    /// already present in the SELECT column list.  Returns (AggregateFunc, column) pairs.
+    fn collect_having_extra_aggs(
+        expr: &crate::query::SqlExpr,
+        select_cols: &[crate::query::SelectColumn],
+    ) -> Vec<(crate::query::AggregateFunc, Option<String>)> {
+        use crate::query::{SqlExpr, AggregateFunc, SelectColumn};
+
+        // Build set of already-present aggregate output names (upper-cased)
+        let existing: Vec<String> = select_cols.iter().filter_map(|c| {
+            if let SelectColumn::Aggregate { func, column, alias, .. } = c {
+                let fn_name = match func {
+                    AggregateFunc::Count => "COUNT",
+                    AggregateFunc::Sum   => "SUM",
+                    AggregateFunc::Avg   => "AVG",
+                    AggregateFunc::Min   => "MIN",
+                    AggregateFunc::Max   => "MAX",
+                };
+                let name = alias.clone().unwrap_or_else(|| format!("{}({})", fn_name, column.as_deref().unwrap_or("*")));
+                Some(name.to_uppercase())
+            } else { None }
+        }).collect();
+
+        let mut found: Vec<(AggregateFunc, Option<String>)> = Vec::new();
+        Self::walk_having_expr(expr, &existing, &mut found);
+        found
+    }
+
+    fn walk_having_expr(
+        expr: &crate::query::SqlExpr,
+        existing: &[String],
+        out: &mut Vec<(crate::query::AggregateFunc, Option<String>)>,
+    ) {
+        use crate::query::{SqlExpr, AggregateFunc};
+        match expr {
+            SqlExpr::Function { name, args } => {
+                let upper = name.to_uppercase();
+                let agg_func = match upper.as_str() {
+                    "COUNT" => Some(AggregateFunc::Count),
+                    "SUM"   => Some(AggregateFunc::Sum),
+                    "AVG"   => Some(AggregateFunc::Avg),
+                    "MIN"   => Some(AggregateFunc::Min),
+                    "MAX"   => Some(AggregateFunc::Max),
+                    _       => None,
+                };
+                if let Some(func) = agg_func {
+                    // Determine column argument
+                    let col: Option<String> = args.first().and_then(|a| match a {
+                        SqlExpr::Column(c) if c == "*" => None,
+                        SqlExpr::Column(c) => Some(c.clone()),
+                        SqlExpr::Literal(crate::data::Value::String(s)) if s == "*" => None,
+                        _ => None,
+                    });
+                    let fn_name = match func {
+                        AggregateFunc::Count => "COUNT",
+                        AggregateFunc::Sum   => "SUM",
+                        AggregateFunc::Avg   => "AVG",
+                        AggregateFunc::Min   => "MIN",
+                        AggregateFunc::Max   => "MAX",
+                    };
+                    let key = format!("{}({})", fn_name, col.as_deref().unwrap_or("*")).to_uppercase();
+                    if !existing.iter().any(|e| *e == key)
+                        && !out.iter().any(|(f, c)| {
+                            let fn2 = match f { AggregateFunc::Count=>"COUNT", AggregateFunc::Sum=>"SUM", AggregateFunc::Avg=>"AVG", AggregateFunc::Min=>"MIN", AggregateFunc::Max=>"MAX" };
+                            format!("{}({})", fn2, c.as_deref().unwrap_or("*")).to_uppercase() == key
+                        })
+                    {
+                        out.push((func, col));
+                    }
+                } else {
+                    for arg in args { Self::walk_having_expr(arg, existing, out); }
+                }
+            }
+            SqlExpr::BinaryOp { left, right, .. } => {
+                Self::walk_having_expr(left, existing, out);
+                Self::walk_having_expr(right, existing, out);
+            }
+            SqlExpr::UnaryOp { expr, .. } | SqlExpr::Paren(expr) | SqlExpr::Cast { expr, .. } => {
+                Self::walk_having_expr(expr, existing, out);
+            }
+            SqlExpr::Case { when_then, else_expr } => {
+                for (c, t) in when_then {
+                    Self::walk_having_expr(c, existing, out);
+                    Self::walk_having_expr(t, existing, out);
+                }
+                if let Some(e) = else_expr { Self::walk_having_expr(e, existing, out); }
+            }
+            _ => {}
+        }
     }
     
     /// Materialize expression-based GROUP BY columns into the batch as virtual columns.

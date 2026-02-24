@@ -7,6 +7,8 @@ Complete API reference for ApexBase Python SDK.
 1. [ApexClient](#apexclient) - Main client class
 2. [ResultView](#resultview) - Query results
 3. [Constants](#constants) - Module constants
+4. [File Reading Table Functions](#file-reading-table-functions) - read_csv / read_parquet / read_json
+5. [Set Operations](#set-operations) - UNION / INTERSECT / EXCEPT
 
 ---
 
@@ -995,10 +997,249 @@ GROUP BY category
 HAVING COUNT(*) > 10
 ```
 
-### JOINs (if supported)
+### JOINs
 ```sql
 SELECT * FROM table1 JOIN table2 ON table1.id = table2.id
 ```
+
+---
+
+## File Reading Table Functions
+
+ApexBase provides SQL table functions that read external files directly in a `FROM` clause without importing data into a table first. All three functions return a result compatible with the full SQL engine — you can apply `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN`, and `UNION` on top of them.
+
+### read_csv
+
+```sql
+SELECT * FROM read_csv('path/to/file.csv')
+SELECT * FROM read_csv('path/to/file.csv', header=true, delimiter=',')
+```
+
+**Parameters:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `header` | `true` | Whether the first row is a header. Set to `false` / `0` if the file has no header row. |
+| `delimiter` / `delim` / `sep` | `,` | Field delimiter character. Use `'\t'` for TSV files. |
+
+**Schema inference**: types are inferred automatically from the first 100 data rows (Int64, Float64, Bool, or String).
+
+**Examples:**
+
+```python
+# Read a comma-delimited CSV with header row
+result = client.execute("SELECT * FROM read_csv('/data/sales.csv')")
+
+# Tab-separated values (TSV)
+result = client.execute("SELECT * FROM read_csv('/data/data.tsv', delimiter='\t')")
+
+# No header row
+result = client.execute("SELECT * FROM read_csv('/data/raw.csv', header=false)")
+
+# Full SQL on top of the file
+result = client.execute("""
+    SELECT city, COUNT(*) AS cnt, AVG(price)
+    FROM read_csv('/data/orders.csv')
+    WHERE price > 100
+    GROUP BY city
+    ORDER BY cnt DESC
+    LIMIT 10
+""")
+
+# Convert directly to DataFrame
+df = client.execute("SELECT * FROM read_csv('/data/large.csv')").to_pandas()
+```
+
+### read_parquet
+
+```sql
+SELECT * FROM read_parquet('path/to/file.parquet')
+```
+
+No options — schema is read directly from the Parquet file's metadata.
+
+**Examples:**
+
+```python
+# Read a Parquet file
+result = client.execute("SELECT * FROM read_parquet('/data/events.parquet')")
+
+# Projection and filter
+result = client.execute("""
+    SELECT user_id, SUM(amount) AS total
+    FROM read_parquet('/data/transactions.parquet')
+    WHERE category = 'food'
+    GROUP BY user_id
+""")
+
+# Zero-copy to Arrow
+table = client.execute("SELECT * FROM read_parquet('/data/wide.parquet')").to_arrow()
+```
+
+### read_json
+
+```sql
+SELECT * FROM read_json('path/to/file.json')
+```
+
+Handles two formats automatically:
+- **NDJSON / JSON Lines** — one JSON object per line (`.json`, `.jsonl`, `.ndjson`)
+- **pandas column-oriented JSON** — output of `df.to_json(orient='columns')` or `orient='split'`
+
+No options — format is detected automatically.
+
+**Examples:**
+
+```python
+# Read NDJSON (one JSON object per line)
+result = client.execute("SELECT * FROM read_json('/data/logs.ndjson')")
+
+# Read pandas-exported JSON
+result = client.execute("SELECT * FROM read_json('/data/export.json')")
+
+# Apply aggregation
+result = client.execute("""
+    SELECT status, COUNT(*) AS cnt
+    FROM read_json('/data/events.json')
+    GROUP BY status
+    ORDER BY cnt DESC
+""")
+```
+
+### Joining file reads with tables
+
+```python
+# JOIN a file read with a stored table
+result = client.execute("""
+    SELECT u.name, f.score
+    FROM users u
+    JOIN read_csv('/data/scores.csv') f ON u.id = f.user_id
+    WHERE f.score > 90
+""")
+
+# UNION a file with a table
+result = client.execute("""
+    SELECT name, city FROM users
+    UNION ALL
+    SELECT name, city FROM read_csv('/data/new_users.csv')
+""")
+```
+
+### Performance notes
+
+- All three functions use `mmap` for zero-copy file access.
+- CSV and JSON files are parsed in parallel (one chunk per CPU core via Rayon).
+- Parquet files use parallel column decoding with shared metadata (zero re-parse overhead).
+- Benchmarked against Polars on 1M rows: CSV 0.95×, NDJSON 0.93×, Parquet 1.33× (Arrow output).
+
+---
+
+## Set Operations
+
+SQL set operations combine result sets from two or more `SELECT` statements. Both sides must return the same number of columns.
+
+### UNION
+
+Combines rows from both sides and **removes duplicate rows**.
+
+```sql
+SELECT col FROM table_a
+UNION
+SELECT col FROM table_b
+```
+
+### UNION ALL
+
+Combines rows from both sides and **keeps all rows**, including duplicates.
+
+```sql
+SELECT col FROM table_a
+UNION ALL
+SELECT col FROM table_b
+```
+
+### INTERSECT
+
+Returns only rows that appear in **both** result sets (deduplicated).
+
+```sql
+SELECT col FROM table_a
+INTERSECT
+SELECT col FROM table_b
+```
+
+### EXCEPT
+
+Returns rows from the **left** side that do **not** appear in the right side (deduplicated).
+
+```sql
+SELECT col FROM table_a
+EXCEPT
+SELECT col FROM table_b
+```
+
+### Ordering and limiting set operation results
+
+Append `ORDER BY`, `LIMIT`, and `OFFSET` after the final set operation; they apply to the combined result:
+
+```sql
+SELECT val FROM a
+UNION
+SELECT val FROM b
+ORDER BY val ASC
+LIMIT 100
+```
+
+### Examples
+
+```python
+# UNION: unique names across two tables
+client.execute("""
+    SELECT name FROM customers
+    UNION
+    SELECT name FROM leads
+    ORDER BY name
+""")
+
+# UNION ALL: all rows from both tables (duplicates kept)
+client.execute("""
+    SELECT name, city FROM domestic_users
+    UNION ALL
+    SELECT name, city FROM international_users
+""")
+
+# INTERSECT: users who appear in both the orders and wishlist tables
+client.execute("""
+    SELECT user_id FROM orders
+    INTERSECT
+    SELECT user_id FROM wishlist
+""")
+
+# EXCEPT: users who placed orders but have no open support tickets
+client.execute("""
+    SELECT user_id FROM orders
+    EXCEPT
+    SELECT user_id FROM support_tickets WHERE status = 'open'
+""")
+
+# Works with read_csv too
+client.execute("""
+    SELECT email FROM users
+    EXCEPT
+    SELECT email FROM read_csv('/data/unsubscribed.csv')
+""")
+```
+
+### Set operation summary
+
+| Operation | Duplicates | Rows returned |
+|-----------|-----------|---------------|
+| `UNION` | removed | left ∪ right (unique) |
+| `UNION ALL` | kept | all rows from both sides |
+| `INTERSECT` | removed | left ∩ right |
+| `EXCEPT` | removed | left \ right |
+
+---
 
 ### INSERT
 ```sql

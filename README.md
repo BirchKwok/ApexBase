@@ -14,6 +14,7 @@ ApexBase is an embedded columnar database designed for **Hybrid Transactional/An
   - [Table Management](#table-management)
   - [Data Ingestion](#data-ingestion)
   - [SQL](#sql)
+  - [File Reading Table Functions](#file-reading-table-functions)
   - [Transactions](#transactions)
   - [Indexes](#indexes)
   - [Full-Text Search](#full-text-search)
@@ -52,7 +53,7 @@ ApexBase is an embedded columnar database designed for **Hybrid Transactional/An
 - **HTAP architecture** — V4 Row Group columnar storage with DeltaStore for cell-level updates; fast inserts and fast analytical scans in one engine
 - **Multi-database support** — multiple isolated databases in one directory; cross-database queries with standard `db.table` SQL syntax
 - **Single-file storage** — custom `.apex` format per table, no server process, no external dependencies
-- **Comprehensive SQL** — DDL, DML, JOINs (INNER/LEFT/RIGHT/FULL/CROSS), subqueries (IN/EXISTS/scalar), CTEs (WITH ... AS), UNION/UNION ALL, window functions, EXPLAIN/ANALYZE, multi-statement execution
+- **Comprehensive SQL** — DDL, DML, JOINs (INNER/LEFT/RIGHT/FULL/CROSS), subqueries (IN/EXISTS/scalar), CTEs (WITH ... AS), UNION/UNION ALL/INTERSECT/EXCEPT, window functions, EXPLAIN/ANALYZE, multi-statement execution
 - **70+ built-in functions** — math (ABS, SQRT, POWER, LOG, trig), string (UPPER, LOWER, SUBSTR, REPLACE, CONCAT, REGEXP_REPLACE, ...), date (YEAR, MONTH, DAY, DATEDIFF, DATE_ADD, ...), conditional (COALESCE, IFNULL, NULLIF, CASE WHEN, GREATEST, LEAST)
 - **Aggregation and analytics** — COUNT, SUM, AVG, MIN, MAX, COUNT(DISTINCT), GROUP BY, HAVING, ORDER BY with NULLS FIRST/LAST
 - **Window functions** — ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, RUNNING_SUM, and windowed SUM/AVG/COUNT/MIN/MAX with PARTITION BY and ORDER BY
@@ -64,6 +65,7 @@ ApexBase is an embedded columnar database designed for **Hybrid Transactional/An
 - **Zero-copy Python bridge** — Arrow IPC between Rust and Python; direct conversion to Pandas, Polars, and PyArrow
 - **Durability levels** — configurable `fast` / `safe` / `max` with WAL support and crash recovery
 - **Compact storage** — dictionary encoding for low-cardinality strings, LZ4 and Zstd compression
+- **File reading table functions** — `read_csv()`, `read_parquet()`, `read_json()` directly in SQL `FROM` clauses; parallel mmap parsing; full SQL (WHERE / GROUP BY / JOIN / UNION) on top of any file
 - **Parquet interop** — COPY TO / COPY FROM Parquet files
 - **PostgreSQL wire protocol** — built-in server for DBeaver, psql, DataGrip, pgAdmin, Navicat, and any PostgreSQL-compatible client; two distribution modes (Python CLI or standalone Rust binary)
 - **Arrow Flight gRPC server** — high-performance columnar data transfer over HTTP/2; streams Arrow IPC RecordBatch directly, 4–7× faster than PG wire for large result sets; accessible via `pyarrow.flight`, Go arrow, Java arrow, and any Arrow Flight client
@@ -233,11 +235,21 @@ client.execute("""
     FROM users
 """)
 
-# UNION
+# Set operations
 client.execute("""
     SELECT name FROM users WHERE city = 'Beijing'
     UNION ALL
     SELECT name FROM users WHERE city = 'Shanghai'
+""")
+client.execute("""
+    SELECT user_id FROM orders
+    INTERSECT
+    SELECT user_id FROM wishlist
+""")
+client.execute("""
+    SELECT user_id FROM orders
+    EXCEPT
+    SELECT user_id FROM support_tickets WHERE status = 'open'
 """)
 
 # Multi-statement
@@ -263,6 +275,60 @@ client.execute("EXPLAIN SELECT * FROM users WHERE age > 25")
 client.execute("COPY users TO '/tmp/users.parquet'")
 client.execute("COPY users FROM '/tmp/users.parquet'")
 ```
+
+### File Reading Table Functions
+
+Read external files directly in a SQL `FROM` clause — no import step required. The full SQL engine runs on top: `WHERE`, `GROUP BY`, `ORDER BY`, `JOIN`, `UNION`, etc.
+
+```python
+# CSV: schema inferred automatically, parallel mmap parser
+df = client.execute("SELECT * FROM read_csv('/data/sales.csv')").to_pandas()
+
+# TSV — specify delimiter
+df = client.execute("SELECT * FROM read_csv('/data/data.tsv', delimiter='\t')").to_pandas()
+
+# No header row
+df = client.execute("SELECT * FROM read_csv('/data/raw.csv', header=false)").to_pandas()
+
+# Parquet: schema from file metadata, parallel column decode
+table = client.execute("SELECT * FROM read_parquet('/data/events.parquet')").to_arrow()
+
+# JSON / NDJSON: auto-detects format (NDJSON or pandas column-oriented)
+df = client.execute("SELECT * FROM read_json('/data/logs.ndjson')").to_pandas()
+
+# Full SQL on top of a file
+result = client.execute("""
+    SELECT city, COUNT(*) AS cnt, AVG(price)
+    FROM read_csv('/data/orders.csv')
+    WHERE price > 100
+    GROUP BY city
+    ORDER BY cnt DESC
+    LIMIT 10
+""")
+
+# JOIN a file with a stored table
+result = client.execute("""
+    SELECT u.name, f.score
+    FROM users u
+    JOIN read_csv('/data/scores.csv') f ON u.id = f.user_id
+    WHERE f.score > 90
+""")
+
+# EXCEPT using a file as a blocklist
+result = client.execute("""
+    SELECT email FROM users
+    EXCEPT
+    SELECT email FROM read_csv('/data/unsubscribed.csv')
+""")
+```
+
+| Function | Options | Description |
+|----------|---------|-------------|
+| `read_csv(path)` | `header=true`, `delimiter=','` | Read CSV/TSV; auto-infers schema |
+| `read_parquet(path)` | — | Read Parquet; schema from file metadata |
+| `read_json(path)` | — | Read NDJSON or pandas JSON; auto-detects format |
+
+See [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md#file-reading-table-functions) for full details.
 
 ### Transactions
 

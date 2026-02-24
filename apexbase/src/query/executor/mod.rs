@@ -1139,7 +1139,7 @@ impl ApexExecutor {
                     if let Some(view_stmt) = views.get(table_name) {
                         let alias_name = alias.clone().unwrap_or_else(|| table_name.to_string());
                         select.from = Some(FromItem::Subquery {
-                            stmt: Box::new(view_stmt.clone()),
+                            stmt: Box::new(SqlStatement::Select(view_stmt.clone())),
                             alias: alias_name,
                         });
                     }
@@ -1156,7 +1156,7 @@ impl ApexExecutor {
                 if let Some(view_stmt) = views.get(table_name) {
                     let alias_name = alias.clone().unwrap_or_else(|| table_name.to_string());
                     join.right = FromItem::Subquery {
-                        stmt: Box::new(view_stmt.clone()),
+                        stmt: Box::new(SqlStatement::Select(view_stmt.clone())),
                         alias: alias_name,
                     };
                 }
