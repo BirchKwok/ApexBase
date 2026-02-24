@@ -37,6 +37,9 @@ impl ApexExecutor {
         
         // Check for derived table (FROM subquery) - resolve table path from subquery's FROM clause
         let batch = match &stmt.from {
+            Some(FromItem::TableFunction { func, file, options, .. }) => {
+                Self::read_table_function(func, file, options)?
+            }
             Some(FromItem::Subquery { stmt: sub_stmt, .. }) => {
                 // Resolve the actual table path from the subquery's FROM clause
                 let sub_path = Self::resolve_from_table_path(sub_stmt, base_dir, default_table_path);
@@ -1611,7 +1614,22 @@ impl ApexExecutor {
         storage_path: &Path,
     ) -> io::Result<RecordBatch> {
         use arrow::compute;
-        
+
+        let where_clause = stmt.where_clause.as_ref().unwrap();
+        let need_count = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+
+        // FAST PATH: no LIMIT → full sequential read + vectorized Arrow filter
+        // This beats chunked reads + random index access (400K random seeks > 1 sequential scan).
+        if need_count.is_none() {
+            let full_batch = backend.read_columns_to_arrow(None, 0, None)?;
+            if full_batch.num_rows() > 0 {
+                let mask = Self::evaluate_predicate_with_storage(&full_batch, where_clause, storage_path)?;
+                return compute::filter_record_batch(&full_batch, &mask)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+            }
+            return Ok(full_batch);
+        }
+
         // Step 1: Read only columns needed for WHERE clause
         let where_cols = stmt.where_columns();
         let where_col_refs: Vec<&str> = where_cols.iter().map(|s| s.as_str()).collect();
@@ -1619,9 +1637,6 @@ impl ApexExecutor {
         // Also include _id for later row identification
         let mut cols_to_read: Vec<&str> = vec!["_id"];
         cols_to_read.extend(where_col_refs.iter());
-        
-        let where_clause = stmt.where_clause.as_ref().unwrap();
-        let need_count = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
         
         // OPTIMIZATION: Streaming filter evaluation with early termination
         // Read data in chunks and stop once we have enough matches

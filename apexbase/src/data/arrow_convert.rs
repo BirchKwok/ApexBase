@@ -1,7 +1,4 @@
 //! Arrow format conversion for zero-copy data transfer
-//! 
-//! Optimized with ForkUnion for lower-latency parallelism than Rayon.
-//! See: https://github.com/ashvardanian/ForkUnion
 
 use super::{Row, Value};
 use crate::table::column_table::{BitVec, TypedColumn};
@@ -14,26 +11,9 @@ use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use fork_union::ThreadPool;
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::{Arc, OnceLock};
-
-// Global thread pool for maximum efficiency (avoid repeated initialization)
-// Using OnceLock for thread-safe lazy initialization
-static THREAD_POOL: OnceLock<parking_lot::Mutex<ThreadPool>> = OnceLock::new();
-
-fn get_thread_pool() -> &'static parking_lot::Mutex<ThreadPool> {
-    THREAD_POOL.get_or_init(|| {
-        // Use all available logical cores
-        let cores = fork_union::count_logical_cores();
-        let pool = ThreadPool::try_spawn(cores).unwrap_or_else(|_| {
-            // Fallback to 4 threads if auto-detection fails
-            ThreadPool::try_spawn(4).expect("Failed to create thread pool")
-        });
-        parking_lot::Mutex::new(pool)
-    })
-}
+use std::sync::Arc;
 
 // SAFETY: These wrapper types allow raw pointers to be sent across threads
 // The caller must ensure the pointers remain valid for the duration of parallel execution
@@ -422,49 +402,15 @@ fn build_int64_array_optimized(
         
         Arc::new(Int64Array::new(ScalarBuffer::from(values), Some(null_buffer)))
     } else {
-        // GATHER PATH: Parallel using ForkUnion for large datasets
-        let mut values = vec![0i64; num_rows];
+        // GATHER PATH
         let data_len = data.len();
-        
-        // Use ForkUnion parallel processing for very large datasets (>100K rows)
-        if num_rows >= 100000 {
-            // Wrap pointers in Send+Sync wrappers for thread safety (use usize to avoid Sync issues)
-            let values_ptr = SendPtr::new(values.as_mut_ptr());
-            let data_ptr = SendConstPtr::new(data.as_ptr());
-            let indices_ptr = SendConstPtr::new(row_indices.as_ptr());
-            
-            // SAFETY: Each thread writes to unique indices, no data races
-            // Pointers remain valid for the duration of parallel execution
-            {
-                let mut pool = get_thread_pool().lock();
-                let _ = pool.for_n(num_rows, move |prong| {
-                    let i = prong.task_index;
-                    unsafe {
-                        let idx = indices_ptr.read(i);
-                        let val = if idx < data_len { data_ptr.read(idx) } else { 0 };
-                        values_ptr.write(i, val);
-                    }
-                });
-                // ForNOperation executes when dropped here
-            }
-        } else {
-            // Sequential for smaller datasets - avoid parallel overhead
-            unsafe {
-                let data_ptr = data.as_ptr();
-                let values_ptr = values.as_mut_ptr();
-                
-                for (i, &idx) in row_indices.iter().enumerate() {
-                    *values_ptr.add(i) = if idx < data_len { *data_ptr.add(idx) } else { 0 };
-                }
-            }
-        }
-        
-        // Build null buffer sequentially (BitVec not thread-safe)
+        let values: Vec<i64> = row_indices.iter()
+            .map(|&idx| if idx < data_len { data[idx] } else { 0 })
+            .collect();
         let null_bits: Vec<bool> = row_indices.iter()
             .map(|&idx| !nulls.get(idx))
             .collect();
         let null_buffer = NullBuffer::from(null_bits);
-        
         Arc::new(Int64Array::new(ScalarBuffer::from(values), Some(null_buffer)))
     }
 }
@@ -501,43 +447,15 @@ fn build_float64_array_optimized(
         
         Arc::new(Float64Array::new(ScalarBuffer::from(values), Some(null_buffer)))
     } else {
-        // GATHER PATH: Parallel using ForkUnion for large datasets
-        let mut values = vec![0.0f64; num_rows];
+        // GATHER PATH
         let data_len = data.len();
-        
-        if num_rows >= 100000 {
-            let values_ptr = SendPtr::new(values.as_mut_ptr());
-            let data_ptr = SendConstPtr::new(data.as_ptr());
-            let indices_ptr = SendConstPtr::new(row_indices.as_ptr());
-            
-            {
-                let mut pool = get_thread_pool().lock();
-                let _ = pool.for_n(num_rows, move |prong| {
-                    let i = prong.task_index;
-                    unsafe {
-                        let idx = indices_ptr.read(i);
-                        let val = if idx < data_len { data_ptr.read(idx) } else { 0.0 };
-                        values_ptr.write(i, val);
-                    }
-                });
-            }
-        } else {
-            unsafe {
-                let data_ptr = data.as_ptr();
-                let values_ptr = values.as_mut_ptr();
-                
-                for (i, &idx) in row_indices.iter().enumerate() {
-                    *values_ptr.add(i) = if idx < data_len { *data_ptr.add(idx) } else { 0.0 };
-                }
-            }
-        }
-        
-        // Build null buffer sequentially (BitVec not thread-safe)
+        let values: Vec<f64> = row_indices.iter()
+            .map(|&idx| if idx < data_len { data[idx] } else { 0.0 })
+            .collect();
         let null_bits: Vec<bool> = row_indices.iter()
             .map(|&idx| !nulls.get(idx))
             .collect();
         let null_buffer = NullBuffer::from(null_bits);
-        
         Arc::new(Float64Array::new(ScalarBuffer::from(values), Some(null_buffer)))
     }
 }

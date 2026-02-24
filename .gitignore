@@ -65,3 +65,7 @@ Cargo.lock
 AGENTS.md
 
 .claude/
+
+*.csv
+*.json
+*.parquet

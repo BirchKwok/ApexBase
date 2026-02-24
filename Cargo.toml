@@ -28,14 +28,14 @@ memmap2 = "0.9"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 bincode = "1.3"
 
 # Arrow for zero-copy data transfer
-arrow = { version = "57", default-features = false, features = ["ipc", "ffi"] }
+arrow = { version = "57", default-features = false, features = ["ipc", "ffi", "csv", "json"] }
 
 # Parquet for import/export
-parquet = { version = "57", default-features = false, features = ["arrow"] }
+parquet = { version = "57", default-features = false, features = ["arrow", "snap"] }
 
 # Error handling
 thiserror = "1.0"
@@ -43,13 +43,7 @@ anyhow = "1.0"
 
 # Concurrency  
 parking_lot = "0.12"
-crossbeam-channel = "0.5"
 rayon = "1.10"
-fork_union = "2.3"  # Low-latency Fork-Join parallelism (faster than rayon)
-
-# String optimization
-compact_str = { version = "0.8", features = ["serde"] }  # SSO for short strings
-string-interner = "0.18"  # String interning for repeated strings
 
 # Checksums
 crc32fast = "1.4"
@@ -78,6 +72,9 @@ memchr = "2.7"
 
 # Fast non-cryptographic hashing
 ahash = "0.8"
+
+# Fast float parsing for custom CSV parser
+fast-float = "0.2"
 
 # Bloom filter for fast membership testing
 bloomfilter = "1.0"

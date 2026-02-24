@@ -1132,6 +1132,11 @@ impl ApexExecutor {
                     }
                 }
             }
+            SqlExpr::Variable(name) => {
+                use crate::query::executor::get_session_variable;
+                let value = get_session_variable(name).unwrap_or(crate::data::Value::Null);
+                Self::value_to_array(&value, batch.num_rows())
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported expression type: {:?}", expr),
@@ -1817,6 +1822,26 @@ impl ApexExecutor {
         }
         
         match upper.as_str() {
+            "GETVARIABLE" => {
+                if args.len() != 1 {
+                    return Err(err_input("GETVARIABLE requires exactly one argument"));
+                }
+                let var_name = match &args[0] {
+                    SqlExpr::Literal(crate::data::Value::String(s)) => s.clone(),
+                    SqlExpr::Column(s) => s.clone(),
+                    other => {
+                        let arr = Self::evaluate_expr_to_array(batch, other)?;
+                        if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
+                            s.value(0).to_string()
+                        } else {
+                            return Err(err_input("GETVARIABLE argument must be a string"));
+                        }
+                    }
+                };
+                use crate::query::executor::get_session_variable;
+                let value = get_session_variable(&var_name).unwrap_or(crate::data::Value::Null);
+                return Self::value_to_array(&value, batch.num_rows());
+            }
             "COALESCE" => {
                 if args.is_empty() {
                     return Err(err_input( "COALESCE requires at least one argument"));

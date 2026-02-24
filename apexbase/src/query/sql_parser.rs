@@ -78,6 +78,9 @@ pub enum SqlStatement {
     AnalyzeTable { table: String },
     CopyToParquet { table: String, file_path: String },
     CopyFromParquet { table: String, file_path: String },
+    CopyImport { table: String, file_path: String, format: String, options: Vec<(String, String)> },
+    SetVariable { name: String, value: Value },
+    ResetVariable { name: String },
     Reindex { table: String },
     Pragma { name: String, arg: Option<String> },
     // FTS DDL Statements
@@ -111,6 +114,12 @@ pub enum FromItem {
     Subquery {
         stmt: Box<SelectStatement>,
         alias: String,
+    },
+    TableFunction {
+        func: String,
+        file: String,
+        options: Vec<(String, String)>,
+        alias: Option<String>,
     },
 }
 
@@ -236,6 +245,8 @@ pub enum SqlExpr {
     FtsMatch { query: String, fuzzy: bool },
     /// Function call
     Function { name: String, args: Vec<SqlExpr> },
+    /// Session variable reference: $varname
+    Variable(String),
     /// CAST(expr AS TYPE)
     Cast { expr: Box<SqlExpr>, data_type: DataType },
     /// Parenthesized expression
@@ -554,6 +565,8 @@ enum Token {
     Index, Unique, Using,
     // DML keywords
     Insert, Into, Values, Delete, Update, Set,
+    // Variable keywords (token for $name)
+    Variable(String),
     // Transaction keywords
     Begin, Commit, Rollback, Transaction, Read,
     // CTE / EXPLAIN keywords
@@ -900,6 +913,19 @@ impl SqlParser {
                     _ => Token::Identifier(word),
                 };
                 tokens.push(SpannedToken { token, start, end: i });
+                continue;
+            }
+
+            // $variable_name — session variable reference
+            if c == '$' && i + 1 < len && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_') {
+                let start = i;
+                i += 1; // skip '$'
+                let var_start = i;
+                while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let name: String = chars[var_start..i].iter().collect();
+                tokens.push(SpannedToken { token: Token::Variable(name), start, end: i });
                 continue;
             }
 
@@ -1614,6 +1640,19 @@ impl SqlParser {
                 };
                 Ok(SqlStatement::Update { table, assignments, where_clause })
             }
+            Token::Set => {
+                // SET VARIABLE name = value
+                self.advance();
+                let kw = self.parse_identifier()?;
+                if kw.to_uppercase() != "VARIABLE" {
+                    let (start, _) = self.current_span();
+                    return Err(self.syntax_error(start, "Expected VARIABLE after SET".to_string()));
+                }
+                let name = self.parse_identifier()?;
+                self.expect(Token::Eq)?;
+                let value = self.parse_literal_value()?;
+                Ok(SqlStatement::SetVariable { name, value })
+            }
             Token::Begin => {
                 // BEGIN [TRANSACTION] [READ ONLY]
                 self.advance();
@@ -1675,13 +1714,16 @@ impl SqlParser {
                         "COPY" => {
                             self.advance();
                             let table = self.parse_identifier()?;
-                            // Expect TO or FROM
-                            let direction = if let Token::Identifier(ref kw) = self.current().clone() {
-                                let u = kw.to_uppercase();
-                                self.advance();
-                                u
-                            } else {
-                                return Err(ApexError::QueryParseError("Expected TO or FROM after COPY table".to_string()));
+                            // Expect TO or FROM (may be keywords or identifiers)
+                            let direction = match self.current().clone() {
+                                Token::From => { self.advance(); "FROM".to_string() }
+                                Token::To => { self.advance(); "TO".to_string() }
+                                Token::Identifier(ref kw) => {
+                                    let u = kw.to_uppercase();
+                                    self.advance();
+                                    u
+                                }
+                                _ => return Err(ApexError::QueryParseError("Expected TO or FROM after COPY table".to_string())),
                             };
                             // file path as string literal
                             let file_path = if let Token::StringLit(ref s) = self.current().clone() {
@@ -1691,11 +1733,52 @@ impl SqlParser {
                             } else {
                                 return Err(ApexError::QueryParseError("Expected file path string after COPY table TO/FROM".to_string()));
                             };
-                            // Optional FORMAT PARQUET or just PARQUET keyword
-                            // We accept: COPY t TO 'f.parquet'  or  COPY t TO 'f' FORMAT PARQUET
                             match direction.as_str() {
                                 "TO" => return Ok(SqlStatement::CopyToParquet { table, file_path }),
-                                "FROM" => return Ok(SqlStatement::CopyFromParquet { table, file_path }),
+                                "FROM" => {
+                                    // Parse optional (FORMAT CSV, HEADER true, DELIMITER ',', ...) options
+                                    let mut format: Option<String> = None;
+                                    let mut options: Vec<(String, String)> = Vec::new();
+                                    if matches!(self.current(), Token::LParen) {
+                                        self.advance();
+                                        loop {
+                                            let key = self.parse_identifier()?.to_uppercase();
+                                            if key == "FORMAT" {
+                                                let fmt_val = self.parse_identifier()?.to_uppercase();
+                                                format = Some(fmt_val);
+                                            } else {
+                                                let val = match self.current().clone() {
+                                                    Token::StringLit(s) => { self.advance(); s }
+                                                    Token::Identifier(s) => { self.advance(); s }
+                                                    Token::True => { self.advance(); "true".to_string() }
+                                                    Token::False => { self.advance(); "false".to_string() }
+                                                    Token::IntLit(n) => { self.advance(); n.to_string() }
+                                                    _ => "true".to_string(),
+                                                };
+                                                options.push((key.to_lowercase(), val));
+                                            }
+                                            if !matches!(self.current(), Token::Comma) { break; }
+                                            self.advance();
+                                        }
+                                        self.expect(Token::RParen)?;
+                                    }
+                                    // Auto-detect format from file extension if not explicit
+                                    if format.is_none() {
+                                        let lower = file_path.to_lowercase();
+                                        if lower.ends_with(".csv") || lower.ends_with(".tsv") {
+                                            format = Some("CSV".to_string());
+                                        } else if lower.ends_with(".json") || lower.ends_with(".ndjson") || lower.ends_with(".jsonl") {
+                                            format = Some("JSON".to_string());
+                                        } else {
+                                            format = Some("PARQUET".to_string());
+                                        }
+                                    }
+                                    let fmt = format.unwrap();
+                                    if fmt == "PARQUET" && options.is_empty() {
+                                        return Ok(SqlStatement::CopyFromParquet { table, file_path });
+                                    }
+                                    return Ok(SqlStatement::CopyImport { table, file_path, format: fmt, options });
+                                }
                                 _ => return Err(ApexError::QueryParseError("Expected TO or FROM in COPY statement".to_string())),
                             }
                         }
@@ -1707,6 +1790,16 @@ impl SqlParser {
                             }
                             let name = self.parse_identifier()?;
                             return Ok(SqlStatement::ReleaseSavepoint { name });
+                        }
+                        "RESET" => {
+                            self.advance();
+                            let kw = self.parse_identifier()?;
+                            if kw.to_uppercase() != "VARIABLE" {
+                                let (start, _) = self.current_span();
+                                return Err(self.syntax_error(start, "Expected VARIABLE after RESET".to_string()));
+                            }
+                            let name = self.parse_identifier()?;
+                            return Ok(SqlStatement::ResetVariable { name });
                         }
                         "SHOW" => {
                             self.advance();
@@ -1818,33 +1911,78 @@ impl SqlParser {
             match self.current().clone() {
                 Token::Identifier(table) => {
                     self.advance();
-                    // Check for qualified db.table syntax
-                    let table = if matches!(self.current(), Token::Dot) {
-                        self.advance(); // consume '.'
-                        if let Token::Identifier(tbl) = self.current().clone() {
+                    let upper = table.to_uppercase();
+                    // Check for table function: read_csv(...), read_parquet(...), read_json(...)
+                    if matches!(upper.as_str(), "READ_CSV" | "READ_PARQUET" | "READ_JSON")
+                        && matches!(self.current(), Token::LParen)
+                    {
+                        self.advance(); // consume '('
+                        let file = match self.current().clone() {
+                            Token::StringLit(s) => { self.advance(); s }
+                            other => return Err(ApexError::QueryParseError(format!(
+                                "Expected file path string in {}(), got {:?}", table, other
+                            ))),
+                        };
+                        let mut options: Vec<(String, String)> = Vec::new();
+                        while matches!(self.current(), Token::Comma) {
                             self.advance();
-                            format!("{}.{}", table, tbl)
+                            let key = self.parse_identifier()?.to_lowercase();
+                            self.expect(Token::Eq)?;
+                            let val = match self.current().clone() {
+                                Token::StringLit(s) => { self.advance(); s }
+                                Token::Identifier(s) => { self.advance(); s }
+                                Token::IntLit(n) => { self.advance(); n.to_string() }
+                                Token::FloatLit(f) => { self.advance(); f.to_string() }
+                                Token::True => { self.advance(); "true".to_string() }
+                                Token::False => { self.advance(); "false".to_string() }
+                                other => return Err(ApexError::QueryParseError(format!(
+                                    "Expected option value, got {:?}", other
+                                ))),
+                            };
+                            options.push((key, val));
+                        }
+                        self.expect(Token::RParen)?;
+                        let alias = if matches!(self.current(), Token::As) {
+                            self.advance();
+                            Some(self.parse_identifier()?)
+                        } else if let Token::Identifier(a) = self.current().clone() {
+                            if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) {
+                                None
+                            } else {
+                                self.advance();
+                                Some(a)
+                            }
+                        } else {
+                            None
+                        };
+                        Some(FromItem::TableFunction { func: upper, file, options, alias })
+                    } else {
+                        // Check for qualified db.table syntax
+                        let table = if matches!(self.current(), Token::Dot) {
+                            self.advance(); // consume '.'
+                            if let Token::Identifier(tbl) = self.current().clone() {
+                                self.advance();
+                                format!("{}.{}", table, tbl)
+                            } else {
+                                table
+                            }
                         } else {
                             table
-                        }
-                    } else {
-                        table
-                    };
-                    // Only consume an identifier as alias if it doesn't look like
-                    // a misspelled keyword (e.g., "joinn" should NOT be an alias).
-                    // Only apply this heuristic for identifiers >= 4 chars with
-                    // edit distance <= 1, to avoid rejecting short aliases like "u", "t1".
-                    let alias = if let Token::Identifier(a) = self.current().clone() {
-                        if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) {
-                            None
+                        };
+                        // Only consume an identifier as alias if it doesn't look like
+                        // a misspelled keyword (e.g., "joinn" should NOT be an alias).
+                        let alias = if let Token::Identifier(a) = self.current().clone() {
+                            if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) {
+                                None
+                            } else {
+                                self.advance();
+                                Some(a)
+                            }
                         } else {
-                            self.advance();
-                            Some(a)
-                        }
-                    } else {
-                        None
-                    };
-                    Some(FromItem::Table { table, alias })
+                            None
+                        };
+                        Some(FromItem::Table { table, alias })
+                    }
                 }
                 Token::LParen => {
                     self.advance();
@@ -3064,7 +3202,11 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
 
                 Ok(SqlExpr::Column(full))
             }
-
+            Token::Variable(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(SqlExpr::Variable(name))
+            }
             Token::Count => {
                 self.advance();
                 self.parse_function_call_from_name("count".to_string())

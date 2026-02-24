@@ -438,6 +438,9 @@ impl ApexStorageImpl {
             }
         }
 
+        // Pre-warm rayon global thread pool so first parallel CSV/parquet read has no thread-startup delay
+        rayon::spawn(|| {});
+
         // No default table - users must explicitly create or use a table
         // Existing .apex files in the directory are discovered lazily via use_table() or list_tables()
 
@@ -1440,8 +1443,10 @@ impl ApexStorageImpl {
         use arrow::array::{StructArray, Array};
         
         let sql = sql.to_string();
-        let table_path = self.get_current_table_path()?;
         let base_dir = self.current_base_dir();
+        // Fall back to base_dir when no table selected (e.g. SELECT * FROM read_csv(...)).
+        // Table-function queries don't use the default_table_path at all.
+        let table_path = self.get_current_table_path().unwrap_or_else(|_| base_dir.clone());
         crate::query::executor::set_query_root_dir(&self.root_dir);
 
         // Execute query in Rust thread pool

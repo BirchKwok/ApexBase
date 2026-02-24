@@ -58,6 +58,29 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+// ============================================================================
+// Thread-local session variables — SET VARIABLE / RESET VARIABLE / $varname
+// ============================================================================
+thread_local! {
+    static SESSION_VARS: std::cell::RefCell<AHashMap<String, crate::data::Value>> =
+        std::cell::RefCell::new(AHashMap::new());
+}
+
+/// Store a session variable (SET VARIABLE name = value).
+pub fn set_session_variable(name: &str, value: crate::data::Value) {
+    SESSION_VARS.with(|m| m.borrow_mut().insert(name.to_lowercase(), value));
+}
+
+/// Remove a session variable (RESET VARIABLE name).
+pub fn reset_session_variable(name: &str) {
+    SESSION_VARS.with(|m| m.borrow_mut().remove(&name.to_lowercase()));
+}
+
+/// Retrieve a session variable by name.
+pub fn get_session_variable(name: &str) -> Option<crate::data::Value> {
+    SESSION_VARS.with(|m| m.borrow().get(&name.to_lowercase()).cloned())
+}
+
 /// Set the root directory for the current thread's query context.
 /// Call this before execute_with_base_dir when using named databases.
 pub fn set_query_root_dir(root_dir: &Path) {
@@ -741,7 +764,7 @@ impl ApexExecutor {
     pub fn execute_parsed(stmt: SqlStatement, storage_path: &Path) -> io::Result<ApexResult> {
         match stmt {
             SqlStatement::Select(select) => Self::execute_select(select, storage_path),
-            SqlStatement::Union(union) => Self::execute_union(union, storage_path),
+            SqlStatement::Union(union) => Self::execute_union(union, storage_path, storage_path),
             SqlStatement::Insert { values, columns, .. } => {
                 with_table_write_lock(storage_path, || {
                     Self::execute_insert(storage_path, columns.as_deref(), &values)
@@ -806,7 +829,7 @@ impl ApexExecutor {
                     Self::execute_select_with_joins(select, base_dir, default_table_path)
                 }
             }
-            SqlStatement::Union(union) => Self::execute_union(union, default_table_path),
+            SqlStatement::Union(union) => Self::execute_union(union, base_dir, default_table_path),
             // DDL Statements — acquire per-table write lock for concurrency safety
             SqlStatement::CreateTable { table, columns, if_not_exists } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
@@ -929,6 +952,20 @@ impl ApexExecutor {
             }
             SqlStatement::ShowFtsIndexes => {
                 Self::execute_show_fts_indexes(base_dir)
+            }
+            SqlStatement::SetVariable { name, value } => {
+                set_session_variable(&name, value);
+                Ok(ApexResult::Scalar(0))
+            }
+            SqlStatement::ResetVariable { name } => {
+                reset_session_variable(&name);
+                Ok(ApexResult::Scalar(0))
+            }
+            SqlStatement::CopyImport { table, file_path, format, options } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                with_table_write_lock(&table_path, || {
+                    Self::execute_copy_import(&table_path, &table, &file_path, &format, &options, base_dir, default_table_path)
+                })
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1069,7 +1106,7 @@ impl ApexExecutor {
                     }
                 }
                 SqlStatement::Union(union) => {
-                    last_result = Some(Self::execute_union(union, default_table_path)?);
+                    last_result = Some(Self::execute_union(union, base_dir, default_table_path)?);
                 }
                 // DML/DDL statements - route through txn if active
                 other => {

@@ -710,6 +710,25 @@ class ApexClient:
             if _cached is not None:
                 return _cached
 
+        # FAST PATH: table-function queries (read_csv / read_parquet / read_json).
+        # Skip all table-existence checks, lock, and DML routing — go straight to Arrow FFI.
+        if (not is_multi_stmt and sql_upper.startswith('SELECT')
+                and ('FROM READ_CSV(' in sql_upper
+                     or 'FROM READ_PARQUET(' in sql_upper
+                     or 'FROM READ_JSON(' in sql_upper)):
+            try:
+                schema_ptr, array_ptr = self._storage._execute_arrow_ffi(sql)
+                if schema_ptr != 0 and array_ptr != 0:
+                    batch = pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
+                    table = pa.Table.from_batches([batch]) if batch.num_rows > 0 else None
+                else:
+                    table = None
+                rv = ResultView(arrow_table=table, data=None)
+                rv._show_internal_id = False
+                return rv
+            except Exception:
+                pass  # fall through to normal path on error
+
         if not is_multi_stmt:
             # Allow execution without a selected table for DDL, CTE, or cross-database queries.
             # Cross-db queries use qualified db.table references (e.g. FROM default.users,
@@ -717,7 +736,9 @@ class ApexClient:
             _qualified = _RE_QUALIFIED_REF.search(sql)
             _has_qualified_ref = bool(_qualified and '.' in _qualified.group(0))
             if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE')
-                    or sql_upper.startswith('WITH ') or _has_qualified_ref):
+                    or sql_upper.startswith('WITH ') or _has_qualified_ref
+                    or sql_upper.startswith('COPY ') or sql_upper.startswith('SET ')
+                    or sql_upper.startswith('RESET ')):
                 self._ensure_table_selected()
         else:
             # Multi-statement: only require table if we have one
@@ -887,18 +908,30 @@ class ApexClient:
                 self._query_cache.clear()
                 self._has_writes = True
             
-            # Standard path: Arrow IPC for efficient bulk transfer
-            ipc_bytes = self._storage._execute_arrow_ipc(sql)
-            
-            # After CREATE TABLE, sync Python-side _current_table with Rust-side
+            # Fast path: Arrow C Data Interface (zero-copy, no serialization)
+            try:
+                schema_ptr, array_ptr = self._storage._execute_arrow_ffi(sql)
+                if schema_ptr != 0 and array_ptr != 0:
+                    batch = pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
+                    table = pa.Table.from_batches([batch]) if batch.num_rows > 0 else None
+                else:
+                    table = None
+            except Exception:
+                # Fallback: Arrow IPC
+                ipc_bytes = self._storage._execute_arrow_ipc(sql)
+                reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
+                table = reader.read_all()
+                if table.num_rows == 0:
+                    table = None
+
+            # After CREATE TABLE or COPY FROM, sync Python-side _current_table
             if sql_upper.startswith('CREATE TABLE'):
                 self._current_table = self._storage.current_table()
-            
-            reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
-            table = reader.read_all()
-            
-            if table.num_rows == 0:
-                table = None
+            elif sql_upper.startswith('COPY '):
+                import re as _re
+                _m = _re.match(r'COPY\s+(\w+)\s+FROM\b', sql_upper)
+                if _m:
+                    self._current_table = _m.group(1).lower()
             
             rv = ResultView(arrow_table=table, data=None)
             rv._show_internal_id = show_internal_id
@@ -927,6 +960,10 @@ class ApexClient:
             return
         
         table_name = m.group(1).lower()
+
+        # Skip validation for table functions: read_csv, read_json, read_parquet
+        if table_name in ('read_csv', 'read_json', 'read_parquet'):
+            return
 
         # Skip validation for qualified db.table names (e.g. "default.users", "analytics.events")
         # The Rust executor resolves cross-database paths; we cannot validate them here.

@@ -2,13 +2,13 @@
 
 impl ApexExecutor {
     /// Execute UNION / INTERSECT / EXCEPT statement
-    fn execute_union(union: UnionStatement, storage_path: &Path) -> io::Result<ApexResult> {
+    fn execute_union(union: UnionStatement, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
         use crate::query::SetOpType;
 
-        let left_result = Self::execute_parsed(*union.left, storage_path)?;
+        let left_result = Self::execute_parsed_multi(*union.left, base_dir, default_table_path)?;
         let left_batch = left_result.to_record_batch()?;
 
-        let right_result = Self::execute_parsed(*union.right, storage_path)?;
+        let right_result = Self::execute_parsed_multi(*union.right, base_dir, default_table_path)?;
         let right_batch = right_result.to_record_batch()?;
 
         if left_batch.num_columns() != right_batch.num_columns() {

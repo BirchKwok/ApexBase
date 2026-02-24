@@ -234,6 +234,10 @@ impl ApexExecutor {
                         FromItem::Subquery { alias, .. } => {
                             plan_lines.push(format!("  Scan: subquery AS {}", alias));
                         }
+                        FromItem::TableFunction { func, file, alias, .. } => {
+                            let alias_str = alias.as_ref().map(|a| format!(" AS {}", a)).unwrap_or_default();
+                            plan_lines.push(format!("  Scan: {}('{}'){}", func, file, alias_str));
+                        }
                     }
                 }
                 // JOINs
@@ -248,6 +252,7 @@ impl ApexExecutor {
                     let table_name = match &join.right {
                         FromItem::Table { table, .. } => table.clone(),
                         FromItem::Subquery { alias, .. } => format!("(subquery) {}", alias),
+                        FromItem::TableFunction { func, file, .. } => format!("{}('{}')", func, file),
                     };
                     plan_lines.push(format!("  {}: {}", jt, table_name));
                 }

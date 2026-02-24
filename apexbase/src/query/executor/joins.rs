@@ -21,6 +21,9 @@ impl ApexExecutor {
                 let sub_result = Self::execute_select_with_base_dir(*sub_stmt.clone(), &sub_path, base_dir, default_table_path)?;
                 sub_result.to_record_batch()?
             }
+            Some(FromItem::TableFunction { func, file, options, .. }) => {
+                Self::read_table_function(func, file, options)?
+            }
             None => {
                 let left_backend = get_cached_backend(default_table_path)?;
                 left_backend.read_columns_to_arrow(None, 0, None)?
@@ -40,6 +43,9 @@ impl ApexExecutor {
                     let sub_path = Self::resolve_from_table_path(sub_stmt, base_dir, default_table_path);
                     let sub_result = Self::execute_select_with_base_dir(*sub_stmt.clone(), &sub_path, base_dir, default_table_path)?;
                     sub_result.to_record_batch()?
+                }
+                FromItem::TableFunction { func, file, options, .. } => {
+                    Self::read_table_function(func, file, options)?
                 }
             };
 
