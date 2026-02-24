@@ -663,6 +663,7 @@ impl ApexStorageImpl {
         let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
         let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
         let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
+        let mut binary_columns_map: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
         let mut null_positions: HashMap<String, Vec<bool>> = HashMap::new();
 
@@ -678,11 +679,14 @@ impl ApexStorageImpl {
             
             // Detect type from first non-None element
             // NOTE: Check bool before int because in Python bool is a subclass of int
+            // NOTE: Check bytes before string because PyBytes can also be extracted as str in some pyo3 versions
             let mut col_type: Option<&str> = None;
             for item in list.iter() {
                 if !item.is_none() {
-                    if item.extract::<bool>().is_ok() {
+                    if item.extract::<bool>().is_ok() && item.get_type().name().map_or(false, |n| n == "bool") {
                         col_type = Some("bool");
+                    } else if item.downcast::<pyo3::types::PyBytes>().is_ok() {
+                        col_type = Some("bytes");
                     } else if item.extract::<i64>().is_ok() {
                         col_type = Some("int");
                     } else if item.extract::<f64>().is_ok() {
@@ -728,6 +732,25 @@ impl ApexStorageImpl {
                     bool_columns.insert(col_name.clone(), vals);
                     null_positions.insert(col_name, nulls);
                 }
+                Some("bytes") => {
+                    let mut vals: Vec<Vec<u8>> = Vec::with_capacity(col_len);
+                    let mut nulls = Vec::with_capacity(col_len);
+                    for item in list.iter() {
+                        let is_null = item.is_none();
+                        nulls.push(is_null);
+                        if is_null {
+                            vals.push(Vec::new());
+                        } else if let Ok(b) = item.downcast::<pyo3::types::PyBytes>() {
+                            vals.push(b.as_bytes().to_vec());
+                        } else if let Ok(s) = item.extract::<Vec<u8>>() {
+                            vals.push(s);
+                        } else {
+                            vals.push(Vec::new());
+                        }
+                    }
+                    binary_columns_map.insert(col_name.clone(), vals);
+                    null_positions.insert(col_name, nulls);
+                }
                 Some("string") | None => {
                     let mut vals = Vec::with_capacity(col_len);
                     let mut nulls = Vec::with_capacity(col_len);
@@ -767,8 +790,8 @@ impl ApexStorageImpl {
             let engine = crate::storage::engine::engine();
             engine.write_typed(
                 &table_path,
-                int_columns, float_columns, string_columns, 
-                HashMap::new(), // binary_columns 
+                int_columns, float_columns, string_columns,
+                binary_columns_map,
                 bool_columns,
                 null_positions,
                 durability,

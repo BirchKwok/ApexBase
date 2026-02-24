@@ -152,6 +152,17 @@ class ResultView:
             List[dict]: List of records as dictionaries, excluding the internal '_id' field.
         """
         return self._ensure_data()
+
+    def tolist(self) -> List[dict]:
+        """Convert results to a list of dictionaries.
+
+        Alias for :meth:`to_dict`. Returns one dictionary per row, excluding
+        the internal ``_id`` field.
+
+        Returns:
+            List[dict]: List of records as dictionaries.
+        """
+        return self._ensure_data()
     
     def to_pandas(self, zero_copy: bool = True):
         """Convert results to a pandas DataFrame.

@@ -366,7 +366,60 @@ class TestResultViewFunctionality:
             assert dict_list[1]["name"] == "Bob"
             
             client.close()
-    
+
+    def test_result_view_tolist(self):
+        """Test ResultView.tolist() method"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            test_data = [
+                {"name": "Alice", "age": 25},
+                {"name": "Bob", "age": 30},
+                {"name": "Charlie", "age": 35},
+            ]
+            client.store(test_data)
+
+            results = client.query()
+            rows = results.tolist()
+
+            # Basic type and length checks
+            assert isinstance(rows, list)
+            assert len(rows) == 3
+            assert isinstance(rows[0], dict)
+
+            # Values are correct
+            names = [r["name"] for r in rows]
+            ages = [r["age"] for r in rows]
+            assert "Alice" in names
+            assert "Bob" in names
+            assert "Charlie" in names
+            assert 25 in ages
+            assert 30 in ages
+            assert 35 in ages
+
+            # Internal _id must be hidden
+            assert "_id" not in rows[0]
+
+            # tolist() and to_dict() must return equivalent data
+            assert rows == results.to_dict()
+
+            client.close()
+
+    def test_result_view_tolist_empty(self):
+        """Test ResultView.tolist() on empty result"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            results = client.query()
+            rows = results.tolist()
+
+            assert isinstance(rows, list)
+            assert len(rows) == 0
+
+            client.close()
+
     @pytest.mark.skipif(not PANDAS_AVAILABLE, reason="Pandas not available")
     def test_result_view_to_pandas(self):
         """Test ResultView.to_pandas() method"""

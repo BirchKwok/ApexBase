@@ -24,6 +24,61 @@ import polars as pl
 ARROW_AVAILABLE = True
 POLARS_AVAILABLE = True
 
+import struct
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vector encoding / decoding helpers
+# Vectors are stored as Binary columns: raw little-endian float32 bytes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def encode_vector(vec) -> bytes:
+    """Encode a float vector to raw little-endian float32 bytes for storage.
+
+    Accepts: list/tuple of numbers, numpy array (any float/int dtype).
+
+    Example::
+
+        client.store([{"name": "item1", "vec": encode_vector([1.0, 2.0, 3.0])}])
+    """
+    if hasattr(vec, 'astype'):  # numpy array
+        return vec.astype('<f4').tobytes()
+    return struct.pack(f'<{len(vec)}f', *[float(v) for v in vec])
+
+
+def decode_vector(b: bytes) -> list:
+    """Decode raw little-endian float32 bytes back to a Python list of floats.
+
+    Example::
+
+        row = client.retrieve(1)
+        floats = decode_vector(row["vec"])
+    """
+    n = len(b) // 4
+    return list(struct.unpack(f'<{n}f', b[:n * 4]))
+
+
+def _is_vector_column(values) -> bool:
+    """Return True if *values* looks like a column of float vectors."""
+    if not values:
+        return False
+    # Find first non-None value
+    first = next((v for v in values if v is not None), None)
+    if first is None:
+        return False
+    # numpy array element (1-D)
+    if hasattr(first, 'dtype') and hasattr(first, 'shape') and len(getattr(first, 'shape', ())) == 1:
+        return True
+    # plain list/tuple of numbers (not already bytes)
+    if isinstance(first, (list, tuple)) and first and isinstance(first[0], (int, float)):
+        return True
+    return False
+
+
+def _encode_vector_col(values) -> list:
+    """Encode a column of vectors to a list of bytes objects."""
+    return [None if v is None else encode_vector(v) for v in values]
+
+
 # Pre-compiled regex for SQL validation (avoids re-compilation on every query)
 _RE_CREATE_TABLE = re.compile(r"\bcreate\s+(table|view)\b", re.IGNORECASE)
 _RE_FROM_TABLE = re.compile(r"\bfrom\s+([\w]+(?:\.[\w]+)?)", re.IGNORECASE)
@@ -633,7 +688,7 @@ class ApexClient:
         
             # 5. Single record dict
             if isinstance(data, dict):
-                self._storage.store(data)
+                self._storage.store(self._encode_vectors_in_record(data))
                 return
             
             # 6. List[dict] - OPTIMIZED: Convert to columnar for better performance
@@ -643,11 +698,26 @@ class ApexClient:
                 # Auto-convert to columnar for batch processing (3x faster!)
                 if len(data) > 1 and isinstance(data[0], dict):
                     self._store_batch_optimized(data)
+                elif isinstance(data[0], dict):
+                    # Single-record list: use store() path to handle partial columns correctly
+                    self._storage.store(self._encode_vectors_in_record(data[0]))
                 else:
                     self._store_batch(data)
                 return
             else:
                 raise ValueError("Data must be dict, list of dicts, Dict[str, list], pandas.DataFrame, polars.DataFrame, or pyarrow.Table")
+
+    def _encode_vectors_in_record(self, record: dict) -> dict:
+        """Return a copy of *record* with any vector fields encoded as bytes."""
+        result = {}
+        for k, v in record.items():
+            if isinstance(v, (list, tuple)) and v and isinstance(v[0], (int, float)):
+                result[k] = encode_vector(v)
+            elif hasattr(v, 'dtype') and hasattr(v, 'shape') and len(v.shape) == 1:
+                result[k] = encode_vector(v)
+            else:
+                result[k] = v
+        return result
 
     def _store_batch(self, records: List[dict]) -> None:
         if not records:
@@ -666,10 +736,17 @@ class ApexClient:
         if not records:
             return
         
-        # Convert to columnar format for optimal performance
+        # Convert to columnar format for optimal performance.
+        # Collect ALL keys across ALL records so missing fields become None (NULL).
         if records and isinstance(records[0], dict):
-            keys = records[0].keys()
-            columns = {key: [record.get(key) for record in records] for key in keys}
+            all_keys: list = []
+            seen_keys: set = set()
+            for record in records:
+                for k in record:
+                    if k not in seen_keys:
+                        all_keys.append(k)
+                        seen_keys.add(k)
+            columns = {key: [record.get(key) for record in records] for key in all_keys}
             self._store_columnar(columns)
         else:
             # Fallback to standard batch store
@@ -682,12 +759,15 @@ class ApexClient:
         # Convert numpy arrays to Python lists for Rust binding
         converted = {}
         for name, values in columns.items():
-            if hasattr(values, 'tolist'):  # numpy array
+            if hasattr(values, 'tolist'):  # numpy array column
                 converted[name] = values.tolist()
             elif hasattr(values, 'to_list'):  # polars series
                 converted[name] = values.to_list()
             else:
                 converted[name] = list(values) if not isinstance(values, list) else values
+            # Auto-encode vector columns (list-of-floats or list-of-arrays)
+            if _is_vector_column(converted[name]):
+                converted[name] = _encode_vector_col(converted[name])
         
         # Call native columnar storage - much faster than row-by-row
         self._storage.store_columnar(converted)

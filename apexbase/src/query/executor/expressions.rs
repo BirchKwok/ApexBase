@@ -1106,6 +1106,16 @@ impl ApexExecutor {
             SqlExpr::ArrayIndex { array, index } => {
                 Self::evaluate_array_index(batch, array, index)
             }
+            SqlExpr::ArrayLiteral(values) => {
+                // Encode as a single-value BinaryArray (raw f32 LE bytes), broadcast to all rows
+                use arrow::array::BinaryArray;
+                let bytes = crate::query::vector_ops::encode_f32_vec(
+                    &values.iter().map(|&f| f as f32).collect::<Vec<_>>()
+                );
+                let n = batch.num_rows().max(1);
+                let arr: BinaryArray = (0..n).map(|_| Some(bytes.as_slice())).collect();
+                Ok(Arc::new(arr) as ArrayRef)
+            }
             SqlExpr::UnaryOp { op, expr: inner } => {
                 use crate::query::sql_parser::UnaryOperator;
                 match op {
@@ -2606,10 +2616,138 @@ impl ApexExecutor {
                 }
                 Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_str()).collect::<Vec<_>>())))
             }
+            // ===== Vector Distance Functions =====
+            // Naming mirrors DuckDB's array functions for drop-in compatibility.
+            "ARRAY_DISTANCE"            | "L2_DISTANCE"                   |
+            "ARRAY_L2_DISTANCE"         | "EUCLIDEAN_DISTANCE"            => {
+                Self::evaluate_vector_distance(batch, args, crate::query::vector_ops::DistanceMetric::L2)
+            }
+            "L2_SQUARED_DISTANCE"       | "SQUARED_L2"                    => {
+                Self::evaluate_vector_distance(batch, args, crate::query::vector_ops::DistanceMetric::L2Squared)
+            }
+            "COSINE_DISTANCE"           | "ARRAY_COSINE_DISTANCE"         => {
+                Self::evaluate_vector_distance(batch, args, crate::query::vector_ops::DistanceMetric::CosineDistance)
+            }
+            "COSINE_SIMILARITY"         | "ARRAY_COSINE_SIMILARITY"       => {
+                Self::evaluate_vector_distance(batch, args, crate::query::vector_ops::DistanceMetric::CosineSimilarity)
+            }
+            "INNER_PRODUCT"             | "DOT_PRODUCT"                   |
+            "ARRAY_INNER_PRODUCT"       => {
+                Self::evaluate_vector_distance(batch, args, crate::query::vector_ops::DistanceMetric::InnerProduct)
+            }
+            "NEGATIVE_INNER_PRODUCT"    | "ARRAY_NEGATIVE_INNER_PRODUCT"  => {
+                Self::evaluate_vector_distance(batch, args, crate::query::vector_ops::DistanceMetric::NegInnerProduct)
+            }
+            "L1_DISTANCE"               | "ARRAY_L1_DISTANCE"             |
+            "MANHATTAN_DISTANCE"        => {
+                Self::evaluate_vector_distance(batch, args, crate::query::vector_ops::DistanceMetric::L1)
+            }
+            "LINF_DISTANCE"             | "ARRAY_LINF_DISTANCE"           |
+            "CHEBYSHEV_DISTANCE"        => {
+                Self::evaluate_vector_distance(batch, args, crate::query::vector_ops::DistanceMetric::LInf)
+            }
+            // ── Utility ──────────────────────────────────────────────────────────
+            "VECTOR_DIM" | "ARRAY_LENGTH" => {
+                if args.len() != 1 { return Err(err_input("VECTOR_DIM requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                use arrow::array::BinaryArray;
+                if let Some(ba) = arr.as_any().downcast_ref::<BinaryArray>() {
+                    let result: Vec<Option<i64>> = (0..ba.len())
+                        .map(|i| if ba.is_null(i) { None } else { Some((ba.value(i).len() / 4) as i64) })
+                        .collect();
+                    Ok(Arc::new(Int64Array::from(result)) as ArrayRef)
+                } else {
+                    Err(err_input("VECTOR_DIM requires a binary vector column"))
+                }
+            }
+            "VECTOR_NORM" | "L2_NORM" => {
+                if args.len() != 1 { return Err(err_input("VECTOR_NORM requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                use arrow::array::BinaryArray;
+                if let Some(ba) = arr.as_any().downcast_ref::<BinaryArray>() {
+                    let result: Vec<Option<f64>> = (0..ba.len())
+                        .map(|i| {
+                            if ba.is_null(i) { return None; }
+                            let bytes = ba.value(i);
+                            if bytes.len() % 4 != 0 { return None; }
+                            let vec = unsafe {
+                                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4)
+                            };
+                            Some(vec.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt())
+                        })
+                        .collect();
+                    Ok(Arc::new(Float64Array::from(result)) as ArrayRef)
+                } else {
+                    Err(err_input("VECTOR_NORM requires a binary vector column"))
+                }
+            }
+            "VECTOR_TO_STRING" | "ARRAY_TO_STRING" => {
+                if args.len() != 1 { return Err(err_input("VECTOR_TO_STRING requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                use arrow::array::BinaryArray;
+                if let Some(ba) = arr.as_any().downcast_ref::<BinaryArray>() {
+                    let result: Vec<Option<String>> = (0..ba.len())
+                        .map(|i| {
+                            if ba.is_null(i) { return None; }
+                            let bytes = ba.value(i);
+                            if bytes.len() % 4 != 0 { return None; }
+                            let floats = crate::query::vector_ops::decode_f32_vec(bytes)?;
+                            Some(format!("[{}]", floats.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")))
+                        })
+                        .collect();
+                    Ok(Arc::new(StringArray::from(result)) as ArrayRef)
+                } else {
+                    Err(err_input("VECTOR_TO_STRING requires a binary vector column"))
+                }
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported function: {}", name),
             )),
+        }
+    }
+
+    /// Shared implementation for all pairwise vector distance functions.
+    fn evaluate_vector_distance(
+        batch: &RecordBatch,
+        args: &[SqlExpr],
+        metric: crate::query::vector_ops::DistanceMetric,
+    ) -> io::Result<ArrayRef> {
+        if args.len() != 2 {
+            return Err(err_input(format!(
+                "Vector distance function requires exactly 2 arguments, got {}", args.len()
+            )));
+        }
+        let col_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+        let query_vec = Self::extract_vector_literal(&args[1], batch)?;
+        crate::query::vector_ops::batch_distance(&*col_arr, &query_vec, metric)
+    }
+
+    /// Extract a query vector (Vec<f32>) from a SQL expression.
+    /// Handles: ArrayLiteral, StringLit "[1.0,…]", BinaryArray, Float32Array, Float64Array.
+    fn extract_vector_literal(expr: &SqlExpr, batch: &RecordBatch) -> io::Result<Vec<f32>> {
+        match expr {
+            SqlExpr::ArrayLiteral(values) => {
+                Ok(values.iter().map(|&f| f as f32).collect())
+            }
+            SqlExpr::Literal(crate::data::Value::String(s)) => {
+                // "[1.0, 2.0, 3.0]" string literal
+                let s = s.trim();
+                if s.starts_with('[') && s.ends_with(']') {
+                    let inner = &s[1..s.len()-1];
+                    inner.split(',')
+                        .map(|t| t.trim().parse::<f32>()
+                            .map_err(|_| err_input(format!("Invalid float in vector literal: {}", t))))
+                        .collect()
+                } else {
+                    Err(err_input("Vector literal must be a JSON array string like '[1.0,2.0]'"))
+                }
+            }
+            _ => {
+                let arr = Self::evaluate_expr_to_array(batch, expr)?;
+                crate::query::vector_ops::extract_query_vector(&*arr)
+                    .map_err(|e| err_input(e.to_string()))
+            }
         }
     }
 
@@ -2855,6 +2993,26 @@ impl ApexExecutor {
         }
         // Try parsing as raw integer (epoch micros)
         s.parse::<i64>().unwrap_or(0)
+    }
+
+    /// Parse a JSON-style float array string like `[1.0, 2.0, 3.0]` into
+    /// little-endian float32 bytes.  Returns `None` if the string is not a
+    /// valid float-array literal.
+    pub(crate) fn try_parse_vector_string(s: &str) -> Option<Vec<u8>> {
+        let s = s.trim();
+        if !s.starts_with('[') || !s.ends_with(']') {
+            return None;
+        }
+        let inner = &s[1..s.len() - 1];
+        if inner.trim().is_empty() {
+            return Some(Vec::new());
+        }
+        let mut bytes = Vec::new();
+        for part in inner.split(',') {
+            let v: f32 = part.trim().parse().ok()?;
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        Some(bytes)
     }
 
     /// Convert a SqlExpr back to a SQL string (for CHECK constraint persistence)

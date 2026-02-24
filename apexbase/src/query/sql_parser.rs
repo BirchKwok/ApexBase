@@ -207,6 +207,10 @@ pub struct OrderByClause {
     pub column: String,
     pub descending: bool,
     pub nulls_first: Option<bool>,  // SQL:2023 NULLS FIRST/LAST
+    /// Optional SQL expression (for ORDER BY func_call(...) syntax).
+    /// When set, the executor will evaluate this expression if `column` is
+    /// not found as a pre-existing column in the result batch.
+    pub expr: Option<SqlExpr>,
 }
 
 /// SQL Expression (for WHERE, HAVING, etc.)
@@ -253,6 +257,8 @@ pub enum SqlExpr {
     Paren(Box<SqlExpr>),
     /// Array index: expr[index]
     ArrayIndex { array: Box<SqlExpr>, index: Box<SqlExpr> },
+    /// Array literal: [1.0, 2.0, 3.0]  (used for vector distance queries)
+    ArrayLiteral(Vec<f64>),
 }
 
 /// Binary operators
@@ -379,7 +385,11 @@ impl SelectStatement {
         
         // Extract from ORDER BY
         for ob in &self.order_by {
-            if ob.column != "_id" {
+            if let Some(ref expr) = ob.expr {
+                // Expression ORDER BY (e.g. ORDER BY array_distance(col, [...])):
+                // extract all column references from the expression.
+                Self::extract_columns_from_expr(expr, &mut columns);
+            } else if ob.column != "_id" {
                 columns.push(ob.column.clone());
             }
         }
@@ -2689,8 +2699,10 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
             Token::Sum | Token::Count | Token::Avg | Token::Min | Token::Max);
         let is_ident = matches!(self.current(), Token::Identifier(_));
         let is_int_lit = matches!(self.current(), Token::IntLit(_));
+        let is_expr_start = matches!(self.current(),
+            Token::LBracket | Token::LParen | Token::Minus | Token::FloatLit(_));
 
-        if !is_ident && !is_agg_func && !is_int_lit {
+        if !is_ident && !is_agg_func && !is_int_lit && !is_expr_start {
             break;
         }
 
@@ -2734,8 +2746,49 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                 self.advance();
                 s
             } else { break; }
+        } else if is_expr_start {
+            // Expression that starts with '[', '(', '-', or a float literal
+            let expr = self.parse_expr()?;
+            let display = Self::expr_to_display_string(&expr);
+            let descending = if matches!(self.current(), Token::Desc) {
+                self.advance(); true
+            } else if matches!(self.current(), Token::Asc) {
+                self.advance(); false
+            } else { false };
+            let nulls_first = if matches!(self.current(), Token::Nulls) {
+                self.advance();
+                if matches!(self.current(), Token::First) { self.advance(); Some(true) }
+                else if matches!(self.current(), Token::Last) { self.advance(); Some(false) }
+                else { None }
+            } else { None };
+            clauses.push(OrderByClause { column: display.clone(), descending, nulls_first, expr: Some(expr) });
+            if matches!(self.current(), Token::Comma) { self.advance(); } else { break; }
+            continue;
         } else {
-            self.parse_column_ref()?
+            // Identifier — check if it's followed by '(' (function call expression)
+            let saved_pos = self.pos;
+            let col = self.parse_column_ref()?;
+            if matches!(self.current(), Token::LParen) {
+                // Restore and re-parse as full expression
+                self.pos = saved_pos;
+                let expr = self.parse_expr()?;
+                let display = Self::expr_to_display_string(&expr);
+                let descending = if matches!(self.current(), Token::Desc) {
+                    self.advance(); true
+                } else if matches!(self.current(), Token::Asc) {
+                    self.advance(); false
+                } else { false };
+                let nulls_first = if matches!(self.current(), Token::Nulls) {
+                    self.advance();
+                    if matches!(self.current(), Token::First) { self.advance(); Some(true) }
+                    else if matches!(self.current(), Token::Last) { self.advance(); Some(false) }
+                    else { None }
+                } else { None };
+                clauses.push(OrderByClause { column: display.clone(), descending, nulls_first, expr: Some(expr) });
+                if matches!(self.current(), Token::Comma) { self.advance(); } else { break; }
+                continue;
+            }
+            col
         };
 
         let descending = if matches!(self.current(), Token::Desc) {
@@ -2764,7 +2817,7 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
             None
         };
 
-        clauses.push(OrderByClause { column, descending, nulls_first });
+        clauses.push(OrderByClause { column, descending, nulls_first, expr: None });
 
         if matches!(self.current(), Token::Comma) {
             self.advance();
@@ -2850,6 +2903,36 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                         other
                     ))),
                 }
+            }
+            // Array literal [f1, f2, ...] → little-endian float32 binary (vector)
+            Token::LBracket => {
+                self.advance();
+                let mut floats: Vec<f32> = Vec::new();
+                loop {
+                    if matches!(self.current(), Token::RBracket) {
+                        break;
+                    }
+                    let sign = if matches!(self.current(), Token::Minus) {
+                        self.advance();
+                        -1.0f32
+                    } else {
+                        1.0f32
+                    };
+                    let v = match self.current().clone() {
+                        Token::FloatLit(f) => { self.advance(); f as f32 }
+                        Token::IntLit(n)   => { self.advance(); n as f32 }
+                        other => return Err(ApexError::QueryParseError(format!(
+                            "Expected number in array literal, got {:?}", other
+                        ))),
+                    };
+                    floats.push(sign * v);
+                    if matches!(self.current(), Token::Comma) { self.advance(); }
+                }
+                self.expect(Token::RBracket)?;
+                let bytes: Vec<u8> = floats.iter()
+                    .flat_map(|f| f.to_le_bytes())
+                    .collect();
+                Ok(Value::Binary(bytes))
             }
             other => Err(ApexError::QueryParseError(format!(
                 "Expected literal value, got {:?}",
@@ -3224,6 +3307,32 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
             Token::Null => {
                 self.advance();
                 Ok(SqlExpr::Literal(Value::Null))
+            }
+            Token::LBracket => {
+                // Array literal: [1.0, 2.0, 3.0]
+                self.advance(); // consume '['
+                let mut values: Vec<f64> = Vec::new();
+                while !matches!(self.current(), Token::RBracket | Token::Eof) {
+                    let neg = if matches!(self.current(), Token::Minus) {
+                        self.advance();
+                        true
+                    } else {
+                        false
+                    };
+                    let v = match self.current().clone() {
+                        Token::FloatLit(f) => { self.advance(); f }
+                        Token::IntLit(n) => { self.advance(); n as f64 }
+                        other => return Err(ApexError::QueryParseError(
+                            format!("Array literal must contain numbers, got {:?}", other)
+                        )),
+                    };
+                    values.push(if neg { -v } else { v });
+                    if matches!(self.current(), Token::Comma) {
+                        self.advance();
+                    }
+                }
+                self.expect(Token::RBracket)?;
+                Ok(SqlExpr::ArrayLiteral(values))
             }
             Token::Identifier(name) => {
                 self.advance();

@@ -1125,6 +1125,12 @@ impl ApexExecutor {
                                 Some(crate::storage::on_demand::ColumnType::Date) => {
                                     Value::Date(Self::parse_date_string(v) as i32)
                                 }
+                                Some(crate::storage::on_demand::ColumnType::Binary) => {
+                                    // Auto-encode JSON-style float array string '[1.0,2.0,…]' as binary vector
+                                    Self::try_parse_vector_string(v)
+                                        .map(Value::Binary)
+                                        .unwrap_or_else(|| value.clone())
+                                }
                                 _ => value.clone(),
                             }
                         }

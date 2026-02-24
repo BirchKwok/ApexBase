@@ -364,7 +364,10 @@ impl ApexExecutor {
             // Apply ORDER BY with LIMIT optimization (top-k heap sort)
             let limited = if !stmt.order_by.is_empty() {
                 let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
-                let sorted = Self::apply_order_by_topk(&filtered, &stmt.order_by, k)?;
+                // Pre-evaluate any SELECT expression aliases referenced in ORDER BY
+                // (e.g. SELECT array_distance(vec,[…]) AS dist … ORDER BY dist)
+                let sort_batch = Self::augment_batch_for_order_by(&filtered, &stmt.columns, &stmt.order_by)?;
+                let sorted = Self::apply_order_by_topk(&sort_batch, &stmt.order_by, k)?;
                 Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset)?
             } else {
                 Self::apply_limit_offset(&filtered, stmt.limit, stmt.offset)?
@@ -1901,6 +1904,64 @@ impl ApexExecutor {
 
         // Step 3: Read ALL columns but only for top-k row indices
         backend.read_columns_by_indices_to_arrow(&final_indices)
+    }
+
+    /// Pre-evaluate SELECT expression aliases that are referenced by ORDER BY clauses.
+    /// e.g. `SELECT array_distance(vec,[...]) AS dist … ORDER BY dist`
+    /// The `dist` column doesn't exist in `batch` yet, but we can evaluate the expression
+    /// and add it temporarily so the sort has something to work with.
+    /// The extra columns are stripped by the subsequent projection step.
+    fn augment_batch_for_order_by(
+        batch: &RecordBatch,
+        select_cols: &[crate::query::SelectColumn],
+        order_by: &[crate::query::OrderByClause],
+    ) -> io::Result<RecordBatch> {
+        use crate::query::SelectColumn;
+        use arrow::datatypes::Field;
+
+        // Build alias→expr map from SELECT columns
+        let mut alias_map: std::collections::HashMap<String, &crate::query::SqlExpr> =
+            std::collections::HashMap::new();
+        for sc in select_cols {
+            if let SelectColumn::Expression { expr, alias: Some(alias) } = sc {
+                alias_map.insert(alias.to_lowercase(), expr);
+            }
+        }
+
+        if alias_map.is_empty() {
+            return Ok(batch.clone());
+        }
+
+        // Find ORDER BY columns that are aliases not yet in the batch
+        let mut extra: Vec<(String, arrow::array::ArrayRef)> = Vec::new();
+        for ob in order_by {
+            if ob.expr.is_some() {
+                continue; // already handled by apply_order_by_topk expression path
+            }
+            let cn = ob.column.trim_matches('"');
+            let cn = cn.rfind('.').map_or(cn, |p| &cn[p+1..]);
+            if batch.column_by_name(cn).is_none() {
+                // Try to resolve as alias
+                if let Some(expr) = alias_map.get(&cn.to_lowercase()) {
+                    let arr = Self::evaluate_expr_to_array(batch, expr)?;
+                    extra.push((cn.to_string(), arr));
+                }
+            }
+        }
+
+        if extra.is_empty() {
+            return Ok(batch.clone());
+        }
+
+        let mut fields: Vec<Field> =
+            batch.schema().fields().iter().map(|f| (**f).clone()).collect();
+        let mut cols = batch.columns().to_vec();
+        for (name, arr) in extra {
+            fields.push(Field::new(&name, arr.data_type().clone(), true));
+            cols.push(arr);
+        }
+        RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), cols)
+            .map_err(|e| err_data(e.to_string()))
     }
 
     /// Generic top-k computation using partial sort (fallback for complex cases)

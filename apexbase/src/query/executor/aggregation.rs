@@ -34,6 +34,7 @@ impl ApexExecutor {
                             column: out_name,
                             descending: clause.descending,
                             nulls_first: clause.nulls_first,
+                            expr: None,
                         };
                     }
                 }
@@ -50,6 +51,44 @@ impl ApexExecutor {
     ) -> io::Result<RecordBatch> {
         use arrow::compute::SortColumn;
         use rayon::prelude::*;
+
+        // Pre-evaluate expression ORDER BY columns (e.g. ORDER BY array_distance(...))
+        let batch_cow = if order_by.iter().any(|o| {
+            o.expr.is_some() && {
+                let cn = o.column.trim_matches('"');
+                let cn = cn.rfind('.').map_or(cn, |p| &cn[p+1..]);
+                batch.column_by_name(cn).is_none()
+            }
+        }) {
+            let mut extra: Vec<(String, arrow::array::ArrayRef)> = Vec::new();
+            for o in order_by {
+                if let Some(ref expr) = o.expr {
+                    let cn = o.column.trim_matches('"');
+                    let cn = cn.rfind('.').map_or(cn, |p| &cn[p+1..]);
+                    if batch.column_by_name(cn).is_none() {
+                        let arr = Self::evaluate_expr_to_array(batch, expr)?;
+                        extra.push((o.column.clone(), arr));
+                    }
+                }
+            }
+            if extra.is_empty() {
+                std::borrow::Cow::Borrowed(batch)
+            } else {
+                let mut fields: Vec<arrow::datatypes::Field> =
+                    batch.schema().fields().iter().map(|f| (**f).clone()).collect();
+                let mut cols = batch.columns().to_vec();
+                for (name, arr) in extra {
+                    fields.push(arrow::datatypes::Field::new(&name, arr.data_type().clone(), true));
+                    cols.push(arr);
+                }
+                let nb = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), cols)
+                    .map_err(|e| err_data(e.to_string()))?;
+                std::borrow::Cow::Owned(nb)
+            }
+        } else {
+            std::borrow::Cow::Borrowed(batch)
+        };
+        let batch: &RecordBatch = &batch_cow;
 
         let sort_columns: Vec<SortColumn> = order_by
             .iter()
@@ -290,6 +329,51 @@ impl ApexExecutor {
     ) -> io::Result<RecordBatch> {
         use std::cmp::Ordering;
 
+        // Pre-evaluate any expression-based ORDER BY columns not yet in the batch.
+        // e.g. ORDER BY array_distance(vec, [1,2,3]) — expression not in SELECT output yet.
+        let batch = if order_by.iter().any(|o| {
+            o.expr.is_some() && {
+                let cn = o.column.trim_matches('"');
+                let cn = cn.rfind('.').map_or(cn, |p| &cn[p+1..]);
+                batch.column_by_name(cn).is_none()
+            }
+        }) {
+            let mut new_cols: Vec<(String, arrow::array::ArrayRef)> = Vec::new();
+            for o in order_by {
+                if let Some(ref expr) = o.expr {
+                    let cn = o.column.trim_matches('"');
+                    let cn = cn.rfind('.').map_or(cn, |p| &cn[p+1..]);
+                    if batch.column_by_name(cn).is_none() {
+                        let arr = Self::evaluate_expr_to_array(batch, expr)?;
+                        new_cols.push((o.column.clone(), arr));
+                    }
+                }
+            }
+            if new_cols.is_empty() {
+                std::borrow::Cow::Borrowed(batch)
+            } else {
+                let mut fields: Vec<arrow::datatypes::Field> =
+                    batch.schema().fields().iter().map(|f| (**f).clone()).collect();
+                let mut cols: Vec<arrow::array::ArrayRef> =
+                    batch.columns().to_vec();
+                for (name, arr) in new_cols {
+                    fields.push(arrow::datatypes::Field::new(
+                        &name,
+                        arr.data_type().clone(),
+                        true,
+                    ));
+                    cols.push(arr);
+                }
+                let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+                let nb = RecordBatch::try_new(schema, cols)
+                    .map_err(|e| err_data(e.to_string()))?;
+                std::borrow::Cow::Owned(nb)
+            }
+        } else {
+            std::borrow::Cow::Borrowed(batch)
+        };
+        let batch: &RecordBatch = &batch;
+
         // If no limit or limit >= rows, use standard sort
         let num_rows = batch.num_rows();
         if k.is_none() || k.unwrap() >= num_rows {
@@ -313,8 +397,17 @@ impl ApexExecutor {
             .iter()
             .filter_map(|clause| {
                 let col_name = clause.column.trim_matches('"');
-                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
-                    &col_name[dot_pos + 1..]
+                // Try exact name first; only strip table prefix if the prefix part is a
+                // simple identifier (no parens/brackets) — avoids mis-splitting float literals.
+                let actual_col = if batch.column_by_name(col_name).is_some() {
+                    col_name
+                } else if let Some(dot_pos) = col_name.rfind('.') {
+                    let prefix = &col_name[..dot_pos];
+                    if prefix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        &col_name[dot_pos + 1..]
+                    } else {
+                        col_name
+                    }
                 } else {
                     col_name
                 };

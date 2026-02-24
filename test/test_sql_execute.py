@@ -1681,7 +1681,58 @@ class TestSqlResultFunctionality:
             assert dict_list[1]["name"] == "Bob"
             
             client.close()
-    
+
+    def test_sql_result_tolist(self):
+        """Test ResultView.tolist() method via execute()"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            test_data = [
+                {"name": "Alice", "age": 25},
+                {"name": "Bob", "age": 30},
+                {"name": "Charlie", "age": 35},
+            ]
+            client.store(test_data)
+
+            result = client.execute("SELECT name, age FROM default ORDER BY age")
+            rows = result.tolist()
+
+            # Basic type and length checks
+            assert isinstance(rows, list)
+            assert len(rows) == 3
+            assert isinstance(rows[0], dict)
+
+            # Values and order are correct
+            assert rows[0]["name"] == "Alice"
+            assert rows[0]["age"] == 25
+            assert rows[1]["name"] == "Bob"
+            assert rows[1]["age"] == 30
+            assert rows[2]["name"] == "Charlie"
+            assert rows[2]["age"] == 35
+
+            # Internal _id must be hidden
+            assert "_id" not in rows[0]
+
+            # tolist() and to_dict() must return equivalent data
+            assert rows == result.to_dict()
+
+            client.close()
+
+    def test_sql_result_tolist_empty(self):
+        """Test ResultView.tolist() on empty result via execute()"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            result = client.execute("SELECT name, age FROM default WHERE age > 999")
+            rows = result.tolist()
+
+            assert isinstance(rows, list)
+            assert len(rows) == 0
+
+            client.close()
+
     @pytest.mark.skipif(not PANDAS_AVAILABLE, reason="Pandas not available")
     def test_sql_result_to_pandas(self):
         """Test ResultView.to_pandas() method"""
