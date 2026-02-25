@@ -778,6 +778,26 @@ class ApexClient:
         # DDL (CREATE TABLE) is allowed without a table selected
         sql_upper = sql.strip().upper()
 
+        # ULTRA-FAST PATH: _id point lookup — bypass regex, _should_show_internal_id, lock overhead.
+        # Detects "SELECT ... WHERE _ID = N" with no modifiers and routes directly to retrieve_rcix.
+        if (show_internal_id is None
+                and sql_upper.startswith('SELECT')
+                and ('WHERE _ID =' in sql_upper or 'WHERE _ID=' in sql_upper)
+                and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+                and ';' not in sql_upper):
+            self._ensure_table_selected()
+            try:
+                result = self._storage.execute(sql)
+                if result is not None:
+                    columns_dict = result.get('columns_dict')
+                    if columns_dict is not None:
+                        rv = ResultView(lazy_pydict=columns_dict)
+                        rv._show_internal_id = True
+                        return rv
+            except Exception:
+                pass  # fall through to normal path on error
+
         # Detect multi-statement SQL: contains ';' with non-whitespace content after
         _trimmed = sql.strip().rstrip(';').strip()
         is_multi_stmt = ';' in _trimmed

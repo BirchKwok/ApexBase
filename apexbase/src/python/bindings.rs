@@ -1076,7 +1076,40 @@ impl ApexStorageImpl {
             || sql_upper.starts_with("INSERT")
             || sql_upper.starts_with("ALTER")
             || sql_upper.starts_with("DROP");
-        
+
+        // ULTRA-FAST PATH: _id = X point lookup — bypass table_path resolution, py_query_cache,
+        // and global STORAGE_CACHE. Uses per-instance cached_backends (zero PathBuf hashing).
+        // Only active for warm calls (after first call populates cached_backends).
+        if !is_write_op && !is_ddl && sql_upper.starts_with("SELECT")
+            && (sql_upper.contains("WHERE _ID =") || sql_upper.contains("WHERE _ID=")) {
+            let eq_pos = sql_upper.find("WHERE _ID =").map(|p| p + 6)
+                .or_else(|| sql_upper.find("WHERE _ID=").map(|p| p + 6));
+            if let Some(eq_pos) = eq_pos {
+                let after_eq = sql_upper[eq_pos + if sql_upper[eq_pos..].starts_with("_ID =") { 5 } else { 4 }..].trim_start();
+                let num_end = after_eq.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_eq.len());
+                if num_end > 0 {
+                    if let Ok(id) = after_eq[..num_end].parse::<u64>() {
+                        let table_name_fast = self.current_table.read().clone();
+                        let maybe_backend = self.cached_backends.read().get(&table_name_fast).cloned();
+                        if let Some(backend) = maybe_backend {
+                            let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(id));
+                            if let Ok(Some(vals)) = rcix_result {
+                                let out = PyDict::new_bound(py);
+                                let columns_dict = PyDict::new_bound(py);
+                                for (col_name, val) in &vals {
+                                    let pyval = value_to_py(py, val)?;
+                                    columns_dict.set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
+                                }
+                                out.set_item("columns_dict", columns_dict)?;
+                                out.set_item("rows_affected", 0i64)?;
+                                return Ok(out.into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Invalidate cached backend before write operations to avoid stale data
         let table_name = self.current_table.read().clone();
         if is_write_op && !table_name.is_empty() {
@@ -1173,30 +1206,32 @@ impl ApexStorageImpl {
         }
         
         // FAST PATH: Point lookup SELECT * FROM <table> WHERE _id = X
-        if !is_write_op && sql_upper.starts_with("SELECT") && sql_upper.contains("_ID") {
-            // Extract _id = N pattern from WHERE clause
-            if let Some(id_pos) = sql_upper.find("_ID") {
-                let rest = &sql_upper[id_pos + 3..];
-                let rest = rest.trim_start();
-                if rest.starts_with('=') {
-                    let val_str = rest[1..].trim().trim_end_matches(';');
-                    if let Ok(id) = val_str.parse::<u64>() {
+        // (First call warmup path — populates cached_backends for next ultra-fast calls)
+        if !is_write_op && sql_upper.starts_with("SELECT")
+            && (sql_upper.contains("WHERE _ID =") || sql_upper.contains("WHERE _ID=")) {
+            let eq_pos = sql_upper.find("WHERE _ID =").map(|p| p + 6)
+                .or_else(|| sql_upper.find("WHERE _ID=").map(|p| p + 6));
+            if let Some(eq_pos) = eq_pos {
+                let after_eq = sql_upper[eq_pos + if sql_upper[eq_pos..].starts_with("_ID =") { 5 } else { 4 }..].trim_start();
+                let num_end = after_eq.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_eq.len());
+                if num_end > 0 {
+                    if let Ok(id) = after_eq[..num_end].parse::<u64>() {
                         if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-                            // Primary: retrieve_rcix — page cache, zero Arrow allocation
+                            // Populate cached_backends so the ultra-fast path works on next call
+                            self.cached_backends.write().insert(table_name.clone(), Arc::clone(&backend));
                             let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(id));
                             if let Ok(Some(vals)) = rcix_result {
                                 let out = PyDict::new_bound(py);
                                 let columns_dict = PyDict::new_bound(py);
                                 for (col_name, val) in &vals {
-                                    let col_list = PyList::empty_bound(py);
-                                    col_list.append(value_to_py(py, val)?)?;
-                                    columns_dict.set_item(col_name.as_str(), col_list)?;
+                                    let pyval = value_to_py(py, val)?;
+                                    columns_dict.set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
                                 }
                                 out.set_item("columns_dict", columns_dict)?;
-                                out.set_item("rows_affected", 0)?;
+                                out.set_item("rows_affected", 0i64)?;
                                 return Ok(out.into());
                             }
-                            // Fallback: Arrow batch path (compressed RG or no RCIX index)
+                            // Fallback: Arrow batch path
                             if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(id) {
                                 if batch.num_rows() > 0 {
                                     let out = PyDict::new_bound(py);
@@ -1205,15 +1240,13 @@ impl ApexStorageImpl {
                                     for col_idx in 0..batch.num_columns() {
                                         let col_name = schema.field(col_idx).name();
                                         let arr = batch.column(col_idx);
-                                        let col_list = PyList::empty_bound(py);
-                                        for row_idx in 0..batch.num_rows() {
-                                            let val = arrow_value_at(arr, row_idx);
-                                            col_list.append(value_to_py(py, &val)?)?;
-                                        }
-                                        columns_dict.set_item(col_name, col_list)?;
+                                        let vals_1row: Vec<_> = (0..batch.num_rows())
+                                            .map(|r| value_to_py(py, &arrow_value_at(arr, r)))
+                                            .collect::<PyResult<_>>()?;
+                                        columns_dict.set_item(col_name, PyList::new_bound(py, vals_1row))?;
                                     }
                                     out.set_item("columns_dict", columns_dict)?;
-                                    out.set_item("rows_affected", 0)?;
+                                    out.set_item("rows_affected", 0i64)?;
                                     return Ok(out.into());
                                 }
                             }

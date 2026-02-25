@@ -724,6 +724,79 @@ impl ApexExecutor {
             }
         }
 
+        // PRE-PARSE FAST PATH: SELECT * FROM <table> WHERE _id = N — bypass SQL parser + executor.
+        // Handles the core OLTP point lookup without tokenization, CBO, or Arrow batch build overhead.
+        // Benefits: pg wire, Arrow Flight, and all Rust callers of execute_with_base_dir.
+        {
+            let s = sql.trim();
+            if s.len() <= 300 {
+                let su = s.to_ascii_uppercase();
+                if su.starts_with("SELECT") && su.contains("WHERE") && !su.contains("JOIN")
+                    && !su.contains("GROUP") && !su.contains("ORDER") && !su.contains("LIMIT")
+                    && !su.contains(';')
+                    && (su.contains("WHERE _ID =") || su.contains("WHERE _ID="))
+                {
+                    let eq_pos = su.find("WHERE _ID =").map(|p| p + 6)
+                        .or_else(|| su.find("WHERE _ID=").map(|p| p + 6));
+                    if let Some(ep) = eq_pos {
+                        let skip = if su[ep..].starts_with("_ID =") { 5 } else { 4 };
+                        let after_eq = su[ep + skip..].trim_start();
+                        let num_end = after_eq.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_eq.len());
+                        if num_end > 0 {
+                            if let Ok(id) = after_eq[..num_end].parse::<u64>() {
+                                // Resolve table path from FROM clause
+                                let table_path = if let Some(fp) = su.find(" FROM ") {
+                                    let after_from = su[fp + 6..].trim_start();
+                                    let tn_end = after_from.find(|c: char| c == ' ' || c == '\t' || c == '\n' || c == ';')
+                                        .unwrap_or(after_from.len());
+                                    let tname = after_from[..tn_end].trim_matches('"').to_lowercase();
+                                    if tname.is_empty() {
+                                        default_table_path.to_path_buf()
+                                    } else {
+                                        let default_stem = default_table_path.file_stem()
+                                            .and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                                        if tname == default_stem {
+                                            default_table_path.to_path_buf()
+                                        } else {
+                                            base_dir.join(format!("{}.apex", tname))
+                                        }
+                                    }
+                                } else {
+                                    default_table_path.to_path_buf()
+                                };
+                                if let Ok(backend) = get_cached_backend(&table_path) {
+                                    if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
+                                        if let Ok(Some(vals)) = backend.storage.retrieve_rcix(id) {
+                                            use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
+                                            use crate::data::Value as V;
+                                            let mut fields = Vec::with_capacity(vals.len());
+                                            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(vals.len());
+                                            for (col_name, val) in &vals {
+                                                let nullable = matches!(val, V::Null);
+                                                let (dt, arr): (ArrowDataType, ArrayRef) = match val {
+                                                    V::Int64(v)   => (ArrowDataType::Int64,   Arc::new(Int64Array::from(vec![*v]))),
+                                                    V::Float64(v) => (ArrowDataType::Float64, Arc::new(Float64Array::from(vec![*v]))),
+                                                    V::String(s)  => (ArrowDataType::Utf8,    Arc::new(StringArray::from(vec![s.as_str()]))),
+                                                    V::Bool(b)    => (ArrowDataType::Boolean, Arc::new(BooleanArray::from(vec![*b]))),
+                                                    _             => (ArrowDataType::Utf8,    Arc::new(StringArray::from(vec![None as Option<&str>]))),
+                                                };
+                                                fields.push(Field::new(col_name, dt, nullable));
+                                                arrays.push(arr);
+                                            }
+                                            let schema = Arc::new(Schema::new(fields));
+                                            if let Ok(batch) = RecordBatch::try_new(schema, arrays) {
+                                                return Ok(ApexResult::Data(batch));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Support multi-statement execution (e.g., CREATE VIEW; SELECT ...; DROP VIEW;)
         // Parse as multi-statement unconditionally to avoid relying on string heuristics.
         let stmts = {

@@ -907,37 +907,72 @@ impl OnDemandStorage {
         Ok(Some(result))
     }
 
+    /// Read bytes from an already-locked page cache (no lock acquisition).
+    /// Returns false if any required page is missing (cache miss).
+    #[inline]
+    fn read_from_locked_cache(
+        cache: &std::collections::HashMap<u64, Box<[u8; 4096]>>,
+        abs_offset: u64,
+        dst: &mut [u8],
+    ) -> bool {
+        let len = dst.len();
+        if len == 0 { return true; }
+        let mut written = 0usize;
+        let mut cur_off = abs_offset;
+        while written < len {
+            let page_num = cur_off / 4096;
+            let page_off = (cur_off % 4096) as usize;
+            let to_copy = (len - written).min(4096 - page_off);
+            match cache.get(&page_num) {
+                Some(page) => {
+                    dst[written..written + to_copy].copy_from_slice(&page[page_off..page_off + to_copy]);
+                    written += to_copy;
+                    cur_off += to_copy as u64;
+                }
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// Zero-syscall RCIX point lookup using user-space page cache.
     /// Reads file bytes via cached heap pages (pread on miss), avoiding repeated macOS
     /// mmap soft page faults (~21µs each). After warmup, all accesses hit the heap cache
     /// (~50ns each) — no page table involvement.
     pub(crate) fn retrieve_rcix(&self, id: u64) -> io::Result<Option<Vec<(String, crate::data::Value)>>> {
         use crate::data::Value;
-        let footer = {
+        // Extract only the fields we need — avoids cloning the full footer
+        // (zone_maps, all row_groups, all col_offsets for every RG, schema strings).
+        let (rg_offset, rg_rows, rg_min_id, col_offsets_rg, col_schema) = {
             let fg = self.v4_footer.read();
-            match fg.as_ref() { Some(f) => f.clone(), None => return Ok(None) }
+            let footer = match fg.as_ref() { Some(f) => f, None => return Ok(None) };
+            let col_count = footer.schema.column_count();
+            let mut rg_i_found = None;
+            for (i, rg) in footer.row_groups.iter().enumerate() {
+                if rg.min_id <= id && id <= rg.max_id && rg.row_count > 0 { rg_i_found = Some(i); break; }
+            }
+            let rg_i = match rg_i_found { Some(i) => i, None => return Ok(None) };
+            let rg_meta = &footer.row_groups[rg_i];
+            if rg_i >= footer.col_offsets.len() || footer.col_offsets[rg_i].len() < col_count {
+                return Ok(None);
+            }
+            // Clone only the small per-RG slice and per-column schema (names + types)
+            let col_offsets_rg: Vec<u32> = footer.col_offsets[rg_i].clone();
+            let col_schema: Vec<(String, ColumnType)> = footer.schema.columns.clone();
+            (rg_meta.offset, rg_meta.row_count as usize, rg_meta.min_id, col_offsets_rg, col_schema)
         };
-        let col_count = footer.schema.column_count();
-        let mut rg_i_found: Option<usize> = None;
-        for (i, rg) in footer.row_groups.iter().enumerate() {
-            if rg.min_id <= id && id <= rg.max_id && rg.row_count > 0 { rg_i_found = Some(i); break; }
-        }
-        let rg_i = match rg_i_found { Some(i) => i, None => return Ok(None) };
-        let rg_meta = &footer.row_groups[rg_i];
-        let rg_rows = rg_meta.row_count as usize;
-        if rg_i >= footer.col_offsets.len() || footer.col_offsets[rg_i].len() < col_count {
-            return Ok(None);
-        }
+
+        let col_count = col_schema.len();
         // Read RG header (32 bytes) to check compression + encoding version
         let mut rg_hdr = [0u8; 32];
-        self.read_cached_bytes(rg_meta.offset, &mut rg_hdr)?;
+        self.read_cached_bytes(rg_offset, &mut rg_hdr)?;
         if rg_hdr[28] != RG_COMPRESS_NONE || rg_hdr[29] < 1 { return Ok(None); }
 
-        let body_base = rg_meta.offset + 32;
+        let body_base = rg_offset + 32;
         let null_bitmap_len = (rg_rows + 7) / 8;
 
         // O(1) local_idx: direct guess then verify
-        let guess = (id.saturating_sub(rg_meta.min_id)) as usize;
+        let guess = (id.saturating_sub(rg_min_id)) as usize;
         let local_idx = if guess < rg_rows {
             let mut id_buf = [0u8; 8];
             self.read_cached_bytes(body_base + (guess * 8) as u64, &mut id_buf)?;
@@ -957,14 +992,14 @@ impl OnDemandStorage {
         self.read_cached_bytes(body_base + (rg_rows * 8 + local_idx / 8) as u64, &mut del_buf)?;
         if (del_buf[0] >> (local_idx % 8)) & 1 == 1 { return Ok(None); }
 
-        let col_offsets = &footer.col_offsets[rg_i];
-        let schema = &footer.schema;
+        let col_offsets = &col_offsets_rg;
+        // Use col_schema as schema reference (already cloned above)
         let mut result = Vec::with_capacity(col_count + 1);
         result.push(("_id".to_string(), Value::Int64(id as i64)));
 
         for col_idx in 0..col_count {
-            let col_name = schema.columns[col_idx].0.clone();
-            let col_type = schema.columns[col_idx].1;
+            let col_name = col_schema[col_idx].0.clone();
+            let col_type = col_schema[col_idx].1;
             let col_start = col_offsets[col_idx] as usize;
 
             // Null bit
