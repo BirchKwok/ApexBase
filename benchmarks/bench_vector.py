@@ -187,6 +187,45 @@ def bench_duckdb_batch_sequential(con, queries: np.ndarray, k: int, metric: str)
         con.execute(sql).fetch_arrow_table()
     return (time.perf_counter() - t0) * 1000
 
+
+def bench_apex_batch(client, queries: np.ndarray, k: int, metric: str, iters: int):
+    """Benchmark ApexBase batch_topk_distance — all N queries in a single Rust call."""
+    _metric_map = {
+        "l2":     "l2",
+        "cosine": "cosine_distance",
+        "dot":    "dot",
+    }
+    apex_metric = _metric_map[metric]
+    # warmup
+    client.batch_topk_distance("vec", queries, k, apex_metric)
+
+    times = []
+    for _ in range(max(1, iters)):
+        gc.collect()
+        t0 = time.perf_counter()
+        client.batch_topk_distance("vec", queries, k, apex_metric)
+        times.append((time.perf_counter() - t0) * 1000)
+    return times
+
+
+def bench_apex_sequential(client, queries: np.ndarray, k: int, metric: str, iters: int):
+    """ApexBase: N sequential _topk_distance_ffi calls — baseline for batch comparison."""
+    _metric_map = {
+        "l2":     "l2",
+        "cosine": "cosine_distance",
+        "dot":    "dot",
+    }
+    apex_metric = _metric_map[metric]
+
+    times = []
+    for _ in range(max(1, iters)):
+        gc.collect()
+        t0 = time.perf_counter()
+        for qvec in queries:
+            client._storage._topk_distance_ffi("vec", qvec.tobytes(), k, apex_metric)
+        times.append((time.perf_counter() - t0) * 1000)
+    return times
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -250,39 +289,39 @@ def main():
             apex_med = median(apex_times)
             print(f"{metric:<18} {fmt(apex_med):>12}")
 
-        # ── Section 3: Batch query (10 query vectors, single SQL round-trip) ──
+        # ── Section 3: Batch TopK — new batch_topk_distance API ──────────────
         print()
-        print("── Section 3: Batch TopK (10 query vectors, single round-trip) ──")
-        batch_header = f"{'Metric':<18} {'ApexBase×10':>14} {'DuckDB×10':>14} {'per-query Apex':>16} {'per-query Duck':>16}"
+        nq = len(batch_queries)
+        print(f"── Section 3: Batch TopK ({nq} queries) — batch API vs N×single ──")
+        batch_header = (
+            f"{'Metric':<18} {'Apex-batch(1call)':>18} {'Apex-seq(N calls)':>18}"
+            f" {'DuckDB-seq(N calls)':>20} {'speedup(seq/batch)':>20}"
+        )
         print(batch_header)
         print("-" * len(batch_header))
 
-        nq = len(batch_queries)
         for metric in ["l2", "cosine", "dot"]:
-            # ApexBase: N sequential topk_distance calls
-            apex_batch_times = []
-            for _ in range(max(1, args.iters)):
-                gc.collect()
-                t0 = time.perf_counter()
-                for qvec in batch_queries:
-                    _run_single_apex(client, qvec, args.k, metric)
-                apex_batch_times.append((time.perf_counter() - t0) * 1000)
+            # ApexBase batch: single batch_topk_distance call
+            apex_batch_times = bench_apex_batch(client, batch_queries, args.k, metric, args.iters)
             apex_batch_med = median(apex_batch_times)
 
+            # ApexBase sequential: N individual _topk_distance_ffi calls
+            apex_seq_times = bench_apex_sequential(client, batch_queries, args.k, metric, args.iters)
+            apex_seq_med = median(apex_seq_times)
+
+            speedup = apex_seq_med / apex_batch_med
+            speedup_str = f"{speedup:.2f}x {'✅' if speedup > 1.0 else '❌'}"
+
             if duck_con is not None:
-                # DuckDB: N sequential queries — FAIR apples-to-apples comparison
-                duck_batch_ms = bench_duckdb_batch_sequential(duck_con, batch_queries, args.k, metric)
-                duck_str = fmt(duck_batch_ms)
-                ratio = apex_batch_med / duck_batch_ms
-                faster = "✅" if ratio < 1.0 else "❌"
-                per_duck = fmt(duck_batch_ms / nq)
+                duck_ms = bench_duckdb_batch_sequential(duck_con, batch_queries, args.k, metric)
+                duck_str = fmt(duck_ms)
             else:
                 duck_str = "N/A"
-                per_duck = "N/A"
-                faster = ""
 
-            per_apex = fmt(apex_batch_med / nq)
-            print(f"{metric:<18} {fmt(apex_batch_med):>14} {duck_str:>14} {per_apex:>16} {per_duck:>16}")
+            print(
+                f"{metric:<18} {fmt(apex_batch_med):>18} {fmt(apex_seq_med):>18}"
+                f" {duck_str:>20} {speedup_str:>20}"
+            )
 
         # ── Section 4: ApexBase detailed stats ────────────────────────────────
         print()

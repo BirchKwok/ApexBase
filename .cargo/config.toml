@@ -1,0 +1,6 @@
+[build]
+# Use the host CPU's full instruction set for local dev/bench builds.
+# On Apple Silicon this enables advanced NEON/FMA; on x86-64 enables AVX2/FMA3.
+# NOTE: wheels built for distribution should override this with
+#   RUSTFLAGS="-C target-cpu=<baseline>" in the CI environment.
+rustflags = ["-C", "target-cpu=native"]

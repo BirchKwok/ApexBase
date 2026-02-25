@@ -2847,6 +2847,169 @@ impl ApexStorageImpl {
         Ok((schema_ptr, array_ptr))
     }
 
+    /// Batch TopK vector distance search — N queries in a single Rust call.
+    ///
+    /// Much faster than N sequential `_topk_distance_ffi` calls because:
+    /// - `scan_buf` (the mmap→heap float cache) is loaded once regardless of N.
+    /// - All N queries run in parallel via Rayon (outer parallelism over queries,
+    ///   sequential inner scan per query — no nested Rayon contention).
+    /// - The `_id` column is read only once.
+    ///
+    /// Parameters:
+    /// - col:          name of the vector column (FixedList or Binary)
+    /// - queries_bytes: raw little-endian float32 bytes of all N query vectors,
+    ///                  row-major, shape (n_queries, dim)
+    /// - n_queries:    number of query vectors (N)
+    /// - k:            number of nearest neighbours per query
+    /// - metric:       distance metric ("l2", "cosine", "dot", …)
+    ///
+    /// Returns raw little-endian float64 bytes of shape (N, K, 2) where
+    ///   result[i * K * 2 + j * 2 + 0]  = _id  of the j-th neighbour for query i
+    ///   result[i * K * 2 + j * 2 + 1]  = dist of the j-th neighbour for query i
+    ///
+    /// Python side: `np.frombuffer(result, dtype=np.float64).reshape(n_queries, k, 2)`
+    /// Rows with fewer than k neighbours are padded with (-1, inf).
+    #[pyo3(name = "_batch_topk_ffi")]
+    fn batch_topk_ffi(
+        &self,
+        py: Python<'_>,
+        col: &str,
+        queries_bytes: &[u8],
+        n_queries: usize,
+        k: usize,
+        metric: &str,
+    ) -> PyResult<PyObject> {
+        use pyo3::types::PyBytes;
+        use crate::query::vector_ops::DistanceMetric;
+        use crate::query::executor::get_cached_backend_pub;
+        use arrow::array::Int64Array;
+
+        if n_queries == 0 || k == 0 {
+            let empty: Vec<u8> = vec![];
+            return Ok(PyBytes::new_bound(py, &empty).into());
+        }
+        if queries_bytes.len() % 4 != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "_batch_topk_ffi: queries_bytes length must be a multiple of 4",
+            ));
+        }
+        let total_floats = queries_bytes.len() / 4;
+        if total_floats % n_queries != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "_batch_topk_ffi: queries_bytes length must be divisible by n_queries",
+            ));
+        }
+        let dim = total_floats / n_queries;
+
+        // Parse raw LE f32 bytes into Vec<f32>
+        let queries_f32: Vec<f32> = queries_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let table_path = self.get_current_table_path()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+        let col_owned    = col.to_string();
+        let metric_str   = metric.to_string();
+        let n_q          = n_queries;
+
+        let (all_results, ids_map) = py.allow_threads(|| -> PyResult<(Vec<Vec<(usize, f32)>>, Vec<i64>)> {
+            let metric_enum = DistanceMetric::from_str(&metric_str).ok_or_else(|| {
+                PyRuntimeError::new_err(format!("_batch_topk_ffi: unknown metric '{}'", metric_str))
+            })?;
+
+            let backend = get_cached_backend_pub(&table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            // FAST PATH: mmap direct scan (FixedList → Binary fallback)
+            let batch_results = backend.batch_topk_fixedlist_direct(&col_owned, &queries_f32, n_q, k, metric_enum)
+                .ok().flatten()
+                .or_else(|| backend.batch_topk_binary_direct(&col_owned, &queries_f32, n_q, k, metric_enum).ok().flatten());
+
+            let all_results: Vec<Vec<(usize, f32)>> = if let Some(r) = batch_results {
+                r
+            } else {
+                // FALLBACK: load Arrow batch, run batch topk on FixedSizeListArray / BinaryArray
+                use arrow::array::{BinaryArray, FixedSizeListArray};
+                use crate::query::vector_ops::{topk_heap_direct_parallel, topk_heap_direct_parallel_fixed, DistanceComputer};
+
+                let needed: &[&str] = &[&col_owned, "_id"];
+                let full_batch = backend.read_columns_to_arrow(Some(needed), 0, None)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+                if full_batch.num_rows() == 0 {
+                    return Ok((vec![vec![]; n_q], vec![]));
+                }
+
+                let bin_col = full_batch.column_by_name(&col_owned).ok_or_else(|| {
+                    PyRuntimeError::new_err(format!("column '{}' not found", col_owned))
+                })?;
+
+                // Run N queries sequentially (Arrow fallback — uncommon path)
+                let mut results = Vec::with_capacity(n_q);
+                for qi in 0..n_q {
+                    let q = queries_f32[qi * dim..(qi + 1) * dim].to_vec();
+                    let computer = DistanceComputer::new(metric_enum, q);
+                    let topk = if let Some(fixed_arr) = bin_col.as_any().downcast_ref::<FixedSizeListArray>() {
+                        topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
+                    } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
+                        topk_heap_direct_parallel(bin_arr, &computer, k)
+                    } else {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "column '{}' is not a vector column", col_owned
+                        )));
+                    };
+                    results.push(topk);
+                }
+
+                let id_col = full_batch.column_by_name("_id");
+                let n_rows = full_batch.num_rows();
+                let ids: Vec<i64> = (0..n_rows).map(|i| {
+                    id_col.and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+                          .map(|a| a.value(i))
+                          .unwrap_or(i as i64)
+                }).collect();
+                return Ok((results, ids));
+            };
+
+            // Read _id column once to map row_idx → _id
+            let id_batch = backend.read_columns_to_arrow(Some(&["_id"]), 0, None)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let n_rows = id_batch.num_rows();
+            let id_col = id_batch.column_by_name("_id");
+            let ids: Vec<i64> = (0..n_rows).map(|i| {
+                id_col.and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+                      .map(|a| a.value(i))
+                      .unwrap_or(i as i64)
+            }).collect();
+
+            Ok((all_results, ids))
+        })?;
+
+        // Encode results as flat f64 bytes: (N × K × 2), row-major
+        // [i, j, 0] = id (as f64), [i, j, 1] = dist (as f64)
+        // Pad with (-1.0, f64::INFINITY) when fewer than k neighbours found.
+        let out_len = n_queries * k * 2;
+        let mut out: Vec<u8> = Vec::with_capacity(out_len * 8);
+        for qi in 0..n_queries {
+            let row = if qi < all_results.len() { &all_results[qi] } else { &[][..] };
+            for j in 0..k {
+                let (id_f64, dist_f64) = if j < row.len() {
+                    let (row_idx, dist) = row[j];
+                    let id = if row_idx < ids_map.len() { ids_map[row_idx] } else { row_idx as i64 };
+                    (id as f64, dist as f64)
+                } else {
+                    (-1.0f64, f64::INFINITY)
+                };
+                out.extend_from_slice(&id_f64.to_le_bytes());
+                out.extend_from_slice(&dist_f64.to_le_bytes());
+            }
+        }
+
+        Ok(PyBytes::new_bound(py, &out).into())
+    }
+
     /// Get FTS stats
     fn get_fts_stats(&self) -> PyResult<Option<(usize, usize)>> {
         let table_name = self.current_table.read().clone();

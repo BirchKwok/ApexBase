@@ -1045,6 +1045,56 @@ class ApexClient:
         )
         return self.execute(sql)
 
+    def batch_topk_distance(
+        self,
+        col: str,
+        queries,
+        k: int = 10,
+        metric: str = 'l2',
+    ):
+        """Batch heap-based TopK vector distance search — N queries in one Rust call.
+
+        Significantly faster than calling ``topk_distance`` N times because:
+
+        - The mmap float buffer (``scan_buf``) is loaded **once** regardless of N.
+        - All N queries run in **parallel** via Rayon (outer parallelism over queries).
+        - The ``_id`` column is read only once.
+
+        Args:
+            col:     Name of the vector column (FixedList or Binary).
+            queries: ``(N, D)`` array-like or numpy array of query vectors (float32/float64).
+            k:       Number of nearest neighbours per query (default 10).
+            metric:  Distance metric — same values accepted as :meth:`topk_distance`.
+
+        Returns:
+            ``numpy.ndarray`` of shape ``(N, K, 2)``, dtype ``float64``, where
+
+            - ``result[i, j, 0]``  is the ``_id`` of the j-th nearest neighbour for query i.
+            - ``result[i, j, 1]``  is the corresponding distance.
+
+            Each row is sorted ascending by distance.
+            Entries padded with ``(-1, inf)`` when fewer than *k* neighbours exist.
+
+        Example::
+
+            queries = np.random.rand(100, 128).astype(np.float32)
+            result = client.batch_topk_distance('vec', queries, k=10)
+            # result.shape == (100, 10, 2)
+            ids   = result[:, :, 0].astype(np.int64)   # (100, 10)
+            dists = result[:, :, 1]                     # (100, 10)
+        """
+        import numpy as np
+        self._check_connection()
+        self._ensure_table_selected()
+        queries = np.asarray(queries, dtype=np.float32)
+        if queries.ndim == 1:
+            queries = queries[np.newaxis, :]
+        if queries.ndim != 2:
+            raise ValueError("batch_topk_distance: queries must be a 2-D array of shape (N, D)")
+        n, _d = queries.shape
+        raw = self._storage._batch_topk_ffi(col, queries.tobytes(), n, k, metric)
+        return np.frombuffer(raw, dtype=np.float64).reshape(n, k, 2)
+
     def _validate_table_in_sql(self, sql: str) -> None:
         """Validate that table names in SQL exist (skip for multi-statement SQL)"""
         # Skip validation for multi-statement SQL (contains CREATE TABLE/VIEW)

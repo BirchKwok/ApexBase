@@ -48,25 +48,31 @@ pub fn bytes_to_query_vec_f32(bytes: &[u8]) -> Option<Vec<f32>> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// L2 squared distance (Σ(aᵢ−bᵢ)²).  No sqrt → safe for ordering.
+///
+/// Uses 4 independent accumulators (16-way unroll) to hide FMA latency
+/// (~4 cycles on NEON, ~5 on AVX2). LLVM maps each accumulator to a
+/// separate SIMD register, sustaining near-peak multiply-add throughput.
 #[inline(always)]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
-    let mut s = 0.0f32;
-    // 8-element unroll for AVX2 (256-bit / 32-bit = 8 lanes)
-    let c = n / 8;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let c = n / 16;
     for i in 0..c {
-        let base = i << 3;
-        let d0 = a[base]   - b[base];
-        let d1 = a[base+1] - b[base+1];
-        let d2 = a[base+2] - b[base+2];
-        let d3 = a[base+3] - b[base+3];
-        let d4 = a[base+4] - b[base+4];
-        let d5 = a[base+5] - b[base+5];
-        let d6 = a[base+6] - b[base+6];
-        let d7 = a[base+7] - b[base+7];
-        s += d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 + d7*d7;
+        let o = i * 16;
+        let (d0,  d1,  d2,  d3)  = (a[o]    - b[o],    a[o+1]  - b[o+1],  a[o+2]  - b[o+2],  a[o+3]  - b[o+3]);
+        let (d4,  d5,  d6,  d7)  = (a[o+4]  - b[o+4],  a[o+5]  - b[o+5],  a[o+6]  - b[o+6],  a[o+7]  - b[o+7]);
+        let (d8,  d9,  d10, d11) = (a[o+8]  - b[o+8],  a[o+9]  - b[o+9],  a[o+10] - b[o+10], a[o+11] - b[o+11]);
+        let (d12, d13, d14, d15) = (a[o+12] - b[o+12], a[o+13] - b[o+13], a[o+14] - b[o+14], a[o+15] - b[o+15]);
+        s0 += d0*d0   + d1*d1   + d2*d2   + d3*d3;
+        s1 += d4*d4   + d5*d5   + d6*d6   + d7*d7;
+        s2 += d8*d8   + d9*d9   + d10*d10 + d11*d11;
+        s3 += d12*d12 + d13*d13 + d14*d14 + d15*d15;
     }
-    for i in (c*8)..n {
+    let mut s = s0 + s1 + s2 + s3;
+    for i in (c * 16)..n {
         let d = a[i] - b[i];
         s += d * d;
     }
@@ -80,52 +86,77 @@ pub fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// L1 (Manhattan) distance Σ|aᵢ−bᵢ|.
+///
+/// 4 independent accumulators hide the abs+add latency chain.
+/// NEON maps abs to `FABS`, AVX2 uses a sign-mask `VANDNPS`.
 #[inline(always)]
 pub fn l1_distance(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
-    let mut s = 0.0f32;
-    let c = n / 8;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let c = n / 16;
     for i in 0..c {
-        let base = i << 3;
-        s += (a[base]   - b[base]).abs()
-           + (a[base+1] - b[base+1]).abs()
-           + (a[base+2] - b[base+2]).abs()
-           + (a[base+3] - b[base+3]).abs()
-           + (a[base+4] - b[base+4]).abs()
-           + (a[base+5] - b[base+5]).abs()
-           + (a[base+6] - b[base+6]).abs()
-           + (a[base+7] - b[base+7]).abs();
+        let o = i * 16;
+        s0 += (a[o]    - b[o]).abs()    + (a[o+1]  - b[o+1]).abs()  + (a[o+2]  - b[o+2]).abs()  + (a[o+3]  - b[o+3]).abs();
+        s1 += (a[o+4]  - b[o+4]).abs()  + (a[o+5]  - b[o+5]).abs()  + (a[o+6]  - b[o+6]).abs()  + (a[o+7]  - b[o+7]).abs();
+        s2 += (a[o+8]  - b[o+8]).abs()  + (a[o+9]  - b[o+9]).abs()  + (a[o+10] - b[o+10]).abs() + (a[o+11] - b[o+11]).abs();
+        s3 += (a[o+12] - b[o+12]).abs() + (a[o+13] - b[o+13]).abs() + (a[o+14] - b[o+14]).abs() + (a[o+15] - b[o+15]).abs();
     }
-    for i in (c*8)..n {
+    let mut s = s0 + s1 + s2 + s3;
+    for i in (c * 16)..n {
         s += (a[i] - b[i]).abs();
     }
     s
 }
 
 /// L∞ (Chebyshev) distance max|aᵢ−bᵢ|.
+///
+/// 4 independent max lanes allow SIMD vectorization (NEON `FMAX`, AVX2 `VMAXPS`).
 #[inline(always)]
 pub fn linf_distance(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
-    let mut m = 0.0f32;
-    for i in 0..n {
-        let d = (a[i] - b[i]).abs();
-        if d > m { m = d; }
+    let mut m0 = 0.0f32;
+    let mut m1 = 0.0f32;
+    let mut m2 = 0.0f32;
+    let mut m3 = 0.0f32;
+    let c = n / 16;
+    for i in 0..c {
+        let o = i * 16;
+        m0 = m0.max((a[o]    - b[o]).abs()).max((a[o+1]  - b[o+1]).abs()).max((a[o+2]  - b[o+2]).abs()).max((a[o+3]  - b[o+3]).abs());
+        m1 = m1.max((a[o+4]  - b[o+4]).abs()).max((a[o+5]  - b[o+5]).abs()).max((a[o+6]  - b[o+6]).abs()).max((a[o+7]  - b[o+7]).abs());
+        m2 = m2.max((a[o+8]  - b[o+8]).abs()).max((a[o+9]  - b[o+9]).abs()).max((a[o+10] - b[o+10]).abs()).max((a[o+11] - b[o+11]).abs());
+        m3 = m3.max((a[o+12] - b[o+12]).abs()).max((a[o+13] - b[o+13]).abs()).max((a[o+14] - b[o+14]).abs()).max((a[o+15] - b[o+15]).abs());
+    }
+    let mut m = m0.max(m1).max(m2).max(m3);
+    for i in (c * 16)..n {
+        m = m.max((a[i] - b[i]).abs());
     }
     m
 }
 
 /// Dot product Σ aᵢ·bᵢ.
+///
+/// 4 independent accumulators hide FMA latency and enable
+/// out-of-order execution across 4 NEON/AVX2 multiply-add pipelines.
 #[inline(always)]
 pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
-    let mut s = 0.0f32;
-    let c = n / 8;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let c = n / 16;
     for i in 0..c {
-        let base = i << 3;
-        s += a[base]*b[base] + a[base+1]*b[base+1] + a[base+2]*b[base+2] + a[base+3]*b[base+3]
-           + a[base+4]*b[base+4] + a[base+5]*b[base+5] + a[base+6]*b[base+6] + a[base+7]*b[base+7];
+        let o = i * 16;
+        s0 += a[o]*b[o]     + a[o+1]*b[o+1]   + a[o+2]*b[o+2]   + a[o+3]*b[o+3];
+        s1 += a[o+4]*b[o+4] + a[o+5]*b[o+5]   + a[o+6]*b[o+6]   + a[o+7]*b[o+7];
+        s2 += a[o+8]*b[o+8] + a[o+9]*b[o+9]   + a[o+10]*b[o+10] + a[o+11]*b[o+11];
+        s3 += a[o+12]*b[o+12] + a[o+13]*b[o+13] + a[o+14]*b[o+14] + a[o+15]*b[o+15];
     }
-    for i in (c*8)..n {
+    let mut s = s0 + s1 + s2 + s3;
+    for i in (c * 16)..n {
         s += a[i] * b[i];
     }
     s
@@ -143,27 +174,36 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 /// Cosine similarity with **pre-computed query norm** `nb = ‖b‖`.
 ///
-/// Fuses the dot-product and ‖a‖ computation into a single 8-way unrolled pass,
-/// avoiding the extra full pass over `a` that the two-call version would need.
-/// `nb` should be computed once per query (not once per row).
+/// Fuses dot-product and ‖a‖² into a single 16-way pass with 8 independent
+/// accumulators (4 for dot, 4 for norm²). On NEON this maps to 8 `VFMLA`
+/// chains executing in parallel; on AVX2 to 8 `VFMADD231PS` chains.
+/// `nb` is pre-computed once per query by `DistanceComputer::new`.
 #[inline(always)]
 pub fn cosine_similarity_fused(a: &[f32], b: &[f32], nb: f32) -> f32 {
     let n = a.len().min(b.len());
-    let mut dot = 0.0f32;
-    let mut na2 = 0.0f32;
-    let c = n / 8;
+    let mut dot0 = 0.0f32; let mut na0 = 0.0f32;
+    let mut dot1 = 0.0f32; let mut na1 = 0.0f32;
+    let mut dot2 = 0.0f32; let mut na2 = 0.0f32;
+    let mut dot3 = 0.0f32; let mut na3 = 0.0f32;
+    let c = n / 16;
     for i in 0..c {
-        let base = i << 3;
-        dot += a[base]*b[base] + a[base+1]*b[base+1] + a[base+2]*b[base+2] + a[base+3]*b[base+3]
-             + a[base+4]*b[base+4] + a[base+5]*b[base+5] + a[base+6]*b[base+6] + a[base+7]*b[base+7];
-        na2 += a[base]*a[base] + a[base+1]*a[base+1] + a[base+2]*a[base+2] + a[base+3]*a[base+3]
-             + a[base+4]*a[base+4] + a[base+5]*a[base+5] + a[base+6]*a[base+6] + a[base+7]*a[base+7];
+        let o = i * 16;
+        dot0 += a[o]*b[o]     + a[o+1]*b[o+1]   + a[o+2]*b[o+2]   + a[o+3]*b[o+3];
+        na0  += a[o]*a[o]     + a[o+1]*a[o+1]   + a[o+2]*a[o+2]   + a[o+3]*a[o+3];
+        dot1 += a[o+4]*b[o+4] + a[o+5]*b[o+5]   + a[o+6]*b[o+6]   + a[o+7]*b[o+7];
+        na1  += a[o+4]*a[o+4] + a[o+5]*a[o+5]   + a[o+6]*a[o+6]   + a[o+7]*a[o+7];
+        dot2 += a[o+8]*b[o+8] + a[o+9]*b[o+9]   + a[o+10]*b[o+10] + a[o+11]*b[o+11];
+        na2  += a[o+8]*a[o+8] + a[o+9]*a[o+9]   + a[o+10]*a[o+10] + a[o+11]*a[o+11];
+        dot3 += a[o+12]*b[o+12] + a[o+13]*b[o+13] + a[o+14]*b[o+14] + a[o+15]*b[o+15];
+        na3  += a[o+12]*a[o+12] + a[o+13]*a[o+13] + a[o+14]*a[o+14] + a[o+15]*a[o+15];
     }
-    for i in (c*8)..n {
-        dot += a[i] * b[i];
-        na2 += a[i] * a[i];
+    let mut dot = dot0 + dot1 + dot2 + dot3;
+    let mut na_sq = na0 + na1 + na2 + na3;
+    for i in (c * 16)..n {
+        dot  += a[i] * b[i];
+        na_sq += a[i] * a[i];
     }
-    let na = na2.sqrt();
+    let na = na_sq.sqrt();
     if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
 }
 
@@ -852,6 +892,112 @@ pub fn topk_heap_on_floats(
         .collect();
     result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     result
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Batch TopK: N queries in parallel, sequential inner scan per query
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Single-query sequential TopK on a raw contiguous `&[f32]` (no Rayon overhead).
+/// Used by `batch_topk_on_floats` where outer parallelism is over N queries.
+/// Returns `Vec<(row_index, f32_distance)>` sorted ascending (nearest first).
+fn topk_sequential_on_floats(
+    floats: &[f32],
+    n_rows: usize,
+    dim: usize,
+    computer: &DistanceComputer,
+    k: usize,
+) -> Vec<(usize, f32)> {
+    use std::collections::BinaryHeap;
+    use std::cmp::Ordering;
+
+    #[derive(Copy, Clone)]
+    struct Entry(u32, usize);
+    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
+    impl Eq         for Entry {}
+    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+    impl Ord        for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+
+    let float_len = floats.len();
+    let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k + 1);
+    for i in 0..n_rows {
+        let off = i * dim;
+        if off + dim > float_len { break; }
+        let vec = unsafe { floats.get_unchecked(off..off + dim) };
+        let dist = computer.compute(vec);
+        if dist.is_nan() { continue; }
+        let bits = dist.to_bits();
+        if heap.len() < k {
+            heap.push(Entry(bits, i));
+        } else if let Some(&Entry(top, _)) = heap.peek() {
+            if bits < top { heap.pop(); heap.push(Entry(bits, i)); }
+        }
+    }
+    let mut result: Vec<(usize, f32)> = heap.into_iter()
+        .map(|Entry(b, i)| (i, f32::from_bits(b)))
+        .collect();
+    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    result
+}
+
+/// Adaptive batch TopK on a raw contiguous `&[f32]` database.
+///
+/// Chooses the best parallelism strategy based on N vs num_threads:
+/// - **N < num_threads**: sequential over queries, each using the full Rayon pool
+///   for row-level parallelism (same as N individual `topk_heap_on_floats` calls).
+/// - **N ≥ num_threads**: outer Rayon over queries, sequential inner per query;
+///   avoids nested Rayon contention and scales well when N >> threads.
+///
+/// `floats`:  `n_rows × dim`, row-major — the stored database vectors.
+/// `queries`: `n_queries × dim`, row-major — the query vectors.
+///
+/// Returns `Vec<Vec<(row_index, f32_distance)>>` of length `n_queries`,
+/// each inner Vec sorted ascending (nearest first) and capped at `k`.
+pub fn batch_topk_on_floats(
+    floats: &[f32],
+    n_rows: usize,
+    dim: usize,
+    queries: &[f32],
+    n_queries: usize,
+    k: usize,
+    metric: DistanceMetric,
+) -> Vec<Vec<(usize, f32)>> {
+    use rayon::prelude::*;
+
+    if k == 0 || n_rows == 0 || dim == 0 || n_queries == 0 {
+        return vec![vec![]; n_queries];
+    }
+    let k_capped   = k.min(n_rows);
+    let t          = rayon::current_num_threads().max(1);
+    let float_ptr  = floats.as_ptr()  as usize;
+    let float_len  = floats.len();
+    let query_ptr  = queries.as_ptr() as usize;
+    let query_len  = queries.len();
+
+    if n_queries < t {
+        // N < threads: inner-parallel per query (full Rayon pool on each query's rows).
+        // Same perf as N individual topk_heap_on_floats calls, but all within one
+        // py.allow_threads scope → saves N-1 Python→Rust transitions + N-1 _id reads.
+        (0..n_queries).map(|qi| {
+            let queries = unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
+            let q_slice = &queries[qi * dim..(qi + 1) * dim];
+            let computer = DistanceComputer::new(metric, q_slice.to_vec());
+            topk_heap_on_floats(floats, n_rows, dim, &computer, k_capped)
+        }).collect()
+    } else {
+        // N >= threads: outer-parallel over queries, sequential inner per query.
+        // Each Rayon thread handles N/T queries sequentially — no nested contention.
+        (0..n_queries)
+            .into_par_iter()
+            .map(|qi| {
+                let floats  = unsafe { std::slice::from_raw_parts(float_ptr as *const f32, float_len) };
+                let queries = unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
+                let q_slice = &queries[qi * dim..(qi + 1) * dim];
+                let computer = DistanceComputer::new(metric, q_slice.to_vec());
+                topk_sequential_on_floats(floats, n_rows, dim, &computer, k_capped)
+            })
+            .collect()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

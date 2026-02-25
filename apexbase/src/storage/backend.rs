@@ -1173,6 +1173,31 @@ impl TableStorageBackend {
         self.storage.topk_fixedlist_direct(col_name, computer, k)
     }
 
+    /// Batch parallel TopK for a FixedList column — N queries in one call.
+    /// Loads `scan_buf` once and runs all queries in parallel; much faster than N sequential calls.
+    pub fn batch_topk_fixedlist_direct(
+        &self,
+        col_name: &str,
+        queries: &[f32],
+        n_queries: usize,
+        k: usize,
+        metric: crate::query::vector_ops::DistanceMetric,
+    ) -> io::Result<Option<Vec<Vec<(usize, f32)>>>> {
+        self.storage.batch_topk_fixedlist_direct(col_name, queries, n_queries, k, metric)
+    }
+
+    /// Batch parallel TopK for a Binary vector column — N queries in one call.
+    pub fn batch_topk_binary_direct(
+        &self,
+        col_name: &str,
+        queries: &[f32],
+        n_queries: usize,
+        k: usize,
+        metric: crate::query::vector_ops::DistanceMetric,
+    ) -> io::Result<Option<Vec<Vec<(usize, f32)>>>> {
+        self.storage.batch_topk_binary_direct(col_name, queries, n_queries, k, metric)
+    }
+
     /// Read columns to Arrow with dictionary encoding for low-cardinality string columns.
     /// Use this for GROUP BY queries where DictionaryArray accelerates aggregation.
     pub fn read_columns_to_arrow_dict(
