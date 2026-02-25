@@ -276,6 +276,12 @@ impl IndexManager {
         self.column_index_map.contains_key(column_name)
     }
 
+    /// Returns true when this table has no indexes at all — used as a fast CBO bypass.
+    #[inline]
+    pub fn catalog_is_empty(&self) -> bool {
+        self.catalog.is_empty()
+    }
+
     // ========================================================================
     // Index Lifecycle
     // ========================================================================

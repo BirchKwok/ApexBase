@@ -147,26 +147,30 @@ impl ApexExecutor {
                             }
                         }
 
-                        // CBO: Use plan_with_stats() to decide execution strategy.
+                        // CBO: Use plan_select_pub() to decide execution strategy.
                         // Skip expensive index checks when CBO recommends full scan or aggregation.
-                        // Also skip CBO entirely for trivial queries (no WHERE = no index possible).
+                        // Also skip CBO entirely for: (a) no WHERE clause, (b) table has no indexes.
                         let cbo_skip_index = if stmt.where_clause.is_none() {
                             true
                         } else {
-                            let cbo_strategy = {
+                            let (bd, tname) = base_dir_and_table(storage_path);
+                            let idx_mgr_arc = get_index_manager(&bd, &tname);
+                            let idx_mgr = idx_mgr_arc.lock();
+                            // Fast exit: if table has no indexes, CBO can only say full/filtered scan
+                            if idx_mgr.catalog_is_empty() {
+                                true
+                            } else {
                                 let table_key = storage_path.to_string_lossy();
-                                let (bd, tname) = base_dir_and_table(storage_path);
-                                let idx_mgr_arc = get_index_manager(&bd, &tname);
-                                let idx_mgr = idx_mgr_arc.lock();
-                                let sql_stmt = SqlStatement::Select(stmt.clone());
-                                QueryPlanner::plan_with_stats(&sql_stmt, Some(&*idx_mgr), &table_key)
-                            };
-                            matches!(
-                                cbo_strategy,
-                                ExecutionStrategy::OlapFullScan
-                                | ExecutionStrategy::OlapAggregation
-                                | ExecutionStrategy::OlapFilteredScan
-                            )
+                                let cbo_strategy = QueryPlanner::plan_select_pub(
+                                    &stmt, Some(&*idx_mgr), &table_key,
+                                );
+                                matches!(
+                                    cbo_strategy,
+                                    ExecutionStrategy::OlapFullScan
+                                    | ExecutionStrategy::OlapAggregation
+                                    | ExecutionStrategy::OlapFilteredScan
+                                )
+                            }
                         };
 
                         // FAST PATH INDEX: Check if WHERE clause can use a secondary index
@@ -1785,9 +1789,46 @@ impl ApexExecutor {
         let where_clause = stmt.where_clause.as_ref().unwrap();
         let need_count = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
 
-        // FAST PATH: no LIMIT → full sequential read + vectorized Arrow filter
-        // This beats chunked reads + random index access (400K random seeks > 1 sequential scan).
+        // FAST PATH: no LIMIT.
+        // For large tables with selective WHERE clauses, use column-pruning late materialization:
+        //   1. Read only the filter column(s) — a small fraction of total data
+        //   2. Apply predicate → collect matching row indices
+        //   3. If < 40% rows match: read only matching rows via scatter (read_columns_by_indices)
+        //   4. Otherwise: fall back to full sequential read + vectorized Arrow filter
+        // This avoids reading N×unmatched_rows×col_width of data for typical filters like
+        // BETWEEN, LIKE prefix, IN on low-cardinality columns.
         if need_count.is_none() {
+            let total_rows = backend.row_count() as usize;
+            // Only bother for tables > 50K rows (below that, full scan is cheap)
+            if total_rows > 50_000 && !backend.has_pending_deltas() {
+                let filter_cols = stmt.where_columns();
+                // Proceed if WHERE references ≤ 2 columns (covers BETWEEN, LIKE, IN, single-range)
+                if !filter_cols.is_empty() && filter_cols.len() <= 2 {
+                    let mut cols_to_read: Vec<&str> = Vec::with_capacity(filter_cols.len() + 1);
+                    cols_to_read.push("_id");
+                    for c in &filter_cols {
+                        cols_to_read.push(c.as_str());
+                    }
+                    let filter_batch = backend.read_columns_to_arrow(Some(&cols_to_read), 0, None)?;
+                    if filter_batch.num_rows() > 0 {
+                        let mask = Self::evaluate_predicate_with_storage(&filter_batch, where_clause, storage_path)?;
+                        let true_count = mask.true_count();
+                        // Late materialization threshold: < 40% of rows matched
+                        if true_count < total_rows * 2 / 5 {
+                            if true_count == 0 {
+                                return Ok(filter_batch); // empty result with partial schema
+                            }
+                            let indices: Vec<usize> = mask.iter().enumerate()
+                                .filter(|(_, v)| *v == Some(true))
+                                .map(|(i, _)| i)
+                                .collect();
+                            return backend.read_columns_by_indices_to_arrow(&indices);
+                        }
+                        // ≥ 40% matched: full sequential + filter is cheaper
+                    }
+                }
+            }
+            // Fallback: full sequential read + vectorized Arrow filter
             let full_batch = backend.read_columns_to_arrow(None, 0, None)?;
             if full_batch.num_rows() > 0 {
                 let mask = Self::evaluate_predicate_with_storage(&full_batch, where_clause, storage_path)?;

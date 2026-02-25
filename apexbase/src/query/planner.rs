@@ -414,6 +414,16 @@ impl QueryPlanner {
         }
     }
 
+    /// Plan SELECT with CBO — takes &SelectStatement directly, avoiding a clone at the call site.
+    pub fn plan_select_pub(
+        select: &SelectStatement,
+        index_manager: Option<&IndexManager>,
+        table_key: &str,
+    ) -> ExecutionStrategy {
+        let stats = get_table_stats(table_key);
+        Self::plan_select_with_stats(select, index_manager, stats.as_ref())
+    }
+
     /// Plan SELECT with cost-based optimization using ANALYZE stats
     fn plan_select_with_stats(
         select: &SelectStatement,

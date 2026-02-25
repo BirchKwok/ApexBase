@@ -3128,90 +3128,157 @@ impl ApexExecutor {
         }
     }
 
-    /// Evaluate IN expression with Value list
+    /// Evaluate IN expression with Value list.
+    /// Fast path for string columns: builds an AHashSet and does a single O(N) scan
+    /// instead of K separate vectorized-eq passes (K = number of IN values).
     fn evaluate_in_values(
         batch: &RecordBatch,
         column: &str,
         values: &[Value],
         negated: bool,
     ) -> io::Result<BooleanArray> {
+        use ahash::AHashSet;
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt32Type;
+
         let col_name = column.trim_matches('"');
         let target = Self::get_column_by_name(batch, col_name)
             .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
         let num_rows = batch.num_rows();
-        
-        // Start with all false
+
+        // Fast path: all IN values are strings → use AHashSet for O(1) lookup per row
+        let all_strings = values.iter().all(|v| matches!(v, Value::String(_)));
+        if all_strings {
+            let str_set: AHashSet<&str> = values.iter()
+                .filter_map(|v| if let Value::String(s) = v { Some(s.as_str()) } else { None })
+                .collect();
+
+            let result: BooleanArray = if let Some(sa) = target.as_any().downcast_ref::<StringArray>() {
+                sa.iter().map(|opt| opt.map(|s| str_set.contains(s)).unwrap_or(false)).collect()
+            } else if let Some(da) = target.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+                let vals = da.values();
+                let sv = vals.as_any().downcast_ref::<StringArray>()
+                    .ok_or_else(|| err_data("Dictionary values must be strings"))?;
+                let keys = da.keys();
+                // Check which dictionary values are in the set (only iterate unique dict entries)
+                let dict_match: Vec<bool> = (0..sv.len())
+                    .map(|k| !sv.is_null(k) && str_set.contains(sv.value(k)))
+                    .collect();
+                (0..num_rows).map(|i| {
+                    if keys.is_null(i) { false }
+                    else { dict_match.get(keys.value(i) as usize).copied().unwrap_or(false) }
+                }).collect()
+            } else {
+                // Non-string column: fall back to generic path
+                let mut result = BooleanArray::from(vec![false; num_rows]);
+                for val in values {
+                    let va = Self::value_to_array(val, num_rows)?;
+                    result = compute::or(&result, &cmp::eq(target, &va).map_err(|e| err_data(e.to_string()))?)
+                        .map_err(|e| err_data(e.to_string()))?;
+                }
+                result
+            };
+
+            return if negated {
+                compute::not(&result).map_err(|e| err_data(e.to_string()))
+            } else {
+                Ok(result)
+            };
+        }
+
+        // Generic path for numeric IN values (vectorized eq + or)
         let mut result = BooleanArray::from(vec![false; num_rows]);
-        
         for val in values {
             let val_array = Self::value_to_array(val, num_rows)?;
             let eq_mask = cmp::eq(target, &val_array)
-                .map_err(|e| err_data( e.to_string()))?;
+                .map_err(|e| err_data(e.to_string()))?;
             result = compute::or(&result, &eq_mask)
-                .map_err(|e| err_data( e.to_string()))?;
+                .map_err(|e| err_data(e.to_string()))?;
         }
-        
         if negated {
-            compute::not(&result)
-                .map_err(|e| err_data( e.to_string()))
+            compute::not(&result).map_err(|e| err_data(e.to_string()))
         } else {
             Ok(result)
         }
     }
 
-    /// Evaluate LIKE expression
+    /// Parse a SQL LIKE pattern into a fast-match closure, avoiding regex for simple cases.
+    fn like_pattern_to_matcher(pattern: &str) -> io::Result<Box<dyn Fn(&str) -> bool + Send + Sync>> {
+        let bytes = pattern.as_bytes();
+        let len = bytes.len();
+        // Check for wildcards (_ is single-char wildcard, % is any-length)
+        let has_underscore = bytes.iter().any(|&b| b == b'_');
+        let leading_pct  = !bytes.is_empty() && bytes[0] == b'%';
+        let trailing_pct = !bytes.is_empty() && bytes[len - 1] == b'%';
+        // Inner = pattern without leading/trailing %
+        let inner_start = if leading_pct { 1 } else { 0 };
+        let inner_end   = if trailing_pct && len > 0 { len - 1 } else { len };
+        let inner = if inner_start <= inner_end { &pattern[inner_start..inner_end] } else { "" };
+        let inner_has_wildcard = inner.contains(['%', '_']);
+
+        if !has_underscore && !leading_pct && trailing_pct && !inner_has_wildcard {
+            // "prefix%" — starts_with
+            let prefix = inner.to_string();
+            Ok(Box::new(move |s: &str| s.starts_with(prefix.as_str())))
+        } else if !has_underscore && leading_pct && !trailing_pct && !inner_has_wildcard {
+            // "%suffix" — ends_with
+            let suffix = inner.to_string();
+            Ok(Box::new(move |s: &str| s.ends_with(suffix.as_str())))
+        } else if !has_underscore && leading_pct && trailing_pct && !inner_has_wildcard {
+            // "%substr%" — contains
+            let substr = inner.to_string();
+            Ok(Box::new(move |s: &str| s.contains(substr.as_str())))
+        } else if !has_underscore && !leading_pct && !trailing_pct && !inner_has_wildcard {
+            // Exact match (no wildcards at all)
+            let exact = pattern.to_string();
+            Ok(Box::new(move |s: &str| s == exact.as_str()))
+        } else {
+            // Complex pattern: compile regex once
+            let regex_pat = Self::like_to_regex(pattern);
+            let re = regex::Regex::new(&regex_pat).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            Ok(Box::new(move |s: &str| re.is_match(s)))
+        }
+    }
+
+    /// Evaluate LIKE expression.
+    /// Fast path for simple patterns: starts_with / ends_with / contains — no regex overhead.
     fn evaluate_like(
         batch: &RecordBatch,
         column: &str,
         pattern: &str,
         negated: bool,
     ) -> io::Result<BooleanArray> {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt32Type;
+
         let col_name = column.trim_matches('"');
         let array = Self::get_column_by_name(batch, col_name)
             .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
-        
-        // Convert SQL LIKE pattern to regex
-        let regex_pattern = Self::like_to_regex(pattern);
-        let regex = regex::Regex::new(&regex_pattern)
-            .map_err(|e| err_input( e.to_string()))?;
-        
-        // Handle both StringArray and DictionaryArray
-        use arrow::array::DictionaryArray;
-        use arrow::datatypes::UInt32Type;
-        
+
+        let matcher = Self::like_pattern_to_matcher(pattern)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
         let result: BooleanArray = if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-            string_array
-                .iter()
-                .map(|opt| opt.map(|s| regex.is_match(s)).unwrap_or(false))
-                .collect()
+            string_array.iter().map(|opt| opt.map(|s| matcher(s)).unwrap_or(false)).collect()
         } else if let Some(dict_array) = array.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
-            // Handle dictionary-encoded string columns
             let values = dict_array.values();
             let str_values = values.as_any().downcast_ref::<StringArray>()
-                .ok_or_else(|| err_data( "Dictionary values must be strings"))?;
+                .ok_or_else(|| err_data("Dictionary values must be strings"))?;
             let keys = dict_array.keys();
-            
-            (0..dict_array.len())
-                .map(|i| {
-                    if keys.is_null(i) {
-                        false
-                    } else {
-                        let key = keys.value(i) as usize;
-                        if key < str_values.len() && !str_values.is_null(key) {
-                            regex.is_match(str_values.value(key))
-                        } else {
-                            false
-                        }
-                    }
-                })
-                .collect()
+            // Apply matcher only to unique dictionary entries, then map by key
+            let dict_match: Vec<bool> = (0..str_values.len())
+                .map(|k| !str_values.is_null(k) && matcher(str_values.value(k)))
+                .collect();
+            (0..dict_array.len()).map(|i| {
+                if keys.is_null(i) { false }
+                else { dict_match.get(keys.value(i) as usize).copied().unwrap_or(false) }
+            }).collect()
         } else {
-            return Err(err_data( "LIKE requires string column"));
+            return Err(err_data("LIKE requires string column"));
         };
-        
+
         if negated {
-            compute::not(&result)
-                .map_err(|e| err_data( e.to_string()))
+            compute::not(&result).map_err(|e| err_data(e.to_string()))
         } else {
             Ok(result)
         }

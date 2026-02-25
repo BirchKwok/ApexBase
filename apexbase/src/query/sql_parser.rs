@@ -624,9 +624,9 @@ enum Token {
 impl SqlParser {
     /// Parse a SQL statement
     pub fn parse(sql: &str) -> Result<SqlStatement, ApexError> {
-        let tokens = Self::tokenize(sql)?;
+        let (sql_chars, tokens) = Self::tokenize(sql)?;
         let mut parser = SqlParser {
-            sql_chars: sql.chars().collect(),
+            sql_chars,
             tokens,
             pos: 0,
         };
@@ -649,9 +649,9 @@ impl SqlParser {
 
     /// Parse multiple SQL statements separated by semicolons.
     pub fn parse_multi(sql: &str) -> Result<Vec<SqlStatement>, ApexError> {
-        let tokens = Self::tokenize(sql)?;
+        let (sql_chars, tokens) = Self::tokenize(sql)?;
         let mut parser = SqlParser {
-            sql_chars: sql.chars().collect(),
+            sql_chars,
             tokens,
             pos: 0,
         };
@@ -662,9 +662,9 @@ impl SqlParser {
     ///
     /// This is used to unify the non-SQL query language with SQL semantics.
     pub fn parse_expression(expr: &str) -> Result<SqlExpr, ApexError> {
-        let tokens = Self::tokenize(expr)?;
+        let (sql_chars, tokens) = Self::tokenize(expr)?;
         let mut parser = SqlParser {
-            sql_chars: expr.chars().collect(),
+            sql_chars,
             tokens,
             pos: 0,
         };
@@ -681,33 +681,35 @@ impl SqlParser {
         Ok(e)
     }
 
-    /// Tokenize SQL string
-    fn tokenize(sql: &str) -> Result<Vec<SpannedToken>, ApexError> {
-        let mut tokens: Vec<SpannedToken> = Vec::new();
-        let chars: Vec<char> = sql.chars().collect();
-        let len = chars.len();
+    /// Tokenize SQL string — returns (sql_chars for error reporting, token list).
+    /// Uses byte-level scanning for cache-friendly 4x smaller working set vs Vec<char>.
+    /// SQL is ASCII; `'`/`"` delimiters can never appear inside a multi-byte UTF-8 sequence.
+    fn tokenize(sql: &str) -> Result<(Vec<char>, Vec<SpannedToken>), ApexError> {
+        let mut tokens: Vec<SpannedToken> = Vec::with_capacity(sql.len() / 4 + 8);
+        let bytes = sql.as_bytes(); // no allocation: reference into existing str
+        let len = bytes.len();
         let mut i = 0;
 
         while i < len {
-            let c = chars[i];
+            let c = bytes[i];
 
             // Skip whitespace
-            if c.is_whitespace() {
+            if c.is_ascii_whitespace() {
                 i += 1;
                 continue;
             }
 
             // -- line comment: skip to end of line
-            if c == '-' && i + 1 < len && chars[i + 1] == '-' {
+            if c == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
                 i += 2;
-                while i < len && chars[i] != '\n' {
+                while i < len && bytes[i] != b'\n' {
                     i += 1;
                 }
                 continue;
             }
 
             // /* block comment */: skip to closing */
-            if c == '/' && i + 1 < len && chars[i + 1] == '*' {
+            if c == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
                 i += 2;
                 loop {
                     if i + 1 >= len {
@@ -715,7 +717,7 @@ impl SqlParser {
                             "Unterminated block comment /* ... */".to_string(),
                         ));
                     }
-                    if chars[i] == '*' && chars[i + 1] == '/' {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
                         i += 2;
                         break;
                     }
@@ -726,34 +728,34 @@ impl SqlParser {
 
             // Single character tokens
             match c {
-                '*' => { tokens.push(SpannedToken { token: Token::Star, start: i, end: i + 1 }); i += 1; continue; }
-                ',' => { tokens.push(SpannedToken { token: Token::Comma, start: i, end: i + 1 }); i += 1; continue; }
-                '.' => { tokens.push(SpannedToken { token: Token::Dot, start: i, end: i + 1 }); i += 1; continue; }
-                '(' => { tokens.push(SpannedToken { token: Token::LParen, start: i, end: i + 1 }); i += 1; continue; }
-                ')' => { tokens.push(SpannedToken { token: Token::RParen, start: i, end: i + 1 }); i += 1; continue; }
-                ';' => { tokens.push(SpannedToken { token: Token::Semicolon, start: i, end: i + 1 }); i += 1; continue; }
-                '+' => { tokens.push(SpannedToken { token: Token::Plus, start: i, end: i + 1 }); i += 1; continue; }
-                '-' => { tokens.push(SpannedToken { token: Token::Minus, start: i, end: i + 1 }); i += 1; continue; }
-                '/' => { tokens.push(SpannedToken { token: Token::Slash, start: i, end: i + 1 }); i += 1; continue; }
-                '%' => { tokens.push(SpannedToken { token: Token::Percent, start: i, end: i + 1 }); i += 1; continue; }
-                '[' => { tokens.push(SpannedToken { token: Token::LBracket, start: i, end: i + 1 }); i += 1; continue; }
-                ']' => { tokens.push(SpannedToken { token: Token::RBracket, start: i, end: i + 1 }); i += 1; continue; }
+                b'*' => { tokens.push(SpannedToken { token: Token::Star, start: i, end: i + 1 }); i += 1; continue; }
+                b',' => { tokens.push(SpannedToken { token: Token::Comma, start: i, end: i + 1 }); i += 1; continue; }
+                b'.' => { tokens.push(SpannedToken { token: Token::Dot, start: i, end: i + 1 }); i += 1; continue; }
+                b'(' => { tokens.push(SpannedToken { token: Token::LParen, start: i, end: i + 1 }); i += 1; continue; }
+                b')' => { tokens.push(SpannedToken { token: Token::RParen, start: i, end: i + 1 }); i += 1; continue; }
+                b';' => { tokens.push(SpannedToken { token: Token::Semicolon, start: i, end: i + 1 }); i += 1; continue; }
+                b'+' => { tokens.push(SpannedToken { token: Token::Plus, start: i, end: i + 1 }); i += 1; continue; }
+                b'-' => { tokens.push(SpannedToken { token: Token::Minus, start: i, end: i + 1 }); i += 1; continue; }
+                b'/' => { tokens.push(SpannedToken { token: Token::Slash, start: i, end: i + 1 }); i += 1; continue; }
+                b'%' => { tokens.push(SpannedToken { token: Token::Percent, start: i, end: i + 1 }); i += 1; continue; }
+                b'[' => { tokens.push(SpannedToken { token: Token::LBracket, start: i, end: i + 1 }); i += 1; continue; }
+                b']' => { tokens.push(SpannedToken { token: Token::RBracket, start: i, end: i + 1 }); i += 1; continue; }
                 _ => {}
             }
 
             // Multi-character operators
-            if c == '=' {
+            if c == b'=' {
                 tokens.push(SpannedToken { token: Token::Eq, start: i, end: i + 1 });
                 i += 1;
                 continue;
             }
 
             // Double-quoted identifier: "identifier"
-            if c == '"' {
+            if c == b'"' {
                 let start0 = i;
-                i += 1; // skip opening quote
+                i += 1;
                 let start = i;
-                while i < len && chars[i] != '"' {
+                while i < len && bytes[i] != b'"' {
                     i += 1;
                 }
                 if i >= len {
@@ -762,16 +764,16 @@ impl SqlParser {
                         start0
                     )));
                 }
-                let ident: String = chars[start..i].iter().collect();
-                i += 1; // skip closing quote
+                let ident = sql[start..i].to_string();
+                i += 1;
                 tokens.push(SpannedToken { token: Token::Identifier(ident), start: start0, end: i });
                 continue;
             }
-            if c == '\'' {
+            if c == b'\'' {
                 let start0 = i;
-                i += 1; // skip opening quote
+                i += 1;
                 let start = i;
-                while i < len && chars[i] != '\'' {
+                while i < len && bytes[i] != b'\'' {
                     i += 1;
                 }
                 if i >= len {
@@ -780,21 +782,21 @@ impl SqlParser {
                         start0
                     )));
                 }
-                let s: String = chars[start..i].iter().collect();
-                i += 1; // skip closing quote
+                let s = sql[start..i].to_string();
+                i += 1;
                 tokens.push(SpannedToken { token: Token::StringLit(s), start: start0, end: i });
                 continue;
             }
-            if c == '!' && i + 1 < len && chars[i + 1] == '=' {
+            if c == b'!' && i + 1 < len && bytes[i + 1] == b'=' {
                 tokens.push(SpannedToken { token: Token::NotEq, start: i, end: i + 2 });
                 i += 2;
                 continue;
             }
-            if c == '<' {
-                if i + 1 < len && chars[i + 1] == '=' {
+            if c == b'<' {
+                if i + 1 < len && bytes[i + 1] == b'=' {
                     tokens.push(SpannedToken { token: Token::Le, start: i, end: i + 2 });
                     i += 2;
-                } else if i + 1 < len && chars[i + 1] == '>' {
+                } else if i + 1 < len && bytes[i + 1] == b'>' {
                     tokens.push(SpannedToken { token: Token::NotEq, start: i, end: i + 2 });
                     i += 2;
                 } else {
@@ -803,8 +805,8 @@ impl SqlParser {
                 }
                 continue;
             }
-            if c == '>' {
-                if i + 1 < len && chars[i + 1] == '=' {
+            if c == b'>' {
+                if i + 1 < len && bytes[i + 1] == b'=' {
                     tokens.push(SpannedToken { token: Token::Ge, start: i, end: i + 2 });
                     i += 2;
                 } else {
@@ -815,21 +817,21 @@ impl SqlParser {
             }
 
             // Numbers
-            if c.is_ascii_digit() || (c == '.' && i + 1 < len && chars[i + 1].is_ascii_digit()) {
+            if c.is_ascii_digit() || (c == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit()) {
                 let start = i;
-                let mut has_dot = c == '.';
+                let mut has_dot = c == b'.';
                 i += 1;
-                while i < len && (chars[i].is_ascii_digit() || (!has_dot && chars[i] == '.')) {
-                    if chars[i] == '.' { has_dot = true; }
+                while i < len && (bytes[i].is_ascii_digit() || (!has_dot && bytes[i] == b'.')) {
+                    if bytes[i] == b'.' { has_dot = true; }
                     i += 1;
                 }
-                let num_str: String = chars[start..i].iter().collect();
+                let num_str = &sql[start..i];
                 if has_dot {
-                    let f: f64 = num_str.parse().map_err(|_| 
+                    let f: f64 = num_str.parse().map_err(|_|
                         ApexError::QueryParseError(format!("Syntax error at byte {}: Invalid number: {}", start, num_str)))?;
                     tokens.push(SpannedToken { token: Token::FloatLit(f), start, end: i });
                 } else {
-                    let n: i64 = num_str.parse().map_err(|_| 
+                    let n: i64 = num_str.parse().map_err(|_|
                         ApexError::QueryParseError(format!("Syntax error at byte {}: Invalid number: {}", start, num_str)))?;
                     tokens.push(SpannedToken { token: Token::IntLit(n), start, end: i });
                 }
@@ -837,128 +839,136 @@ impl SqlParser {
             }
 
             // Identifiers and keywords
-            if c.is_ascii_alphabetic() || c == '_' {
+            if c.is_ascii_alphabetic() || c == b'_' {
                 let start = i;
                 i += 1;
-                while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
-                let word: String = chars[start..i].iter().collect();
-                let upper = word.to_uppercase();
-                let token = match upper.as_str() {
-                    "SELECT" => Token::Select,
-                    "FROM" => Token::From,
-                    "WHERE" => Token::Where,
-                    "AND" => Token::And,
-                    "OR" => Token::Or,
-                    "NOT" => Token::Not,
-                    "AS" => Token::As,
-                    "DISTINCT" => Token::Distinct,
-                    "ORDER" => Token::Order,
-                    "BY" => Token::By,
-                    "ASC" => Token::Asc,
-                    "DESC" => Token::Desc,
-                    "LIMIT" => Token::Limit,
-                    "OFFSET" => Token::Offset,
-                    "NULLS" => Token::Nulls,
-                    "FIRST" => Token::First,
-                    "LAST" => Token::Last,
-                    "LIKE" => Token::Like,
-                    "IN" => Token::In,
-                    "BETWEEN" => Token::Between,
-                    "IS" => Token::Is,
-                    "NULL" => Token::Null,
-                    "GROUP" => Token::Group,
-                    "HAVING" => Token::Having,
-                    "COUNT" => Token::Count,
-                    "SUM" => Token::Sum,
-                    "AVG" => Token::Avg,
-                    "MIN" => Token::Min,
-                    "MAX" => Token::Max,
-                    "TRUE" => Token::True,
-                    "FALSE" => Token::False,
-                    "REGEXP" => Token::Regexp,
-                    "OVER" => Token::Over,
-                    "PARTITION" => Token::Partition,
-                    "JOIN" => Token::Join,
-                    "LEFT" => Token::Left,
-                    "RIGHT" => Token::Right,
-                    "FULL" => Token::Full,
-                    "INNER" => Token::Inner,
-                    "OUTER" => Token::Outer,
-                    "CROSS" => Token::Cross,
-                    "ON" => Token::On,
-                    "UNION" => Token::Union,
-                    "INTERSECT" => Token::Intersect,
-                    "EXCEPT" => Token::Except,
-                    "ALL" => Token::All,
-                    "EXISTS" => Token::Exists,
-                    "CAST" => Token::Cast,
-                    "CASE" => Token::Case,
-                    "WHEN" => Token::When,
-                    "THEN" => Token::Then,
-                    "ELSE" => Token::Else,
-                    "END" => Token::End,
-                    "CREATE" => Token::Create,
-                    "DROP" => Token::Drop,
-                    "VIEW" => Token::View,
+                let word = &sql[start..i];
+                // Stack-allocated uppercase buffer: avoids heap alloc for keyword matching.
+                let mut upper_buf = [0u8; 32];
+                let kw_len = word.len().min(32);
+                for (j, b) in word.bytes().enumerate().take(kw_len) {
+                    upper_buf[j] = b.to_ascii_uppercase();
+                }
+                let upper = &upper_buf[..kw_len];
+                let token = match upper {
+                    b"SELECT" => Token::Select,
+                    b"FROM" => Token::From,
+                    b"WHERE" => Token::Where,
+                    b"AND" => Token::And,
+                    b"OR" => Token::Or,
+                    b"NOT" => Token::Not,
+                    b"AS" => Token::As,
+                    b"DISTINCT" => Token::Distinct,
+                    b"ORDER" => Token::Order,
+                    b"BY" => Token::By,
+                    b"ASC" => Token::Asc,
+                    b"DESC" => Token::Desc,
+                    b"LIMIT" => Token::Limit,
+                    b"OFFSET" => Token::Offset,
+                    b"NULLS" => Token::Nulls,
+                    b"FIRST" => Token::First,
+                    b"LAST" => Token::Last,
+                    b"LIKE" => Token::Like,
+                    b"IN" => Token::In,
+                    b"BETWEEN" => Token::Between,
+                    b"IS" => Token::Is,
+                    b"NULL" => Token::Null,
+                    b"GROUP" => Token::Group,
+                    b"HAVING" => Token::Having,
+                    b"COUNT" => Token::Count,
+                    b"SUM" => Token::Sum,
+                    b"AVG" => Token::Avg,
+                    b"MIN" => Token::Min,
+                    b"MAX" => Token::Max,
+                    b"TRUE" => Token::True,
+                    b"FALSE" => Token::False,
+                    b"REGEXP" => Token::Regexp,
+                    b"OVER" => Token::Over,
+                    b"PARTITION" => Token::Partition,
+                    b"JOIN" => Token::Join,
+                    b"LEFT" => Token::Left,
+                    b"RIGHT" => Token::Right,
+                    b"FULL" => Token::Full,
+                    b"INNER" => Token::Inner,
+                    b"OUTER" => Token::Outer,
+                    b"CROSS" => Token::Cross,
+                    b"ON" => Token::On,
+                    b"UNION" => Token::Union,
+                    b"INTERSECT" => Token::Intersect,
+                    b"EXCEPT" => Token::Except,
+                    b"ALL" => Token::All,
+                    b"EXISTS" => Token::Exists,
+                    b"CAST" => Token::Cast,
+                    b"CASE" => Token::Case,
+                    b"WHEN" => Token::When,
+                    b"THEN" => Token::Then,
+                    b"ELSE" => Token::Else,
+                    b"END" => Token::End,
+                    b"CREATE" => Token::Create,
+                    b"DROP" => Token::Drop,
+                    b"VIEW" => Token::View,
                     // DDL keywords
-                    "TABLE" => Token::Table,
-                    "ALTER" => Token::Alter,
-                    "ADD" => Token::Add,
-                    "COLUMN" => Token::Column,
-                    "RENAME" => Token::Rename,
-                    "TO" => Token::To,
-                    "IF" => Token::If,
-                    "TRUNCATE" => Token::Truncate,
+                    b"TABLE" => Token::Table,
+                    b"ALTER" => Token::Alter,
+                    b"ADD" => Token::Add,
+                    b"COLUMN" => Token::Column,
+                    b"RENAME" => Token::Rename,
+                    b"TO" => Token::To,
+                    b"IF" => Token::If,
+                    b"TRUNCATE" => Token::Truncate,
                     // Index keywords
-                    "INDEX" => Token::Index,
-                    "UNIQUE" => Token::Unique,
-                    "USING" => Token::Using,
+                    b"INDEX" => Token::Index,
+                    b"UNIQUE" => Token::Unique,
+                    b"USING" => Token::Using,
                     // DML keywords
-                    "INSERT" => Token::Insert,
-                    "INTO" => Token::Into,
-                    "VALUES" => Token::Values,
-                    "DELETE" => Token::Delete,
-                    "UPDATE" => Token::Update,
-                    "SET" => Token::Set,
+                    b"INSERT" => Token::Insert,
+                    b"INTO" => Token::Into,
+                    b"VALUES" => Token::Values,
+                    b"DELETE" => Token::Delete,
+                    b"UPDATE" => Token::Update,
+                    b"SET" => Token::Set,
                     // Transaction keywords
-                    "BEGIN" => Token::Begin,
-                    "COMMIT" => Token::Commit,
-                    "ROLLBACK" => Token::Rollback,
-                    "TRANSACTION" => Token::Transaction,
-                    "READ" => Token::Read,
+                    b"BEGIN" => Token::Begin,
+                    b"COMMIT" => Token::Commit,
+                    b"ROLLBACK" => Token::Rollback,
+                    b"TRANSACTION" => Token::Transaction,
+                    b"READ" => Token::Read,
                     // CTE / EXPLAIN keywords
-                    "WITH" => Token::With,
-                    "EXPLAIN" => Token::Explain,
-                    "RECURSIVE" => Token::Recursive,
-                    _ => Token::Identifier(word),
+                    b"WITH" => Token::With,
+                    b"EXPLAIN" => Token::Explain,
+                    b"RECURSIVE" => Token::Recursive,
+                    _ => Token::Identifier(word.to_string()),
                 };
                 tokens.push(SpannedToken { token, start, end: i });
                 continue;
             }
 
             // $variable_name — session variable reference
-            if c == '$' && i + 1 < len && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_') {
+            if c == b'$' && i + 1 < len && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_') {
                 let start = i;
                 i += 1; // skip '$'
                 let var_start = i;
-                while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
-                let name: String = chars[var_start..i].iter().collect();
+                let name = sql[var_start..i].to_string();
                 tokens.push(SpannedToken { token: Token::Variable(name), start, end: i });
                 continue;
             }
 
             return Err(ApexError::QueryParseError(format!(
                 "Syntax error at byte {}: Unexpected character: {}",
-                i, c
+                i, c as char
             )));
         }
 
         tokens.push(SpannedToken { token: Token::Eof, start: len, end: len });
-        Ok(tokens)
+        // Build chars only once here, for error-reporting (format_near / format_position).
+        let chars = sql.chars().collect();
+        Ok((chars, tokens))
     }
 
     fn current(&self) -> &Token {
