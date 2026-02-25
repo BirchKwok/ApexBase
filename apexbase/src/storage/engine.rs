@@ -799,6 +799,7 @@ impl StorageEngine {
         float_columns: HashMap<String, Vec<f64>>,
         string_columns: HashMap<String, Vec<String>>,
         binary_columns: HashMap<String, Vec<Vec<u8>>>,
+        fixedlist_columns: HashMap<String, Vec<Vec<u8>>>,
         bool_columns: HashMap<String, Vec<bool>>,
         null_positions: HashMap<String, Vec<bool>>,
         durability: DurabilityLevel,
@@ -811,6 +812,7 @@ impl StorageEngine {
             .or_else(|| string_columns.values().next().map(|v| v.len()))
             .or_else(|| bool_columns.values().next().map(|v| v.len()))
             .or_else(|| binary_columns.values().next().map(|v| v.len()))
+            .or_else(|| fixedlist_columns.values().next().map(|v| v.len()))
             .unwrap_or(0);
 
         // FAST PATH: V4 append for existing tables with matching schema
@@ -834,6 +836,7 @@ impl StorageEngine {
                             for k in string_columns.keys() { data_cols.insert(k.clone()); }
                             for k in bool_columns.keys() { data_cols.insert(k.clone()); }
                             for k in binary_columns.keys() { data_cols.insert(k.clone()); }
+                            for k in fixedlist_columns.keys() { data_cols.insert(k.clone()); }
                             
                             if schema_cols == data_cols {
                                 // Build ColumnData + null bitmaps in schema order
@@ -915,6 +918,20 @@ impl StorageEngine {
                                                 new_columns.push(ColumnData::Binary { offsets, data: Vec::new() });
                                             }
                                         }
+                                        ColumnType::FixedList => {
+                                            if let Some(vals) = fixedlist_columns.get(col_name) {
+                                                let dim = vals.iter().find(|b| !b.is_empty())
+                                                    .map(|b| b.len() / 4).unwrap_or(0) as u32;
+                                                let mut data: Vec<u8> = Vec::with_capacity(
+                                                    row_count * dim as usize * 4);
+                                                for b in vals {
+                                                    data.extend_from_slice(b);
+                                                }
+                                                new_columns.push(ColumnData::FixedList { data, dim });
+                                            } else {
+                                                new_columns.push(ColumnData::FixedList { data: Vec::new(), dim: 0 });
+                                            }
+                                        }
                                     }
                                 }
                                 
@@ -939,11 +956,12 @@ impl StorageEngine {
         // SLOW PATH: Full write (for new tables, schema changes, etc.)
         self.invalidate(table_path);
         let backend = self.get_write_backend(table_path, durability)?;
-        let ids = backend.insert_typed_with_nulls(
+        let ids = backend.insert_typed_with_nulls_full(
             int_columns,
             float_columns,
             string_columns,
             binary_columns,
+            fixedlist_columns,
             bool_columns,
             null_positions,
         )?;

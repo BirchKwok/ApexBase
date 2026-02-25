@@ -131,7 +131,7 @@ fn value_to_arrow_type(value: &Value) -> ArrowDataType {
             ArrowDataType::UInt64
         }
         Value::Float32(_) | Value::Float64(_) => ArrowDataType::Float64,
-        Value::String(_) | Value::Json(_) | Value::Binary(_) => ArrowDataType::Utf8,
+        Value::String(_) | Value::Json(_) | Value::Binary(_) | Value::FixedList(_) => ArrowDataType::Utf8,
         Value::Timestamp(_) => ArrowDataType::Int64,
         Value::Date(_) => ArrowDataType::Int64,
         Value::Array(_) => ArrowDataType::Utf8, // Serialize arrays as JSON strings

@@ -135,6 +135,18 @@ impl ApexExecutor {
                             && stmt.group_by.is_empty()
                             && !has_aggregation_check;
                         
+                        // EARLY FAST PATH: _id = X point lookup — skip CBO entirely
+                        if !has_scalar_subquery && stmt.group_by.is_empty() && !has_aggregation_check {
+                            if let Some(ref where_clause) = stmt.where_clause {
+                                if let Some(id) = Self::extract_id_equality_filter(where_clause) {
+                                    if let Some(row_batch) = backend.read_row_by_id_to_arrow(id)? {
+                                        let projected = Self::apply_projection_with_storage(&row_batch, &stmt.columns, Some(storage_path))?;
+                                        return Ok(ApexResult::Data(projected));
+                                    }
+                                }
+                            }
+                        }
+
                         // CBO: Use plan_with_stats() to decide execution strategy.
                         // Skip expensive index checks when CBO recommends full scan or aggregation.
                         // Also skip CBO entirely for trivial queries (no WHERE = no index possible).
@@ -1424,8 +1436,18 @@ impl ApexExecutor {
 
         use crate::query::AggregateFunc;
         
+        // Must be 1 or 2 GROUP BY columns, no WHERE
+        if stmt.group_by.is_empty() || stmt.group_by.len() > 2 || stmt.where_clause.is_some() || !stmt.order_by.is_empty() {
+            return Ok(None);
+        }
+
+        // Handle 2-column GROUP BY as a separate fast path
+        if stmt.group_by.len() == 2 {
+            return Self::try_fast_cached_group_by_2col(backend, stmt);
+        }
+
         // Must be single GROUP BY column, no WHERE
-        if stmt.group_by.len() != 1 || stmt.where_clause.is_some() || !stmt.order_by.is_empty() {
+        if stmt.group_by.len() != 1 {
             return Ok(None);
         }
         
@@ -1516,6 +1538,128 @@ impl ApexExecutor {
             return Ok(Some(ApexResult::Data(filtered)));
         }
         
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
+    /// 2-column GROUP BY fast path using dict caches for both columns.
+    fn try_fast_cached_group_by_2col(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::AggregateFunc;
+
+        let group_col1 = stmt.group_by[0].trim_matches('"');
+        let group_col2 = stmt.group_by[1].trim_matches('"');
+
+        // Extract aggregate info (support multiple aggregates)
+        let mut agg_info: Vec<(&str, bool, AggregateFunc, Option<String>)> = Vec::new();
+        for col in &stmt.columns {
+            match col {
+                SelectColumn::Aggregate { func, column, alias, .. } => {
+                    let is_count_star = matches!(func, AggregateFunc::Count) && column.is_none();
+                    let col_name = column.as_deref().unwrap_or("*");
+                    agg_info.push((col_name, is_count_star, func.clone(), alias.clone()));
+                }
+                SelectColumn::Column(name) => {
+                    let n = name.trim_matches('"');
+                    if n == group_col1 || n == group_col2 { continue; }
+                    return Ok(None);
+                }
+                SelectColumn::ColumnAlias { column, .. } => {
+                    let n = column.trim_matches('"');
+                    if n == group_col1 || n == group_col2 { continue; }
+                    return Ok(None);
+                }
+                _ => return Ok(None),
+            }
+        }
+        if agg_info.is_empty() { return Ok(None); }
+
+        // Get dict caches for both group columns
+        let dict1_arc = match crate::storage::backend::get_global_dict_cache(
+            backend.path(), group_col1, &backend.storage,
+        )? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let dict2_arc = match crate::storage::backend::get_global_dict_cache(
+            backend.path(), group_col2, &backend.storage,
+        )? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let (dict1_strings, group_ids1) = (dict1_arc.0.as_slice(), dict1_arc.1.as_slice());
+        let (dict2_strings, group_ids2) = (dict2_arc.0.as_slice(), dict2_arc.1.as_slice());
+
+        let agg_cols: Vec<(&str, bool)> = agg_info.iter()
+            .map(|(col, is_count, _, _)| (*col, *is_count))
+            .collect();
+
+        let raw = match backend.execute_group_agg_2col_cached(
+            dict1_strings, group_ids1, dict2_strings, group_ids2, &agg_cols,
+        )? {
+            Some(r) if !r.is_empty() => r,
+            _ => return Ok(None),
+        };
+
+        // Build result RecordBatch
+        let col1_vals: Vec<&str> = raw.iter().map(|((k1, _), _)| k1.as_str()).collect();
+        let col2_vals: Vec<&str> = raw.iter().map(|((_, k2), _)| k2.as_str()).collect();
+
+        let mut fields: Vec<Field> = vec![
+            Field::new(group_col1, ArrowDataType::Utf8, false),
+            Field::new(group_col2, ArrowDataType::Utf8, false),
+        ];
+        let mut arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(col1_vals)),
+            Arc::new(StringArray::from(col2_vals)),
+        ];
+
+        for (ai, (_, _, func, alias)) in agg_info.iter().enumerate() {
+            let col_name = alias.as_deref().unwrap_or(match func {
+                AggregateFunc::Count => "COUNT(*)",
+                AggregateFunc::Avg   => "AVG",
+                AggregateFunc::Sum   => "SUM",
+                AggregateFunc::Min   => "MIN",
+                AggregateFunc::Max   => "MAX",
+            });
+            match func {
+                AggregateFunc::Count => {
+                    let vals: Vec<i64> = raw.iter().map(|(_, aggs)| aggs[ai].1).collect();
+                    fields.push(Field::new(col_name, ArrowDataType::Int64, false));
+                    arrays.push(Arc::new(Int64Array::from(vals)));
+                }
+                AggregateFunc::Avg => {
+                    let vals: Vec<f64> = raw.iter().map(|(_, aggs)| {
+                        let (sum, cnt) = aggs[ai];
+                        if cnt > 0 { sum / cnt as f64 } else { 0.0 }
+                    }).collect();
+                    fields.push(Field::new(col_name, ArrowDataType::Float64, false));
+                    arrays.push(Arc::new(Float64Array::from(vals)));
+                }
+                AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => {
+                    let vals: Vec<f64> = raw.iter().map(|(_, aggs)| aggs[ai].0).collect();
+                    fields.push(Field::new(col_name, ArrowDataType::Float64, false));
+                    arrays.push(Arc::new(Float64Array::from(vals)));
+                }
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let mut batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+
+        // Apply HAVING
+        if let Some(having) = &stmt.having {
+            let mask = Self::evaluate_predicate(&batch, having)?;
+            batch = arrow::compute::filter_record_batch(&batch, &mask)
+                .map_err(|e| err_data(e.to_string()))?;
+        }
+
+        if batch.num_rows() == 0 {
+            return Ok(Some(ApexResult::Empty(batch.schema())));
+        }
         Ok(Some(ApexResult::Data(batch)))
     }
 
@@ -1781,6 +1925,23 @@ impl ApexExecutor {
             return backend.read_columns_to_arrow(None, 0, Some(0));
         }
 
+        // IN-MEMORY FAST PATH: 2-col ORDER BY (string, float64) — skip Arrow string conversion.
+        // Uses global dict cache (u16 group_ids) + raw float64 column for typed sort keys.
+        if stmt.order_by.len() == 2 && !backend.has_pending_deltas() {
+            let o0 = &stmt.order_by[0];
+            let o1 = &stmt.order_by[1];
+            let c0 = { let c = o0.column.trim_matches('"'); if let Some(p) = c.rfind('.') { &c[p+1..] } else { c } };
+            let c1 = { let c = o1.column.trim_matches('"'); if let Some(p) = c.rfind('.') { &c[p+1..] } else { c } };
+            if let Some(indices) = backend.order_topk_str_float64(
+                c0, !o0.descending, c1, !o1.descending, k, stmt.offset.unwrap_or(0),
+            )? {
+                if !indices.is_empty() {
+                    return backend.read_columns_by_indices_to_arrow(&indices);
+                }
+                return backend.read_columns_to_arrow(None, 0, Some(0));
+            }
+        }
+
         // MMAP FAST PATH: single ORDER BY column + mmap-only → direct top-K scan without Arrow
         if backend.is_mmap_only() && stmt.order_by.len() == 1 && !backend.has_pending_deltas() {
             let clause = &stmt.order_by[0];
@@ -1984,6 +2145,61 @@ impl ApexExecutor {
     offset: Option<usize>,
 ) -> Vec<usize> {
     let num_rows = sort_batch.num_rows();
+
+    // FAST PATH: 2-column (StringArray, Float64Array) — typed comparison, no closure overhead
+    if order_by.len() == 2 {
+        let col0_name = { let c = order_by[0].column.trim_matches('"'); if let Some(p) = c.rfind('.') { &c[p+1..] } else { c } };
+        let col1_name = { let c = order_by[1].column.trim_matches('"'); if let Some(p) = c.rfind('.') { &c[p+1..] } else { c } };
+        let arr0 = sort_batch.column_by_name(col0_name);
+        let arr1 = sort_batch.column_by_name(col1_name);
+        if let (Some(a0), Some(a1)) = (arr0, arr1) {
+            use arrow::array::StringArray as SA;
+            use arrow::array::Float64Array as FA;
+            if let (Some(str_arr), Some(flt_arr)) = (
+                a0.as_any().downcast_ref::<SA>(),
+                a1.as_any().downcast_ref::<FA>(),
+            ) {
+                use ahash::AHashMap;
+                // Build dict for string col → u16 id (1-based, 0=null)
+                let mut dict: AHashMap<&str, u16> = AHashMap::with_capacity(64);
+                let mut dict_vals: Vec<&str> = Vec::with_capacity(64);
+                let str_ids: Vec<u16> = (0..num_rows).map(|i| {
+                    if str_arr.is_null(i) { return 0u16; }
+                    let s = str_arr.value(i);
+                    let next = dict_vals.len() as u16 + 1;
+                    *dict.entry(s).or_insert_with(|| { dict_vals.push(s); next })
+                }).collect();
+                // Sort dict entries to get alphabetical rank mapping
+                let mut sorted: Vec<(u16, &str)> = dict_vals.iter()
+                    .enumerate().map(|(i, &s)| (i as u16 + 1, s)).collect();
+                sorted.sort_unstable_by_key(|&(_, s)| s);
+                let mut rank_of = vec![0u16; dict_vals.len() + 1];
+                for (rank, &(id, _)) in sorted.iter().enumerate() {
+                    rank_of[id as usize] = rank as u16;
+                }
+                let asc0 = !order_by[0].descending;
+                let desc1 = order_by[1].descending;
+                // Pack (str_rank, score_sortable_bits) into (u64, u64) composite key
+                let mut packed: Vec<(u64, u64, usize)> = (0..num_rows).map(|i| {
+                    let sid = str_ids[i] as usize;
+                    let sr = if sid == 0 { u16::MAX as u64 } else { rank_of[sid] as u64 };
+                    let sk0 = if asc0 { sr } else { u16::MAX as u64 - sr };
+                    let f = if flt_arr.is_null(i) { f64::NEG_INFINITY } else { flt_arr.value(i) };
+                    let fb = f.to_bits();
+                    let fs = if fb >> 63 == 0 { fb ^ (1u64 << 63) } else { !fb };
+                    let sk1 = if desc1 { !fs } else { fs };
+                    (sk0, sk1, i)
+                }).collect();
+                if k < num_rows {
+                    packed.select_nth_unstable_by_key(k - 1, |&(a, b, _)| (a, b));
+                    packed.truncate(k);
+                }
+                packed.sort_unstable_by_key(|&(a, b, _)| (a, b));
+                let off = offset.unwrap_or(0);
+                return packed.into_iter().skip(off).map(|(_, _, idx)| idx).collect();
+            }
+        }
+    }
     
     let sort_cols: Vec<(ArrayRef, bool)> = order_by.iter()
         .filter_map(|clause| {
@@ -2480,12 +2696,49 @@ impl ApexExecutor {
         let query_f32: Vec<f32> = query.iter().map(|&x| x as f32).collect();
 
         let backend = get_cached_backend(storage_path)?;
-        let full_batch = backend.read_columns_to_arrow(None, 0, None)?;
 
         // Output schema: names[0]=Int64(_id), names[1]=Float64(dist)
         let id_field   = Field::new(&names[0], ArrowDataType::Int64,   false);
         let dist_field = Field::new(&names[1], ArrowDataType::Float64, false);
         let out_schema = Arc::new(Schema::new(vec![id_field, dist_field]));
+
+        use crate::query::vector_ops::{DistanceComputer, topk_heap_direct_parallel, topk_heap_direct_parallel_fixed};
+        let computer = DistanceComputer::new(metric_enum, query_f32);
+
+        // FAST PATH: zero-copy scan directly on OS mmap (no Arrow batch, no memcpy)
+        let direct_topk = backend.topk_fixedlist_direct(col, &computer, k)
+            .ok().flatten()
+            .or_else(|| backend.topk_binary_direct(col, &computer, k).ok().flatten());
+        if let Some(topk) = direct_topk {
+            if topk.is_empty() {
+                return RecordBatch::try_new(
+                    out_schema,
+                    vec![
+                        Arc::new(Int64Array::from(Vec::<i64>::new()))   as ArrayRef,
+                        Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
+                    ],
+                ).map_err(|e| err_data(e.to_string()));
+            }
+            // Read only the _id column (8MB) instead of all columns (512MB+)
+            let id_batch = backend.read_columns_to_arrow(Some(&["_id"]), 0, None)?;
+            let id_col = id_batch.column_by_name("_id");
+            let ids: Vec<i64> = topk.iter().map(|(row_idx, _)| {
+                id_col.and_then(|a| a.as_any().downcast_ref::<arrow::array::Int64Array>())
+                      .map(|a| a.value(*row_idx))
+                      .unwrap_or(*row_idx as i64)
+            }).collect();
+            let dists: Vec<f64> = topk.iter().map(|(_, d)| *d as f64).collect();
+            return RecordBatch::try_new(
+                out_schema,
+                vec![
+                    Arc::new(Int64Array::from(ids))    as ArrayRef,
+                    Arc::new(Float64Array::from(dists)) as ArrayRef,
+                ],
+            ).map_err(|e| err_data(e.to_string()));
+        }
+
+        // FALLBACK: full Arrow path (Binary columns / compressed RGs)
+        let full_batch = backend.read_columns_to_arrow(None, 0, None)?;
 
         if full_batch.num_rows() == 0 {
             return RecordBatch::try_new(
@@ -2504,17 +2757,17 @@ impl ApexExecutor {
                 format!("topk_distance: column '{}' not found", col),
             )
         })?;
-        let bin_arr = bin_col.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
-            io::Error::new(
+        let topk = if let Some(fixed_arr) = bin_col.as_any().downcast_ref::<arrow::array::FixedSizeListArray>() {
+            topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
+        } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
+            topk_heap_direct_parallel(bin_arr, &computer, k)
+        } else {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("topk_distance: column '{}' is not a binary (vector) column", col),
-            )
-        })?;
+                format!("topk_distance: column '{}' is not a vector column", col),
+            ));
+        };
 
-        // Fused O(n log k) heap
-        let topk = topk_heap_direct(bin_arr, &query_f32, k, metric_enum);
-
-        // Look up _id for each top-k row index
         let id_col = full_batch.column_by_name("_id");
         let ids: Vec<i64> = topk
             .iter()
@@ -2554,7 +2807,7 @@ impl ApexExecutor {
         k: usize,
         metric: &str,
     ) -> io::Result<RecordBatch> {
-        use crate::query::vector_ops::{topk_heap_direct, DistanceMetric};
+        use crate::query::vector_ops::DistanceMetric;
         use arrow::array::{BinaryArray, Float64Array, UInt32Array};
         use arrow::compute;
         use arrow::datatypes::DataType as ArrowDT;
@@ -2606,18 +2859,19 @@ impl ApexExecutor {
             )
         })?;
 
-        let bin_arr = bin_col
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("topk_distance: column '{}' is not a binary (vector) column", col),
-                )
-            })?;
-
-        // Fused single-pass: compute distances + maintain max-heap of size k
-        let topk = topk_heap_direct(bin_arr, &query_f32, k, metric_enum);
+        // Parallel O(n/T log k) heap — dispatch on Binary vs FixedSizeList
+        use crate::query::vector_ops::{DistanceComputer, topk_heap_direct_parallel, topk_heap_direct_parallel_fixed};
+        let computer = DistanceComputer::new(metric_enum, query_f32);
+        let topk = if let Some(fixed_arr) = bin_col.as_any().downcast_ref::<arrow::array::FixedSizeListArray>() {
+            topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
+        } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
+            topk_heap_direct_parallel(bin_arr, &computer, k)
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("topk_distance: column '{}' is not a vector column", col),
+            ));
+        };
 
         if topk.is_empty() {
             let empty_cols: Vec<ArrayRef> = out_schema

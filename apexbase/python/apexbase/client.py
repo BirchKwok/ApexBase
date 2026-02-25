@@ -705,12 +705,11 @@ class ApexClient:
                 raise ValueError("Data must be dict, list of dicts, Dict[str, list], pandas.DataFrame, polars.DataFrame, or pyarrow.Table")
 
     def _encode_vectors_in_record(self, record: dict) -> dict:
-        """Return a copy of *record* with any vector fields encoded as bytes."""
+        """Return a copy of *record* with list/tuple vector fields encoded as bytes.
+        numpy 1-D arrays are passed through unchanged (stored as FixedList by Rust)."""
         result = {}
         for k, v in record.items():
             if isinstance(v, (list, tuple)) and v and isinstance(v[0], (int, float)):
-                result[k] = encode_vector(v)
-            elif hasattr(v, 'dtype') and hasattr(v, 'shape') and len(v.shape) == 1:
                 result[k] = encode_vector(v)
             else:
                 result[k] = v
@@ -762,9 +761,12 @@ class ApexClient:
                 converted[name] = values.to_list()
             else:
                 converted[name] = list(values) if not isinstance(values, list) else values
-            # Auto-encode vector columns (list-of-floats or list-of-arrays)
+            # Encode plain list/tuple-of-numbers as Binary bytes.
+            # numpy array elements are left as-is (Rust stores them as FixedList).
             if _is_vector_column(converted[name]):
-                converted[name] = _encode_vector_col(converted[name])
+                first = next((v for v in converted[name] if v is not None), None)
+                if first is not None and not (hasattr(first, 'dtype') and hasattr(first, 'shape')):
+                    converted[name] = _encode_vector_col(converted[name])
         
         # Call native columnar storage - much faster than row-by-row
         self._storage.store_columnar(converted)

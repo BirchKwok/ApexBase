@@ -110,6 +110,11 @@ impl WalRecord {
                 buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 buf.extend_from_slice(v);
             }
+            ColumnValue::FixedList(v) => {
+                buf.push(5); // same wire encoding as Binary
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                buf.extend_from_slice(v);
+            }
         }
     }
 
@@ -579,6 +584,11 @@ impl WalWriter {
                     data_buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
                     data_buf.extend_from_slice(v);
                 }
+                ColumnValue::FixedList(v) => {
+                    data_buf.push(5);
+                    data_buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    data_buf.extend_from_slice(v);
+                }
             }
         }
         
@@ -804,6 +814,7 @@ impl IncrementalStorage {
                                 ColumnValue::Float64(_) => ColumnData::new(ColumnType::Float64),
                                 ColumnValue::String(_) => ColumnData::new(ColumnType::String),
                                 ColumnValue::Binary(_) => ColumnData::new(ColumnType::Binary),
+                                ColumnValue::FixedList(_) => ColumnData::FixedList { data: Vec::new(), dim: 0 },
                                 ColumnValue::Bool(_) => ColumnData::new(ColumnType::Bool),
                                 ColumnValue::Null => ColumnData::new(ColumnType::String),
                             }
@@ -813,6 +824,7 @@ impl IncrementalStorage {
                             (ColumnData::Float64(v), ColumnValue::Float64(val)) => v.push(*val),
                             (col @ ColumnData::String { .. }, ColumnValue::String(val)) => col.push_string(val),
                             (col @ ColumnData::Binary { .. }, ColumnValue::Binary(val)) => col.push_bytes(val),
+                            (col @ ColumnData::FixedList { .. }, ColumnValue::FixedList(val)) => col.push_fixed_list(val),
                             (col @ ColumnData::Bool { .. }, ColumnValue::Bool(val)) => col.push_bool(*val),
                             _ => {}
                         }
@@ -899,6 +911,7 @@ impl IncrementalStorage {
                                 ColumnValue::Float64(_) => ColumnData::new(ColumnType::Float64),
                                 ColumnValue::String(_) => ColumnData::new(ColumnType::String),
                                 ColumnValue::Binary(_) => ColumnData::new(ColumnType::Binary),
+                                ColumnValue::FixedList(_) => ColumnData::FixedList { data: Vec::new(), dim: 0 },
                                 ColumnValue::Bool(_) => ColumnData::new(ColumnType::Bool),
                                 ColumnValue::Null => ColumnData::new(ColumnType::String),
                             }
@@ -908,6 +921,7 @@ impl IncrementalStorage {
                             (ColumnData::Float64(v), ColumnValue::Float64(val)) => v.push(*val),
                             (col @ ColumnData::String { .. }, ColumnValue::String(val)) => col.push_string(val),
                             (col @ ColumnData::Binary { .. }, ColumnValue::Binary(val)) => col.push_bytes(val),
+                            (col @ ColumnData::FixedList { .. }, ColumnValue::FixedList(val)) => col.push_fixed_list(val),
                             (col @ ColumnData::Bool { .. }, ColumnValue::Bool(val)) => col.push_bool(*val),
                             _ => {}
                         }

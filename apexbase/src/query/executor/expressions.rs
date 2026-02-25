@@ -1357,6 +1357,10 @@ impl ApexExecutor {
                 use arrow::array::BinaryArray;
                 Arc::new(BinaryArray::from(vec![Some(b.as_slice()); num_rows]))
             }
+            Value::FixedList(b) => {
+                use arrow::array::BinaryArray;
+                Arc::new(BinaryArray::from(vec![Some(b.as_slice()); num_rows]))
+            }
             Value::Json(j) => {
                 let s = j.to_string();
                 Arc::new(StringArray::from(vec![s.as_str(); num_rows]))

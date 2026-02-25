@@ -3977,6 +3977,29 @@ impl ApexExecutor {
         use std::collections::HashMap;
         let active_count = backend.active_row_count() as i64;
 
+        // FAST PATH: COUNT(DISTINCT col) — global dict cache + null-aware count.
+        // Warm calls: O(dict_size) ≈ O(10) — dict already cached, just count entries.
+        // Cold calls: O(N) to build dict (same as before), but result is cached for next call.
+        // Null-aware: uses null bitmaps to exclude NULL rows from the count.
+        if stmt.columns.len() == 1 {
+            if let SelectColumn::Aggregate { func: AggregateFunc::Count, column: Some(col_name), distinct: true, alias } = &stmt.columns[0] {
+                let actual = col_name.trim_matches('"');
+                let actual = if let Some(p) = actual.rfind('.') { &actual[p+1..] } else { actual };
+                if let Some(dict) = crate::storage::backend::get_global_dict_cache(
+                    backend.path(), actual, &backend.storage,
+                )? {
+                    let (dict_strings, group_ids) = (dict.0.as_slice(), dict.1.as_slice());
+                    let count = backend.count_distinct_with_dict(actual, dict_strings, group_ids)?;
+                    let out = alias.clone().unwrap_or_else(|| format!("COUNT(DISTINCT {})", actual));
+                    let schema = Arc::new(Schema::new(vec![Field::new(&out, ArrowDataType::Int64, false)]));
+                    let arr: ArrayRef = Arc::new(Int64Array::from(vec![count]));
+                    let batch = RecordBatch::try_new(schema, vec![arr]).map_err(|e| err_data(e.to_string()))?;
+                    return Ok(Some(ApexResult::Data(batch)));
+                }
+                return Ok(None); // non-string col — fall through to slow path
+            }
+        }
+
         // Collect unique column names for a single-pass multi-column aggregation
         let mut unique_cols: Vec<String> = Vec::new();
         for col in &stmt.columns {

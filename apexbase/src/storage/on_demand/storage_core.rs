@@ -73,6 +73,16 @@ pub struct OnDemandStorage {
     /// On-demand: only pages actually accessed are cached (~13 pages = ~52KB per backend).
     /// Invalidated after every write (save_v4).
     pub(crate) page_cache: RwLock<HashMap<u64, Box<[u8; 4096]>>>,
+    /// Reusable scratch buffer for vector TopK scans.
+    /// Pre-allocated on first use; grown as needed; reused to avoid per-query
+    /// 512MB allocation + soft-page-fault overhead on the destination pages.
+    /// Never shrinks — sized to the largest scan seen so far.
+    pub(crate) scan_buf: std::sync::Mutex<Vec<f32>>,
+    /// File size when scan_buf was last populated; 0 = cache invalid.
+    /// Used to skip re-copying vector data when file hasn't changed.
+    pub(crate) scan_buf_file_size: std::sync::atomic::AtomicU64,
+    /// Column name whose data is currently in scan_buf (empty = none).
+    pub(crate) scan_buf_col: std::sync::Mutex<String>,
 }
 
 
@@ -143,6 +153,9 @@ impl OnDemandStorage {
             delta_store: RwLock::new(DeltaStore::new(path)),
             compression: std::sync::atomic::AtomicU8::new(CompressionType::None as u8),
             page_cache: RwLock::new(HashMap::new()),
+            scan_buf: std::sync::Mutex::new(Vec::new()),
+            scan_buf_file_size: std::sync::atomic::AtomicU64::new(0),
+            scan_buf_col: std::sync::Mutex::new(String::new()),
         };
 
         // Write initial file
@@ -363,6 +376,9 @@ impl OnDemandStorage {
             delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
             page_cache: RwLock::new(HashMap::new()),
+            scan_buf: std::sync::Mutex::new(Vec::new()),
+            scan_buf_file_size: std::sync::atomic::AtomicU64::new(0),
+            scan_buf_col: std::sync::Mutex::new(String::new()),
         })
     }
     
@@ -462,10 +478,12 @@ impl OnDemandStorage {
             v4_base_loaded: AtomicBool::new(false),
             cached_footer_offset: AtomicU64::new(cached_fo),
             v4_footer: RwLock::new(cached_v4_footer),
-            // Load DeltaStore from disk so DeltaMerger can apply pending UPDATE deltas on reads.
             delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
             page_cache: RwLock::new(HashMap::new()),
+            scan_buf: std::sync::Mutex::new(Vec::new()),
+            scan_buf_file_size: std::sync::atomic::AtomicU64::new(0),
+            scan_buf_col: std::sync::Mutex::new(String::new()),
         })
     }
 
@@ -546,9 +564,11 @@ impl OnDemandStorage {
         Ok(())
     }
 
-    /// Invalidate the user-space page cache. Called after every write (save_v4).
+    /// Invalidate the user-space page cache and raw Arrow batch cache.
+    /// Called after every write (save_v4, append_row_group, open_v4_data).
     pub(crate) fn invalidate_page_cache(&self) {
         self.page_cache.write().clear();
+        self.scan_buf_file_size.store(0, std::sync::atomic::Ordering::Release);
     }
 
     /// Check if auto-flush is needed and perform it if so
@@ -886,6 +906,9 @@ impl OnDemandStorage {
             delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
             compression: std::sync::atomic::AtomicU8::new(CompressionType::from_flags(cached_flags) as u8),
             page_cache: RwLock::new(HashMap::new()),
+            scan_buf: std::sync::Mutex::new(Vec::new()),
+            scan_buf_file_size: std::sync::atomic::AtomicU64::new(0),
+            scan_buf_col: std::sync::Mutex::new(String::new()),
         })
     }
     
@@ -1339,6 +1362,7 @@ impl OnDemandStorage {
                             *len += 1;
                         }
                         ColumnData::StringDict { indices, .. } => indices.push(0),
+                        ColumnData::FixedList { .. } => {} // pads implicitly
                     }
                 }
                 
@@ -1429,6 +1453,9 @@ impl OnDemandStorage {
                 ColumnType::Binary => { 
                     binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
                 }
+                ColumnType::FixedList => { 
+                    binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
+                }
                 ColumnType::Bool => { 
                     bool_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
                 }
@@ -1460,6 +1487,13 @@ impl OnDemandStorage {
                     }
                     ColumnType::Binary => {
                         let v = val.and_then(|v| if let ColumnValue::Binary(b) = v { Some(b.clone()) } else { None }).unwrap_or_default();
+                        binary_columns.get_mut(col_name).unwrap().push(v);
+                    }
+                    ColumnType::FixedList => {
+                        let v = val.and_then(|v| match v {
+                            ColumnValue::FixedList(b) | ColumnValue::Binary(b) => Some(b.clone()),
+                            _ => None,
+                        }).unwrap_or_default();
                         binary_columns.get_mut(col_name).unwrap().push(v);
                     }
                     ColumnType::Bool => {
@@ -1763,6 +1797,7 @@ impl OnDemandStorage {
             ColumnType::Binary => {
                 ColumnData::Binary { offsets: vec![0u32; count + 1], data: Vec::new() }
             }
+            ColumnType::FixedList => ColumnData::FixedList { data: Vec::new(), dim: 0 },
             ColumnType::Null => ColumnData::Int64(vec![0i64; count]),
         }
     }

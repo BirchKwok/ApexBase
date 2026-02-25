@@ -475,8 +475,222 @@ impl OnDemandStorage {
         }
     }
 
-    /// Build cached string dictionary indices for a column (row→group_id mapping)
-    /// Returns (dict_strings, group_ids) where group_ids[row] = index into dict_strings.
+    /// Returns true if the column has any NULL values in the in-memory store.
+    pub fn column_has_nulls(&self, col_name: &str) -> bool {
+        let schema = self.schema.read();
+        let col_idx = match schema.get_index(col_name) {
+            Some(idx) => idx,
+            None => return false,
+        };
+        let nulls = self.nulls.read();
+        if col_idx >= nulls.len() { return false; }
+        nulls[col_idx].iter().any(|&b| b != 0)
+    }
+
+    /// Fast COUNT(DISTINCT col) for string columns using the dict cache.
+    /// Correctly excludes NULL values via null bitmaps (both in-memory and mmap paths).
+    /// Returns None if the column is not a string or not scannable.
+    pub fn count_distinct_string(&self, col_name: &str) -> io::Result<Option<i64>> {
+        let dict_pair = match self.build_string_dict_cache(col_name)? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        Ok(Some(self.count_distinct_with_dict(col_name, &dict_pair.0, &dict_pair.1)?))
+    }
+
+    /// Fast COUNT(DISTINCT col) given a pre-built dict (dict_strings, group_ids).
+    /// Uses the pre-built group_ids so no O(N) string-hashing is needed on warm cache hits.
+    /// Correctly excludes NULL values via null bitmaps.
+    pub fn count_distinct_with_dict(
+        &self,
+        col_name: &str,
+        dict_strings: &[String],
+        group_ids: &[u16],
+    ) -> io::Result<i64> {
+        const NULL_MARKER: &str = "\x00__NULL__\x00";
+        let num_groups = dict_strings.len();
+        if num_groups == 0 { return Ok(0); }
+
+        if self.has_v4_in_memory_data() {
+            // IN-MEMORY PATH: use null bitmap from self.nulls
+            let schema = self.schema.read();
+            let col_idx = match schema.get_index(col_name) {
+                Some(idx) => idx,
+                None => return Ok(num_groups as i64),
+            };
+            let nulls = self.nulls.read();
+            let null_bm: &[u8] = if col_idx < nulls.len() { &nulls[col_idx] } else { &[] };
+            let has_null_bm = !null_bm.is_empty() && null_bm.iter().any(|&b| b != 0);
+            let deleted = self.deleted.read();
+            let has_deleted = deleted.iter().any(|&b| b != 0);
+
+            if !has_null_bm && !has_deleted {
+                // No nulls, no deletes — count entries excluding NULL_MARKER (O(dict_size), fast)
+                let count = dict_strings.iter().filter(|s| s.as_str() != NULL_MARKER).count() as i64;
+                return Ok(count);
+            }
+
+            let mut seen = vec![false; num_groups];
+            for (i, &gid) in group_ids.iter().enumerate() {
+                if has_deleted { let b = i/8; let bit = i%8; if b < deleted.len() && (deleted[b] >> bit) & 1 != 0 { continue; } }
+                if has_null_bm { let b = i/8; let bit = i%8; if b < null_bm.len() && (null_bm[b] >> bit) & 1 != 0 { continue; } }
+                let g = gid as usize;
+                if g < num_groups { seen[g] = true; }
+            }
+            // Also exclude any NULL_MARKER groups
+            let count = (0..num_groups).filter(|&g| seen[g] && dict_strings[g].as_str() != NULL_MARKER).count() as i64;
+            return Ok(count);
+        }
+
+        // MMAP PATH: read per-column null bitmaps from RG data
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(dict_strings.iter().filter(|s| s.as_str() != NULL_MARKER).count() as i64),
+        };
+        let col_idx = match footer.schema.get_index(col_name) {
+            Some(idx) => idx,
+            None => return Ok(dict_strings.iter().filter(|s| s.as_str() != NULL_MARKER).count() as i64),
+        };
+
+        let max_col_idx = col_idx;
+        let all_rcix = footer.row_groups.iter().enumerate().all(|(rg_i, rg_meta)| {
+            if rg_meta.row_count == 0 { return true; }
+            footer.col_offsets.get(rg_i).map_or(false, |v| v.len() > max_col_idx)
+        });
+
+        if !all_rcix {
+            // Can't read null bitmaps — conservative count (may include null row groups)
+            return Ok(dict_strings.iter().filter(|s| s.as_str() != NULL_MARKER).count() as i64);
+        }
+
+        let file_guard = self.file.read();
+        let file = match file_guard.as_ref() {
+            Some(f) => f,
+            None => return Ok(dict_strings.iter().filter(|s| s.as_str() != NULL_MARKER).count() as i64),
+        };
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        let mut seen = vec![false; num_groups];
+        let mut rg_row_offset = 0usize;
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 { rg_row_offset += rg_rows; continue; }
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() { rg_row_offset += rg_rows; continue; }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            if rg_bytes.len() < 32 { rg_row_offset += rg_rows; continue; }
+
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let compress_flag = rg_bytes[28];
+            let encoding_version = rg_bytes[29];
+            if compress_flag != crate::storage::on_demand::RG_COMPRESS_NONE || encoding_version < 1 {
+                rg_row_offset += rg_rows; continue;
+            }
+            let body = &rg_bytes[32..];
+            let rcix = &footer.col_offsets[rg_i];
+            if col_idx >= rcix.len() { rg_row_offset += rg_rows; continue; }
+            let col_off = rcix[col_idx] as usize;
+            let null_bm = if col_off + null_bitmap_len <= body.len() { &body[col_off..col_off + null_bitmap_len] } else { &[] };
+            let has_null_bm = null_bm.iter().any(|&b| b != 0);
+            let has_deleted = rg_meta.deletion_count > 0;
+            let del_start = rg_rows * 8;
+            let del_vec_len = null_bitmap_len;
+            let del_bytes = if del_start + del_vec_len <= body.len() { &body[del_start..del_start + del_vec_len] } else { &[] };
+
+            let gids_slice = &group_ids[rg_row_offset..(rg_row_offset + rg_rows).min(group_ids.len())];
+            let rg_n = gids_slice.len();
+
+            for i in 0..rg_n {
+                if has_deleted { if !del_bytes.is_empty() && (del_bytes[i/8] >> (i%8)) & 1 != 0 { continue; } }
+                if has_null_bm { if !null_bm.is_empty() && (null_bm[i/8] >> (i%8)) & 1 != 0 { continue; } }
+                let g = unsafe { *gids_slice.get_unchecked(i) } as usize;
+                if g < num_groups { unsafe { *seen.get_unchecked_mut(g) = true; } }
+            }
+            rg_row_offset += rg_rows;
+        }
+
+        Ok(seen.iter().filter(|&&b| b).count() as i64)
+    }
+
+    /// Fast top-k for ORDER BY (string_col, float_col) without Arrow string conversion.
+    /// Accepts pre-built dict (dict_strings, row_gids) from global dict cache for O(1) warm calls.
+    /// Returns None if not applicable (non-float second col, data not in memory, etc).
+    pub fn order_topk_str_float64_with_dict(
+        &self,
+        dict_strings: &[String], row_gids: &[u16], str_asc: bool,
+        f64_col: &str, f64_asc: bool,
+        k: usize, offset: usize,
+    ) -> io::Result<Option<Vec<usize>>> {
+        // Build alphabetical rank mapping (O(dict_size log dict_size), trivial for small dicts)
+        let num_dict = dict_strings.len();
+        if num_dict == 0 { return Ok(None); }
+        let mut sorted_idx: Vec<u16> = (0..num_dict as u16).collect();
+        sorted_idx.sort_unstable_by_key(|&i| dict_strings[i as usize].as_str());
+        let mut rank_of = vec![0u16; num_dict];
+        for (rank, &orig) in sorted_idx.iter().enumerate() {
+            rank_of[orig as usize] = rank as u16;
+        }
+        let k_plus_offset = k + offset;
+
+        // Helper: run the streaming heap top-k loop given f64 values and deletion bitmap
+        let run_topk = |f64_vals: &[f64], del_bytes: &[u8]| -> Vec<usize> {
+            let scan_rows = row_gids.len().min(f64_vals.len());
+            let has_deleted = del_bytes.iter().any(|&b| b != 0);
+            let mut heap: std::collections::BinaryHeap<(u64, u64, usize)> =
+                std::collections::BinaryHeap::with_capacity(k_plus_offset + 1);
+            for i in 0..scan_rows {
+                if has_deleted {
+                    let b = i / 8; let bit = i % 8;
+                    if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { continue; }
+                }
+                let gid = row_gids[i] as usize;
+                let sr = if gid < num_dict { rank_of[gid] as u64 } else { u16::MAX as u64 };
+                let sk0 = if str_asc { sr } else { u16::MAX as u64 - sr };
+                let f = f64_vals[i];
+                let fb = f.to_bits();
+                let fs = if fb >> 63 == 0 { fb ^ (1u64 << 63) } else { !fb };
+                let sk1 = if f64_asc { fs } else { !fs };
+                if heap.len() < k_plus_offset {
+                    heap.push((sk0, sk1, i));
+                } else if let Some(&(h0, h1, _)) = heap.peek() {
+                    if (sk0, sk1) < (h0, h1) { heap.pop(); heap.push((sk0, sk1, i)); }
+                }
+            }
+            let mut results: Vec<(u64, u64, usize)> = heap.into_vec();
+            results.sort_unstable_by_key(|&(a, b, _)| (a, b));
+            results.into_iter().skip(offset).map(|(_, _, idx)| idx).collect()
+        };
+
+        // IN-MEMORY PATH
+        if self.has_v4_in_memory_data() {
+            let schema = self.schema.read();
+            let columns = self.columns.read();
+            let deleted = self.deleted.read();
+            let f64_idx = match schema.get_index(f64_col) { Some(i) => i, None => return Ok(None) };
+            let f64_vals: &[f64] = match columns.get(f64_idx) {
+                Some(ColumnData::Float64(v)) => v.as_slice(),
+                _ => return Ok(None),
+            };
+            return Ok(Some(run_topk(f64_vals, &deleted)));
+        }
+
+        // MMAP PATH: data was auto-flushed to V4 format; read f64 col via scan_columns_mmap
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let f64_idx = match footer.schema.get_index(f64_col) { Some(i) => i, None => return Ok(None) };
+        let (scanned, del_bytes) = self.scan_columns_mmap(&[f64_idx], &footer)?;
+        if scanned.is_empty() { return Ok(None); }
+        let f64_vals: &[f64] = match &scanned[0] {
+            ColumnData::Float64(v) => v.as_slice(),
+            _ => return Ok(None),
+        };
+        Ok(Some(run_topk(f64_vals, &del_bytes)))
+    }
+
     /// Supports both in-memory and mmap-only paths.
     pub fn build_string_dict_cache(
         &self,
@@ -960,6 +1174,193 @@ impl OnDemandStorage {
             })
             .collect();
         
+        Ok(Some(results))
+    }
+
+    /// Execute 2-column GROUP BY + aggregate using pre-built dict caches for both group columns.
+    /// Uses composite index: idx1 * dict2_size + idx2 for O(1) group lookup per row.
+    /// group_ids are 0-based (matching build_string_dict_cache output).
+    /// Returns Vec<((group1_val, group2_val), [(sum, count) per agg])>
+    pub fn execute_group_agg_2col_cached(
+        &self,
+        dict1_strings: &[String], group_ids1: &[u16],
+        dict2_strings: &[String], group_ids2: &[u16],
+        agg_cols: &[(&str, bool)], // (col_name, is_count_star)
+    ) -> io::Result<Option<Vec<((String, String), Vec<(f64, i64)>)>>> {
+        // 0-based: dict indices 0..len-1 (no null slot)
+        let dict1_size = dict1_strings.len();
+        let dict2_size = dict2_strings.len();
+        let total_size = dict1_size * dict2_size;
+        if dict1_size == 0 || dict2_size == 0 { return Ok(Some(Vec::new())); }
+        if total_size > 200_000 { return Ok(None); }
+
+        let num_aggs = agg_cols.len();
+        let flat_len = total_size * num_aggs;
+        let mut flat_sums = vec![0.0f64; flat_len];
+        let mut flat_counts = vec![0i64; flat_len];
+
+        if !self.has_v4_in_memory_data() {
+            // MMAP PATH: read agg columns from disk, group_ids already built
+            let footer = match self.get_or_load_footer()? {
+                Some(f) => f,
+                None => return Ok(None),
+            };
+            let schema = &footer.schema;
+            let agg_col_indices: Vec<Option<usize>> = agg_cols.iter()
+                .map(|(name, is_count)| if *is_count { None } else { schema.get_index(name) })
+                .collect();
+            let needed: Vec<usize> = agg_col_indices.iter().filter_map(|&x| x).collect();
+            let scan_rows = group_ids1.len().min(group_ids2.len());
+
+            if needed.is_empty() {
+                // COUNT(*) only — no column read needed
+                for i in 0..scan_rows {
+                    let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
+                    let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
+                    if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
+                    let composite = idx1 * dict2_size + idx2;
+                    unsafe { *flat_counts.get_unchecked_mut(composite * num_aggs) += 1; }
+                }
+            } else {
+                let (scanned, del_bytes) = self.scan_columns_mmap(&needed, &footer)?;
+                let has_deleted = del_bytes.iter().any(|&b| b != 0);
+                struct AggSl<'a> { f64v: Option<&'a [f64]>, i64v: Option<&'a [i64]>, is_count: bool }
+                let slices: Vec<AggSl> = agg_col_indices.iter().map(|opt_idx| {
+                    if opt_idx.is_none() { return AggSl { f64v: None, i64v: None, is_count: true }; }
+                    let col_idx = opt_idx.unwrap();
+                    let pos = needed.iter().position(|&x| x == col_idx);
+                    if let Some(pos) = pos {
+                        if pos < scanned.len() {
+                            match &scanned[pos] {
+                                ColumnData::Float64(v) => return AggSl { f64v: Some(v.as_slice()), i64v: None, is_count: false },
+                                ColumnData::Int64(v)   => return AggSl { f64v: None, i64v: Some(v.as_slice()), is_count: false },
+                                _ => {}
+                            }
+                        }
+                    }
+                    AggSl { f64v: None, i64v: None, is_count: true }
+                }).collect();
+                for i in 0..scan_rows {
+                    if has_deleted { let b = i/8; let bit = i%8; if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { continue; } }
+                    let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
+                    let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
+                    if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
+                    let composite = idx1 * dict2_size + idx2;
+                    let base = composite * num_aggs;
+                    for (ai, sl) in slices.iter().enumerate() {
+                        unsafe { *flat_counts.get_unchecked_mut(base + ai) += 1; }
+                        if !sl.is_count {
+                            if let Some(v) = sl.f64v { if i < v.len() { unsafe { *flat_sums.get_unchecked_mut(base + ai) += *v.get_unchecked(i); } } }
+                            else if let Some(v) = sl.i64v { if i < v.len() { unsafe { *flat_sums.get_unchecked_mut(base + ai) += *v.get_unchecked(i) as f64; } } }
+                        }
+                    }
+                }
+            }
+        } else {
+            // IN-MEMORY PATH
+            let schema = self.schema.read();
+            let columns = self.columns.read();
+            let deleted = self.deleted.read();
+            let total_rows = self.ids.read().len();
+            let scan_rows = total_rows.min(group_ids1.len()).min(group_ids2.len());
+            let has_deleted = deleted.iter().any(|&b| b != 0);
+
+            struct AggSl<'a> { f64v: Option<&'a [f64]>, i64v: Option<&'a [i64]>, is_count: bool }
+            let slices: Vec<AggSl> = agg_cols.iter().map(|(name, is_count)| {
+                if *is_count { return AggSl { f64v: None, i64v: None, is_count: true }; }
+                if let Some(idx) = schema.get_index(name) {
+                    if idx < columns.len() {
+                        match &columns[idx] {
+                            ColumnData::Float64(v) => return AggSl { f64v: Some(v.as_slice()), i64v: None, is_count: false },
+                            ColumnData::Int64(v)   => return AggSl { f64v: None, i64v: Some(v.as_slice()), is_count: false },
+                            _ => {}
+                        }
+                    }
+                }
+                AggSl { f64v: None, i64v: None, is_count: true }
+            }).collect();
+
+            if !has_deleted && num_aggs == 2 {
+                // Specialized 2-agg path (COUNT+AVG/SUM) — most common case
+                let sl0 = &slices[0]; let sl1 = &slices[1];
+                if sl0.is_count {
+                    if let Some(fv) = sl1.f64v {
+                        let n = scan_rows.min(fv.len());
+                        for i in 0..n {
+                            let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
+                            let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
+                            if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
+                            let c = (idx1 * dict2_size + idx2) * 2;
+                            unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_sums.get_unchecked_mut(c + 1) += *fv.get_unchecked(i); }
+                        }
+                        for comp in 0..total_size { flat_counts[comp * 2 + 1] = flat_counts[comp * 2]; }
+                    } else if let Some(iv) = sl1.i64v {
+                        let n = scan_rows.min(iv.len());
+                        for i in 0..n {
+                            let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
+                            let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
+                            if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
+                            let c = (idx1 * dict2_size + idx2) * 2;
+                            unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_sums.get_unchecked_mut(c + 1) += *iv.get_unchecked(i) as f64; }
+                        }
+                        for comp in 0..total_size { flat_counts[comp * 2 + 1] = flat_counts[comp * 2]; }
+                    } else {
+                        for i in 0..scan_rows {
+                            let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
+                            let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
+                            if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
+                            let c = (idx1 * dict2_size + idx2) * 2;
+                            unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_counts.get_unchecked_mut(c + 1) += 1; }
+                        }
+                    }
+                } else {
+                    // General 2-agg
+                    for i in 0..scan_rows {
+                        let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
+                        let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
+                        if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
+                        let base = (idx1 * dict2_size + idx2) * 2;
+                        for (ai, sl) in slices.iter().enumerate() {
+                            unsafe { *flat_counts.get_unchecked_mut(base + ai) += 1; }
+                            if !sl.is_count {
+                                if let Some(v) = sl.f64v { if i < v.len() { unsafe { *flat_sums.get_unchecked_mut(base + ai) += *v.get_unchecked(i); } } }
+                                else if let Some(v) = sl.i64v { if i < v.len() { unsafe { *flat_sums.get_unchecked_mut(base + ai) += *v.get_unchecked(i) as f64; } } }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for i in 0..scan_rows {
+                    if has_deleted { let b = i/8; let bit = i%8; if b < deleted.len() && (deleted[b] >> bit) & 1 != 0 { continue; } }
+                    let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
+                    let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
+                    if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
+                    let base = (idx1 * dict2_size + idx2) * num_aggs;
+                    for (ai, sl) in slices.iter().enumerate() {
+                        unsafe { *flat_counts.get_unchecked_mut(base + ai) += 1; }
+                        if !sl.is_count {
+                            if let Some(v) = sl.f64v { if i < v.len() { unsafe { *flat_sums.get_unchecked_mut(base + ai) += *v.get_unchecked(i); } } }
+                            else if let Some(v) = sl.i64v { if i < v.len() { unsafe { *flat_sums.get_unchecked_mut(base + ai) += *v.get_unchecked(i) as f64; } } }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect non-empty groups (0-based indices)
+        let mut results: Vec<((String, String), Vec<(f64, i64)>)> = Vec::new();
+        for idx1 in 0..dict1_size {
+            for idx2 in 0..dict2_size {
+                let composite = idx1 * dict2_size + idx2;
+                let base = composite * num_aggs;
+                if flat_counts[base] > 0 {
+                    let aggs: Vec<(f64, i64)> = (0..num_aggs)
+                        .map(|ai| (flat_sums[base + ai], flat_counts[base + ai]))
+                        .collect();
+                    results.push(((dict1_strings[idx1].clone(), dict2_strings[idx2].clone()), aggs));
+                }
+            }
+        }
         Ok(Some(results))
     }
 
@@ -2037,6 +2438,7 @@ impl OnDemandStorage {
         let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
         let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
         let mut binary_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut fixedlist_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
         let mut null_positions: HashMap<String, Vec<bool>> = HashMap::new();
 
@@ -2060,6 +2462,9 @@ impl OnDemandStorage {
                     ColumnType::Binary => {
                         binary_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
+                    ColumnType::FixedList => {
+                        fixedlist_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
+                    }
                     ColumnType::Bool => {
                         bool_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
@@ -2082,6 +2487,7 @@ impl OnDemandStorage {
                     ColumnValue::Float64(_) => { float_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     ColumnValue::String(_) => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     ColumnValue::Binary(_) => { binary_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValue::FixedList(_) => { fixedlist_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     ColumnValue::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     ColumnValue::Null => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                 }
@@ -2099,12 +2505,13 @@ impl OnDemandStorage {
             for (key, val) in row {
                 if !int_columns.contains_key(key) && !float_columns.contains_key(key) 
                     && !string_columns.contains_key(key) && !binary_columns.contains_key(key)
-                    && !bool_columns.contains_key(key) {
+                    && !fixedlist_columns.contains_key(key) && !bool_columns.contains_key(key) {
                     match val {
                         ColumnValue::Int64(_) => { int_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                         ColumnValue::Float64(_) => { float_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                         ColumnValue::String(_) => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                         ColumnValue::Binary(_) => { binary_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValue::FixedList(_) => { fixedlist_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                         ColumnValue::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                         ColumnValue::Null => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     }
@@ -2150,6 +2557,15 @@ impl OnDemandStorage {
                 col.push(val);
                 null_positions.entry(key.clone()).or_default().push(is_null);
             }
+            for (key, col) in fixedlist_columns.iter_mut() {
+                let (val, is_null) = match row.get(key) {
+                    Some(ColumnValue::FixedList(v)) => (v.clone(), false),
+                    Some(ColumnValue::Null) | None => (Vec::new(), true),
+                    _ => (Vec::new(), true),
+                };
+                col.push(val);
+                null_positions.entry(key.clone()).or_default().push(is_null);
+            }
             for (key, col) in bool_columns.iter_mut() {
                 let (val, is_null) = match row.get(key) {
                     Some(ColumnValue::Bool(v)) => (*v, false),
@@ -2161,7 +2577,7 @@ impl OnDemandStorage {
             }
         }
 
-        let result = self.insert_typed_with_nulls(int_columns, float_columns, string_columns, binary_columns, bool_columns, null_positions)?;
+        let result = self.insert_typed_with_nulls_full(int_columns, float_columns, string_columns, binary_columns, fixedlist_columns, bool_columns, null_positions)?;
         
         // Update pending rows counter and check auto-flush
         self.pending_rows.fetch_add(result.len() as u64, Ordering::Relaxed);

@@ -51,6 +51,7 @@ impl IndexKey {
             Value::Date(d) => IndexKey::Int(*d as i64),
             Value::Json(j) => IndexKey::Str(j.to_string()),
             Value::Array(_) => IndexKey::Null,
+            Value::FixedList(_) => IndexKey::Null,
         }
     }
 }

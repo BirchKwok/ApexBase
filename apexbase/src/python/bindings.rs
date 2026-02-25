@@ -64,6 +64,20 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         }
     }
 
+    // numpy ndarray (1-D float32 or float64) → FixedList (raw LE f32 bytes)
+    // Checked BEFORE list/sequence to catch np.ndarray first.
+    if obj.get_type().name().map(|n| n == "ndarray").unwrap_or(false) {
+        if let Ok(floats) = obj.call_method0("flatten")
+            .and_then(|flat| flat.call_method1("astype", ("float32",)))
+            .and_then(|f32arr| f32arr.call_method0("tobytes"))
+            .and_then(|b| b.extract::<Vec<u8>>())
+        {
+            if floats.len() % 4 == 0 {
+                return Ok(Value::FixedList(floats));
+            }
+        }
+    }
+
     if let Ok(s) = obj.extract::<String>() {
         return Ok(Value::String(s));
     }
@@ -85,6 +99,7 @@ fn column_value_to_py(py: Python<'_>, val: &ColumnValue) -> PyResult<PyObject> {
         ColumnValue::Float64(f) => Ok(f.into_py(py)),
         ColumnValue::String(s) => Ok(s.into_py(py)),
         ColumnValue::Binary(b) => Ok(b.clone().into_py(py)),
+        ColumnValue::FixedList(b) => Ok(b.clone().into_py(py)),
     }
 }
 
@@ -107,6 +122,7 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
         Value::Float64(f) => Ok(f.into_py(py)),
         Value::String(s) => Ok(s.into_py(py)),
         Value::Binary(b) => Ok(PyBytes::new_bound(py, b).into()),
+        Value::FixedList(b) => Ok(PyBytes::new_bound(py, b).into()),
         Value::Json(j) => Ok(j.to_string().into_py(py)),
         Value::Timestamp(t) => Ok(t.into_py(py)),
         Value::Date(d) => Ok(d.into_py(py)),
@@ -664,6 +680,7 @@ impl ApexStorageImpl {
         let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
         let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
         let mut binary_columns_map: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut fixedlist_columns_map: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
         let mut null_positions: HashMap<String, Vec<bool>> = HashMap::new();
 
@@ -687,6 +704,8 @@ impl ApexStorageImpl {
                         col_type = Some("bool");
                     } else if item.downcast::<pyo3::types::PyBytes>().is_ok() {
                         col_type = Some("bytes");
+                    } else if item.get_type().name().map_or(false, |n| n == "ndarray") {
+                        col_type = Some("fixedlist");
                     } else if item.extract::<i64>().is_ok() {
                         col_type = Some("int");
                     } else if item.extract::<f64>().is_ok() {
@@ -751,6 +770,28 @@ impl ApexStorageImpl {
                     binary_columns_map.insert(col_name.clone(), vals);
                     null_positions.insert(col_name, nulls);
                 }
+                Some("fixedlist") => {
+                    let mut vals: Vec<Vec<u8>> = Vec::with_capacity(col_len);
+                    let mut nulls = Vec::with_capacity(col_len);
+                    for item in list.iter() {
+                        let is_null = item.is_none();
+                        nulls.push(is_null);
+                        if is_null {
+                            vals.push(Vec::new());
+                        } else if let Ok(bytes) = item
+                            .call_method0("flatten")
+                            .and_then(|flat| flat.call_method1("astype", ("float32",)))
+                            .and_then(|f32arr| f32arr.call_method0("tobytes"))
+                            .and_then(|b| b.extract::<Vec<u8>>())
+                        {
+                            vals.push(bytes);
+                        } else {
+                            vals.push(Vec::new());
+                        }
+                    }
+                    fixedlist_columns_map.insert(col_name.clone(), vals);
+                    null_positions.insert(col_name, nulls);
+                }
                 Some("string") | None => {
                     let mut vals = Vec::with_capacity(col_len);
                     let mut nulls = Vec::with_capacity(col_len);
@@ -792,6 +833,7 @@ impl ApexStorageImpl {
                 &table_path,
                 int_columns, float_columns, string_columns,
                 binary_columns_map,
+                fixedlist_columns_map,
                 bool_columns,
                 null_positions,
                 durability,
@@ -2677,35 +2719,119 @@ impl ApexStorageImpl {
         use arrow::array::{StructArray, Array};
         use crate::query::vector_ops::bytes_to_query_vec_f32;
 
-        let query = bytes_to_query_vec_f32(query_bytes).ok_or_else(|| {
+        let query_f32 = bytes_to_query_vec_f32(query_bytes).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(
                 "_topk_distance_ffi: query_bytes must be raw little-endian float32 bytes",
             )
         })?;
 
-        let q_str = query
-            .iter()
-            .map(|v| format!("{:.7}", v))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT * FROM topk_distance({}, [{}], {}, '{}')",
-            col, q_str, k, metric
-        );
-
-        let base_dir = self.current_base_dir();
         let table_path = self.get_current_table_path()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        crate::query::executor::set_query_root_dir(&self.root_dir);
+
+        // Direct path — no SQL string formatting or parsing overhead.
+        let col_owned  = col.to_string();
+        let metric_str = metric.to_string();
+        let names = vec!["_id".to_string(), "dist".to_string()];
 
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
-            let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
+            use crate::query::vector_ops::{DistanceComputer, DistanceMetric, topk_heap_direct_parallel};
+            use arrow::array::{ArrayRef, BinaryArray, Float64Array, Int64Array};
+            use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+            use crate::query::executor::get_cached_backend_pub;
+
+            let metric_enum = DistanceMetric::from_str(&metric_str).ok_or_else(|| {
+                PyRuntimeError::new_err(format!("_topk_distance_ffi: unknown metric '{}'", metric_str))
+            })?;
+
+            let backend = get_cached_backend_pub(&table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            result
-                .to_record_batch()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+
+            let id_field   = Field::new(&names[0], ArrowDataType::Int64,   false);
+            let dist_field = Field::new(&names[1], ArrowDataType::Float64, false);
+            let out_schema = std::sync::Arc::new(Schema::new(vec![id_field, dist_field]));
+
+            let computer = DistanceComputer::new(metric_enum, query_f32.clone());
+
+            // FAST PATH: zero-copy scan on OS mmap — no Arrow batch, no memcpy
+            let direct_topk = backend.topk_fixedlist_direct(&col_owned, &computer, k)
+                .ok().flatten()
+                .or_else(|| backend.topk_binary_direct(&col_owned, &computer, k).ok().flatten());
+            if let Some(topk) = direct_topk {
+                if topk.is_empty() {
+                    return RecordBatch::try_new(
+                        out_schema,
+                        vec![
+                            std::sync::Arc::new(Int64Array::from(Vec::<i64>::new()))   as ArrayRef,
+                            std::sync::Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
+                        ],
+                    ).map_err(|e| PyRuntimeError::new_err(e.to_string()));
+                }
+                // Read only the _id column (8MB) to map row indices → IDs
+                let id_batch = backend.read_columns_to_arrow(Some(&["_id"]), 0, None)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let id_col = id_batch.column_by_name("_id");
+                let ids: Vec<i64> = topk.iter().map(|(row_idx, _)| {
+                    id_col.and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+                          .map(|a| a.value(*row_idx))
+                          .unwrap_or(*row_idx as i64)
+                }).collect();
+                let dists: Vec<f64> = topk.iter().map(|(_, d)| *d as f64).collect();
+                return RecordBatch::try_new(
+                    out_schema,
+                    vec![
+                        std::sync::Arc::new(Int64Array::from(ids))    as ArrayRef,
+                        std::sync::Arc::new(Float64Array::from(dists)) as ArrayRef,
+                    ],
+                ).map_err(|e| PyRuntimeError::new_err(e.to_string()));
+            }
+
+            // FALLBACK: Arrow path for Binary columns / compressed RGs
+            let needed: &[&str] = &[&col_owned, "_id"];
+            let full_batch = backend.read_columns_to_arrow(Some(needed), 0, None)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            if full_batch.num_rows() == 0 {
+                return RecordBatch::try_new(
+                    out_schema,
+                    vec![
+                        std::sync::Arc::new(Int64Array::from(Vec::<i64>::new()))   as ArrayRef,
+                        std::sync::Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
+                    ],
+                ).map_err(|e| PyRuntimeError::new_err(e.to_string()));
+            }
+
+            let bin_col = full_batch.column_by_name(&col_owned).ok_or_else(|| {
+                PyRuntimeError::new_err(format!("column '{}' not found", col_owned))
+            })?;
+
+            let topk = if let Some(fixed_arr) = bin_col.as_any().downcast_ref::<arrow::array::FixedSizeListArray>() {
+                use crate::query::vector_ops::topk_heap_direct_parallel_fixed;
+                topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
+            } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
+                topk_heap_direct_parallel(bin_arr, &computer, k)
+            } else {
+                return Err(PyRuntimeError::new_err(format!("column '{}' is not a vector column", col_owned)));
+            };
+
+            let id_col = full_batch.column_by_name("_id");
+            let ids: Vec<i64> = topk.iter().map(|(row_idx, _)| {
+                if let Some(arr) = &id_col {
+                    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                        return a.value(*row_idx);
+                    }
+                }
+                *row_idx as i64
+            }).collect();
+            let dists: Vec<f64> = topk.iter().map(|(_, d)| *d as f64).collect();
+
+            RecordBatch::try_new(
+                out_schema,
+                vec![
+                    std::sync::Arc::new(Int64Array::from(ids))    as ArrayRef,
+                    std::sync::Arc::new(Float64Array::from(dists)) as ArrayRef,
+                ],
+            ).map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
-        crate::query::executor::clear_query_root_dir();
 
         if batch.num_rows() == 0 {
             return Ok((0, 0));

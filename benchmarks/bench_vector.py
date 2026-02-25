@@ -16,9 +16,6 @@ DuckDB fetch strategy:
 
 import argparse
 import gc
-import math
-import os
-import struct
 import tempfile
 import time
 
@@ -62,7 +59,7 @@ def generate_data(n: int, dim: int, seed: int = 42):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def setup_apex(vecs: np.ndarray, tmp_dir: str):
-    from apexbase.client import ApexClient, encode_vector
+    from apexbase.client import ApexClient
 
     client = ApexClient(dirpath=tmp_dir, drop_if_exists=True)
     client.create_table("vecs")
@@ -71,7 +68,7 @@ def setup_apex(vecs: np.ndarray, tmp_dir: str):
     n = len(vecs)
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
-        rows = [{"id": i, "vec": encode_vector(vecs[i])} for i in range(start, end)]
+        rows = [{"id": i, "vec": vecs[i]} for i in range(start, end)]
         client.store(rows)
     return client
 
@@ -190,49 +187,6 @@ def bench_duckdb_batch_sequential(con, queries: np.ndarray, k: int, metric: str)
         con.execute(sql).fetch_arrow_table()
     return (time.perf_counter() - t0) * 1000
 
-
-def bench_duckdb_batch_crossjoin(con, queries: np.ndarray, k: int, metric: str):
-    """DuckDB batch: CROSS JOIN + window function — single SQL round-trip.
-
-    NOTE: This is O(n×q) and typically much SLOWER than N sequential queries
-    for small q and large n, because the full cartesian product is materialized
-    before any pruning can occur. Included only for reference.
-    """
-    import pyarrow as pa
-
-    nq, dim = queries.shape
-    q_cast = f"FLOAT[{dim}]"
-    qt = pa.table({"qid": pa.array(range(nq), type=pa.int32()),
-                   "qvec": pa.array(queries.tolist())})
-    con.register("_queries", qt)
-
-    if metric == "l2":
-        dist_fn = f"array_distance(v.vec, q.qvec::{q_cast})"
-    elif metric == "cosine":
-        dist_fn = f"array_cosine_distance(v.vec, q.qvec::{q_cast})"
-    elif metric == "dot":
-        dist_fn = f"array_negative_inner_product(v.vec, q.qvec::{q_cast})"
-    else:
-        raise ValueError(metric)
-
-    sql = f"""
-        WITH dists AS (
-            SELECT q.qid, v.id, {dist_fn} AS dist
-            FROM vecs v CROSS JOIN _queries q
-        )
-        SELECT qid, id, dist
-        FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY qid ORDER BY dist) AS rn FROM dists)
-        WHERE rn <= {k}
-        ORDER BY qid, dist
-    """
-    gc.collect()
-    t0 = time.perf_counter()
-    con.execute(sql).fetch_arrow_table()
-    elapsed = (time.perf_counter() - t0) * 1000
-    con.execute("DROP VIEW IF EXISTS _queries")
-    return elapsed
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -329,20 +283,6 @@ def main():
 
             per_apex = fmt(apex_batch_med / nq)
             print(f"{metric:<18} {fmt(apex_batch_med):>14} {duck_str:>14} {per_apex:>16} {per_duck:>16}")
-
-        # ── Section 3b: DuckDB CROSS JOIN (reference only) ────────────────────
-        if duck_con is not None:
-            print()
-            print("── Section 3b: DuckDB CROSS JOIN batch (reference — typically much slower) ──")
-            cj_header = f"{'Metric':<18} {'CROSS JOIN':>14} {'Sequential':>14} {'Slowdown':>10}"
-            print(cj_header)
-            print("-" * len(cj_header))
-            for metric in ["l2", "cosine", "dot"]:
-                cj_ms = bench_duckdb_batch_crossjoin(duck_con, batch_queries, args.k, metric)
-                seq_ms = bench_duckdb_batch_sequential(duck_con, batch_queries, args.k, metric)
-                slowdown = cj_ms / seq_ms if seq_ms > 0 else float("inf")
-                flag = "❌" if slowdown > 1.5 else "≈"
-                print(f"{metric:<18} {fmt(cj_ms):>14} {fmt(seq_ms):>14} {slowdown:>8.1f}x {flag}")
 
         # ── Section 4: ApexBase detailed stats ────────────────────────────────
         print()

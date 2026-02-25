@@ -592,6 +592,36 @@ impl OnDemandStorage {
                         (ArrowDataType::Binary, Arc::new(BinaryArray::from(bins)))
                     }
                 }
+                ColumnData::FixedList { data, dim } => {
+                    use arrow::array::{FixedSizeListArray, Float32Array};
+                    use arrow::buffer::Buffer;
+                    let dim_usize = *dim as usize;
+                    let row_count = if dim_usize == 0 { 0 } else { data.len() / (dim_usize * 4) }
+                        .min(active_count);
+                    let byte_len = row_count * dim_usize * 4;
+                    // Build Float32 values buffer — one copy from accumulated data
+                    let float_buf = Buffer::from_vec(data[..byte_len].to_vec());
+                    let float_arr = unsafe {
+                        Float32Array::from(arrow::array::ArrayData::new_unchecked(
+                            ArrowDataType::Float32,
+                            row_count * dim_usize,
+                            Some(0), None, 0,
+                            vec![float_buf],
+                            vec![],
+                        ))
+                    };
+                    let list_dt = ArrowDataType::FixedSizeList(
+                        Arc::new(Field::new("item", ArrowDataType::Float32, false)),
+                        dim_usize as i32,
+                    );
+                    let arr = FixedSizeListArray::new(
+                        Arc::new(Field::new("item", ArrowDataType::Float32, false)),
+                        dim_usize as i32,
+                        Arc::new(float_arr),
+                        None,
+                    );
+                    (list_dt, Arc::new(arr) as ArrayRef)
+                }
                 _ => {
                     // Fallback: null array
                     let arr = arrow::array::new_null_array(&ArrowDataType::Utf8, active_count);
@@ -1528,6 +1558,22 @@ impl OnDemandStorage {
                 // Native dictionary-encoded string reading
                 self.read_string_dict_column_range_mmap(mmap_cache, file, index, start_row, row_count)
             }
+            ColumnType::FixedList => {
+                // FixedList: contiguous raw f32 bytes stored like Binary but with fixed stride
+                // Format: [count:u64][dim:u32][data: count * dim * 4 bytes]
+                // Read the dim first, then the data slice
+                let mut dim_buf = [0u8; 4];
+                let _ = mmap_cache.read_at(file, &mut dim_buf, index.data_offset + 8);
+                let dim = u32::from_le_bytes(dim_buf);
+                let dim_usize = dim as usize;
+                let byte_len = row_count * dim_usize * 4;
+                let byte_offset = index.data_offset + 12 + (start_row * dim_usize * 4) as u64;
+                let mut data = vec![0u8; byte_len];
+                if byte_len > 0 {
+                    mmap_cache.read_at(file, &mut data, byte_offset)?;
+                }
+                Ok(ColumnData::FixedList { data, dim })
+            }
             ColumnType::Null => {
                 Ok(ColumnData::Int64(vec![0; row_count]))
             }
@@ -2045,6 +2091,22 @@ impl OnDemandStorage {
             ColumnType::StringDict => {
                 // Native dictionary-encoded string scattered read
                 self.read_string_dict_column_scattered_mmap(mmap_cache, file, index, row_indices)
+            }
+            ColumnType::FixedList => {
+                let mut dim_buf = [0u8; 4];
+                let _ = mmap_cache.read_at(file, &mut dim_buf, index.data_offset + 8);
+                let dim = u32::from_le_bytes(dim_buf);
+                let dim_usize = dim as usize;
+                let mut data = Vec::with_capacity(row_indices.len() * dim_usize * 4);
+                for &row in row_indices {
+                    let byte_offset = index.data_offset + 12 + (row * dim_usize * 4) as u64;
+                    let mut row_data = vec![0u8; dim_usize * 4];
+                    if dim_usize > 0 {
+                        let _ = mmap_cache.read_at(file, &mut row_data, byte_offset);
+                    }
+                    data.extend_from_slice(&row_data);
+                }
+                Ok(ColumnData::FixedList { data, dim })
             }
             ColumnType::Null => {
                 // Null column - return empty Int64 as placeholder
@@ -3746,6 +3808,286 @@ impl OnDemandStorage {
         let batch = arrow::record_batch::RecordBatch::try_new(batch_schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(Some(batch))
+    }
+
+    /// Zero-copy parallel TopK for a Binary (vector) column.
+    ///
+    /// For uniform-stride binary data (fixed-size vectors stored as raw f32 bytes),
+    /// scans directly on OS mmap with no memcpy.
+    /// Returns `Some(Vec<(global_row_idx, distance)>)` or `None` to fall back.
+    pub fn topk_binary_direct(
+        &self,
+        col_name: &str,
+        computer: &crate::query::vector_ops::DistanceComputer,
+        k: usize,
+    ) -> io::Result<Option<Vec<(usize, f32)>>> {
+        use crate::query::vector_ops::topk_heap_on_floats;
+
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        if schema.columns[col_idx].1 != ColumnType::Binary {
+            return Ok(None);
+        }
+
+        let file_guard = self.file.read();
+        let file = match file_guard.as_ref() { Some(f) => f, None => return Ok(None) };
+        let mmap_arc = self.mmap_cache.write().get_mmap_arc(file)?;
+        drop(file_guard);
+        let mmap: &[u8] = &mmap_arc;
+
+        // ── PASS 1: validate all RGs, determine dim, compute total rows ──────
+        let query_dim = computer.query.len();
+        let total_active: usize = footer.row_groups.iter().map(|rg| rg.active_rows() as usize).sum();
+        if total_active == 0 { return Ok(Some(vec![])); }
+
+        struct RgDesc { count: usize, dim: usize, data_start: usize, byte_len: usize }
+        let mut rg_descs: Vec<Option<RgDesc>> = Vec::with_capacity(footer.row_groups.len());
+
+        for (rg_idx, rg_meta) in footer.row_groups.iter().enumerate() {
+            if rg_meta.row_count == 0 { rg_descs.push(None); continue; }
+            let rg_rows = rg_meta.row_count as usize;
+
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap.len() { return Ok(None); }
+            let rg_bytes = &mmap[rg_meta.offset as usize..rg_end];
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { 1 };
+            let encoding_ver  = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+
+            if compress_flag != RG_COMPRESS_NONE || encoding_ver < 1
+                || rg_meta.deletion_count > 0
+                || rg_idx >= footer.col_offsets.len()
+                || col_idx >= footer.col_offsets[rg_idx].len()
+            { return Ok(None); }
+
+            let rg_body_abs  = (rg_meta.offset + 32) as usize;
+            let col_abs      = rg_body_abs + footer.col_offsets[rg_idx][col_idx] as usize;
+            let null_bm_len  = (rg_rows + 7) / 8;
+            let data_abs     = col_abs + null_bm_len;
+
+            if data_abs + 9 > mmap.len() { return Ok(None); }
+            if mmap[data_abs] != COL_ENCODING_PLAIN { return Ok(None); }
+
+            let count = u64::from_le_bytes(mmap[data_abs+1..data_abs+9].try_into().unwrap()) as usize;
+            if count == 0 { rg_descs.push(None); continue; }
+
+            let off_base = data_abs + 9;
+            if off_base + 8 > mmap.len() { return Ok(None); }
+            let off0 = u32::from_le_bytes(mmap[off_base..off_base+4].try_into().unwrap()) as usize;
+            let off1 = u32::from_le_bytes(mmap[off_base+4..off_base+8].try_into().unwrap()) as usize;
+            if off1 <= off0 || (off1 - off0) % 4 != 0 { return Ok(None); }
+            let dim = (off1 - off0) / 4;
+            if dim != query_dim { return Ok(None); }
+
+            // Binary column format: [count:u64][(count+1)*u32 offsets][data_len:u64][data bytes]
+            // Must skip the 8-byte data_len field between the offsets array and the float data.
+            let data_start = off_base + (count + 1) * 4 + 8;
+            let byte_len   = count * dim * 4;
+            if data_start + byte_len > mmap.len() { return Ok(None); }
+            rg_descs.push(Some(RgDesc { count, dim, data_start, byte_len }));
+        }
+
+        // ── PASS 2: fill reusable buffer and run ONE topk scan ───────────────
+        // scan_buf caches the float data for this column. On repeated queries the
+        // data is already present — skip the 512MB mmap→heap copy entirely.
+        // Invalidated by invalidate_page_cache() on every write.
+        let needed = total_active * query_dim;
+        let file_size = mmap.len() as u64;
+        let mut buf_guard = self.scan_buf.lock().unwrap();
+        let cached_size = self.scan_buf_file_size.load(std::sync::atomic::Ordering::Acquire);
+        let col_guard = self.scan_buf_col.lock().unwrap();
+        let cache_hit = cached_size == file_size
+            && buf_guard.len() >= needed
+            && col_guard.as_str() == col_name;
+        drop(col_guard);
+
+        if !cache_hit {
+            if buf_guard.capacity() < needed {
+                let cur = buf_guard.len();
+                buf_guard.reserve(needed - cur);
+            }
+            unsafe { buf_guard.set_len(needed); }
+
+            let buf_ptr = buf_guard.as_mut_ptr();
+            let mut filled_floats = 0usize;
+            for desc in rg_descs.iter() {
+                let Some(d) = desc else { continue };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        mmap.as_ptr().add(d.data_start),
+                        (buf_ptr as *mut u8).add(filled_floats * 4),
+                        d.byte_len,
+                    );
+                }
+                filled_floats += d.count * d.dim;
+            }
+
+            // Mark cache valid
+            let mut cg = self.scan_buf_col.lock().unwrap();
+            cg.clear(); cg.push_str(col_name);
+            drop(cg);
+            self.scan_buf_file_size.store(file_size, std::sync::atomic::Ordering::Release);
+        }
+        drop(mmap_arc);
+
+        // SAFETY: scan_buf holds at least `needed` valid f32 elements.
+        let buf_ptr = buf_guard.as_ptr();
+        let floats: &[f32] = unsafe { std::slice::from_raw_parts(buf_ptr, needed) };
+        let total_rows = needed / query_dim;
+        let mut result = topk_heap_on_floats(floats, total_rows, query_dim, computer, k);
+        drop(buf_guard);
+        result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        result.truncate(k);
+        Ok(Some(result))
+    }
+
+    /// Zero-copy parallel TopK for a FixedList column.
+    ///
+    /// Runs directly on the OS mmap — no Arrow construction, no 512MB memcpy.
+    /// Returns `Some(Vec<(global_row_idx, distance)>)` sorted ascending, or
+    /// `None` if the column is not found / not FixedList / RG requires fallback.
+    pub fn topk_fixedlist_direct(
+        &self,
+        col_name: &str,
+        computer: &crate::query::vector_ops::DistanceComputer,
+        k: usize,
+    ) -> io::Result<Option<Vec<(usize, f32)>>> {
+        use crate::query::vector_ops::topk_heap_on_floats;
+
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        if schema.columns[col_idx].1 != ColumnType::FixedList {
+            return Ok(None);
+        }
+
+        let query_dim = computer.query.len();
+
+        // Get Arc<Mmap> and immediately release the write lock.
+        let file_guard = self.file.read();
+        let file = match file_guard.as_ref() {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let mmap_arc = self.mmap_cache.write().get_mmap_arc(file)?;
+        drop(file_guard);
+
+        let mmap: &[u8] = &mmap_arc;
+        let null_bitmap_len_fn = |rg_rows: usize| (rg_rows + 7) / 8;
+
+        // ── PASS 1: validate all RGs, collect descriptors ──────────────────
+        struct RgDesc { count: usize, float_abs: usize, byte_len: usize }
+        let mut rg_descs: Vec<Option<RgDesc>> = Vec::with_capacity(footer.row_groups.len());
+        let mut total_active: usize = 0;
+
+        for (rg_idx, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_active = rg_meta.active_rows() as usize;
+            total_active += rg_active;
+
+            if rg_meta.row_count == 0 { rg_descs.push(None); continue; }
+            let rg_rows = rg_meta.row_count as usize;
+
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap.len() { return Ok(None); }
+            let rg_bytes = &mmap[rg_meta.offset as usize..rg_end];
+
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { 1 };
+            let encoding_ver  = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+
+            if compress_flag != RG_COMPRESS_NONE
+                || encoding_ver < 1
+                || rg_meta.deletion_count > 0
+                || rg_idx >= footer.col_offsets.len()
+                || col_idx >= footer.col_offsets[rg_idx].len()
+            {
+                return Ok(None);
+            }
+
+            let rg_body_abs = (rg_meta.offset + 32) as usize;
+            let col_abs  = rg_body_abs + footer.col_offsets[rg_idx][col_idx] as usize;
+            let data_abs = col_abs + null_bitmap_len_fn(rg_rows);
+
+            // FixedList layout: [encoding:u8][count:u64][dim:u32][f32 * count * dim]
+            if data_abs + 13 > mmap.len() { return Ok(None); }
+            if mmap[data_abs] != COL_ENCODING_PLAIN { return Ok(None); }
+
+            let count = u64::from_le_bytes(mmap[data_abs+1..data_abs+9].try_into().unwrap()) as usize;
+            let dim   = u32::from_le_bytes(mmap[data_abs+9..data_abs+13].try_into().unwrap()) as usize;
+
+            if count == 0 || dim == 0 { rg_descs.push(None); continue; }
+            if dim != query_dim { return Ok(None); }
+
+            let float_abs = data_abs + 13;
+            let byte_len  = count * dim * 4;
+            if float_abs + byte_len > mmap.len() { return Ok(None); }
+
+            rg_descs.push(Some(RgDesc { count, float_abs, byte_len }));
+        }
+
+        if total_active == 0 { return Ok(Some(vec![])); }
+
+        // ── PASS 2: fill scan_buf and run ONE topk scan ─────────────────────
+        // Same scan_buf caching as topk_binary_direct: on repeated queries the
+        // mmap→heap copy is skipped entirely. Invalidated on every write.
+        let needed    = total_active * query_dim;
+        let file_size = mmap.len() as u64;
+        let mut buf_guard = self.scan_buf.lock().unwrap();
+        let cached_size = self.scan_buf_file_size.load(std::sync::atomic::Ordering::Acquire);
+        let col_guard   = self.scan_buf_col.lock().unwrap();
+        let cache_hit   = cached_size == file_size
+            && buf_guard.len() >= needed
+            && col_guard.as_str() == col_name;
+        drop(col_guard);
+
+        if !cache_hit {
+            let cur = buf_guard.len();
+            if buf_guard.capacity() < needed {
+                buf_guard.reserve(needed - cur);
+            }
+            unsafe { buf_guard.set_len(needed); }
+
+            let buf_ptr = buf_guard.as_mut_ptr();
+            let mut filled_floats = 0usize;
+            for desc in rg_descs.iter() {
+                let Some(d) = desc else { continue };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        mmap.as_ptr().add(d.float_abs),
+                        (buf_ptr as *mut u8).add(filled_floats * 4),
+                        d.byte_len,
+                    );
+                }
+                filled_floats += d.count * query_dim;
+            }
+
+            let mut cg = self.scan_buf_col.lock().unwrap();
+            cg.clear(); cg.push_str(col_name);
+            drop(cg);
+            self.scan_buf_file_size.store(file_size, std::sync::atomic::Ordering::Release);
+        }
+        drop(mmap_arc);
+
+        // SAFETY: scan_buf holds at least `needed` valid f32 elements.
+        let buf_ptr = buf_guard.as_ptr();
+        let floats: &[f32] = unsafe { std::slice::from_raw_parts(buf_ptr, needed) };
+        let total_rows = needed / query_dim;
+        let mut result = topk_heap_on_floats(floats, total_rows, query_dim, computer, k);
+        drop(buf_guard);
+        result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        result.truncate(k);
+        Ok(Some(result))
     }
 
 }

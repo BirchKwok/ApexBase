@@ -96,6 +96,7 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::String | ColumnType::StringDict => DataType::String,
         ColumnType::Bool => DataType::Bool,
         ColumnType::Binary => DataType::Binary,
+        ColumnType::FixedList => DataType::Binary,
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Date => DataType::Date,
         ColumnType::Null => DataType::String,
@@ -236,7 +237,44 @@ pub fn column_data_to_typed_column(cd: &ColumnData, _dtype: DataType) -> TypedCo
             }
             TypedColumn::String(arrow_col)
         }
+        ColumnData::FixedList { data, dim } => {
+            // Represent as Mixed<Value::Binary> for legacy TypedColumn
+            let mut values = Vec::new();
+            let mut nulls = BitVec::new();
+            let dim_usize = *dim as usize;
+            let row_count = if dim_usize == 0 { 0 } else { data.len() / (dim_usize * 4) };
+            for i in 0..row_count {
+                let start = i * dim_usize * 4;
+                let end = start + dim_usize * 4;
+                values.push(Value::Binary(data[start..end].to_vec()));
+                nulls.push(false);
+            }
+            TypedColumn::Mixed { data: values, nulls }
+        }
     }
+}
+
+/// Convert ColumnData::FixedList to (ArrowDataType, ArrayRef)
+fn fixedlist_to_arrow_pair(data: &[u8], dim: u32) -> (arrow::datatypes::DataType, std::sync::Arc<dyn arrow::array::Array>) {
+    use arrow::array::{FixedSizeListArray, Float32Array};
+    use arrow::buffer::Buffer;
+    use arrow::datatypes::{Field, DataType as ArrowDataType};
+    let dim_usize = dim as usize;
+    let row_count = if dim_usize == 0 { 0 } else { data.len() / (dim_usize * 4) };
+    let float_buf = Buffer::from_vec(data.to_vec());
+    let float_arr = unsafe {
+        Float32Array::from(arrow::array::ArrayData::new_unchecked(
+            ArrowDataType::Float32,
+            row_count * dim_usize,
+            Some(0), None, 0,
+            vec![float_buf],
+            vec![],
+        ))
+    };
+    let item_field = std::sync::Arc::new(Field::new("item", ArrowDataType::Float32, false));
+    let list_dt = ArrowDataType::FixedSizeList(item_field.clone(), dim_usize as i32);
+    let arr = FixedSizeListArray::new(item_field, dim_usize as i32, std::sync::Arc::new(float_arr), None);
+    (list_dt, std::sync::Arc::new(arr) as std::sync::Arc<dyn arrow::array::Array>)
 }
 
 // ============================================================================
@@ -410,6 +448,7 @@ impl TableStorageBackend {
                     Value::String(s) => ColumnValue::String(s.clone()),
                     Value::Bool(b) => ColumnValue::Bool(*b),
                     Value::Binary(b) => ColumnValue::Binary(b.clone()),
+                    Value::FixedList(b) => ColumnValue::Binary(b.clone()),
                     _ => ColumnValue::Null,
                 };
                 (k.clone(), cv)
@@ -607,6 +646,7 @@ impl TableStorageBackend {
                                 Value::String(s) => ColumnValue::String(s.clone()),
                                 Value::Bool(b) => ColumnValue::Bool(*b),
                                 Value::Binary(b) => ColumnValue::Binary(b.clone()),
+                                Value::FixedList(b) => ColumnValue::Binary(b.clone()),
                                 Value::Null => ColumnValue::Null,
                                 _ => ColumnValue::String(serde_json::to_string(v).unwrap_or_default()),
                             };
@@ -628,6 +668,7 @@ impl TableStorageBackend {
                                 Value::String(s) => ColumnValue::String(s.clone()),
                                 Value::Bool(b) => ColumnValue::Bool(*b),
                                 Value::Binary(b) => ColumnValue::Binary(b.clone()),
+                                Value::FixedList(b) => ColumnValue::Binary(b.clone()),
                                 Value::Null => ColumnValue::Null,
                                 _ => ColumnValue::String(serde_json::to_string(v).unwrap_or_default()),
                             };
@@ -779,6 +820,67 @@ impl TableStorageBackend {
         self.cached_columns.write().clear();
         *self.dirty.write() = true;
 
+        Ok(ids)
+    }
+
+    /// Insert typed columns with null tracking — full version supporting FixedList columns
+    pub fn insert_typed_with_nulls_full(
+        &self,
+        int_columns: HashMap<String, Vec<i64>>,
+        float_columns: HashMap<String, Vec<f64>>,
+        string_columns: HashMap<String, Vec<String>>,
+        binary_columns: HashMap<String, Vec<Vec<u8>>>,
+        fixedlist_columns: HashMap<String, Vec<Vec<u8>>>,
+        bool_columns: HashMap<String, Vec<bool>>,
+        null_positions: HashMap<String, Vec<bool>>,
+    ) -> io::Result<Vec<u64>> {
+        let ids = self.storage.insert_typed_with_nulls_full(
+            int_columns.clone(),
+            float_columns.clone(),
+            string_columns.clone(),
+            binary_columns.clone(),
+            fixedlist_columns.clone(),
+            bool_columns.clone(),
+            null_positions,
+        )?;
+
+        {
+            let mut schema = self.schema.write();
+            for name in int_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Int64));
+                }
+            }
+            for name in float_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Float64));
+                }
+            }
+            for name in string_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::String));
+                }
+            }
+            for name in binary_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Binary));
+                }
+            }
+            for name in fixedlist_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Binary));
+                }
+            }
+            for name in bool_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Bool));
+                }
+            }
+        }
+
+        *self.row_count.write() += ids.len() as u64;
+        self.cached_columns.write().clear();
+        *self.dirty.write() = true;
         Ok(ids)
     }
 
@@ -1047,6 +1149,29 @@ impl TableStorageBackend {
     // ========================================================================
     // True On-Demand Column Projection APIs
     // ========================================================================
+
+    /// Zero-copy parallel TopK for a Binary vector column.
+    /// Returns `Some(topk)` sorted ascending, or `None` to fall back to the Arrow path.
+    pub fn topk_binary_direct(
+        &self,
+        col_name: &str,
+        computer: &crate::query::vector_ops::DistanceComputer,
+        k: usize,
+    ) -> io::Result<Option<Vec<(usize, f32)>>> {
+        self.storage.topk_binary_direct(col_name, computer, k)
+    }
+
+    /// Zero-copy parallel TopK for a FixedList column.
+    /// Runs directly on OS mmap — no Arrow construction, no memcpy.
+    /// Returns `Some(topk)` sorted ascending, or `None` to fall back to the Arrow path.
+    pub fn topk_fixedlist_direct(
+        &self,
+        col_name: &str,
+        computer: &crate::query::vector_ops::DistanceComputer,
+        k: usize,
+    ) -> io::Result<Option<Vec<(usize, f32)>>> {
+        self.storage.topk_fixedlist_direct(col_name, computer, k)
+    }
 
     /// Read columns to Arrow with dictionary encoding for low-cardinality string columns.
     /// Use this for GROUP BY queries where DictionaryArray accelerates aggregation.
@@ -1361,6 +1486,7 @@ impl TableStorageBackend {
                         (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)), 
                          Arc::new(dict_array) as ArrayRef)
                     }
+                    ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(&data, dim),
                 };
 
                 fields.push(Field::new(col_name, arrow_dt, true));
@@ -1498,6 +1624,7 @@ impl TableStorageBackend {
                             .collect();
                         (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
                     }
+                    ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                 };
 
                 fields.push(Field::new(col_name, arrow_dt, true));
@@ -1614,6 +1741,7 @@ impl TableStorageBackend {
                         .collect();
                     (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
                 }
+                ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(&data, dim),
             };
             
             fields.push(Field::new(col_name, arrow_dt, true));
@@ -1633,14 +1761,31 @@ impl TableStorageBackend {
         use std::sync::Arc;
         use crate::data::DataType;
 
-        // V4 mmap-only: use Arrow batch cache + O(1) index lookup via id_to_idx
+        // V4 mmap-only: user-space page cache path — avoids mmap page faults and hash map build.
+        // retrieve_rcix reads field values using cached 4KB pages (~50ns/page after warmup).
         if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
-            // get_row_idx ensures id_to_idx is built (lazy) then does O(1) lookup
-            if let Some(row_idx) = self.storage.get_row_idx(id) {
-                let full_batch = self.read_columns_to_arrow(None, 0, None)?;
-                if row_idx < full_batch.num_rows() {
-                    return Ok(Some(full_batch.slice(row_idx, 1)));
+            if let Some(row_vals) = self.storage.retrieve_rcix(id)? {
+                // Convert Vec<(col_name, Value)> to single-row Arrow RecordBatch
+                use crate::data::Value;
+                let mut fields: Vec<Field> = Vec::with_capacity(row_vals.len());
+                let mut arrays: Vec<ArrayRef> = Vec::with_capacity(row_vals.len());
+                for (col_name, val) in &row_vals {
+                    let (dt, arr): (ArrowDataType, ArrayRef) = match val {
+                        Value::Int64(v) => (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![*v]))),
+                        Value::Float64(v) => (ArrowDataType::Float64, Arc::new(Float64Array::from(vec![*v]))),
+                        Value::String(s) => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![s.as_str()]))),
+                        Value::Bool(b) => (ArrowDataType::Boolean, Arc::new(BooleanArray::from(vec![*b]))),
+                        Value::Null => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![None as Option<&str>]))),
+                        _ => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![None as Option<&str>]))),
+                    };
+                    let nullable = matches!(val, Value::Null);
+                    fields.push(Field::new(col_name, dt, nullable));
+                    arrays.push(arr);
                 }
+                let schema = Arc::new(Schema::new(fields));
+                let batch = arrow::record_batch::RecordBatch::try_new(schema, arrays)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                return Ok(Some(batch));
             }
             return Ok(None);
         }
@@ -1877,6 +2022,7 @@ impl TableStorageBackend {
                             .collect();
                         (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
                     }
+                    ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                 };
 
                 fields.push(Field::new(col_name, arrow_dt, true));
@@ -2018,10 +2164,10 @@ impl TableStorageBackend {
                         
                         let dict_array = DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
                             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                        
-                        (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)), 
+                        (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)),
                          Arc::new(dict_array) as ArrayRef)
                     }
+                    ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                 };
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
@@ -2143,6 +2289,7 @@ impl TableStorageBackend {
                         (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)), 
                          Arc::new(dict_array) as ArrayRef)
                     }
+                    ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                 };
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
@@ -2334,6 +2481,7 @@ impl TableStorageBackend {
                         (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)), 
                          Arc::new(dict_array) as ArrayRef)
                     }
+                    ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                 };
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
@@ -2375,6 +2523,39 @@ impl TableStorageBackend {
         self.storage.build_string_dict_cache(col_name)
     }
 
+    /// Returns true if the column has any NULL values in the in-memory store.
+    pub fn column_has_nulls(&self, col_name: &str) -> bool {
+        self.storage.column_has_nulls(col_name)
+    }
+
+    /// Fast COUNT(DISTINCT col) for string columns. Null-aware via bitmaps.
+    pub fn count_distinct_string(&self, col_name: &str) -> io::Result<Option<i64>> {
+        self.storage.count_distinct_string(col_name)
+    }
+
+    /// Fast COUNT(DISTINCT col) given a pre-built dict (from global cache). Null-aware via bitmaps.
+    pub fn count_distinct_with_dict(&self, col_name: &str, dict_strings: &[String], group_ids: &[u16]) -> io::Result<i64> {
+        self.storage.count_distinct_with_dict(col_name, dict_strings, group_ids)
+    }
+
+    /// Fast top-k for ORDER BY (str_col, f64_col) without Arrow string conversion.
+    /// Uses global dict cache for warm O(dict_size) rank lookup instead of rebuilding the dict.
+    pub fn order_topk_str_float64(
+        &self,
+        str_col: &str, str_asc: bool,
+        f64_col: &str, f64_asc: bool,
+        k: usize, offset: usize,
+    ) -> io::Result<Option<Vec<usize>>> {
+        let dict = match get_global_dict_cache(self.path(), str_col, &self.storage)? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        self.storage.order_topk_str_float64_with_dict(
+            dict.0.as_slice(), dict.1.as_slice(), str_asc,
+            f64_col, f64_asc, k, offset,
+        )
+    }
+
     /// Execute GROUP BY + aggregate using pre-built dict cache.
     /// Delegates directly to storage: uses in-memory path when data is loaded,
     /// otherwise uses mmap path reading only the needed agg columns via RCIX.
@@ -2382,6 +2563,16 @@ impl TableStorageBackend {
         &self, dict_strings: &[String], group_ids: &[u16], agg_cols: &[(&str, bool)],
     ) -> io::Result<Option<Vec<(String, Vec<(f64, i64)>)>>> {
         self.storage.execute_group_agg_cached(dict_strings, group_ids, agg_cols)
+    }
+
+    /// Execute 2-column GROUP BY + aggregate using pre-built dict caches.
+    pub fn execute_group_agg_2col_cached(
+        &self,
+        dict1_strings: &[String], group_ids1: &[u16],
+        dict2_strings: &[String], group_ids2: &[u16],
+        agg_cols: &[(&str, bool)],
+    ) -> io::Result<Option<Vec<((String, String), Vec<(f64, i64)>)>>> {
+        self.storage.execute_group_agg_2col_cached(dict1_strings, group_ids1, dict2_strings, group_ids2, agg_cols)
     }
 
     /// Execute BETWEEN + GROUP BY using pre-built dict cache.

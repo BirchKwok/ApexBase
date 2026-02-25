@@ -21,6 +21,9 @@ pub enum ColumnType {
     StringDict = TYPE_STRING_DICT,  // Dictionary-encoded string for low-cardinality columns
     Timestamp = TYPE_TIMESTAMP,      // Timestamp (i64 microseconds since Unix epoch)
     Date = TYPE_DATE,                // Date (i64 days since Unix epoch, stored as i64 for alignment)
+    /// Fixed-size list of f32 — stored as contiguous raw bytes (dim * 4 per row, no offset array).
+    /// Semantically equivalent to Arrow FixedSizeList<Float32>.
+    FixedList = TYPE_FIXED_LIST,
 }
 
 impl ColumnType {
@@ -43,6 +46,7 @@ impl ColumnType {
             TYPE_STRING_DICT => Some(ColumnType::StringDict),
             TYPE_TIMESTAMP => Some(ColumnType::Timestamp),
             TYPE_DATE => Some(ColumnType::Date),
+            TYPE_FIXED_LIST => Some(ColumnType::FixedList),
             _ => None,
         }
     }
@@ -56,12 +60,12 @@ impl ColumnType {
             ColumnType::Int16 | ColumnType::UInt16 => 2,
             ColumnType::Int32 | ColumnType::UInt32 | ColumnType::Float32 => 4,
             ColumnType::Int64 | ColumnType::UInt64 | ColumnType::Float64 | ColumnType::Timestamp | ColumnType::Date => 8,
-            ColumnType::String | ColumnType::Binary | ColumnType::StringDict => 0,
+            ColumnType::String | ColumnType::Binary | ColumnType::StringDict | ColumnType::FixedList => 0,
         }
     }
 
     pub fn is_variable_length(&self) -> bool {
-        matches!(self, ColumnType::String | ColumnType::Binary | ColumnType::StringDict)
+        matches!(self, ColumnType::String | ColumnType::Binary | ColumnType::StringDict | ColumnType::FixedList)
     }
 }
 
@@ -74,6 +78,8 @@ pub enum ColumnValue {
     Float64(f64),
     String(String),
     Binary(Vec<u8>),
+    /// Raw f32 bytes for a FixedList (vector) column
+    FixedList(Vec<u8>),
 }
 
 /// Column definition
@@ -155,6 +161,12 @@ pub enum ColumnData {
         dict_offsets: Vec<u32>, // Offsets into dict_data
         dict_data: Vec<u8>,     // Unique string bytes
     },
+    /// Fixed-size list of f32 — contiguous raw bytes, no offset array.
+    /// data.len() == row_count * dim * 4
+    FixedList {
+        data: Vec<u8>,  // raw little-endian f32 bytes
+        dim: u32,       // number of f32 elements per row
+    },
 }
 
 impl ColumnData {
@@ -180,6 +192,7 @@ impl ColumnData {
                 dict_offsets: vec![0],
                 dict_data: Vec::new(),
             },
+            ColumnType::FixedList => ColumnData::FixedList { data: Vec::new(), dim: 0 },
             ColumnType::Null => ColumnData::Int64(Vec::new()),
         }
     }
@@ -193,6 +206,7 @@ impl ColumnData {
             ColumnData::String { offsets, .. } => offsets.len().saturating_sub(1),
             ColumnData::Binary { offsets, .. } => offsets.len().saturating_sub(1),
             ColumnData::StringDict { indices, .. } => indices.len(),
+            ColumnData::FixedList { data, dim } => if *dim == 0 { 0 } else { data.len() / (*dim as usize * 4) },
         }
     }
 
@@ -210,6 +224,7 @@ impl ColumnData {
             ColumnData::String { .. } => ColumnType::String,
             ColumnData::Binary { .. } => ColumnType::Binary,
             ColumnData::StringDict { .. } => ColumnType::StringDict,
+            ColumnData::FixedList { .. } => ColumnType::FixedList,
         }
     }
 
@@ -397,13 +412,29 @@ impl ColumnData {
                 buf.extend_from_slice(dict_data);
                 buf
             }
+            ColumnData::FixedList { data, dim } => {
+                let count = if *dim == 0 { 0usize } else { data.len() / (*dim as usize * 4) };
+                let mut buf = Vec::with_capacity(12 + data.len());
+                buf.extend_from_slice(&(count as u64).to_le_bytes());
+                buf.extend_from_slice(&dim.to_le_bytes());
+                buf.extend_from_slice(data);
+                buf
+            }
         }
     }
 
-    /// Write serialized bytes directly to a writer, avoiding intermediate Vec<u8> allocation.
-    /// Produces the same byte format as to_bytes().
-    /// For large columns, this avoids allocating a temporary buffer (e.g., 80MB for 10M i64 rows).
+    /// Push a single f32 vector (as raw bytes) into a FixedList column.
     #[inline]
+    pub fn push_fixed_list(&mut self, bytes: &[u8]) {
+        if let ColumnData::FixedList { data, dim } = self {
+            let row_bytes = bytes.len();
+            if *dim == 0 && row_bytes % 4 == 0 {
+                *dim = (row_bytes / 4) as u32;
+            }
+            data.extend_from_slice(bytes);
+        }
+    }
+
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         match self {
             ColumnData::Bool { data, len } => {
@@ -453,6 +484,12 @@ impl ColumnData {
                 writer.write_all(offsets_bytes)?;
                 writer.write_all(&(dict_data.len() as u64).to_le_bytes())?;
                 writer.write_all(dict_data)?;
+            }
+            ColumnData::FixedList { data, dim } => {
+                let count = if *dim == 0 { 0 } else { data.len() / (*dim as usize * 4) };
+                writer.write_all(&(count as u64).to_le_bytes())?;
+                writer.write_all(&dim.to_le_bytes())?;
+                writer.write_all(data)?;
             }
         }
         Ok(())
@@ -592,6 +629,21 @@ impl ColumnData {
                 pos += dict_data_len;
                 Ok((ColumnData::StringDict { indices, dict_offsets, dict_data }, pos))
             }
+            ColumnType::FixedList => {
+                let count = read_u64!() as usize;
+                if pos + 4 > bytes.len() {
+                    return Err(err_data("FixedList: dim truncated"));
+                }
+                let dim = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+                pos += 4;
+                let byte_len = count * dim as usize * 4;
+                if pos + byte_len > bytes.len() {
+                    return Err(err_data("FixedList: data truncated"));
+                }
+                let data = bytes[pos..pos + byte_len].to_vec();
+                pos += byte_len;
+                Ok((ColumnData::FixedList { data, dim }, pos))
+            }
             ColumnType::Null => {
                 let count = read_u64!() as usize;
                 let byte_len = count * 8;
@@ -649,6 +701,15 @@ impl ColumnData {
                 let dict_data_len = read_u64!() as usize;
                 pos += dict_data_len;
             }
+            ColumnType::FixedList => {
+                let count = read_u64!() as usize;
+                if pos + 4 > bytes.len() {
+                    return Err(err_data("skip FixedList: dim truncated"));
+                }
+                let dim = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+                pos += 4;
+                pos += count * dim as usize * 4;
+            }
             ColumnType::Null => {
                 let count = read_u64!() as usize;
                 pos += count * 8;
@@ -674,6 +735,7 @@ impl ColumnData {
                 dict_offsets: vec![0], 
                 dict_data: Vec::new() 
             },
+            ColumnData::FixedList { dim, .. } => ColumnData::FixedList { data: Vec::new(), dim: *dim },
         }
     }
     
@@ -739,6 +801,10 @@ impl ColumnData {
                 for &idx in other_indices {
                     indices.push(idx + offset);
                 }
+            }
+            (ColumnData::FixedList { data, dim }, ColumnData::FixedList { data: other_data, dim: other_dim }) => {
+                if *dim == 0 && *other_dim > 0 { *dim = *other_dim; }
+                data.extend_from_slice(other_data);
             }
             _ => {} // Type mismatch - ignore
         }
@@ -831,6 +897,19 @@ impl ColumnData {
     /// OPTIMIZATION: uses pre-allocation and unchecked indexing for hot paths.
     pub fn filter_by_indices(&self, indices: &[usize]) -> Self {
         match self {
+            ColumnData::FixedList { data, dim } => {
+                let stride = *dim as usize * 4;
+                let mut new_data = Vec::with_capacity(indices.len() * stride);
+                for &i in indices {
+                    let start = i * stride;
+                    if start + stride <= data.len() {
+                        new_data.extend_from_slice(&data[start..start + stride]);
+                    } else {
+                        new_data.extend(std::iter::repeat(0u8).take(stride));
+                    }
+                }
+                ColumnData::FixedList { data: new_data, dim: *dim }
+            }
             ColumnData::Bool { data, len } => {
                 let new_len = indices.len();
                 let mut new_data = vec![0u8; (new_len + 7) / 8];
@@ -1032,6 +1111,16 @@ impl ColumnData {
     /// More efficient than filter_by_indices for contiguous ranges (uses memcpy).
     pub fn slice_range(&self, start: usize, end: usize) -> Self {
         match self {
+            ColumnData::FixedList { data, dim } => {
+                let stride = *dim as usize * 4;
+                let row_count = if stride == 0 { 0 } else { data.len() / stride };
+                let s = start.min(row_count);
+                let e = end.min(row_count);
+                ColumnData::FixedList {
+                    data: data[s * stride .. e * stride].to_vec(),
+                    dim: *dim,
+                }
+            }
             ColumnData::Bool { data, len } => {
                 let s = start.min(*len);
                 let e = end.min(*len);
@@ -1103,6 +1192,7 @@ impl ColumnData {
             ColumnData::StringDict { indices, dict_offsets, dict_data } => {
                 indices.len() * 4 + dict_offsets.len() * 4 + dict_data.len()
             }
+            ColumnData::FixedList { data, .. } => data.len(),
         }
     }
 }

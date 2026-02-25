@@ -141,10 +141,79 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
 }
 
+/// Cosine similarity with **pre-computed query norm** `nb = ‖b‖`.
+///
+/// Fuses the dot-product and ‖a‖ computation into a single 8-way unrolled pass,
+/// avoiding the extra full pass over `a` that the two-call version would need.
+/// `nb` should be computed once per query (not once per row).
+#[inline(always)]
+pub fn cosine_similarity_fused(a: &[f32], b: &[f32], nb: f32) -> f32 {
+    let n = a.len().min(b.len());
+    let mut dot = 0.0f32;
+    let mut na2 = 0.0f32;
+    let c = n / 8;
+    for i in 0..c {
+        let base = i << 3;
+        dot += a[base]*b[base] + a[base+1]*b[base+1] + a[base+2]*b[base+2] + a[base+3]*b[base+3]
+             + a[base+4]*b[base+4] + a[base+5]*b[base+5] + a[base+6]*b[base+6] + a[base+7]*b[base+7];
+        na2 += a[base]*a[base] + a[base+1]*a[base+1] + a[base+2]*a[base+2] + a[base+3]*a[base+3]
+             + a[base+4]*a[base+4] + a[base+5]*a[base+5] + a[base+6]*a[base+6] + a[base+7]*a[base+7];
+    }
+    for i in (c*8)..n {
+        dot += a[i] * b[i];
+        na2 += a[i] * a[i];
+    }
+    let na = na2.sqrt();
+    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+}
+
 /// Cosine distance = 1 − cosine_similarity.
 #[inline(always)]
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - cosine_similarity(a, b)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DistanceComputer: precomputes per-query state to avoid N recomputations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Holds the query vector and any precomputed values (e.g. query norm for cosine).
+///
+/// Construct once per query; call `compute(row)` N times.
+/// This avoids recomputing the query norm O(n) times in batch/TopK scans.
+pub struct DistanceComputer {
+    pub metric: DistanceMetric,
+    pub query:  Vec<f32>,
+    /// Pre-computed ‖query‖ for cosine metrics (0.0 for others).
+    query_norm: f32,
+}
+
+impl DistanceComputer {
+    pub fn new(metric: DistanceMetric, query: Vec<f32>) -> Self {
+        let query_norm = match metric {
+            DistanceMetric::CosineSimilarity | DistanceMetric::CosineDistance => {
+                query.iter().map(|x| x * x).sum::<f32>().sqrt()
+            }
+            _ => 0.0,
+        };
+        Self { metric, query, query_norm }
+    }
+
+    #[inline(always)]
+    pub fn compute(&self, a: &[f32]) -> f32 {
+        match self.metric {
+            DistanceMetric::L2             => l2_distance(a, &self.query),
+            DistanceMetric::L2Squared      => l2_squared(a, &self.query),
+            DistanceMetric::L1             => l1_distance(a, &self.query),
+            DistanceMetric::LInf           => linf_distance(a, &self.query),
+            DistanceMetric::InnerProduct   => inner_product(a, &self.query),
+            DistanceMetric::NegInnerProduct => -inner_product(a, &self.query),
+            DistanceMetric::CosineSimilarity =>
+                cosine_similarity_fused(a, &self.query, self.query_norm),
+            DistanceMetric::CosineDistance =>
+                1.0 - cosine_similarity_fused(a, &self.query, self.query_norm),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -470,6 +539,314 @@ pub fn topk_heap_direct(
     }
 
     let mut result: Vec<(usize, f32)> = heap
+        .into_iter()
+        .map(|Entry(b, i)| (i, f32::from_bits(b)))
+        .collect();
+    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    result
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Parallel TopK: Rayon fold+reduce, O(n/T log k) per thread
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parallel TopK on a `BinaryArray` using Rayon.
+///
+/// Uses `DistanceComputer` which has pre-computed query-norm for cosine metrics.
+/// Splits the array into exactly T = num_threads contiguous chunks; each thread
+/// maintains one local max-heap of size k, then T heaps are merged.
+/// Inner loop uses raw buffer pointers to avoid per-row `col.value(i)` overhead.
+///
+/// Returns `Vec<(row_index, f32_distance)>` sorted **ascending** (nearest first).
+pub fn topk_heap_direct_parallel(
+    col: &BinaryArray,
+    computer: &DistanceComputer,
+    k: usize,
+) -> Vec<(usize, f32)> {
+    use rayon::prelude::*;
+    use std::collections::BinaryHeap;
+    use std::cmp::Ordering;
+
+    let n = col.len();
+    if k == 0 || n == 0 || computer.query.is_empty() {
+        return vec![];
+    }
+    let k_capped = k.min(n);
+    let dim = computer.query.len();
+    let expected_bytes = dim * 4;
+
+    #[derive(Copy, Clone)]
+    struct Entry(u32, usize);
+    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
+    impl Eq         for Entry {}
+    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+    impl Ord        for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+
+    // Grab raw buffer slices ONCE — avoid Arc deref + bounds checks inside the hot loop.
+    // SAFETY: these references live for the duration of the function, col is immutable.
+    let values: &[u8]  = col.values().as_slice();
+    let offsets: &[i32] = col.offsets().as_ref(); // len = n+1
+    // Null bitmap: Option<&[u8]> pointing into Arrow's validity buffer.
+    let null_bytes: Option<&[u8]> = col.nulls().map(|nb| nb.buffer().as_slice());
+
+    // Capture raw pointers as usize so they are Send across Rayon threads.
+    // SAFETY: values, offsets, null_bytes are all derived from `col` which is
+    //         immutable and outlives the parallel section below.
+    let val_ptr  = values.as_ptr() as usize;
+    let val_len  = values.len();
+    let off_ptr  = offsets.as_ptr() as usize;
+    let null_ptr: Option<(usize, usize)> = null_bytes.map(|nb| (nb.as_ptr() as usize, nb.len()));
+
+    // Split into exactly T chunks (one per Rayon worker thread).
+    let t = rayon::current_num_threads().max(1);
+    let chunk_size = (n + t - 1) / t;
+
+    let per_chunk: Vec<Vec<(usize, f32)>> = (0..t)
+        .into_par_iter()
+        .map(|tid| {
+            let start = tid * chunk_size;
+            if start >= n { return vec![]; }
+            let end = (start + chunk_size).min(n);
+
+            // SAFETY: pointers are valid for `col`'s lifetime (enforced by borrow above).
+            let values  = unsafe { std::slice::from_raw_parts(val_ptr  as *const u8,  val_len) };
+            let offsets = unsafe { std::slice::from_raw_parts(off_ptr  as *const i32, n + 1)  };
+
+            let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+
+            for i in start..end {
+                // Null check via raw bitmap (bit i).
+                if let Some((nb_ptr, nb_len)) = null_ptr {
+                    let byte_idx = i / 8;
+                    if byte_idx < nb_len {
+                        // SAFETY: byte_idx < nb_len.
+                        let byte = unsafe { *(nb_ptr as *const u8).add(byte_idx) };
+                        if (byte >> (i & 7)) & 1 == 0 { continue; }
+                    }
+                }
+
+                // SAFETY: offsets has n+1 elements; i and i+1 are within bounds.
+                let off_s = unsafe { *offsets.get_unchecked(i)   } as usize;
+                let off_e = unsafe { *offsets.get_unchecked(i+1) } as usize;
+                if off_e - off_s != expected_bytes { continue; }
+
+                // SAFETY: off_s..off_e is within values (enforced by BinaryArray invariants).
+                let bytes = unsafe { values.get_unchecked(off_s..off_e) };
+                let vec   = unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr() as *const f32, dim)
+                };
+
+                let dist = computer.compute(vec);
+                if dist.is_nan() { continue; }
+
+                let bits = dist.to_bits();
+                if heap.len() < k_capped {
+                    heap.push(Entry(bits, i));
+                } else if let Some(&Entry(top, _)) = heap.peek() {
+                    if bits < top {
+                        heap.pop();
+                        heap.push(Entry(bits, i));
+                    }
+                }
+            }
+            heap.into_iter().map(|Entry(b, i)| (i, f32::from_bits(b))).collect()
+        })
+        .collect();
+
+    // Merge T small top-k lists into final top-k (T is small, e.g. 8-16).
+    let mut final_heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+    for chunk in per_chunk {
+        for (idx, dist) in chunk {
+            let bits = dist.to_bits();
+            if final_heap.len() < k_capped {
+                final_heap.push(Entry(bits, idx));
+            } else if let Some(&Entry(top, _)) = final_heap.peek() {
+                if bits < top {
+                    final_heap.pop();
+                    final_heap.push(Entry(bits, idx));
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<(usize, f32)> = final_heap
+        .into_iter()
+        .map(|Entry(b, i)| (i, f32::from_bits(b)))
+        .collect();
+    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    result
+}
+
+/// Parallel TopK on a `FixedSizeListArray<Float32>` using Rayon.
+///
+/// Compared to the `BinaryArray` version, the inner loop is simpler:
+/// the float data is stored contiguously with stride = `dim`, so there
+/// are no per-row offset lookups.  This eliminates one pointer dereference
+/// and the `off_e - off_s != expected_bytes` size-check per row.
+///
+/// Returns `Vec<(row_index, f32_distance)>` sorted **ascending** (nearest first).
+pub fn topk_heap_direct_parallel_fixed(
+    col: &arrow::array::FixedSizeListArray,
+    computer: &DistanceComputer,
+    k: usize,
+) -> Vec<(usize, f32)> {
+    use rayon::prelude::*;
+    use std::collections::BinaryHeap;
+    use std::cmp::Ordering;
+
+    let n = col.len();
+    if k == 0 || n == 0 || computer.query.is_empty() {
+        return vec![];
+    }
+    let k_capped = k.min(n);
+    let dim = computer.query.len();
+
+    // The values child is a flat Float32Array with n*dim elements.
+    let values_child = col.values();
+    let float_arr = values_child
+        .as_any()
+        .downcast_ref::<arrow::array::Float32Array>()
+        .expect("FixedSizeList child must be Float32Array");
+    let floats: &[f32] = float_arr.values().as_ref();
+    // floats has length n * dim (no nulls expected for vector columns)
+
+    let float_ptr = floats.as_ptr() as usize;
+    let float_len = floats.len();
+
+    #[derive(Copy, Clone)]
+    struct Entry(u32, usize);
+    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
+    impl Eq         for Entry {}
+    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+    impl Ord        for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+
+    let t = rayon::current_num_threads().max(1);
+    let chunk_size = (n + t - 1) / t;
+
+    let per_chunk: Vec<Vec<(usize, f32)>> = (0..t)
+        .into_par_iter()
+        .map(|tid| {
+            let start = tid * chunk_size;
+            if start >= n { return vec![]; }
+            let end = (start + chunk_size).min(n);
+
+            // SAFETY: float_ptr is valid for `col`'s lifetime (borrow above).
+            let floats = unsafe { std::slice::from_raw_parts(float_ptr as *const f32, float_len) };
+            let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+
+            for i in start..end {
+                let off = i * dim;
+                if off + dim > float_len { break; }
+                // SAFETY: bounds checked above.
+                let vec = unsafe { floats.get_unchecked(off..off + dim) };
+                let dist = computer.compute(vec);
+                if dist.is_nan() { continue; }
+                let bits = dist.to_bits();
+                if heap.len() < k_capped {
+                    heap.push(Entry(bits, i));
+                } else if let Some(&Entry(top, _)) = heap.peek() {
+                    if bits < top {
+                        heap.pop();
+                        heap.push(Entry(bits, i));
+                    }
+                }
+            }
+            heap.into_iter().map(|Entry(b, i)| (i, f32::from_bits(b))).collect()
+        })
+        .collect();
+
+    // Merge T small top-k lists.
+    let mut final_heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+    for chunk in per_chunk {
+        for (idx, dist) in chunk {
+            let bits = dist.to_bits();
+            if final_heap.len() < k_capped {
+                final_heap.push(Entry(bits, idx));
+            } else if let Some(&Entry(top, _)) = final_heap.peek() {
+                if bits < top {
+                    final_heap.pop();
+                    final_heap.push(Entry(bits, idx));
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<(usize, f32)> = final_heap
+        .into_iter()
+        .map(|Entry(b, i)| (i, f32::from_bits(b)))
+        .collect();
+    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    result
+}
+
+/// Core parallel TopK on a raw contiguous `&[f32]` (no Arrow, no allocation).
+/// `floats` has length `n_rows * dim`. Zero-copy when called with an mmap slice.
+/// Returns `Vec<(row_index, f32_distance)>` sorted ascending (nearest first).
+pub fn topk_heap_on_floats(
+    floats: &[f32],
+    n_rows: usize,
+    dim: usize,
+    computer: &DistanceComputer,
+    k: usize,
+) -> Vec<(usize, f32)> {
+    use rayon::prelude::*;
+    use std::collections::BinaryHeap;
+    use std::cmp::Ordering;
+
+    if k == 0 || n_rows == 0 || dim == 0 || computer.query.is_empty() {
+        return vec![];
+    }
+    let k_capped = k.min(n_rows);
+
+    #[derive(Copy, Clone)]
+    struct Entry(u32, usize);
+    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
+    impl Eq         for Entry {}
+    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+    impl Ord        for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+
+    let float_ptr = floats.as_ptr() as usize;
+    let float_len = floats.len();
+    let t = rayon::current_num_threads().max(1);
+    let chunk_size = (n_rows + t - 1) / t;
+
+    let per_chunk: Vec<Vec<(usize, f32)>> = (0..t)
+        .into_par_iter()
+        .map(|tid| {
+            let start = tid * chunk_size;
+            if start >= n_rows { return vec![]; }
+            let end = (start + chunk_size).min(n_rows);
+            let floats = unsafe { std::slice::from_raw_parts(float_ptr as *const f32, float_len) };
+            let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+            for i in start..end {
+                let off = i * dim;
+                if off + dim > float_len { break; }
+                let vec = unsafe { floats.get_unchecked(off..off + dim) };
+                let dist = computer.compute(vec);
+                if dist.is_nan() { continue; }
+                let bits = dist.to_bits();
+                if heap.len() < k_capped {
+                    heap.push(Entry(bits, i));
+                } else if let Some(&Entry(top, _)) = heap.peek() {
+                    if bits < top { heap.pop(); heap.push(Entry(bits, i)); }
+                }
+            }
+            heap.into_iter().map(|Entry(b, i)| (i, f32::from_bits(b))).collect()
+        })
+        .collect();
+
+    let mut final_heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+    for chunk in per_chunk {
+        for (idx, dist) in chunk {
+            let bits = dist.to_bits();
+            if final_heap.len() < k_capped {
+                final_heap.push(Entry(bits, idx));
+            } else if let Some(&Entry(top, _)) = final_heap.peek() {
+                if bits < top { final_heap.pop(); final_heap.push(Entry(bits, idx)); }
+            }
+        }
+    }
+    let mut result: Vec<(usize, f32)> = final_heap
         .into_iter()
         .map(|Entry(b, i)| (i, f32::from_bits(b)))
         .collect();

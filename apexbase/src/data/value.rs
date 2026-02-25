@@ -21,6 +21,9 @@ pub enum Value {
     Float64(f64),
     String(String),
     Binary(Vec<u8>),
+    /// Fixed-size float32 vector — auto-detected from np.ndarray on store().
+    /// Bytes are raw little-endian f32: len = dim * 4.
+    FixedList(Vec<u8>),
     Json(serde_json::Value),
     Timestamp(i64),
     Date(i32),
@@ -45,6 +48,7 @@ impl Value {
             Value::Float64(_) => DataType::Float64,
             Value::String(_) => DataType::String,
             Value::Binary(_) => DataType::Binary,
+            Value::FixedList(_) => DataType::Binary,
             Value::Json(_) => DataType::Json,
             Value::Timestamp(_) => DataType::Timestamp,
             Value::Date(_) => DataType::Date,
@@ -130,14 +134,13 @@ impl Value {
             Value::Float64(v) => v.to_string(),
             Value::String(s) => s.clone(),
             Value::Binary(b) => {
-                // For binary data, try to represent as UTF-8 string first, fallback to length indicator
                 if let Ok(s) = std::str::from_utf8(b) {
                     s.to_string()
                 } else {
-                    // For non-UTF8 binary data, indicate it's binary with length
                     format!("<binary_data_{}bytes>", b.len())
                 }
             },
+            Value::FixedList(b) => format!("<vector_{}dims>", b.len() / 4),
             Value::Json(j) => j.to_string(),
             Value::Timestamp(t) => t.to_string(),
             Value::Date(d) => d.to_string(),
@@ -197,6 +200,7 @@ impl Value {
             Value::Float64(v) => serde_json::json!(*v),
             Value::String(s) => serde_json::Value::String(s.clone()),
             Value::Binary(b) => serde_json::json!(b),
+            Value::FixedList(b) => serde_json::json!(b),
             Value::Json(j) => j.clone(),
             Value::Timestamp(t) => serde_json::json!(*t),
             Value::Date(d) => serde_json::json!(*d),

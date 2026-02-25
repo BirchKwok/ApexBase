@@ -79,7 +79,7 @@ thread_local! {
 /// Memory-mapped file cache for fast repeated reads
 /// Uses OS page cache for automatic caching
 struct MmapCache {
-    mmap: Option<Mmap>,
+    mmap: Option<std::sync::Arc<Mmap>>,
     file_size: u64,
 }
 
@@ -88,18 +88,12 @@ impl MmapCache {
         Self { mmap: None, file_size: 0 }
     }
     
-    /// Get or create mmap for the file
-    fn get_or_create(&mut self, file: &File) -> io::Result<&Mmap> {
+    /// Get or create mmap Arc for the file, allowing the Arc to be cloned and held outside the lock.
+    pub(crate) fn get_mmap_arc(&mut self, file: &File) -> io::Result<std::sync::Arc<Mmap>> {
         let metadata = file.metadata()?;
         let current_size = metadata.len();
-        
-        // Invalidate cache if file size changed
         if self.mmap.is_none() || self.file_size != current_size {
-            if current_size == 0 {
-                return Err(err_data("Empty file"));
-            }
-            // SAFETY: File must remain open while mmap is in use
-            // We ensure this by keeping mmap in the same struct as file
+            if current_size == 0 { return Err(err_data("Empty file")); }
             let mmap = unsafe {
                 // On Linux, use MAP_POPULATE for files < 64MB to pre-fault pages
                 // and eliminate page-fault overhead on first access.
@@ -131,17 +125,22 @@ impl MmapCache {
                     i += 4096;
                 }
             }
-            self.mmap = Some(mmap);
+            self.mmap = Some(std::sync::Arc::new(mmap));
             self.file_size = current_size;
         }
-        
+        Ok(std::sync::Arc::clone(self.mmap.as_ref().unwrap()))
+    }
+
+    /// Get or create mmap for the file
+    fn get_or_create(&mut self, file: &File) -> io::Result<&Mmap> {
+        self.get_mmap_arc(file)?;
         Ok(self.mmap.as_ref().unwrap())
     }
     
     /// Return mmap slice without any syscalls or staleness checks.
     /// Caller must ensure the mmap is still valid (backend freshness checked by STORAGE_CACHE).
     pub(crate) fn mmap_slice_unchecked(&self) -> Option<&[u8]> {
-        self.mmap.as_deref()
+        self.mmap.as_ref().map(|arc| -> &[u8] { arc.as_ref() })
     }
 
     /// Read bytes at offset using mmap (zero-copy when possible)
@@ -181,6 +180,11 @@ impl MmapCache {
     fn invalidate(&mut self) {
         self.mmap = None;
         self.file_size = 0;
+    }
+
+    /// Return mmap size without any syscalls.
+    pub(crate) fn mmap_len(&self) -> usize {
+        self.mmap.as_ref().map(|m| m.len()).unwrap_or(0)
     }
 }
 
@@ -698,6 +702,11 @@ fn write_column_encoded<W: Write>(col: &ColumnData, col_type: ColumnType, writer
             writer.write_all(&[COL_ENCODING_PLAIN])?;
             col.write_to(writer)
         }
+        ColumnData::FixedList { .. } => {
+            // FixedList: always plain — f32 data is already random (no benefit from RLE/bitpack)
+            writer.write_all(&[COL_ENCODING_PLAIN])?;
+            col.write_to(writer)
+        }
         _ => {
             // Other types: always plain
             writer.write_all(&[COL_ENCODING_PLAIN])?;
@@ -935,7 +944,11 @@ fn skip_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<usize> 
             let num_runs = u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
             Ok(1 + 16 + num_runs * 5)
         }
-        _ => Err(err_data(&format!("skip_column_encoded: unknown encoding {}", encoding))),
+        _ => {
+            // For unknown encodings (shouldn't happen), fall back to plain skip
+            let consumed = ColumnData::skip_bytes_typed(data_bytes, col_type)?;
+            Ok(1 + consumed)
+        }
     }
 }
 
@@ -1003,6 +1016,7 @@ const TYPE_BINARY: u8 = 13;
 const TYPE_STRING_DICT: u8 = 14;  // Dictionary-encoded string (DuckDB-style)
 const TYPE_TIMESTAMP: u8 = 15;   // Timestamp (microseconds since Unix epoch)
 const TYPE_DATE: u8 = 16;        // Date (days since Unix epoch)
+const TYPE_FIXED_LIST: u8 = 17;  // Fixed-size list of f32 (no offset array)
 
 // ============================================================================
 // Data Types

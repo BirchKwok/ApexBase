@@ -49,7 +49,7 @@ impl OnDemandStorage {
                 drop(cols);
 
                 if !has_in_memory_data {
-                    // Pure mmap path — no data in memory, read everything from disk
+                    // Pure mmap path — read directly from disk every time
                     if let Some(batch) = self.to_arrow_batch_mmap(
                         column_names, include_id, None, dict_encode_strings,
                     )? {
@@ -378,6 +378,50 @@ impl OnDemandStorage {
                     // StringDict should have been decoded to String during column loading
                     // Fallback: create empty string array
                     (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![""; active_count])))
+                }
+                Some(ColumnData::FixedList { data, dim }) => {
+                    use arrow::array::{FixedSizeListArray, Float32Array};
+                    use arrow::buffer::Buffer;
+                    let dim_usize = *dim as usize;
+                    let row_count_full = if dim_usize == 0 { 0 } else { data.len() / (dim_usize * 4) };
+                    let selected_data: Vec<u8> = if let Some(ref indices) = active_indices {
+                        let mut out = Vec::with_capacity(indices.len() * dim_usize * 4);
+                        for &i in indices {
+                            let start = i * dim_usize * 4;
+                            let end = start + dim_usize * 4;
+                            if end <= data.len() {
+                                out.extend_from_slice(&data[start..end]);
+                            } else {
+                                out.extend(std::iter::repeat(0u8).take(dim_usize * 4));
+                            }
+                        }
+                        out
+                    } else {
+                        let byte_len = row_count_full.min(active_count) * dim_usize * 4;
+                        data[..byte_len].to_vec()
+                    };
+                    let row_count = if dim_usize == 0 { 0 } else { selected_data.len() / (dim_usize * 4) };
+                    let float_buf = Buffer::from_vec(selected_data);
+                    let float_arr = unsafe {
+                        Float32Array::from(arrow::array::ArrayData::new_unchecked(
+                            ArrowDataType::Float32,
+                            row_count * dim_usize,
+                            Some(0), None, 0,
+                            vec![float_buf],
+                            vec![],
+                        ))
+                    };
+                    let list_dt = ArrowDataType::FixedSizeList(
+                        Arc::new(Field::new("item", ArrowDataType::Float32, false)),
+                        dim_usize as i32,
+                    );
+                    let arr = FixedSizeListArray::new(
+                        Arc::new(Field::new("item", ArrowDataType::Float32, false)),
+                        dim_usize as i32,
+                        Arc::new(float_arr),
+                        null_buf,
+                    );
+                    (list_dt, Arc::new(arr) as ArrayRef)
                 }
                 None => {
                     // Column doesn't exist, create default

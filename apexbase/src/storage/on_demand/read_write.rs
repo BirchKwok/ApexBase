@@ -310,6 +310,7 @@ impl OnDemandStorage {
                         ColumnData::StringDict { indices, .. } => {
                             indices.resize(existing_row_count, 0);
                         }
+                        ColumnData::FixedList { .. } => {} // pads implicitly
                     }
                 }
                 columns.push(col);
@@ -409,6 +410,7 @@ impl OnDemandStorage {
                                 offsets.push(*offsets.last().unwrap_or(&0));
                             }
                         }
+                        ColumnData::FixedList { .. } => {} // FixedList rows pad implicitly
                         ColumnData::Bool { data, len } => {
                             for _ in 0..pad_count {
                                 let byte_idx = *len / 8;
@@ -452,11 +454,29 @@ impl OnDemandStorage {
         bool_columns: HashMap<String, Vec<bool>>,
         null_positions: HashMap<String, Vec<bool>>,
     ) -> io::Result<Vec<u64>> {
+        self.insert_typed_with_nulls_full(
+            int_columns, float_columns, string_columns,
+            binary_columns, HashMap::new(), bool_columns, null_positions,
+        )
+    }
+
+    /// Full version with fixedlist_columns support
+    pub fn insert_typed_with_nulls_full(
+        &self,
+        int_columns: HashMap<String, Vec<i64>>,
+        float_columns: HashMap<String, Vec<f64>>,
+        string_columns: HashMap<String, Vec<String>>,
+        binary_columns: HashMap<String, Vec<Vec<u8>>>,
+        fixedlist_columns: HashMap<String, Vec<Vec<u8>>>,
+        bool_columns: HashMap<String, Vec<bool>>,
+        null_positions: HashMap<String, Vec<bool>>,
+    ) -> io::Result<Vec<u64>> {
         // Determine row count as maximum across all columns
         let row_count = int_columns.values().map(|v| v.len()).max().unwrap_or(0)
             .max(float_columns.values().map(|v| v.len()).max().unwrap_or(0))
             .max(string_columns.values().map(|v| v.len()).max().unwrap_or(0))
             .max(binary_columns.values().map(|v| v.len()).max().unwrap_or(0))
+            .max(fixedlist_columns.values().map(|v| v.len()).max().unwrap_or(0))
             .max(bool_columns.values().map(|v| v.len()).max().unwrap_or(0));
 
         if row_count == 0 {
@@ -531,6 +551,14 @@ impl OnDemandStorage {
                     nulls.push(Vec::new());
                 }
             }
+            for name in fixedlist_columns.keys() {
+                let idx = schema.add_column(name, ColumnType::FixedList);
+                col_name_to_idx.insert(name.clone(), idx);
+                while columns.len() <= idx {
+                    columns.push(ColumnData::FixedList { data: Vec::new(), dim: 0 });
+                    nulls.push(Vec::new());
+                }
+            }
             for name in bool_columns.keys() {
                 let idx = schema.add_column(name, ColumnType::Bool);
                 col_name_to_idx.insert(name.clone(), idx);
@@ -579,6 +607,13 @@ impl OnDemandStorage {
                 if let Some(idx) = schema.get_index(&name) {
                     for v in &values {
                         columns[idx].push_bytes(v);
+                    }
+                }
+            }
+            for (name, values) in fixedlist_columns {
+                if let Some(idx) = schema.get_index(&name) {
+                    for v in &values {
+                        columns[idx].push_fixed_list(v);
                     }
                 }
             }
@@ -1830,10 +1865,7 @@ impl OnDemandStorage {
     }
 
     /// MMAP PATH: Fast SELECT * LIMIT N
-    /// For small limits on mmap-only data, return None to let SQL path use arrow_batch_cache
     fn read_rows_limit_values_mmap(&self, _limit: usize) -> io::Result<Option<(Vec<String>, Vec<Vec<crate::data::Value>>)>> {
-        // Return None to fall through to SQL execution path which uses
-        // arrow_batch_cache (populated on warmup, subsequent reads are O(1) slice)
         Ok(None)
     }
 
@@ -2043,6 +2075,9 @@ impl OnDemandStorage {
                 ColumnData::StringDict { indices, .. } => {
                     indices.resize(existing_row_count, 0);
                 }
+                ColumnData::FixedList { .. } => {
+                    // FixedList pads implicitly (dim=0 until first real insert)
+                }
             }
             columns.push(col);
             nulls.push(Vec::new());
@@ -2081,6 +2116,7 @@ impl OnDemandStorage {
                 ColumnValue::Float64(v) => { float_columns.insert(name.clone(), vec![*v]); }
                 ColumnValue::String(v) => { string_columns.insert(name.clone(), vec![v.clone()]); }
                 ColumnValue::Binary(v) => { binary_columns.insert(name.clone(), vec![v.clone()]); }
+                ColumnValue::FixedList(v) => { binary_columns.insert(name.clone(), vec![v.clone()]); }
                 ColumnValue::Bool(v) => { bool_columns.insert(name.clone(), vec![*v]); }
                 ColumnValue::Null => {}
             }
@@ -2228,6 +2264,7 @@ impl OnDemandStorage {
                                 *len += 1;
                             }
                             ColumnData::StringDict { indices, .. } => indices.push(0),
+                            ColumnData::FixedList { .. } => {} // pads implicitly
                         }
                     }
                     // Mark padded rows as null
