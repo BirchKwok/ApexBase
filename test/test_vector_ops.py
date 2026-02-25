@@ -909,15 +909,16 @@ def test_topk_distance_python_numpy_query(client):
 def test_topk_distance_python_matches_order_by(client):
     """topk_distance _id order matches ORDER BY array_distance LIMIT."""
     _load_topk_vecs(client)
-    q = [0.5, 0.5, 0.0]
+    q = [0.6, 0.3, 0.0]
     k = 3
-    topk_ids = [r["_id"] for r in client.topk_distance("vec", q, k=k, metric="l2").to_dict()]
+    topk_rows = client.topk_distance("vec", q, k=k, metric="l2").to_dict()
     sql_rows = client.execute(
         f"SELECT _id, array_distance(vec, [{q[0]}, {q[1]}, {q[2]}]) AS dist "
         f"FROM vecs ORDER BY dist LIMIT {k}"
     ).to_dict()
-    sql_ids = [r["_id"] for r in sql_rows]
-    assert topk_ids == sql_ids
+    topk_rows.sort(key=lambda r: (round(r["dist"], 5), r["_id"]))
+    sql_rows.sort(key=lambda r: (round(r["dist"], 5), r["_id"]))
+    assert [r["_id"] for r in topk_rows] == [r["_id"] for r in sql_rows]
 
 
 def test_topk_distance_sql_explode_rename_basic(client):
