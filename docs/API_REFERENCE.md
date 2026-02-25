@@ -9,6 +9,7 @@ Complete API reference for ApexBase Python SDK.
 3. [Constants](#constants) - Module constants
 4. [File Reading Table Functions](#file-reading-table-functions) - read_csv / read_parquet / read_json
 5. [Set Operations](#set-operations) - UNION / INTERSECT / EXCEPT
+6. [Vector Search](#vector-search) - topk_distance / batch_topk_distance / SQL explode_rename
 
 ---
 
@@ -1238,6 +1239,226 @@ client.execute("""
 | `UNION ALL` | kept | all rows from both sides |
 | `INTERSECT` | removed | left ∩ right |
 | `EXCEPT` | removed | left \ right |
+
+---
+
+## Vector Search
+
+ApexBase has a built-in vector similarity search engine implemented entirely in Rust with SIMD-accelerated distance kernels and an OS-level mmap scan buffer that is populated once and reused across queries. Both single-query and batch modes are available through dedicated Python methods and through a SQL extension syntax.
+
+### Vector column storage
+
+Vectors are stored as **FixedList** columns when inserted as numpy arrays (recommended) or as **Binary** columns when inserted as Python lists or tuples.
+
+```python
+import numpy as np
+from apexbase import ApexClient
+
+client = ApexClient("./vecdb")
+client.create_table("items")
+
+# numpy arrays → FixedList column (optimal, zero-copy mmap scan)
+client.store({
+    "label": ["a", "b", "c"],
+    "vec":   [np.random.rand(128).astype(np.float32) for _ in range(3)],
+})
+
+# Python list/tuple → Binary column (also supported)
+client.store({"label": "d", "vec": [0.1, 0.2, 0.3]})
+```
+
+---
+
+### topk_distance
+
+```python
+topk_distance(
+    col: str,
+    query,
+    k: int = 10,
+    metric: str = 'l2',
+    id_col: str = '_id',
+    dist_col: str = 'dist',
+) -> ResultView
+```
+
+Heap-based nearest-neighbour search: O(n log k), significantly faster than `ORDER BY distance LIMIT k` for large tables.
+
+**Parameters:**
+- `col`: Name of the vector column to search (FixedList or Binary).
+- `query`: Query vector — list, tuple, or numpy array of floats.
+- `k`: Number of nearest neighbours to return (default `10`).
+- `metric`: Distance metric (see table below).
+- `id_col`: Column name for the returned row IDs (default `'_id'`).
+- `dist_col`: Column name for the returned distances (default `'dist'`).
+
+**Supported metrics:**
+
+| `metric` value | Aliases | Formula |
+|---|---|---|
+| `'l2'` | `'euclidean'` | √Σ(aᵢ−bᵢ)² |
+| `'l2_squared'` | — | Σ(aᵢ−bᵢ)² |
+| `'l1'` | `'manhattan'` | Σ|aᵢ−bᵢ| |
+| `'linf'` | `'chebyshev'` | max|aᵢ−bᵢ| |
+| `'cosine'` | `'cosine_distance'` | 1 − (a·b)/(‖a‖‖b‖) |
+| `'dot'` | `'inner_product'` | −(a·b) (negated for min-heap) |
+
+**Returns:** `ResultView` with `id_col` (Int64) and `dist_col` (Float64) columns, sorted nearest first.
+
+**Example:**
+
+```python
+import numpy as np
+
+query = np.random.rand(128).astype(np.float32)
+
+# L2 (default)
+results = client.topk_distance('vec', query, k=10)
+df = results.to_pandas()
+# df columns: _id (int64), dist (float64)
+
+# Cosine distance, custom column names
+results = client.topk_distance('vec', query, k=5, metric='cosine',
+                                id_col='item_id', dist_col='cosine_dist')
+
+# Join back to the original table to retrieve full records
+top_ids = results.get_ids()                    # numpy array of _id values
+records  = client.retrieve_many(top_ids.tolist())
+
+# Or use a SQL subquery
+client.execute("""
+    SELECT items.label, items.vec
+    FROM items
+    WHERE _id IN (
+        SELECT _id FROM (
+            SELECT explode_rename(topk_distance(vec, [0.1, 0.2, 0.3], 5, 'l2'), '_id', 'dist')
+            FROM items
+        )
+    )
+""")
+```
+
+---
+
+### batch_topk_distance
+
+```python
+batch_topk_distance(
+    col: str,
+    queries,
+    k: int = 10,
+    metric: str = 'l2',
+) -> numpy.ndarray
+```
+
+Batch nearest-neighbour search — N query vectors in a single Rust call.
+
+**Why use this instead of calling `topk_distance` N times:**
+- The mmap float buffer (`scan_buf`) is populated **once** regardless of N.
+- All N queries run in **parallel** via Rayon (outer parallelism over queries).
+- The `_id` column is read only once.
+
+**Parameters:**
+- `col`: Name of the vector column (FixedList or Binary).
+- `queries`: `(N, D)` numpy array or array-like of query vectors (float32 or float64). A 1-D array is treated as a single query (N=1).
+- `k`: Number of nearest neighbours per query (default `10`).
+- `metric`: Distance metric — same values accepted as `topk_distance`.
+
+**Returns:** `numpy.ndarray` of shape `(N, k, 2)`, dtype `float64`.
+- `result[i, j, 0]` — `_id` of the j-th nearest neighbour for query i (cast to `int64` as needed).
+- `result[i, j, 1]` — corresponding distance.
+- Each row is sorted ascending by distance.
+- Entries padded with `(-1, inf)` when fewer than k neighbours exist.
+
+**Example:**
+
+```python
+import numpy as np
+
+N, D = 100, 128
+queries = np.random.rand(N, D).astype(np.float32)
+
+result = client.batch_topk_distance('vec', queries, k=10)
+# result.shape == (100, 10, 2)
+
+ids   = result[:, :, 0].astype(np.int64)   # shape (100, 10)
+dists = result[:, :, 1]                     # shape (100, 10)
+
+# Nearest neighbour for each query
+nearest_id   = ids[:, 0]    # shape (100,)
+nearest_dist = dists[:, 0]  # shape (100,)
+
+# Cosine similarity batch search
+result_cos = client.batch_topk_distance('vec', queries, k=5, metric='cosine')
+```
+
+---
+
+### SQL: `explode_rename(topk_distance(...))`
+
+Vector search is also available as a pure SQL expression. This is the form used internally by `topk_distance()` and is useful when composing larger SQL queries.
+
+**Syntax:**
+
+```sql
+SELECT explode_rename(
+    topk_distance(col, [q1, q2, ..., qD], k, 'metric'),
+    'id_column_name',
+    'dist_column_name'
+)
+FROM table_name
+```
+
+- `col` — vector column name.
+- `[q1, q2, ..., qD]` — query vector as an array literal (float values).
+- `k` — integer number of results.
+- `'metric'` — distance metric string.
+- The two string arguments to `explode_rename` name the output columns.
+
+`explode_rename` "explodes" the TopK pairs returned by `topk_distance` into k rows with two named columns.
+
+**Examples:**
+
+```python
+# Basic: top 10 by L2 distance
+results = client.execute("""
+    SELECT explode_rename(topk_distance(vec, [0.1, 0.2, 0.3], 10, 'l2'), '_id', 'dist')
+    FROM items
+""")
+df = results.to_pandas()
+# df: _id (int64), dist (float64), 10 rows sorted nearest first
+
+# Cosine distance with custom column names
+results = client.execute("""
+    SELECT explode_rename(
+        topk_distance(vec, [1.0, 0.0, 0.0], 5, 'cosine'),
+        'item_id', 'cosine_dist'
+    )
+    FROM items
+""")
+
+# Dot product (inner product) search
+results = client.execute("""
+    SELECT explode_rename(topk_distance(vec, [0.5, 0.5, 0.5], 20, 'dot'), '_id', 'score')
+    FROM embeddings
+""")
+```
+
+> **Note:** The SQL `topk_distance` / `explode_rename` syntax requires the array literal `[...]` form for the query vector. To use dynamic vectors from Python, use the `topk_distance()` method instead, which handles the formatting automatically.
+
+---
+
+### Vector Search Performance
+
+Benchmark: 1M rows × dim=128, k=10, release build, warm mmap scan buffer.
+
+| Metric | ApexBase | DuckDB | Speedup |
+|---|---|---|---|
+| L2 | ~12ms | ~47ms | **3.8× faster** |
+| Cosine | ~13ms | ~42ms | **3.1× faster** |
+| Dot | ~13ms | ~36ms | **2.8× faster** |
+
+All three metrics use a single scan of the mmap float buffer; distance computation is SIMD-accelerated.
 
 ---
 

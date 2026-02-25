@@ -11,11 +11,12 @@ Comprehensive examples covering 100% of the ApexBase Python API.
 5. [Querying Data](#querying-data)
 6. [File Reading Table Functions](#file-reading-table-functions)
 7. [Set Operations](#set-operations)
-8. [Column Operations](#column-operations)
-9. [Full-Text Search](#full-text-search)
-10. [Data Modification](#data-modification)
-11. [Utility Methods](#utility-methods)
-12. [Advanced Usage](#advanced-usage)
+8. [Vector Search](#vector-search)
+9. [Column Operations](#column-operations)
+10. [Full-Text Search](#full-text-search)
+11. [Data Modification](#data-modification)
+12. [Utility Methods](#utility-methods)
+13. [Advanced Usage](#advanced-usage)
 
 ---
 
@@ -956,6 +957,208 @@ result = client.execute("""
 
 ---
 
+## Vector Search
+
+ApexBase provides SIMD-accelerated nearest-neighbour search over vector columns. The engine scans an OS-level mmap float buffer that is populated once and reused, delivering 3–4× speedups over DuckDB at 1M rows.
+
+### Storing vectors
+
+```python
+import numpy as np
+from apexbase import ApexClient
+
+client = ApexClient("./vecdb")
+client.create_table("items")
+
+# Bulk insert — numpy arrays become FixedList columns (optimal path)
+N, D = 100_000, 128
+vecs = np.random.rand(N, D).astype(np.float32)
+client.store({
+    "label": [f"item_{i}" for i in range(N)],
+    "vec":   list(vecs),   # list of 1-D numpy arrays
+})
+
+# Single record
+client.store({"label": "query_item", "vec": np.array([0.1] * D, dtype=np.float32)})
+
+# Python list/tuple vectors also work (stored as Binary column)
+client.store({"label": "list_item", "vec": [0.1, 0.2, 0.3]})
+```
+
+### `topk_distance` — single-query search
+
+Returns the k nearest neighbours for one query vector as a `ResultView`.
+
+```python
+query = np.random.rand(D).astype(np.float32)
+
+# Default: L2 distance, top 10
+results = client.topk_distance('vec', query, k=10)
+df = results.to_pandas()
+print(df.columns.tolist())   # ['_id', 'dist']
+print(df.head())
+#    _id      dist
+# 0   42  0.312...
+# 1   17  0.318...
+# ...
+
+# Cosine distance
+results = client.topk_distance('vec', query, k=5, metric='cosine')
+
+# Dot product (inner product) — maximise similarity
+results = client.topk_distance('vec', query, k=10, metric='dot')
+
+# Custom output column names
+results = client.topk_distance(
+    'vec', query, k=10, metric='l2',
+    id_col='item_id', dist_col='l2_dist',
+)
+df = results.to_pandas()
+print(df.columns.tolist())  # ['item_id', 'l2_dist']
+```
+
+**Retrieve full records for the top-k results:**
+
+```python
+results  = client.topk_distance('vec', query, k=10)
+top_ids  = results.get_ids()                    # numpy int64 array
+records  = client.retrieve_many(top_ids.tolist())  # ResultView with all columns
+print(records.to_pandas())
+```
+
+**All supported metrics:**
+
+| `metric` | Aliases | Notes |
+|---|---|---|
+| `'l2'` | `'euclidean'` | Euclidean distance (default) |
+| `'l2_squared'` | — | Squared L2 (avoids sqrt, same ranking) |
+| `'l1'` | `'manhattan'` | Sum of absolute differences |
+| `'linf'` | `'chebyshev'` | Maximum absolute difference |
+| `'cosine'` | `'cosine_distance'` | 1 − cosine similarity |
+| `'dot'` | `'inner_product'` | Negated dot product (min = max similarity) |
+
+### `batch_topk_distance` — N queries in one call
+
+Significantly faster than N sequential `topk_distance` calls when the scan buffer is warm.
+
+```python
+import numpy as np
+
+N_queries = 200
+queries = np.random.rand(N_queries, D).astype(np.float32)
+
+# Returns ndarray of shape (N_queries, k, 2)
+result = client.batch_topk_distance('vec', queries, k=10)
+print(result.shape)   # (200, 10, 2)
+
+# Extract IDs and distances
+ids   = result[:, :, 0].astype(np.int64)  # shape (200, 10)
+dists = result[:, :, 1]                   # shape (200, 10)
+
+# Best (nearest) neighbour for each query
+nearest_id   = ids[:, 0]    # shape (200,)
+nearest_dist = dists[:, 0]  # shape (200,)
+
+# Batch cosine search
+result_cos = client.batch_topk_distance('vec', queries, k=5, metric='cosine')
+
+# Single-query convenience: 1-D array is accepted as N=1
+result_single = client.batch_topk_distance('vec', queries[0], k=10)
+print(result_single.shape)  # (1, 10, 2)
+```
+
+**Result layout:**
+
+```
+result[i, j, 0]  →  _id  of the j-th nearest neighbour for query i
+result[i, j, 1]  →  dist of the j-th nearest neighbour for query i
+```
+
+Rows padded with `(-1, inf)` when fewer than k neighbours exist.
+
+### SQL: `explode_rename(topk_distance(...))`
+
+Vector search is also available as a SQL expression. The Python `topk_distance()` method builds this SQL internally; you can write it directly for more complex compositions.
+
+```python
+# Basic SQL vector search
+results = client.execute("""
+    SELECT explode_rename(topk_distance(vec, [0.1, 0.2, 0.3], 10, 'l2'), '_id', 'dist')
+    FROM items
+""")
+df = results.to_pandas()
+# 10 rows: _id (int64), dist (float64), sorted nearest first
+
+# Cosine search with custom names
+results = client.execute("""
+    SELECT explode_rename(
+        topk_distance(vec, [1.0, 0.0, 0.0], 5, 'cosine'),
+        'item_id', 'cosine_dist'
+    )
+    FROM items
+""")
+
+# Dot product search
+results = client.execute("""
+    SELECT explode_rename(topk_distance(vec, [0.5, 0.5, 0.5], 20, 'dot'), '_id', 'score')
+    FROM embeddings
+""")
+```
+
+**SQL syntax summary:**
+
+```sql
+SELECT explode_rename(
+    topk_distance(col, [q1, q2, ..., qD], k, 'metric'),
+    'id_column_name',
+    'dist_column_name'
+)
+FROM table_name
+```
+
+- The query vector must be an inline array literal `[f1, f2, ...]`.
+- For dynamic Python query vectors, prefer `client.topk_distance()` which formats the literal automatically.
+
+### End-to-end example: embedding search
+
+```python
+import numpy as np
+from apexbase import ApexClient
+
+DIM = 64
+client = ApexClient("./embed_db")
+client.create_table("docs")
+
+# Insert documents with embeddings
+docs = [
+    {"title": "Introduction to Rust",   "vec": np.random.rand(DIM).astype(np.float32)},
+    {"title": "Python Data Science",    "vec": np.random.rand(DIM).astype(np.float32)},
+    {"title": "Deep Learning Basics",   "vec": np.random.rand(DIM).astype(np.float32)},
+    {"title": "Vector Database Guide",  "vec": np.random.rand(DIM).astype(np.float32)},
+]
+client.store(docs)
+
+# Query: find the 3 most similar documents
+query_vec = np.random.rand(DIM).astype(np.float32)
+top = client.topk_distance('vec', query_vec, k=3, metric='cosine')
+
+# Retrieve full records
+top_ids  = top.get_ids()
+results  = client.retrieve_many(top_ids.tolist())
+for row in results:
+    print(row['title'], row['_id'])
+
+# Batch: multiple query vectors at once
+queries = np.random.rand(10, DIM).astype(np.float32)
+batch   = client.batch_topk_distance('vec', queries, k=3, metric='cosine')
+ids   = batch[:, :, 0].astype(np.int64)   # (10, 3)
+dists = batch[:, :, 1]                    # (10, 3)
+print("Top-3 IDs for each query:")
+print(ids)
+```
+
+---
+
 ## Set Operations
 
 Set operations combine result sets from two `SELECT` statements. Both sides must produce the same number of columns.
@@ -1072,6 +1275,8 @@ result = client.execute("""
 **Data Storage:** `store`, `from_pandas(df, table_name=)`, `from_polars(df, table_name=)`, `from_pyarrow(table, table_name=)`
 
 **Query:** `execute`, `query`, `retrieve`, `retrieve_many`, `retrieve_all`, `count_rows`
+
+**Vector Search:** `topk_distance(col, query, k=10, metric='l2', id_col='_id', dist_col='dist')`, `batch_topk_distance(col, queries, k=10, metric='l2')`
 
 **Modification:** `replace`, `batch_replace`, `delete`
 

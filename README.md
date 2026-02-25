@@ -18,6 +18,7 @@ ApexBase is an embedded columnar database designed for **Hybrid Transactional/An
   - [Transactions](#transactions)
   - [Indexes](#indexes)
   - [Full-Text Search](#full-text-search)
+  - [Vector Search](#vector-search)
   - [Record-Level Operations](#record-level-operations)
   - [Column Operations](#column-operations)
   - [ResultView](#resultview)
@@ -61,6 +62,7 @@ ApexBase is an embedded columnar database designed for **Hybrid Transactional/An
 - **MVCC** — multi-version concurrency control with snapshot isolation, version store, and garbage collection
 - **Indexing** — B-Tree and Hash indexes with CREATE INDEX / DROP INDEX / REINDEX; automatic multi-index AND intersection for compound predicates
 - **Full-text search** — built-in NanoFTS integration with fuzzy matching
+- **Vector search** — SIMD-accelerated nearest-neighbour search with 6 distance metrics (L2, cosine, dot, L1, L∞, L2²); heap-based O(n log k) TopK; single-query `topk_distance()` and batch `batch_topk_distance()` Python APIs; SQL `explode_rename(topk_distance(...))` syntax; 3–4× faster than DuckDB at 1M rows
 - **JIT compilation** — Cranelift-based JIT for predicate evaluation and SIMD-vectorized aggregations
 - **Zero-copy Python bridge** — Arrow IPC between Rust and Python; direct conversion to Pandas, Polars, and PyArrow
 - **Durability levels** — configurable `fast` / `safe` / `max` with WAL support and crash recovery
@@ -409,6 +411,58 @@ client.drop_fts()      # remove index + delete files
 ```
 
 > **Tip:** The SQL interface (`MATCH()` / `FUZZY_MATCH()`) works over PG Wire and Arrow Flight without any extra setup; the Python API methods are Python-process-only.
+
+### Vector Search
+
+ApexBase provides SIMD-accelerated nearest-neighbour search with a zero-copy mmap scan buffer. Supports 6 distance metrics and both single-query and batch modes.
+
+```python
+import numpy as np
+
+# Store vectors — numpy arrays are stored as FixedList columns (optimal)
+client.create_table("items")
+client.store({
+    "label": ["a", "b", "c"],
+    "vec":   [np.random.rand(128).astype(np.float32) for _ in range(3)],
+})
+
+query = np.random.rand(128).astype(np.float32)
+
+# Single-query: returns ResultView with _id and dist columns
+results = client.topk_distance('vec', query, k=10)
+df = results.to_pandas()           # columns: _id, dist
+top_ids = results.get_ids()        # numpy int64 array
+records = client.retrieve_many(top_ids.tolist())  # full records
+
+# Custom metric and column names
+results = client.topk_distance('vec', query, k=5, metric='cosine',
+                                id_col='item_id', dist_col='cosine_dist')
+
+# Batch: N queries in one Rust call (scan_buf loaded once, Rayon parallel)
+queries = np.random.rand(100, 128).astype(np.float32)
+result  = client.batch_topk_distance('vec', queries, k=10)
+# result.shape == (100, 10, 2)
+ids   = result[:, :, 0].astype(np.int64)   # (100, 10)
+dists = result[:, :, 1]                     # (100, 10)
+
+# SQL: explode_rename(topk_distance(...)) — same query, SQL form
+results = client.execute("""
+    SELECT explode_rename(topk_distance(vec, [0.1, 0.2, 0.3], 10, 'l2'), '_id', 'dist')
+    FROM items
+""")
+```
+
+**Supported metrics:** `'l2'` / `'euclidean'`, `'l2_squared'`, `'l1'` / `'manhattan'`, `'linf'` / `'chebyshev'`, `'cosine'` / `'cosine_distance'`, `'dot'` / `'inner_product'`
+
+**Benchmark (1M rows × dim=128, k=10):**
+
+| Metric | ApexBase | DuckDB | Speedup |
+|--------|----------|--------|---------|
+| L2 | ~12ms | ~47ms | **3.8× faster** |
+| Cosine | ~13ms | ~42ms | **3.1× faster** |
+| Dot | ~13ms | ~36ms | **2.8× faster** |
+
+See [`docs/API_REFERENCE.md#vector-search`](docs/API_REFERENCE.md#vector-search) for full details.
 
 ### Record-Level Operations
 
@@ -891,6 +945,13 @@ ApexClient(
 | `search_and_retrieve_top(query, n)` | Top N results |
 | `get_fts_stats()` | FTS statistics |
 | `disable_fts()` / `drop_fts()` | Disable or drop FTS |
+
+**Vector Search**
+
+| Method | Description |
+|--------|-------------|
+| `topk_distance(col, query, k=10, metric='l2', id_col='_id', dist_col='dist')` | Single-query TopK: returns `ResultView` with id and distance columns |
+| `batch_topk_distance(col, queries, k=10, metric='l2')` | Batch TopK: `ndarray` of shape `(N, k, 2)` — ids and distances |
 
 **Utility**
 
