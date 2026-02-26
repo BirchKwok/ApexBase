@@ -932,6 +932,24 @@ impl StorageEngine {
                                                 new_columns.push(ColumnData::FixedList { data: Vec::new(), dim: 0 });
                                             }
                                         }
+                                        ColumnType::Float16List => {
+                                            if let Some(vals) = fixedlist_columns.get(col_name) {
+                                                let dim = vals.iter().find(|b| !b.is_empty())
+                                                    .map(|b| b.len() / 4).unwrap_or(0) as u32;
+                                                let mut data: Vec<u8> = Vec::with_capacity(
+                                                    row_count * dim as usize * 2);
+                                                for b in vals {
+                                                    for chunk in b.chunks_exact(4) {
+                                                        let f = f32::from_le_bytes(chunk.try_into().unwrap());
+                                                        let h = crate::storage::on_demand::f32_to_f16(f);
+                                                        data.extend_from_slice(&h.to_le_bytes());
+                                                    }
+                                                }
+                                                new_columns.push(ColumnData::Float16List { data, dim });
+                                            } else {
+                                                new_columns.push(ColumnData::Float16List { data: Vec::new(), dim: 0 });
+                                            }
+                                        }
                                     }
                                 }
                                 

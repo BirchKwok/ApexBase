@@ -16,6 +16,7 @@ DuckDB fetch strategy:
 
 import argparse
 import gc
+import os
 import tempfile
 import time
 
@@ -30,6 +31,8 @@ def parse_args():
     p.add_argument("--k",      type=int, default=10)
     p.add_argument("--warmup", type=int, default=0)
     p.add_argument("--iters",  type=int, default=1)
+    p.add_argument("--no-f16", action="store_true", dest="no_f16",
+                   help="Skip Section 5 (f32 vs f16 comparison)")
     return p.parse_args()
 
 
@@ -102,6 +105,23 @@ def bench_apex(client, query: np.ndarray, k: int, metric: str, warmup: int, iter
         client.execute(sql).to_arrow()
         times.append((time.perf_counter() - t0) * 1000)
     return times
+
+
+def setup_apex_f16(vecs: np.ndarray, tmp_dir: str):
+    """Set up ApexBase with FLOAT16_VECTOR column (2 bytes/elem vs f32's 4 bytes)."""
+    from apexbase.client import ApexClient
+
+    client = ApexClient(dirpath=tmp_dir, drop_if_exists=True)
+    client.execute("CREATE TABLE vecs (id INT, vec FLOAT16_VECTOR)")
+    client.use_table("vecs")
+
+    batch_size = 10_000
+    n = len(vecs)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        rows = [{"id": i, "vec": vecs[i]} for i in range(start, end)]
+        client.store(rows)
+    return client
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -243,10 +263,18 @@ def main():
     # Multiple query vectors for batch section
     batch_queries = rng.random((10, args.dim), dtype=np.float32)
 
-    with tempfile.TemporaryDirectory() as apex_dir:
-        print("Setting up ApexBase...", end="", flush=True)
+    with tempfile.TemporaryDirectory() as apex_dir, \
+         tempfile.TemporaryDirectory() as apex_f16_dir:
+        print("Setting up ApexBase (f32)...", end="", flush=True)
         client = setup_apex(vecs, apex_dir)
         print(" done.")
+
+        if not args.no_f16:
+            print("Setting up ApexBase (f16)...", end="", flush=True)
+            client_f16 = setup_apex_f16(vecs, apex_f16_dir)
+            print(" done.")
+        else:
+            client_f16 = None
 
         print("Setting up DuckDB...", end="", flush=True)
         duck_con = setup_duckdb(vecs)
@@ -329,6 +357,51 @@ def main():
         for metric in shared_metrics + ["l2_squared", "l1", "linf"]:
             t = bench_apex(client, query, args.k, metric, 1, args.iters)
             print(f"  {metric:<12}: min={fmt(min(t))}  med={fmt(median(t))}  max={fmt(max(t))}")
+
+        # ── Section 5: Float32 vs Float16 — storage size & query speed ────────
+        if client_f16 is not None:
+            print()
+            print("── Section 5: Float32 vs Float16 — storage size & query latency ──")
+
+            # Storage size comparison
+            def apex_file_size(dirpath: str) -> int:
+                return sum(
+                    os.path.getsize(os.path.join(dirpath, f))
+                    for f in os.listdir(dirpath)
+                    if os.path.isfile(os.path.join(dirpath, f))
+                        and f.endswith(".apex")
+                )
+
+            f32_bytes = apex_file_size(apex_dir)
+            f16_bytes = apex_file_size(apex_f16_dir)
+            savings_pct = (1 - f16_bytes / f32_bytes) * 100 if f32_bytes > 0 else 0
+            print(f"  File size  f32: {f32_bytes / 1024 / 1024:.2f} MB")
+            print(f"  File size  f16: {f16_bytes / 1024 / 1024:.2f} MB  "
+                  f"({savings_pct:.1f}% smaller)")
+            print()
+
+            # Query speed comparison
+            f16_metrics = ["l2", "cosine", "l1"]
+            sec5_header = (
+                f"{'Metric':<12} {'f32 (FixedList)':>16} {'f16 (Float16List)':>18}"
+                f" {'f16/f32 ratio':>14}"
+            )
+            print(sec5_header)
+            print("-" * len(sec5_header))
+
+            for metric in f16_metrics:
+                f32_times = bench_apex(client,     query, args.k, metric, args.warmup, args.iters)
+                f16_times = bench_apex(client_f16, query, args.k, metric, args.warmup, args.iters)
+                f32_med = median(f32_times)
+                f16_med = median(f16_times)
+                ratio = f16_med / f32_med
+                label = "✅ faster" if ratio < 1.0 else "  slower"
+                print(
+                    f"{metric:<12} {fmt(f32_med):>16} {fmt(f16_med):>18}"
+                    f" {ratio:>8.2f}x {label}"
+                )
+
+            client_f16.close()
 
         client.close()
 

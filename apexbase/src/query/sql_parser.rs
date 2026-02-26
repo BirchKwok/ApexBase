@@ -3745,6 +3745,8 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                     }
                     "TIMESTAMP" | "DATETIME" => Ok(DataType::Timestamp),
                     "DATE" => Ok(DataType::Date),
+                    "FLOAT16_VECTOR" | "FLOAT16VECTOR" | "F16_VECTOR" => Ok(DataType::Float16Vector),
+                    "FLOAT_VECTOR" | "FLOATVECTOR" | "VECTOR" => Ok(DataType::Binary),
                     _ => {
                         let (start, _) = self.current_span();
                         Err(self.syntax_error(start, format!("Unknown data type: {}", s)))

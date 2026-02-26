@@ -83,6 +83,14 @@ pub struct OnDemandStorage {
     pub(crate) scan_buf_file_size: std::sync::atomic::AtomicU64,
     /// Column name whose data is currently in scan_buf (empty = none).
     pub(crate) scan_buf_col: std::sync::Mutex<String>,
+    /// Raw f16 byte cache for Float16List TopK scans.
+    /// Stores n_rows × dim × 2 raw LE f16 bytes; f32 decode happens per-row
+    /// during distance computation — halves memory vs a decoded f32 scan_buf.
+    pub(crate) scan_buf_f16: std::sync::Mutex<Vec<u8>>,
+    /// File size when scan_buf_f16 was last populated; 0 = cache invalid.
+    pub(crate) scan_buf_f16_file_size: std::sync::atomic::AtomicU64,
+    /// Column name whose f16 data is currently in scan_buf_f16 (empty = none).
+    pub(crate) scan_buf_f16_col: std::sync::Mutex<String>,
 }
 
 
@@ -156,6 +164,9 @@ impl OnDemandStorage {
             scan_buf: std::sync::Mutex::new(Vec::new()),
             scan_buf_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_col: std::sync::Mutex::new(String::new()),
+            scan_buf_f16: std::sync::Mutex::new(Vec::new()),
+            scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
+            scan_buf_f16_col: std::sync::Mutex::new(String::new()),
         };
 
         // Write initial file
@@ -379,6 +390,9 @@ impl OnDemandStorage {
             scan_buf: std::sync::Mutex::new(Vec::new()),
             scan_buf_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_col: std::sync::Mutex::new(String::new()),
+            scan_buf_f16: std::sync::Mutex::new(Vec::new()),
+            scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
+            scan_buf_f16_col: std::sync::Mutex::new(String::new()),
         })
     }
     
@@ -484,6 +498,9 @@ impl OnDemandStorage {
             scan_buf: std::sync::Mutex::new(Vec::new()),
             scan_buf_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_col: std::sync::Mutex::new(String::new()),
+            scan_buf_f16: std::sync::Mutex::new(Vec::new()),
+            scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
+            scan_buf_f16_col: std::sync::Mutex::new(String::new()),
         })
     }
 
@@ -569,6 +586,7 @@ impl OnDemandStorage {
     pub(crate) fn invalidate_page_cache(&self) {
         self.page_cache.write().clear();
         self.scan_buf_file_size.store(0, std::sync::atomic::Ordering::Release);
+        self.scan_buf_f16_file_size.store(0, std::sync::atomic::Ordering::Release);
     }
 
     /// Check if auto-flush is needed and perform it if so
@@ -909,6 +927,9 @@ impl OnDemandStorage {
             scan_buf: std::sync::Mutex::new(Vec::new()),
             scan_buf_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_col: std::sync::Mutex::new(String::new()),
+            scan_buf_f16: std::sync::Mutex::new(Vec::new()),
+            scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
+            scan_buf_f16_col: std::sync::Mutex::new(String::new()),
         })
     }
     
@@ -1363,6 +1384,7 @@ impl OnDemandStorage {
                         }
                         ColumnData::StringDict { indices, .. } => indices.push(0),
                         ColumnData::FixedList { .. } => {} // pads implicitly
+                        ColumnData::Float16List { .. } => {} // pads implicitly
                     }
                 }
                 
@@ -1453,7 +1475,7 @@ impl OnDemandStorage {
                 ColumnType::Binary => { 
                     binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
                 }
-                ColumnType::FixedList => { 
+                ColumnType::FixedList | ColumnType::Float16List => { 
                     binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
                 }
                 ColumnType::Bool => { 
@@ -1489,7 +1511,7 @@ impl OnDemandStorage {
                         let v = val.and_then(|v| if let ColumnValue::Binary(b) = v { Some(b.clone()) } else { None }).unwrap_or_default();
                         binary_columns.get_mut(col_name).unwrap().push(v);
                     }
-                    ColumnType::FixedList => {
+                    ColumnType::FixedList | ColumnType::Float16List => {
                         let v = val.and_then(|v| match v {
                             ColumnValue::FixedList(b) | ColumnValue::Binary(b) => Some(b.clone()),
                             _ => None,
@@ -1798,6 +1820,7 @@ impl OnDemandStorage {
                 ColumnData::Binary { offsets: vec![0u32; count + 1], data: Vec::new() }
             }
             ColumnType::FixedList => ColumnData::FixedList { data: Vec::new(), dim: 0 },
+            ColumnType::Float16List => ColumnData::Float16List { data: Vec::new(), dim: 0 },
             ColumnType::Null => ColumnData::Int64(vec![0i64; count]),
         }
     }

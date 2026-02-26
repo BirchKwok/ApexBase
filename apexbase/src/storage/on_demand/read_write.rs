@@ -311,6 +311,7 @@ impl OnDemandStorage {
                             indices.resize(existing_row_count, 0);
                         }
                         ColumnData::FixedList { .. } => {} // pads implicitly
+                        ColumnData::Float16List { .. } => {} // pads implicitly
                     }
                 }
                 columns.push(col);
@@ -410,7 +411,8 @@ impl OnDemandStorage {
                                 offsets.push(*offsets.last().unwrap_or(&0));
                             }
                         }
-                        ColumnData::FixedList { .. } => {} // FixedList rows pad implicitly
+                        ColumnData::FixedList { .. } => {} // pads implicitly
+                        ColumnData::Float16List { .. } => {} // pads implicitly
                         ColumnData::Bool { data, len } => {
                             for _ in 0..pad_count {
                                 let byte_idx = *len / 8;
@@ -554,8 +556,13 @@ impl OnDemandStorage {
             for name in fixedlist_columns.keys() {
                 let idx = schema.add_column(name, ColumnType::FixedList);
                 col_name_to_idx.insert(name.clone(), idx);
+                let actual_type = schema.columns.get(idx).map(|(_, t)| *t).unwrap_or(ColumnType::FixedList);
                 while columns.len() <= idx {
-                    columns.push(ColumnData::FixedList { data: Vec::new(), dim: 0 });
+                    let col = match actual_type {
+                        ColumnType::Float16List => ColumnData::Float16List { data: Vec::new(), dim: 0 },
+                        _ => ColumnData::FixedList { data: Vec::new(), dim: 0 },
+                    };
+                    columns.push(col);
                     nulls.push(Vec::new());
                 }
             }
@@ -612,8 +619,13 @@ impl OnDemandStorage {
             }
             for (name, values) in fixedlist_columns {
                 if let Some(idx) = schema.get_index(&name) {
+                    let is_f16 = matches!(columns[idx], ColumnData::Float16List { .. });
                     for v in &values {
-                        columns[idx].push_fixed_list(v);
+                        if is_f16 {
+                            columns[idx].push_float16_list_from_f32(v);
+                        } else {
+                            columns[idx].push_fixed_list(v);
+                        }
                     }
                 }
             }
@@ -2067,6 +2079,7 @@ impl OnDemandStorage {
             DataType::Binary => ColumnType::Binary,
             DataType::Timestamp => ColumnType::Timestamp,
             DataType::Date => ColumnType::Date,
+            DataType::Float16Vector => ColumnType::Float16List,
             _ => ColumnType::String,
         };
         
@@ -2110,9 +2123,8 @@ impl OnDemandStorage {
                 ColumnData::StringDict { indices, .. } => {
                     indices.resize(existing_row_count, 0);
                 }
-                ColumnData::FixedList { .. } => {
-                    // FixedList pads implicitly (dim=0 until first real insert)
-                }
+                ColumnData::FixedList { .. } => {}
+                ColumnData::Float16List { .. } => {}
             }
             columns.push(col);
             nulls.push(Vec::new());
@@ -2300,6 +2312,7 @@ impl OnDemandStorage {
                             }
                             ColumnData::StringDict { indices, .. } => indices.push(0),
                             ColumnData::FixedList { .. } => {} // pads implicitly
+                            ColumnData::Float16List { .. } => {} // pads implicitly
                         }
                     }
                     // Mark padded rows as null

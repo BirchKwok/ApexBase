@@ -2462,7 +2462,7 @@ impl OnDemandStorage {
                     ColumnType::Binary => {
                         binary_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
-                    ColumnType::FixedList => {
+                    ColumnType::FixedList | ColumnType::Float16List => {
                         fixedlist_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
                     ColumnType::Bool => {

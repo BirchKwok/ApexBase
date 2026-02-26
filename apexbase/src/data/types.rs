@@ -25,6 +25,7 @@ pub enum DataType {
     Date = 16,
     Array = 17,
     Decimal = 18,
+    Float16Vector = 19,
 }
 
 impl DataType {
@@ -40,6 +41,7 @@ impl DataType {
             DataType::Date => Some(4),
             DataType::Decimal => Some(16), // i128 for decimal storage
             DataType::String | DataType::Binary | DataType::Json | DataType::Array => None,
+            DataType::Float16Vector => None,
         }
     }
 
@@ -121,6 +123,7 @@ impl DataType {
             DataType::Date => "DATE",
             DataType::Array => "ARRAY",
             DataType::Decimal => "DECIMAL",
+            DataType::Float16Vector => "FLOAT16_VECTOR",
         }
     }
 }

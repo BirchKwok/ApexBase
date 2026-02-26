@@ -705,6 +705,13 @@ impl ApexStorageImpl {
                     } else if item.downcast::<pyo3::types::PyBytes>().is_ok() {
                         col_type = Some("bytes");
                     } else if item.get_type().name().map_or(false, |n| n == "ndarray") {
+                        // Always use "fixedlist" for numpy arrays (any dtype).
+                        // The fixedlist path calls .astype("float32").tobytes() which produces
+                        // f32 bytes.  insert_typed_with_nulls_full then calls
+                        // push_float16_list_from_f32() which does the single correct f32→f16
+                        // conversion for Float16List columns.  Routing through "float16_vector"
+                        // would produce f16 bytes here AND call push_float16_list_from_f32()
+                        // again — causing a double conversion and garbled data.
                         col_type = Some("fixedlist");
                     } else if item.extract::<i64>().is_ok() {
                         col_type = Some("int");
@@ -785,6 +792,34 @@ impl ApexStorageImpl {
                             .and_then(|b| b.extract::<Vec<u8>>())
                         {
                             vals.push(bytes);
+                        } else {
+                            vals.push(Vec::new());
+                        }
+                    }
+                    fixedlist_columns_map.insert(col_name.clone(), vals);
+                    null_positions.insert(col_name, nulls);
+                }
+                Some("float16_vector") => {
+                    let mut vals: Vec<Vec<u8>> = Vec::with_capacity(col_len);
+                    let mut nulls = Vec::with_capacity(col_len);
+                    for item in list.iter() {
+                        let is_null = item.is_none();
+                        nulls.push(is_null);
+                        if is_null {
+                            vals.push(Vec::new());
+                        } else if let Ok(f32_bytes) = item
+                            .call_method0("flatten")
+                            .and_then(|flat| flat.call_method1("astype", ("float32",)))
+                            .and_then(|f32arr| f32arr.call_method0("tobytes"))
+                            .and_then(|b| b.extract::<Vec<u8>>())
+                        {
+                            let f16_bytes: Vec<u8> = f32_bytes.chunks_exact(4)
+                                .flat_map(|c| {
+                                    let f = f32::from_le_bytes(c.try_into().unwrap());
+                                    crate::storage::on_demand::f32_to_f16(f).to_le_bytes()
+                                })
+                                .collect();
+                            vals.push(f16_bytes);
                         } else {
                             vals.push(Vec::new());
                         }
@@ -2397,6 +2432,7 @@ impl ApexStorageImpl {
             "bool" | "boolean" => crate::data::DataType::Bool,
             "str" | "string" | "text" => crate::data::DataType::String,
             "bytes" | "binary" => crate::data::DataType::Binary,
+            "float16_vector" | "float16vector" | "f16_vector" => crate::data::DataType::Float16Vector,
             "timestamp" | "datetime" => crate::data::DataType::Timestamp,
             "date" => crate::data::DataType::Date,
             _ => crate::data::DataType::String,

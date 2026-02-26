@@ -21,6 +21,31 @@ use arrow::array::{Array, ArrayRef, BinaryArray, Float64Array, Float32Array, Str
 use rayon::prelude::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Fast reciprocal-sqrt: NEON FRSQRTE + 1 Newton-Raphson step on AArch64,
+// plain 1/sqrt elsewhere.  Caller must ensure x > 0.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn rsqrt_positive_f32(x: f32) -> f32 {
+    // Scalar NEON FRSQRTE + one Newton-Raphson step.
+    // Stays entirely in FP/SIMD s-registers — no GPR↔SIMD lane crossing.
+    // Empirically faster than FRSQRTE-alone: LLVM pipelines the NR chain
+    // better alongside the surrounding FMA accumulation loop.
+    unsafe {
+        use std::arch::aarch64::*;
+        let e = vrsqrtes_f32(x);
+        let step = vrsqrtss_f32(x * e, e);  // (3 - x·e²) / 2
+        e * step
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn rsqrt_positive_f32(x: f32) -> f32 {
+    1.0 / x.sqrt()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -172,14 +197,16 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
 }
 
-/// Cosine similarity with **pre-computed query norm** `nb = ‖b‖`.
+/// Cosine similarity with **pre-computed reciprocal query norm** `nb_recip = 1/‖b‖`.
 ///
 /// Fuses dot-product and ‖a‖² into a single 16-way pass with 8 independent
 /// accumulators (4 for dot, 4 for norm²). On NEON this maps to 8 `VFMLA`
 /// chains executing in parallel; on AVX2 to 8 `VFMADD231PS` chains.
-/// `nb` is pre-computed once per query by `DistanceComputer::new`.
+/// The final step uses `rsqrt_positive_f32` (NEON FRSQRTE+NR) instead of
+/// `sqrt + div`, saving ~11 cycles per call.
+/// `nb_recip` is pre-computed once per query by `DistanceComputer::new`.
 #[inline(always)]
-pub fn cosine_similarity_fused(a: &[f32], b: &[f32], nb: f32) -> f32 {
+pub fn cosine_similarity_fused(a: &[f32], b: &[f32], nb_recip: f32) -> f32 {
     let n = a.len().min(b.len());
     let mut dot0 = 0.0f32; let mut na0 = 0.0f32;
     let mut dot1 = 0.0f32; let mut na1 = 0.0f32;
@@ -203,8 +230,8 @@ pub fn cosine_similarity_fused(a: &[f32], b: &[f32], nb: f32) -> f32 {
         dot  += a[i] * b[i];
         na_sq += a[i] * a[i];
     }
-    let na = na_sq.sqrt();
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+    if na_sq == 0.0 || nb_recip == 0.0 { return 0.0; }
+    dot * rsqrt_positive_f32(na_sq) * nb_recip
 }
 
 /// Cosine distance = 1 − cosine_similarity.
@@ -226,6 +253,8 @@ pub struct DistanceComputer {
     pub query:  Vec<f32>,
     /// Pre-computed ‖query‖ for cosine metrics (0.0 for others).
     query_norm: f32,
+    /// Pre-computed 1/‖query‖ for cosine metrics (0.0 for others).
+    query_norm_recip: f32,
 }
 
 impl DistanceComputer {
@@ -236,7 +265,8 @@ impl DistanceComputer {
             }
             _ => 0.0,
         };
-        Self { metric, query, query_norm }
+        let query_norm_recip = if query_norm > 0.0 { 1.0 / query_norm } else { 0.0 };
+        Self { metric, query, query_norm, query_norm_recip }
     }
 
     #[inline(always)]
@@ -249,9 +279,9 @@ impl DistanceComputer {
             DistanceMetric::InnerProduct   => inner_product(a, &self.query),
             DistanceMetric::NegInnerProduct => -inner_product(a, &self.query),
             DistanceMetric::CosineSimilarity =>
-                cosine_similarity_fused(a, &self.query, self.query_norm),
+                cosine_similarity_fused(a, &self.query, self.query_norm_recip),
             DistanceMetric::CosineDistance =>
-                1.0 - cosine_similarity_fused(a, &self.query, self.query_norm),
+                1.0 - cosine_similarity_fused(a, &self.query, self.query_norm_recip),
         }
     }
 }
@@ -405,6 +435,29 @@ pub fn batch_distance(
         return Ok(Arc::new(Float64Array::from(distances)) as ArrayRef);
     }
 
+    // ── FixedSizeList<Float32> column path (Float16List decoded → f32) ────────
+    if let Some(fsl) = col.as_any().downcast_ref::<arrow::array::FixedSizeListArray>() {
+        use arrow::array::Float32Array;
+        let dim = query.len() as i32;
+        if fsl.value_length() != dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("array_distance: FixedSizeList dim {} != query dim {}", fsl.value_length(), dim),
+            ));
+        }
+        let distances: Vec<Option<f64>> = (0..fsl.len())
+            .into_par_iter()
+            .map(|i| {
+                if fsl.is_null(i) { return None; }
+                let vals = fsl.value(i);
+                let f32arr = vals.as_any().downcast_ref::<Float32Array>()?;
+                let slice: Vec<f32> = (0..f32arr.len()).map(|j| f32arr.value(j)).collect();
+                Some(metric.compute(&slice, query) as f64)
+            })
+            .collect();
+        return Ok(Arc::new(Float64Array::from(distances)) as ArrayRef);
+    }
+
     // ── String column path ("[1.0, 2.0, …]" per row) ─────────────────────────
     if let Some(sa) = col.as_any().downcast_ref::<StringArray>() {
         let distances: Vec<Option<f64>> = (0..sa.len())
@@ -428,7 +481,7 @@ pub fn batch_distance(
 
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
-        "array_distance: first argument must be a Binary (vector) or String column",
+        "array_distance: first argument must be a Binary (vector), FixedSizeList, or String column",
     ))
 }
 
@@ -566,7 +619,6 @@ pub fn topk_heap_direct(
         // SAFETY: length == query.len()*4, bytes are valid LE f32 values.
         let vec = unsafe { bytes_to_f32(bytes) };
         let dist = metric.compute(vec, query);
-        if dist.is_nan() { continue; }
         let bits = dist.to_bits();
         if heap.len() < k_capped {
             heap.push(Entry(bits, i));
@@ -677,8 +729,6 @@ pub fn topk_heap_direct_parallel(
                 };
 
                 let dist = computer.compute(vec);
-                if dist.is_nan() { continue; }
-
                 let bits = dist.to_bits();
                 if heap.len() < k_capped {
                     heap.push(Entry(bits, i));
@@ -780,7 +830,6 @@ pub fn topk_heap_direct_parallel_fixed(
                 // SAFETY: bounds checked above.
                 let vec = unsafe { floats.get_unchecked(off..off + dim) };
                 let dist = computer.compute(vec);
-                if dist.is_nan() { continue; }
                 let bits = dist.to_bits();
                 if heap.len() < k_capped {
                     heap.push(Entry(bits, i));
@@ -863,7 +912,6 @@ pub fn topk_heap_on_floats(
                 if off + dim > float_len { break; }
                 let vec = unsafe { floats.get_unchecked(off..off + dim) };
                 let dist = computer.compute(vec);
-                if dist.is_nan() { continue; }
                 let bits = dist.to_bits();
                 if heap.len() < k_capped {
                     heap.push(Entry(bits, i));
@@ -925,7 +973,6 @@ fn topk_sequential_on_floats(
         if off + dim > float_len { break; }
         let vec = unsafe { floats.get_unchecked(off..off + dim) };
         let dist = computer.compute(vec);
-        if dist.is_nan() { continue; }
         let bits = dist.to_bits();
         if heap.len() < k {
             heap.push(Entry(bits, i));
@@ -995,6 +1042,451 @@ pub fn batch_topk_on_floats(
                 let q_slice = &queries[qi * dim..(qi + 1) * dim];
                 let computer = DistanceComputer::new(metric, q_slice.to_vec());
                 topk_sequential_on_floats(floats, n_rows, dim, &computer, k_capped)
+            })
+            .collect()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Native f16 TopK: decode f16→f32 per-element during distance computation.
+// Halves memory bandwidth vs a fully-decoded f32 buffer (50MB vs 100MB).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// IEEE-754 half-precision → f32 (branchless; valid for normal numbers).
+#[inline(always)]
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let b = bits as u32;
+    f32::from_bits(((b & 0x8000) << 16) | (((b >> 10) & 0x1F).wrapping_add(112) << 23) | ((b & 0x03FF) << 13))
+}
+#[inline(always)]
+fn f16u(d: &[u8], i: usize) -> f32 { f16_bits_to_f32(u16::from_le_bytes([d[i*2], d[i*2+1]])) }
+
+// ── aarch64 NEON + fp16 (hardware FCVTL via inline asm, stable Rust) ────────
+/// Load 8 packed f16 LE bytes and return two float32x4_t halves.
+/// Uses FCVTL/FCVTL2 ARM instructions (ARMv8.2-A fp16, always on Apple Silicon).
+/// No stdarch_neon_f16 unstable feature needed — conversion done via inline asm.
+#[cfg(target_arch="aarch64")] #[target_feature(enable="neon,fp16")]
+unsafe fn f16x8_to_f32pair(ptr: *const u8) -> (std::arch::aarch64::float32x4_t, std::arch::aarch64::float32x4_t) {
+    use std::arch::aarch64::*;
+    let src: uint16x8_t = vld1q_u16(ptr as *const u16);
+    let lo: float32x4_t;
+    let hi: float32x4_t;
+    std::arch::asm!(
+        "fcvtl  {lo}.4s, {src}.4h",
+        "fcvtl2 {hi}.4s, {src}.8h",
+        src = in(vreg) src,
+        lo  = out(vreg) lo,
+        hi  = out(vreg) hi,
+        options(nostack, pure, nomem)
+    );
+    (lo, hi)
+}
+#[cfg(target_arch="aarch64")] #[target_feature(enable="neon,fp16")]
+unsafe fn l2sq_f16_neon(d: &[u8], q: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let (dim, n) = (q.len(), q.len()/8);
+    let (mut a, mut b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+    for i in 0..n {
+        let (x0,x1) = f16x8_to_f32pair(d.as_ptr().add(i*16));
+        let (q0,q1) = (vld1q_f32(q.as_ptr().add(i*8)), vld1q_f32(q.as_ptr().add(i*8+4)));
+        let (d0,d1) = (vsubq_f32(q0,x0), vsubq_f32(q1,x1));
+        a = vfmaq_f32(a,d0,d0); b = vfmaq_f32(b,d1,d1);
+    }
+    let mut s = vaddvq_f32(vaddq_f32(a,b));
+    for i in n*8..dim { let e = q[i]-f16u(d,i); s += e*e; }
+    s
+}
+#[cfg(target_arch="aarch64")] #[target_feature(enable="neon,fp16")]
+unsafe fn dot_f16_neon(d: &[u8], q: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let (dim, n) = (q.len(), q.len()/8);
+    let (mut a, mut b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+    for i in 0..n {
+        let (x0,x1) = f16x8_to_f32pair(d.as_ptr().add(i*16));
+        let (q0,q1) = (vld1q_f32(q.as_ptr().add(i*8)), vld1q_f32(q.as_ptr().add(i*8+4)));
+        a = vfmaq_f32(a,x0,q0); b = vfmaq_f32(b,x1,q1);
+    }
+    let mut s = vaddvq_f32(vaddq_f32(a,b));
+    for i in n*8..dim { s += f16u(d,i) * q[i]; }
+    s
+}
+#[cfg(target_arch="aarch64")] #[target_feature(enable="neon,fp16")]
+unsafe fn cosine_f16_neon(d: &[u8], q: &[f32], qnr: f32) -> f32 {
+    use std::arch::aarch64::*;
+    let (dim, n) = (q.len(), q.len()/8);
+    let (mut da,mut db,mut na,mut nb) = (vdupq_n_f32(0.0),vdupq_n_f32(0.0),vdupq_n_f32(0.0),vdupq_n_f32(0.0));
+    for i in 0..n {
+        let (x0,x1) = f16x8_to_f32pair(d.as_ptr().add(i*16));
+        let (q0,q1) = (vld1q_f32(q.as_ptr().add(i*8)), vld1q_f32(q.as_ptr().add(i*8+4)));
+        da=vfmaq_f32(da,x0,q0); db=vfmaq_f32(db,x1,q1);
+        na=vfmaq_f32(na,x0,x0); nb=vfmaq_f32(nb,x1,x1);
+    }
+    let (mut dot, mut ns) = (vaddvq_f32(vaddq_f32(da,db)), vaddvq_f32(vaddq_f32(na,nb)));
+    for i in n*8..dim { let x=f16u(d,i); dot+=x*q[i]; ns+=x*x; }
+    if ns==0.0||qnr==0.0 { return 0.0; }
+    dot * rsqrt_positive_f32(ns) * qnr
+}
+#[cfg(target_arch="aarch64")] #[target_feature(enable="neon,fp16")]
+unsafe fn l1_f16_neon(d: &[u8], q: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let (dim, n) = (q.len(), q.len()/8);
+    let (mut a, mut b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+    for i in 0..n {
+        let (x0,x1) = f16x8_to_f32pair(d.as_ptr().add(i*16));
+        let (q0,q1) = (vld1q_f32(q.as_ptr().add(i*8)), vld1q_f32(q.as_ptr().add(i*8+4)));
+        a=vaddq_f32(a,vabsq_f32(vsubq_f32(q0,x0))); b=vaddq_f32(b,vabsq_f32(vsubq_f32(q1,x1)));
+    }
+    let mut s = vaddvq_f32(vaddq_f32(a,b));
+    for i in n*8..dim { s += (q[i]-f16u(d,i)).abs(); }
+    s
+}
+#[cfg(target_arch="aarch64")] #[target_feature(enable="neon,fp16")]
+unsafe fn linf_f16_neon(d: &[u8], q: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let (dim, n) = (q.len(), q.len()/8);
+    let (mut a, mut b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+    for i in 0..n {
+        let (x0,x1) = f16x8_to_f32pair(d.as_ptr().add(i*16));
+        let (q0,q1) = (vld1q_f32(q.as_ptr().add(i*8)), vld1q_f32(q.as_ptr().add(i*8+4)));
+        a=vmaxq_f32(a,vabsq_f32(vsubq_f32(q0,x0))); b=vmaxq_f32(b,vabsq_f32(vsubq_f32(q1,x1)));
+    }
+    let mut m = vmaxvq_f32(vmaxq_f32(a,b));
+    for i in n*8..dim { m = m.max((q[i]-f16u(d,i)).abs()); }
+    m
+}
+
+// ── x86_64 AVX2 + F16C + FMA ─────────────────────────────────────────────────
+#[cfg(target_arch="x86_64")] #[inline]
+unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let hi=_mm256_extractf128_ps(v,1); let lo=_mm256_castps256_ps128(v);
+    let s=_mm_add_ps(lo,hi); let s=_mm_add_ps(s,_mm_movehl_ps(s,s));
+    _mm_cvtss_f32(_mm_add_ss(s,_mm_shuffle_ps(s,s,1)))
+}
+#[cfg(target_arch="x86_64")] #[target_feature(enable="avx2,f16c,fma")]
+unsafe fn l2sq_f16_avx(d: &[u8], q: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let (dim, n) = (q.len(), q.len()/16);
+    let (mut a, mut b) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    for i in 0..n {
+        let p = d.as_ptr().add(i*32) as *const __m128i;
+        let (x0,x1)=(_mm256_cvtph_ps(_mm_loadu_si128(p)),_mm256_cvtph_ps(_mm_loadu_si128(p.add(1))));
+        let (q0,q1)=(_mm256_loadu_ps(q.as_ptr().add(i*16)),_mm256_loadu_ps(q.as_ptr().add(i*16+8)));
+        let (d0,d1)=(_mm256_sub_ps(q0,x0),_mm256_sub_ps(q1,x1));
+        a=_mm256_fmadd_ps(d0,d0,a); b=_mm256_fmadd_ps(d1,d1,b);
+    }
+    let mut s = hsum256(_mm256_add_ps(a,b));
+    for i in n*16..dim { let e=q[i]-f16u(d,i); s+=e*e; }
+    s
+}
+#[cfg(target_arch="x86_64")] #[target_feature(enable="avx2,f16c,fma")]
+unsafe fn dot_f16_avx(d: &[u8], q: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let (dim, n) = (q.len(), q.len()/16);
+    let (mut a, mut b) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    for i in 0..n {
+        let p = d.as_ptr().add(i*32) as *const __m128i;
+        let (x0,x1)=(_mm256_cvtph_ps(_mm_loadu_si128(p)),_mm256_cvtph_ps(_mm_loadu_si128(p.add(1))));
+        let (q0,q1)=(_mm256_loadu_ps(q.as_ptr().add(i*16)),_mm256_loadu_ps(q.as_ptr().add(i*16+8)));
+        a=_mm256_fmadd_ps(x0,q0,a); b=_mm256_fmadd_ps(x1,q1,b);
+    }
+    let mut s = hsum256(_mm256_add_ps(a,b));
+    for i in n*16..dim { s += f16u(d,i)*q[i]; }
+    s
+}
+#[cfg(target_arch="x86_64")] #[target_feature(enable="avx2,f16c,fma")]
+unsafe fn cosine_f16_avx(d: &[u8], q: &[f32], qnr: f32) -> f32 {
+    use std::arch::x86_64::*;
+    let (dim, n) = (q.len(), q.len()/16);
+    let (mut da,mut db,mut na,mut nb) = (_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps());
+    for i in 0..n {
+        let p = d.as_ptr().add(i*32) as *const __m128i;
+        let (x0,x1)=(_mm256_cvtph_ps(_mm_loadu_si128(p)),_mm256_cvtph_ps(_mm_loadu_si128(p.add(1))));
+        let (q0,q1)=(_mm256_loadu_ps(q.as_ptr().add(i*16)),_mm256_loadu_ps(q.as_ptr().add(i*16+8)));
+        da=_mm256_fmadd_ps(x0,q0,da); db=_mm256_fmadd_ps(x1,q1,db);
+        na=_mm256_fmadd_ps(x0,x0,na); nb=_mm256_fmadd_ps(x1,x1,nb);
+    }
+    let (mut dot,mut ns) = (hsum256(_mm256_add_ps(da,db)), hsum256(_mm256_add_ps(na,nb)));
+    for i in n*16..dim { let x=f16u(d,i); dot+=x*q[i]; ns+=x*x; }
+    if ns==0.0||qnr==0.0 { return 0.0; }
+    dot * rsqrt_positive_f32(ns) * qnr
+}
+#[cfg(target_arch="x86_64")] #[target_feature(enable="avx2,f16c")]
+unsafe fn l1_f16_avx(d: &[u8], q: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let (dim, n) = (q.len(), q.len()/16); let sm=_mm256_set1_ps(-0.0);
+    let (mut a, mut b) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    for i in 0..n {
+        let p = d.as_ptr().add(i*32) as *const __m128i;
+        let (x0,x1)=(_mm256_cvtph_ps(_mm_loadu_si128(p)),_mm256_cvtph_ps(_mm_loadu_si128(p.add(1))));
+        let (q0,q1)=(_mm256_loadu_ps(q.as_ptr().add(i*16)),_mm256_loadu_ps(q.as_ptr().add(i*16+8)));
+        a=_mm256_add_ps(a,_mm256_andnot_ps(sm,_mm256_sub_ps(q0,x0)));
+        b=_mm256_add_ps(b,_mm256_andnot_ps(sm,_mm256_sub_ps(q1,x1)));
+    }
+    let mut s = hsum256(_mm256_add_ps(a,b));
+    for i in n*16..dim { s += (q[i]-f16u(d,i)).abs(); }
+    s
+}
+#[cfg(target_arch="x86_64")] #[target_feature(enable="avx2,f16c")]
+unsafe fn linf_f16_avx(d: &[u8], q: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let (dim, n) = (q.len(), q.len()/16); let sm=_mm256_set1_ps(-0.0);
+    let (mut a, mut b) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    for i in 0..n {
+        let p = d.as_ptr().add(i*32) as *const __m128i;
+        let (x0,x1)=(_mm256_cvtph_ps(_mm_loadu_si128(p)),_mm256_cvtph_ps(_mm_loadu_si128(p.add(1))));
+        let (q0,q1)=(_mm256_loadu_ps(q.as_ptr().add(i*16)),_mm256_loadu_ps(q.as_ptr().add(i*16+8)));
+        a=_mm256_max_ps(a,_mm256_andnot_ps(sm,_mm256_sub_ps(q0,x0)));
+        b=_mm256_max_ps(b,_mm256_andnot_ps(sm,_mm256_sub_ps(q1,x1)));
+    }
+    let m=_mm256_max_ps(a,b); let hi=_mm256_extractf128_ps(m,1); let lo=_mm256_castps256_ps128(m);
+    let s=_mm_max_ps(lo,hi); let s=_mm_max_ps(s,_mm_movehl_ps(s,s));
+    let mut mv=_mm_cvtss_f32(_mm_max_ss(s,_mm_shuffle_ps(s,s,1)));
+    for i in n*16..dim { mv=mv.max((q[i]-f16u(d,i)).abs()); }
+    mv
+}
+
+// ── Scalar fallbacks (all targets; also used as aarch64/non-fp16 fallback) ────
+fn l2sq_f16_scalar(d: &[u8], q: &[f32]) -> f32 {
+    let (mut s0,mut s1,mut s2,mut s3) = (0f32,0f32,0f32,0f32);
+    let c = q.len()/4;
+    for i in 0..c { let o=i*4;
+        let (d0,d1,d2,d3)=(q[o]-f16u(d,o),q[o+1]-f16u(d,o+1),q[o+2]-f16u(d,o+2),q[o+3]-f16u(d,o+3));
+        s0+=d0*d0; s1+=d1*d1; s2+=d2*d2; s3+=d3*d3; }
+    let mut s=s0+s1+s2+s3; for i in c*4..q.len() { let e=q[i]-f16u(d,i); s+=e*e; } s
+}
+fn dot_f16_scalar(d: &[u8], q: &[f32]) -> f32 {
+    let (mut s0,mut s1,mut s2,mut s3) = (0f32,0f32,0f32,0f32);
+    let c = q.len()/4;
+    for i in 0..c { let o=i*4;
+        s0+=f16u(d,o)*q[o]; s1+=f16u(d,o+1)*q[o+1]; s2+=f16u(d,o+2)*q[o+2]; s3+=f16u(d,o+3)*q[o+3]; }
+    let mut s=s0+s1+s2+s3; for i in c*4..q.len() { s+=f16u(d,i)*q[i]; } s
+}
+fn cosine_f16_scalar(d: &[u8], q: &[f32], qnr: f32) -> f32 {
+    let (mut dot,mut ns) = (0f32,0f32);
+    for i in 0..q.len() { let x=f16u(d,i); dot+=x*q[i]; ns+=x*x; }
+    if ns==0.0||qnr==0.0 { return 0.0; } dot * rsqrt_positive_f32(ns) * qnr
+}
+fn l1_f16_scalar(d: &[u8], q: &[f32]) -> f32 {
+    let mut s = 0f32; for i in 0..q.len() { s+=(q[i]-f16u(d,i)).abs(); } s
+}
+fn linf_f16_scalar(d: &[u8], q: &[f32]) -> f32 {
+    let mut m = 0f32; for i in 0..q.len() { m=m.max((q[i]-f16u(d,i)).abs()); } m
+}
+
+// ── Runtime dispatcher ────────────────────────────────────────────────────────
+#[inline(always)]
+fn compute_f16_row_distance(row: &[u8], c: &DistanceComputer) -> f32 {
+    let (q, qnr) = (&c.query, c.query_norm_recip);
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("fp16") {
+        return match c.metric {
+            DistanceMetric::L2Squared       => unsafe { l2sq_f16_neon(row, q) },
+            DistanceMetric::L2              => unsafe { l2sq_f16_neon(row, q) }.sqrt(),
+            DistanceMetric::InnerProduct    => unsafe { dot_f16_neon(row, q) },
+            DistanceMetric::NegInnerProduct => -unsafe { dot_f16_neon(row, q) },
+            DistanceMetric::CosineSimilarity => unsafe { cosine_f16_neon(row, q, qnr) },
+            DistanceMetric::CosineDistance  => 1.0 - unsafe { cosine_f16_neon(row, q, qnr) },
+            DistanceMetric::L1              => unsafe { l1_f16_neon(row, q) },
+            DistanceMetric::LInf            => unsafe { linf_f16_neon(row, q) },
+        };
+    }
+    #[cfg(target_arch = "aarch64")]
+    return match c.metric {
+        DistanceMetric::L2Squared       => l2sq_f16_scalar(row, q),
+        DistanceMetric::L2              => l2sq_f16_scalar(row, q).sqrt(),
+        DistanceMetric::InnerProduct    => dot_f16_scalar(row, q),
+        DistanceMetric::NegInnerProduct => -dot_f16_scalar(row, q),
+        DistanceMetric::CosineSimilarity => cosine_f16_scalar(row, q, qnr),
+        DistanceMetric::CosineDistance  => 1.0 - cosine_f16_scalar(row, q, qnr),
+        DistanceMetric::L1              => l1_f16_scalar(row, q),
+        DistanceMetric::LInf            => linf_f16_scalar(row, q),
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx2") {
+            return match c.metric {
+                DistanceMetric::L2Squared       => unsafe { l2sq_f16_avx(row, q) },
+                DistanceMetric::L2              => unsafe { l2sq_f16_avx(row, q) }.sqrt(),
+                DistanceMetric::InnerProduct    => unsafe { dot_f16_avx(row, q) },
+                DistanceMetric::NegInnerProduct => -unsafe { dot_f16_avx(row, q) },
+                DistanceMetric::CosineSimilarity => unsafe { cosine_f16_avx(row, q, qnr) },
+                DistanceMetric::CosineDistance  => 1.0 - unsafe { cosine_f16_avx(row, q, qnr) },
+                DistanceMetric::L1              => unsafe { l1_f16_avx(row, q) },
+                DistanceMetric::LInf            => unsafe { linf_f16_avx(row, q) },
+            };
+        }
+        match c.metric {
+            DistanceMetric::L2Squared       => l2sq_f16_scalar(row, q),
+            DistanceMetric::L2              => l2sq_f16_scalar(row, q).sqrt(),
+            DistanceMetric::InnerProduct    => dot_f16_scalar(row, q),
+            DistanceMetric::NegInnerProduct => -dot_f16_scalar(row, q),
+            DistanceMetric::CosineSimilarity => cosine_f16_scalar(row, q, qnr),
+            DistanceMetric::CosineDistance  => 1.0 - cosine_f16_scalar(row, q, qnr),
+            DistanceMetric::L1              => l1_f16_scalar(row, q),
+            DistanceMetric::LInf            => linf_f16_scalar(row, q),
+        }
+    }
+}
+
+/// Parallel TopK on raw f16 LE bytes (n_rows × dim × 2 bytes), no pre-decode.
+/// Uses SIMD f16 distance kernels; no intermediate row_buf write.
+/// Returns `Vec<(row_index, f32_distance)>` sorted ascending (nearest first).
+pub fn topk_heap_on_f16_bytes(
+    f16_bytes: &[u8],
+    n_rows: usize,
+    dim: usize,
+    computer: &DistanceComputer,
+    k: usize,
+) -> Vec<(usize, f32)> {
+    use rayon::prelude::*;
+    use std::collections::BinaryHeap;
+    use std::cmp::Ordering;
+
+    if k == 0 || n_rows == 0 || dim == 0 || computer.query.is_empty() {
+        return vec![];
+    }
+    let k_capped  = k.min(n_rows);
+    let row_bytes = dim * 2;
+
+    #[derive(Copy, Clone)]
+    struct Entry(u32, usize);
+    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
+    impl Eq         for Entry {}
+    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+    impl Ord        for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+
+    let bytes_ptr = f16_bytes.as_ptr() as usize;
+    let bytes_len = f16_bytes.len();
+    let t         = rayon::current_num_threads().max(1);
+    let chunk     = (n_rows + t - 1) / t;
+
+    let per_chunk: Vec<Vec<(usize, f32)>> = (0..t)
+        .into_par_iter()
+        .map(|tid| {
+            let start = tid * chunk;
+            if start >= n_rows { return vec![]; }
+            let end   = (start + chunk).min(n_rows);
+            let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
+            let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+            for i in start..end {
+                let off = i * row_bytes;
+                if off + row_bytes > bytes_len { break; }
+                let dist = compute_f16_row_distance(&bytes[off..off + row_bytes], computer);
+                let dist_bits = dist.to_bits();
+                if heap.len() < k_capped {
+                    heap.push(Entry(dist_bits, i));
+                } else if let Some(&Entry(top, _)) = heap.peek() {
+                    if dist_bits < top { heap.pop(); heap.push(Entry(dist_bits, i)); }
+                }
+            }
+            heap.into_iter().map(|Entry(b, i)| (i, f32::from_bits(b))).collect()
+        })
+        .collect();
+
+    let mut final_heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+    for chunk in per_chunk {
+        for (idx, dist) in chunk {
+            let bits = dist.to_bits();
+            if final_heap.len() < k_capped {
+                final_heap.push(Entry(bits, idx));
+            } else if let Some(&Entry(top, _)) = final_heap.peek() {
+                if bits < top { final_heap.pop(); final_heap.push(Entry(bits, idx)); }
+            }
+        }
+    }
+    let mut result: Vec<(usize, f32)> = final_heap
+        .into_iter()
+        .map(|Entry(b, i)| (i, f32::from_bits(b)))
+        .collect();
+    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    result
+}
+
+/// Single-query sequential TopK on raw f16 LE bytes.
+/// Used by `batch_topk_on_f16_bytes` for outer-parallel-over-queries strategy.
+fn topk_sequential_on_f16_bytes(
+    f16_bytes: &[u8],
+    n_rows: usize,
+    dim: usize,
+    computer: &DistanceComputer,
+    k: usize,
+) -> Vec<(usize, f32)> {
+    use std::collections::BinaryHeap;
+    use std::cmp::Ordering;
+
+    #[derive(Copy, Clone)]
+    struct Entry(u32, usize);
+    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
+    impl Eq         for Entry {}
+    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+    impl Ord        for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+
+    let row_bytes = dim * 2;
+    let bytes_len = f16_bytes.len();
+    let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k + 1);
+    for i in 0..n_rows {
+        let off = i * row_bytes;
+        if off + row_bytes > bytes_len { break; }
+        let dist = compute_f16_row_distance(&f16_bytes[off..off + row_bytes], computer);
+        let dist_bits = dist.to_bits();
+        if heap.len() < k {
+            heap.push(Entry(dist_bits, i));
+        } else if let Some(&Entry(top, _)) = heap.peek() {
+            if dist_bits < top { heap.pop(); heap.push(Entry(dist_bits, i)); }
+        }
+    }
+    let mut result: Vec<(usize, f32)> = heap.into_iter()
+        .map(|Entry(b, i)| (i, f32::from_bits(b)))
+        .collect();
+    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    result
+}
+
+/// Adaptive batch TopK on raw f16 LE bytes — N queries in one call.
+/// Mirrors `batch_topk_on_floats` but decodes f16→f32 per row during computation.
+/// `f16_bytes`: n_rows × dim × 2, row-major.
+/// `queries`:   n_queries × dim, f32 row-major.
+/// Returns `Vec<Vec<(row_index, f32_distance)>>` length n_queries, each sorted asc.
+pub fn batch_topk_on_f16_bytes(
+    f16_bytes: &[u8],
+    n_rows: usize,
+    dim: usize,
+    queries: &[f32],
+    n_queries: usize,
+    k: usize,
+    metric: DistanceMetric,
+) -> Vec<Vec<(usize, f32)>> {
+    use rayon::prelude::*;
+
+    if k == 0 || n_rows == 0 || dim == 0 || n_queries == 0 {
+        return vec![vec![]; n_queries];
+    }
+    let k_capped   = k.min(n_rows);
+    let t          = rayon::current_num_threads().max(1);
+    let bytes_ptr  = f16_bytes.as_ptr() as usize;
+    let bytes_len  = f16_bytes.len();
+    let query_ptr  = queries.as_ptr() as usize;
+    let query_len  = queries.len();
+
+    if n_queries < t {
+        (0..n_queries).map(|qi| {
+            let f16_b  = unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
+            let qs     = unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
+            let q_slice = &qs[qi * dim..(qi + 1) * dim];
+            let computer = DistanceComputer::new(metric, q_slice.to_vec());
+            topk_heap_on_f16_bytes(f16_b, n_rows, dim, &computer, k_capped)
+        }).collect()
+    } else {
+        (0..n_queries)
+            .into_par_iter()
+            .map(|qi| {
+                let f16_b   = unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
+                let qs      = unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
+                let q_slice = &qs[qi * dim..(qi + 1) * dim];
+                let computer = DistanceComputer::new(metric, q_slice.to_vec());
+                topk_sequential_on_f16_bytes(f16_b, n_rows, dim, &computer, k_capped)
             })
             .collect()
     }

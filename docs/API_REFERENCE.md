@@ -1269,6 +1269,97 @@ client.store({"label": "d", "vec": [0.1, 0.2, 0.3]})
 
 ---
 
+### Float16 Vector Storage (`FLOAT16_VECTOR`)
+
+ApexBase supports **half-precision (float16) vector columns** for memory-efficient embedding storage.  Each element is stored as a 16-bit IEEE 754 half-precision float, halving the memory and I/O footprint compared to float32 vectors.
+
+#### Declaring a float16 column
+
+```sql
+CREATE TABLE embeddings (id TEXT, vec FLOAT16_VECTOR)
+```
+
+Accepted type name aliases: `FLOAT16_VECTOR`, `FLOAT16VECTOR`, `F16_VECTOR`.
+
+#### Inserting float16 vectors
+
+Use a **batch store** (two or more records in one call) for optimal encoding.  Pass vectors as `numpy` arrays — any numeric dtype is accepted; the storage layer converts to float16 automatically.
+
+```python
+import numpy as np
+from apexbase import ApexClient
+
+client = ApexClient("./vecdb")
+client.execute("CREATE TABLE embeddings (label TEXT, vec FLOAT16_VECTOR)")
+client.use_table("embeddings")
+
+# float32 source data — auto-quantized to f16 on write
+vecs = np.random.rand(1000, 128).astype(np.float32)
+client.store([{"label": str(i), "vec": vecs[i]} for i in range(len(vecs))])
+
+# float16 source data — stored directly
+vecs_f16 = vecs.astype(np.float16)
+client.store([{"label": str(i), "vec": vecs_f16[i]} for i in range(len(vecs_f16))])
+```
+
+> **Note:** Always use batch store (`len(data) > 1`) for `FLOAT16_VECTOR` columns.  The single-record path converts vectors to float32 bytes before storage, which will produce incorrect distances on float16 columns.  Batch the writes or use the columnar dict API:
+>
+> ```python
+> # Columnar dict — also correct and fastest
+> client.store({"label": [str(i) for i in range(n)], "vec": [vecs[i] for i in range(n)]})
+> ```
+
+#### Querying float16 vectors
+
+All `topk_distance`, `batch_topk_distance`, and SQL distance functions work transparently on `FLOAT16_VECTOR` columns.  The query vector is always provided in float32/float64 — no special handling needed.
+
+```python
+query = np.random.rand(128).astype(np.float32)
+
+# TopK search
+results = client.topk_distance("vec", query, k=10, metric="l2")
+
+# SQL distance functions also work
+client.execute("""
+    SELECT label, array_distance(vec, [0.1, 0.2, 0.3, 0.4]) AS dist
+    FROM embeddings
+    ORDER BY dist
+    LIMIT 5
+""")
+```
+
+#### SIMD acceleration
+
+Float16 distance kernels are hardware-accelerated on supported CPUs:
+
+| Architecture | Feature | Kernels |
+|---|---|---|
+| `aarch64` (Apple M-series, AWS Graviton) | `fp16` NEON | L2, Dot, Cosine, L1, L∞ — FCVTL/FCVTL2 |
+| `x86_64` | `f16c` + `AVX2` | L2, Dot, Cosine, L1, L∞ — `_cvtph_ps` |
+| All others | scalar fallback | all metrics |
+
+CPU feature detection is automatic at runtime — no build flags or environment variables required.  On Apple Silicon (M1/M2/M3/M4), f16 kernels are typically **≥2× faster** than equivalent float32 kernels.
+
+#### Quantization error
+
+Float16 has ~3 decimal digits of precision (machine epsilon ≈ 9.77 × 10⁻⁴).  For unit vectors or typical embedding ranges [−1, 1], the relative distance error is under 0.2%.
+
+```python
+import numpy as np
+
+def f16_quantize(v):
+    return v.astype(np.float16).astype(np.float32)
+
+vec = np.random.rand(128).astype(np.float32)
+q   = np.random.rand(128).astype(np.float32)
+
+exact    = float(np.sqrt(np.sum((vec - q) ** 2)))
+f16_dist = float(np.sqrt(np.sum((f16_quantize(vec) - q) ** 2)))
+print(f"relative error: {abs(exact - f16_dist) / exact:.2e}")  # typically < 2e-3
+```
+
+---
+
 ### topk_distance
 
 ```python
@@ -1505,6 +1596,7 @@ DROP TABLE IF EXISTS table_name
 | `INT` | `INTEGER`, `INT32`, `INT64` | Integer numbers |
 | `FLOAT` | `DOUBLE`, `FLOAT64` | Floating point numbers |
 | `BOOL` | `BOOLEAN` | Boolean values |
+| `FLOAT16_VECTOR` | `FLOAT16VECTOR`, `F16_VECTOR` | Half-precision float vector (SIMD-accelerated TopK) |
 
 ### Examples
 

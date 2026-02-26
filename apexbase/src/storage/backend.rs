@@ -96,7 +96,7 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::String | ColumnType::StringDict => DataType::String,
         ColumnType::Bool => DataType::Bool,
         ColumnType::Binary => DataType::Binary,
-        ColumnType::FixedList => DataType::Binary,
+        ColumnType::FixedList | ColumnType::Float16List => DataType::Binary,
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Date => DataType::Date,
         ColumnType::Null => DataType::String,
@@ -251,7 +251,29 @@ pub fn column_data_to_typed_column(cd: &ColumnData, _dtype: DataType) -> TypedCo
             }
             TypedColumn::Mixed { data: values, nulls }
         }
+        ColumnData::Float16List { data, dim } => {
+            let mut values = Vec::new();
+            let mut nulls = BitVec::new();
+            let dim_usize = *dim as usize;
+            let row_count = if dim_usize == 0 { 0 } else { data.len() / (dim_usize * 2) };
+            for i in 0..row_count {
+                let start = i * dim_usize * 2;
+                let end = start + dim_usize * 2;
+                values.push(Value::Binary(data[start..end].to_vec()));
+                nulls.push(false);
+            }
+            TypedColumn::Mixed { data: values, nulls }
+        }
     }
+}
+
+/// Convert ColumnData::Float16List to (ArrowDataType, ArrayRef) - decodes f16->f32
+fn float16list_to_arrow_pair(data: &[u8], dim: u32) -> (arrow::datatypes::DataType, std::sync::Arc<dyn arrow::array::Array>) {
+    use crate::storage::on_demand::f16_to_f32;
+    let f32_bytes: Vec<u8> = data.chunks_exact(2)
+        .flat_map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())).to_le_bytes())
+        .collect();
+    fixedlist_to_arrow_pair(&f32_bytes, dim)
 }
 
 /// Convert ColumnData::FixedList to (ArrowDataType, ArrayRef)
@@ -1512,6 +1534,7 @@ impl TableStorageBackend {
                          Arc::new(dict_array) as ArrayRef)
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(&data, dim),
+                    ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(&data, dim),
                 };
 
                 fields.push(Field::new(col_name, arrow_dt, true));
@@ -1650,6 +1673,7 @@ impl TableStorageBackend {
                         (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
+                    ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                 };
 
                 fields.push(Field::new(col_name, arrow_dt, true));
@@ -1767,6 +1791,7 @@ impl TableStorageBackend {
                     (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
                 }
                 ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(&data, dim),
+                ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(&data, dim),
             };
             
             fields.push(Field::new(col_name, arrow_dt, true));
@@ -2048,6 +2073,7 @@ impl TableStorageBackend {
                         (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
+                    ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                 };
 
                 fields.push(Field::new(col_name, arrow_dt, true));
@@ -2193,6 +2219,7 @@ impl TableStorageBackend {
                          Arc::new(dict_array) as ArrayRef)
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
+                    ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                 };
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
@@ -2315,6 +2342,7 @@ impl TableStorageBackend {
                          Arc::new(dict_array) as ArrayRef)
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
+                    ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                 };
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
@@ -2507,6 +2535,7 @@ impl TableStorageBackend {
                          Arc::new(dict_array) as ArrayRef)
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
+                    ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                 };
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);

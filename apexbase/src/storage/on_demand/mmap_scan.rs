@@ -622,6 +622,40 @@ impl OnDemandStorage {
                     );
                     (list_dt, Arc::new(arr) as ArrayRef)
                 }
+                ColumnData::Float16List { data, dim } => {
+                    use arrow::array::{FixedSizeListArray, Float32Array};
+                    use arrow::buffer::Buffer;
+                    let dim_usize = *dim as usize;
+                    let row_count = if dim_usize == 0 { 0 } else { data.len() / (dim_usize * 2) }
+                        .min(active_count);
+                    // Decode f16 bytes to f32 bytes
+                    let mut f32_bytes: Vec<u8> = Vec::with_capacity(row_count * dim_usize * 4);
+                    for chunk in data[..row_count * dim_usize * 2].chunks_exact(2) {
+                        let bits = u16::from_le_bytes(chunk.try_into().unwrap());
+                        f32_bytes.extend_from_slice(&crate::storage::on_demand::f16_to_f32(bits).to_le_bytes());
+                    }
+                    let float_buf = Buffer::from_vec(f32_bytes);
+                    let float_arr = unsafe {
+                        Float32Array::from(arrow::array::ArrayData::new_unchecked(
+                            ArrowDataType::Float32,
+                            row_count * dim_usize,
+                            Some(0), None, 0,
+                            vec![float_buf],
+                            vec![],
+                        ))
+                    };
+                    let list_dt = ArrowDataType::FixedSizeList(
+                        Arc::new(Field::new("item", ArrowDataType::Float32, false)),
+                        dim_usize as i32,
+                    );
+                    let arr = FixedSizeListArray::new(
+                        Arc::new(Field::new("item", ArrowDataType::Float32, false)),
+                        dim_usize as i32,
+                        Arc::new(float_arr),
+                        None,
+                    );
+                    (list_dt, Arc::new(arr) as ArrayRef)
+                }
                 _ => {
                     // Fallback: null array
                     let arr = arrow::array::new_null_array(&ArrowDataType::Utf8, active_count);
@@ -1559,9 +1593,6 @@ impl OnDemandStorage {
                 self.read_string_dict_column_range_mmap(mmap_cache, file, index, start_row, row_count)
             }
             ColumnType::FixedList => {
-                // FixedList: contiguous raw f32 bytes stored like Binary but with fixed stride
-                // Format: [count:u64][dim:u32][data: count * dim * 4 bytes]
-                // Read the dim first, then the data slice
                 let mut dim_buf = [0u8; 4];
                 let _ = mmap_cache.read_at(file, &mut dim_buf, index.data_offset + 8);
                 let dim = u32::from_le_bytes(dim_buf);
@@ -1573,6 +1604,19 @@ impl OnDemandStorage {
                     mmap_cache.read_at(file, &mut data, byte_offset)?;
                 }
                 Ok(ColumnData::FixedList { data, dim })
+            }
+            ColumnType::Float16List => {
+                let mut dim_buf = [0u8; 4];
+                let _ = mmap_cache.read_at(file, &mut dim_buf, index.data_offset + 8);
+                let dim = u32::from_le_bytes(dim_buf);
+                let dim_usize = dim as usize;
+                let byte_len = row_count * dim_usize * 2;
+                let byte_offset = index.data_offset + 12 + (start_row * dim_usize * 2) as u64;
+                let mut data = vec![0u8; byte_len];
+                if byte_len > 0 {
+                    mmap_cache.read_at(file, &mut data, byte_offset)?;
+                }
+                Ok(ColumnData::Float16List { data, dim })
             }
             ColumnType::Null => {
                 Ok(ColumnData::Int64(vec![0; row_count]))
@@ -2108,8 +2152,23 @@ impl OnDemandStorage {
                 }
                 Ok(ColumnData::FixedList { data, dim })
             }
+            ColumnType::Float16List => {
+                let mut dim_buf = [0u8; 4];
+                let _ = mmap_cache.read_at(file, &mut dim_buf, index.data_offset + 8);
+                let dim = u32::from_le_bytes(dim_buf);
+                let dim_usize = dim as usize;
+                let mut data = Vec::with_capacity(row_indices.len() * dim_usize * 2);
+                for &row in row_indices {
+                    let byte_offset = index.data_offset + 12 + (row * dim_usize * 2) as u64;
+                    let mut row_data = vec![0u8; dim_usize * 2];
+                    if dim_usize > 0 {
+                        let _ = mmap_cache.read_at(file, &mut row_data, byte_offset);
+                    }
+                    data.extend_from_slice(&row_data);
+                }
+                Ok(ColumnData::Float16List { data, dim })
+            }
             ColumnType::Null => {
-                // Null column - return empty Int64 as placeholder
                 Ok(ColumnData::Int64(vec![0i64; row_indices.len()]))
             }
         }
@@ -3969,7 +4028,8 @@ impl OnDemandStorage {
             Some(i) => i,
             None => return Ok(None),
         };
-        if schema.columns[col_idx].1 != ColumnType::FixedList {
+        let is_f16 = schema.columns[col_idx].1 == ColumnType::Float16List;
+        if schema.columns[col_idx].1 != ColumnType::FixedList && !is_f16 {
             return Ok(None);
         }
 
@@ -3991,8 +4051,12 @@ impl OnDemandStorage {
         struct RgDesc { count: usize, float_abs: usize, byte_len: usize }
         let mut rg_descs: Vec<Option<RgDesc>> = Vec::with_capacity(footer.row_groups.len());
         let mut total_active: usize = 0;
+        // co_idx tracks position in footer.col_offsets independently of rg_idx.
+        // Empty RGs (row_count==0, e.g. the initial RG from CREATE TABLE) never
+        // push a col_offsets entry, so rg_idx and co_idx can diverge.
+        let mut co_idx: usize = 0;
 
-        for (rg_idx, rg_meta) in footer.row_groups.iter().enumerate() {
+        for (_rg_idx, rg_meta) in footer.row_groups.iter().enumerate() {
             let rg_active = rg_meta.active_rows() as usize;
             total_active += rg_active;
 
@@ -4009,17 +4073,17 @@ impl OnDemandStorage {
             if compress_flag != RG_COMPRESS_NONE
                 || encoding_ver < 1
                 || rg_meta.deletion_count > 0
-                || rg_idx >= footer.col_offsets.len()
-                || col_idx >= footer.col_offsets[rg_idx].len()
+                || co_idx >= footer.col_offsets.len()
+                || col_idx >= footer.col_offsets[co_idx].len()
             {
                 return Ok(None);
             }
 
             let rg_body_abs = (rg_meta.offset + 32) as usize;
-            let col_abs  = rg_body_abs + footer.col_offsets[rg_idx][col_idx] as usize;
+            let col_abs  = rg_body_abs + footer.col_offsets[co_idx][col_idx] as usize;
             let data_abs = col_abs + null_bitmap_len_fn(rg_rows);
 
-            // FixedList layout: [encoding:u8][count:u64][dim:u32][f32 * count * dim]
+            // FixedList/Float16List layout: [encoding:u8][count:u64][dim:u32][elem * count * dim]
             if data_abs + 13 > mmap.len() { return Ok(None); }
             if mmap[data_abs] != COL_ENCODING_PLAIN { return Ok(None); }
 
@@ -4029,20 +4093,68 @@ impl OnDemandStorage {
             if count == 0 || dim == 0 { rg_descs.push(None); continue; }
             if dim != query_dim { return Ok(None); }
 
+            let elem_bytes = if is_f16 { 2 } else { 4 };
             let float_abs = data_abs + 13;
-            let byte_len  = count * dim * 4;
+            let byte_len  = count * dim * elem_bytes;
             if float_abs + byte_len > mmap.len() { return Ok(None); }
 
             rg_descs.push(Some(RgDesc { count, float_abs, byte_len }));
+            co_idx += 1;
         }
 
         if total_active == 0 { return Ok(Some(vec![])); }
 
-        // ── PASS 2: fill scan_buf and run ONE topk scan ─────────────────────
-        // Same scan_buf caching as topk_binary_direct: on repeated queries the
-        // mmap→heap copy is skipped entirely. Invalidated on every write.
-        let needed    = total_active * query_dim;
         let file_size = mmap.len() as u64;
+
+        // ── PASS 2 (f16): cache raw f16 bytes, decode per-element during topk ─
+        if is_f16 {
+            let f16_needed = total_active * query_dim * 2;
+            let mut f16_guard = self.scan_buf_f16.lock().unwrap();
+            let f16_cached   = self.scan_buf_f16_file_size.load(std::sync::atomic::Ordering::Acquire);
+            let f16_cg       = self.scan_buf_f16_col.lock().unwrap();
+            let f16_hit      = f16_cached == file_size
+                && f16_guard.len() >= f16_needed
+                && f16_cg.as_str() == col_name;
+            drop(f16_cg);
+
+            if !f16_hit {
+                let cur = f16_guard.len();
+                if f16_guard.capacity() < f16_needed {
+                    f16_guard.reserve(f16_needed - cur);
+                }
+                unsafe { f16_guard.set_len(f16_needed); }
+                let f16_ptr = f16_guard.as_mut_ptr();
+                let mut filled = 0usize;
+                for desc in rg_descs.iter() {
+                    let Some(d) = desc else { continue };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            mmap.as_ptr().add(d.float_abs),
+                            f16_ptr.add(filled),
+                            d.byte_len,
+                        );
+                    }
+                    filled += d.byte_len;
+                }
+                let mut cg = self.scan_buf_f16_col.lock().unwrap();
+                cg.clear(); cg.push_str(col_name);
+                drop(cg);
+                self.scan_buf_f16_file_size.store(file_size, std::sync::atomic::Ordering::Release);
+            }
+            drop(mmap_arc);
+
+            let f16_ptr   = f16_guard.as_ptr();
+            let f16_slice = unsafe { std::slice::from_raw_parts(f16_ptr, f16_needed) };
+            let mut result = crate::query::vector_ops::topk_heap_on_f16_bytes(
+                f16_slice, total_active, query_dim, computer, k);
+            drop(f16_guard);
+            result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            result.truncate(k);
+            return Ok(Some(result));
+        }
+
+        // ── PASS 2 (f32): fill scan_buf and run ONE topk scan ────────────────
+        let needed    = total_active * query_dim;
         let mut buf_guard = self.scan_buf.lock().unwrap();
         let cached_size = self.scan_buf_file_size.load(std::sync::atomic::Ordering::Acquire);
         let col_guard   = self.scan_buf_col.lock().unwrap();
@@ -4057,7 +4169,6 @@ impl OnDemandStorage {
                 buf_guard.reserve(needed - cur);
             }
             unsafe { buf_guard.set_len(needed); }
-
             let buf_ptr = buf_guard.as_mut_ptr();
             let mut filled_floats = 0usize;
             for desc in rg_descs.iter() {
@@ -4071,7 +4182,6 @@ impl OnDemandStorage {
                 }
                 filled_floats += d.count * query_dim;
             }
-
             let mut cg = self.scan_buf_col.lock().unwrap();
             cg.clear(); cg.push_str(col_name);
             drop(cg);
@@ -4079,7 +4189,6 @@ impl OnDemandStorage {
         }
         drop(mmap_arc);
 
-        // SAFETY: scan_buf holds at least `needed` valid f32 elements.
         let buf_ptr = buf_guard.as_ptr();
         let floats: &[f32] = unsafe { std::slice::from_raw_parts(buf_ptr, needed) };
         let total_rows = needed / query_dim;
@@ -4127,7 +4236,8 @@ impl OnDemandStorage {
             Some(i) => i,
             None => return Ok(None),
         };
-        if schema.columns[col_idx].1 != ColumnType::FixedList {
+        let is_f16_batch = schema.columns[col_idx].1 == ColumnType::Float16List;
+        if schema.columns[col_idx].1 != ColumnType::FixedList && !is_f16_batch {
             return Ok(None);
         }
 
@@ -4142,8 +4252,11 @@ impl OnDemandStorage {
         struct RgDesc { count: usize, float_abs: usize, byte_len: usize }
         let mut rg_descs: Vec<Option<RgDesc>> = Vec::with_capacity(footer.row_groups.len());
         let mut total_active: usize = 0;
+        // co_idx tracks position in footer.col_offsets independently of rg_idx.
+        // Empty RGs (row_count==0) never push a col_offsets entry.
+        let mut co_idx: usize = 0;
 
-        for (rg_idx, rg_meta) in footer.row_groups.iter().enumerate() {
+        for (_rg_idx, rg_meta) in footer.row_groups.iter().enumerate() {
             let rg_active = rg_meta.active_rows() as usize;
             total_active += rg_active;
 
@@ -4160,12 +4273,12 @@ impl OnDemandStorage {
             if compress_flag != RG_COMPRESS_NONE
                 || encoding_ver < 1
                 || rg_meta.deletion_count > 0
-                || rg_idx >= footer.col_offsets.len()
-                || col_idx >= footer.col_offsets[rg_idx].len()
+                || co_idx >= footer.col_offsets.len()
+                || col_idx >= footer.col_offsets[co_idx].len()
             { return Ok(None); }
 
             let rg_body_abs = (rg_meta.offset + 32) as usize;
-            let col_abs  = rg_body_abs + footer.col_offsets[rg_idx][col_idx] as usize;
+            let col_abs  = rg_body_abs + footer.col_offsets[co_idx][col_idx] as usize;
             let data_abs = col_abs + null_bitmap_len_fn(rg_rows);
 
             if data_abs + 13 > mmap.len() { return Ok(None); }
@@ -4177,19 +4290,67 @@ impl OnDemandStorage {
             if count == 0 || dim == 0 { rg_descs.push(None); continue; }
             if dim != query_dim { return Ok(None); }
 
+            let elem_bytes_b = if is_f16_batch { 2 } else { 4 };
             let float_abs = data_abs + 13;
-            let byte_len  = count * dim * 4;
+            let byte_len  = count * dim * elem_bytes_b;
             if float_abs + byte_len > mmap.len() { return Ok(None); }
             rg_descs.push(Some(RgDesc { count, float_abs, byte_len }));
+            co_idx += 1;
         }
 
         if total_active == 0 {
             return Ok(Some(vec![vec![]; n_queries]));
         }
 
-        // ── PASS 2: fill scan_buf once, run all N queries in parallel ───────
-        let needed    = total_active * query_dim;
         let file_size = mmap.len() as u64;
+
+        // ── PASS 2 (f16 batch): cache raw f16 bytes, decode per-row during topk
+        if is_f16_batch {
+            let f16_needed = total_active * query_dim * 2;
+            let mut f16_guard = self.scan_buf_f16.lock().unwrap();
+            let f16_cached   = self.scan_buf_f16_file_size.load(std::sync::atomic::Ordering::Acquire);
+            let f16_cg       = self.scan_buf_f16_col.lock().unwrap();
+            let f16_hit      = f16_cached == file_size
+                && f16_guard.len() >= f16_needed
+                && f16_cg.as_str() == col_name;
+            drop(f16_cg);
+
+            if !f16_hit {
+                let cur = f16_guard.len();
+                if f16_guard.capacity() < f16_needed {
+                    f16_guard.reserve(f16_needed - cur);
+                }
+                unsafe { f16_guard.set_len(f16_needed); }
+                let f16_ptr = f16_guard.as_mut_ptr();
+                let mut filled = 0usize;
+                for desc in rg_descs.iter() {
+                    let Some(d) = desc else { continue };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            mmap.as_ptr().add(d.float_abs),
+                            f16_ptr.add(filled),
+                            d.byte_len,
+                        );
+                    }
+                    filled += d.byte_len;
+                }
+                let mut cg = self.scan_buf_f16_col.lock().unwrap();
+                cg.clear(); cg.push_str(col_name);
+                drop(cg);
+                self.scan_buf_f16_file_size.store(file_size, std::sync::atomic::Ordering::Release);
+            }
+            drop(mmap_arc);
+
+            let f16_ptr   = f16_guard.as_ptr();
+            let f16_slice = unsafe { std::slice::from_raw_parts(f16_ptr, f16_needed) };
+            let results = crate::query::vector_ops::batch_topk_on_f16_bytes(
+                f16_slice, total_active, query_dim, queries, n_queries, k, metric);
+            drop(f16_guard);
+            return Ok(Some(results));
+        }
+
+        // ── PASS 2 (f32 batch): fill scan_buf once, run all N queries ────────
+        let needed    = total_active * query_dim;
         let mut buf_guard = self.scan_buf.lock().unwrap();
         let cached_size = self.scan_buf_file_size.load(std::sync::atomic::Ordering::Acquire);
         let col_guard   = self.scan_buf_col.lock().unwrap();
@@ -4199,8 +4360,8 @@ impl OnDemandStorage {
         drop(col_guard);
 
         if !cache_hit {
-            let cur = buf_guard.len();
             if buf_guard.capacity() < needed {
+                let cur = buf_guard.len();
                 buf_guard.reserve(needed - cur);
             }
             unsafe { buf_guard.set_len(needed); }

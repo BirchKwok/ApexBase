@@ -24,6 +24,9 @@ pub enum ColumnType {
     /// Fixed-size list of f32 — stored as contiguous raw bytes (dim * 4 per row, no offset array).
     /// Semantically equivalent to Arrow FixedSizeList<Float32>.
     FixedList = TYPE_FIXED_LIST,
+    /// Fixed-size list of f16 — stored as contiguous raw bytes (dim * 2 per row, no offset array).
+    /// Half the storage of FixedList; decoded to f32 on read/distance computation.
+    Float16List = TYPE_FLOAT16_LIST,
 }
 
 impl ColumnType {
@@ -47,6 +50,7 @@ impl ColumnType {
             TYPE_TIMESTAMP => Some(ColumnType::Timestamp),
             TYPE_DATE => Some(ColumnType::Date),
             TYPE_FIXED_LIST => Some(ColumnType::FixedList),
+            TYPE_FLOAT16_LIST => Some(ColumnType::Float16List),
             _ => None,
         }
     }
@@ -60,12 +64,12 @@ impl ColumnType {
             ColumnType::Int16 | ColumnType::UInt16 => 2,
             ColumnType::Int32 | ColumnType::UInt32 | ColumnType::Float32 => 4,
             ColumnType::Int64 | ColumnType::UInt64 | ColumnType::Float64 | ColumnType::Timestamp | ColumnType::Date => 8,
-            ColumnType::String | ColumnType::Binary | ColumnType::StringDict | ColumnType::FixedList => 0,
+            ColumnType::String | ColumnType::Binary | ColumnType::StringDict | ColumnType::FixedList | ColumnType::Float16List => 0,
         }
     }
 
     pub fn is_variable_length(&self) -> bool {
-        matches!(self, ColumnType::String | ColumnType::Binary | ColumnType::StringDict | ColumnType::FixedList)
+        matches!(self, ColumnType::String | ColumnType::Binary | ColumnType::StringDict | ColumnType::FixedList | ColumnType::Float16List)
     }
 }
 
@@ -167,6 +171,79 @@ pub enum ColumnData {
         data: Vec<u8>,  // raw little-endian f32 bytes
         dim: u32,       // number of f32 elements per row
     },
+    /// Fixed-size list of f16 — contiguous raw LE u16 bytes, no offset array.
+    /// data.len() == row_count * dim * 2
+    Float16List {
+        data: Vec<u8>,  // raw little-endian f16 (u16) bytes
+        dim: u32,       // number of f16 elements per row
+    },
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// f16 ↔ f32 conversion utilities (software, no external crate)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Encode f32 as IEEE 754 half-precision bits (u16 LE).
+#[inline]
+pub fn f32_to_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp_f32 = ((bits >> 23) & 0xFF) as i32;
+    let mant_f32 = bits & 0x7FFFFF;
+    if exp_f32 == 0xFF {
+        let mant_f16 = if mant_f32 != 0 { 0x0200u16 } else { 0u16 };
+        return sign | 0x7C00 | mant_f16;
+    }
+    let exp = exp_f32 - 127 + 15;
+    if exp >= 31 { return sign | 0x7C00; }
+    if exp <= 0 {
+        if exp < -10 { return sign; }
+        let mant = (mant_f32 | 0x800000) >> (1 - exp);
+        return sign | (mant >> 13) as u16;
+    }
+    sign | ((exp as u16) << 10) | ((mant_f32 >> 13) as u16)
+}
+
+/// Decode IEEE 754 half-precision bits (u16) to f32.
+#[inline]
+pub fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exp  = ((bits >> 10) & 0x1F) as u32;
+    let mant = (bits & 0x3FF) as u32;
+    let f32_bits = if exp == 0 {
+        if mant == 0 { sign }
+        else {
+            let mut e = 127u32 - 14;
+            let mut m = mant;
+            while m & 0x400 == 0 { m <<= 1; e = e.wrapping_sub(1); }
+            sign | (e << 23) | ((m & 0x3FF) << 13)
+        }
+    } else if exp == 31 {
+        sign | (0xFF << 23) | (mant << 13)
+    } else {
+        sign | ((exp + 127 - 15) << 23) | (mant << 13)
+    };
+    f32::from_bits(f32_bits)
+}
+
+/// Convert f32 bytes (LE) to f16 bytes (LE).
+/// Input length must be a multiple of 4; output is half the length.
+pub fn f32_bytes_to_f16_bytes(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() / 2);
+    for chunk in src.chunks_exact(4) {
+        let f = f32::from_le_bytes(chunk.try_into().unwrap());
+        let h = f32_to_f16(f);
+        out.extend_from_slice(&h.to_le_bytes());
+    }
+    out
+}
+
+/// Convert f16 bytes (LE) to f32 bytes (LE) in-place into dst.
+pub fn f16_bytes_to_f32_into(src: &[u8], dst: &mut [f32]) {
+    for (i, chunk) in src.chunks_exact(2).enumerate() {
+        let bits = u16::from_le_bytes(chunk.try_into().unwrap());
+        dst[i] = f16_to_f32(bits);
+    }
 }
 
 impl ColumnData {
@@ -193,6 +270,7 @@ impl ColumnData {
                 dict_data: Vec::new(),
             },
             ColumnType::FixedList => ColumnData::FixedList { data: Vec::new(), dim: 0 },
+            ColumnType::Float16List => ColumnData::Float16List { data: Vec::new(), dim: 0 },
             ColumnType::Null => ColumnData::Int64(Vec::new()),
         }
     }
@@ -207,6 +285,7 @@ impl ColumnData {
             ColumnData::Binary { offsets, .. } => offsets.len().saturating_sub(1),
             ColumnData::StringDict { indices, .. } => indices.len(),
             ColumnData::FixedList { data, dim } => if *dim == 0 { 0 } else { data.len() / (*dim as usize * 4) },
+            ColumnData::Float16List { data, dim } => if *dim == 0 { 0 } else { data.len() / (*dim as usize * 2) },
         }
     }
 
@@ -225,6 +304,7 @@ impl ColumnData {
             ColumnData::Binary { .. } => ColumnType::Binary,
             ColumnData::StringDict { .. } => ColumnType::StringDict,
             ColumnData::FixedList { .. } => ColumnType::FixedList,
+            ColumnData::Float16List { .. } => ColumnType::Float16List,
         }
     }
 
@@ -420,6 +500,14 @@ impl ColumnData {
                 buf.extend_from_slice(data);
                 buf
             }
+            ColumnData::Float16List { data, dim } => {
+                let count = if *dim == 0 { 0usize } else { data.len() / (*dim as usize * 2) };
+                let mut buf = Vec::with_capacity(12 + data.len());
+                buf.extend_from_slice(&(count as u64).to_le_bytes());
+                buf.extend_from_slice(&dim.to_le_bytes());
+                buf.extend_from_slice(data);
+                buf
+            }
         }
     }
 
@@ -432,6 +520,31 @@ impl ColumnData {
                 *dim = (row_bytes / 4) as u32;
             }
             data.extend_from_slice(bytes);
+        }
+    }
+
+    /// Push a single f16 vector (as raw LE u16 bytes) into a Float16List column.
+    #[inline]
+    pub fn push_float16_list(&mut self, bytes: &[u8]) {
+        if let ColumnData::Float16List { data, dim } = self {
+            let row_bytes = bytes.len();
+            if *dim == 0 && row_bytes % 2 == 0 {
+                *dim = (row_bytes / 2) as u32;
+            }
+            data.extend_from_slice(bytes);
+        }
+    }
+
+    /// Push f32 bytes (LE) into a Float16List column (converts f32→f16 on the fly).
+    #[inline]
+    pub fn push_float16_list_from_f32(&mut self, f32_bytes: &[u8]) {
+        if let ColumnData::Float16List { data, dim } = self {
+            let n = f32_bytes.len() / 4;
+            if *dim == 0 && n > 0 { *dim = n as u32; }
+            for chunk in f32_bytes.chunks_exact(4) {
+                let f = f32::from_le_bytes(chunk.try_into().unwrap());
+                data.extend_from_slice(&f32_to_f16(f).to_le_bytes());
+            }
         }
     }
 
@@ -487,6 +600,12 @@ impl ColumnData {
             }
             ColumnData::FixedList { data, dim } => {
                 let count = if *dim == 0 { 0 } else { data.len() / (*dim as usize * 4) };
+                writer.write_all(&(count as u64).to_le_bytes())?;
+                writer.write_all(&dim.to_le_bytes())?;
+                writer.write_all(data)?;
+            }
+            ColumnData::Float16List { data, dim } => {
+                let count = if *dim == 0 { 0 } else { data.len() / (*dim as usize * 2) };
                 writer.write_all(&(count as u64).to_le_bytes())?;
                 writer.write_all(&dim.to_le_bytes())?;
                 writer.write_all(data)?;
@@ -644,6 +763,21 @@ impl ColumnData {
                 pos += byte_len;
                 Ok((ColumnData::FixedList { data, dim }, pos))
             }
+            ColumnType::Float16List => {
+                let count = read_u64!() as usize;
+                if pos + 4 > bytes.len() {
+                    return Err(err_data("Float16List: dim truncated"));
+                }
+                let dim = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+                pos += 4;
+                let byte_len = count * dim as usize * 2;
+                if pos + byte_len > bytes.len() {
+                    return Err(err_data("Float16List: data truncated"));
+                }
+                let data = bytes[pos..pos + byte_len].to_vec();
+                pos += byte_len;
+                Ok((ColumnData::Float16List { data, dim }, pos))
+            }
             ColumnType::Null => {
                 let count = read_u64!() as usize;
                 let byte_len = count * 8;
@@ -710,6 +844,15 @@ impl ColumnData {
                 pos += 4;
                 pos += count * dim as usize * 4;
             }
+            ColumnType::Float16List => {
+                let count = read_u64!() as usize;
+                if pos + 4 > bytes.len() {
+                    return Err(err_data("skip Float16List: dim truncated"));
+                }
+                let dim = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+                pos += 4;
+                pos += count * dim as usize * 2;
+            }
             ColumnType::Null => {
                 let count = read_u64!() as usize;
                 pos += count * 8;
@@ -736,6 +879,7 @@ impl ColumnData {
                 dict_data: Vec::new() 
             },
             ColumnData::FixedList { dim, .. } => ColumnData::FixedList { data: Vec::new(), dim: *dim },
+            ColumnData::Float16List { dim, .. } => ColumnData::Float16List { data: Vec::new(), dim: *dim },
         }
     }
     
@@ -803,6 +947,10 @@ impl ColumnData {
                 }
             }
             (ColumnData::FixedList { data, dim }, ColumnData::FixedList { data: other_data, dim: other_dim }) => {
+                if *dim == 0 && *other_dim > 0 { *dim = *other_dim; }
+                data.extend_from_slice(other_data);
+            }
+            (ColumnData::Float16List { data, dim }, ColumnData::Float16List { data: other_data, dim: other_dim }) => {
                 if *dim == 0 && *other_dim > 0 { *dim = *other_dim; }
                 data.extend_from_slice(other_data);
             }
@@ -897,32 +1045,41 @@ impl ColumnData {
     /// OPTIMIZATION: uses pre-allocation and unchecked indexing for hot paths.
     pub fn filter_by_indices(&self, indices: &[usize]) -> Self {
         match self {
+            ColumnData::Bool { data, len: _ } => {
+                let new_len = indices.len();
+                let mut new_data = vec![0u8; (new_len + 7) / 8];
+                for (new_idx, &idx) in indices.iter().enumerate() {
+                    let old_byte = idx / 8;
+                    let old_bit = idx % 8;
+                    if old_byte < data.len() && (data[old_byte] >> old_bit) & 1 == 1 {
+                        new_data[new_idx / 8] |= 1 << (new_idx % 8);
+                    }
+                }
+                ColumnData::Bool { data: new_data, len: new_len }
+            }
             ColumnData::FixedList { data, dim } => {
                 let stride = *dim as usize * 4;
                 let mut new_data = Vec::with_capacity(indices.len() * stride);
                 for &i in indices {
-                    let start = i * stride;
-                    if start + stride <= data.len() {
-                        new_data.extend_from_slice(&data[start..start + stride]);
+                    if stride > 0 && i * stride + stride <= data.len() {
+                        new_data.extend_from_slice(&data[i * stride .. i * stride + stride]);
                     } else {
                         new_data.extend(std::iter::repeat(0u8).take(stride));
                     }
                 }
                 ColumnData::FixedList { data: new_data, dim: *dim }
             }
-            ColumnData::Bool { data, len } => {
-                let new_len = indices.len();
-                let mut new_data = vec![0u8; (new_len + 7) / 8];
-                for (new_idx, &idx) in indices.iter().enumerate() {
-                    if idx < *len {
-                        let old_byte = idx / 8;
-                        let old_bit = idx % 8;
-                        if old_byte < data.len() && (data[old_byte] >> old_bit) & 1 == 1 {
-                            new_data[new_idx / 8] |= 1 << (new_idx % 8);
-                        }
+            ColumnData::Float16List { data, dim } => {
+                let stride = *dim as usize * 2;
+                let mut new_data = Vec::with_capacity(indices.len() * stride);
+                for &i in indices {
+                    if stride > 0 && i * stride + stride <= data.len() {
+                        new_data.extend_from_slice(&data[i * stride .. i * stride + stride]);
+                    } else {
+                        new_data.extend(std::iter::repeat(0u8).take(stride));
                     }
                 }
-                ColumnData::Bool { data: new_data, len: new_len }
+                ColumnData::Float16List { data: new_data, dim: *dim }
             }
             ColumnData::Int64(v) => {
                 // OPTIMIZATION: pre-allocate exact size, use unchecked indexing
@@ -1121,6 +1278,16 @@ impl ColumnData {
                     dim: *dim,
                 }
             }
+            ColumnData::Float16List { data, dim } => {
+                let stride = *dim as usize * 2;
+                let row_count = if stride == 0 { 0 } else { data.len() / stride };
+                let s = start.min(row_count);
+                let e = end.min(row_count);
+                ColumnData::Float16List {
+                    data: data[s * stride .. e * stride].to_vec(),
+                    dim: *dim,
+                }
+            }
             ColumnData::Bool { data, len } => {
                 let s = start.min(*len);
                 let e = end.min(*len);
@@ -1193,6 +1360,7 @@ impl ColumnData {
                 indices.len() * 4 + dict_offsets.len() * 4 + dict_data.len()
             }
             ColumnData::FixedList { data, .. } => data.len(),
+            ColumnData::Float16List { data, .. } => data.len(),
         }
     }
 }

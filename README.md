@@ -63,6 +63,7 @@ ApexBase is an embedded columnar database designed for **Hybrid Transactional/An
 - **Indexing** — B-Tree and Hash indexes with CREATE INDEX / DROP INDEX / REINDEX; automatic multi-index AND intersection for compound predicates
 - **Full-text search** — built-in NanoFTS integration with fuzzy matching
 - **Vector search** — SIMD-accelerated nearest-neighbour search with 6 distance metrics (L2, cosine, dot, L1, L∞, L2²); heap-based O(n log k) TopK; single-query `topk_distance()` and batch `batch_topk_distance()` Python APIs; SQL `explode_rename(topk_distance(...))` syntax; 3–4× faster than DuckDB at 1M rows
+- **Float16 vector storage** — `FLOAT16_VECTOR` column type stores embeddings as 16-bit floats (half the memory of float32); SIMD-accelerated f16 distance kernels via NEON fp16 on ARM (FCVTL/FCVTL2) and AVX2+F16C on x86_64; automatic runtime CPU dispatch; ≥2× faster than f32 on Apple Silicon; transparent API — query with float32, stored as f16
 - **JIT compilation** — Cranelift-based JIT for predicate evaluation and SIMD-vectorized aggregations
 - **Zero-copy Python bridge** — Arrow IPC between Rust and Python; direct conversion to Pandas, Polars, and PyArrow
 - **Durability levels** — configurable `fast` / `safe` / `max` with WAL support and crash recovery

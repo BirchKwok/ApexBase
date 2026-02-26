@@ -379,6 +379,52 @@ impl OnDemandStorage {
                     // Fallback: create empty string array
                     (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![""; active_count])))
                 }
+                Some(ColumnData::Float16List { data, dim }) => {
+                    use arrow::array::{FixedSizeListArray, Float32Array};
+                    use arrow::buffer::Buffer;
+                    let dim_usize = *dim as usize;
+                    let row_count_full = if dim_usize == 0 { 0 } else { data.len() / (dim_usize * 2) };
+                    let f32_data: Vec<u8> = if let Some(ref indices) = active_indices {
+                        let mut out = Vec::with_capacity(indices.len() * dim_usize * 4);
+                        for &i in indices {
+                            let src_start = i * dim_usize * 2;
+                            let src_end = src_start + dim_usize * 2;
+                            if src_end <= data.len() {
+                                for chunk in data[src_start..src_end].chunks_exact(2) {
+                                    let bits = u16::from_le_bytes(chunk.try_into().unwrap());
+                                    out.extend_from_slice(&crate::storage::on_demand::f16_to_f32(bits).to_le_bytes());
+                                }
+                            } else {
+                                out.extend(std::iter::repeat(0u8).take(dim_usize * 4));
+                            }
+                        }
+                        out
+                    } else {
+                        let n = row_count_full.min(active_count);
+                        let mut out = Vec::with_capacity(n * dim_usize * 4);
+                        for chunk in data[..n * dim_usize * 2].chunks_exact(2) {
+                            let bits = u16::from_le_bytes(chunk.try_into().unwrap());
+                            out.extend_from_slice(&crate::storage::on_demand::f16_to_f32(bits).to_le_bytes());
+                        }
+                        out
+                    };
+                    let row_count = if dim_usize == 0 { 0 } else { f32_data.len() / (dim_usize * 4) };
+                    let float_buf = Buffer::from_vec(f32_data);
+                    let float_arr = unsafe {
+                        Float32Array::from(arrow::array::ArrayData::new_unchecked(
+                            ArrowDataType::Float32, row_count * dim_usize,
+                            Some(0), None, 0, vec![float_buf], vec![],
+                        ))
+                    };
+                    let list_dt = ArrowDataType::FixedSizeList(
+                        Arc::new(Field::new("item", ArrowDataType::Float32, false)), dim_usize as i32,
+                    );
+                    let arr = FixedSizeListArray::new(
+                        Arc::new(Field::new("item", ArrowDataType::Float32, false)), dim_usize as i32,
+                        Arc::new(float_arr), null_buf,
+                    );
+                    (list_dt, Arc::new(arr) as ArrayRef)
+                }
                 Some(ColumnData::FixedList { data, dim }) => {
                     use arrow::array::{FixedSizeListArray, Float32Array};
                     use arrow::buffer::Buffer;

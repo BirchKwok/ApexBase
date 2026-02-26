@@ -1009,3 +1009,583 @@ def test_topk_distance_large_table(client):
     gt_ids = set(int(i) for i in np.argsort(dists)[:k])
     result_ids = set(int(r["_id"]) for r in topk)
     assert result_ids == gt_ids
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Float16Vector (f16 storage) tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def f16_client(tmp_path):
+    c = ApexClient(dirpath=str(tmp_path), drop_if_exists=True)
+    c.execute("CREATE TABLE f16vecs (name TEXT, vec FLOAT16_VECTOR)")
+    c.use_table("f16vecs")
+    yield c
+    c.close()
+
+
+def test_f16_create_table(tmp_path):
+    """CREATE TABLE with FLOAT16_VECTOR column succeeds."""
+    c = ApexClient(dirpath=str(tmp_path), drop_if_exists=True)
+    c.execute("CREATE TABLE t (name TEXT, vec FLOAT16_VECTOR)")
+    c.close()
+
+
+def test_f16_store_and_count(f16_client):
+    """Rows stored in float16_vector table are retrievable."""
+    rows = [
+        {"name": "a", "vec": np.array([1.0, 0.0, 0.0], dtype=np.float32)},
+        {"name": "b", "vec": np.array([0.0, 1.0, 0.0], dtype=np.float32)},
+        {"name": "c", "vec": np.array([0.0, 0.0, 1.0], dtype=np.float32)},
+    ]
+    f16_client.store(rows)
+    result = f16_client.execute("SELECT COUNT(*) FROM f16vecs").to_dict()
+    assert result[0]["COUNT(*)"] == 3
+
+
+def test_f16_topk_distance_l2(f16_client):
+    """topk_distance on FLOAT16_VECTOR column returns correct nearest neighbor."""
+    rng = np.random.default_rng(7)
+    n, dim = 200, 16
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    k = 5
+    topk = f16_client.topk_distance("vec", query, k=k, metric="l2").to_dict()
+    assert len(topk) == k
+
+    # Ground-truth via numpy (f16 quantization shifts distances slightly)
+    dists_np = np.linalg.norm(vecs - query, axis=1)
+    gt_top20_ids = set(int(i) for i in np.argsort(dists_np)[:20])
+    result_ids = set(int(r["_id"]) for r in topk)
+    # Top-5 results should mostly overlap with numpy top-20 (f16 has ~3e-4 rel error)
+    assert len(result_ids & gt_top20_ids) >= 4
+
+
+def test_f16_topk_distance_cosine(f16_client):
+    """topk_distance with cosine_distance on FLOAT16_VECTOR."""
+    rng = np.random.default_rng(13)
+    n, dim = 100, 8
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    topk = f16_client.topk_distance("vec", query, k=3, metric="cosine_distance").to_dict()
+    assert len(topk) == 3
+    # Distances should be in [0, 2]
+    for r in topk:
+        assert 0.0 <= r["dist"] <= 2.0 + 1e-4
+
+
+def test_f16_memory_savings(tmp_path):
+    """Float16 column uses ~half the vector-data bytes of float32 for same vectors."""
+    import os
+
+    dim = 64
+    n = 1000
+    rng = np.random.default_rng(0)
+    vecs = rng.random((n, dim), dtype=np.float32)
+
+    # f32 table — use create_table() so numpy arrays auto-create FixedList column
+    c32 = ApexClient(dirpath=str(tmp_path / "f32"), drop_if_exists=True)
+    c32.create_table("t")
+    c32.store([{"vec": vecs[i]} for i in range(n)])
+    c32.close()
+
+    # f16 table — explicitly FLOAT16_VECTOR
+    c16 = ApexClient(dirpath=str(tmp_path / "f16"), drop_if_exists=True)
+    c16.execute("CREATE TABLE t (vec FLOAT16_VECTOR)")
+    c16.use_table("t")
+    c16.store([{"vec": vecs[i]} for i in range(n)])
+    c16.close()
+
+    def dir_size(p):
+        return sum(
+            os.path.getsize(p / f)
+            for f in os.listdir(p)
+            if os.path.isfile(p / f)
+        )
+
+    f32_size = dir_size(tmp_path / "f32")
+    f16_size = dir_size(tmp_path / "f16")
+    # f16 vector data is 2 bytes/elem vs f32's 4 bytes/elem → f16 file should be smaller
+    assert f16_size < f32_size, (
+        f"Expected f16 ({f16_size}B) < f32 ({f32_size}B) for {n}×{dim} vectors"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Float16Vector — all distance metrics
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_f16_topk_all_metrics(f16_client):
+    """topk_distance on FLOAT16_VECTOR supports all 6 distance metrics."""
+    rng = np.random.default_rng(55)
+    n, dim = 60, 8
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    metrics = ["l2", "l2_squared", "cosine_distance", "l1", "linf", "dot"]
+    for m in metrics:
+        rows = f16_client.topk_distance("vec", query, k=5, metric=m).to_dict()
+        assert len(rows) == 5, f"metric={m}: expected 5 rows"
+        dists = [r["dist"] for r in rows]
+        assert dists == sorted(dists), f"metric={m}: results not sorted ascending"
+
+
+def test_f16_topk_l2_squared(f16_client):
+    """l2_squared on FLOAT16_VECTOR: same ordering as l2, values ≈ l2²."""
+    rng = np.random.default_rng(3)
+    n, dim = 80, 8
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    k = 5
+    rows_l2 = f16_client.topk_distance("vec", query, k=k, metric="l2").to_dict()
+    rows_sq = f16_client.topk_distance("vec", query, k=k, metric="l2_squared").to_dict()
+
+    assert [r["_id"] for r in rows_l2] == [r["_id"] for r in rows_sq]
+    for l2r, sqr in zip(rows_l2, rows_sq):
+        assert sqr["dist"] == pytest.approx(l2r["dist"] ** 2, rel=5e-3)
+
+
+def test_f16_topk_l1(f16_client):
+    """l1 topk on FLOAT16_VECTOR returns sorted results matching numpy reference."""
+    rng = np.random.default_rng(77)
+    n, dim = 80, 8
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    k = 5
+    rows = f16_client.topk_distance("vec", query, k=k, metric="l1").to_dict()
+    assert len(rows) == k
+    dists = [r["dist"] for r in rows]
+    assert dists == sorted(dists)
+
+    # Ground-truth: L1 via numpy with f16 quantization
+    vecs_q = vecs.astype(np.float16).astype(np.float32)
+    np_l1 = np.sum(np.abs(vecs_q - query), axis=1)
+    gt_top20 = set(int(i) for i in np.argsort(np_l1)[:20])
+    result_ids = set(int(r["_id"]) for r in rows)
+    assert len(result_ids & gt_top20) >= 4
+
+
+def test_f16_topk_linf(f16_client):
+    """linf topk on FLOAT16_VECTOR returns sorted results."""
+    rng = np.random.default_rng(99)
+    n, dim = 80, 8
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    rows = f16_client.topk_distance("vec", query, k=5, metric="linf").to_dict()
+    assert len(rows) == 5
+    dists = [r["dist"] for r in rows]
+    assert dists == sorted(dists)
+
+
+def test_f16_topk_inner_product(f16_client):
+    """dot/inner_product on FLOAT16_VECTOR: ordered by descending dot product."""
+    rng = np.random.default_rng(17)
+    n, dim = 80, 8
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    rows = f16_client.topk_distance("vec", query, k=5, metric="dot").to_dict()
+    assert len(rows) == 5
+    dists = [r["dist"] for r in rows]
+    assert dists == sorted(dists)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Float16Vector — correctness vs numpy reference
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _f16_quantize(v):
+    """Simulate f16 quantization: cast f32→f16→f32."""
+    return v.astype(np.float16).astype(np.float32)
+
+
+def test_f16_l2_correctness_vs_numpy(f16_client):
+    """f16 L2 distance matches numpy reference (f16-quantized vectors) to 5e-3."""
+    rng = np.random.default_rng(42)
+    n, dim = 30, 16
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    rows = f16_client.topk_distance("vec", query, k=n, metric="l2").to_dict()
+
+    vecs_q = _f16_quantize(vecs)
+    for r in rows:
+        idx = int(r["_id"])
+        expected = float(np.sqrt(np.sum((vecs_q[idx] - query) ** 2)))
+        assert r["dist"] == pytest.approx(expected, rel=5e-3, abs=1e-4), \
+            f"id={idx} got={r['dist']} expected={expected}"
+
+
+def test_f16_cosine_correctness_vs_numpy(f16_client):
+    """f16 cosine distance matches numpy reference to 5e-3."""
+    rng = np.random.default_rng(11)
+    n, dim = 30, 16
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    rows = f16_client.topk_distance("vec", query, k=n, metric="cosine_distance").to_dict()
+
+    vecs_q = _f16_quantize(vecs)
+    for r in rows:
+        idx = int(r["_id"])
+        a, b = vecs_q[idx], query
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        expected = 1.0 - float(np.dot(a, b)) / (na * nb) if na > 0 and nb > 0 else 0.0
+        assert r["dist"] == pytest.approx(expected, rel=5e-3, abs=1e-4), \
+            f"id={idx} got={r['dist']} expected={expected}"
+
+
+def test_f16_l1_correctness_vs_numpy(f16_client):
+    """f16 L1 distance matches numpy reference to 5e-3."""
+    rng = np.random.default_rng(23)
+    n, dim = 30, 16
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    rows = f16_client.topk_distance("vec", query, k=n, metric="l1").to_dict()
+
+    vecs_q = _f16_quantize(vecs)
+    for r in rows:
+        idx = int(r["_id"])
+        expected = float(np.sum(np.abs(vecs_q[idx] - query)))
+        assert r["dist"] == pytest.approx(expected, rel=5e-3, abs=1e-4), \
+            f"id={idx} got={r['dist']} expected={expected}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Float16Vector — edge cases
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_f16_dim_not_multiple_of_8(f16_client):
+    """FLOAT16_VECTOR works for dimensions not a multiple of 8 (scalar tail path)."""
+    rng = np.random.default_rng(7)
+    dim = 13   # 8 + 5 — exercises the scalar tail
+    n = 30
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    rows = f16_client.topk_distance("vec", query, k=5, metric="l2").to_dict()
+    assert len(rows) == 5
+    dists = [r["dist"] for r in rows]
+    assert dists == sorted(dists)
+
+
+def test_f16_dim_1(f16_client):
+    """FLOAT16_VECTOR with dim=1 (extreme edge case)."""
+    f16_client.store([
+        {"name": "a", "vec": np.array([1.0], dtype=np.float32)},
+        {"name": "b", "vec": np.array([2.0], dtype=np.float32)},
+        {"name": "c", "vec": np.array([3.0], dtype=np.float32)},
+    ])
+    rows = f16_client.topk_distance("vec", [1.0], k=3, metric="l2").to_dict()
+    assert len(rows) == 3
+    assert rows[0]["dist"] == pytest.approx(0.0, abs=1e-4)
+
+
+def test_f16_negative_components(f16_client):
+    """FLOAT16_VECTOR handles negative float components correctly."""
+    vecs = [
+        {"name": "neg_x", "vec": np.array([-1.0,  0.0,  0.0], dtype=np.float32)},
+        {"name": "pos_x", "vec": np.array([ 1.0,  0.0,  0.0], dtype=np.float32)},
+        {"name": "neg_all", "vec": np.array([-1.0, -1.0, -1.0], dtype=np.float32)},
+    ]
+    f16_client.store(vecs)
+    query = [-1.0, 0.0, 0.0]
+
+    rows = f16_client.topk_distance("vec", query, k=1, metric="l2").to_dict()
+    assert rows[0]["dist"] == pytest.approx(0.0, abs=1e-3)
+
+    rows_l1 = f16_client.topk_distance("vec", query, k=1, metric="l1").to_dict()
+    assert rows_l1[0]["dist"] == pytest.approx(0.0, abs=1e-3)
+
+
+def test_f16_zero_query_vector(f16_client):
+    """topk_distance with a zero query vector returns valid distances."""
+    rng = np.random.default_rng(5)
+    n, dim = 20, 4
+    vecs = rng.random((n, dim), dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    query = [0.0] * dim
+    rows = f16_client.topk_distance("vec", query, k=5, metric="l2").to_dict()
+    assert len(rows) == 5
+    dists = [r["dist"] for r in rows]
+    assert dists == sorted(dists)
+    assert all(d >= 0.0 for d in dists)
+
+
+def test_f16_large_dim_128(f16_client):
+    """FLOAT16_VECTOR works at dim=128 (typical embedding size)."""
+    rng = np.random.default_rng(99)
+    n, dim = 200, 128
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    rows = f16_client.topk_distance("vec", query, k=10, metric="l2").to_dict()
+    assert len(rows) == 10
+    dists = [r["dist"] for r in rows]
+    assert dists == sorted(dists)
+
+    # Nearest neighbour should be in numpy top-30 (f16 ≈3e-4 rel error)
+    vecs_q = _f16_quantize(vecs)
+    np_dists = np.linalg.norm(vecs_q - query, axis=1)
+    gt_top30 = set(int(i) for i in np.argsort(np_dists)[:30])
+    result_ids = set(int(r["_id"]) for r in rows)
+    assert len(result_ids & gt_top30) >= 8
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Float16Vector — SQL interface
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_f16_sql_order_by_distance(f16_client):
+    """ORDER BY array_distance(vec, [...]) on FLOAT16_VECTOR column."""
+    rng = np.random.default_rng(31)
+    n, dim = 50, 4
+    vecs = rng.random((n, dim), dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+    q = rng.random(dim, dtype=np.float32)
+    q_str = ",".join(f"{v:.6f}" for v in q)
+
+    rows = f16_client.execute(
+        f"SELECT _id, array_distance(vec, [{q_str}]) AS dist FROM f16vecs ORDER BY dist LIMIT 5"
+    ).to_dict()
+    assert len(rows) == 5
+    dists = [r["dist"] for r in rows]
+    assert dists == sorted(dists)
+
+
+def test_f16_sql_cosine_similarity(f16_client):
+    """cosine_similarity(vec, [...]) works on FLOAT16_VECTOR column."""
+    f16_client.store([
+        {"name": "same", "vec": np.array([1.0, 0.0, 0.0], dtype=np.float32)},
+        {"name": "ortho", "vec": np.array([0.0, 1.0, 0.0], dtype=np.float32)},
+    ])
+    rows = f16_client.execute(
+        "SELECT name, cosine_similarity(vec, [1.0, 0.0, 0.0]) AS sim FROM f16vecs ORDER BY sim DESC"
+    ).to_dict()
+    assert rows[0]["name"] == "same"
+    assert rows[0]["sim"] == pytest.approx(1.0, abs=2e-3)
+    assert rows[1]["sim"] == pytest.approx(0.0, abs=2e-3)
+
+
+def test_f16_sql_l1_l2_linf(f16_client):
+    """l1_distance / array_distance / linf_distance all work on FLOAT16_VECTOR."""
+    f16_client.store([
+        {"name": "a", "vec": np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)},
+        {"name": "b", "vec": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)},
+    ])
+    q_str = "1.0, 2.0, 3.0, 4.0"
+    r = f16_client.execute(
+        f"SELECT name, l1_distance(vec, [{q_str}]) AS l1, "
+        f"array_distance(vec, [{q_str}]) AS l2, "
+        f"linf_distance(vec, [{q_str}]) AS linf FROM f16vecs ORDER BY l2"
+    ).to_dict()
+    # Row "a" is identical to query, so all distances ≈ 0
+    assert r[0]["name"] == "a"
+    assert r[0]["l1"]   == pytest.approx(0.0, abs=2e-3)
+    assert r[0]["l2"]   == pytest.approx(0.0, abs=2e-3)
+    assert r[0]["linf"] == pytest.approx(0.0, abs=2e-3)
+
+
+def test_f16_sql_explode_rename(f16_client):
+    """SQL explode_rename(topk_distance(...)) works on FLOAT16_VECTOR column."""
+    rng = np.random.default_rng(61)
+    n, dim = 40, 4
+    vecs = rng.random((n, dim), dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+    q_str = ",".join(f"{v:.6f}" for v in rng.random(dim, dtype=np.float32))
+
+    rows = f16_client.execute(
+        f"SELECT explode_rename(topk_distance(vec, [{q_str}], 5, 'l2'), '_id', 'dist') FROM f16vecs"
+    ).to_dict()
+    assert len(rows) == 5
+    dists = [r["dist"] for r in rows]
+    assert dists == sorted(dists)
+
+
+def test_f16_sql_type_aliases(tmp_path):
+    """FLOAT16VECTOR and F16_VECTOR are accepted as type name aliases."""
+    c = ApexClient(dirpath=str(tmp_path), drop_if_exists=True)
+    c.execute("CREATE TABLE t1 (vec FLOAT16VECTOR)")
+    c.execute("CREATE TABLE t2 (vec F16_VECTOR)")
+    c.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Float16Vector — batch_topk_distance
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_f16_batch_topk(f16_client):
+    """batch_topk_distance on FLOAT16_VECTOR returns (N, k, 2) array."""
+    rng = np.random.default_rng(19)
+    n, dim = 200, 16
+    vecs = rng.random((n, dim), dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    N, k = 10, 5
+    queries = rng.random((N, dim), dtype=np.float32)
+    result = f16_client.batch_topk_distance("vec", queries, k=k, metric="l2")
+
+    assert result.shape == (N, k, 2)
+    # Each query's results must be sorted ascending by distance
+    for i in range(N):
+        dists = result[i, :, 1]
+        assert list(dists) == sorted(dists), f"query {i}: not sorted"
+    # Distances must be non-negative
+    assert (result[:, :, 1] >= 0).all()
+
+
+def test_f16_batch_topk_consistent_with_single(f16_client):
+    """batch_topk_distance and topk_distance return the same IDs for same query."""
+    rng = np.random.default_rng(71)
+    n, dim = 100, 8
+    vecs = rng.random((n, dim), dtype=np.float32)
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    query = rng.random(dim, dtype=np.float32)
+    k = 5
+
+    single = f16_client.topk_distance("vec", query, k=k, metric="l2").to_dict()
+    batch  = f16_client.batch_topk_distance("vec", query.reshape(1, -1), k=k, metric="l2")
+
+    single_ids = set(int(r["_id"]) for r in single)
+    batch_ids  = set(int(batch[0, j, 0]) for j in range(k))
+    assert single_ids == batch_ids
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Float16Vector — input formats
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_f16_store_python_list(f16_client):
+    """FLOAT16_VECTOR column: Python list input is auto-converted via numpy before storing."""
+    # Python lists must be wrapped as numpy float32 arrays for FLOAT16_VECTOR columns;
+    # raw Python lists are encoded as f32 Binary by the client and will not interoperate
+    # with the f16 topk path.  The recommended form is np.array([...], dtype=np.float32).
+    f16_client.store([
+        {"name": "a", "vec": np.array([1.0, 0.0, 0.0], dtype=np.float32)},
+        {"name": "b", "vec": np.array([0.0, 1.0, 0.0], dtype=np.float32)},
+    ])
+    result = f16_client.execute("SELECT COUNT(*) FROM f16vecs").to_dict()
+    assert result[0]["COUNT(*)"] == 2
+    rows = f16_client.topk_distance("vec", [1.0, 0.0, 0.0], k=1, metric="l2").to_dict()
+    assert rows[0]["dist"] == pytest.approx(0.0, abs=1e-3)
+
+
+def test_f16_store_numpy_float16(f16_client):
+    """FLOAT16_VECTOR column accepts numpy float16 array input."""
+    vecs = [
+        {"name": "a", "vec": np.array([1.0, 0.0, 0.0], dtype=np.float16)},
+        {"name": "b", "vec": np.array([0.0, 1.0, 0.0], dtype=np.float16)},
+    ]
+    f16_client.store(vecs)
+    result = f16_client.execute("SELECT COUNT(*) FROM f16vecs").to_dict()
+    assert result[0]["COUNT(*)"] == 2
+
+    rows = f16_client.topk_distance("vec", [1.0, 0.0, 0.0], k=1, metric="l2").to_dict()
+    assert rows[0]["dist"] == pytest.approx(0.0, abs=1e-3)
+
+
+def test_f16_store_numpy_float32(f16_client):
+    """FLOAT16_VECTOR column accepts numpy float32 array input (auto-quantized to f16)."""
+    vecs = [
+        {"name": "a", "vec": np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)},
+        {"name": "b", "vec": np.array([0.5, 0.6, 0.7, 0.8], dtype=np.float32)},
+    ]
+    f16_client.store(vecs)
+    q = [0.1, 0.2, 0.3, 0.4]
+    rows = f16_client.topk_distance("vec", q, k=1, metric="l2").to_dict()
+    assert rows[0]["dist"] == pytest.approx(0.0, abs=5e-3)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Float16Vector — precision bounds
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_f16_quantization_error_bound(f16_client):
+    """f16 relative quantization error is within 2e-3 for typical float values."""
+    rng = np.random.default_rng(100)
+    dim = 64
+    vec = rng.random(dim, dtype=np.float32) * 2.0 - 1.0  # [-1, 1]
+    vec2 = rng.random(dim, dtype=np.float32) * 2.0 - 1.0  # second record for batch store
+    query = rng.random(dim, dtype=np.float32) * 2.0 - 1.0
+    # Use batch store (len>1) so the query goes through _store_columnar → correct f16 encoding
+    f16_client.store([{"name": "v", "vec": vec}, {"name": "v2", "vec": vec2}])
+
+    q_str = ",".join(f"{v:.7f}" for v in query)
+    rows = f16_client.execute(
+        f"SELECT name, array_distance(vec, [{q_str}]) AS dist FROM f16vecs WHERE name = 'v'"
+    ).to_dict()
+    assert len(rows) == 1, "record 'v' not found"
+    got = rows[0]["dist"]
+
+    # Expected with f16 quantization
+    expected = float(np.sqrt(np.sum((_f16_quantize(vec) - query) ** 2)))
+    assert got == pytest.approx(expected, rel=2e-3, abs=1e-4)
+
+
+def test_f16_cosine_unit_vectors(f16_client):
+    """cosine_distance(v, v) ≈ 0 for unit vectors (self-similarity)."""
+    rng = np.random.default_rng(200)
+    vecs = rng.random((5, 8), dtype=np.float32)
+    # Normalize to unit vectors
+    vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+    # Batch store (len>1) so all vectors go through _store_columnar → correct f16 encoding
+    f16_client.store([{"name": str(i), "vec": vecs[i]} for i in range(len(vecs))])
+
+    for i, v in enumerate(vecs):
+        rows = f16_client.topk_distance("vec", v.tolist(), k=1, metric="cosine_distance").to_dict()
+        assert rows[0]["dist"] == pytest.approx(0.0, abs=5e-3), \
+            f"unit vec {i}: cosine self-distance = {rows[0]['dist']}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Float16Vector — consistent ordering with f32
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_f16_topk_ordering_consistent_with_f32(tmp_path):
+    """f16 TopK order matches f32 TopK order for the same data (top-k overlap ≥ 80%)."""
+    rng = np.random.default_rng(42)
+    n, dim, k = 300, 32, 10
+    vecs = rng.random((n, dim), dtype=np.float32)
+    query = rng.random(dim, dtype=np.float32)
+
+    # f32 table
+    c32 = ApexClient(dirpath=str(tmp_path / "f32"), drop_if_exists=True)
+    c32.create_table("t")
+    c32.store([{"vec": vecs[i]} for i in range(n)])
+    ids_f32 = set(int(r["_id"]) for r in c32.topk_distance("vec", query, k=k).to_dict())
+    c32.close()
+
+    # f16 table — quantized vectors
+    c16 = ApexClient(dirpath=str(tmp_path / "f16"), drop_if_exists=True)
+    c16.execute("CREATE TABLE t (vec FLOAT16_VECTOR)")
+    c16.use_table("t")
+    c16.store([{"vec": vecs[i]} for i in range(n)])
+    ids_f16 = set(int(r["_id"]) for r in c16.topk_distance("vec", query, k=k).to_dict())
+    c16.close()
+
+    overlap = len(ids_f32 & ids_f16)
+    assert overlap >= int(k * 0.8), (
+        f"f16 vs f32 TopK overlap {overlap}/{k} < 80% for dim={dim}"
+    )
