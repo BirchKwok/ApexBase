@@ -1,5 +1,7 @@
 use super::*;
+use tempfile::tempdir;
 
+    #[test]
     fn test_v3_create_and_open() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.apex");

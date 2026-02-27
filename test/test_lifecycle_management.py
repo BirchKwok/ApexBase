@@ -273,18 +273,31 @@ class TestInstanceRegistry:
             client1.create_table("default")
             client1.store({"name": "First"})
             
-            # Create second client with same path - first may be closed
+            # Create second client with same path - both clients can coexist
+            # With multi-client support, both clients share the storage
             client2 = ApexClient(dirpath=temp_dir)
-            client2.create_table("default")
             
-            # Second client should be active
+            # Both clients should be active
+            assert not client1._is_closed
             assert not client2._is_closed
             
-            # Second client should work
+            # Second client uses shared storage, needs to select the table
+            client2.use_table("default")
+            
+            # Second client can access existing data
+            result = client2.execute("SELECT * FROM default")
+            assert len(result) == 1
+            
+            # Second client can insert data
             client2.store({"name": "Second"})
             
-            client2.close()
+            # Both clients should see the data
+            result1 = client1.execute("SELECT * FROM default")
+            result2 = client2.execute("SELECT * FROM default")
+            assert len(result1) == 2
+            assert len(result2) == 2
             
+            client1.close()
             client2.close()
     
     def test_registry_disabled_auto_manage(self):

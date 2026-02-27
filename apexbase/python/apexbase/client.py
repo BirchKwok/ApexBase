@@ -117,8 +117,10 @@ class ApexClient:
         self._db_path = self._dirpath / "apexbase.apex"
         self._auto_manage = _auto_manage
         self._is_closed = False
+        self._shared_storage = None  # Will be set by registry if sharing
+        self._is_shared_client = False  # True if using shared storage
         
-        # Register to global registry
+        # Register to global registry (this may set _shared_storage for sharing)
         if self._auto_manage:
             _registry.register(self, str(self._db_path))
         
@@ -127,11 +129,20 @@ class ApexClient:
             raise ValueError(f"durability must be 'fast', 'safe', or 'max', got '{durability}'")
         self._durability = durability
         
-        # Initialize V3 storage engine with durability level (best-effort across bindings)
-        try:
-            self._storage = ApexStorage(str(self._db_path), drop_if_exists=drop_if_exists, durability=durability)
-        except TypeError:
-            self._storage = ApexStorage(str(self._db_path), drop_if_exists=drop_if_exists)
+        # Initialize storage: use shared if available, otherwise create new
+        if self._shared_storage is not None:
+            # Use shared storage from another client
+            self._storage = self._shared_storage
+        else:
+            # First client - create new storage
+            try:
+                self._storage = ApexStorage(str(self._db_path), drop_if_exists=drop_if_exists, durability=durability)
+            except TypeError:
+                self._storage = ApexStorage(str(self._db_path), drop_if_exists=drop_if_exists)
+            # Register storage with registry for sharing
+            if self._auto_manage:
+                _registry.set_storage(str(self._db_path), self._storage)
+        
         self._connected = True
         self._lock = threading.RLock()
         
@@ -1593,12 +1604,17 @@ class ApexClient:
                         self._storage._fts_flush()
                 except Exception:
                     pass
-                self._storage.close()
+                # Only close storage if this is the first client (not shared)
+                # Shared clients should not close the storage
+                if not self._is_shared_client:
+                    self._storage.close()
                 self._storage = None
         finally:
             self._is_closed = True
             if self._auto_manage:
-                _registry.unregister(str(self._db_path))
+                # Pass client_id for proper reference counting
+                client_id = getattr(self, '_client_id', None)
+                _registry.unregister(str(self._db_path), client_id)
 
     @classmethod
     def create_clean(cls, dirpath=None, **kwargs):

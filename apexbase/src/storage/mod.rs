@@ -14,6 +14,7 @@ pub mod engine;
 pub mod index;
 pub mod delta;
 pub mod mvcc;
+pub mod concurrent;
 
 // ============================================================================
 // Durability Level - Controls fsync behavior for ACID guarantees
@@ -100,6 +101,7 @@ pub use incremental::{
     WalRecord,
     WalWriter,
     WalReader,
+    ConcurrentWalWriter,
 };
 
 // Re-export bloom filter types
@@ -121,6 +123,12 @@ pub use delta::{DeltaStore, DeltaRecord, DeleteBitmap, DeltaMerger};
 
 // Re-export MVCC types
 pub use mvcc::{VersionStore, RowVersion, VersionChain, SnapshotManager, Snapshot, GarbageCollector};
+
+// Re-export concurrent access types
+pub use concurrent::{
+    StorageStats, StorageSnapshot, BackendStats, global_stats,
+    ReadGuard, WriteGuard,
+};
 
 // Type alias for backward compatibility
 pub type ColumnarStorage = OnDemandStorage;

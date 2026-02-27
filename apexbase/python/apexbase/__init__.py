@@ -30,11 +30,18 @@ __version__ = "1.9.0"
 
 
 class _InstanceRegistry:
-    """Global instance registry"""
+    """Global instance registry with multi-client support
+    
+    This registry now supports multiple clients per database path using reference counting.
+    The underlying storage is shared among all clients for the same database.
+    """
     
     def __init__(self):
+        # db_path -> {'storage': ApexStorage, 'clients': {client_id: weakref}, 'count': int}
         self._instances = {}
         self._lock = None
+        self._client_id_counter = 0
+        self._client_id_lock = None
     
     def _get_lock(self):
         if self._lock is None:
@@ -42,40 +49,133 @@ class _InstanceRegistry:
             self._lock = threading.Lock()
         return self._lock
     
+    def _get_client_id_lock(self):
+        if self._client_id_lock is None:
+            import threading
+            self._client_id_lock = threading.Lock()
+        return self._client_id_lock
+    
+    def _generate_client_id(self):
+        """Generate a unique client ID"""
+        with self._get_client_id_lock():
+            self._client_id_counter += 1
+            return self._client_id_counter
+    
     def register(self, instance, db_path: str):
+        """Register a new client for the given database path.
+        
+        If other active clients exist for this path, share the underlying storage.
+        If all existing clients are closed, create new storage.
+        """
         lock = self._get_lock()
         with lock:
             if db_path in self._instances:
-                old_ref = self._instances[db_path]
-                old_instance = old_ref() if old_ref else None
-                if old_instance is not None:
-                    try:
-                        old_instance._force_close()
-                    except Exception:
-                        pass
-            
-            self._instances[db_path] = weakref.ref(instance, 
-                                                   lambda ref: self._cleanup_ref(db_path, ref))
+                entry = self._instances[db_path]
+                
+                # Check if any existing clients are still active
+                active_clients = []
+                for cid, client_ref in list(entry['clients'].items()):
+                    client = client_ref()
+                    if client is not None and not getattr(client, '_is_closed', False):
+                        active_clients.append(cid)
+                
+                if active_clients:
+                    # Another active client exists - share the storage
+                    client_id = self._generate_client_id()
+                    entry['clients'][client_id] = weakref.ref(instance, 
+                        lambda ref: self._cleanup_ref(db_path, client_id, ref))
+                    entry['count'] += 1
+                    # Attach shared storage to the new instance
+                    instance._shared_storage = entry['storage']
+                    instance._client_id = client_id
+                    instance._is_shared_client = True
+                else:
+                    # All previous clients are closed - create new storage
+                    client_id = self._generate_client_id()
+                    self._instances[db_path] = {
+                        'storage': None,  # Will be set by the client
+                        'clients': {client_id: weakref.ref(instance)},
+                        'count': 1
+                    }
+                    instance._client_id = client_id
+                    instance._is_shared_client = False
+            else:
+                # First client for this database - create new storage
+                client_id = self._generate_client_id()
+                self._instances[db_path] = {
+                    'storage': None,  # Will be set by the client
+                    'clients': {client_id: weakref.ref(instance)},
+                    'count': 1
+                }
+                instance._client_id = client_id
+                instance._is_shared_client = False
     
-    def _cleanup_ref(self, db_path: str, ref):
+    def set_storage(self, db_path: str, storage):
+        """Set the storage instance for a database (called by client after creating storage)"""
         lock = self._get_lock()
         with lock:
-            if self._instances.get(db_path) == ref:
-                del self._instances[db_path]
+            if db_path in self._instances:
+                self._instances[db_path]['storage'] = storage
     
-    def unregister(self, db_path: str):
+    def _cleanup_ref(self, db_path: str, client_id: int, ref):
+        """Clean up when a client is garbage collected"""
         lock = self._get_lock()
         with lock:
-            self._instances.pop(db_path, None)
+            if db_path in self._instances:
+                entry = self._instances[db_path]
+                if client_id in entry['clients']:
+                    del entry['clients'][client_id]
+                    entry['count'] -= 1
+                    
+                    # If no more clients, clean up
+                    if entry['count'] <= 0:
+                        self._instances.pop(db_path, None)
+    
+    def unregister(self, db_path: str, client_id: int = None):
+        """Unregister a client"""
+        lock = self._get_lock()
+        with lock:
+            if db_path in self._instances:
+                entry = self._instances[db_path]
+                if client_id and client_id in entry['clients']:
+                    del entry['clients'][client_id]
+                    entry['count'] -= 1
+                    
+                    # If no more clients, the storage will be closed by the client's close() method
+                    if entry['count'] <= 0:
+                        self._instances.pop(db_path, None)
+                elif not client_id:
+                    # Remove all clients for this path
+                    self._instances.pop(db_path, None)
+    
+    def get_storage(self, db_path: str):
+        """Get the shared storage for a database path"""
+        lock = self._get_lock()
+        with lock:
+            if db_path in self._instances:
+                return self._instances[db_path]['storage']
+            return None
     
     def close_all(self):
+        """Close all instances (called at program exit)"""
         lock = self._get_lock()
         with lock:
-            for ref in list(self._instances.values()):
-                instance = ref() if ref else None
-                if instance is not None:
+            # First, mark all clients as closed
+            for db_path, entry in list(self._instances.items()):
+                for client_ref in list(entry['clients'].values()):
+                    client = client_ref()
+                    if client is not None:
+                        try:
+                            client._is_closed = True
+                            client._storage = None
+                        except Exception:
+                            pass
+            # Then close the storage
+            for db_path, entry in list(self._instances.items()):
+                storage = entry.get('storage')
+                if storage is not None:
                     try:
-                        instance._force_close()
+                        storage.close()
                     except Exception:
                         pass
             self._instances.clear()
