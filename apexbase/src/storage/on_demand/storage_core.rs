@@ -208,6 +208,8 @@ impl OnDemandStorage {
         if ds_tmp.exists() {
             let _ = std::fs::remove_file(&ds_tmp);
         }
+        // Apply any deferred delete state before reading the file
+        let _ = apply_pending_deletes(path);
         
         let file = open_for_sequential_read(path)?;
         
@@ -373,7 +375,18 @@ impl OnDemandStorage {
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(deleted),
             id_to_idx: RwLock::new(None),  // Lazy loaded when needed
-            active_count: AtomicU64::new(id_count as u64),  // All rows active on fresh open
+            active_count: AtomicU64::new(
+                if let Some(ref f) = cached_v4_footer {
+                    // Footer already loaded: derive active count from per-RG metadata.
+                    // Allows DELETE to skip header pwrite while fresh backends still get
+                    // the correct count (footer.deletion_count is always kept in sync).
+                    f.row_groups.iter()
+                        .map(|rg| (rg.row_count as u64).saturating_sub(rg.deletion_count as u64))
+                        .sum::<u64>()
+                } else {
+                    id_count as u64
+                }
+            ),
             durability,
             wal_writer: RwLock::new(wal_writer),
             wal_buffer: RwLock::new(wal_buffer),
@@ -404,6 +417,8 @@ impl OnDemandStorage {
         file: File,
         file_len: u64,
     ) -> io::Result<Self> {
+        // Apply pending delete state before creating the mmap so reads see fresh data
+        let _ = apply_pending_deletes(path);
         let mut mmap_cache = MmapCache::new();
 
         let mut header_bytes = [0u8; HEADER_SIZE_V3];
@@ -481,7 +496,15 @@ impl OnDemandStorage {
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(deleted),
             id_to_idx: RwLock::new(None),
-            active_count: AtomicU64::new(id_count as u64),
+            active_count: AtomicU64::new(
+                if let Some(ref f) = cached_v4_footer {
+                    f.row_groups.iter()
+                        .map(|rg| (rg.row_count as u64).saturating_sub(rg.deletion_count as u64))
+                        .sum::<u64>()
+                } else {
+                    id_count as u64
+                }
+            ),
             durability: super::DurabilityLevel::Fast,
             wal_writer: RwLock::new(None),
             wal_buffer: RwLock::new(Vec::new()),

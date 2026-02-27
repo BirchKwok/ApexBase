@@ -3259,7 +3259,20 @@ impl ApexExecutor {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
         let result: BooleanArray = if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-            string_array.iter().map(|opt| opt.map(|s| matcher(s)).unwrap_or(false)).collect()
+            const PAR_THRESHOLD: usize = 8192;
+            if string_array.len() >= PAR_THRESHOLD {
+                use rayon::prelude::*;
+                let bools: Vec<bool> = (0..string_array.len())
+                    .into_par_iter()
+                    .map(|i| {
+                        if string_array.is_null(i) { false }
+                        else { matcher(string_array.value(i)) }
+                    })
+                    .collect();
+                BooleanArray::from(bools)
+            } else {
+                string_array.iter().map(|opt| opt.map(|s| matcher(s)).unwrap_or(false)).collect()
+            }
         } else if let Some(dict_array) = array.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
             let values = dict_array.values();
             let str_values = values.as_any().downcast_ref::<StringArray>()

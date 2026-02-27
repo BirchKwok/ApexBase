@@ -443,7 +443,14 @@ impl TableStorageBackend {
     /// Used by execute_delete to avoid the expensive load_all_columns_into_memory() + save_v4()
     /// cycle. Deletion vectors are updated in-place via save_delete_only().
     pub fn open_for_delete(path: &Path) -> io::Result<Self> {
-        // Regular open: V4 files stay in mmap-only mode (no load_all_columns_into_memory)
+        // Light-weight open: skips tmp file cleanup, DeltaStore::load, and WAL init.
+        // None of these are needed for the in-place delete fast path (~50µs savings).
+        // Falls back to Self::open() if file::open or metadata fails.
+        if let Ok(file) = std::fs::File::open(path) {
+            if let Ok(meta) = file.metadata() {
+                return Self::open_with_file(path, file, meta.len());
+            }
+        }
         Self::open(path)
     }
 
@@ -1949,15 +1956,12 @@ impl TableStorageBackend {
         // Avoids materializing all rows (which causes ~100ms for 1M unique StringDict strings).
         // Works for cold backends — scan_string_filter_mmap loads the footer lazily.
         // Skip when there is in-memory data not yet flushed (would miss pending writes).
-        eprintln!("[DBG rcfs] filter_eq={} pending_deltas={} col={} val={}", filter_eq, self.has_pending_deltas(), filter_column, filter_value);
         if filter_eq && !self.has_pending_deltas() {
             let scan_res = self.storage.scan_string_filter_mmap(filter_column, filter_value, None)?;
-            eprintln!("[DBG rcfs] scan_result={:?}", scan_res.as_ref().map(|v| v.len()));
             if let Some(indices) = scan_res {
                 if indices.is_empty() {
                     return self.read_columns_to_arrow(column_names, 0, Some(0));
                 }
-                eprintln!("[DBG rcfs] calling read_columns_by_indices with {} indices", indices.len());
                 return self.read_columns_by_indices_to_arrow(&indices);
             }
         }
@@ -2373,6 +2377,11 @@ impl TableStorageBackend {
     /// Mmap-level string equality scan: find matching row indices without Arrow arrays.
     pub fn scan_string_filter_mmap(&self, col_name: &str, target: &str, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
         self.storage.scan_string_filter_mmap(col_name, target, limit)
+    }
+
+    /// Mmap-level LIKE pattern scan: find matching row indices without Arrow arrays.
+    pub fn scan_like_filter_mmap(&self, col_name: &str, pattern: &str, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
+        self.storage.scan_like_filter_mmap(col_name, pattern, limit)
     }
 
     /// Numeric range scan returning matching row IDs directly (not indices).

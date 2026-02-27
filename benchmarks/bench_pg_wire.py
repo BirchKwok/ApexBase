@@ -144,7 +144,7 @@ def timeit(fn, repeats=REPEATS, warmup=WARMUP):
 
 # ── direct API benchmarks (no-cache: unique params each call) ─────────────────
 def bench_direct_nocache(data_dir):
-    """Benchmark direct API with unique query per call to avoid py_query_cache."""
+    """Benchmark direct API with unique query per call."""
     client = apexbase.ApexClient(data_dir)
     client.use_table("benchmark")
 
@@ -455,7 +455,6 @@ def main():
         # ── report ──
         print(f"\n{'═'*90}")
         print(f"  SECTION A: Cached Direct API vs PG Wire  (all latency = min over {REPEATS} runs)")
-        print(f"  NOTE: Direct API uses py_query_cache — repeated identical queries return instantly")
         print(f"{'═'*90}")
         print_comparison(direct, pg_simple, pg_ext)
 

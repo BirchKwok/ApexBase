@@ -797,6 +797,39 @@ impl ApexExecutor {
             }
         }
 
+        // PRE-PARSE FAST PATH: DELETE FROM <table> WHERE <col> <op> <num>
+        // Bypasses SqlParser::parse_multi (~200µs) for simple single-condition numeric predicates.
+        // Handles: col=N, col>N, col>=N, col<N, col<=N, col BETWEEN A AND B
+        {
+            let s = sql.trim().trim_end_matches(';');
+            if s.len() <= 300 {
+                let su = s.to_ascii_uppercase();
+                if su.starts_with("DELETE FROM ") {
+                    let after_df = &s["DELETE FROM ".len()..];
+                    let after_df_u = &su["DELETE FROM ".len()..];
+                    if let Some(where_pos) = after_df_u.find(" WHERE ") {
+                        let table_raw = after_df[..where_pos].trim();
+                        let after_where = after_df[where_pos + 7..].trim();
+                        let after_where_u = after_df_u[where_pos + 7..].to_ascii_uppercase();
+                        // Single-condition only (no AND/OR/NOT/IN)
+                        if !after_where_u.contains(" AND ") && !after_where_u.contains(" OR ")
+                            && !after_where_u.contains("NOT ") && !after_where_u.contains(" IN ")
+                            && !table_raw.contains(' ')
+                        {
+                            if let Some(expr) = Self::try_parse_delete_numeric_where(after_where) {
+                                let table_path = Self::resolve_table_path(table_raw, base_dir, default_table_path);
+                                if table_path.exists() {
+                                    return with_table_write_lock(&table_path, || {
+                                        Self::execute_delete(&table_path, Some(&expr))
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Support multi-statement execution (e.g., CREATE VIEW; SELECT ...; DROP VIEW;)
         // Parse as multi-statement unconditionally to avoid relying on string heuristics.
         let stmts = {
@@ -1239,6 +1272,53 @@ impl ApexExecutor {
         select.joins = new_joins;
 
         select
+    }
+
+    /// Parse "col=N", "col>N", "col>=N", "col<N", "col<=N", "col BETWEEN A AND B" into a SqlExpr.
+    /// Used by the DELETE pre-parse fast path to skip SqlParser::parse_multi entirely.
+    fn try_parse_delete_numeric_where(where_str: &str) -> Option<SqlExpr> {
+        let upper = where_str.to_ascii_uppercase();
+
+        // BETWEEN: "col BETWEEN a AND b"
+        if let Some(bet_pos) = upper.find(" BETWEEN ") {
+            let col = where_str[..bet_pos].trim().trim_matches('"').to_string();
+            let rest = &where_str[bet_pos + 9..];
+            if let Some(and_pos) = rest.to_ascii_uppercase().find(" AND ") {
+                let low: f64 = rest[..and_pos].trim().parse().ok()?;
+                let high: f64 = rest[and_pos + 5..].trim().parse().ok()?;
+                return Some(SqlExpr::Between {
+                    column: col,
+                    low: Box::new(SqlExpr::Literal(Value::Float64(low))),
+                    high: Box::new(SqlExpr::Literal(Value::Float64(high))),
+                    negated: false,
+                });
+            }
+        }
+
+        // Binary operators — check two-char ops before single-char to avoid prefix ambiguity
+        let (col_s, op, val_s) = if let Some(pos) = where_str.find(">=") {
+            (&where_str[..pos], BinaryOperator::Ge, &where_str[pos + 2..])
+        } else if let Some(pos) = where_str.find("<=") {
+            (&where_str[..pos], BinaryOperator::Le, &where_str[pos + 2..])
+        } else if let Some(pos) = where_str.find('>') {
+            (&where_str[..pos], BinaryOperator::Gt, &where_str[pos + 1..])
+        } else if let Some(pos) = where_str.find('<') {
+            (&where_str[..pos], BinaryOperator::Lt, &where_str[pos + 1..])
+        } else if let Some(pos) = where_str.find('=') {
+            (&where_str[..pos], BinaryOperator::Eq, &where_str[pos + 1..])
+        } else {
+            return None;
+        };
+        let col = col_s.trim().trim_matches('"');
+        if col.is_empty() || col.contains(' ') || col.contains('(') { return None; }
+        // Column name must be a valid identifier (starts with letter or _), not a numeric literal
+        if !col.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_') { return None; }
+        let val: f64 = val_s.trim().parse().ok()?;
+        Some(SqlExpr::BinaryOp {
+            left: Box::new(SqlExpr::Column(col.to_string())),
+            op,
+            right: Box::new(SqlExpr::Literal(Value::Float64(val))),
+        })
     }
 
     /// Execute SELECT statement (resolves FROM table path relative to storage_path's directory)

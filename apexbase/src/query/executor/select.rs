@@ -214,6 +214,9 @@ impl ApexExecutor {
                                 // FAST PATH 1b: String equality without LIMIT - storage-level scan
                                 } else if let Some(result) = Self::try_fast_string_filter_no_limit(&backend, &stmt)? {
                                     return Ok(ApexResult::Data(result));
+                                // FAST PATH 1c: LIKE pattern scan (prefix/suffix/contains)
+                                } else if let Some(result) = Self::try_fast_like_filter(&backend, &stmt)? {
+                                    return Ok(ApexResult::Data(result));
                                 // FAST PATH 2: Try numeric range filter for BETWEEN
                                 } else if let Some(result) = Self::try_fast_numeric_range_filter(&backend, &stmt)? {
                                     result
@@ -270,6 +273,9 @@ impl ApexExecutor {
                             // FAST PATH 1b: No-LIMIT string filter (uses mmap scan + late materialization)
                             } else if let Some(result) = Self::try_fast_string_filter_no_limit(&backend, &stmt)? {
                                 result
+                            // FAST PATH 1c: LIKE pattern scan (prefix/suffix/contains)
+                            } else if let Some(result) = Self::try_fast_like_filter(&backend, &stmt)? {
+                                result
                             // FAST PATH 2: Try numeric range filter for BETWEEN
                             } else if let Some(result) = Self::try_fast_numeric_range_filter(&backend, &stmt)? {
                                 result
@@ -283,6 +289,9 @@ impl ApexExecutor {
                         } else if stmt.where_clause.is_some() && stmt.limit.is_none() {
                             // FAST PATH: String filter without LIMIT (uses dictionary scan)
                             if let Some(result) = Self::try_fast_string_filter_no_limit(&backend, &stmt)? {
+                                result
+                            // FAST PATH: LIKE pattern scan (prefix/suffix/contains)
+                            } else if let Some(result) = Self::try_fast_like_filter(&backend, &stmt)? {
                                 result
                             } else if let Some(batch) = Self::try_numeric_predicate_pushdown(&backend, &stmt)? {
                                 batch
@@ -776,6 +785,55 @@ impl ApexExecutor {
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
         Self::try_fast_string_filter_impl(backend, stmt, None)
+    }
+
+    /// Fast path for LIKE filters: mmap-level pattern scan + late materialization.
+    /// Handles prefix ('abc%'), suffix ('%abc'), contains ('%abc%'), and regex patterns.
+    fn try_fast_like_filter(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<RecordBatch>> {
+        if backend.has_pending_deltas() { return Ok(None); }
+
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        let (col_name, pattern) = match Self::extract_like_pattern(where_clause) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let limit_with_offset = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+        let mut indices = match backend.scan_like_filter_mmap(&col_name, &pattern, limit_with_offset)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let projected_cols: Option<Vec<String>> = if stmt.is_select_star() {
+            None
+        } else {
+            Some(stmt.required_columns().unwrap_or_default())
+        };
+        let col_refs: Option<Vec<&str>> = projected_cols.as_ref()
+            .map(|cols| cols.iter().map(|s| s.as_str()).collect());
+
+        if indices.is_empty() {
+            return Ok(Some(backend.read_columns_to_arrow(col_refs.as_deref(), 0, Some(0))?));
+        }
+
+        let offset = stmt.offset.unwrap_or(0);
+        if offset > 0 {
+            if offset >= indices.len() {
+                return Ok(Some(backend.read_columns_to_arrow(col_refs.as_deref(), 0, Some(0))?));
+            }
+            indices = indices[offset..].to_vec();
+        }
+        if let Some(lim) = stmt.limit {
+            indices.truncate(lim);
+        }
+
+        Ok(Some(backend.read_columns_by_indices_to_arrow(&indices)?))
     }
     
     /// Unified implementation for string equality filter fast path
@@ -1665,6 +1723,16 @@ impl ApexExecutor {
             return Ok(Some(ApexResult::Empty(batch.schema())));
         }
         Ok(Some(ApexResult::Data(batch)))
+    }
+
+    /// Helper to extract LIKE pattern: col LIKE 'pattern' (non-negated only)
+    fn extract_like_pattern(expr: &SqlExpr) -> Option<(String, String)> {
+        match expr {
+            SqlExpr::Like { column, pattern, negated } if !negated => {
+                Some((column.trim_matches('"').to_string(), pattern.clone()))
+            }
+            _ => None,
+        }
     }
 
     /// Helper to extract string equality: col = 'value'

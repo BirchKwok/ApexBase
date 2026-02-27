@@ -1,5 +1,71 @@
 // Insert, delete, read_row_by_id, column management, save, persist
 
+use std::sync::RwLock as StdRwLock;
+
+static PENDING_DELETES: StdRwLock<Option<HashMap<PathBuf, Vec<u8>>>> = StdRwLock::new(None);
+
+fn global_pending_deletes() -> &'static StdRwLock<Option<HashMap<PathBuf, Vec<u8>>>> {
+    let mut guard = PENDING_DELETES.write().unwrap();
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    drop(guard);
+    &PENDING_DELETES
+}
+
+/// Apply pending delete state from global map to file on disk.
+/// Called on fresh open so reads see the latest state.
+/// Returns Ok(()) even if no pending state exists.
+pub fn apply_pending_deletes(path: &std::path::Path) -> io::Result<()> {
+    let buf = {
+        let pending = global_pending_deletes().read().unwrap();
+        pending.as_ref().and_then(|m| m.get(path).cloned())
+    };
+    let buf = match buf {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+    // Parse pending format: "APXP"[rg_count:u32][(rg_i:u32, offset:u64, len:u32, del_bytes)...][footer_off:u64][footer_len:u32][footer_bytes...]
+    if buf.len() < 8 || &buf[0..4] != b"APXP" {
+        return Ok(());
+    }
+    let mut pos = 4;
+    let rg_count = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap()) as usize;
+    pos += 4;
+    let mut rg_writes: Vec<(usize, u64, Vec<u8>)> = Vec::new();
+    for _ in 0..rg_count {
+        if pos + 12 > buf.len() { break; }
+        let rg_i = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap()) as usize;
+        pos += 4;
+        let offset = u64::from_le_bytes(buf[pos..pos+8].try_into().unwrap());
+        pos += 8;
+        let len = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + len > buf.len() { break; }
+        rg_writes.push((rg_i, offset, buf[pos..pos+len].to_vec()));
+        pos += len;
+    }
+    if pos + 12 > buf.len() { return Ok(()); }
+    let footer_offset = u64::from_le_bytes(buf[pos..pos+8].try_into().unwrap());
+    pos += 8;
+    let footer_len = u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap()) as usize;
+    pos += 4;
+    if pos + footer_len > buf.len() { return Ok(()); }
+    let footer_bytes = &buf[pos..pos+footer_len];
+    // Write deletion vectors and footer to disk
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    for (rg_i, offset, del_bytes) in &rg_writes {
+        file.seek(SeekFrom::Start(*offset))?;
+        file.write_all(del_bytes)?;
+    }
+    file.seek(SeekFrom::Start(footer_offset))?;
+    file.write_all(footer_bytes)?;
+    file.flush()?;
+    // Remove from global map after checkpoint
+    global_pending_deletes().write().unwrap().as_mut().map(|m| m.remove(path));
+    Ok(())
+}
+
 impl OnDemandStorage {
     /// Read IDs for specific global row indices from mmap.
     /// Returns Vec<u64> of IDs corresponding to the given indices.
@@ -869,8 +935,8 @@ impl OnDemandStorage {
                     let dec = decompress_rg_body(cflag, &rg_bytes[32..])?;
                     let body = dec.as_deref().unwrap_or(&rg_bytes[32..]);
                     if rg_rows * 8 > body.len() { continue; }
-                    let ids = unsafe { std::slice::from_raw_parts(body.as_ptr() as *const u64, rg_rows) };
-                    if let Ok(idx) = ids.binary_search(&id) { found_rg_i = Some(rg_i); local_idx_found = idx; break; }
+                    let ids_cow = bytes_as_u64_slice(body, rg_rows);
+                    if let Ok(idx) = ids_cow.binary_search(&id) { found_rg_i = Some(rg_i); local_idx_found = idx; break; }
                 }
                 drop(mmap_guard);
                 drop(file_guard);
@@ -994,8 +1060,8 @@ impl OnDemandStorage {
                 // Rare: non-contiguous IDs — binary search over full ID array
                 let mut ids_buf = vec![0u8; rg_rows * 8];
                 self.read_cached_bytes(body_base, &mut ids_buf)?;
-                let ids: &[u64] = unsafe { std::slice::from_raw_parts(ids_buf.as_ptr() as *const u64, rg_rows) };
-                match ids.binary_search(&id) { Ok(i) => i, Err(_) => return Ok(None) }
+                let ids_cow = bytes_as_u64_slice(&ids_buf, rg_rows);
+                match ids_cow.binary_search(&id) { Ok(i) => i, Err(_) => return Ok(None) }
             }
         } else { return Ok(None); };
 
@@ -1451,12 +1517,12 @@ impl OnDemandStorage {
                     if id_at == id {
                         guess
                     } else {
-                        let ids = unsafe { std::slice::from_raw_parts(body.as_ptr() as *const u64, rg_rows) };
-                        match ids.binary_search(&id) { Ok(i) => i, Err(_) => return Ok(None) }
+                        let ids_cow = bytes_as_u64_slice(body, rg_rows);
+                        match ids_cow.binary_search(&id) { Ok(i) => i, Err(_) => return Ok(None) }
                     }
                 } else {
-                    let ids = unsafe { std::slice::from_raw_parts(body.as_ptr() as *const u64, rg_rows) };
-                    match ids.binary_search(&id) { Ok(i) => i, Err(_) => return Ok(None) }
+                    let ids_cow = bytes_as_u64_slice(body, rg_rows);
+                    match ids_cow.binary_search(&id) { Ok(i) => i, Err(_) => return Ok(None) }
                 };
 
                 // Step 4: Check deletion bit.
@@ -1642,8 +1708,8 @@ impl OnDemandStorage {
             let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
             let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
             if rg_rows * 8 > body.len() { return Ok(None); }
-            let ids = unsafe { std::slice::from_raw_parts(body.as_ptr() as *const u64, rg_rows) };
-            let local_idx = match ids.binary_search(&id) { Ok(i) => i, Err(_) => return Ok(None) };
+            let ids_cow = bytes_as_u64_slice(body, rg_rows);
+            let local_idx = match ids_cow.binary_search(&id) { Ok(i) => i, Err(_) => return Ok(None) };
             let del_start = rg_rows * 8;
             let del_vec_len = (rg_rows + 7) / 8;
             if del_start + del_vec_len > body.len() { return Ok(None); }
@@ -3424,7 +3490,10 @@ impl OnDemandStorage {
 
         // Per-RG: (del_vec_offset, new_del_bytes) for RGs that had new deletions
         struct RgWrite { del_vec_offset: u64, del_bytes: Vec<u8>, new_del_count: u32 }
+        // Zone map updates to apply after the scan (can't mutate footer while iterating it)
+        struct ZmUpdate { rg_i: usize, zm_pos: usize, new_min: i64, new_max: i64 }
         let mut rg_writes: Vec<(usize, RgWrite)> = Vec::new(); // (rg_i, write)
+        let mut zm_updates: Vec<ZmUpdate> = Vec::new();
         let mut newly_deleted: i64 = 0;
         let mut new_total_active: u64 = 0;
         let mut can_fast_delete = true;
@@ -3490,8 +3559,8 @@ impl OnDemandStorage {
                 let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
                 let encoding = if encoding_version >= 1 && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
 
-                // Only handle PLAIN encoding — any other encoding falls back to general path
-                if encoding != COL_ENCODING_PLAIN || col_bytes.len() <= enc_offset + 8 {
+                // Handle PLAIN and RLE encodings — fall back for others
+                if col_bytes.len() <= enc_offset + 8 {
                     can_fast_delete = false;
                     break 'rg_loop;
                 }
@@ -3501,7 +3570,40 @@ impl OnDemandStorage {
                 let has_deletes = rg_meta.deletion_count > 0;
                 let mut rg_newly_deleted: i64 = 0;
 
-                let payload = &col_bytes[enc_offset..];
+                // Decode column data based on encoding
+                let payload: Vec<u8> = if encoding == COL_ENCODING_RLE {
+                    // RLE format: [count:u64][num_runs:u64][(value:i64, run_len:u32)...]
+                    let rle_data = &col_bytes[enc_offset..];
+                    if rle_data.len() < 16 {
+                        can_fast_delete = false;
+                        break 'rg_loop;
+                    }
+                    let count = u64::from_le_bytes(rle_data[0..8].try_into().unwrap()) as usize;
+                    let num_runs = u64::from_le_bytes(rle_data[8..16].try_into().unwrap()) as usize;
+                    if rle_data.len() < 16 + num_runs * 12 {
+                        can_fast_delete = false;
+                        break 'rg_loop;
+                    }
+                    // Decode RLE to flat array
+                    let mut decoded = Vec::with_capacity(count * 8);
+                    let mut pos = 16;
+                    for _ in 0..num_runs {
+                        let val = i64::from_le_bytes(rle_data[pos..pos+8].try_into().unwrap());
+                        pos += 8;
+                        let run_len = u32::from_le_bytes(rle_data[pos..pos+4].try_into().unwrap()) as usize;
+                        pos += 4;
+                        for _ in 0..run_len {
+                            decoded.extend_from_slice(&val.to_le_bytes());
+                        }
+                    }
+                    decoded
+                } else if encoding == COL_ENCODING_PLAIN {
+                    col_bytes[enc_offset..].to_vec()
+                } else {
+                    can_fast_delete = false;
+                    break 'rg_loop;
+                };
+
                 let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
                 let n = count.min(rg_rows).min((payload.len().saturating_sub(8)) / 8);
                 let vals_raw = &payload[8..];
@@ -3539,6 +3641,49 @@ impl OnDemandStorage {
                 if rg_newly_deleted > 0 {
                     let del_vec_offset = rg_meta.offset + 32 + (rg_rows as u64 * 8);
                     rg_writes.push((rg_i, RgWrite { del_vec_offset, del_bytes, new_del_count }));
+
+                    // Zone map staleness fix: if deleted values touched the zone map boundary,
+                    // rescan remaining active rows so future queries can prune this RG.
+                    if rg_i < footer.zone_maps.len() {
+                        if let Some(zm_pos) = footer.zone_maps[rg_i].iter().position(|z| z.col_idx as usize == col_idx) {
+                            let zm = &footer.zone_maps[rg_i][zm_pos];
+                            let boundary_hit = if zm.is_float {
+                                low <= f64::from_bits(zm.max_bits as u64) && high >= f64::from_bits(zm.min_bits as u64)
+                            } else {
+                                low_i <= zm.max_bits && high_i >= zm.min_bits
+                            };
+                            if boundary_hit {
+                                let updated_del = &rg_writes.last().unwrap().1.del_bytes;
+                                let mut new_min = i64::MAX;
+                                let mut new_max = i64::MIN;
+                                let n_scan = count.min(rg_rows).min(vals_raw.len() / 8);
+                                if is_int {
+                                    for i in 0..n_scan {
+                                        if (updated_del[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                        if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                        let v = i64::from_le_bytes(vals_raw[i*8..(i+1)*8].try_into().unwrap());
+                                        if v < new_min { new_min = v; }
+                                        if v > new_max { new_max = v; }
+                                    }
+                                } else {
+                                    for i in 0..n_scan {
+                                        if (updated_del[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                        if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                        let v = f64::from_le_bytes(vals_raw[i*8..(i+1)*8].try_into().unwrap());
+                                        let v_bits = v.to_bits() as i64;
+                                        if v_bits < new_min { new_min = v_bits; }
+                                        if v_bits > new_max { new_max = v_bits; }
+                                    }
+                                }
+                                // new_min > new_max means all rows deleted — use impossible range
+                                zm_updates.push(ZmUpdate {
+                                    rg_i, zm_pos,
+                                    new_min: if new_min <= new_max { new_min } else { 1 },
+                                    new_max: if new_min <= new_max { new_max } else { 0 },
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3550,48 +3695,80 @@ impl OnDemandStorage {
             return Ok(Some(0));
         }
 
+        // Apply zone map updates (stale boundary fix) so future scans can prune these RGs
+        for zu in zm_updates {
+            if zu.rg_i < footer.zone_maps.len() && zu.zm_pos < footer.zone_maps[zu.rg_i].len() {
+                footer.zone_maps[zu.rg_i][zu.zm_pos].min_bits = zu.new_min;
+                footer.zone_maps[zu.rg_i][zu.zm_pos].max_bits = zu.new_max;
+            }
+        }
+
         // Reuse the already-parsed footer (no re-read from disk needed)
         let mut footer_mut = footer;
 
-        // Close mmap before writing
-        self.mmap_cache.write().invalidate();
-        self.invalidate_page_cache();
-        *self.file.write() = None;
-        crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
-
-        let mut file = OpenOptions::new().write(true).open(&self.path)?;
-
-        // Only write RGs that had actual new deletions
-        for (rg_i, wr) in &rg_writes {
-            file.seek(SeekFrom::Start(wr.del_vec_offset))?;
-            let rg_rows = footer_mut.row_groups[*rg_i].row_count as usize;
-            let del_vec_len = (rg_rows + 7) / 8;
-            file.write_all(&wr.del_bytes[..del_vec_len])?;
-            footer_mut.row_groups[*rg_i].deletion_count = wr.new_del_count;
-        }
-
-        // Rewrite footer
-        file.seek(SeekFrom::Start(footer_offset))?;
-        let new_footer_bytes = footer_mut.to_bytes();
-        file.write_all(&new_footer_bytes)?;
-        // Footer size is identical (deletion counts only); skip set_len on Windows.
-        let new_end = footer_offset + new_footer_bytes.len() as u64;
-        #[cfg(not(target_os = "windows"))]
-        file.set_len(new_end)?;
-        file.flush()?;
-
-        // Update header row_count
+        // On Unix: defer all disk writes to global pending map (zero I/O at DELETE time).
+        // The next open_with_durability / open_for_read_with_file call applies pending state.
+        #[cfg(unix)]
         {
-            let mut hdr = self.header.write();
-            hdr.row_count = new_total_active;
-            file.seek(SeekFrom::Start(0))?;
-            file.write_all(&hdr.to_bytes())?;
-        }
-        file.flush()?;
-        drop(file);
+            // Clear user-space row cache only (no mmap invalidation needed)
+            self.invalidate_page_cache();
 
-        // Reopen for reading
-        *self.file.write() = Some(open_for_sequential_read(&self.path)?);
+            // Update footer deletion counts
+            for (rg_i, wr) in &rg_writes {
+                footer_mut.row_groups[*rg_i].deletion_count = wr.new_del_count;
+            }
+
+            // Serialize pending state to global map (no file I/O)
+            let footer_bytes = footer_mut.to_bytes();
+            let mut buf = Vec::with_capacity(8 + rg_writes.len() * 20 + 12 + footer_bytes.len());
+            buf.extend_from_slice(b"APXP");
+            buf.extend_from_slice(&(rg_writes.len() as u32).to_le_bytes());
+            for (rg_i, wr) in &rg_writes {
+                let del_vec_len = (footer_mut.row_groups[*rg_i].row_count as usize + 7) / 8;
+                buf.extend_from_slice(&(*rg_i as u32).to_le_bytes());
+                buf.extend_from_slice(&wr.del_vec_offset.to_le_bytes());
+                buf.extend_from_slice(&(del_vec_len as u32).to_le_bytes());
+                buf.extend_from_slice(&wr.del_bytes[..del_vec_len]);
+            }
+            buf.extend_from_slice(&footer_offset.to_le_bytes());
+            buf.extend_from_slice(&(footer_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&footer_bytes);
+
+            // Store in global map — zero file I/O at DELETE time
+            global_pending_deletes().write().unwrap().as_mut().map(|m| m.insert(self.path.clone(), buf));
+
+            // Update header in memory only (not on disk)
+            self.header.write().row_count = new_total_active;
+        }
+        #[cfg(not(unix))]
+        {
+            // Non-Unix: fall back to full mmap invalidation + seek-based writes
+            self.mmap_cache.write().invalidate();
+            self.invalidate_page_cache();
+            *self.file.write() = None;
+            crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
+
+            let mut file_mut = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            for (rg_i, wr) in &rg_writes {
+                file_mut.seek(SeekFrom::Start(wr.del_vec_offset))?;
+                let rg_rows = footer_mut.row_groups[*rg_i].row_count as usize;
+                let del_vec_len = (rg_rows + 7) / 8;
+                file_mut.write_all(&wr.del_bytes[..del_vec_len])?;
+                footer_mut.row_groups[*rg_i].deletion_count = wr.new_del_count;
+            }
+            file_mut.seek(SeekFrom::Start(footer_offset))?;
+            let new_footer_bytes = footer_mut.to_bytes();
+            file_mut.write_all(&new_footer_bytes)?;
+            let new_end = footer_offset + new_footer_bytes.len() as u64;
+            file_mut.set_len(new_end)?;
+            {
+                let mut hdr = self.header.write();
+                hdr.row_count = new_total_active;
+                file_mut.seek(SeekFrom::Start(0))?;
+                file_mut.write_all(&hdr.to_bytes())?;
+            }
+            *self.file.write() = Some(file_mut);
+        }
 
         Ok(Some(newly_deleted))
     }
@@ -3644,12 +3821,10 @@ impl OnDemandStorage {
                 let del_vec_len = (rg_rows + 7) / 8;
                 if body_start + ids_size + del_vec_len > rg_end { return Ok(None); }
 
-                let rg_ids: &[u64] = unsafe {
-                    std::slice::from_raw_parts(
-                        mmap_ref[body_start..body_start + ids_size].as_ptr() as *const u64,
-                        rg_rows,
-                    )
-                };
+                let rg_ids_cow = bytes_as_u64_slice(
+                    &mmap_ref[body_start..body_start + ids_size], rg_rows
+                );
+                let rg_ids: &[u64] = &rg_ids_cow;
 
                 // Quick range check (IDs are monotonically increasing within each RG)
                 let lo = sorted_ids.partition_point(|&x| x < rg_ids[0]);

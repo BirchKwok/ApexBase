@@ -174,9 +174,6 @@ pub struct ApexStorageImpl {
     durability: DurabilityLevel,
     /// Current active transaction ID (None if not in a transaction)
     current_txn_id: RwLock<Option<u64>>,
-    /// Python-level query result cache: SQL -> PyObject
-    /// Caches the FINAL Python dict to avoid all conversion overhead on repeated queries
-    py_query_cache: RwLock<HashMap<String, PyObject>>,
     /// Auto-flush row threshold (struct-level so it survives backend cache invalidation)
     auto_flush_rows: RwLock<u64>,
     /// Auto-flush byte threshold (struct-level so it survives backend cache invalidation)
@@ -472,7 +469,6 @@ impl ApexStorageImpl {
             fts_index_fields: RwLock::new(HashMap::new()),
             durability: durability_level,
             current_txn_id: RwLock::new(None),
-            py_query_cache: RwLock::new(HashMap::new()),
             auto_flush_rows: RwLock::new(0),
             auto_flush_bytes: RwLock::new(0),
         })
@@ -1162,21 +1158,6 @@ impl ApexStorageImpl {
             }
         }
         
-        // PYTHON-LEVEL QUERY RESULT CACHE: return cached PyObject for identical read queries
-        // Cache is invalidated on any write operation
-        if !is_write_op && !is_ddl && sql_upper.starts_with("SELECT") {
-            let cache = self.py_query_cache.read();
-            if let Some(cached_obj) = cache.get(&sql_upper) {
-                return Ok(cached_obj.clone_ref(py));
-            }
-        }
-        
-        // Invalidate py_query_cache on writes
-        if is_write_op || is_ddl {
-            let mut cache = self.py_query_cache.write();
-            cache.clear();
-        }
-
         // FAST PATH: SELECT COUNT(*) FROM <table> — bypass SQL parser + executor entirely.
         // Returns count directly from metadata (active_row_count atomic load).
         // NOTE: result intentionally not cached (count changes on writes).
@@ -1230,8 +1211,6 @@ impl ApexStorageImpl {
                                 }
                                 out.set_item("columns_dict", columns_dict)?;
                                 out.set_item("rows_affected", 0i64)?;
-                                let cached: PyObject = out.clone().into();
-                                self.py_query_cache.write().insert(sql_upper.clone(), cached);
                                 return Ok(out.into());
                             }
                         }
@@ -1342,9 +1321,66 @@ impl ApexStorageImpl {
                                     }
                                     out.set_item("rows", py_rows)?;
                                     out.set_item("rows_affected", 0)?;
-                                    let mut cache = self.py_query_cache.write();
-                                    cache.insert(sql_upper.clone(), out.clone().into());
                                     return Ok(out.into());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // FAST PATH: SELECT * WHERE col LIKE 'pattern' — bypass SQL executor overhead.
+        // Uses mmap-level LIKE scan (prefix/suffix/contains/regex) + columnar Arrow output.
+        if !is_write_op && sql_upper.starts_with("SELECT *")
+            && sql_upper.contains(" LIKE ") && sql_upper.contains("WHERE")
+            && !sql_upper.contains("NOT LIKE") && !sql_upper.contains("LIMIT")
+            && !sql_upper.contains("ORDER") && !sql_upper.contains("GROUP")
+            && !sql_upper.contains("JOIN") && !sql_upper.contains(" AND ")
+            && !sql_upper.contains(" OR ") && sql.contains('\'')
+        {
+            if let Some(where_pos) = sql_upper.find("WHERE") {
+                let after_where = sql[where_pos + 5..].trim().trim_end_matches(';');
+                let after_where_upper = after_where.to_uppercase();
+                if let Some(like_pos) = after_where_upper.find(" LIKE ") {
+                    let col = after_where[..like_pos].trim().trim_matches('"').to_string();
+                    let rhs = after_where[like_pos + 6..].trim();
+                    if !col.contains(' ') && !col.contains('(') && rhs.starts_with('\'') {
+                        if let Some(val_end) = rhs[1..].find('\'') {
+                            let pattern = rhs[1..1 + val_end].to_string();
+                            if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+                                let scan_result: io::Result<Option<RecordBatch>> = (|| {
+                                    let indices = match backend.scan_like_filter_mmap(&col, &pattern, None)? {
+                                        Some(v) => v,
+                                        None => return Ok(None),
+                                    };
+                                    if indices.is_empty() {
+                                        Ok(Some(backend.read_columns_to_arrow(None, 0, Some(0))?))
+                                    } else {
+                                        Ok(Some(backend.read_columns_by_indices_to_arrow(&indices)?))
+                                    }
+                                })();
+                                if let Ok(Some(batch)) = scan_result {
+                                    // Serialize as Arrow IPC — avoids creating O(rows*cols) Python
+                                    // objects in Rust.  PyArrow's ipc.read_all is SIMD-optimized
+                                    // bulk C++ (~2ms) vs 666K Python object allocs (~40ms).
+                                    // Result stored as arrow_table for zero-copy to_pandas().
+                                    use arrow::ipc::writer::StreamWriter;
+                                    use pyo3::types::PyBytes;
+                                    let estimated = batch.get_array_memory_size() + 512;
+                                    let mut buf = Vec::with_capacity(estimated);
+                                    let ipc_ok = (|| -> Result<(), arrow::error::ArrowError> {
+                                        let mut w = StreamWriter::try_new(&mut buf, batch.schema().as_ref())?;
+                                        w.write(&batch)?;
+                                        w.finish()
+                                    })();
+                                    if ipc_ok.is_ok() {
+                                        let out = PyDict::new_bound(py);
+                                        out.set_item("arrow_ipc", PyBytes::new_bound(py, &buf))?;
+                                        out.set_item("rows_affected", 0i64)?;
+                                        return Ok(out.into());
+                                    }
+                                    // IPC serialization failed — fall through to slow path
                                 }
                             }
                         }
@@ -1558,15 +1594,7 @@ impl ApexStorageImpl {
             }
         }
         
-        // Cache the result for future identical read queries
-        let result_obj: PyObject = out.into();
-        if !is_write_op && !is_ddl && sql_upper.starts_with("SELECT") {
-            let mut cache = self.py_query_cache.write();
-            if cache.len() > 200 { cache.clear(); }
-            cache.insert(sql_upper.clone(), result_obj.clone_ref(py));
-        }
-        
-        Ok(result_obj)
+        Ok(out.into())
     }
     
     /// Execute SQL query and return Arrow FFI pointers for zero-copy transfer
@@ -1967,7 +1995,6 @@ impl ApexStorageImpl {
         self.table_paths.write().clear();
         *self.tables_scanned.write() = false;
         *self.current_table.write() = String::new();
-        self.py_query_cache.write().clear();
 
         Ok(())
     }
@@ -3135,16 +3162,45 @@ fn arrow_col_to_pylist(py: Python<'_>, arr: &arrow::array::ArrayRef) -> PyResult
         }
         ArrowDT::Utf8 => {
             let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
-            let list = PyList::empty_bound(py);
-            for i in 0..n {
-                if a.is_null(i) {
-                    list.append(py.None())?;
-                } else {
-                    let s = a.value(i);
-                    if s == "\x00__NULL__\x00" { list.append(py.None())?; } else { list.append(s)?; }
+            if a.null_count() == 0 {
+                // String interning with pre-allocated list: O(unique) PyUnicode_DecodeUTF8 allocs
+                // + O(n) Py_INCREF + PyList_SET_ITEM.  Avoids both per-element string alloc
+                // (good for low-cardinality: city/category with 6 unique values) and PyList
+                // realloc overhead from append (good for all sizes).
+                use pyo3::ffi;
+                let mut cache: std::collections::HashMap<&str, pyo3::PyObject> =
+                    std::collections::HashMap::with_capacity(32);
+                let list_obj = unsafe {
+                    let list_ptr = ffi::PyList_New(n as ffi::Py_ssize_t);
+                    if list_ptr.is_null() { return Err(pyo3::PyErr::fetch(py)); }
+                    for i in 0..n {
+                        let s = a.value(i);
+                        let py_obj: pyo3::PyObject = match cache.get(s) {
+                            Some(o) => o.clone_ref(py),
+                            None => {
+                                let o: pyo3::PyObject = s.into_py(py);
+                                cache.insert(s, o.clone_ref(py));
+                                o
+                            }
+                        };
+                        // SET_ITEM takes ownership of the ptr (no extra incref)
+                        ffi::PyList_SET_ITEM(list_ptr, i as ffi::Py_ssize_t, py_obj.into_ptr());
+                    }
+                    pyo3::PyObject::from_owned_ptr(py, list_ptr)
+                };
+                Ok(list_obj.into())
+            } else {
+                let list = PyList::empty_bound(py);
+                for i in 0..n {
+                    if a.is_null(i) {
+                        list.append(py.None())?;
+                    } else {
+                        let s = a.value(i);
+                        if s == "\x00__NULL__\x00" { list.append(py.None())?; } else { list.append(s)?; }
+                    }
                 }
+                Ok(list.into())
             }
-            Ok(list.into())
         }
         ArrowDT::Boolean => {
             let a = arr.as_any().downcast_ref::<BooleanArray>().unwrap();

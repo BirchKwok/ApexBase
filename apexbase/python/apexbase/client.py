@@ -982,6 +982,26 @@ class ApexClient:
                 rv._show_internal_id = show_internal_id
                 return rv
 
+            # LIKE fast path: call execute() which has an optimized LIKE scan in Rust
+            # returning Arrow IPC bytes (skips ~40ms of Python object creation for large results).
+            # Not gated on _has_writes since the Rust LIKE scan reads the current mmap state.
+            if (sql_upper.startswith('SELECT') and ' LIKE ' in sql_upper
+                    and 'GROUP BY' not in sql_upper and 'ORDER BY' not in sql_upper
+                    and 'LIMIT' not in sql_upper and 'JOIN' not in sql_upper
+                    and not getattr(self, '_in_txn', False)):
+                try:
+                    result = self._storage.execute(sql)
+                    if result is not None:
+                        arrow_ipc = result.get('arrow_ipc')
+                        if arrow_ipc is not None:
+                            _reader = pa.ipc.open_stream(pa.BufferReader(arrow_ipc))
+                            _table = _reader.read_all()
+                            rv = ResultView(arrow_table=_table if _table.num_rows > 0 else None)
+                            rv._show_internal_id = show_internal_id
+                            return rv
+                except Exception:
+                    pass  # fall through to _execute_arrow_ffi on any error
+
             if sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'TRUNCATE', 'ALTER', 'DROP', 'CREATE')):
                 self._has_writes = True
             
