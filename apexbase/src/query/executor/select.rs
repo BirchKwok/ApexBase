@@ -798,23 +798,92 @@ impl ApexExecutor {
         Self::try_fast_string_filter_impl(backend, stmt, None)
     }
 
-    /// Fast path for LIKE filters: mmap-level pattern scan + late materialization.
-    /// Handles prefix ('abc%'), suffix ('%abc'), contains ('%abc%'), and regex patterns.
+    /// Fast path for LIKE filters: adaptive strategy based on selectivity.
+    /// Uses full table scan + Arrow filter for high-selectivity queries,
+    /// and index extraction for low-selectivity queries.
     fn try_fast_like_filter(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
-        if backend.has_pending_deltas() { return Ok(None); }
+        // Skip if there are pending deltas (use slower but accurate path)
+        if backend.has_pending_deltas() {
+            return Ok(None);
+        }
 
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
-            None => return Ok(None),
+            None => return Ok(None);
         };
         let (col_name, pattern) = match Self::extract_like_pattern(where_clause) {
             Some(v) => v,
             None => return Ok(None),
         };
 
+        // Get total row count
+        let total_rows = backend.row_count() as usize;
+        if total_rows == 0 {
+            return Ok(None);
+        }
+
+        // Analyze pattern for selectivity estimation
+        let is_prefix_like = pattern.ends_with("%") && !pattern.starts_with("%");
+        let estimated_selectivity = if is_prefix_like {
+            let prefix = &pattern[..pattern.len()-1];
+            if prefix.is_empty() {
+                1.0 // Match all
+            } else {
+                // Count trailing digits to estimate cardinality
+                let digit_count = prefix.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+                if digit_count == 1 {
+                    0.1 // "user_1%" ~10%
+                } else if digit_count >= 2 {
+                    0.01 // "user_10%" ~1%
+                } else if prefix.len() > 0 {
+                    0.001 // Very low selectivity
+                } else {
+                    0.1 // Default
+                }
+            }
+        } else if pattern == "%" {
+            1.0 // Match all
+        } else {
+            0.1 // Default estimate
+        };
+
+        let estimated_matches = (total_rows as f64 * estimated_selectivity) as usize;
+
+        // Decision: use full scan for high-selectivity, index for low-selectivity
+        // Full scan threshold: >50K matches or >5% selectivity
+        let use_full_scan = estimated_matches > 50_000 || (estimated_selectivity > 0.05 && stmt.limit.is_none());
+
+        if use_full_scan {
+            // Full table scan + vectorized filter
+            let projected_cols: Option<Vec<String>> = if stmt.is_select_star() {
+                None
+            } else {
+                Some(stmt.required_columns().unwrap_or_default())
+            };
+            let col_refs: Option<Vec<&str>> = projected_cols.as_ref()
+                .map(|cols| cols.iter().map(|s| s.as_str()).collect());
+
+            // Read all data and filter in one pass
+            let full_batch = backend.read_columns_to_arrow(col_refs.as_deref().map(|v| v.as_slice()), 0, None)?;
+            if full_batch.num_rows() == 0 {
+                return Ok(Some(full_batch));
+            }
+
+            // Evaluate predicate on full batch using vectorized operations
+            let storage_path = backend.get_storage_path();
+            let mask = Self::evaluate_predicate_with_storage(&full_batch, where_clause, storage_path)?;
+
+            // Use Arrow's optimized filter
+            use arrow::compute::filter_record_batch;
+            return filter_record_batch(&full_batch, &mask)
+                .map(Some)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+        }
+
+        // Low selectivity or has LIMIT: use index-based extraction
         let limit_with_offset = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
         let mut indices = match backend.scan_like_filter_mmap(&col_name, &pattern, limit_with_offset)? {
             Some(v) => v,
@@ -839,7 +908,7 @@ impl ApexExecutor {
                 return Ok(Some(backend.read_columns_to_arrow(col_refs.as_deref(), 0, Some(0))?));
             }
             indices = indices[offset..].to_vec();
-        }
+ = indices[offset..        }
         if let Some(lim) = stmt.limit {
             indices.truncate(lim);
         }

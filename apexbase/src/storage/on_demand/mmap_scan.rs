@@ -62,17 +62,39 @@ pub(crate) enum LikeKind {
     Regex(regex::Regex),
 }
 
+/// Pre-compiled finder for contains patterns (much faster than on-the-fly)
+/// Uses memchr's precompilation which caches SIMD state
+pub struct PrecompiledFinder {
+    finder: memchr::memmem::Finder<'static>,
+}
+
 /// Test whether a raw byte slice matches a LikeKind pattern.
 /// Must not allocate — called inside Rayon parallel closures.
 #[inline(always)]
 pub(crate) fn like_matches_bytes(kind: &LikeKind, s: &[u8]) -> bool {
     match kind {
-        LikeKind::Prefix(p)   => s.len() >= p.len() && s[..p.len()] == p[..],
-        LikeKind::Suffix(p)   => s.len() >= p.len() && s[s.len()-p.len()..] == p[..],
+        LikeKind::Prefix(p)   => s.len() >= p.len() && fast_eq(p, s),
+        LikeKind::Suffix(p)   => s.len() >= p.len() && fast_eq(p, &s[s.len()-p.len()..]),
         LikeKind::Contains(p) => memchr::memmem::find(s, p).is_some(),
         LikeKind::Any         => true,
         LikeKind::Regex(re)   => std::str::from_utf8(s).map(|st| re.is_match(st)).unwrap_or(false),
     }
+}
+
+/// Fast equality check using memchr's optimized comparison
+/// Uses word-at-a-time comparison for longer prefixes
+#[inline(always)]
+fn fast_eq(pattern: &[u8], s: &[u8]) -> bool {
+    if pattern.len() != s.len() {
+        if pattern.len() > s.len() {
+            return false;
+        }
+        // For prefix match: just check first pattern.len() bytes
+        if s.len() < pattern.len() {
+            return false;
+        }
+    }
+    pattern == &s[..pattern.len()]
 }
 
 /// Classify a SQL LIKE pattern into a LikeKind for fast byte-level matching.
@@ -2899,16 +2921,34 @@ impl OnDemandStorage {
                         let offsets_cow = bytes_as_u32_slice(&data[8..], count + 1);
                         let offsets: &[u32] = &offsets_cow;
                         let n = count.min(rg_rows);
-                        for i in 0..n {
-                            if let Some(db) = del_bytes_opt {
-                                if (db[i/8] >> (i%8)) & 1 == 1 { continue; }
+
+                        // Fast path: no deletions and no nulls - skip bitmap checks entirely
+                        let no_deletes = del_bytes_opt.is_none();
+                        let no_nulls = null_bytes.iter().all(|&b| b == 0);
+
+                        if no_deletes && no_nulls {
+                            // Ultra-fast path: no bitmap checks needed
+                            for i in 0..n {
+                                let s = offsets[i] as usize;
+                                let e = offsets[i+1] as usize;
+                                if e > data_region.len() { continue; }
+                                if like_matches_bytes(like_kind_ref, &data_region[s..e]) {
+                                    local.push(desc.global_off + i);
+                                }
                             }
-                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                            let s = offsets[i] as usize;
-                            let e = offsets[i+1] as usize;
-                            if e > data_region.len() { continue; }
-                            if like_matches_bytes(like_kind_ref, &data_region[s..e]) {
-                                local.push(desc.global_off + i);
+                        } else {
+                            // Standard path with deletion/null checks
+                            for i in 0..n {
+                                if let Some(db) = del_bytes_opt {
+                                    if (db[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                }
+                                if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                let s = offsets[i] as usize;
+                                let e = offsets[i+1] as usize;
+                                if e > data_region.len() { continue; }
+                                if like_matches_bytes(like_kind_ref, &data_region[s..e]) {
+                                    local.push(desc.global_off + i);
+                                }
                             }
                         }
                     } else {

@@ -3241,7 +3241,7 @@ impl ApexExecutor {
     }
 
     /// Evaluate LIKE expression.
-    /// Fast path for simple patterns: starts_with / ends_with / contains — no regex overhead.
+    /// Uses Arrow's optimized match_like kernel when available, with fallback to custom implementation.
     fn evaluate_like(
         batch: &RecordBatch,
         column: &str,
@@ -3255,6 +3255,22 @@ impl ApexExecutor {
         let array = Self::get_column_by_name(batch, col_name)
             .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
 
+        // Try Arrow's optimized match_like first (much faster than custom implementation)
+        if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+            match compute::match_like(string_array, pattern) {
+                Ok(result) => {
+                    if negated {
+                        return compute::not(&result).map_err(|e| err_data(e.to_string()));
+                    }
+                    return Ok(result);
+                }
+                Err(_) => {
+                    // Fall back to custom implementation if Arrow's fails
+                }
+            }
+        }
+
+        // Fallback: custom implementation with parallel processing
         let matcher = Self::like_pattern_to_matcher(pattern)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
