@@ -37,11 +37,23 @@ class _InstanceRegistry:
     """
     
     def __init__(self):
-        # db_path -> {'storage': ApexStorage, 'clients': {client_id: weakref}, 'count': int}
+        # db_path -> {'storage': ApexStorage, 'clients': {client_id: weakref}, 'count': int, 'storage_lock': threading.RLock}
         self._instances = {}
         self._lock = None
         self._client_id_counter = 0
         self._client_id_lock = None
+    
+    def _get_storage_lock(self, db_path: str):
+        """Get or create a lock for the storage at the given path"""
+        lock = self._get_lock()
+        with lock:
+            if db_path in self._instances:
+                entry = self._instances[db_path]
+                if 'storage_lock' not in entry:
+                    import threading
+                    entry['storage_lock'] = threading.RLock()
+                return entry['storage_lock']
+        return None
     
     def _get_lock(self):
         if self._lock is None:
@@ -92,20 +104,24 @@ class _InstanceRegistry:
                 else:
                     # All previous clients are closed - create new storage
                     client_id = self._generate_client_id()
+                    import threading
                     self._instances[db_path] = {
                         'storage': None,  # Will be set by the client
                         'clients': {client_id: weakref.ref(instance)},
-                        'count': 1
+                        'count': 1,
+                        'storage_lock': threading.RLock()
                     }
                     instance._client_id = client_id
                     instance._is_shared_client = False
             else:
                 # First client for this database - create new storage
                 client_id = self._generate_client_id()
+                import threading
                 self._instances[db_path] = {
                     'storage': None,  # Will be set by the client
                     'clients': {client_id: weakref.ref(instance)},
-                    'count': 1
+                    'count': 1,
+                    'storage_lock': threading.RLock()
                 }
                 instance._client_id = client_id
                 instance._is_shared_client = False
@@ -154,6 +170,14 @@ class _InstanceRegistry:
         with lock:
             if db_path in self._instances:
                 return self._instances[db_path]['storage']
+            return None
+    
+    def get_storage_lock(self, db_path: str):
+        """Get the lock for the shared storage (for thread-safe concurrent access)"""
+        lock = self._get_lock()
+        with lock:
+            if db_path in self._instances:
+                return self._instances[db_path].get('storage_lock')
             return None
     
     def close_all(self):

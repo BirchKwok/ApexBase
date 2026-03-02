@@ -2314,9 +2314,10 @@ impl OnDemandStorage {
         base_rows + delta_rows
     }
     
-    /// Get base file row count only (without delta)
+    /// Fast path: Get base table row count only (O(1) lock-free atomic read)
+    /// Use this for COUNT(*) without WHERE clause
     pub fn base_row_count(&self) -> u64 {
-        self.header.read().row_count
+        self.active_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get column names

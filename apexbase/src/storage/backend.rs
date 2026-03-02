@@ -555,6 +555,20 @@ impl TableStorageBackend {
         names
     }
 
+    /// Acquire global read lock for thread-safe concurrent reads.
+    /// Multiple readers can hold the lock simultaneously.
+    #[inline]
+    pub fn read_lock(&self) -> parking_lot::RwLockReadGuard<()> {
+        self.storage.read_lock()
+    }
+    
+    /// Acquire global write lock for thread-safe writes.
+    /// Only one writer can hold the lock; readers are blocked while held.
+    #[inline]
+    pub fn write_lock(&self) -> parking_lot::RwLockWriteGuard<()> {
+        self.storage.write_lock()
+    }
+
     // ========================================================================
     // Lazy Loading APIs
     // ========================================================================
@@ -1075,6 +1089,12 @@ impl TableStorageBackend {
     /// Get active (non-deleted) row count
     pub fn active_row_count(&self) -> u64 {
         self.storage.active_row_count()
+    }
+
+    /// Fast path: Get base table row count only (no delta scan)
+    /// Use this for COUNT(*) without WHERE clause - O(1) lock-free read
+    pub fn base_row_count(&self) -> u64 {
+        self.storage.base_row_count()
     }
 
     /// Replace a row (delete + insert new)
@@ -2414,6 +2434,11 @@ impl TableStorageBackend {
     /// Mmap-level numeric range scan: find matching row indices without Arrow arrays.
     pub fn scan_numeric_range_mmap(&self, col_name: &str, low: f64, high: f64, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
         self.storage.scan_numeric_range_mmap(col_name, low, high, limit)
+    }
+
+    /// Mmap-level boolean equality scan: find matching row indices without Arrow arrays.
+    pub fn scan_bool_filter_mmap(&self, col_name: &str, target_value: bool, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
+        self.storage.scan_bool_filter_mmap(col_name, target_value, limit)
     }
 
     /// Direct mmap top-K scan: finds top-k row indices without materializing the full Arrow column.

@@ -91,6 +91,10 @@ pub struct OnDemandStorage {
     pub(crate) scan_buf_f16_file_size: std::sync::atomic::AtomicU64,
     /// Column name whose f16 data is currently in scan_buf_f16 (empty = none).
     pub(crate) scan_buf_f16_col: std::sync::Mutex<String>,
+    /// Global lock for thread-safe concurrent access to file and mmap.
+    /// This prevents "File not open" and "V4 footer: schema overflow" errors
+    /// when multiple threads access the storage simultaneously.
+    pub(crate) global_lock: parking_lot::RwLock<()>,
 }
 
 
@@ -167,6 +171,7 @@ impl OnDemandStorage {
             scan_buf_f16: std::sync::Mutex::new(Vec::new()),
             scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_f16_col: std::sync::Mutex::new(String::new()),
+            global_lock: parking_lot::RwLock::new(()),
         };
 
         // Write initial file
@@ -406,6 +411,7 @@ impl OnDemandStorage {
             scan_buf_f16: std::sync::Mutex::new(Vec::new()),
             scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_f16_col: std::sync::Mutex::new(String::new()),
+            global_lock: parking_lot::RwLock::new(()),
         })
     }
     
@@ -524,6 +530,7 @@ impl OnDemandStorage {
             scan_buf_f16: std::sync::Mutex::new(Vec::new()),
             scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_f16_col: std::sync::Mutex::new(String::new()),
+            global_lock: parking_lot::RwLock::new(()),
         })
     }
 
@@ -538,6 +545,22 @@ impl OnDemandStorage {
     /// Get current auto-flush configuration
     pub fn get_auto_flush(&self) -> (u64, u64) {
         (self.auto_flush_rows.load(Ordering::SeqCst), self.auto_flush_bytes.load(Ordering::SeqCst))
+    }
+    
+    /// Acquire global read lock for thread-safe concurrent reads.
+    /// Returns a guard that releases the lock when dropped.
+    /// Multiple readers can hold the lock simultaneously.
+    #[inline]
+    pub fn read_lock(&self) -> parking_lot::RwLockReadGuard<()> {
+        self.global_lock.read()
+    }
+    
+    /// Acquire global write lock for thread-safe writes.
+    /// Returns a guard that releases the lock when dropped.
+    /// Only one writer can hold the lock; readers are blocked while held.
+    #[inline]
+    pub fn write_lock(&self) -> parking_lot::RwLockWriteGuard<()> {
+        self.global_lock.write()
     }
     
     /// Estimate current in-memory data size in bytes
@@ -953,6 +976,7 @@ impl OnDemandStorage {
             scan_buf_f16: std::sync::Mutex::new(Vec::new()),
             scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_f16_col: std::sync::Mutex::new(String::new()),
+            global_lock: parking_lot::RwLock::new(()),
         })
     }
     

@@ -173,6 +173,11 @@ class ApexClient:
         self._prefer_arrow_format = prefer_arrow_format and ARROW_AVAILABLE
         self._registry = _registry
         self._has_writes = False  # True after any write; disables _storage.execute() fast paths
+        
+        # Get the storage lock for thread-safe concurrent access
+        self._storage_lock = None
+        if self._auto_manage:
+            self._storage_lock = _registry.get_storage_lock(str(self._db_path))
 
     def _load_fts_config(self) -> None:
         try:
@@ -640,6 +645,16 @@ class ApexClient:
     def store(self, data) -> None:
         self._check_connection()
         self._ensure_table_selected()
+        
+        # Acquire storage lock for thread-safe concurrent access (shared across all clients)
+        storage_lock = getattr(self, '_storage_lock', None)
+        if storage_lock is not None:
+            with storage_lock:
+                self._store_impl(data)
+        else:
+            self._store_impl(data)
+    
+    def _store_impl(self, data) -> None:
         with self._lock:
             # 1. Columnar data Dict[str, list/ndarray]
             if isinstance(data, dict):
@@ -786,8 +801,32 @@ class ApexClient:
 
     def execute(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
         self._check_connection()
+        
+        # Lock-free execution: Rust layer handles concurrent reads via RwLock.
+        # Python-level _storage_lock was causing serialization of all queries.
+        return self._execute_impl(sql, show_internal_id)
+    
+    def _execute_impl(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
         # DDL (CREATE TABLE) is allowed without a table selected
         sql_upper = sql.strip().upper()
+
+        # ULTRA-FAST PATH: Pure COUNT(*) — bypass execute() overhead entirely.
+        # Uses fast_row_count() which directly returns active_row_count from cached backend.
+        # This is 2-3x faster than row_count() which goes through the engine.
+        if (sql_upper.startswith("SELECT COUNT(*) FROM ")
+                and "WHERE" not in sql_upper and "GROUP" not in sql_upper
+                and "HAVING" not in sql_upper and "JOIN" not in sql_upper
+                and "DISTINCT" not in sql_upper):
+            self._ensure_table_selected()
+            try:
+                # Use fast_row_count for maximum speed
+                count = self._storage.fast_row_count()
+                # Use lazy_pydict for fastest path (avoid Arrow conversion)
+                rv = ResultView(lazy_pydict={'COUNT(*)': [count]})
+                rv._show_internal_id = False
+                return rv
+            except Exception:
+                pass  # fall through to normal path on error
 
         # ULTRA-FAST PATH: _id point lookup — bypass regex, _should_show_internal_id, lock overhead.
         # Detects "SELECT ... WHERE _ID = N" with no modifiers and routes directly to retrieve_rcix.

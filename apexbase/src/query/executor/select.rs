@@ -239,6 +239,17 @@ impl ApexExecutor {
                                             }
                                             // Use index-based extraction for all result sizes (avoids full table scan)
                                             let batch = backend.read_columns_by_indices_to_arrow(&indices)?;
+                                            
+                                            // Apply ORDER BY with LIMIT if needed
+                                            if !stmt.order_by.is_empty() {
+                                                let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+                                                let sort_batch = Self::augment_batch_for_order_by(&batch, &stmt.columns, &stmt.order_by)?;
+                                                let sorted = Self::apply_order_by_topk(&sort_batch, &stmt.order_by, k)?;
+                                                let limited = Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset)?;
+                                                let projected = Self::apply_projection_with_storage(&limited, &stmt.columns, Some(storage_path))?;
+                                                return Ok(ApexResult::Data(projected));
+                                            }
+                                            
                                             return Ok(ApexResult::Data(batch));
                                         }
                                     }
@@ -1761,6 +1772,23 @@ impl ApexExecutor {
                 let low_val = Self::extract_numeric_value(low).ok()?;
                 let high_val = Self::extract_numeric_value(high).ok()?;
                 Some((col, low_val, high_val))
+            }
+            _ => None,
+        }
+    }
+    
+    /// Helper to extract boolean equality: col = true/false
+    fn extract_bool_equality(expr: &SqlExpr) -> Option<(String, bool)> {
+        use crate::query::sql_parser::BinaryOperator;
+        match expr {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(col), SqlExpr::Literal(Value::Bool(val))) |
+                    (SqlExpr::Literal(Value::Bool(val)), SqlExpr::Column(col)) => {
+                        Some((col.trim_matches('"').to_string(), *val))
+                    }
+                    _ => None,
+                }
             }
             _ => None,
         }

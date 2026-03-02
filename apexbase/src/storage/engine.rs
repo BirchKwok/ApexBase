@@ -718,6 +718,13 @@ impl StorageEngine {
         Ok(backend.active_row_count())
     }
     
+    /// Fast path: Get base table row count only (no delta scan)
+    /// Use this for COUNT(*) without WHERE clause - O(1) lock-free read
+    pub fn base_row_count(&self, table_path: &Path) -> io::Result<u64> {
+        let backend = self.get_read_backend(table_path)?;
+        Ok(backend.base_row_count())
+    }
+    
     // ========================================================================
     // Schema Modification Operations
     // ========================================================================

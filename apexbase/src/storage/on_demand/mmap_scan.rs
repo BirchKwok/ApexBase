@@ -2645,6 +2645,136 @@ impl OnDemandStorage {
         Ok(Some(matches))
     }
 
+    /// Mmap-level boolean column filter: find rows where col = target_value (true/false).
+    /// Uses Rayon parallel scan across row groups for maximum performance.
+    pub fn scan_bool_filter_mmap(
+        &self,
+        col_name: &str,
+        target_value: bool,
+        limit: Option<usize>,
+    ) -> io::Result<Option<Vec<usize>>> {
+        use rayon::prelude::*;
+        
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let col_type = schema.columns[col_idx].1;
+        if !matches!(col_type, ColumnType::Bool) { return Ok(None); }
+        
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for bool scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        
+        let max_matches = limit.unwrap_or(usize::MAX);
+        let target_bit: u8 = if target_value { 1 } else { 0 };
+        
+        // Use parallel scan for better performance on multi-core
+        if footer.row_groups.len() > 1 {
+            let mmap_ptr: usize = mmap_ref.as_ptr() as usize;
+            let mmap_len: usize = mmap_ref.len();
+            
+            struct RgDesc {
+                rg_offset: usize, rg_data_size: usize, rg_rows: usize,
+                global_off: usize, col_rcix: usize, has_deletes: bool,
+            }
+            let mut rg_descs: Vec<RgDesc> = Vec::with_capacity(footer.row_groups.len());
+            let mut off = 0usize;
+            for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+                rg_descs.push(RgDesc {
+                    rg_offset: rg_meta.offset as usize,
+                    rg_data_size: rg_meta.data_size as usize,
+                    rg_rows: rg_meta.row_count as usize,
+                    global_off: off,
+                    col_rcix: footer.col_offsets[rg_i][col_idx] as usize,
+                    has_deletes: rg_meta.deletion_count > 0,
+                });
+                off += rg_meta.row_count as usize;
+            }
+            
+            let all_rg_matches: Vec<Vec<usize>> = rg_descs.par_iter().map(|desc| {
+                let mmap = unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len) };
+                let rg_end = desc.rg_offset + desc.rg_data_size;
+                if rg_end > mmap.len() || rg_end < desc.rg_offset + 32 { return vec![]; }
+                let rg_bytes = &mmap[desc.rg_offset..rg_end];
+                let body = &rg_bytes[32..];
+                let rg_rows = desc.rg_rows;
+                let null_bitmap_len = (rg_rows + 7) / 8;
+                let del_vec_len = null_bitmap_len;
+                
+                let col_off = desc.col_rcix;
+                if col_off + null_bitmap_len > body.len() { return vec![]; }
+                let bool_data = &body[col_off..col_off + null_bitmap_len];
+                
+                let mut matches = Vec::new();
+                for i in 0..rg_rows {
+                    if matches.len() >= max_matches { break; }
+                    if desc.has_deletes {
+                        let b = i / 8; let bit = i % 8;
+                        if b < del_vec_len && (body[b] >> bit) & 1 != 0 { continue; }
+                    }
+                    let bool_val = (bool_data[i/8] >> (i%8)) & 1;
+                    if bool_val == target_bit {
+                        matches.push(desc.global_off + i);
+                    }
+                }
+                matches
+            }).collect();
+            
+            let mut result: Vec<usize> = all_rg_matches.into_iter().flatten().collect();
+            if let Some(lim) = limit {
+                result.truncate(lim);
+            }
+            return Ok(Some(result));
+        }
+        
+        // Fallback for single RG
+        let mut matches: Vec<usize> = Vec::new();
+        let mut global_row_offset: usize = 0;
+        
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            if matches.len() >= max_matches { break; }
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 { global_row_offset += rg_rows; continue; }
+            
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() { continue; }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+            let body = &rg_bytes[32..];
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let del_vec_len = null_bitmap_len;
+            
+            let col_off = if rg_i < footer.col_offsets.len() && col_idx < footer.col_offsets[rg_i].len() {
+                footer.col_offsets[rg_i][col_idx] as usize
+            } else {
+                continue;
+            };
+            
+            if col_off + null_bitmap_len > body.len() { global_row_offset += rg_rows; continue; }
+            let bool_data = &body[col_off..col_off + null_bitmap_len];
+            
+            let has_deletes = rg_meta.deletion_count > 0;
+            for i in 0..rg_rows {
+                if matches.len() >= max_matches { break; }
+                if has_deletes && (body[i/8] >> (i%8)) & 1 != 0 { continue; }
+                let bool_val = (bool_data[i/8] >> (i%8)) & 1;
+                if bool_val == target_bit {
+                    matches.push(global_row_offset + i);
+                }
+            }
+            global_row_offset += rg_rows;
+        }
+        
+        Ok(Some(matches))
+    }
+
     /// Mmap-level LIKE pattern scan: find rows where `col_name LIKE pattern`.
     /// Handles prefix ('abc%'), suffix ('%abc'), contains ('%abc%'), any ('%'), and
     /// complex patterns via compiled regex. Delegates exact (no-wildcard) patterns to
@@ -2951,11 +3081,22 @@ impl OnDemandStorage {
             None => return Ok(None),
         };
         let col_type = schema.columns[col_idx].1;
+        let is_bool = matches!(col_type, ColumnType::Bool);
         let is_int = matches!(col_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 |
             ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 |
             ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date);
         let is_float = matches!(col_type, ColumnType::Float64 | ColumnType::Float32);
-        if !is_int && !is_float { return Ok(None); }
+        if !is_bool && !is_int && !is_float { return Ok(None); }
+        
+        // For boolean columns, convert to integer range: false=0, true=1
+        let (low, high) = if is_bool {
+            let bool_low = if low > 0.5 { 1 } else { 0 };
+            let bool_high = if high > 0.5 { 1 } else { 0 };
+            (bool_low as f64, bool_high as f64)
+        } else {
+            (low, high)
+        };
+        
         let col_count = schema.column_count();
         let file_guard = self.file.read();
         let file = file_guard.as_ref()
@@ -3009,6 +3150,28 @@ impl OnDemandStorage {
                 let col_bytes = &body[data_start..];
                 let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
                 let encoding = if encoding_version >= 1 && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                
+                // Handle boolean columns (packed bits)
+                if is_bool {
+                    let bool_data_len = (rg_rows + 7) / 8;
+                    if col_bytes.len() >= enc_offset + bool_data_len {
+                        let bool_data = &col_bytes[enc_offset..enc_offset + bool_data_len];
+                        let low_i = low.ceil() as i64;
+                        let high_i = high.floor() as i64;
+                        for i in 0..rg_rows {
+                            if matches.len() >= max_matches { break; }
+                            if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            let bool_val = (bool_data[i/8] >> (i%8)) & 1;
+                            if bool_val as i64 >= low_i && bool_val as i64 <= high_i {
+                                matches.push(global_row_offset + i);
+                            }
+                        }
+                        global_row_offset += rg_rows;
+                        continue;
+                    }
+                }
+                
                 if encoding == COL_ENCODING_PLAIN && col_bytes.len() > enc_offset + 8 {
                     let payload = &col_bytes[enc_offset..];
                     let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
