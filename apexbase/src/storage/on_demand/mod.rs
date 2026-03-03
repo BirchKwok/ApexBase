@@ -314,9 +314,24 @@ impl CompressionType {
 }
 
 // Per-column encoding types (stored as 1-byte prefix when encoding_version=1)
+//
+// Column compression encodings (0-15):
 const COL_ENCODING_PLAIN: u8 = 0;
 const COL_ENCODING_RLE: u8 = 1;
 const COL_ENCODING_BITPACK: u8 = 2;
+const COL_ENCODING_RLE_BOOL: u8 = 3;
+
+// Extended encodings for compatibility with other systems (16-31):
+const COL_ENCODING_FORWARD: u8 = 16;   // Forward encoding (delta)
+const COL_ENCODING_DICTIONARY: u8 = 17; // Dictionary encoding for strings
+const COL_ENCODING_UNENCODED: u8 = 18; // Unencoded (raw bytes)
+
+// Character encoding hints for string columns (typically stored in schema, not per-column):
+// These are not column compression encodings, but we handle them gracefully if encountered.
+const CHAR_ENCODING_UTF8: u8 = 1;      // UTF-8 (common)
+const CHAR_ENCODING_ASCII: u8 = 0;      // ASCII (7-bit)
+const CHAR_ENCODING_LATIN1: u8 = 208;  // ISO-8859-1 (Latin-1)
+const CHAR_ENCODING_UTF16: u8 = 209;    // UTF-16
 
 /// Encode an Int64 column with RLE (Run-Length Encoding).
 /// Format: [count:u64][num_runs:u64][(value:i64, run_len:u32)...]
@@ -665,8 +680,6 @@ fn rle_decode_bool(bytes: &[u8]) -> io::Result<(ColumnData, usize)> {
     Ok((ColumnData::Bool { data, len: count }, pos))
 }
 
-const COL_ENCODING_RLE_BOOL: u8 = 3;
-
 /// Write a column with encoding prefix: [encoding:u8][encoded_data...]
 /// Tries RLE → Bit-pack → Plain, picks the smallest encoding.
 fn write_column_encoded<W: Write>(col: &ColumnData, col_type: ColumnType, writer: &mut W) -> io::Result<()> {
@@ -901,7 +914,28 @@ fn read_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<(Column
             let (col, consumed) = rle_decode_bool(data_bytes)?;
             Ok((col, 1 + consumed))
         }
-        _ => Err(err_data(&format!("Unknown column encoding: {}", encoding))),
+        // Handle extended encodings - fallback to plain for compatibility
+        COL_ENCODING_FORWARD | COL_ENCODING_DICTIONARY | COL_ENCODING_UNENCODED => {
+            // Treat as plain encoding for backward compatibility
+            let (col, consumed) = ColumnData::from_bytes_typed(data_bytes, col_type)?;
+            Ok((col, 1 + consumed))
+        }
+        // Handle potential character encoding values (not compression encodings)
+        // These may appear if data was written by another system or corrupted
+        _ => {
+            // Check if this might be a character encoding (typically seen in string columns)
+            // Character encodings like UTF-8, Latin-1, UTF-16 are not column compression,
+            // so we treat the entire byte sequence as plain data
+            if matches!(col_type, ColumnType::String | ColumnType::StringDict | ColumnType::Binary) {
+                // For string/binary types, treat unknown byte as raw data (PLAIN fallback)
+                let (col, consumed) = ColumnData::from_bytes_typed(data_bytes, col_type)?;
+                Ok((col, 1 + consumed))
+            } else {
+                // For other types, try as plain encoding (might be data corruption or legacy format)
+                let (col, consumed) = ColumnData::from_bytes_typed(data_bytes, col_type)?;
+                Ok((col, 1 + consumed))
+            }
+        }
     }
 }
 

@@ -812,7 +812,7 @@ impl ApexExecutor {
 
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
-            None => return Ok(None);
+            None => return Ok(None),
         };
         let (col_name, pattern) = match Self::extract_like_pattern(where_clause) {
             Some(v) => v,
@@ -908,7 +908,7 @@ impl ApexExecutor {
                 return Ok(Some(backend.read_columns_to_arrow(col_refs.as_deref(), 0, Some(0))?));
             }
             indices = indices[offset..].to_vec();
- = indices[offset..        }
+         }
         if let Some(lim) = stmt.limit {
             indices.truncate(lim);
         }

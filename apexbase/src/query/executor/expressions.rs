@@ -3255,9 +3255,9 @@ impl ApexExecutor {
         let array = Self::get_column_by_name(batch, col_name)
             .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
 
-        // Try Arrow's optimized match_like first (much faster than custom implementation)
+        // Try Arrow's optimized like first (much faster than custom implementation)
         if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-            match compute::match_like(string_array, pattern) {
+            match compute::like(string_array, pattern) {
                 Ok(result) => {
                     if negated {
                         return compute::not(&result).map_err(|e| err_data(e.to_string()));
