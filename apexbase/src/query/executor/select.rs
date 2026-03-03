@@ -867,13 +867,14 @@ impl ApexExecutor {
                 .map(|cols| cols.iter().map(|s| s.as_str()).collect());
 
             // Read all data and filter in one pass
-            let full_batch = backend.read_columns_to_arrow(col_refs.as_deref().map(|v| v.as_slice()), 0, None)?;
+            let col_refs_deref: Option<&[&str]> = col_refs.as_deref();
+            let full_batch = backend.read_columns_to_arrow(col_refs_deref, 0, None)?;
             if full_batch.num_rows() == 0 {
                 return Ok(Some(full_batch));
             }
 
             // Evaluate predicate on full batch using vectorized operations
-            let storage_path = backend.get_storage_path();
+            let storage_path = backend.path();
             let mask = Self::evaluate_predicate_with_storage(&full_batch, where_clause, storage_path)?;
 
             // Use Arrow's optimized filter
