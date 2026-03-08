@@ -7,6 +7,7 @@ This module provides the ApexClient class that wraps ApexStorage with on-demand 
 import os
 import re
 import threading
+import queue
 
 import json
 
@@ -25,6 +26,34 @@ ARROW_AVAILABLE = True
 POLARS_AVAILABLE = True
 
 import struct
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto Scheduler - Initialize scheduler lazily for parallel query execution
+# ─────────────────────────────────────────────────────────────────────────────
+_auto_scheduler_enabled = False
+_auto_scheduler_initialized = False
+
+def _init_auto_scheduler():
+    """Initialize the scheduler automatically if enabled"""
+    global _auto_scheduler_initialized
+    if not _auto_scheduler_initialized:
+        try:
+            from apexbase import _core
+            _core.init_query_scheduler(4)
+            _auto_scheduler_initialized = True
+        except Exception:
+            pass
+
+def _enable_auto_scheduler():
+    """Enable automatic scheduler for concurrent query execution"""
+    global _auto_scheduler_enabled
+    _auto_scheduler_enabled = True
+    _init_auto_scheduler()
+
+def _disable_auto_scheduler():
+    """Disable automatic scheduler"""
+    global _auto_scheduler_enabled
+    _auto_scheduler_enabled = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Vector encoding / decoding helpers
@@ -1083,6 +1112,69 @@ class ApexClient:
             rv = ResultView(arrow_table=table, data=None)
             rv._show_internal_id = show_internal_id
             return rv
+
+    def execute_batch(self, queries: List[str]) -> List['ResultView']:
+        """Execute multiple queries in parallel using Rust's Query Scheduler.
+
+        This is more efficient than calling execute() multiple times from Python
+        because it avoids Python GIL contention and thread creation overhead.
+        Uses the internal thread pool scheduler for optimal parallel execution.
+
+        Args:
+            queries: List of SQL queries to execute
+
+        Returns:
+            List of ResultView objects, one for each query
+        """
+        global _auto_scheduler_enabled, _auto_scheduler_initialized
+
+        if not queries:
+            return []
+
+        # For single queries, skip scheduler overhead and execute directly
+        # The scheduler is optimized for batch workloads (multiple queries)
+        if len(queries) == 1:
+            return [self.execute(queries[0])]
+
+        # Auto-enable scheduler on first batch execution
+        if not _auto_scheduler_initialized:
+            _init_auto_scheduler()
+
+        # Try to use scheduler if available
+        try:
+            from apexbase import _core
+            table_path = self._current_table
+            if table_path:
+                full_path = os.path.join(self._storage._base_dir, f"{table_path}")
+                results = _core.execute_scheduled_batch(queries, full_path)
+                # Convert results to ResultView
+                view_results = []
+                for success, error in results:
+                    if success:
+                        view_results.append(ResultView(arrow_table=None, data=None))
+                    else:
+                        raise Exception(error)
+                return view_results
+        except Exception:
+            pass  # Fall back to Rust batch execute
+
+        # Call Rust batch execute
+        ipc_bytes_list = self._storage.execute_batch(queries)
+
+        # Parse each IPC result
+        results = []
+        for ipc_bytes in ipc_bytes_list:
+            if ipc_bytes:
+                reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
+                table = reader.read_all()
+                if table.num_rows == 0:
+                    table = None
+                rv = ResultView(arrow_table=table, data=None)
+                results.append(rv)
+            else:
+                results.append(ResultView(arrow_table=None, data=None))
+
+        return results
 
     def topk_distance(
         self,

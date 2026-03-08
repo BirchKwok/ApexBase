@@ -780,8 +780,8 @@ impl ApexExecutor {
         alias: &Option<String>,
     ) -> io::Result<(Field, ArrayRef)> {
         use crate::query::AggregateFunc;
-        use std::collections::HashSet;
-        
+        use ahash::AHashSet;
+
         let fn_name = match func { AggregateFunc::Count => "COUNT", AggregateFunc::Sum => "SUM", AggregateFunc::Avg => "AVG", AggregateFunc::Min => "MIN", AggregateFunc::Max => "MAX" };
         let output_name = alias.clone().unwrap_or_else(|| if let Some(col) = column { format!("{}({})", fn_name, col) } else { format!("{}(*)", fn_name) });
 
@@ -794,17 +794,18 @@ impl ApexExecutor {
                     } else if let Some(array) = batch.column_by_name(col_name) {
                         if distinct {
                             // COUNT(DISTINCT column) - count unique non-null values
+                            // OPTIMIZATION: Use AHashSet instead of std HashSet for faster hashing
                             if let Some(int_arr) = array.as_any().downcast_ref::<Int64Array>() {
-                                let unique: HashSet<i64> = int_arr.iter().filter_map(|v| v).collect();
+                                let unique: AHashSet<i64> = int_arr.iter().filter_map(|v| v).collect();
                                 unique.len() as i64
                             } else if let Some(str_arr) = array.as_any().downcast_ref::<StringArray>() {
-                                let unique: HashSet<&str> = (0..str_arr.len())
+                                let unique: AHashSet<&str> = (0..str_arr.len())
                                     .filter(|&i| !str_arr.is_null(i))
                                     .map(|i| str_arr.value(i))
                                     .collect();
                                 unique.len() as i64
                             } else if let Some(float_arr) = array.as_any().downcast_ref::<Float64Array>() {
-                                let unique: HashSet<u64> = float_arr.iter()
+                                let unique: AHashSet<u64> = float_arr.iter()
                                     .filter_map(|v| v.map(|f| f.to_bits()))
                                     .collect();
                                 unique.len() as i64

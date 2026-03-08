@@ -22,6 +22,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use parking_lot::RwLock;
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 
 use crate::query::{SqlParser, SqlStatement, SelectStatement, SqlExpr, SelectColumn, JoinType, JoinClause, UnionStatement, AggregateFunc};
@@ -217,8 +218,8 @@ where
 const MAX_CACHE_ENTRIES: usize = 64;  // Limit cache to 64 tables
 
 type CacheEntry = (Arc<TableStorageBackend>, std::time::SystemTime, Arc<AtomicU64>);
-static STORAGE_CACHE: Lazy<RwLock<AHashMap<PathBuf, CacheEntry>>> =
-    Lazy::new(|| RwLock::new(AHashMap::with_capacity(MAX_CACHE_ENTRIES)));
+// DashMap provides fine-grained locking - concurrent reads don't block each other
+static STORAGE_CACHE: Lazy<DashMap<PathBuf, CacheEntry>> = Lazy::new(DashMap::new);
 
 /// Returns current time as nanoseconds since UNIX_EPOCH (fits in u64 until year 2554)
 #[inline(always)]
@@ -308,18 +309,21 @@ where
 }
 
 /// Evict least recently used entries from cache if over limit
-fn evict_lru_cache_entries(cache: &mut AHashMap<PathBuf, CacheEntry>) {
-    if cache.len() <= MAX_CACHE_ENTRIES {
+fn evict_lru_cache_entries() {
+    if STORAGE_CACHE.len() <= MAX_CACHE_ENTRIES {
         return;
     }
-    let entries_to_remove = cache.len() - MAX_CACHE_ENTRIES + 1;
-    let mut access_times: Vec<(PathBuf, u64)> = cache
+    let entries_to_remove = STORAGE_CACHE.len() - MAX_CACHE_ENTRIES + 1;
+    let mut access_times: Vec<(PathBuf, u64)> = STORAGE_CACHE
         .iter()
-        .map(|(k, (_, _, access))| (k.clone(), access.load(Ordering::Relaxed)))
+        .map(|entry| {
+            let (path, (_, _, access)) = entry.pair();
+            (path.clone(), access.load(Ordering::Relaxed))
+        })
         .collect();
     access_times.sort_by_key(|(_, t)| *t);
     for (path, _) in access_times.into_iter().take(entries_to_remove) {
-        cache.remove(&path);
+        STORAGE_CACHE.remove(&path);
     }
 }
 
@@ -518,7 +522,7 @@ impl ZoneMap {
 /// CRITICAL: Must be called before any write operation to release mmap on Windows
 #[inline]
 pub fn invalidate_storage_cache(path: &Path) {
-    STORAGE_CACHE.write().remove(path);
+    STORAGE_CACHE.remove(path);
 }
 
 /// Invalidate all storage cache entries under a directory
@@ -526,8 +530,8 @@ pub fn invalidate_storage_cache(path: &Path) {
 #[inline]
 pub fn invalidate_storage_cache_dir(dir: &Path) {
     // Use path directly - avoid expensive canonicalize
-    let mut cache = STORAGE_CACHE.write();
-    cache.retain(|path, _| !path.starts_with(dir));
+    // DashMap::retain is available in dashmap 5.5+
+    STORAGE_CACHE.retain(|path, _| !path.starts_with(dir));
     // Also invalidate index caches
     invalidate_index_cache_dir(dir);
 }
@@ -546,15 +550,16 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
 
     // FASTEST PATH: if backend was validated within last 500ms, skip ALL stat() syscalls.
     // Uses AtomicU64 for last_access so no write-lock is needed on the warm hit path.
-    {
-        let cache = STORAGE_CACHE.read();
-        if let Some((backend, _, last_access)) = cache.get(&cache_key) {
-            if nanos_elapsed(last_access.load(Ordering::Relaxed)) < 500_000_000 {
-                let backend_clone = Arc::clone(backend);
-                // Refresh last_access atomically — no write lock needed
-                last_access.store(now_nanos(), Ordering::Relaxed);
-                return Ok(backend_clone);
-            }
+    // DashMap::get is lock-free for reads
+    if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
+        let pair = entry.pair();
+        let value = pair.1;
+        let last_access = &value.2;
+        if nanos_elapsed(last_access.load(Ordering::Relaxed)) < 500_000_000 {
+            let backend = Arc::clone(&value.0);
+            // Refresh last_access atomically — no write lock needed
+            last_access.store(now_nanos(), Ordering::Relaxed);
+            return Ok(backend);
         }
     }
 
@@ -563,7 +568,7 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     let metadata = file.metadata()?;
     let file_len = metadata.len();
     let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    
+
     // Check for delta file - combine path construction with existence check
     let delta_path = {
         let mut dp = cache_key.clone();
@@ -571,7 +576,7 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         dp.set_file_name(format!("{}.delta", name));
         dp
     };
-    
+
     // Check delta metadata (also gets modified time if exists)
     let (has_delta, effective_modified) = match std::fs::metadata(&delta_path) {
         Ok(delta_meta) => {
@@ -580,19 +585,22 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         }
         Err(_) => (false, modified),
     };
-    
+
     // Try read from cache first (only if no delta file pending)
     if !has_delta {
-        let cache = STORAGE_CACHE.read();
-        if let Some((backend, cached_time, last_access)) = cache.get(&cache_key) {
-            if *cached_time >= effective_modified {
-                let backend_clone = Arc::clone(backend);
+        if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
+            let pair = entry.pair();
+            let value = pair.1;
+            let cached_time = value.1;
+            let last_access = &value.2;
+            if cached_time >= effective_modified {
+                let backend = Arc::clone(&value.0);
                 last_access.store(now_nanos(), Ordering::Relaxed);
-                return Ok(backend_clone);
+                return Ok(backend);
             }
         }
     }
-    
+
     // Open backend — reuse pre-opened file when no delta (saves File::open + DeltaStore stat)
     let backend = Arc::new(if has_delta {
         drop(file); // release read handle before write path opens its own
@@ -603,20 +611,21 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     } else {
         TableStorageBackend::open_with_file(path, file, file_len)?
     });
-    
+
     // Use current time as modified (avoid extra metadata call after compaction)
     let new_modified = if has_delta {
         std::time::SystemTime::now() // Just compacted, use current time
     } else {
         effective_modified // No change, reuse
     };
-    
-    {
-        let mut cache = STORAGE_CACHE.write();
-        evict_lru_cache_entries(&mut cache);
-        cache.insert(cache_key, (Arc::clone(&backend), new_modified, Arc::new(AtomicU64::new(now_nanos()))));
+
+    // LRU eviction before insert - check cache size and evict if needed
+    if STORAGE_CACHE.len() >= MAX_CACHE_ENTRIES {
+        evict_lru_cache_entries();
     }
-    
+
+    STORAGE_CACHE.insert(cache_key, (Arc::clone(&backend), new_modified, Arc::new(AtomicU64::new(now_nanos()))));
+
     Ok(backend)
 }
 

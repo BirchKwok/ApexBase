@@ -889,5 +889,208 @@ class TestQueryOptimizations:
             client.close()
 
 
+class TestExecuteBatch:
+    """Test execute_batch functionality with scheduler"""
+
+    def test_execute_batch_single_query(self):
+        """Test execute_batch with a single query (should use direct execute)"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            # Store test data
+            test_data = [
+                {"name": "Alice", "age": 25, "city": "NYC"},
+                {"name": "Bob", "age": 30, "city": "LA"},
+                {"name": "Charlie", "age": 35, "city": "NYC"},
+            ]
+            client.store(test_data)
+
+            # Single query in batch
+            results = client.execute_batch([
+                "SELECT * FROM default WHERE name = 'Alice'"
+            ])
+
+            assert len(results) == 1
+            assert len(results[0]) == 1
+            assert results[0][0]["name"] == "Alice"
+
+            client.close()
+
+    def test_execute_batch_multiple_queries(self):
+        """Test execute_batch with multiple queries (uses scheduler)"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            # Store test data
+            test_data = [
+                {"name": "Alice", "age": 25, "city": "NYC"},
+                {"name": "Bob", "age": 30, "city": "LA"},
+                {"name": "Charlie", "age": 35, "city": "NYC"},
+            ]
+            client.store(test_data)
+
+            # Multiple queries in batch
+            queries = [
+                "SELECT COUNT(*) FROM default",
+                "SELECT * FROM default WHERE city = 'NYC'",
+                "SELECT AVG(age) FROM default",
+            ]
+            results = client.execute_batch(queries)
+
+            assert len(results) == 3
+            # COUNT(*)
+            assert len(results[0]) == 1
+            # WHERE city = 'NYC' (2 rows)
+            assert len(results[1]) == 2
+            # AVG(age)
+            assert len(results[2]) == 1
+
+            client.close()
+
+    def test_execute_batch_empty_list(self):
+        """Test execute_batch with empty query list"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            results = client.execute_batch([])
+
+            assert results == []
+
+            client.close()
+
+    def test_execute_batch_mixed_queries(self):
+        """Test execute_batch with different query types"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            # Store test data
+            test_data = [{"name": f"user_{i}", "value": i} for i in range(100)]
+            client.store(test_data)
+
+            queries = [
+                "SELECT * FROM default LIMIT 10",
+                "SELECT COUNT(*) FROM default WHERE value > 50",
+                "SELECT * FROM default WHERE value = 42",
+                "SELECT MAX(value), MIN(value) FROM default",
+            ]
+            results = client.execute_batch(queries)
+
+            assert len(results) == 4
+            # LIMIT 10
+            assert len(results[0]) == 10
+            # COUNT where value > 50
+            assert len(results[1]) == 1
+            # value = 42
+            assert len(results[2]) == 1
+            # MAX/MIN
+            assert len(results[3]) == 1
+
+            client.close()
+
+    def test_execute_batch_with_aggregation(self):
+        """Test execute_batch with GROUP BY queries"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            # Store test data with groups
+            test_data = [
+                {"category": "A", "value": 10},
+                {"category": "A", "value": 20},
+                {"category": "B", "value": 30},
+                {"category": "B", "value": 40},
+            ]
+            client.store(test_data)
+
+            queries = [
+                "SELECT category, SUM(value) FROM default GROUP BY category",
+                "SELECT category, AVG(value) FROM default GROUP BY category",
+            ]
+            results = client.execute_batch(queries)
+
+            assert len(results) == 2
+            # SUM
+            sum_result = results[0].to_dict()
+            assert len(sum_result) == 2
+            # AVG
+            avg_result = results[1].to_dict()
+            assert len(avg_result) == 2
+
+            client.close()
+
+    def test_execute_batch_no_results(self):
+        """Test execute_batch with queries returning no results"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            # Store minimal data
+            client.store({"name": "test", "value": 1})
+
+            queries = [
+                "SELECT * FROM default WHERE name = 'nonexistent'",
+                "SELECT * FROM default WHERE value > 1000",
+            ]
+            results = client.execute_batch(queries)
+
+            assert len(results) == 2
+            assert len(results[0]) == 0
+            assert len(results[1]) == 0
+
+            client.close()
+
+    def test_execute_batch_result_view_types(self):
+        """Test that execute_batch returns proper ResultView objects"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            client.store({"name": "test", "value": 42})
+
+            queries = ["SELECT * FROM default", "SELECT COUNT(*) FROM default"]
+            results = client.execute_batch(queries)
+
+            # Both should be ResultView
+            assert isinstance(results[0], ResultView)
+            assert isinstance(results[1], ResultView)
+
+            # Test that we can convert to dict
+            assert isinstance(results[0].to_dict(), list)
+            assert isinstance(results[1].to_dict(), list)
+
+            client.close()
+
+    def test_execute_batch_consistency_with_execute(self):
+        """Test that execute_batch gives same results as execute"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            # Store test data
+            test_data = [
+                {"name": "Alice", "age": 25},
+                {"name": "Bob", "age": 30},
+            ]
+            client.store(test_data)
+
+            query = "SELECT * FROM default WHERE age > 25"
+
+            # Execute via execute()
+            result_single = client.execute(query)
+
+            # Execute via execute_batch
+            result_batch = client.execute_batch([query])
+
+            # Should have same results
+            assert len(result_single) == len(result_batch[0])
+            assert result_single.to_dict() == result_batch[0].to_dict()
+
+            client.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

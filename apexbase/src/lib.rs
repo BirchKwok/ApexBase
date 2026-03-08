@@ -32,11 +32,103 @@ use pyo3::prelude::*;
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<python::ApexStorage>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+
+    // Add scheduler functions
+    m.add_function(pyo3::wrap_pyfunction!(init_query_scheduler, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(get_scheduler_status, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(execute_scheduled, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(execute_scheduled_batch, m)?)?;
+
     #[cfg(feature = "server")]
     m.add_function(pyo3::wrap_pyfunction!(python::start_pg_server, m)?)?;
     #[cfg(feature = "flight")]
     m.add_function(pyo3::wrap_pyfunction!(python::start_flight_server, m)?)?;
     Ok(())
+}
+
+/// Initialize the query scheduler with specified number of threads
+#[cfg(feature = "python")]
+#[pyfunction]
+fn init_query_scheduler(num_threads: Option<usize>) -> PyResult<()> {
+    let threads = num_threads.unwrap_or(4);
+    crate::query::scheduler::init_scheduler(threads);
+    Ok(())
+}
+
+/// Get scheduler status - returns (initialized: bool, active_count: int or -1)
+#[cfg(feature = "python")]
+#[pyfunction]
+fn get_scheduler_status() -> PyResult<(bool, i32)> {
+    let initialized = crate::query::scheduler::is_scheduler_initialized();
+    let active = if initialized {
+        crate::query::scheduler::get_active_count()
+            .map(|c| c as i32)
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
+    Ok((initialized, active))
+}
+
+/// Execute a query through the scheduler (for parallel execution)
+/// Returns a tuple of (success: bool, error_message: str)
+#[cfg(feature = "python")]
+#[pyfunction]
+fn execute_scheduled(sql: String, table_path: String) -> PyResult<(bool, String)> {
+    use crate::query::scheduler::{execute_through_scheduler, QueryResult};
+    use std::path::PathBuf;
+
+    let path = PathBuf::from(table_path);
+
+    // Try to get a receiver from the scheduler
+    match execute_through_scheduler(sql.clone(), path) {
+        Some(receiver) => {
+            // Wait for result
+            match receiver.recv() {
+                Ok(QueryResult::Data(_batch)) => {
+                    Ok((true, String::new()))
+                }
+                Ok(QueryResult::Error(e)) => Ok((false, e)),
+                Ok(QueryResult::Done) => Ok((true, String::new())),
+                Err(_) => Ok((false, "Channel error".to_string())),
+            }
+        }
+        None => Ok((false, "Scheduler not initialized".to_string())),
+    }
+}
+
+/// Execute multiple queries in parallel through the scheduler
+/// Returns list of (success: bool, error_message: str)
+#[cfg(feature = "python")]
+#[pyfunction]
+fn execute_scheduled_batch(sqls: Vec<String>, table_path: String) -> PyResult<Vec<(bool, String)>> {
+    use crate::query::scheduler::{execute_through_scheduler, QueryResult};
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+
+    let path = PathBuf::from(table_path);
+
+    // Submit all queries and collect receivers
+    let mut receivers = Vec::new();
+    for sql in &sqls {
+        match execute_through_scheduler(sql.clone(), path.clone()) {
+            Some(receiver) => receivers.push(receiver),
+            None => return Err(pyo3::exceptions::PyRuntimeError::new_err("Scheduler not initialized")),
+        }
+    }
+
+    // Wait for all results
+    let mut results = Vec::new();
+    for receiver in receivers {
+        match receiver.recv() {
+            Ok(QueryResult::Data(_batch)) => results.push((true, String::new())),
+            Ok(QueryResult::Error(e)) => results.push((false, e)),
+            Ok(QueryResult::Done) => results.push((true, String::new())),
+            Err(_) => results.push((false, "Channel error".to_string())),
+        }
+    }
+
+    Ok(results)
 }
 
 /// Storage engine error type

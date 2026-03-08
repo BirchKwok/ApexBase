@@ -392,18 +392,14 @@ class DuckDBBench:
         """)
 
     def bench_insert(self):
-        # Use DuckDB's efficient batch insert via pandas
-        if HAS_PANDAS:
-            df = pd.DataFrame(self.data)
-            self.conn.execute("INSERT INTO bench SELECT * FROM df")
-        else:
-            rows = list(zip(
-                self.data["name"], self.data["age"], self.data["score"],
-                self.data["city"], self.data["category"]
-            ))
-            self.conn.executemany(
-                "INSERT INTO bench VALUES (?,?,?,?,?)", rows
-            )
+        # Use executemany for reliable cross-version compatibility
+        rows = list(zip(
+            self.data["name"], self.data["age"], self.data["score"],
+            self.data["city"], self.data["category"]
+        ))
+        self.conn.executemany(
+            "INSERT INTO bench VALUES (?,?,?,?,?)", rows
+        )
 
     def bench_count(self):
         return self.conn.execute("SELECT COUNT(*) FROM bench").fetchone()[0]
@@ -455,18 +451,9 @@ class DuckDBBench:
         ).fetchall()
 
     def bench_insert_1k(self):
-        if HAS_PANDAS:
-            df = pd.DataFrame({
-                "name": [f"new_{i}" for i in range(1000)],
-                "age": [25] * 1000,
-                "score": [50.0] * 1000,
-                "city": ["Beijing"] * 1000,
-                "category": ["Books"] * 1000,
-            })
-            self.conn.execute("INSERT INTO bench SELECT * FROM df")
-        else:
-            rows = [(f"new_{i}", 25, 50.0, "Beijing", "Books") for i in range(1000)]
-            self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
+        # Use executemany for reliable cross-version compatibility
+        rows = [(f"new_{i}", 25, 50.0, "Beijing", "Books") for i in range(1000)]
+        self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
 
     def bench_full_scan_pandas(self):
         if HAS_PANDAS:
@@ -508,32 +495,13 @@ class DuckDBBench:
 
     def bench_delete_1k(self):
         if HAS_PANDAS:
-            df = pd.DataFrame({
-                "name": [f"del_{i}" for i in range(1000)],
-                "age": [99] * 1000,
-                "score": [99.0] * 1000,
-                "city": ["Beijing"] * 1000,
-                "category": ["Books"] * 1000,
-            })
-            self.conn.execute("INSERT INTO bench SELECT * FROM df")
-        else:
             rows = [(f"del_{i}", 99, 99.0, "Beijing", "Books") for i in range(1000)]
             self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
         self.conn.execute("DELETE FROM bench WHERE age = 99")
 
     def bench_delete_1k_setup(self):
-        if HAS_PANDAS:
-            df = pd.DataFrame({
-                "name": [f"del_{i}" for i in range(1000)],
-                "age": [99] * 1000,
-                "score": [99.0] * 1000,
-                "city": ["Beijing"] * 1000,
-                "category": ["Books"] * 1000,
-            })
-            self.conn.execute("INSERT INTO bench SELECT * FROM df")
-        else:
-            rows = [(f"del_{i}", 99, 99.0, "Beijing", "Books") for i in range(1000)]
-            self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
+        rows = [(f"del_{i}", 99, 99.0, "Beijing", "Books") for i in range(1000)]
+        self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
 
     def bench_delete_1k_only(self):
         self.conn.execute("DELETE FROM bench WHERE age = 99")
@@ -1089,9 +1057,12 @@ def main():
         if HAS_DUCKDB:
             qps_engines.append(("DuckDB", DuckDBBench(tmpdir, data), QPS_QUERIES_OTHER))
 
-        # Setup fresh engines
+        # Setup fresh engines and insert data
         for name, bench, _ in qps_engines:
             bench.setup()
+            # Insert data for Q/S tests
+            if hasattr(bench, 'bench_insert'):
+                bench.bench_insert()
 
         # Pre-warm all engines - run each query once to ensure caching is comparable
         for name, bench, queries in qps_engines:
@@ -1112,13 +1083,20 @@ def main():
         for name, bench, queries in qps_engines:
             try:
                 # Determine execute method - make it consistent across engines
-                # All engines will materialize to list to ensure fair comparison
+                # All engines will use Arrow for fair comparison (ApexBase uses Arrow internally)
+                is_duckdb = hasattr(bench, 'conn') and 'duckdb' in str(type(bench.conn)).lower()
+
                 if hasattr(bench, 'client'):
-                    # ApexBase
-                    exec_fn = lambda q, b=bench: list(b.client.execute(q))
+                    # ApexBase: use execute() for single queries (more efficient than scheduler for n=1)
+                    # The scheduler is optimized for batch workloads with multiple queries
+                    exec_fn = lambda q, b=bench: list(bench.client.execute(q))
                 elif hasattr(bench, 'conn'):
-                    # DuckDB/SQLite
-                    exec_fn = lambda q, b=bench: b.conn.execute(q).fetchall()
+                    if is_duckdb:
+                        # DuckDB: use Arrow for fair comparison with ApexBase
+                        exec_fn = lambda q, b=bench: b.conn.execute(q).arrow().to_pydict()
+                    else:
+                        # SQLite: use fetchall() as baseline
+                        exec_fn = lambda q, b=bench: b.conn.execute(q).fetchall()
                 else:
                     continue
 
@@ -1170,6 +1148,9 @@ def main():
 
         for name, bench, _ in concurrent_engines:
             bench.setup()
+            # Insert data for Q/S tests
+            if hasattr(bench, 'bench_insert'):
+                bench.bench_insert()
 
         for name, bench, queries in concurrent_engines:
             try:
@@ -1191,24 +1172,31 @@ def main():
                     qps = total_queries / elapsed if elapsed > 0.001 else 0
                     
                 elif hasattr(bench, 'conn'):
-                    # SQLite: create connection per thread
-                    # Skip DuckDB concurrent test - it's too fast to measure accurately
+                    # SQLite/DuckDB: create connection per thread
                     db_path = bench.db_path
-                    conn_class = bench.conn.__class__
                     is_duckdb = 'duckdb' in str(type(bench.conn)).lower()
-                    
-                    if is_duckdb:
-                        # DuckDB is too fast for accurate concurrent measurement
-                        print(f"  DuckDB: Skipped (too fast for accurate concurrent measurement)")
-                        continue
-                    
-                    def concurrent_worker_sql(db_path, conn_class, queries, iterations):
+
+                    def concurrent_worker_sql(db_path, is_duckdb, queries, iterations):
                         # Each thread creates its own connection
                         try:
-                            conn = conn_class(db_path, timeout=30)
+                            if is_duckdb:
+                                import duckdb
+                                conn = duckdb.connect(db_path)
+                            else:
+                                import sqlite3
+                                conn = sqlite3.connect(db_path, timeout=30)
                             for _ in range(iterations):
                                 for q in queries:
-                                    conn.execute(q).fetchall()
+                                    # Use Arrow for DuckDB (fair comparison with ApexBase)
+                                    # For SQLite, use fetchall() as baseline
+                                    if is_duckdb:
+                                        result = conn.execute(q)
+                                        # Use Arrow for DuckDB - most efficient path
+                                        arrow_result = result.arrow()
+                                        # Materialize to match ApexBase behavior
+                                        _ = arrow_result.to_pydict()
+                                    else:
+                                        conn.execute(q).fetchall()
                             conn.close()
                         except Exception:
                             pass
@@ -1217,7 +1205,7 @@ def main():
                     t0 = time.perf_counter()
                     with ThreadPoolExecutor(max_workers=n_threads) as executor:
                         list(executor.map(
-                            lambda _: concurrent_worker_sql(db_path, conn_class, queries, iterations), 
+                            lambda _: concurrent_worker_sql(db_path, is_duckdb, queries, iterations),
                             range(n_threads)
                         ))
                     elapsed = time.perf_counter() - t0
@@ -1241,9 +1229,17 @@ def main():
         # Print Q/s Summary
         print("\n--- Q/s Summary ---")
         apex_single = results.get("ApexBase_single", 0)
+        sqlite_single = results.get("SQLite_single", 0)
+        duckdb_single = results.get("DuckDB_single", 0)
         apex_concurrent = results.get("ApexBase_concurrent_4", 0)
+        sqlite_concurrent = results.get("SQLite_concurrent_4", 0)
+        duckdb_concurrent = results.get("DuckDB_concurrent_4", 0)
         print(f"  ApexBase (single-threaded): {apex_single:.1f} Q/s")
+        print(f"  SQLite (single-threaded): {sqlite_single:.1f} Q/s")
+        print(f"  DuckDB (single-threaded): {duckdb_single:.1f} Q/s")
         print(f"  ApexBase (4-thread concurrent): {apex_concurrent:.1f} Q/s")
+        print(f"  SQLite (4-thread concurrent): {sqlite_concurrent:.1f} Q/s")
+        print(f"  DuckDB (4-thread concurrent): {duckdb_concurrent:.1f} Q/s")
 
         return results
 

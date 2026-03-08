@@ -12,6 +12,8 @@ pub mod multi_column;
 pub mod simd_take;
 pub mod planner;
 pub mod vector_ops;
+pub mod vectorized_join;
+pub mod scheduler;
 
 pub use expr_compiler::sql_expr_to_filter;
 pub use filter::{Filter, CompareOp, LikeMatcher, RegexpMatcher};

@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use parking_lot::RwLock;
+use dashmap::DashMap;
+use rayon::prelude::*;
 use arrow::record_batch::RecordBatch;
 
 /// Convert Python dict to HashMap<String, Value>
@@ -163,7 +165,8 @@ pub struct ApexStorageImpl {
     tables_scanned: RwLock<bool>,
     /// Cached storage backends per table (table_name -> backend)
     /// Backends are opened once and reused for all operations
-    cached_backends: RwLock<HashMap<String, Arc<TableStorageBackend>>>,
+    /// Uses DashMap for lock-free concurrent reads
+    cached_backends: DashMap<String, Arc<TableStorageBackend>>,
     /// Current table name
     current_table: RwLock<String>,
     /// FTS Manager (optional) — Arc so it can be shared with the global SQL executor registry
@@ -334,15 +337,12 @@ impl ApexStorageImpl {
         let table_name = self.current_table.read().clone();
         let table_path = self.get_current_table_path()?;
         let cache_key = format!("{}_insert", table_name);
-        
-        // Check if backend is already cached
-        {
-            let backends = self.cached_backends.read();
-            if let Some(backend) = backends.get(&cache_key) {
-                return Ok(backend.clone());
-            }
+
+        // Check if backend is already cached (lock-free read)
+        if let Some(entry) = self.cached_backends.get(&cache_key) {
+            return Ok(entry.clone());
         }
-        
+
         // Create new backend with open_for_insert (memory efficient)
         let backend = if table_path.exists() {
             TableStorageBackend::open_for_insert_with_durability(&table_path, self.durability)
@@ -353,7 +353,7 @@ impl ApexStorageImpl {
         };
         
         let backend = Arc::new(backend);
-        self.cached_backends.write().insert(cache_key, backend.clone());
+        self.cached_backends.insert(cache_key, backend.clone());
         
         Ok(backend)
     }
@@ -363,15 +363,12 @@ impl ApexStorageImpl {
     fn get_backend(&self) -> PyResult<Arc<TableStorageBackend>> {
         let table_name = self.current_table.read().clone();
         let table_path = self.get_current_table_path()?;
-        
-        // Check if backend is already cached
-        {
-            let backends = self.cached_backends.read();
-            if let Some(backend) = backends.get(&table_name) {
-                return Ok(backend.clone());
-            }
+
+        // Check if backend is already cached (lock-free read)
+        if let Some(entry) = self.cached_backends.get(&table_name) {
+            return Ok(entry.clone());
         }
-        
+
         // Create new backend with durability level and cache it
         // Use open_for_write to ensure existing column data is loaded
         // This is necessary because save() rewrites the entire file from in-memory columns
@@ -384,16 +381,15 @@ impl ApexStorageImpl {
         };
         
         let backend = Arc::new(backend);
-        self.cached_backends.write().insert(table_name, backend.clone());
+        self.cached_backends.insert(table_name, backend.clone());
         
         Ok(backend)
     }
     
     /// Invalidate cached backend for a table (used when table is dropped or modified externally)
     fn invalidate_backend(&self, table_name: &str) {
-        let mut backends = self.cached_backends.write();
-        backends.remove(table_name);
-        backends.remove(&format!("{}_insert", table_name));
+        self.cached_backends.remove(table_name);
+        self.cached_backends.remove(&format!("{}_insert", table_name));
     }
 
     /// Return current base directory (root_dir for default db, root_dir/db for named db)
@@ -463,7 +459,7 @@ impl ApexStorageImpl {
             base_dir: RwLock::new(root_dir),
             table_paths: RwLock::new(HashMap::new()),
             tables_scanned: RwLock::new(false),
-            cached_backends: RwLock::new(HashMap::new()),
+            cached_backends: DashMap::new(),
             current_table: RwLock::new(String::new()),
             fts_manager: RwLock::new(None::<Arc<FtsManager>>),
             fts_index_fields: RwLock::new(HashMap::new()),
@@ -1121,7 +1117,7 @@ impl ApexStorageImpl {
                 if num_end > 0 {
                     if let Ok(id) = after_eq[..num_end].parse::<u64>() {
                         let table_name_fast = self.current_table.read().clone();
-                        let maybe_backend = self.cached_backends.read().get(&table_name_fast).cloned();
+                        let maybe_backend = self.cached_backends.get(&table_name_fast).map(|v| Arc::clone(&v));
                         if let Some(backend) = maybe_backend {
                             let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(id));
                             if let Ok(Some(vals)) = rcix_result {
@@ -1232,7 +1228,7 @@ impl ApexStorageImpl {
                     if let Ok(id) = after_eq[..num_end].parse::<u64>() {
                         if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
                             // Populate cached_backends so the ultra-fast path works on next call
-                            self.cached_backends.write().insert(table_name.clone(), Arc::clone(&backend));
+                            self.cached_backends.insert(table_name.clone(), Arc::clone(&backend));
                             let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(id));
                             if let Ok(Some(vals)) = rcix_result {
                                 let out = PyDict::new_bound(py);
@@ -1596,7 +1592,71 @@ impl ApexStorageImpl {
         
         Ok(out.into())
     }
-    
+
+    /// Execute multiple SQL queries in parallel using Rayon
+    /// Returns a list of IPC byte arrays for each query
+    fn execute_batch(&self, py: Python<'_>, queries: Vec<String>) -> PyResult<PyObject> {
+        use arrow::ipc::writer::StreamWriter;
+
+        let table_path = self.get_current_table_path()
+            .unwrap_or_else(|_| self.current_base_dir());
+        let base_dir = self.current_base_dir();
+        let root_dir = self.root_dir.clone();
+
+        // Execute queries in parallel using Rayon (releases GIL)
+        let ipc_results: Vec<Result<Vec<u8>, String>> = py.allow_threads(|| {
+            use rayon::prelude::*;
+
+            queries
+                .par_iter()
+                .map(|sql| {
+                    crate::query::executor::set_query_root_dir(&root_dir);
+
+                    // Execute query in Rust thread pool
+                    let result = ApexExecutor::execute_with_base_dir(sql, &base_dir, &table_path);
+                    let batch = match result {
+                        Ok(r) => r.to_record_batch(),
+                        Err(e) => return Err(e.to_string()),
+                    };
+                    let batch = match batch {
+                        Ok(b) => b,
+                        Err(e) => return Err(e.to_string()),
+                    };
+
+                    crate::query::executor::clear_query_root_dir();
+
+                    // Serialize to IPC format
+                    let estimated_size = batch.get_array_memory_size() + 512;
+                    let mut buf = Vec::with_capacity(estimated_size);
+                    {
+                        let mut writer = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
+                            .map_err(|e| format!("IPC writer error: {}", e))?;
+                        writer.write(&batch)
+                            .map_err(|e| format!("IPC write error: {}", e))?;
+                        writer.finish()
+                            .map_err(|e| format!("IPC finish error: {}", e))?;
+                    }
+                    Ok(buf)
+                })
+                .collect()
+        });
+
+        // Build Python list of results
+        let empty_slice: &[PyObject] = &[];
+        let list = PyList::new_bound(py, empty_slice);
+
+        for result in ipc_results {
+            match result {
+                Ok(buf) => {
+                    let py_bytes = pyo3::types::PyBytes::new_bound(py, &buf);
+                    list.append(py_bytes)?;
+                }
+                Err(e) => return Err(PyRuntimeError::new_err(e)),
+            }
+        }
+        Ok(list.into())
+    }
+
     /// Execute SQL query and return Arrow FFI pointers for zero-copy transfer
     /// Returns (schema_ptr, array_ptr) that can be imported by PyArrow
     fn _execute_arrow_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(usize, usize)> {
@@ -1991,7 +2051,7 @@ impl ApexStorageImpl {
         *self.base_dir.write() = new_base_dir;
 
         // Clear all per-database caches
-        self.cached_backends.write().clear();
+        self.cached_backends.clear();
         self.table_paths.write().clear();
         *self.tables_scanned.write() = false;
         *self.current_table.write() = String::new();
@@ -2090,9 +2150,8 @@ impl ApexStorageImpl {
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         
         let result = {
-            let backends = self.cached_backends.read();
             let table_name = self.current_table.read().clone();
-            if let Some(backend) = backends.get(&table_name) {
+            if let Some(backend) = self.cached_backends.get(&table_name) {
                 backend.sync()
                     .map_err(|e| PyIOError::new_err(format!("Failed to sync: {}", e)))
             } else {
@@ -2123,9 +2182,8 @@ impl ApexStorageImpl {
         *self.auto_flush_rows.write() = rows;
         *self.auto_flush_bytes.write() = bytes;
         // Also apply to cached backend if present
-        let mut backends = self.cached_backends.write();
         let table_name = self.current_table.read().clone();
-        if let Some(backend) = backends.get_mut(&table_name) {
+        if let Some(backend) = self.cached_backends.get(&table_name) {
             backend.set_auto_flush(rows, bytes);
         }
         Ok(())
@@ -2140,16 +2198,14 @@ impl ApexStorageImpl {
     
     /// Get estimated memory usage in bytes
     fn estimate_memory_bytes(&self) -> PyResult<u64> {
-        let backends = self.cached_backends.read();
         let table_name = self.current_table.read().clone();
-        if let Some(backend) = backends.get(&table_name) {
+        if let Some(backend) = self.cached_backends.get(&table_name) {
             let mem = backend.estimate_memory_bytes();
             if mem > 0 {
                 return Ok(mem);
             }
         }
         // No in-memory data (flushed to disk): estimate from file size
-        drop(backends);
         if let Ok(table_path) = self.get_current_table_path() {
             if let Ok(meta) = std::fs::metadata(&table_path) {
                 return Ok(meta.len());
@@ -2202,7 +2258,7 @@ impl ApexStorageImpl {
     /// Close storage
     fn close(&self) -> PyResult<()> {
         // Clear per-instance cached backends (releases per-instance references)
-        self.cached_backends.write().clear();
+        self.cached_backends.clear();
         
         // On Windows: release all mmaps so temp directories can be cleaned up.
         // On Unix: mmaps remain valid after atomic rename; keep STORAGE_CACHE alive
@@ -2227,14 +2283,13 @@ impl ApexStorageImpl {
         // Use per-instance cached_backends first: no stat() syscalls (~600µs saved vs get_cached_backend_pub).
         let table_name = self.current_table.read().clone();
         let maybe_cached = {
-            let cb = self.cached_backends.read();
-            cb.get(&table_name).cloned()
+            self.cached_backends.get(&table_name).map(|v| Arc::clone(&v))
         };
         let backend_opt: Option<Arc<TableStorageBackend>> = if let Some(b) = maybe_cached {
             Some(b)
         } else if let Ok(b) = crate::query::get_cached_backend_pub(&table_path) {
             // Populate per-instance cache so next call is zero-syscall
-            self.cached_backends.write().insert(table_name.clone(), Arc::clone(&b));
+            self.cached_backends.insert(table_name.clone(), Arc::clone(&b));
             Some(b)
         } else {
             None

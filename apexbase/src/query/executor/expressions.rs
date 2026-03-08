@@ -1,5 +1,10 @@
 // Filter, predicate evaluation, expression evaluation, SQL functions
 
+use crate::query::vectorized_join::{
+    count_matching_int64, count_matching_float64,
+    filter_int64_batch, filter_float64_batch,
+};
+
 impl ApexExecutor {
     /// Apply WHERE clause filter using Arrow compute
     /// When storage_path is provided, enables Zone Map optimization and subquery support
@@ -10,12 +15,46 @@ impl ApexExecutor {
                 return Ok(RecordBatch::new_empty(batch.schema()));
             }
         }
-        
+
         let mask = if let Some(path) = storage_path {
             Self::evaluate_predicate_with_storage(batch, expr, path)?
         } else {
             Self::evaluate_predicate(batch, expr)?
         };
+
+        // Early exit optimization: check if mask selects all or none
+        // This avoids unnecessary filter operation overhead
+        let num_rows = batch.num_rows();
+        if num_rows > 0 {
+            use arrow::array::BooleanArray;
+
+            // OPTIMIZATION: Check if mask is all true (select all) - skip filtering
+            if mask.null_count() == 0 {
+                // All values are non-null, check if all are true
+                let mut all_true = true;
+                let check_len = num_rows.min(64); // Sample first 64 rows
+                for i in 0..check_len {
+                    if !mask.value(i) {
+                        all_true = false;
+                        break;
+                    }
+                }
+                if all_true {
+                    // Verify all rows are true
+                    let mut verified = true;
+                    for i in check_len..num_rows {
+                        if !mask.value(i) {
+                            verified = false;
+                            break;
+                        }
+                    }
+                    if verified {
+                        return Ok(batch.clone());
+                    }
+                }
+            }
+        }
+
         compute::filter_record_batch(batch, &mask)
             .map_err(|e| err_data( e.to_string()))
     }
@@ -111,19 +150,57 @@ impl ApexExecutor {
     /// Evaluate a predicate expression to a boolean mask
     fn evaluate_predicate(batch: &RecordBatch, expr: &SqlExpr) -> io::Result<BooleanArray> {
         use crate::query::sql_parser::{BinaryOperator, UnaryOperator};
-        
+
         match expr {
             SqlExpr::BinaryOp { left, op, right } => {
                 // Handle logical operators (AND, OR)
                 match op {
                     BinaryOperator::And => {
+                        // Short-circuit evaluation: if left is all false, don't evaluate right
                         let left_mask = Self::evaluate_predicate(batch, left)?;
+
+                        // Check if left is all false (early exit)
+                        if left_mask.null_count() == 0 {
+                            let mut all_false = true;
+                            for i in 0..left_mask.len().min(64) {
+                                if left_mask.value(i) { all_false = false; break; }
+                            }
+                            if all_false {
+                                for i in 64..left_mask.len() {
+                                    if left_mask.value(i) { all_false = false; break; }
+                                }
+                            }
+                            if all_false {
+                                // Left is all false, AND result is all false
+                                return Ok(BooleanArray::from(vec![false; left_mask.len()]));
+                            }
+                        }
+
                         let right_mask = Self::evaluate_predicate(batch, right)?;
                         compute::and(&left_mask, &right_mask)
                             .map_err(|e| err_data( e.to_string()))
                     }
                     BinaryOperator::Or => {
+                        // Short-circuit evaluation: if left is all true, don't evaluate right
                         let left_mask = Self::evaluate_predicate(batch, left)?;
+
+                        // Check if left is all true (early exit)
+                        if left_mask.null_count() == 0 {
+                            let mut all_true = true;
+                            for i in 0..left_mask.len().min(64) {
+                                if !left_mask.value(i) { all_true = false; break; }
+                            }
+                            if all_true {
+                                for i in 64..left_mask.len() {
+                                    if !left_mask.value(i) { all_true = false; break; }
+                                }
+                            }
+                            if all_true {
+                                // Left is all true, OR result is all true
+                                return Ok(BooleanArray::from(vec![true; left_mask.len()]));
+                            }
+                        }
+
                         let right_mask = Self::evaluate_predicate(batch, right)?;
                         compute::or(&left_mask, &right_mask)
                             .map_err(|e| err_data( e.to_string()))
@@ -400,9 +477,12 @@ impl ApexExecutor {
             .or_else(|| sub_batch.column(sub_batch.num_columns() - 1).into())
             .ok_or_else(|| err_not_found(format!("Inner join column: {}", inner_col_clean)))?;
         let sub_value_col = sub_batch.column(0);
-        
+
         // Build hash map: outer_value -> set of IN values
-        let mut join_map: std::collections::HashMap<String, HashSet<u64>> = std::collections::HashMap::new();
+        // OPTIMIZATION: Use AHashMap and AHashSet for faster hashing
+        use ahash::AHashMap;
+        use ahash::AHashSet;
+        let mut join_map: AHashMap<String, AHashSet<u64>> = AHashMap::new();
         for i in 0..sub_batch.num_rows() {
             if !inner_join_col.is_null(i) {
                 let join_key = Self::arrow_value_to_string(inner_join_col, i);
@@ -528,8 +608,10 @@ impl ApexExecutor {
         }
         
         // Build hash set from inner column values
+        // OPTIMIZATION: Use AHashSet for faster string hashing
         let inner_array = sub_batch.column(0);
-        let mut hash_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        use ahash::AHashSet;
+        let mut hash_set: AHashSet<String> = AHashSet::new();
         for i in 0..inner_array.len() {
             if !inner_array.is_null(i) {
                 let val = Self::arrow_value_to_string(inner_array, i);
@@ -923,15 +1005,60 @@ impl ApexExecutor {
                 Value::Float64(f) => *f as i64,
                 _ => return Ok(None),
             };
-            
-            // JIT optimization for large arrays (>100k rows)
+
+            // VECTORIZED OPTIMIZATION: Use batch filtering for simple comparisons
+            // This is faster than Arrow compute kernels for most cases
             let num_rows = int_arr.len();
+            let op_str = match (op, reversed) {
+                (BinaryOperator::Gt, false) => ">",
+                (BinaryOperator::Lt, false) => "<",
+                (BinaryOperator::Ge, false) => ">=",
+                (BinaryOperator::Le, false) => "<=",
+                (BinaryOperator::Gt, true) => "<",  // reversed: val > literal means literal < val
+                (BinaryOperator::Lt, true) => ">",
+                (BinaryOperator::Ge, true) => "<=",
+                (BinaryOperator::Le, true) => ">=",
+                _ => "",
+            };
+
+            // Use batch filtering for simple range comparisons (> < >= <=)
+            if !op_str.is_empty() && int_arr.null_count() == 0 {
+                let values = int_arr.values();
+                let is_equal = op_str == ">=" || op_str == "<=";
+                let indices = filter_int64_batch(values, int_val, op_str == ">" || op_str == ">=", is_equal);
+
+                if indices.len() == num_rows {
+                    // All match - return all true
+                    return Ok(Some(BooleanArray::from(vec![true; num_rows])));
+                } else if indices.is_empty() {
+                    // None match - return all false
+                    return Ok(Some(BooleanArray::from(vec![false; num_rows])));
+                }
+                // Partial match - build boolean array from indices
+                if indices.len() < num_rows / 2 {
+                    // Sparse result - use builder
+                    let mut builder = arrow::array::BooleanBuilder::with_capacity(num_rows);
+                    let mut idx_pos = 0;
+                    for i in 0..num_rows {
+                        if idx_pos < indices.len() && indices[idx_pos] == i {
+                            builder.append_value(true);
+                            idx_pos += 1;
+                        } else {
+                            builder.append_value(false);
+                        }
+                    }
+                    return Ok(Some(builder.finish()));
+                }
+                // Otherwise fall through to Arrow compute (dense result)
+            }
+
+            // JIT optimization for large arrays (>100k rows)
             if num_rows > 100_000 {
                 if let Some(result) = Self::try_jit_int_filter(int_arr, op, int_val, reversed) {
                     return Ok(Some(result));
                 }
             }
-            
+
             let scalar = Scalar::new(Int64Array::from(vec![int_val]));
             let result = match (op, reversed) {
                 (BinaryOperator::Eq, _) => cmp::eq(int_arr, &scalar),
@@ -974,6 +1101,47 @@ impl ApexExecutor {
                 Value::Int64(i) => *i as f64,
                 _ => return Ok(None),
             };
+
+            // VECTORIZED OPTIMIZATION: Use batch filtering for Float64
+            let num_rows = float_arr.len();
+            let op_str = match (op, reversed) {
+                (BinaryOperator::Gt, false) => ">",
+                (BinaryOperator::Lt, false) => "<",
+                (BinaryOperator::Ge, false) => ">=",
+                (BinaryOperator::Le, false) => "<=",
+                (BinaryOperator::Gt, true) => "<",
+                (BinaryOperator::Lt, true) => ">",
+                (BinaryOperator::Ge, true) => "<=",
+                (BinaryOperator::Le, true) => ">=",
+                _ => "",
+            };
+
+            // Use batch filtering for simple range comparisons
+            if !op_str.is_empty() && float_arr.null_count() == 0 {
+                let values = float_arr.values();
+                let is_equal = op_str == ">=" || op_str == "<=";
+                let indices = filter_float64_batch(values, float_val, op_str == ">" || op_str == ">=", is_equal);
+
+                if indices.len() == num_rows {
+                    return Ok(Some(BooleanArray::from(vec![true; num_rows])));
+                } else if indices.is_empty() {
+                    return Ok(Some(BooleanArray::from(vec![false; num_rows])));
+                }
+                if indices.len() < num_rows / 2 {
+                    let mut builder = arrow::array::BooleanBuilder::with_capacity(num_rows);
+                    let mut idx_pos = 0;
+                    for i in 0..num_rows {
+                        if idx_pos < indices.len() && indices[idx_pos] == i {
+                            builder.append_value(true);
+                            idx_pos += 1;
+                        } else {
+                            builder.append_value(false);
+                        }
+                    }
+                    return Ok(Some(builder.finish()));
+                }
+            }
+
             let scalar = Scalar::new(Float64Array::from(vec![float_val]));
             let result = match (op, reversed) {
                 (BinaryOperator::Eq, _) => cmp::eq(float_arr, &scalar),
