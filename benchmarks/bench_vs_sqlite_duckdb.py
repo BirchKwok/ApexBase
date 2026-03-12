@@ -265,6 +265,14 @@ class SQLiteBench:
             "SELECT * FROM bench WHERE _id = 5000"
         ).fetchone()
 
+    def bench_retrieve_many(self):
+        # Retrieve 100 random IDs
+        ids = random.sample(range(1, self.n + 1), 100)
+        placeholders = ",".join(["?"] * 100)
+        return self.conn.execute(
+            f"SELECT * FROM bench WHERE _id IN ({placeholders})", ids
+        ).fetchall()
+
     def bench_insert_1k(self):
         rows = [(f"new_{i}", 25, 50.0, "Beijing", "Books") for i in range(1000)]
         self.conn.executemany(
@@ -450,6 +458,14 @@ class DuckDBBench:
             "SELECT * FROM bench WHERE rowid = 5000"
         ).fetchall()
 
+    def bench_retrieve_many(self):
+        # Retrieve 100 random IDs using rowid
+        ids = random.sample(range(1, self.n + 1), 100)
+        placeholders = ",".join(["?"] * 100)
+        return self.conn.execute(
+            f"SELECT * FROM bench WHERE rowid IN ({placeholders})", ids
+        ).fetchall()
+
     def bench_insert_1k(self):
         # Use executemany for reliable cross-version compatibility
         rows = [(f"new_{i}", 25, 50.0, "Beijing", "Books") for i in range(1000)]
@@ -616,6 +632,11 @@ class ApexBaseBench:
         # Use optimized retrieve API for point lookup by ID
         return self.client.retrieve(5000)
 
+    def bench_retrieve_many(self):
+        # Retrieve 100 random IDs using retrieve_many
+        ids = random.sample(range(1, self.n + 1), 100)
+        return self.client.retrieve_many(ids)
+
     def bench_insert_1k(self):
         data_1k = {
             "name": [f"new_{i}" for i in range(1000)],
@@ -750,6 +771,7 @@ BENCHMARKS = [
     ("Aggregation (5 funcs)",            "bench_aggregation",      False, False, False, None),
     ("Complex (Filter+Group+Order)",     "bench_complex",          False, False, False, None),
     ("Point Lookup (by ID)",             "bench_point_lookup",     False, False, False, None),
+    ("Retrieve Many (100 IDs)",          "bench_retrieve_many",    False, False, False, None),
     ("Insert 1K rows",                   "bench_insert_1k",        False, False, False, None),
     # --- New cases ---
     ("SELECT * -> pandas (full scan)",   "bench_full_scan_pandas", False, False, False, None),

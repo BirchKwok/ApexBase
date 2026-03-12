@@ -290,18 +290,18 @@ class ResultView:
     
     def to_pandas(self, zero_copy: bool = True):
         """Convert results to a pandas DataFrame.
-        
+
         Args:
             zero_copy: If True, use ArrowDtype for zero-copy conversion (pandas 2.0+).
                 If False, use traditional conversion copying data to NumPy.
                 Defaults to True.
-        
+
         Returns:
             pandas.DataFrame: DataFrame containing the query results.
-        
+
         Raises:
             ImportError: If pandas is not available.
-        
+
         Note:
             In zero-copy mode, DataFrame columns use Arrow native types (like string[pyarrow]).
             This performs better in most scenarios, but some NumPy operations may need
@@ -309,7 +309,18 @@ class ResultView:
         """
         if not ARROW_AVAILABLE:
             raise ImportError("pandas not available. Install with: pip install pandas")
-        
+
+        # Fast path: if we have lazy_pydict, convert directly to pandas without Arrow conversion
+        if self._lazy_pydict is not None:
+            show_id = bool(getattr(self, "_show_internal_id", False))
+            d = self._lazy_pydict
+            if show_id:
+                return pd.DataFrame(d)
+            else:
+                # Exclude _id column
+                filtered = {k: v for k, v in d.items() if k != '_id'}
+                return pd.DataFrame(filtered)
+
         self._ensure_arrow()
         if self._arrow_table is not None:
             show_id = bool(getattr(self, "_show_internal_id", False))

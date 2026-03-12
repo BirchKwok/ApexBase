@@ -2375,46 +2375,91 @@ impl ApexStorageImpl {
     }
     
     /// Retrieve multiple records by IDs
-    fn retrieve_many(&self, py: Python<'_>, ids: Vec<i64>) -> PyResult<Vec<PyObject>> {
+    /// Retrieve multiple records by IDs, returning as Arrow RecordBatch
+    /// Returns a dict with 'columns_dict' for efficient ResultView creation
+    fn retrieve_many(&self, py: Python<'_>, ids: Vec<i64>) -> PyResult<PyObject> {
+        use pyo3::types::PyDict;
+
         if ids.is_empty() {
-            return Ok(Vec::new());
+            let out = PyDict::new_bound(py);
+            out.set_item("columns_dict", PyDict::new_bound(py))?;
+            out.set_item("rows_affected", 0i64)?;
+            return Ok(out.into());
         }
-        
+
         let table_path = self.get_current_table_path()?;
         let table_name = self.current_table.read().clone();
-        let ids_str = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-        
-        let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
-            let sql = format!("SELECT * FROM {} WHERE _id IN ({})", table_name, ids_str);
-            let result = ApexExecutor::execute(&sql, &table_path)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
-            let batch = result.to_record_batch()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
-            let mut rows = Vec::with_capacity(batch.num_rows());
-            for row_idx in 0..batch.num_rows() {
-                let mut row_data = HashMap::new();
-                for (col_idx, field) in batch.schema().fields().iter().enumerate() {
-                    let val = arrow_value_at(batch.column(col_idx), row_idx);
-                    row_data.insert(field.name().clone(), val);
+
+        // Try to get cached backend
+        let maybe_cached = self.cached_backends.get(&table_name).map(|v| Arc::clone(&v));
+        let backend_opt: Option<Arc<TableStorageBackend>> = if let Some(b) = maybe_cached {
+            Some(b)
+        } else if let Ok(b) = crate::query::get_cached_backend_pub(&table_path) {
+            self.cached_backends.insert(table_name.clone(), Arc::clone(&b));
+            Some(b)
+        } else {
+            None
+        };
+
+        // If we have a backend, use the fast batch path
+        if let Some(backend) = backend_opt {
+            let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
+
+            let batch_result = py.allow_threads(|| {
+                backend.read_rows_by_ids_to_arrow(&ids_u64)
+            });
+
+            if let Ok(batch) = batch_result {
+                if batch.num_rows() > 0 {
+                    let num_rows = batch.num_rows();
+                    let num_cols = batch.num_columns();
+
+                    // Build columns_dict directly from batch (more efficient than per-row dict)
+                    let columns_dict = PyDict::new_bound(py);
+                    for col_idx in 0..num_cols {
+                        let col_name = batch.schema().field(col_idx).name().to_string();
+                        let col = batch.column(col_idx);
+                        // Convert each column to a list of values
+                        let mut py_list: Vec<PyObject> = Vec::with_capacity(num_rows);
+                        for row_idx in 0..num_rows {
+                            let py_val: PyObject = match col.data_type() {
+                                arrow::datatypes::DataType::Int64 => {
+                                    let arr = col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+                                    arr.value(row_idx).into_py(py)
+                                }
+                                arrow::datatypes::DataType::Float64 => {
+                                    let arr = col.as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+                                    arr.value(row_idx).into_py(py)
+                                }
+                                arrow::datatypes::DataType::Utf8 => {
+                                    let arr = col.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+                                    arr.value(row_idx).into_py(py)
+                                }
+                                arrow::datatypes::DataType::Boolean => {
+                                    let arr = col.as_any().downcast_ref::<arrow::array::BooleanArray>().unwrap();
+                                    arr.value(row_idx).into_py(py)
+                                }
+                                _ => py.None(),
+                            };
+                            py_list.push(py_val);
+                        }
+                        let py_list_bound = PyList::new_bound(py, &py_list);
+                        columns_dict.set_item(col_name.as_str(), py_list_bound)?;
+                    }
+
+                    let out = PyDict::new_bound(py);
+                    out.set_item("columns_dict", columns_dict)?;
+                    out.set_item("rows_affected", 0i64)?;
+                    return Ok(out.into());
                 }
-                rows.push(row_data);
             }
-            
-            Ok(rows)
-        })?;
-        
-        let mut result = Vec::with_capacity(rows.len());
-        for row_data in rows {
-            let dict = PyDict::new_bound(py);
-            for (k, v) in row_data {
-                dict.set_item(k, value_to_py(py, &v)?)?;
-            }
-            result.push(dict.into());
         }
-        
-        Ok(result)
+
+        // FALLBACK: return empty result
+        let out = PyDict::new_bound(py);
+        out.set_item("columns_dict", PyDict::new_bound(py))?;
+        out.set_item("rows_affected", 0i64)?;
+        Ok(out.into())
     }
     
     /// Retrieve all records
@@ -2771,7 +2816,7 @@ impl ApexStorageImpl {
     
     /// Search and retrieve records
     #[pyo3(signature = (query, limit=None))]
-    fn search_and_retrieve(&self, py: Python<'_>, query: &str, limit: Option<usize>) -> PyResult<Vec<PyObject>> {
+    fn search_and_retrieve(&self, py: Python<'_>, query: &str, limit: Option<usize>) -> PyResult<PyObject> {
         let results = self.search_text(py, query, limit)?;
         let ids: Vec<i64> = results.into_iter().map(|(id, _)| id).collect();
         self.retrieve_many(py, ids)

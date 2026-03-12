@@ -1396,21 +1396,17 @@ class ApexClient:
         with self._lock:
             if not ids:
                 return _empty_result_view()
-            
-            results = self._storage.retrieve_many(ids)
-            if not results:
+
+            result = self._storage.retrieve_many(ids)
+            if not result:
                 return _empty_result_view()
-            
-            # Reorder results to match the requested ID order
-            id_to_record = {r.get('_id'): r for r in results}
-            ordered_results = [id_to_record[id_] for id_ in ids if id_ in id_to_record]
-            
-            if not ordered_results:
-                return _empty_result_view()
-            
-            # Convert list of dicts to Arrow table
-            table = pa.Table.from_pylist(ordered_results)
-            return ResultView(arrow_table=table)
+
+            # Result is dict with 'columns_dict' (directly from Rust batch)
+            columns_dict = result.get('columns_dict')
+            if columns_dict:
+                return ResultView(lazy_pydict=columns_dict)
+
+            return _empty_result_view()
 
     def retrieve_all(self) -> 'ResultView':
         self._check_connection()

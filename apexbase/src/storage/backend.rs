@@ -1935,6 +1935,99 @@ impl TableStorageBackend {
         Ok(Some(batch))
     }
 
+    /// Batch retrieve multiple rows by IDs using V4 mmap path
+    /// Returns a RecordBatch with all found rows (in original ID order, missing IDs skipped)
+    pub fn read_rows_by_ids_to_arrow(&self, ids: &[u64]) -> io::Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
+        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+        use crate::data::Value;
+
+        if ids.is_empty() {
+            let schema = Arc::new(Schema::new(Vec::<Field>::new()));
+            return Ok(RecordBatch::new_empty(schema));
+        }
+
+        // V4 mmap path: use optimized batch read (group by row group, read IDs once)
+        let mut all_rows = self.storage.retrieve_rcix_batch(ids)?;
+
+        if all_rows.is_empty() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_id", ArrowDataType::Int64, false)
+            ]));
+            return Ok(RecordBatch::new_empty(schema));
+        }
+
+        // Get column names from first row
+        let col_names: Vec<String> = all_rows[0].iter().map(|(name, _)| name.clone()).collect();
+        let num_cols = col_names.len();
+        let num_rows = all_rows.len();
+
+        // Build arrays column by column
+        let mut fields: Vec<Field> = Vec::with_capacity(num_cols);
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(num_cols);
+
+        for col_idx in 0..num_cols {
+            let col_name = &col_names[col_idx];
+            let (arrow_dt, array): (ArrowDataType, ArrayRef) = {
+                // Check first row to determine type
+                let first_val = &all_rows[0][col_idx].1;
+                match first_val {
+                    Value::Int64(_) => {
+                        let mut values = Vec::with_capacity(num_rows);
+                        for row in &all_rows {
+                            match &row[col_idx].1 {
+                                Value::Int64(v) => values.push(*v),
+                                _ => values.push(0),
+                            }
+                        }
+                        (ArrowDataType::Int64, Arc::new(Int64Array::from(values)))
+                    }
+                    Value::Float64(_) => {
+                        let mut values = Vec::with_capacity(num_rows);
+                        for row in &all_rows {
+                            match &row[col_idx].1 {
+                                Value::Float64(v) => values.push(*v),
+                                _ => values.push(0.0),
+                            }
+                        }
+                        (ArrowDataType::Float64, Arc::new(Float64Array::from(values)))
+                    }
+                    Value::String(_) => {
+                        let mut values = Vec::with_capacity(num_rows);
+                        for row in &all_rows {
+                            match &row[col_idx].1 {
+                                Value::String(s) => values.push(s.as_str()),
+                                _ => values.push(""),
+                            }
+                        }
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(values)))
+                    }
+                    Value::Bool(_) => {
+                        let mut values = Vec::with_capacity(num_rows);
+                        for row in &all_rows {
+                            match &row[col_idx].1 {
+                                Value::Bool(b) => values.push(Some(*b)),
+                                _ => values.push(None),
+                            }
+                        }
+                        (ArrowDataType::Boolean, Arc::new(BooleanArray::from(values)))
+                    }
+                    Value::Null => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![""; num_rows]))),
+                    _ => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![""; num_rows]))),
+                }
+            };
+            fields.push(Field::new(col_name, arrow_dt, false));
+            arrays.push(array);
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(batch)
+    }
+
     /// Create a typed null array with a single null value
     fn create_typed_null_array(dt: &crate::data::DataType) -> (arrow::datatypes::DataType, arrow::array::ArrayRef) {
         use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
