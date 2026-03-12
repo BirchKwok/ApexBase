@@ -69,3 +69,6 @@ AGENTS.md
 *.csv
 *.json
 *.parquet
+
+*.lock
+*.stats

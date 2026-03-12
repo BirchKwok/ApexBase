@@ -1397,16 +1397,37 @@ class ApexClient:
             if not ids:
                 return _empty_result_view()
 
+            # Try FFI path first (fastest - zero-copy from Rust)
+            if hasattr(self._storage, '_retrieve_many_arrow_ffi'):
+                try:
+                    schema_ptr, array_ptr = self._storage._retrieve_many_arrow_ffi(ids)
+                    if schema_ptr != 0 and array_ptr != 0:
+                        # Import RecordBatch from C pointers (note: array_ptr first, then schema_ptr)
+                        batch = pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
+                        table = pa.Table.from_batches([batch])
+                        # Free the FFI pointers
+                        self._storage._free_arrow_ffi(schema_ptr, array_ptr)
+                        return ResultView(arrow_table=table)
+                except Exception:
+                    pass
+
+            # Fallback to dict format
             result = self._storage.retrieve_many(ids)
-            if not result:
+
+            # Handle both old format (list of dicts) and new format (dict with columns_dict)
+            if isinstance(result, dict):
+                columns_dict = result.get('columns_dict')
+                if columns_dict:
+                    return ResultView(lazy_pydict=columns_dict)
                 return _empty_result_view()
-
-            # Result is dict with 'columns_dict' (directly from Rust batch)
-            columns_dict = result.get('columns_dict')
-            if columns_dict:
-                return ResultView(lazy_pydict=columns_dict)
-
-            return _empty_result_view()
+            elif isinstance(result, list):
+                # Old format: list of dicts
+                if not result:
+                    return _empty_result_view()
+                table = pa.Table.from_pylist(result)
+                return ResultView(arrow_table=table)
+            else:
+                return _empty_result_view()
 
     def retrieve_all(self) -> 'ResultView':
         self._check_connection()
@@ -1646,29 +1667,52 @@ class ApexClient:
         
         return np.array([r[0] for r in results], dtype=np.int64)
 
-    def search_and_retrieve(self, query: str, table_name: str = None, 
+    def search_and_retrieve(self, query: str, table_name: str = None,
                            limit: Optional[int] = None, offset: int = 0) -> 'ResultView':
         self._check_connection()
         target_table = table_name or self._current_table
-        
+
         if not self._is_fts_enabled(target_table):
             raise ValueError(f"Full-text search is not enabled for table '{target_table}'. Call init_fts() first.")
 
         if not self._ensure_fts_initialized(target_table):
             return _empty_result_view()
-        
+
         # Switch to target table for search
         old_table = self._current_table
         if target_table != old_table:
             self.use_table(target_table)
-        
+
         try:
-            results = self._storage.search_and_retrieve(query, limit=limit)
-            if not results:
+            # Try FFI path first (fastest - zero-copy from Rust)
+            if hasattr(self._storage, '_search_and_retrieve_arrow_ffi'):
+                try:
+                    schema_ptr, array_ptr = self._storage._search_and_retrieve_arrow_ffi(query, limit=limit)
+                    if schema_ptr != 0 and array_ptr != 0:
+                        batch = pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
+                        table = pa.Table.from_batches([batch])
+                        self._storage._free_arrow_ffi(schema_ptr, array_ptr)
+                        return ResultView(arrow_table=table)
+                except Exception:
+                    pass
+
+            # Fallback to dict format
+            result = self._storage.search_and_retrieve(query, limit=limit)
+
+            # Handle both old format (list of dicts) and new format (dict with columns_dict)
+            if isinstance(result, dict):
+                columns_dict = result.get('columns_dict')
+                if columns_dict:
+                    return ResultView(lazy_pydict=columns_dict)
                 return _empty_result_view()
-            
-            table = pa.Table.from_pylist(results)
-            return ResultView(arrow_table=table)
+            elif isinstance(result, list):
+                # Old format: list of dicts
+                if not result:
+                    return _empty_result_view()
+                table = pa.Table.from_pylist(result)
+                return ResultView(arrow_table=table)
+            else:
+                return _empty_result_view()
         finally:
             # Restore original table
             if target_table != old_table:

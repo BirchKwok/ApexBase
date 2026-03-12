@@ -2374,9 +2374,63 @@ impl ApexStorageImpl {
         }
     }
     
+    /// Retrieve multiple records by IDs using Arrow FFI for zero-copy transfer
+    /// Returns (schema_ptr, array_ptr) that can be imported by PyArrow
+    fn _retrieve_many_arrow_ffi(&self, py: Python<'_>, ids: Vec<i64>) -> PyResult<(usize, usize)> {
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        use arrow::array::{StructArray, Array};
+
+        if ids.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let table_path = self.get_current_table_path()?;
+        let table_name = self.current_table.read().clone();
+
+        // Try to get cached backend
+        let maybe_cached = self.cached_backends.get(&table_name).map(|v| Arc::clone(&v));
+        let backend_opt: Option<Arc<TableStorageBackend>> = if let Some(b) = maybe_cached {
+            Some(b)
+        } else if let Ok(b) = crate::query::get_cached_backend_pub(&table_path) {
+            self.cached_backends.insert(table_name.clone(), Arc::clone(&b));
+            Some(b)
+        } else {
+            None
+        };
+
+        if let Some(backend) = backend_opt {
+            let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
+
+            let batch_result = py.allow_threads(|| {
+                backend.read_rows_by_ids_to_arrow(&ids_u64)
+            });
+
+            if let Ok(batch) = batch_result {
+                if batch.num_rows() > 0 {
+                    // Convert RecordBatch to StructArray for FFI export
+                    let struct_array: StructArray = batch.into();
+                    let array_data = struct_array.to_data();
+
+                    // Export to FFI
+                    let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&array_data)
+                        .map_err(|e| PyRuntimeError::new_err(format!("FFI export failed: {}", e)))?;
+
+                    // Leak the FFI structs to get stable pointers (caller must free via _free_arrow_ffi)
+                    let schema_ptr = Box::into_raw(Box::new(ffi_schema)) as usize;
+                    let array_ptr = Box::into_raw(Box::new(ffi_array)) as usize;
+
+                    return Ok((schema_ptr, array_ptr));
+                }
+            }
+        }
+
+        Ok((0, 0))
+    }
+
     /// Retrieve multiple records by IDs
     /// Retrieve multiple records by IDs, returning as Arrow RecordBatch
     /// Returns a dict with 'columns_dict' for efficient ResultView creation
+    /// DEPRECATED: Use _retrieve_many_arrow_ffi for better performance
     fn retrieve_many(&self, py: Python<'_>, ids: Vec<i64>) -> PyResult<PyObject> {
         use pyo3::types::PyDict;
 
@@ -2813,7 +2867,14 @@ impl ApexStorageImpl {
             Err(PyRuntimeError::new_err("FTS not initialized"))
         }
     }
-    
+    /// Search and retrieve records using Arrow FFI for zero-copy transfer
+    /// Returns (schema_ptr, array_ptr) that can be imported by PyArrow
+    fn _search_and_retrieve_arrow_ffi(&self, py: Python<'_>, query: &str, limit: Option<usize>) -> PyResult<(usize, usize)> {
+        let results = self.search_text(py, query, limit)?;
+        let ids: Vec<i64> = results.into_iter().map(|(id, _)| id).collect();
+        self._retrieve_many_arrow_ffi(py, ids)
+    }
+
     /// Search and retrieve records
     #[pyo3(signature = (query, limit=None))]
     fn search_and_retrieve(&self, py: Python<'_>, query: &str, limit: Option<usize>) -> PyResult<PyObject> {
