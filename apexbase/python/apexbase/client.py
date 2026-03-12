@@ -1400,18 +1400,6 @@ class ApexClient:
             result = self._storage.retrieve_many(ids)
             columns_dict = result.get('columns_dict') if isinstance(result, dict) else None
             if columns_dict:
-                # Only reorder if needed (when IDs don't match requested order)
-                id_list = columns_dict.get('_id', [])
-                if id_list and len(id_list) > 1 and id_list != ids[:len(id_list)]:
-                    id_set = set(ids)
-                    # Filter to only requested IDs and preserve request order
-                    filtered = {k: [v for i, v in enumerate(col) if id_list[i] in id_set]
-                                for k, col in columns_dict.items()}
-                    # Build in requested order
-                    id_to_idx = {id_: i for i, id_ in enumerate(id_list)}
-                    ordered = {k: [v for id_ in ids if (idx := id_to_idx.get(id_)) is not None]
-                               for k, v in filtered.items()}
-                    return ResultView(lazy_pydict=ordered)
                 return ResultView(lazy_pydict=columns_dict)
             return _empty_result_view()
 
