@@ -1235,35 +1235,6 @@ impl OnDemandStorage {
         Ok(Some(result))
     }
 
-    /// Batch retrieve multiple rows by IDs - delegates to retrieve_rcix for each ID
-    /// This is a simple fallback that works correctly; a more optimized version can be added later
-    pub(crate) fn retrieve_rcix_batch(&self, ids: &[u64]) -> io::Result<Vec<Vec<(String, crate::data::Value)>>> {
-        use crate::data::Value;
-
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut all_results: Vec<Vec<(String, Value)>> = Vec::with_capacity(ids.len());
-
-        for &id in ids {
-            if let Ok(Some(row_vals)) = self.retrieve_rcix(id) {
-                all_results.push(row_vals);
-            }
-        }
-
-        // Sort by original ID order
-        all_results.sort_by_key(|row| {
-            if let Some(Value::Int64(id)) = row.get(0).map(|(_, v)| v) {
-                *id as u64
-            } else {
-                u64::MAX
-            }
-        });
-
-        Ok(all_results)
-    }
-
     /// RCIX pread batch read: builds Arrow RecordBatch for first `rows_to_take` rows
     /// using page cache instead of mmap. Only reads the minimal bytes per column:
     ///   - PLAIN Int64/Float64: 8 + N*8 bytes  (not 8 + rg_rows*8)

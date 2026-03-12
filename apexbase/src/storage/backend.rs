@@ -1949,8 +1949,13 @@ impl TableStorageBackend {
             return Ok(RecordBatch::new_empty(schema));
         }
 
-        // V4 mmap path: use optimized batch read (group by row group, read IDs once)
-        let mut all_rows = self.storage.retrieve_rcix_batch(ids)?;
+        // V4 mmap path: call retrieve_rcix for each ID
+        let mut all_rows = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Ok(Some(row_vals)) = self.storage.retrieve_rcix(id) {
+                all_rows.push(row_vals);
+            }
+        }
 
         if all_rows.is_empty() {
             let schema = Arc::new(Schema::new(vec![
