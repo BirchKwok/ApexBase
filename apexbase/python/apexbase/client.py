@@ -1397,37 +1397,23 @@ class ApexClient:
             if not ids:
                 return _empty_result_view()
 
-            # Try FFI path first (fastest - zero-copy from Rust)
-            if hasattr(self._storage, '_retrieve_many_arrow_ffi'):
-                try:
-                    schema_ptr, array_ptr = self._storage._retrieve_many_arrow_ffi(ids)
-                    if schema_ptr != 0 and array_ptr != 0:
-                        # Import RecordBatch from C pointers (note: array_ptr first, then schema_ptr)
-                        batch = pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
-                        table = pa.Table.from_batches([batch])
-                        # Free the FFI pointers
-                        self._storage._free_arrow_ffi(schema_ptr, array_ptr)
-                        return ResultView(arrow_table=table)
-                except Exception:
-                    pass
-
-            # Fallback to dict format
             result = self._storage.retrieve_many(ids)
-
-            # Handle both old format (list of dicts) and new format (dict with columns_dict)
-            if isinstance(result, dict):
-                columns_dict = result.get('columns_dict')
-                if columns_dict:
-                    return ResultView(lazy_pydict=columns_dict)
-                return _empty_result_view()
-            elif isinstance(result, list):
-                # Old format: list of dicts
-                if not result:
-                    return _empty_result_view()
-                table = pa.Table.from_pylist(result)
-                return ResultView(arrow_table=table)
-            else:
-                return _empty_result_view()
+            columns_dict = result.get('columns_dict') if isinstance(result, dict) else None
+            if columns_dict:
+                # Only reorder if needed (when IDs don't match requested order)
+                id_list = columns_dict.get('_id', [])
+                if id_list and len(id_list) > 1 and id_list != ids[:len(id_list)]:
+                    id_set = set(ids)
+                    # Filter to only requested IDs and preserve request order
+                    filtered = {k: [v for i, v in enumerate(col) if id_list[i] in id_set]
+                                for k, col in columns_dict.items()}
+                    # Build in requested order
+                    id_to_idx = {id_: i for i, id_ in enumerate(id_list)}
+                    ordered = {k: [v for id_ in ids if (idx := id_to_idx.get(id_)) is not None]
+                               for k, v in filtered.items()}
+                    return ResultView(lazy_pydict=ordered)
+                return ResultView(lazy_pydict=columns_dict)
+            return _empty_result_view()
 
     def retrieve_all(self) -> 'ResultView':
         self._check_connection()
@@ -1684,35 +1670,12 @@ class ApexClient:
             self.use_table(target_table)
 
         try:
-            # Try FFI path first (fastest - zero-copy from Rust)
-            if hasattr(self._storage, '_search_and_retrieve_arrow_ffi'):
-                try:
-                    schema_ptr, array_ptr = self._storage._search_and_retrieve_arrow_ffi(query, limit=limit)
-                    if schema_ptr != 0 and array_ptr != 0:
-                        batch = pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
-                        table = pa.Table.from_batches([batch])
-                        self._storage._free_arrow_ffi(schema_ptr, array_ptr)
-                        return ResultView(arrow_table=table)
-                except Exception:
-                    pass
-
-            # Fallback to dict format
+            # Default path: dict format - fastest for typical use cases
             result = self._storage.search_and_retrieve(query, limit=limit)
-
-            # Handle both old format (list of dicts) and new format (dict with columns_dict)
-            if isinstance(result, dict):
-                columns_dict = result.get('columns_dict')
-                if columns_dict:
-                    return ResultView(lazy_pydict=columns_dict)
-                return _empty_result_view()
-            elif isinstance(result, list):
-                # Old format: list of dicts
-                if not result:
-                    return _empty_result_view()
-                table = pa.Table.from_pylist(result)
-                return ResultView(arrow_table=table)
-            else:
-                return _empty_result_view()
+            columns_dict = result.get('columns_dict') if isinstance(result, dict) else None
+            if columns_dict:
+                return ResultView(lazy_pydict=columns_dict)
+            return _empty_result_view()
         finally:
             # Restore original table
             if target_table != old_table:

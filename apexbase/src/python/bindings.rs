@@ -2428,9 +2428,7 @@ impl ApexStorageImpl {
     }
 
     /// Retrieve multiple records by IDs
-    /// Retrieve multiple records by IDs, returning as Arrow RecordBatch
-    /// Returns a dict with 'columns_dict' for efficient ResultView creation
-    /// DEPRECATED: Use _retrieve_many_arrow_ffi for better performance
+    /// Uses direct storage access for optimal small-batch performance
     fn retrieve_many(&self, py: Python<'_>, ids: Vec<i64>) -> PyResult<PyObject> {
         use pyo3::types::PyDict;
 
@@ -2444,7 +2442,7 @@ impl ApexStorageImpl {
         let table_path = self.get_current_table_path()?;
         let table_name = self.current_table.read().clone();
 
-        // Try to get cached backend
+        // Try to get cached backend for direct storage access
         let maybe_cached = self.cached_backends.get(&table_name).map(|v| Arc::clone(&v));
         let backend_opt: Option<Arc<TableStorageBackend>> = if let Some(b) = maybe_cached {
             Some(b)
@@ -2455,61 +2453,51 @@ impl ApexStorageImpl {
             None
         };
 
-        // If we have a backend, use the fast batch path
+        // Use direct storage read (faster than SQL for small batches)
         if let Some(backend) = backend_opt {
             let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
 
-            let batch_result = py.allow_threads(|| {
-                backend.read_rows_by_ids_to_arrow(&ids_u64)
-            });
-
-            if let Ok(batch) = batch_result {
-                if batch.num_rows() > 0 {
-                    let num_rows = batch.num_rows();
-                    let num_cols = batch.num_columns();
-
-                    // Build columns_dict directly from batch (more efficient than per-row dict)
-                    let columns_dict = PyDict::new_bound(py);
-                    for col_idx in 0..num_cols {
-                        let col_name = batch.schema().field(col_idx).name().to_string();
-                        let col = batch.column(col_idx);
-                        // Convert each column to a list of values
-                        let mut py_list: Vec<PyObject> = Vec::with_capacity(num_rows);
-                        for row_idx in 0..num_rows {
-                            let py_val: PyObject = match col.data_type() {
-                                arrow::datatypes::DataType::Int64 => {
-                                    let arr = col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
-                                    arr.value(row_idx).into_py(py)
-                                }
-                                arrow::datatypes::DataType::Float64 => {
-                                    let arr = col.as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
-                                    arr.value(row_idx).into_py(py)
-                                }
-                                arrow::datatypes::DataType::Utf8 => {
-                                    let arr = col.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
-                                    arr.value(row_idx).into_py(py)
-                                }
-                                arrow::datatypes::DataType::Boolean => {
-                                    let arr = col.as_any().downcast_ref::<arrow::array::BooleanArray>().unwrap();
-                                    arr.value(row_idx).into_py(py)
-                                }
-                                _ => py.None(),
-                            };
-                            py_list.push(py_val);
-                        }
-                        let py_list_bound = PyList::new_bound(py, &py_list);
-                        columns_dict.set_item(col_name.as_str(), py_list_bound)?;
-                    }
-
-                    let out = PyDict::new_bound(py);
-                    out.set_item("columns_dict", columns_dict)?;
-                    out.set_item("rows_affected", 0i64)?;
-                    return Ok(out.into());
+            // Read rows directly using retrieve_rcix
+            let mut all_rows: Vec<Vec<(String, Value)>> = Vec::with_capacity(ids_u64.len());
+            for &id in &ids_u64 {
+                if let Ok(Some(row)) = backend.storage.retrieve_rcix(id) {
+                    all_rows.push(row);
                 }
             }
+
+            if all_rows.is_empty() {
+                let out = PyDict::new_bound(py);
+                out.set_item("columns_dict", PyDict::new_bound(py))?;
+                out.set_item("rows_affected", 0i64)?;
+                return Ok(out.into());
+            }
+
+            // Build columns_dict from rows (column-by-column)
+            let num_rows = all_rows.len();
+            let col_names: Vec<String> = all_rows[0].iter().map(|(n, _)| n.clone()).collect();
+            let num_cols = col_names.len();
+
+            let columns_dict = PyDict::new_bound(py);
+            for col_idx in 0..num_cols {
+                let col_name = &col_names[col_idx];
+                let mut py_list: Vec<PyObject> = Vec::with_capacity(num_rows);
+
+                for row in &all_rows {
+                    let val = value_to_py(py, &row[col_idx].1)?;
+                    py_list.push(val);
+                }
+
+                let py_list_bound = PyList::new_bound(py, &py_list);
+                columns_dict.set_item(col_name.as_str(), py_list_bound)?;
+            }
+
+            let out = PyDict::new_bound(py);
+            out.set_item("columns_dict", columns_dict)?;
+            out.set_item("rows_affected", num_rows as i64)?;
+            return Ok(out.into());
         }
 
-        // FALLBACK: return empty result
+        // Fallback: empty result
         let out = PyDict::new_bound(py);
         out.set_item("columns_dict", PyDict::new_bound(py))?;
         out.set_item("rows_affected", 0i64)?;
