@@ -1700,6 +1700,67 @@ impl ApexStorageImpl {
         Ok((schema_ptr, array_ptr))
     }
     
+    /// Single-pass LIKE scan+extract via scan_like_and_extract_mmap, returned as zero-copy
+    /// Arrow FFI pointers.  Returns (0, 0) on any error or when the fast path is unavailable
+    /// (compressed/non-RCIX files), letting Python fall back to the IPC path.
+    fn _execute_like_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(usize, usize)> {
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        use arrow::array::{StructArray, Array};
+
+        let sql_upper = sql.trim().to_uppercase();
+        // Only handle simple SELECT * ... WHERE col LIKE 'pat' (no JOIN/GROUP/ORDER/LIMIT/AND/OR)
+        if !sql_upper.starts_with("SELECT *")
+            || !sql_upper.contains(" LIKE ")
+            || !sql_upper.contains("WHERE")
+            || sql_upper.contains("NOT LIKE")
+            || sql_upper.contains("LIMIT")
+            || sql_upper.contains("ORDER")
+            || sql_upper.contains("GROUP")
+            || sql_upper.contains("JOIN")
+            || sql_upper.contains(" AND ")
+            || sql_upper.contains(" OR ")
+            || !sql.contains('\'')
+        {
+            return Ok((0, 0));
+        }
+
+        // Extract col + pattern from WHERE clause
+        let where_pos = match sql_upper.find("WHERE") { Some(p) => p, None => return Ok((0, 0)) };
+        let after_where = sql[where_pos + 5..].trim().trim_end_matches(';');
+        let after_where_upper = after_where.to_uppercase();
+        let like_pos = match after_where_upper.find(" LIKE ") { Some(p) => p, None => return Ok((0, 0)) };
+        let col = after_where[..like_pos].trim().trim_matches('"').to_string();
+        if col.contains(' ') || col.contains('(') { return Ok((0, 0)); }
+        let rhs = after_where[like_pos + 6..].trim();
+        if !rhs.starts_with('\'') { return Ok((0, 0)); }
+        let val_end = match rhs[1..].find('\'') { Some(p) => p, None => return Ok((0, 0)) };
+        let pattern = rhs[1..1 + val_end].to_string();
+
+        let table_path = match self.get_current_table_path() {
+            Ok(p) => p,
+            Err(_) => return Ok((0, 0)),
+        };
+
+        let batch = py.allow_threads(|| -> Option<arrow::record_batch::RecordBatch> {
+            let backend = crate::query::get_cached_backend_pub(&table_path).ok()?;
+            backend.scan_like_and_extract_mmap(&col, &pattern, None).ok().flatten()
+        });
+
+        let batch = match batch {
+            Some(b) if b.num_rows() > 0 => b,
+            _ => return Ok((0, 0)),
+        };
+
+        // Export via Arrow C Data Interface (zero-copy)
+        let struct_array: StructArray = batch.into();
+        let array_data = struct_array.to_data();
+        let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&array_data)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("FFI export: {}", e)))?;
+        let schema_ptr = Box::into_raw(Box::new(ffi_schema)) as usize;
+        let array_ptr  = Box::into_raw(Box::new(ffi_array))  as usize;
+        Ok((schema_ptr, array_ptr))
+    }
+
     /// Free Arrow FFI pointers allocated by _execute_arrow_ffi or _query_arrow_ffi
     fn _free_arrow_ffi(&self, schema_ptr: usize, array_ptr: usize) -> PyResult<()> {
         use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -2373,59 +2434,6 @@ impl ApexStorageImpl {
             }
         }
     }
-    
-    /// Retrieve multiple records by IDs using Arrow FFI for zero-copy transfer
-    /// Returns (schema_ptr, array_ptr) that can be imported by PyArrow
-    fn _retrieve_many_arrow_ffi(&self, py: Python<'_>, ids: Vec<i64>) -> PyResult<(usize, usize)> {
-        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-        use arrow::array::{StructArray, Array};
-
-        if ids.is_empty() {
-            return Ok((0, 0));
-        }
-
-        let table_path = self.get_current_table_path()?;
-        let table_name = self.current_table.read().clone();
-
-        // Try to get cached backend
-        let maybe_cached = self.cached_backends.get(&table_name).map(|v| Arc::clone(&v));
-        let backend_opt: Option<Arc<TableStorageBackend>> = if let Some(b) = maybe_cached {
-            Some(b)
-        } else if let Ok(b) = crate::query::get_cached_backend_pub(&table_path) {
-            self.cached_backends.insert(table_name.clone(), Arc::clone(&b));
-            Some(b)
-        } else {
-            None
-        };
-
-        if let Some(backend) = backend_opt {
-            let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
-
-            let batch_result = py.allow_threads(|| {
-                backend.read_rows_by_ids_to_arrow(&ids_u64)
-            });
-
-            if let Ok(batch) = batch_result {
-                if batch.num_rows() > 0 {
-                    // Convert RecordBatch to StructArray for FFI export
-                    let struct_array: StructArray = batch.into();
-                    let array_data = struct_array.to_data();
-
-                    // Export to FFI
-                    let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&array_data)
-                        .map_err(|e| PyRuntimeError::new_err(format!("FFI export failed: {}", e)))?;
-
-                    // Leak the FFI structs to get stable pointers (caller must free via _free_arrow_ffi)
-                    let schema_ptr = Box::into_raw(Box::new(ffi_schema)) as usize;
-                    let array_ptr = Box::into_raw(Box::new(ffi_array)) as usize;
-
-                    return Ok((schema_ptr, array_ptr));
-                }
-            }
-        }
-
-        Ok((0, 0))
-    }
 
     /// Retrieve multiple records by IDs
     /// Uses direct storage access for optimal small-batch performance
@@ -2453,11 +2461,38 @@ impl ApexStorageImpl {
             None
         };
 
-        // Use direct storage read (faster than SQL for small batches)
+        // Use direct storage batch read (one mmap pass per RG, no per-row lock overhead)
         if let Some(backend) = backend_opt {
             let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
 
-            // Read rows directly using retrieve_rcix
+            // Fast path: retrieve_many_mmap — one footer lock + one mmap slice per RG
+            let batch_opt = if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
+                backend.storage.retrieve_many_mmap(&ids_u64).ok().flatten()
+            } else {
+                None
+            };
+
+            if let Some(batch) = batch_opt {
+                let num_rows = batch.num_rows();
+                if num_rows == 0 {
+                    let out = PyDict::new_bound(py);
+                    out.set_item("columns_dict", PyDict::new_bound(py))?;
+                    out.set_item("rows_affected", 0i64)?;
+                    return Ok(out.into());
+                }
+                let columns_dict = PyDict::new_bound(py);
+                for (i, field) in batch.schema().fields().iter().enumerate() {
+                    let col = batch.column(i);
+                    let py_list = arrow_col_to_pylist(py, col)?;
+                    columns_dict.set_item(field.name().as_str(), py_list)?;
+                }
+                let out = PyDict::new_bound(py);
+                out.set_item("columns_dict", columns_dict)?;
+                out.set_item("rows_affected", num_rows as i64)?;
+                return Ok(out.into());
+            }
+
+            // Fallback: per-row retrieve_rcix (V3 files / non-RCIX RGs)
             let mut all_rows: Vec<Vec<(String, Value)>> = Vec::with_capacity(ids_u64.len());
             for &id in &ids_u64 {
                 if let Ok(Some(row)) = backend.storage.retrieve_rcix(id) {
@@ -2472,7 +2507,6 @@ impl ApexStorageImpl {
                 return Ok(out.into());
             }
 
-            // Build columns_dict from rows (column-by-column)
             let num_rows = all_rows.len();
             let col_names: Vec<String> = all_rows[0].iter().map(|(n, _)| n.clone()).collect();
             let num_cols = col_names.len();
@@ -2481,12 +2515,10 @@ impl ApexStorageImpl {
             for col_idx in 0..num_cols {
                 let col_name = &col_names[col_idx];
                 let mut py_list: Vec<PyObject> = Vec::with_capacity(num_rows);
-
                 for row in &all_rows {
                     let val = value_to_py(py, &row[col_idx].1)?;
                     py_list.push(val);
                 }
-
                 let py_list_bound = PyList::new_bound(py, &py_list);
                 columns_dict.set_item(col_name.as_str(), py_list_bound)?;
             }
@@ -2854,13 +2886,6 @@ impl ApexStorageImpl {
         } else {
             Err(PyRuntimeError::new_err("FTS not initialized"))
         }
-    }
-    /// Search and retrieve records using Arrow FFI for zero-copy transfer
-    /// Returns (schema_ptr, array_ptr) that can be imported by PyArrow
-    fn _search_and_retrieve_arrow_ffi(&self, py: Python<'_>, query: &str, limit: Option<usize>) -> PyResult<(usize, usize)> {
-        let results = self.search_text(py, query, limit)?;
-        let ids: Vec<i64> = results.into_iter().map(|(id, _)| id).collect();
-        self._retrieve_many_arrow_ffi(py, ids)
     }
 
     /// Search and retrieve records

@@ -1935,8 +1935,10 @@ impl TableStorageBackend {
         Ok(Some(batch))
     }
 
-    /// Batch retrieve multiple rows by IDs using V4 mmap path
-    /// Returns a RecordBatch with all found rows (in original ID order, missing IDs skipped)
+    /// Batch retrieve multiple rows by IDs.
+    /// Fast path: retrieve_many_mmap (one footer lock + one mmap slice per RG).
+    /// Fallback: per-ID retrieve_rcix loop (for V3/non-RCIX files).
+    /// Returns a RecordBatch with all found rows (in original ID order, missing IDs skipped).
     pub fn read_rows_by_ids_to_arrow(&self, ids: &[u64]) -> io::Result<arrow::record_batch::RecordBatch> {
         use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
@@ -1949,7 +1951,14 @@ impl TableStorageBackend {
             return Ok(RecordBatch::new_empty(schema));
         }
 
-        // V4 mmap path: call retrieve_rcix for each ID
+        // Fast path: one footer lock + one mmap body slice per RG
+        if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
+            if let Ok(Some(batch)) = self.storage.retrieve_many_mmap(ids) {
+                return Ok(batch);
+            }
+        }
+
+        // Fallback: per-ID retrieve_rcix loop (V3 files / non-RCIX RGs)
         let mut all_rows = Vec::with_capacity(ids.len());
         for &id in ids {
             if let Ok(Some(row_vals)) = self.storage.retrieve_rcix(id) {
@@ -1964,19 +1973,16 @@ impl TableStorageBackend {
             return Ok(RecordBatch::new_empty(schema));
         }
 
-        // Get column names from first row
         let col_names: Vec<String> = all_rows[0].iter().map(|(name, _)| name.clone()).collect();
         let num_cols = col_names.len();
         let num_rows = all_rows.len();
 
-        // Build arrays column by column
         let mut fields: Vec<Field> = Vec::with_capacity(num_cols);
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(num_cols);
 
         for col_idx in 0..num_cols {
             let col_name = &col_names[col_idx];
             let (arrow_dt, array): (ArrowDataType, ArrayRef) = {
-                // Check first row to determine type
                 let first_val = &all_rows[0][col_idx].1;
                 match first_val {
                     Value::Int64(_) => {
@@ -2500,6 +2506,11 @@ impl TableStorageBackend {
     /// Mmap-level LIKE pattern scan: find matching row indices without Arrow arrays.
     pub fn scan_like_filter_mmap(&self, col_name: &str, pattern: &str, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
         self.storage.scan_like_filter_mmap(col_name, pattern, limit)
+    }
+
+    /// Single-pass parallel LIKE scan + row extraction: no separate scan/extract passes.
+    pub fn scan_like_and_extract_mmap(&self, col_name: &str, pattern: &str, limit: Option<usize>) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
+        self.storage.scan_like_and_extract_mmap(col_name, pattern, limit)
     }
 
     /// Numeric range scan returning matching row IDs directly (not indices).

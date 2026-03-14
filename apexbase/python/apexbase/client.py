@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import queue
+import contextlib
 
 import json
 
@@ -26,6 +27,9 @@ ARROW_AVAILABLE = True
 POLARS_AVAILABLE = True
 
 import struct
+
+# Null context manager for lock-free SELECT execution paths
+_NULL_CONTEXT = contextlib.nullcontext()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auto Scheduler - Initialize scheduler lazily for parallel query execution
@@ -918,7 +922,18 @@ class ApexClient:
             except Exception:
                 pass
 
-        with self._lock:
+        # Pure SELECT queries skip the Python lock — Rust handles thread safety
+        # via DashMap/RwLock/py.allow_threads(). Only DML, DDL, multi-stmt, and
+        # in-flight transactions need serialization at the Python layer.
+        _needs_lock = (
+            is_multi_stmt
+            or getattr(self, '_in_txn', False)
+            or sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'TRUNCATE',
+                                     'ALTER', 'DROP', 'CREATE', 'COPY',
+                                     'BEGIN', 'COMMIT', 'ROLLBACK',
+                                     'SAVEPOINT', 'RELEASE'))
+        )
+        with (self._lock if _needs_lock else _NULL_CONTEXT):
             # Determine if _id should be shown based on SQL (like ApexClient)
             if show_internal_id is None:
                 show_internal_id = self._should_show_internal_id(sql)
@@ -1061,9 +1076,27 @@ class ApexClient:
                 rv._show_internal_id = show_internal_id
                 return rv
 
-            # LIKE fast path: call execute() which has an optimized LIKE scan in Rust
-            # returning Arrow IPC bytes (skips ~40ms of Python object creation for large results).
-            # Not gated on _has_writes since the Rust LIKE scan reads the current mmap state.
+            # LIKE fast path: zero-copy single-pass scan+extract via _execute_like_ffi.
+            # Falls back to IPC path if scan_like_and_extract_mmap is unavailable.
+            if (sql_upper.startswith('SELECT *') and ' LIKE ' in sql_upper
+                    and 'WHERE' in sql_upper and 'GROUP BY' not in sql_upper
+                    and 'ORDER BY' not in sql_upper and 'LIMIT' not in sql_upper
+                    and 'JOIN' not in sql_upper and ' AND ' not in sql_upper
+                    and ' OR ' not in sql_upper
+                    and not getattr(self, '_in_txn', False)):
+                try:
+                    schema_ptr, array_ptr = self._storage._execute_like_ffi(sql)
+                    if schema_ptr != 0 and array_ptr != 0:
+                        batch = pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
+                        table = pa.Table.from_batches([batch]) if batch.num_rows > 0 else None
+                        rv = ResultView(arrow_table=table, data=None)
+                        rv._show_internal_id = show_internal_id
+                        return rv
+                except Exception:
+                    pass  # fall through to IPC path
+
+            # LIKE IPC path: uses scan_like_filter_mmap + read_columns_by_indices_to_arrow.
+            # Handles non-SELECT-* LIKE, NOT LIKE, JOIN, AND/OR conditions, etc.
             if (sql_upper.startswith('SELECT') and ' LIKE ' in sql_upper
                     and 'GROUP BY' not in sql_upper and 'ORDER BY' not in sql_upper
                     and 'LIMIT' not in sql_upper and 'JOIN' not in sql_upper
