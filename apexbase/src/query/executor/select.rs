@@ -1938,31 +1938,61 @@ impl ApexExecutor {
             _ => return Ok(None),
         };
 
-        // Each side must resolve to a single-column numeric range
-        let (col1, low1, high1) = match Self::extract_any_numeric_range(left_cond) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        let (col2, low2, high2) = match Self::extract_any_numeric_range(right_cond) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        if col1 == col2 {
-            // Same column — already handled by the two-sided range helpers
-            return Ok(None);
+        // --- Case A: numeric AND numeric (two different columns) ---
+        if let (Some((col1, lo1, hi1)), Some((col2, lo2, hi2))) = (
+            Self::extract_any_numeric_range(left_cond),
+            Self::extract_any_numeric_range(right_cond),
+        ) {
+            if col1 != col2 {
+                let idxs1 = match backend.scan_numeric_range_mmap(&col1, lo1, hi1, None)? {
+                    Some(v) => v,
+                    None => return Ok(None),
+                };
+                let idxs2 = match backend.scan_numeric_range_mmap(&col2, lo2, hi2, None)? {
+                    Some(v) => v,
+                    None => return Ok(None),
+                };
+                let mut intersected = Self::intersect_sorted_indices(&idxs1, &idxs2);
+                let offset = stmt.offset.unwrap_or(0);
+                if offset > 0 {
+                    if offset >= intersected.len() {
+                        return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+                    }
+                    intersected = intersected[offset..].to_vec();
+                }
+                if let Some(lim) = stmt.limit { intersected.truncate(lim); }
+                if intersected.is_empty() {
+                    return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+                }
+                let batch = backend.read_columns_by_indices_to_arrow(&intersected)?;
+                return Ok(Some(ApexResult::Data(batch)));
+            }
         }
 
-        // Scan both columns fully (no per-column limit — we need all matches to intersect)
-        let indices1 = match backend.scan_numeric_range_mmap(&col1, low1, high1, None)? {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        let indices2 = match backend.scan_numeric_range_mmap(&col2, low2, high2, None)? {
+        // --- Case B: string equality AND numeric range ---
+        // Try both orderings: (str, num) and (num, str)
+        let str_num = Self::extract_string_equality(left_cond)
+            .and_then(|(sc, sv)| Self::extract_any_numeric_range(right_cond).map(|r| (sc, sv, r)))
+            .or_else(|| {
+                Self::extract_string_equality(right_cond)
+                    .and_then(|(sc, sv)| Self::extract_any_numeric_range(left_cond).map(|r| (sc, sv, r)))
+            });
+
+        let (str_col, str_val, (num_col, num_lo, num_hi)) = match str_num {
             Some(v) => v,
             None => return Ok(None),
         };
 
-        let mut intersected = Self::intersect_sorted_indices(&indices1, &indices2);
+        let str_indices = match backend.scan_string_filter_mmap(&str_col, &str_val, None)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let num_indices = match backend.scan_numeric_range_mmap(&num_col, num_lo, num_hi, None)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let mut intersected = Self::intersect_sorted_indices(&str_indices, &num_indices);
 
         // Apply offset + limit
         let offset = stmt.offset.unwrap_or(0);
