@@ -696,150 +696,104 @@ impl ApexExecutor {
     }
 
     /// Execute a SQL query with multi-table support (for JOINs)
+    ///
+    /// Uses `QuerySignature::classify()` for single-point pre-parse dispatch.
+    /// Fast paths (COUNT*, point lookup) are executed here without SQL parsing.
+    /// Everything else falls through to the SQL parser + executor pipeline.
     pub fn execute_with_base_dir(sql: &str, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
-        // PRE-PARSE FAST PATH: SELECT COUNT(*) FROM <table> — bypass SQL parser entirely.
-        // Handles the most common metadata query without any tokenization overhead.
-        {
-            let s = sql.trim();
-            if s.len() <= 200 {
-                let su = s.to_ascii_uppercase();
-                if su.starts_with("SELECT COUNT(*) FROM ")
-                    && !su.contains("WHERE") && !su.contains("GROUP")
-                    && !su.contains("HAVING") && !su.contains("JOIN")
-                    && !su.contains("DISTINCT")
-                {
-                    let after_from = su["SELECT COUNT(*) FROM ".len()..].trim();
-                    let table_name_upper = after_from.trim_end_matches(';').trim();
-                    if !table_name_upper.is_empty() && !table_name_upper.contains(' ') {
-                        let default_stem = default_table_path.file_stem()
-                            .and_then(|s| s.to_str()).unwrap_or("");
-                        let table_path = if table_name_upper.eq_ignore_ascii_case(default_stem) {
-                            default_table_path.to_path_buf()
-                        } else {
-                            base_dir.join(format!("{}.apex", table_name_upper.to_lowercase()))
-                        };
-                        if let Ok(backend) = get_cached_backend(&table_path) {
-                            let count = backend.active_row_count() as i64;
-                            let schema = Arc::new(Schema::new(vec![
-                                Field::new("COUNT(*)", ArrowDataType::Int64, false),
-                            ]));
-                            let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
-                            let batch = RecordBatch::try_new(schema, vec![array])
-                                .map_err(|e| err_data(e.to_string()))?;
-                            return Ok(ApexResult::Data(batch));
-                        }
-                    }
-                }
-            }
-        }
+        use crate::query::query_signature::{self, QuerySignature};
 
-        // PRE-PARSE FAST PATH: SELECT * FROM <table> WHERE _id = N — bypass SQL parser + executor.
-        // Handles the core OLTP point lookup without tokenization, CBO, or Arrow batch build overhead.
-        // Benefits: pg wire, Arrow Flight, and all Rust callers of execute_with_base_dir.
-        {
-            let s = sql.trim();
-            if s.len() <= 300 {
-                let su = s.to_ascii_uppercase();
-                if su.starts_with("SELECT") && su.contains("WHERE") && !su.contains("JOIN")
-                    && !su.contains("GROUP") && !su.contains("ORDER") && !su.contains("LIMIT")
-                    && !su.contains(';')
-                    && (su.contains("WHERE _ID =") || su.contains("WHERE _ID="))
-                {
-                    let eq_pos = su.find("WHERE _ID =").map(|p| p + 6)
-                        .or_else(|| su.find("WHERE _ID=").map(|p| p + 6));
-                    if let Some(ep) = eq_pos {
-                        let skip = if su[ep..].starts_with("_ID =") { 5 } else { 4 };
-                        let after_eq = su[ep + skip..].trim_start();
-                        let num_end = after_eq.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_eq.len());
-                        if num_end > 0 {
-                            if let Ok(id) = after_eq[..num_end].parse::<u64>() {
-                                // Resolve table path from FROM clause
-                                let table_path = if let Some(fp) = su.find(" FROM ") {
-                                    let after_from = su[fp + 6..].trim_start();
-                                    let tn_end = after_from.find(|c: char| c == ' ' || c == '\t' || c == '\n' || c == ';')
-                                        .unwrap_or(after_from.len());
-                                    let tname = after_from[..tn_end].trim_matches('"').to_lowercase();
-                                    if tname.is_empty() {
-                                        default_table_path.to_path_buf()
-                                    } else {
-                                        let default_stem = default_table_path.file_stem()
-                                            .and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                                        if tname == default_stem {
-                                            default_table_path.to_path_buf()
-                                        } else {
-                                            base_dir.join(format!("{}.apex", tname))
-                                        }
-                                    }
-                                } else {
-                                    default_table_path.to_path_buf()
+        let sig = query_signature::classify(sql);
+
+        // ── Pre-parse fast paths (bypass SQL parser entirely) ──
+        match &sig {
+            QuerySignature::CountStar { table } => {
+                let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    let count = backend.active_row_count() as i64;
+                    let schema = Arc::new(Schema::new(vec![
+                        Field::new("COUNT(*)", ArrowDataType::Int64, false),
+                    ]));
+                    let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
+                    let batch = RecordBatch::try_new(schema, vec![array])
+                        .map_err(|e| err_data(e.to_string()))?;
+                    return Ok(ApexResult::Data(batch));
+                }
+                // Fall through to full parse if backend open fails
+            }
+            QuerySignature::PointLookup { id } => {
+                // Resolve table from SQL's FROM clause for correct multi-table routing
+                let table_path = Self::resolve_point_lookup_table_path(sql, base_dir, default_table_path);
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
+                        if let Ok(Some(vals)) = backend.storage.retrieve_rcix(*id) {
+                            use crate::data::Value as V;
+                            let mut fields = Vec::with_capacity(vals.len());
+                            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(vals.len());
+                            for (col_name, val) in &vals {
+                                let nullable = matches!(val, V::Null);
+                                let (dt, arr): (ArrowDataType, ArrayRef) = match val {
+                                    V::Int64(v)   => (ArrowDataType::Int64,   Arc::new(Int64Array::from(vec![*v]))),
+                                    V::Float64(v) => (ArrowDataType::Float64, Arc::new(arrow::array::Float64Array::from(vec![*v]))),
+                                    V::String(s)  => (ArrowDataType::Utf8,    Arc::new(arrow::array::StringArray::from(vec![s.as_str()]))),
+                                    V::Bool(b)    => (ArrowDataType::Boolean, Arc::new(arrow::array::BooleanArray::from(vec![*b]))),
+                                    _             => (ArrowDataType::Utf8,    Arc::new(arrow::array::StringArray::from(vec![None as Option<&str>]))),
                                 };
-                                if let Ok(backend) = get_cached_backend(&table_path) {
-                                    if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
-                                        if let Ok(Some(vals)) = backend.storage.retrieve_rcix(id) {
-                                            use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
-                                            use crate::data::Value as V;
-                                            let mut fields = Vec::with_capacity(vals.len());
-                                            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(vals.len());
-                                            for (col_name, val) in &vals {
-                                                let nullable = matches!(val, V::Null);
-                                                let (dt, arr): (ArrowDataType, ArrayRef) = match val {
-                                                    V::Int64(v)   => (ArrowDataType::Int64,   Arc::new(Int64Array::from(vec![*v]))),
-                                                    V::Float64(v) => (ArrowDataType::Float64, Arc::new(Float64Array::from(vec![*v]))),
-                                                    V::String(s)  => (ArrowDataType::Utf8,    Arc::new(StringArray::from(vec![s.as_str()]))),
-                                                    V::Bool(b)    => (ArrowDataType::Boolean, Arc::new(BooleanArray::from(vec![*b]))),
-                                                    _             => (ArrowDataType::Utf8,    Arc::new(StringArray::from(vec![None as Option<&str>]))),
-                                                };
-                                                fields.push(Field::new(col_name, dt, nullable));
-                                                arrays.push(arr);
-                                            }
-                                            let schema = Arc::new(Schema::new(fields));
-                                            if let Ok(batch) = RecordBatch::try_new(schema, arrays) {
-                                                return Ok(ApexResult::Data(batch));
-                                            }
-                                        }
+                                fields.push(Field::new(col_name, dt, nullable));
+                                arrays.push(arr);
+                            }
+                            let schema = Arc::new(Schema::new(fields));
+                            if let Ok(batch) = RecordBatch::try_new(schema, arrays) {
+                                return Ok(ApexResult::Data(batch));
+                            }
+                        }
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::DmlWrite => {
+                // PRE-PARSE FAST PATH: DELETE FROM <table> WHERE <col> <op> <num>
+                // Bypasses SqlParser::parse_multi (~200µs) for simple single-condition numeric predicates.
+                let s = sql.trim().trim_end_matches(';');
+                if s.len() <= 300 {
+                    let su = s.to_ascii_uppercase();
+                    if su.starts_with("DELETE FROM ") {
+                        let after_df = &s["DELETE FROM ".len()..];
+                        let after_df_u = &su["DELETE FROM ".len()..];
+                        if let Some(where_pos) = after_df_u.find(" WHERE ") {
+                            let table_raw = after_df[..where_pos].trim();
+                            let after_where = after_df[where_pos + 7..].trim();
+                            let after_where_u = after_df_u[where_pos + 7..].to_ascii_uppercase();
+                            if !after_where_u.contains(" AND ") && !after_where_u.contains(" OR ")
+                                && !after_where_u.contains("NOT ") && !after_where_u.contains(" IN ")
+                                && !table_raw.contains(' ')
+                            {
+                                if let Some(expr) = Self::try_parse_delete_numeric_where(after_where) {
+                                    let table_path = Self::resolve_table_path(table_raw, base_dir, default_table_path);
+                                    if table_path.exists() {
+                                        return with_table_write_lock(&table_path, || {
+                                            Self::execute_delete(&table_path, Some(&expr))
+                                        });
                                     }
                                 }
                             }
                         }
                     }
                 }
+                // Fall through to full parse for non-DELETE or complex DELETE
+            }
+            QuerySignature::MultiStatement => {
+                // Multi-statement: parse all at once and execute
+                let stmts = SqlParser::parse_multi(sql)
+                    .map_err(|e| err_input(e.to_string()))?;
+                return Self::execute_parsed_multi_statements(stmts, base_dir, default_table_path);
+            }
+            _ => {
+                // All other signatures fall through to full parse below
             }
         }
 
-        // PRE-PARSE FAST PATH: DELETE FROM <table> WHERE <col> <op> <num>
-        // Bypasses SqlParser::parse_multi (~200µs) for simple single-condition numeric predicates.
-        // Handles: col=N, col>N, col>=N, col<N, col<=N, col BETWEEN A AND B
-        {
-            let s = sql.trim().trim_end_matches(';');
-            if s.len() <= 300 {
-                let su = s.to_ascii_uppercase();
-                if su.starts_with("DELETE FROM ") {
-                    let after_df = &s["DELETE FROM ".len()..];
-                    let after_df_u = &su["DELETE FROM ".len()..];
-                    if let Some(where_pos) = after_df_u.find(" WHERE ") {
-                        let table_raw = after_df[..where_pos].trim();
-                        let after_where = after_df[where_pos + 7..].trim();
-                        let after_where_u = after_df_u[where_pos + 7..].to_ascii_uppercase();
-                        // Single-condition only (no AND/OR/NOT/IN)
-                        if !after_where_u.contains(" AND ") && !after_where_u.contains(" OR ")
-                            && !after_where_u.contains("NOT ") && !after_where_u.contains(" IN ")
-                            && !table_raw.contains(' ')
-                        {
-                            if let Some(expr) = Self::try_parse_delete_numeric_where(after_where) {
-                                let table_path = Self::resolve_table_path(table_raw, base_dir, default_table_path);
-                                if table_path.exists() {
-                                    return with_table_write_lock(&table_path, || {
-                                        Self::execute_delete(&table_path, Some(&expr))
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Support multi-statement execution (e.g., CREATE VIEW; SELECT ...; DROP VIEW;)
+        // ── Full parse + execute pipeline ──
         // Parse as multi-statement unconditionally to avoid relying on string heuristics.
         let stmts = {
             // Fast path: check parse cache first (read lock, no allocation on hit)

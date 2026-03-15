@@ -203,6 +203,27 @@ impl ApexExecutor {
         }
     }
 
+    /// Resolve the table path for a point-lookup query by extracting the FROM clause table name.
+    /// Used by the QuerySignature::PointLookup pre-parse fast path.
+    fn resolve_point_lookup_table_path(sql: &str, base_dir: &Path, default_table_path: &Path) -> std::path::PathBuf {
+        let su = sql.trim().to_ascii_uppercase();
+        if let Some(fp) = su.find(" FROM ") {
+            let after_from = su[fp + 6..].trim_start();
+            let tn_end = after_from.find(|c: char| c == ' ' || c == '\t' || c == '\n' || c == ';')
+                .unwrap_or(after_from.len());
+            let tname = after_from[..tn_end].trim_matches('"').to_lowercase();
+            if !tname.is_empty() {
+                let default_stem = default_table_path.file_stem()
+                    .and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                if tname == default_stem {
+                    return default_table_path.to_path_buf();
+                }
+                return base_dir.join(format!("{}.apex", tname));
+            }
+        }
+        default_table_path.to_path_buf()
+    }
+
     /// CBO: Reorder INNER JOIN clauses by ascending right-table row count.
     /// Only applies when ALL joins are INNER and each ON condition is a simple
     /// equality (star join pattern — no cross-JOIN column dependencies).

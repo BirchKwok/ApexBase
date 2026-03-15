@@ -1093,325 +1093,153 @@ impl ApexStorageImpl {
         }
     }
 
-    /// Execute SQL query
+    /// Execute SQL query.
+    ///
+    /// Uses `QuerySignature::classify()` for single-point dispatch — no duplicate
+    /// pattern matching. Read queries that need high performance should prefer
+    /// `_execute_arrow_ffi()` from Python; this method is primarily for writes,
+    /// transactions, and point lookups that benefit from `columns_dict` format.
     fn execute(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
-        let sql_upper = sql.trim().to_uppercase();
-        let is_ddl = sql_upper.starts_with("CREATE ") || sql_upper.starts_with("DROP TABLE");
-        let is_write_op = sql_upper.starts_with("DELETE") 
-            || sql_upper.starts_with("TRUNCATE") 
-            || sql_upper.starts_with("UPDATE")
-            || sql_upper.starts_with("INSERT")
-            || sql_upper.starts_with("ALTER")
-            || sql_upper.starts_with("DROP");
+        use crate::query::query_signature::{self, QuerySignature};
 
-        // ULTRA-FAST PATH: _id = X point lookup — bypass table_path resolution, py_query_cache,
-        // and global STORAGE_CACHE. Uses per-instance cached_backends (zero PathBuf hashing).
-        // Only active for warm calls (after first call populates cached_backends).
-        if !is_write_op && !is_ddl && sql_upper.starts_with("SELECT")
-            && (sql_upper.contains("WHERE _ID =") || sql_upper.contains("WHERE _ID=")) {
-            let eq_pos = sql_upper.find("WHERE _ID =").map(|p| p + 6)
-                .or_else(|| sql_upper.find("WHERE _ID=").map(|p| p + 6));
-            if let Some(eq_pos) = eq_pos {
-                let after_eq = sql_upper[eq_pos + if sql_upper[eq_pos..].starts_with("_ID =") { 5 } else { 4 }..].trim_start();
-                let num_end = after_eq.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_eq.len());
-                if num_end > 0 {
-                    if let Ok(id) = after_eq[..num_end].parse::<u64>() {
-                        let table_name_fast = self.current_table.read().clone();
-                        let maybe_backend = self.cached_backends.get(&table_name_fast).map(|v| Arc::clone(&v));
-                        if let Some(backend) = maybe_backend {
-                            let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(id));
-                            if let Ok(Some(vals)) = rcix_result {
-                                let out = PyDict::new_bound(py);
-                                let columns_dict = PyDict::new_bound(py);
-                                for (col_name, val) in &vals {
-                                    let pyval = value_to_py(py, val)?;
-                                    columns_dict.set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
-                                }
-                                out.set_item("columns_dict", columns_dict)?;
-                                out.set_item("rows_affected", 0i64)?;
-                                return Ok(out.into());
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let sig = query_signature::classify(sql);
+        let is_write = matches!(&sig, QuerySignature::DmlWrite | QuerySignature::Ddl);
 
-        // Invalidate cached backend before write operations to avoid stale data
-        let table_name = self.current_table.read().clone();
-        if is_write_op && !table_name.is_empty() {
-            self.invalidate_backend(&table_name);
-        }
-        
-        // For DDL (CREATE/DROP TABLE), don't require a current table
-        // For DDL, CTE, or queries with no current table (cross-db qualified refs), fall back to base_dir
-        let table_path = self.get_current_table_path().unwrap_or_else(|_| self.current_base_dir());
-        if !is_ddl && !sql_upper.starts_with("WITH ") && table_path == self.current_base_dir() {
-            // Only enforce table selection for plain single-table ops
-            let table_name = self.current_table.read().clone();
-            if table_name.is_empty() && !is_ddl {
-                // Allow it — executor will use qualified table names from SQL
-            }
-        }
-        
-        // FAST PATH: SELECT COUNT(*) FROM <table> — bypass SQL parser + executor entirely.
-        // Returns count directly from metadata (active_row_count atomic load).
-        // NOTE: result intentionally not cached (count changes on writes).
-        if !is_write_op && sql_upper.starts_with("SELECT COUNT(*) FROM ")
-            && !sql_upper.contains("WHERE") && !sql_upper.contains("GROUP")
-            && !sql_upper.contains("HAVING") && !sql_upper.contains("JOIN")
-            && !sql_upper.contains("DISTINCT")
-        {
-            let after_from = sql_upper["SELECT COUNT(*) FROM ".len()..].trim();
-            let tname = after_from.trim_end_matches(';').trim();
-            if !tname.is_empty() && !tname.contains(' ') {
-                if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-                    let count = backend.active_row_count() as i64;
+        // ── ULTRA-FAST PATH: _id point lookup via cached_backends (warm) ──
+        // Uses per-instance DashMap — zero PathBuf hashing, bypasses STORAGE_CACHE.
+        if let QuerySignature::PointLookup { id } = &sig {
+            let table_name_fast = self.current_table.read().clone();
+            let maybe_backend = self.cached_backends.get(&table_name_fast).map(|v| Arc::clone(&v));
+            if let Some(backend) = maybe_backend {
+                let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
+                if let Ok(Some(vals)) = rcix_result {
                     let out = PyDict::new_bound(py);
-                    out.set_item("columns", PyList::new_bound(py, ["COUNT(*)"]))?;
-                    let row = PyList::new_bound(py, [count]);
-                    out.set_item("rows", PyList::new_bound(py, [row]))?;
+                    let columns_dict = PyDict::new_bound(py);
+                    for (col_name, val) in &vals {
+                        let pyval = value_to_py(py, val)?;
+                        columns_dict.set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
+                    }
+                    out.set_item("columns_dict", columns_dict)?;
                     out.set_item("rows_affected", 0i64)?;
                     return Ok(out.into());
                 }
             }
         }
 
-        // FAST PATH: SELECT * FROM <table> LIMIT N — skip SQL parse, use pread RCIX directly.
-        // Returns columnar dict format (handled by Python client's fast path at line 713).
-        if !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT")
-            && !sql_upper.contains("WHERE") && !sql_upper.contains("ORDER")
-            && !sql_upper.contains("GROUP") && !sql_upper.contains("JOIN") {
-            if let Some(limit_str) = sql_upper.rsplit("LIMIT").next() {
-                if let Ok(limit) = limit_str.trim().trim_end_matches(';').parse::<usize>() {
-                    if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-                        let batch_result = py.allow_threads(|| {
-                            match backend.storage.get_or_load_footer() {
-                                Ok(Some(footer)) => {
-                                    let col_indices: Vec<usize> = (0..footer.schema.column_count()).collect();
-                                    backend.storage.to_arrow_batch_pread_rcix(&col_indices, true, limit)
-                                }
-                                _ => Ok(None),
-                            }
-                        });
-                        if let Ok(Some(batch)) = batch_result {
-                            if batch.num_rows() > 0 {
-                                let out = PyDict::new_bound(py);
-                                let columns_dict = PyDict::new_bound(py);
-                                let schema = batch.schema();
-                                for col_idx in 0..batch.num_columns() {
-                                    let col_name = schema.field(col_idx).name();
-                                    let arr = batch.column(col_idx);
-                                    let col_list = arrow_col_to_pylist(py, arr)?;
-                                    columns_dict.set_item(col_name, col_list)?;
-                                }
-                                out.set_item("columns_dict", columns_dict)?;
-                                out.set_item("rows_affected", 0i64)?;
-                                return Ok(out.into());
-                            }
-                        }
-                    }
-                }
-            }
+        // Invalidate cached backend before write operations to avoid stale data
+        let table_name = self.current_table.read().clone();
+        if is_write && !table_name.is_empty() {
+            self.invalidate_backend(&table_name);
         }
-        
-        // FAST PATH: Point lookup SELECT * FROM <table> WHERE _id = X
-        // (First call warmup path — populates cached_backends for next ultra-fast calls)
-        if !is_write_op && sql_upper.starts_with("SELECT")
-            && (sql_upper.contains("WHERE _ID =") || sql_upper.contains("WHERE _ID=")) {
-            let eq_pos = sql_upper.find("WHERE _ID =").map(|p| p + 6)
-                .or_else(|| sql_upper.find("WHERE _ID=").map(|p| p + 6));
-            if let Some(eq_pos) = eq_pos {
-                let after_eq = sql_upper[eq_pos + if sql_upper[eq_pos..].starts_with("_ID =") { 5 } else { 4 }..].trim_start();
-                let num_end = after_eq.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_eq.len());
-                if num_end > 0 {
-                    if let Ok(id) = after_eq[..num_end].parse::<u64>() {
-                        if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-                            // Populate cached_backends so the ultra-fast path works on next call
-                            self.cached_backends.insert(table_name.clone(), Arc::clone(&backend));
-                            let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(id));
-                            if let Ok(Some(vals)) = rcix_result {
-                                let out = PyDict::new_bound(py);
-                                let columns_dict = PyDict::new_bound(py);
-                                for (col_name, val) in &vals {
-                                    let pyval = value_to_py(py, val)?;
-                                    columns_dict.set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
-                                }
-                                out.set_item("columns_dict", columns_dict)?;
-                                out.set_item("rows_affected", 0i64)?;
-                                return Ok(out.into());
-                            }
-                            // Fallback: Arrow batch path
-                            if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(id) {
-                                if batch.num_rows() > 0 {
-                                    let out = PyDict::new_bound(py);
-                                    let columns_dict = PyDict::new_bound(py);
-                                    let schema = batch.schema();
-                                    for col_idx in 0..batch.num_columns() {
-                                        let col_name = schema.field(col_idx).name();
-                                        let arr = batch.column(col_idx);
-                                        let vals_1row: Vec<_> = (0..batch.num_rows())
-                                            .map(|r| value_to_py(py, &arrow_value_at(arr, r)))
-                                            .collect::<PyResult<_>>()?;
-                                        columns_dict.set_item(col_name, PyList::new_bound(py, vals_1row))?;
-                                    }
-                                    out.set_item("columns_dict", columns_dict)?;
-                                    out.set_item("rows_affected", 0i64)?;
-                                    return Ok(out.into());
-                                }
-                            }
+
+        let table_path = self.get_current_table_path().unwrap_or_else(|_| self.current_base_dir());
+
+        // ── FAST PATH: Point lookup (cold — populates cached_backends for next ultra-fast call) ──
+        if let QuerySignature::PointLookup { id } = &sig {
+            if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+                self.cached_backends.insert(table_name.clone(), Arc::clone(&backend));
+                let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
+                if let Ok(Some(vals)) = rcix_result {
+                    let out = PyDict::new_bound(py);
+                    let columns_dict = PyDict::new_bound(py);
+                    for (col_name, val) in &vals {
+                        let pyval = value_to_py(py, val)?;
+                        columns_dict.set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
+                    }
+                    out.set_item("columns_dict", columns_dict)?;
+                    out.set_item("rows_affected", 0i64)?;
+                    return Ok(out.into());
+                }
+                // Fallback: Arrow batch path
+                if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(*id) {
+                    if batch.num_rows() > 0 {
+                        let out = PyDict::new_bound(py);
+                        let columns_dict = PyDict::new_bound(py);
+                        let schema = batch.schema();
+                        for col_idx in 0..batch.num_columns() {
+                            let col_name = schema.field(col_idx).name();
+                            let arr = batch.column(col_idx);
+                            let vals_1row: Vec<_> = (0..batch.num_rows())
+                                .map(|r| value_to_py(py, &arrow_value_at(arr, r)))
+                                .collect::<PyResult<_>>()?;
+                            columns_dict.set_item(col_name, PyList::new_bound(py, vals_1row))?;
                         }
+                        out.set_item("columns_dict", columns_dict)?;
+                        out.set_item("rows_affected", 0i64)?;
+                        return Ok(out.into());
                     }
                 }
             }
         }
 
-        // FAST PATH: SELECT * WHERE col = 'val' — bypass SQL executor overhead (~1.3ms)
-        // Uses mmap scan directly, same as LIMIT N fast path. Handles string equality only.
-        if !is_write_op && sql_upper.starts_with("SELECT *")
-            && sql_upper.contains("WHERE") && !sql_upper.contains("LIMIT")
-            && !sql_upper.contains("ORDER") && !sql_upper.contains("GROUP")
-            && !sql_upper.contains("JOIN") && !sql_upper.contains("BETWEEN")
-            && !sql_upper.contains(" IN ") && !sql_upper.contains('>')
-            && !sql_upper.contains('<') && sql.contains('\'')
-        {
-            if let Some(where_pos) = sql_upper.find("WHERE") {
-                let after_where = sql[where_pos + 5..].trim().trim_end_matches(';');
-                if let Some(eq_pos) = after_where.find('=') {
-                    let col = after_where[..eq_pos].trim().trim_matches('"').to_string();
-                    let rhs = after_where[eq_pos + 1..].trim();
-                    if !col.contains(' ') && !col.contains('(') && rhs.starts_with('\'') {
-                        if let Some(val_end) = rhs[1..].find('\'') {
-                            let val = rhs[1..1 + val_end].to_string();
-                            if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-                                let scan_result: io::Result<Option<RecordBatch>> = (|| {
-                                    let indices = match backend.scan_string_filter_mmap(&col, &val, None)? {
-                                        Some(v) => v,
-                                        None => return Ok(None),
-                                    };
-                                    if indices.is_empty() {
-                                        Ok(Some(backend.read_columns_to_arrow(None, 0, Some(0))?))
-                                    } else {
-                                        Ok(Some(backend.read_columns_by_indices_to_arrow(&indices)?))
-                                    }
-                                })();
-                                if let Ok(Some(batch)) = scan_result {
-                                    let schema = batch.schema();
-                                    let col_names: Vec<String> = schema.fields().iter()
-                                        .map(|f| f.name().clone()).collect();
-                                    let mut rows_out: Vec<Vec<Value>> = Vec::with_capacity(batch.num_rows());
-                                    for row_idx in 0..batch.num_rows() {
-                                        let mut row: Vec<Value> = Vec::with_capacity(batch.num_columns());
-                                        for col_idx in 0..batch.num_columns() {
-                                            row.push(arrow_value_at(batch.column(col_idx), row_idx));
-                                        }
-                                        rows_out.push(row);
-                                    }
-                                    let out = PyDict::new_bound(py);
-                                    out.set_item("columns", &col_names)?;
-                                    let py_rows = PyList::empty_bound(py);
-                                    for row in &rows_out {
-                                        let py_row = PyList::empty_bound(py);
-                                        for v in row { py_row.append(value_to_py(py, v)?)?; }
-                                        py_rows.append(py_row)?;
-                                    }
-                                    out.set_item("rows", py_rows)?;
-                                    out.set_item("rows_affected", 0)?;
-                                    return Ok(out.into());
-                                }
-                            }
+        // ── FAST PATH: SELECT * LIMIT N — pread RCIX, returns columnar dict ──
+        if let QuerySignature::SimpleScanLimit { limit } = &sig {
+            if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+                let limit = *limit;
+                let batch_result = py.allow_threads(|| {
+                    match backend.storage.get_or_load_footer() {
+                        Ok(Some(footer)) => {
+                            let col_indices: Vec<usize> = (0..footer.schema.column_count()).collect();
+                            backend.storage.to_arrow_batch_pread_rcix(&col_indices, true, limit)
                         }
+                        _ => Ok(None),
+                    }
+                });
+                if let Ok(Some(batch)) = batch_result {
+                    if batch.num_rows() > 0 {
+                        let out = PyDict::new_bound(py);
+                        let columns_dict = PyDict::new_bound(py);
+                        let schema = batch.schema();
+                        for col_idx in 0..batch.num_columns() {
+                            let col_name = schema.field(col_idx).name();
+                            let arr = batch.column(col_idx);
+                            let col_list = arrow_col_to_pylist(py, arr)?;
+                            columns_dict.set_item(col_name, col_list)?;
+                        }
+                        out.set_item("columns_dict", columns_dict)?;
+                        out.set_item("rows_affected", 0i64)?;
+                        return Ok(out.into());
                     }
                 }
             }
         }
 
-        // FAST PATH: SELECT * WHERE col LIKE 'pattern' — bypass SQL executor overhead.
-        // Uses mmap-level LIKE scan (prefix/suffix/contains/regex) + columnar Arrow output.
-        if !is_write_op && sql_upper.starts_with("SELECT *")
-            && sql_upper.contains(" LIKE ") && sql_upper.contains("WHERE")
-            && !sql_upper.contains("NOT LIKE") && !sql_upper.contains("LIMIT")
-            && !sql_upper.contains("ORDER") && !sql_upper.contains("GROUP")
-            && !sql_upper.contains("JOIN") && !sql_upper.contains(" AND ")
-            && !sql_upper.contains(" OR ") && sql.contains('\'')
-        {
-            if let Some(where_pos) = sql_upper.find("WHERE") {
-                let after_where = sql[where_pos + 5..].trim().trim_end_matches(';');
-                let after_where_upper = after_where.to_uppercase();
-                if let Some(like_pos) = after_where_upper.find(" LIKE ") {
-                    let col = after_where[..like_pos].trim().trim_matches('"').to_string();
-                    let rhs = after_where[like_pos + 6..].trim();
-                    if !col.contains(' ') && !col.contains('(') && rhs.starts_with('\'') {
-                        if let Some(val_end) = rhs[1..].find('\'') {
-                            let pattern = rhs[1..1 + val_end].to_string();
-                            if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-                                let scan_result: io::Result<Option<RecordBatch>> = (|| {
-                                    let indices = match backend.scan_like_filter_mmap(&col, &pattern, None)? {
-                                        Some(v) => v,
-                                        None => return Ok(None),
-                                    };
-                                    if indices.is_empty() {
-                                        Ok(Some(backend.read_columns_to_arrow(None, 0, Some(0))?))
-                                    } else {
-                                        Ok(Some(backend.read_columns_by_indices_to_arrow(&indices)?))
-                                    }
-                                })();
-                                if let Ok(Some(batch)) = scan_result {
-                                    // Serialize as Arrow IPC — avoids creating O(rows*cols) Python
-                                    // objects in Rust.  PyArrow's ipc.read_all is SIMD-optimized
-                                    // bulk C++ (~2ms) vs 666K Python object allocs (~40ms).
-                                    // Result stored as arrow_table for zero-copy to_pandas().
-                                    use arrow::ipc::writer::StreamWriter;
-                                    use pyo3::types::PyBytes;
-                                    let estimated = batch.get_array_memory_size() + 512;
-                                    let mut buf = Vec::with_capacity(estimated);
-                                    let ipc_ok = (|| -> Result<(), arrow::error::ArrowError> {
-                                        let mut w = StreamWriter::try_new(&mut buf, batch.schema().as_ref())?;
-                                        w.write(&batch)?;
-                                        w.finish()
-                                    })();
-                                    if ipc_ok.is_ok() {
-                                        let out = PyDict::new_bound(py);
-                                        out.set_item("arrow_ipc", PyBytes::new_bound(py, &buf))?;
-                                        out.set_item("rows_affected", 0i64)?;
-                                        return Ok(out.into());
-                                    }
-                                    // IPC serialization failed — fall through to slow path
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // ── Transaction handling ──
+        let is_txn = matches!(&sig, QuerySignature::Transaction);
+        let sql_upper_lazy = || sql.trim().to_uppercase();
 
-        // Transaction handling: intercept BEGIN/COMMIT/ROLLBACK/SAVEPOINT
-        let is_begin = sql_upper.starts_with("BEGIN");
-        let is_commit = sql_upper == "COMMIT" || sql_upper == "COMMIT;";
-        let is_rollback = sql_upper == "ROLLBACK" || sql_upper == "ROLLBACK;";
-        let is_savepoint = sql_upper.starts_with("SAVEPOINT ");
-        let is_rollback_to = sql_upper.starts_with("ROLLBACK TO");
-        let is_release = sql_upper.starts_with("RELEASE");
+        let is_begin = is_txn && sql.trim().to_ascii_uppercase().starts_with("BEGIN");
+        let is_commit = is_txn && {
+            let su = sql.trim().to_ascii_uppercase();
+            su == "COMMIT" || su == "COMMIT;"
+        };
+        let is_rollback = is_txn && {
+            let su = sql.trim().to_ascii_uppercase();
+            (su == "ROLLBACK" || su == "ROLLBACK;") && !su.starts_with("ROLLBACK TO")
+        };
+        let is_savepoint = is_txn && sql.trim().to_ascii_uppercase().starts_with("SAVEPOINT ");
+        let is_rollback_to = is_txn && sql.trim().to_ascii_uppercase().starts_with("ROLLBACK TO");
+        let is_release = is_txn && sql.trim().to_ascii_uppercase().starts_with("RELEASE");
+
         let current_txn = *self.current_txn_id.read();
-        let is_txn_dml = current_txn.is_some() && (is_write_op || sql_upper.starts_with("INSERT"));
-        let is_txn_select = current_txn.is_some() && sql_upper.starts_with("SELECT");
+        let is_txn_dml = current_txn.is_some() && matches!(&sig, QuerySignature::DmlWrite);
+        let is_txn_select = current_txn.is_some() && !is_write && !is_txn
+            && matches!(&sig, QuerySignature::Complex | QuerySignature::CountStar { .. }
+                | QuerySignature::PointLookup { .. } | QuerySignature::SimpleScanLimit { .. }
+                | QuerySignature::StringEqualityFilter { .. } | QuerySignature::LikeFilter { .. }
+                | QuerySignature::TableFunction);
 
         let sql = sql.to_string();
         let base_dir = self.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.root_dir);
 
         let (columns, rows) = py.allow_threads(|| -> PyResult<(Vec<String>, Vec<Vec<Value>>)> {
-            // Transaction-aware execution
             if is_begin {
                 let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                // extract txn_id from Scalar result
                 if let ApexResult::Scalar(txn_id) = &result {
-                    // Store txn_id - will be set after allow_threads
                     return Ok((vec!["txn_id".to_string()], vec![vec![Value::Int64(*txn_id)]]));
                 }
-                let batch = result.to_record_batch()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 return Ok((vec![], vec![]));
             }
 
@@ -1434,7 +1262,6 @@ impl ApexStorageImpl {
                 return Ok((vec![], vec![]));
             }
 
-            // SAVEPOINT name — create savepoint within active transaction
             if is_savepoint {
                 if let Some(txn_id) = current_txn {
                     let name = sql.trim().strip_prefix("SAVEPOINT ").or_else(|| sql.trim().strip_prefix("savepoint "))
@@ -1448,13 +1275,11 @@ impl ApexStorageImpl {
                 return Ok((vec![], vec![]));
             }
 
-            // ROLLBACK TO [SAVEPOINT] name — partial rollback
             if is_rollback_to {
                 if let Some(txn_id) = current_txn {
                     let upper_trimmed = sql.trim().to_uppercase();
                     let rest = upper_trimmed.strip_prefix("ROLLBACK TO").unwrap_or("").trim();
                     let rest = rest.strip_prefix("SAVEPOINT").unwrap_or(rest).trim().trim_end_matches(';');
-                    // Use original case from SQL for the name
                     let name_start = sql.trim().to_uppercase().find(rest).unwrap_or(0);
                     let name = sql.trim()[name_start..].trim().trim_end_matches(';').to_string();
                     let mgr = crate::txn::txn_manager();
@@ -1465,7 +1290,6 @@ impl ApexStorageImpl {
                 return Ok((vec![], vec![]));
             }
 
-            // RELEASE [SAVEPOINT] name — release savepoint
             if is_release {
                 if let Some(txn_id) = current_txn {
                     let upper_trimmed = sql.trim().to_uppercase();
@@ -1482,7 +1306,6 @@ impl ApexStorageImpl {
             }
 
             if is_txn_dml || is_txn_select {
-                // Inside a transaction: buffer DML writes or read with overlay
                 let txn_id = current_txn.unwrap();
                 let parsed = SqlParser::parse(&sql)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -1505,20 +1328,19 @@ impl ApexStorageImpl {
                 return Ok((columns, rows));
             }
 
-            // Normal (non-transaction) execution
+            // Normal execution (non-transaction writes, DDL, and fallback reads)
             let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
+
             let batch = result.to_record_batch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
-            // Convert RecordBatch to columns and rows
+
             let columns: Vec<String> = batch.schema()
                 .fields()
                 .iter()
                 .map(|f| f.name().clone())
                 .collect();
-            
+
             let mut rows: Vec<Vec<Value>> = Vec::with_capacity(batch.num_rows());
             for row_idx in 0..batch.num_rows() {
                 let mut row: Vec<Value> = Vec::with_capacity(batch.num_columns());
@@ -1529,14 +1351,13 @@ impl ApexStorageImpl {
                 }
                 rows.push(row);
             }
-            
+
             Ok((columns, rows))
         })?;
         crate::query::executor::clear_query_root_dir();
 
         // Update transaction state after execution
         if is_begin {
-            // Extract txn_id from first row
             if let Some(row) = rows.first() {
                 if let Some(Value::Int64(txn_id)) = row.first() {
                     *self.current_txn_id.write() = Some(*txn_id as u64);
@@ -1545,7 +1366,6 @@ impl ApexStorageImpl {
         }
         if is_commit || is_rollback {
             *self.current_txn_id.write() = None;
-            // Invalidate backend after transaction completes
             if !table_name.is_empty() {
                 self.invalidate_backend(&table_name);
             }
@@ -1564,32 +1384,35 @@ impl ApexStorageImpl {
         }
         out.set_item("rows", py_rows)?;
         out.set_item("rows_affected", 0)?;
-        
-        // Invalidate cached backend AFTER write operations to ensure fresh data on next access
-        if is_write_op && !table_name.is_empty() {
+
+        // Invalidate cached backend AFTER write operations
+        if is_write && !table_name.is_empty() {
             self.invalidate_backend(&table_name);
         }
-        
+
         // After CREATE TABLE, register the new table and set it as current
-        if sql_upper.starts_with("CREATE TABLE") || sql_upper.starts_with("CREATE TABLE IF NOT EXISTS") {
-            let rest = sql_upper.strip_prefix("CREATE TABLE")
-                .unwrap_or("")
-                .trim();
-            let rest = if rest.starts_with("IF NOT EXISTS") {
-                rest.strip_prefix("IF NOT EXISTS").unwrap_or(rest).trim()
-            } else {
-                rest
-            };
-            if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == '(').next() {
-                let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
-                if !tbl.is_empty() {
-                    let tbl_path = self.current_base_dir().join(format!("{}.apex", tbl));
-                    self.table_paths.write().insert(tbl.clone(), tbl_path);
-                    *self.current_table.write() = tbl;
+        if matches!(&sig, QuerySignature::Ddl) {
+            let sql_upper = sql_upper_lazy();
+            if sql_upper.starts_with("CREATE TABLE") {
+                let rest = sql_upper.strip_prefix("CREATE TABLE")
+                    .unwrap_or("")
+                    .trim();
+                let rest = if rest.starts_with("IF NOT EXISTS") {
+                    rest.strip_prefix("IF NOT EXISTS").unwrap_or(rest).trim()
+                } else {
+                    rest
+                };
+                if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == '(').next() {
+                    let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
+                    if !tbl.is_empty() {
+                        let tbl_path = self.current_base_dir().join(format!("{}.apex", tbl));
+                        self.table_paths.write().insert(tbl.clone(), tbl_path);
+                        *self.current_table.write() = tbl;
+                    }
                 }
             }
         }
-        
+
         Ok(out.into())
     }
 
@@ -1703,38 +1526,18 @@ impl ApexStorageImpl {
     /// Single-pass LIKE scan+extract via scan_like_and_extract_mmap, returned as zero-copy
     /// Arrow FFI pointers.  Returns (0, 0) on any error or when the fast path is unavailable
     /// (compressed/non-RCIX files), letting Python fall back to the IPC path.
+    ///
+    /// Uses `QuerySignature::classify()` — no inline pattern matching.
     fn _execute_like_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(usize, usize)> {
         use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
         use arrow::array::{StructArray, Array};
+        use crate::query::query_signature::{self, QuerySignature};
 
-        let sql_upper = sql.trim().to_uppercase();
-        // Only handle simple SELECT * ... WHERE col LIKE 'pat' (no JOIN/GROUP/ORDER/LIMIT/AND/OR)
-        if !sql_upper.starts_with("SELECT *")
-            || !sql_upper.contains(" LIKE ")
-            || !sql_upper.contains("WHERE")
-            || sql_upper.contains("NOT LIKE")
-            || sql_upper.contains("LIMIT")
-            || sql_upper.contains("ORDER")
-            || sql_upper.contains("GROUP")
-            || sql_upper.contains("JOIN")
-            || sql_upper.contains(" AND ")
-            || sql_upper.contains(" OR ")
-            || !sql.contains('\'')
-        {
-            return Ok((0, 0));
-        }
-
-        // Extract col + pattern from WHERE clause
-        let where_pos = match sql_upper.find("WHERE") { Some(p) => p, None => return Ok((0, 0)) };
-        let after_where = sql[where_pos + 5..].trim().trim_end_matches(';');
-        let after_where_upper = after_where.to_uppercase();
-        let like_pos = match after_where_upper.find(" LIKE ") { Some(p) => p, None => return Ok((0, 0)) };
-        let col = after_where[..like_pos].trim().trim_matches('"').to_string();
-        if col.contains(' ') || col.contains('(') { return Ok((0, 0)); }
-        let rhs = after_where[like_pos + 6..].trim();
-        if !rhs.starts_with('\'') { return Ok((0, 0)); }
-        let val_end = match rhs[1..].find('\'') { Some(p) => p, None => return Ok((0, 0)) };
-        let pattern = rhs[1..1 + val_end].to_string();
+        let sig = query_signature::classify(sql);
+        let (col, pattern) = match sig {
+            QuerySignature::LikeFilter { column, pattern } => (column, pattern),
+            _ => return Ok((0, 0)),
+        };
 
         let table_path = match self.get_current_table_path() {
             Ok(p) => p,
@@ -1778,73 +1581,52 @@ impl ApexStorageImpl {
         Ok(())
     }
     
-    /// Execute SQL and return Arrow IPC bytes for efficient transfer
+    /// Execute SQL and return Arrow IPC bytes for efficient transfer.
+    ///
+    /// Uses `QuerySignature::classify()` — no inline pattern matching.
+    /// Primarily used for multi-statement SQL and as a fallback for Arrow FFI failures.
     fn _execute_arrow_ipc(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
         use arrow::ipc::writer::StreamWriter;
         use pyo3::types::PyBytes;
-        
-        // Invalidate cached backend before write operations
-        let sql_upper = sql.trim().to_uppercase();
-        let is_ddl = sql_upper.starts_with("CREATE ") || sql_upper.starts_with("DROP TABLE");
-        let is_write_op = sql_upper.starts_with("DELETE") 
-            || sql_upper.starts_with("TRUNCATE") 
-            || sql_upper.starts_with("UPDATE")
-            || sql_upper.starts_with("INSERT")
-            || sql_upper.starts_with("ALTER")
-            || sql_upper.starts_with("DROP");
+        use crate::query::query_signature::{self, QuerySignature};
+
+        let sig = query_signature::classify(sql);
+        let is_write = matches!(&sig, QuerySignature::DmlWrite | QuerySignature::Ddl);
+        let is_multi = matches!(&sig, QuerySignature::MultiStatement);
+
         let table_name = self.current_table.read().clone();
-        if is_write_op && !table_name.is_empty() {
+        if is_write && !table_name.is_empty() {
             self.invalidate_backend(&table_name);
         }
-        
-        // Detect multi-statement SQL: contains ';' with non-whitespace content after
-        // Also treat BEGIN/COMMIT/ROLLBACK-containing SQL as multi-statement candidate
-        let is_multi_stmt = {
-            let trimmed = sql.trim().trim_end_matches(';').trim();
-            trimmed.contains(';')
-        };
-        let contains_txn_cmd = sql_upper.contains("BEGIN") || sql_upper.contains("COMMIT") || sql_upper.contains("ROLLBACK");
-        
-        // For DDL, CTE, multi-statement, or txn-containing SQL, don't require a current table
-        let is_cte = sql_upper.starts_with("WITH ");
-        // Fall back to base_dir when no table is selected (e.g. cross-db qualified queries)
+
         let table_path = self.get_current_table_path().unwrap_or_else(|_| self.current_base_dir());
         let base_dir = self.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.root_dir);
 
-        // FAST PATH: SELECT * FROM <table> LIMIT N — build Arrow batch directly from V4
-        if !is_multi_stmt && !is_write_op && sql_upper.starts_with("SELECT *") && sql_upper.contains("LIMIT")
-            && !sql_upper.contains("WHERE") && !sql_upper.contains("ORDER")
-            && !sql_upper.contains("GROUP") && !sql_upper.contains("JOIN") {
-            if let Some(limit_str) = sql_upper.rsplit("LIMIT").next() {
-                if let Ok(limit) = limit_str.trim().trim_end_matches(';').parse::<usize>() {
-                    if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-                        if let Ok(batch) = backend.storage.to_arrow_batch_with_limit(None, false, limit) {
-                            if batch.num_rows() > 0 || batch.num_columns() > 0 {
-                                let mut buf = Vec::with_capacity(batch.get_array_memory_size() + 256);
-                                {
-                                    let mut writer = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
-                                        .map_err(|e| PyRuntimeError::new_err(format!("IPC writer error: {}", e)))?;
-                                    writer.write(&batch)
-                                        .map_err(|e| PyRuntimeError::new_err(format!("IPC write error: {}", e)))?;
-                                    writer.finish()
-                                        .map_err(|e| PyRuntimeError::new_err(format!("IPC finish error: {}", e)))?;
-                                }
-                                return Ok(PyBytes::new_bound(py, &buf).into());
-                            }
+        // FAST PATH: SELECT * LIMIT N — build Arrow batch directly from V4
+        if let QuerySignature::SimpleScanLimit { limit } = &sig {
+            if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+                if let Ok(batch) = backend.storage.to_arrow_batch_with_limit(None, false, *limit) {
+                    if batch.num_rows() > 0 || batch.num_columns() > 0 {
+                        let mut buf = Vec::with_capacity(batch.get_array_memory_size() + 256);
+                        {
+                            let mut writer = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
+                                .map_err(|e| PyRuntimeError::new_err(format!("IPC writer error: {}", e)))?;
+                            writer.write(&batch)
+                                .map_err(|e| PyRuntimeError::new_err(format!("IPC write error: {}", e)))?;
+                            writer.finish()
+                                .map_err(|e| PyRuntimeError::new_err(format!("IPC finish error: {}", e)))?;
                         }
+                        return Ok(PyBytes::new_bound(py, &buf).into());
                     }
                 }
             }
         }
 
         let sql = sql.to_string();
-        
-        // For multi-statement SQL with transaction commands, use txn-aware path
         let current_txn = *self.current_txn_id.read();
-        
-        let (batch, new_txn_id) = if is_multi_stmt {
-            // Multi-statement: parse all and execute with txn support
+
+        let (batch, new_txn_id) = if is_multi {
             py.allow_threads(|| -> PyResult<(RecordBatch, Option<u64>)> {
                 let stmts = crate::query::sql_parser::SqlParser::parse_multi(&sql)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -1855,7 +1637,6 @@ impl ApexStorageImpl {
                 Ok((batch, final_txn))
             })?
         } else {
-            // Single statement: standard path
             let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
                 let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -1864,13 +1645,12 @@ impl ApexStorageImpl {
             })?;
             (batch, current_txn)
         };
-        
-        // Update transaction state if changed by multi-statement execution
-        if is_multi_stmt && new_txn_id != current_txn {
+
+        if is_multi && new_txn_id != current_txn {
             *self.current_txn_id.write() = new_txn_id;
         }
-        
-        // Serialize to IPC format (pre-allocate buffer to avoid reallocations)
+
+        // Serialize to IPC format
         let estimated_size = batch.get_array_memory_size() + 512;
         let mut buf = Vec::with_capacity(estimated_size);
         {
@@ -1881,57 +1661,58 @@ impl ApexStorageImpl {
             writer.finish()
                 .map_err(|e| PyRuntimeError::new_err(format!("IPC finish error: {}", e)))?;
         }
-        
+
         // Invalidate cached backend AFTER write operations
-        if (is_write_op || is_multi_stmt) && !table_name.is_empty() {
+        if (is_write || is_multi) && !table_name.is_empty() {
             self.invalidate_backend(&table_name);
         }
-        
-        // After DROP TABLE, remove the table from table_paths and invalidate backend
-        if sql_upper.starts_with("DROP TABLE") {
-            let rest = sql_upper.strip_prefix("DROP TABLE")
-                .unwrap_or("")
-                .trim();
-            let rest = if rest.starts_with("IF EXISTS") {
-                rest.strip_prefix("IF EXISTS").unwrap_or(rest).trim()
-            } else {
-                rest
-            };
-            if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == ';').next() {
-                let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
-                if !tbl.is_empty() {
-                    self.table_paths.write().remove(&tbl);
-                    self.invalidate_backend(&tbl);
-                    // Clear current table if it was the dropped table
-                    if *self.current_table.read() == tbl {
-                        *self.current_table.write() = String::new();
+
+        // After DROP TABLE, remove from table_paths
+        if matches!(&sig, QuerySignature::Ddl) {
+            let sql_upper = sql.trim().to_uppercase();
+            if sql_upper.starts_with("DROP TABLE") {
+                let rest = sql_upper.strip_prefix("DROP TABLE")
+                    .unwrap_or("")
+                    .trim();
+                let rest = if rest.starts_with("IF EXISTS") {
+                    rest.strip_prefix("IF EXISTS").unwrap_or(rest).trim()
+                } else {
+                    rest
+                };
+                if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == ';').next() {
+                    let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
+                    if !tbl.is_empty() {
+                        self.table_paths.write().remove(&tbl);
+                        self.invalidate_backend(&tbl);
+                        if *self.current_table.read() == tbl {
+                            *self.current_table.write() = String::new();
+                        }
+                    }
+                }
+            }
+
+            // After CREATE TABLE, register the new table
+            if sql_upper.starts_with("CREATE TABLE") {
+                let rest = sql_upper.strip_prefix("CREATE TABLE")
+                    .unwrap_or("")
+                    .trim();
+                let rest = if rest.starts_with("IF NOT EXISTS") {
+                    rest.strip_prefix("IF NOT EXISTS").unwrap_or(rest).trim()
+                } else {
+                    rest
+                };
+                if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == '(').next() {
+                    let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
+                    if !tbl.is_empty() {
+                        let tbl_path = self.current_base_dir().join(format!("{}.apex", tbl));
+                        self.table_paths.write().insert(tbl.clone(), tbl_path);
+                        *self.current_table.write() = tbl;
                     }
                 }
             }
         }
-        
-        // After CREATE TABLE, register the new table and set it as current
-        if sql_upper.starts_with("CREATE TABLE") {
-            let rest = sql_upper.strip_prefix("CREATE TABLE")
-                .unwrap_or("")
-                .trim();
-            let rest = if rest.starts_with("IF NOT EXISTS") {
-                rest.strip_prefix("IF NOT EXISTS").unwrap_or(rest).trim()
-            } else {
-                rest
-            };
-            if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == '(').next() {
-                let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
-                if !tbl.is_empty() {
-                    let tbl_path = self.current_base_dir().join(format!("{}.apex", tbl));
-                    self.table_paths.write().insert(tbl.clone(), tbl_path);
-                    *self.current_table.write() = tbl;
-                }
-            }
-        }
-        
+
         crate::query::executor::clear_query_root_dir();
-        // Return as Python bytes
         Ok(PyBytes::new_bound(py, &buf).into())
     }
     
