@@ -547,7 +547,7 @@ Average of 5 timed iterations after 2 warmup runs.
 | Retrieve Many (100 IDs) | 0.190ms | 0.419ms | 4.68ms | **2.2x faster** |
 | Insert 1K rows | 0.664ms | 1.35ms | 163.67ms | **2.0x faster** |
 | SELECT \* → pandas (full scan) | 82.39ms | 1.18s | 198.81ms | **2.4x faster** |
-| GROUP BY city, category (100 grp) | 4.01ms | 691.08ms | 5.78ms | **1.4x faster** |
+| GROUP BY city, category (100 grp) | 3.96ms | 691.08ms | 6.16ms | **1.6x faster** |
 | LIKE filter (name LIKE 'user\_1%') | 21.38ms | 130.91ms | 53.18ms | **2.5x faster** |
 | Multi-cond (age>30 AND score>50) | 47.24ms | 343.33ms | 192.97ms | **4.1x faster** |
 | ORDER BY city, score DESC LIMIT 100 | 3.11ms | 70.36ms | 7.68ms | **2.5x faster** |
