@@ -7,6 +7,14 @@
 //! enum that determines the optimal execution path. This replaces the previous
 //! architecture where 83 fast-path checks were scattered across 4 layers.
 
+/// DDL sub-kind — pre-extracted table name avoids re-uppercasing in bindings.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DdlKind {
+    CreateTable { name: String },
+    DropTable { name: String },
+    Other,
+}
+
 /// Query signature — lightweight classification of a SQL statement.
 ///
 /// Produced ONCE by `classify()`, then consumed by all layers without re-parsing.
@@ -17,7 +25,7 @@ pub enum QuerySignature {
     CountStar { table: String },
 
     /// `SELECT ... WHERE _id = N` — O(1) point lookup by primary key
-    PointLookup { id: u64 },
+    PointLookup { id: u64, table: Option<String> },
 
     /// `SELECT * FROM <table> LIMIT N` — sequential scan with early termination
     SimpleScanLimit { limit: usize },
@@ -32,7 +40,7 @@ pub enum QuerySignature {
     TableFunction,
 
     /// DDL: CREATE TABLE, DROP TABLE, ALTER TABLE, CREATE INDEX, etc.
-    Ddl,
+    Ddl { kind: DdlKind },
 
     /// DML write: INSERT, UPDATE, DELETE, TRUNCATE, COPY IMPORT
     DmlWrite,
@@ -86,7 +94,7 @@ impl QuerySignature {
         matches!(
             self,
             QuerySignature::DmlWrite
-                | QuerySignature::Ddl
+                | QuerySignature::Ddl { .. }
                 | QuerySignature::Transaction
                 | QuerySignature::MultiStatement
         )
@@ -152,7 +160,7 @@ pub fn classify(sql: &str) -> QuerySignature {
 
     // ── DDL ──
     if su.starts_with("CREATE ") || su.starts_with("DROP ") || su.starts_with("ALTER ") {
-        return QuerySignature::Ddl;
+        return QuerySignature::Ddl { kind: extract_ddl_kind(s, su) };
     }
 
     // ── DML writes ──
@@ -183,12 +191,12 @@ pub fn classify(sql: &str) -> QuerySignature {
 
     // ── REINDEX / PRAGMA ──
     if su.starts_with("REINDEX") || su.starts_with("PRAGMA") {
-        return QuerySignature::Ddl;
+        return QuerySignature::Ddl { kind: DdlKind::Other };
     }
 
     // ── SHOW / FTS DDL ──
     if su.starts_with("SHOW ") {
-        return QuerySignature::Ddl;
+        return QuerySignature::Ddl { kind: DdlKind::Other };
     }
 
     // ── SELECT queries — classify further ──
@@ -231,7 +239,8 @@ pub fn classify(sql: &str) -> QuerySignature {
         && !has_limit && !has_order && !has_group && !has_join
     {
         if let Some(id) = extract_id_from_upper(su) {
-            return QuerySignature::PointLookup { id };
+            let table = extract_from_table(sql, su);
+            return QuerySignature::PointLookup { id, table };
         }
     }
 
@@ -304,6 +313,51 @@ fn extract_string_equality(sql: &str, su: &str) -> Option<(String, String)> {
     Some((col, val))
 }
 
+/// Extract table name from `FROM <table>` clause using original-case SQL + uppercased version.
+fn extract_from_table(sql: &str, su: &str) -> Option<String> {
+    let fp = su.find(" FROM ")?;
+    let after_from = sql[fp + 6..].trim_start();
+    let tn_end = after_from.find(|c: char| c.is_whitespace() || c == ';')
+        .unwrap_or(after_from.len());
+    let tname = after_from[..tn_end].trim_matches('"').to_lowercase();
+    if tname.is_empty() { None } else { Some(tname) }
+}
+
+/// Extract DDL sub-kind from original-case SQL + uppercased version.
+/// Extracts table name for CREATE TABLE / DROP TABLE; returns Other for everything else.
+fn extract_ddl_kind(sql: &str, su: &str) -> DdlKind {
+    if su.starts_with("CREATE TABLE") {
+        let rest = &sql["CREATE TABLE".len()..].trim_start();
+        // Skip "IF NOT EXISTS"
+        let rest = if rest.len() >= 13 && rest[..13].eq_ignore_ascii_case("IF NOT EXISTS") {
+            rest[13..].trim_start()
+        } else {
+            rest
+        };
+        if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == '(' || c == ';').next() {
+            let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
+            if !tbl.is_empty() {
+                return DdlKind::CreateTable { name: tbl };
+            }
+        }
+    } else if su.starts_with("DROP TABLE") {
+        let rest = &sql["DROP TABLE".len()..].trim_start();
+        // Skip "IF EXISTS"
+        let rest = if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case("IF EXISTS") {
+            rest[9..].trim_start()
+        } else {
+            rest
+        };
+        if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == ';').next() {
+            let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
+            if !tbl.is_empty() {
+                return DdlKind::DropTable { name: tbl };
+            }
+        }
+    }
+    DdlKind::Other
+}
+
 /// Extract (column, pattern) from `WHERE col LIKE 'pattern'`.
 fn extract_like_pattern(sql: &str, su: &str) -> Option<(String, String)> {
     let where_pos = su.find("WHERE")?;
@@ -340,11 +394,11 @@ mod tests {
     fn test_point_lookup() {
         assert_eq!(
             classify("SELECT * FROM t WHERE _id = 42"),
-            QuerySignature::PointLookup { id: 42 }
+            QuerySignature::PointLookup { id: 42, table: Some("t".to_string()) }
         );
         assert_eq!(
             classify("SELECT * FROM t WHERE _id=100"),
-            QuerySignature::PointLookup { id: 100 }
+            QuerySignature::PointLookup { id: 100, table: Some("t".to_string()) }
         );
     }
 
@@ -393,9 +447,9 @@ mod tests {
 
     #[test]
     fn test_ddl() {
-        assert_eq!(classify("CREATE TABLE t (id INT)"), QuerySignature::Ddl);
-        assert_eq!(classify("DROP TABLE t"), QuerySignature::Ddl);
-        assert_eq!(classify("ALTER TABLE t ADD COLUMN x INT"), QuerySignature::Ddl);
+        assert_eq!(classify("CREATE TABLE t (id INT)"), QuerySignature::Ddl { kind: DdlKind::CreateTable { name: "t".to_string() } });
+        assert_eq!(classify("DROP TABLE t"), QuerySignature::Ddl { kind: DdlKind::DropTable { name: "t".to_string() } });
+        assert!(matches!(classify("ALTER TABLE t ADD COLUMN x INT"), QuerySignature::Ddl { kind: DdlKind::Other }));
     }
 
     #[test]

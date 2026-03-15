@@ -100,10 +100,9 @@ impl ApexBaseHandler {
     /// Returns the sanitized database name if recognised, None otherwise.
     fn try_parse_use_cmd(sql: &str) -> Option<String> {
         let trimmed = sql.trim();
-        let upper = trimmed.to_uppercase();
-        let db_name = if upper.starts_with("USE ") {
+        let db_name = if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("USE ") {
             trimmed[4..].trim().trim_matches('"').trim_matches('\'').trim_matches('`')
-        } else if upper.starts_with("\\C ") || upper.starts_with("\\C\t") {
+        } else if trimmed.starts_with("\\c ") || trimmed.starts_with("\\C ") || trimmed.starts_with("\\c\t") || trimmed.starts_with("\\C\t") {
             trimmed[3..].trim()
         } else {
             return None;
@@ -172,53 +171,54 @@ impl ApexBaseHandler {
 
     /// Check if SQL is a write/command operation (not a SELECT query)
     fn is_write_op(sql: &str) -> bool {
-        let effective = Self::strip_sql_comments(sql);
-        let upper = effective.to_uppercase();
-        upper.starts_with("INSERT")
-            || upper.starts_with("UPDATE")
-            || upper.starts_with("DELETE")
-            || upper.starts_with("CREATE")
-            || upper.starts_with("DROP")
-            || upper.starts_with("ALTER")
-            || upper.starts_with("TRUNCATE")
-            || upper.starts_with("BEGIN")
-            || upper.starts_with("COMMIT")
-            || upper.starts_with("ROLLBACK")
-            || upper.starts_with("SAVEPOINT")
-            || upper.starts_with("RELEASE")
+        let s = Self::strip_sql_comments(sql);
+        if s.is_empty() { return false; }
+        // First-byte guard + eq_ignore_ascii_case — zero allocation
+        match s.as_bytes()[0] | 0x20 {
+            b'i' => s.len() >= 6 && s[..6].eq_ignore_ascii_case("INSERT"),
+            b'u' => s.len() >= 6 && s[..6].eq_ignore_ascii_case("UPDATE"),
+            b'd' => (s.len() >= 6 && s[..6].eq_ignore_ascii_case("DELETE")) || (s.len() >= 4 && s[..4].eq_ignore_ascii_case("DROP")),
+            b'c' => (s.len() >= 6 && s[..6].eq_ignore_ascii_case("CREATE")) || (s.len() >= 6 && s[..6].eq_ignore_ascii_case("COMMIT")),
+            b'a' => s.len() >= 5 && s[..5].eq_ignore_ascii_case("ALTER"),
+            b't' => s.len() >= 8 && s[..8].eq_ignore_ascii_case("TRUNCATE"),
+            b'b' => s.len() >= 5 && s[..5].eq_ignore_ascii_case("BEGIN"),
+            b'r' => (s.len() >= 8 && s[..8].eq_ignore_ascii_case("ROLLBACK")) || (s.len() >= 7 && s[..7].eq_ignore_ascii_case("RELEASE")),
+            b's' => s.len() >= 9 && s[..9].eq_ignore_ascii_case("SAVEPOINT"),
+            _ => false,
+        }
     }
 
     /// Get the proper PG command tag for a SQL statement
     fn command_tag(sql: &str, rows: usize) -> Tag {
-        let effective = Self::strip_sql_comments(sql);
-        let upper = effective.to_uppercase();
-        if upper.starts_with("INSERT") {
+        let s = Self::strip_sql_comments(sql);
+        // Zero-allocation: first-byte dispatch + eq_ignore_ascii_case
+        if s.len() >= 6 && s[..6].eq_ignore_ascii_case("INSERT") {
             Tag::new("INSERT").with_oid(0).with_rows(rows)
-        } else if upper.starts_with("DELETE") {
+        } else if s.len() >= 6 && s[..6].eq_ignore_ascii_case("DELETE") {
             Tag::new("DELETE").with_rows(rows)
-        } else if upper.starts_with("UPDATE") {
+        } else if s.len() >= 6 && s[..6].eq_ignore_ascii_case("UPDATE") {
             Tag::new("UPDATE").with_rows(rows)
-        } else if upper.starts_with("CREATE TABLE") {
+        } else if s.len() >= 12 && s[..12].eq_ignore_ascii_case("CREATE TABLE") {
             Tag::new("CREATE TABLE")
-        } else if upper.starts_with("CREATE INDEX") {
+        } else if s.len() >= 12 && s[..12].eq_ignore_ascii_case("CREATE INDEX") {
             Tag::new("CREATE INDEX")
-        } else if upper.starts_with("CREATE") {
+        } else if s.len() >= 6 && s[..6].eq_ignore_ascii_case("CREATE") {
             Tag::new("CREATE TABLE")
-        } else if upper.starts_with("DROP TABLE") || upper.starts_with("DROP") {
+        } else if s.len() >= 4 && s[..4].eq_ignore_ascii_case("DROP") {
             Tag::new("DROP TABLE")
-        } else if upper.starts_with("ALTER") {
+        } else if s.len() >= 5 && s[..5].eq_ignore_ascii_case("ALTER") {
             Tag::new("ALTER TABLE")
-        } else if upper.starts_with("TRUNCATE") {
+        } else if s.len() >= 8 && s[..8].eq_ignore_ascii_case("TRUNCATE") {
             Tag::new("TRUNCATE TABLE")
-        } else if upper.starts_with("BEGIN") {
+        } else if s.len() >= 5 && s[..5].eq_ignore_ascii_case("BEGIN") {
             Tag::new("BEGIN")
-        } else if upper.starts_with("COMMIT") {
+        } else if s.len() >= 6 && s[..6].eq_ignore_ascii_case("COMMIT") {
             Tag::new("COMMIT")
-        } else if upper.starts_with("ROLLBACK") {
+        } else if s.len() >= 8 && s[..8].eq_ignore_ascii_case("ROLLBACK") {
             Tag::new("ROLLBACK")
-        } else if upper.starts_with("SAVEPOINT") {
+        } else if s.len() >= 9 && s[..9].eq_ignore_ascii_case("SAVEPOINT") {
             Tag::new("SAVEPOINT")
-        } else if upper.starts_with("RELEASE") {
+        } else if s.len() >= 7 && s[..7].eq_ignore_ascii_case("RELEASE") {
             Tag::new("RELEASE")
         } else {
             Tag::new("OK")

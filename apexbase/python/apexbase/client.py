@@ -984,14 +984,22 @@ class ApexClient:
             # ── DML/SELECT within a transaction (single-statement only) ──
             if getattr(self, '_in_txn', False) and _sig != 'multi' and sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'SELECT')):
                 result = self._storage.execute(sql)
-                if sql_upper.startswith('SELECT') and isinstance(result, dict) and 'columns' in result and 'rows' in result:
-                    cols = result['columns']
-                    rows = result['rows']
-                    if cols and rows:
-                        col_dict = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
-                        rv = ResultView(lazy_pydict=col_dict)
+                if sql_upper.startswith('SELECT') and isinstance(result, dict):
+                    # Prefer columns_dict (columnar, zero-copy from Rust)
+                    columns_dict = result.get('columns_dict')
+                    if columns_dict is not None:
+                        rv = ResultView(lazy_pydict=columns_dict)
                         rv._show_internal_id = show_internal_id
                         return rv
+                    # Fallback: columns+rows format (transpose to columnar)
+                    if 'columns' in result and 'rows' in result:
+                        cols = result['columns']
+                        rows = result['rows']
+                        if cols and rows:
+                            col_dict = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
+                            rv = ResultView(lazy_pydict=col_dict)
+                            rv._show_internal_id = show_internal_id
+                            return rv
                 rv = ResultView(data=None)
                 rv._show_internal_id = show_internal_id
                 return rv

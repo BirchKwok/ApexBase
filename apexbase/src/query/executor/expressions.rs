@@ -1927,27 +1927,29 @@ impl ApexExecutor {
         name: &str,
         args: &[SqlExpr],
     ) -> io::Result<ArrayRef> {
-        let upper = name.to_uppercase();
-        
-        // Handle aggregate function references (for HAVING clause)
-        // These should map to already-computed columns in the result batch
-        match upper.as_str() {
-            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+        // Handle aggregate function references (for HAVING clause) — zero-allocation dispatch
+        let agg_upper: &str = if name.eq_ignore_ascii_case("COUNT") { "COUNT" }
+            else if name.eq_ignore_ascii_case("SUM") { "SUM" }
+            else if name.eq_ignore_ascii_case("AVG") { "AVG" }
+            else if name.eq_ignore_ascii_case("MIN") { "MIN" }
+            else if name.eq_ignore_ascii_case("MAX") { "MAX" }
+            else { "" };
+        if !agg_upper.is_empty() {
                 // Build possible column names as they might appear in the result batch
                 let col_name = if args.is_empty() {
-                    format!("{}(*)", upper)
+                    format!("{}(*)", agg_upper)
                 } else if let Some(SqlExpr::Literal(Value::String(s))) = args.first() {
                     if s == "*" {
-                        format!("{}(*)", upper)
+                        format!("{}(*)", agg_upper)
                     } else {
-                        format!("{}({})", upper, s)
+                        format!("{}({})", agg_upper, s)
                     }
                 } else if let Some(SqlExpr::Column(col)) = args.first() {
-                    format!("{}({})", upper, col)
+                    format!("{}({})", agg_upper, col)
                 } else if let Some(SqlExpr::Literal(Value::Int64(n))) = args.first() {
-                    format!("{}({})", upper, n)
+                    format!("{}({})", agg_upper, n)
                 } else {
-                    format!("{}(*)", upper)
+                    format!("{}(*)", agg_upper)
                 };
                 
                 // Try to find the column in the batch by exact name
@@ -1960,9 +1962,9 @@ impl ApexExecutor {
                     return Ok(array.clone());
                 }
                 // Try with just the function name pattern (handles aliased columns)
+                let prefix = format!("{}(", agg_upper);
                 for field in batch.schema().fields() {
-                    let field_upper = field.name().to_uppercase();
-                    if field_upper.starts_with(&format!("{}(", upper)) {
+                    if field.name().eq_ignore_ascii_case(&col_name) || field.name().to_uppercase().starts_with(&prefix) {
                         return batch.column_by_name(field.name()).cloned()
                             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Column not found: {}", col_name)));
                     }
@@ -1985,10 +1987,9 @@ impl ApexExecutor {
                 }
                 
                 // Try to match based on aggregate type position
-                // SUM is typically after COUNT if both are present
                 if !agg_columns.is_empty() {
-                    let target_idx = match upper.as_str() {
-                        "COUNT" => 0,  // COUNT is usually first
+                    let target_idx = match agg_upper {
+                        "COUNT" => 0,
                         "SUM" => if agg_columns.len() > 1 { 1 } else { 0 },
                         "AVG" => if agg_columns.len() > 2 { 2 } else { agg_columns.len().saturating_sub(1) },
                         "MIN" | "MAX" => agg_columns.len().saturating_sub(1),
@@ -1999,10 +2000,9 @@ impl ApexExecutor {
                 }
                 
                 return Err(io::Error::new(io::ErrorKind::NotFound, format!("Aggregate column '{}' not found in result", col_name)));
-            }
-            _ => {}
         }
         
+        let upper = name.to_uppercase();
         match upper.as_str() {
             "GETVARIABLE" => {
                 if args.len() != 1 {

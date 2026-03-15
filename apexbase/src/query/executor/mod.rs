@@ -721,9 +721,19 @@ impl ApexExecutor {
                 }
                 // Fall through to full parse if backend open fails
             }
-            QuerySignature::PointLookup { id } => {
-                // Resolve table from SQL's FROM clause for correct multi-table routing
-                let table_path = Self::resolve_point_lookup_table_path(sql, base_dir, default_table_path);
+            QuerySignature::PointLookup { id, ref table } => {
+                // Use pre-extracted table name from classify() — avoids redundant to_ascii_uppercase()
+                let table_path = if let Some(tname) = table {
+                    let default_stem = default_table_path.file_stem()
+                        .and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                    if *tname == default_stem {
+                        default_table_path.to_path_buf()
+                    } else {
+                        base_dir.join(format!("{}.apex", tname))
+                    }
+                } else {
+                    default_table_path.to_path_buf()
+                };
                 if let Ok(backend) = get_cached_backend(&table_path) {
                     if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
                         if let Ok(Some(vals)) = backend.storage.retrieve_rcix(*id) {
@@ -754,8 +764,9 @@ impl ApexExecutor {
             QuerySignature::DmlWrite => {
                 // PRE-PARSE FAST PATH: DELETE FROM <table> WHERE <col> <op> <num>
                 // Bypasses SqlParser::parse_multi (~200µs) for simple single-condition numeric predicates.
+                // Only uppercase when first byte is 'D'/'d' — skips INSERT/UPDATE/TRUNCATE entirely.
                 let s = sql.trim().trim_end_matches(';');
-                if s.len() <= 300 {
+                if s.len() <= 300 && matches!(s.as_bytes().first(), Some(b'D' | b'd')) {
                     let su = s.to_ascii_uppercase();
                     if su.starts_with("DELETE FROM ") {
                         let after_df = &s["DELETE FROM ".len()..];

@@ -838,8 +838,7 @@ impl ApexStorageImpl {
             return Ok(Vec::new());
         }
 
-        let table_path = self.get_current_table_path()?;
-        let table_name = self.current_table.read().clone();
+        let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
         
         // Skip file lock for 'fast' durability
@@ -973,8 +972,7 @@ impl ApexStorageImpl {
 
     /// Delete a record by ID using StorageEngine
     fn delete(&self, id: i64) -> PyResult<bool> {
-        let table_path = self.get_current_table_path()?;
-        let table_name = self.current_table.read().clone();
+        let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
         
         // Skip file lock for 'fast' durability
@@ -1007,8 +1005,7 @@ impl ApexStorageImpl {
             return Ok(true);
         }
         
-        let table_path = self.get_current_table_path()?;
-        let table_name = self.current_table.read().clone();
+        let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
         
         // Skip file lock for 'fast' durability
@@ -1038,8 +1035,7 @@ impl ApexStorageImpl {
     /// Delete records matching a WHERE clause
     /// Returns the number of deleted rows
     fn delete_where(&self, where_clause: &str) -> PyResult<i64> {
-        let table_path = self.get_current_table_path()?;
-        let table_name = self.current_table.read().clone();
+        let (table_path, table_name) = self.get_current_table_info()?;
         
         // Build DELETE SQL statement
         let sql = format!("DELETE FROM {} WHERE {}", table_name, where_clause);
@@ -1067,8 +1063,7 @@ impl ApexStorageImpl {
     /// Delete all records (no WHERE clause)
     /// Returns the number of deleted rows
     fn delete_all(&self) -> PyResult<i64> {
-        let table_path = self.get_current_table_path()?;
-        let table_name = self.current_table.read().clone();
+        let (table_path, table_name) = self.get_current_table_info()?;
         
         // Build DELETE SQL statement without WHERE
         let sql = format!("DELETE FROM {}", table_name);
@@ -1103,13 +1098,22 @@ impl ApexStorageImpl {
         use crate::query::query_signature::{self, QuerySignature};
 
         let sig = query_signature::classify(sql);
-        let is_write = matches!(&sig, QuerySignature::DmlWrite | QuerySignature::Ddl);
+        let is_write = matches!(&sig, QuerySignature::DmlWrite | QuerySignature::Ddl { .. });
+
+        // Single read of current_table — avoids 3x RwLock acquire + String clone
+        let table_name = self.current_table.read().clone();
+        let table_path = if table_name.is_empty() {
+            self.current_base_dir()
+        } else {
+            self.table_paths.read().get(&table_name)
+                .cloned()
+                .unwrap_or_else(|| self.current_base_dir().join(format!("{}.apex", table_name)))
+        };
 
         // ── ULTRA-FAST PATH: _id point lookup via cached_backends (warm) ──
         // Uses per-instance DashMap — zero PathBuf hashing, bypasses STORAGE_CACHE.
-        if let QuerySignature::PointLookup { id } = &sig {
-            let table_name_fast = self.current_table.read().clone();
-            let maybe_backend = self.cached_backends.get(&table_name_fast).map(|v| Arc::clone(&v));
+        if let QuerySignature::PointLookup { id, .. } = &sig {
+            let maybe_backend = self.cached_backends.get(&table_name).map(|v| Arc::clone(&v));
             if let Some(backend) = maybe_backend {
                 let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
                 if let Ok(Some(vals)) = rcix_result {
@@ -1126,16 +1130,8 @@ impl ApexStorageImpl {
             }
         }
 
-        // Invalidate cached backend before write operations to avoid stale data
-        let table_name = self.current_table.read().clone();
-        if is_write && !table_name.is_empty() {
-            self.invalidate_backend(&table_name);
-        }
-
-        let table_path = self.get_current_table_path().unwrap_or_else(|_| self.current_base_dir());
-
         // ── FAST PATH: Point lookup (cold — populates cached_backends for next ultra-fast call) ──
-        if let QuerySignature::PointLookup { id } = &sig {
+        if let QuerySignature::PointLookup { id, .. } = &sig {
             if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
                 self.cached_backends.insert(table_name.clone(), Arc::clone(&backend));
                 let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
@@ -1204,22 +1200,15 @@ impl ApexStorageImpl {
             }
         }
 
-        // ── Transaction handling ──
+        // ── Transaction handling (single uppercase pass) ──
         let is_txn = matches!(&sig, QuerySignature::Transaction);
-        let sql_upper_lazy = || sql.trim().to_uppercase();
-
-        let is_begin = is_txn && sql.trim().to_ascii_uppercase().starts_with("BEGIN");
-        let is_commit = is_txn && {
-            let su = sql.trim().to_ascii_uppercase();
-            su == "COMMIT" || su == "COMMIT;"
-        };
-        let is_rollback = is_txn && {
-            let su = sql.trim().to_ascii_uppercase();
-            (su == "ROLLBACK" || su == "ROLLBACK;") && !su.starts_with("ROLLBACK TO")
-        };
-        let is_savepoint = is_txn && sql.trim().to_ascii_uppercase().starts_with("SAVEPOINT ");
-        let is_rollback_to = is_txn && sql.trim().to_ascii_uppercase().starts_with("ROLLBACK TO");
-        let is_release = is_txn && sql.trim().to_ascii_uppercase().starts_with("RELEASE");
+        let txn_upper = if is_txn { sql.trim().to_ascii_uppercase() } else { String::new() };
+        let is_begin = is_txn && txn_upper.starts_with("BEGIN");
+        let is_commit = is_txn && (txn_upper == "COMMIT" || txn_upper == "COMMIT;");
+        let is_rollback = is_txn && (txn_upper == "ROLLBACK" || txn_upper == "ROLLBACK;") && !txn_upper.starts_with("ROLLBACK TO");
+        let is_savepoint = is_txn && txn_upper.starts_with("SAVEPOINT ");
+        let is_rollback_to = is_txn && txn_upper.starts_with("ROLLBACK TO");
+        let is_release = is_txn && txn_upper.starts_with("RELEASE");
 
         let current_txn = *self.current_txn_id.read();
         let is_txn_dml = current_txn.is_some() && matches!(&sig, QuerySignature::DmlWrite);
@@ -1233,14 +1222,21 @@ impl ApexStorageImpl {
         let base_dir = self.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.root_dir);
 
-        let (columns, rows) = py.allow_threads(|| -> PyResult<(Vec<String>, Vec<Vec<Value>>)> {
+        // Return enum to avoid per-cell arrow_value_at inside allow_threads
+        enum ExecOut {
+            Scalar(String, i64),   // key, value — for txn commands
+            Batch(RecordBatch),    // data result — columnar conversion with GIL
+            Empty,                 // no result
+        }
+
+        let exec_out = py.allow_threads(|| -> PyResult<ExecOut> {
             if is_begin {
                 let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 if let ApexResult::Scalar(txn_id) = &result {
-                    return Ok((vec!["txn_id".to_string()], vec![vec![Value::Int64(*txn_id)]]));
+                    return Ok(ExecOut::Scalar("txn_id".to_string(), *txn_id));
                 }
-                return Ok((vec![], vec![]));
+                return Ok(ExecOut::Empty);
             }
 
             if is_commit {
@@ -1248,10 +1244,10 @@ impl ApexStorageImpl {
                     let result = ApexExecutor::execute_commit_txn(txn_id, &base_dir, &table_path)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                     if let ApexResult::Scalar(n) = &result {
-                        return Ok((vec!["rows_applied".to_string()], vec![vec![Value::Int64(*n)]]));
+                        return Ok(ExecOut::Scalar("rows_applied".to_string(), *n));
                     }
                 }
-                return Ok((vec![], vec![]));
+                return Ok(ExecOut::Empty);
             }
 
             if is_rollback {
@@ -1259,7 +1255,7 @@ impl ApexStorageImpl {
                     ApexExecutor::execute_rollback_txn(txn_id)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 }
-                return Ok((vec![], vec![]));
+                return Ok(ExecOut::Empty);
             }
 
             if is_savepoint {
@@ -1272,37 +1268,35 @@ impl ApexStorageImpl {
                         Ok(())
                     }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 }
-                return Ok((vec![], vec![]));
+                return Ok(ExecOut::Empty);
             }
 
             if is_rollback_to {
                 if let Some(txn_id) = current_txn {
-                    let upper_trimmed = sql.trim().to_uppercase();
-                    let rest = upper_trimmed.strip_prefix("ROLLBACK TO").unwrap_or("").trim();
+                    let rest = txn_upper.strip_prefix("ROLLBACK TO").unwrap_or("").trim();
                     let rest = rest.strip_prefix("SAVEPOINT").unwrap_or(rest).trim().trim_end_matches(';');
-                    let name_start = sql.trim().to_uppercase().find(rest).unwrap_or(0);
+                    let name_start = txn_upper.find(rest).unwrap_or(0);
                     let name = sql.trim()[name_start..].trim().trim_end_matches(';').to_string();
                     let mgr = crate::txn::txn_manager();
                     mgr.with_context(txn_id, |ctx| {
                         ctx.rollback_to_savepoint(&name)
                     }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 }
-                return Ok((vec![], vec![]));
+                return Ok(ExecOut::Empty);
             }
 
             if is_release {
                 if let Some(txn_id) = current_txn {
-                    let upper_trimmed = sql.trim().to_uppercase();
-                    let rest = upper_trimmed.strip_prefix("RELEASE").unwrap_or("").trim();
+                    let rest = txn_upper.strip_prefix("RELEASE").unwrap_or("").trim();
                     let rest = rest.strip_prefix("SAVEPOINT").unwrap_or(rest).trim().trim_end_matches(';');
-                    let name_start = sql.trim().to_uppercase().find(rest).unwrap_or(0);
+                    let name_start = txn_upper.find(rest).unwrap_or(0);
                     let name = sql.trim()[name_start..].trim().trim_end_matches(';').to_string();
                     let mgr = crate::txn::txn_manager();
                     mgr.with_context(txn_id, |ctx| {
                         ctx.release_savepoint(&name)
                     }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 }
-                return Ok((vec![], vec![]));
+                return Ok(ExecOut::Empty);
             }
 
             if is_txn_dml || is_txn_select {
@@ -1312,56 +1306,29 @@ impl ApexStorageImpl {
                 let result = ApexExecutor::execute_in_txn(txn_id, parsed, &base_dir, &table_path)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 if let ApexResult::Scalar(n) = &result {
-                    return Ok((vec!["rows_buffered".to_string()], vec![vec![Value::Int64(*n)]]));
+                    return Ok(ExecOut::Scalar("rows_buffered".to_string(), *n));
                 }
                 let batch = result.to_record_batch()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let columns: Vec<String> = batch.schema().fields().iter().map(|f| f.name().clone()).collect();
-                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(batch.num_rows());
-                for row_idx in 0..batch.num_rows() {
-                    let mut row: Vec<Value> = Vec::with_capacity(batch.num_columns());
-                    for col_idx in 0..batch.num_columns() {
-                        row.push(arrow_value_at(batch.column(col_idx), row_idx));
-                    }
-                    rows.push(row);
-                }
-                return Ok((columns, rows));
+                return Ok(ExecOut::Batch(batch));
             }
 
             // Normal execution (non-transaction writes, DDL, and fallback reads)
             let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
+            if let ApexResult::Scalar(n) = &result {
+                return Ok(ExecOut::Scalar("rows_affected".to_string(), *n));
+            }
             let batch = result.to_record_batch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let columns: Vec<String> = batch.schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect();
-
-            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(batch.num_rows());
-            for row_idx in 0..batch.num_rows() {
-                let mut row: Vec<Value> = Vec::with_capacity(batch.num_columns());
-                for col_idx in 0..batch.num_columns() {
-                    let arr = batch.column(col_idx);
-                    let val = arrow_value_at(arr, row_idx);
-                    row.push(val);
-                }
-                rows.push(row);
-            }
-
-            Ok((columns, rows))
+            Ok(ExecOut::Batch(batch))
         })?;
         crate::query::executor::clear_query_root_dir();
 
         // Update transaction state after execution
         if is_begin {
-            if let Some(row) = rows.first() {
-                if let Some(Value::Int64(txn_id)) = row.first() {
-                    *self.current_txn_id.write() = Some(*txn_id as u64);
-                }
+            if let ExecOut::Scalar(_, txn_id) = &exec_out {
+                *self.current_txn_id.write() = Some(*txn_id as u64);
             }
         }
         if is_commit || is_rollback {
@@ -1371,18 +1338,30 @@ impl ApexStorageImpl {
             }
         }
 
+        // Build Python result — columnar conversion for batches (single downcast per column)
         let out = PyDict::new_bound(py);
-        out.set_item("columns", &columns)?;
-
-        let py_rows = PyList::empty_bound(py);
-        for row in &rows {
-            let py_row = PyList::empty_bound(py);
-            for v in row {
-                py_row.append(value_to_py(py, v)?)?;
+        match exec_out {
+            ExecOut::Batch(batch) => {
+                let columns_dict = PyDict::new_bound(py);
+                let schema = batch.schema();
+                for col_idx in 0..batch.num_columns() {
+                    let col_name = schema.field(col_idx).name();
+                    let arr = batch.column(col_idx);
+                    let col_list = arrow_col_to_pylist(py, arr)?;
+                    columns_dict.set_item(col_name, col_list)?;
+                }
+                out.set_item("columns_dict", columns_dict)?;
             }
-            py_rows.append(py_row)?;
+            ExecOut::Scalar(key, val) => {
+                out.set_item("columns", PyList::new_bound(py, [&key]))?;
+                let row = PyList::new_bound(py, [val.into_py(py)]);
+                out.set_item("rows", PyList::new_bound(py, [row]))?;
+            }
+            ExecOut::Empty => {
+                out.set_item("columns", PyList::empty_bound(py))?;
+                out.set_item("rows", PyList::empty_bound(py))?;
+            }
         }
-        out.set_item("rows", py_rows)?;
         out.set_item("rows_affected", 0)?;
 
         // Invalidate cached backend AFTER write operations
@@ -1391,26 +1370,10 @@ impl ApexStorageImpl {
         }
 
         // After CREATE TABLE, register the new table and set it as current
-        if matches!(&sig, QuerySignature::Ddl) {
-            let sql_upper = sql_upper_lazy();
-            if sql_upper.starts_with("CREATE TABLE") {
-                let rest = sql_upper.strip_prefix("CREATE TABLE")
-                    .unwrap_or("")
-                    .trim();
-                let rest = if rest.starts_with("IF NOT EXISTS") {
-                    rest.strip_prefix("IF NOT EXISTS").unwrap_or(rest).trim()
-                } else {
-                    rest
-                };
-                if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == '(').next() {
-                    let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
-                    if !tbl.is_empty() {
-                        let tbl_path = self.current_base_dir().join(format!("{}.apex", tbl));
-                        self.table_paths.write().insert(tbl.clone(), tbl_path);
-                        *self.current_table.write() = tbl;
-                    }
-                }
-            }
+        if let QuerySignature::Ddl { kind: crate::query::query_signature::DdlKind::CreateTable { ref name } } = &sig {
+            let tbl_path = self.current_base_dir().join(format!("{}.apex", name));
+            self.table_paths.write().insert(name.clone(), tbl_path);
+            *self.current_table.write() = name.clone();
         }
 
         Ok(out.into())
@@ -1591,15 +1554,18 @@ impl ApexStorageImpl {
         use crate::query::query_signature::{self, QuerySignature};
 
         let sig = query_signature::classify(sql);
-        let is_write = matches!(&sig, QuerySignature::DmlWrite | QuerySignature::Ddl);
+        let is_write = matches!(&sig, QuerySignature::DmlWrite | QuerySignature::Ddl { .. });
         let is_multi = matches!(&sig, QuerySignature::MultiStatement);
 
+        // Single read of current_table — avoids double RwLock acquire in get_current_table_path()
         let table_name = self.current_table.read().clone();
-        if is_write && !table_name.is_empty() {
-            self.invalidate_backend(&table_name);
-        }
-
-        let table_path = self.get_current_table_path().unwrap_or_else(|_| self.current_base_dir());
+        let table_path = if table_name.is_empty() {
+            self.current_base_dir()
+        } else {
+            self.table_paths.read().get(&table_name)
+                .cloned()
+                .unwrap_or_else(|| self.current_base_dir().join(format!("{}.apex", table_name)))
+        };
         let base_dir = self.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.root_dir);
 
@@ -1667,49 +1633,20 @@ impl ApexStorageImpl {
             self.invalidate_backend(&table_name);
         }
 
-        // After DROP TABLE, remove from table_paths
-        if matches!(&sig, QuerySignature::Ddl) {
-            let sql_upper = sql.trim().to_uppercase();
-            if sql_upper.starts_with("DROP TABLE") {
-                let rest = sql_upper.strip_prefix("DROP TABLE")
-                    .unwrap_or("")
-                    .trim();
-                let rest = if rest.starts_with("IF EXISTS") {
-                    rest.strip_prefix("IF EXISTS").unwrap_or(rest).trim()
-                } else {
-                    rest
-                };
-                if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == ';').next() {
-                    let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
-                    if !tbl.is_empty() {
-                        self.table_paths.write().remove(&tbl);
-                        self.invalidate_backend(&tbl);
-                        if *self.current_table.read() == tbl {
-                            *self.current_table.write() = String::new();
-                        }
-                    }
-                }
+        // After DROP TABLE, remove from table_paths (uses pre-extracted DdlKind — no re-uppercase)
+        if let QuerySignature::Ddl { kind: crate::query::query_signature::DdlKind::DropTable { ref name } } = &sig {
+            self.table_paths.write().remove(name);
+            self.invalidate_backend(name);
+            if *self.current_table.read() == *name {
+                *self.current_table.write() = String::new();
             }
+        }
 
-            // After CREATE TABLE, register the new table
-            if sql_upper.starts_with("CREATE TABLE") {
-                let rest = sql_upper.strip_prefix("CREATE TABLE")
-                    .unwrap_or("")
-                    .trim();
-                let rest = if rest.starts_with("IF NOT EXISTS") {
-                    rest.strip_prefix("IF NOT EXISTS").unwrap_or(rest).trim()
-                } else {
-                    rest
-                };
-                if let Some(name) = rest.split(|c: char| c.is_whitespace() || c == '(').next() {
-                    let tbl = name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_lowercase();
-                    if !tbl.is_empty() {
-                        let tbl_path = self.current_base_dir().join(format!("{}.apex", tbl));
-                        self.table_paths.write().insert(tbl.clone(), tbl_path);
-                        *self.current_table.write() = tbl;
-                    }
-                }
-            }
+        // After CREATE TABLE, register the new table (uses pre-extracted DdlKind)
+        if let QuerySignature::Ddl { kind: crate::query::query_signature::DdlKind::CreateTable { ref name } } = &sig {
+            let tbl_path = self.current_base_dir().join(format!("{}.apex", name));
+            self.table_paths.write().insert(name.clone(), tbl_path);
+            *self.current_table.write() = name.clone();
         }
 
         crate::query::executor::clear_query_root_dir();
@@ -1721,10 +1658,18 @@ impl ApexStorageImpl {
         use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
         use arrow::array::{StructArray, Array};
         
-        let table_path = self.get_current_table_path()?;
+        // Single read of current_table — avoids double RwLock acquire
+        let table_name = self.current_table.read().clone();
+        if table_name.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "No table selected. Call create_table() or use_table() first."
+            ));
+        }
+        let table_path = self.table_paths.read().get(&table_name)
+            .cloned()
+            .unwrap_or_else(|| self.current_base_dir().join(format!("{}.apex", table_name)));
         let base_dir = self.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.root_dir);
-        let table_name = self.current_table.read().clone();
         let where_clause = where_clause.to_string();
         
         // Build SQL from where clause using current table name
@@ -2228,8 +2173,7 @@ impl ApexStorageImpl {
             return Ok(out.into());
         }
 
-        let table_path = self.get_current_table_path()?;
-        let table_name = self.current_table.read().clone();
+        let (table_path, table_name) = self.get_current_table_info()?;
 
         // Try to get cached backend for direct storage access
         let maybe_cached = self.cached_backends.get(&table_name).map(|v| Arc::clone(&v));
@@ -2319,8 +2263,7 @@ impl ApexStorageImpl {
     
     /// Retrieve all records
     fn retrieve_all(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
-        let table_path = self.get_current_table_path()?;
-        let table_name = self.current_table.read().clone();
+        let (table_path, table_name) = self.get_current_table_info()?;
         
         let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
             let sql = format!("SELECT * FROM {}", table_name);
@@ -2359,8 +2302,7 @@ impl ApexStorageImpl {
     /// Query with WHERE clause
     #[pyo3(signature = (where_clause, limit=None))]
     fn query(&self, py: Python<'_>, where_clause: &str, limit: Option<usize>) -> PyResult<Vec<PyObject>> {
-        let table_path = self.get_current_table_path()?;
-        let table_name = self.current_table.read().clone();
+        let (table_path, table_name) = self.get_current_table_info()?;
         
         let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
             let sql = if let Some(lim) = limit {

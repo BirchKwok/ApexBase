@@ -11,7 +11,6 @@ impl ApexExecutor {
     ) -> Vec<crate::query::OrderByClause> {
         use crate::query::{SelectColumn, AggregateFunc};
         order_by.iter().map(|clause| {
-            let name_up = clause.column.to_uppercase();
             // Try to match against SELECT aggregate columns
             for sel_col in columns {
                 if let SelectColumn::Aggregate { func, column, alias, .. } = sel_col {
@@ -24,7 +23,7 @@ impl ApexExecutor {
                     };
                     let col_part = column.as_deref().unwrap_or("*");
                     let default_name = format!("{}({})", fn_str, col_part);
-                    if default_name.to_uppercase() == name_up {
+                    if default_name.eq_ignore_ascii_case(&clause.column) {
                         let out_name = if let Some(a) = alias {
                             a.clone()
                         } else {
@@ -1040,7 +1039,7 @@ impl ApexExecutor {
     ) -> Vec<(crate::query::AggregateFunc, Option<String>)> {
         use crate::query::{SqlExpr, AggregateFunc, SelectColumn};
 
-        // Build set of already-present aggregate output names (upper-cased)
+        // Build set of already-present aggregate output names
         let existing: Vec<String> = select_cols.iter().filter_map(|c| {
             if let SelectColumn::Aggregate { func, column, alias, .. } = c {
                 let fn_name = match func {
@@ -1050,8 +1049,7 @@ impl ApexExecutor {
                     AggregateFunc::Min   => "MIN",
                     AggregateFunc::Max   => "MAX",
                 };
-                let name = alias.clone().unwrap_or_else(|| format!("{}({})", fn_name, column.as_deref().unwrap_or("*")));
-                Some(name.to_uppercase())
+                Some(alias.clone().unwrap_or_else(|| format!("{}({})", fn_name, column.as_deref().unwrap_or("*"))))
             } else { None }
         }).collect();
 
@@ -1068,15 +1066,12 @@ impl ApexExecutor {
         use crate::query::{SqlExpr, AggregateFunc};
         match expr {
             SqlExpr::Function { name, args } => {
-                let upper = name.to_uppercase();
-                let agg_func = match upper.as_str() {
-                    "COUNT" => Some(AggregateFunc::Count),
-                    "SUM"   => Some(AggregateFunc::Sum),
-                    "AVG"   => Some(AggregateFunc::Avg),
-                    "MIN"   => Some(AggregateFunc::Min),
-                    "MAX"   => Some(AggregateFunc::Max),
-                    _       => None,
-                };
+                let agg_func = if name.eq_ignore_ascii_case("COUNT") { Some(AggregateFunc::Count) }
+                    else if name.eq_ignore_ascii_case("SUM") { Some(AggregateFunc::Sum) }
+                    else if name.eq_ignore_ascii_case("AVG") { Some(AggregateFunc::Avg) }
+                    else if name.eq_ignore_ascii_case("MIN") { Some(AggregateFunc::Min) }
+                    else if name.eq_ignore_ascii_case("MAX") { Some(AggregateFunc::Max) }
+                    else { None };
                 if let Some(func) = agg_func {
                     // Determine column argument
                     let col: Option<String> = args.first().and_then(|a| match a {
@@ -1092,11 +1087,11 @@ impl ApexExecutor {
                         AggregateFunc::Min   => "MIN",
                         AggregateFunc::Max   => "MAX",
                     };
-                    let key = format!("{}({})", fn_name, col.as_deref().unwrap_or("*")).to_uppercase();
-                    if !existing.iter().any(|e| *e == key)
+                    let key = format!("{}({})", fn_name, col.as_deref().unwrap_or("*"));
+                    if !existing.iter().any(|e| e.eq_ignore_ascii_case(&key))
                         && !out.iter().any(|(f, c)| {
                             let fn2 = match f { AggregateFunc::Count=>"COUNT", AggregateFunc::Sum=>"SUM", AggregateFunc::Avg=>"AVG", AggregateFunc::Min=>"MIN", AggregateFunc::Max=>"MAX" };
-                            format!("{}({})", fn2, c.as_deref().unwrap_or("*")).to_uppercase() == key
+                            format!("{}({})", fn2, c.as_deref().unwrap_or("*")).eq_ignore_ascii_case(&key)
                         })
                     {
                         out.push((func, col));
@@ -3325,40 +3320,34 @@ impl ApexExecutor {
     fn evaluate_aggregate_expr_scalar(batch: &RecordBatch, expr: &SqlExpr) -> io::Result<f64> {
         match expr {
             SqlExpr::Function { name, args } => {
-                // Check if this is an aggregate function
-                let func_upper = name.to_uppercase();
-                match func_upper.as_str() {
-                    "SUM" | "COUNT" | "AVG" | "MIN" | "MAX" => {
-                        let func = match func_upper.as_str() {
-                            "SUM" => AggregateFunc::Sum,
-                            "COUNT" => AggregateFunc::Count,
-                            "AVG" => AggregateFunc::Avg,
-                            "MIN" => AggregateFunc::Min,
-                            "MAX" => AggregateFunc::Max,
-                            _ => unreachable!(),
-                        };
-                        let col_name = if args.is_empty() {
-                            "*"
-                        } else if let SqlExpr::Column(c) = &args[0] {
-                            c.as_str()
-                        } else {
-                            "*"
-                        };
-                        // Create group indices covering all rows in the batch
-                        let all_indices: Vec<usize> = (0..batch.num_rows()).collect();
-                        let (_, result_arr) = Self::compute_aggregate_for_groups(batch, &func, &Some(col_name.to_string()), &None, &[all_indices], false)?;
-                        if let Some(int_arr) = result_arr.as_any().downcast_ref::<Int64Array>() {
-                            Ok(if int_arr.len() > 0 && !int_arr.is_null(0) { int_arr.value(0) as f64 } else { 0.0 })
-                        } else if let Some(float_arr) = result_arr.as_any().downcast_ref::<Float64Array>() {
-                            Ok(if float_arr.len() > 0 && !float_arr.is_null(0) { float_arr.value(0) } else { 0.0 })
-                        } else {
-                            Ok(0.0)
-                        }
+                // Check if this is an aggregate function (zero-allocation)
+                let func_opt = if name.eq_ignore_ascii_case("SUM") { Some(AggregateFunc::Sum) }
+                    else if name.eq_ignore_ascii_case("COUNT") { Some(AggregateFunc::Count) }
+                    else if name.eq_ignore_ascii_case("AVG") { Some(AggregateFunc::Avg) }
+                    else if name.eq_ignore_ascii_case("MIN") { Some(AggregateFunc::Min) }
+                    else if name.eq_ignore_ascii_case("MAX") { Some(AggregateFunc::Max) }
+                    else { None };
+                if let Some(func) = func_opt {
+                    let col_name = if args.is_empty() {
+                        "*"
+                    } else if let SqlExpr::Column(c) = &args[0] {
+                        c.as_str()
+                    } else {
+                        "*"
+                    };
+                    // Create group indices covering all rows in the batch
+                    let all_indices: Vec<usize> = (0..batch.num_rows()).collect();
+                    let (_, result_arr) = Self::compute_aggregate_for_groups(batch, &func, &Some(col_name.to_string()), &None, &[all_indices], false)?;
+                    if let Some(int_arr) = result_arr.as_any().downcast_ref::<Int64Array>() {
+                        Ok(if int_arr.len() > 0 && !int_arr.is_null(0) { int_arr.value(0) as f64 } else { 0.0 })
+                    } else if let Some(float_arr) = result_arr.as_any().downcast_ref::<Float64Array>() {
+                        Ok(if float_arr.len() > 0 && !float_arr.is_null(0) { float_arr.value(0) } else { 0.0 })
+                    } else {
+                        Ok(0.0)
                     }
-                    _ => {
-                        let arr = Self::evaluate_expr_to_array(batch, expr)?;
-                        Self::extract_scalar_from_array(&arr)
-                    }
+                } else {
+                    let arr = Self::evaluate_expr_to_array(batch, expr)?;
+                    Self::extract_scalar_from_array(&arr)
                 }
             }
             SqlExpr::Literal(Value::Int64(i)) => Ok(*i as f64),
@@ -3688,7 +3677,7 @@ impl ApexExecutor {
     /// Check if an expression contains an aggregate function (SUM, COUNT, AVG, MIN, MAX)
     fn expr_contains_aggregate(expr: &SqlExpr) -> bool {
         match expr {
-            SqlExpr::Function { name, args } => matches!(name.to_uppercase().as_str(), "SUM" | "COUNT" | "AVG" | "MIN" | "MAX") || args.iter().any(Self::expr_contains_aggregate),
+            SqlExpr::Function { name, args } => name.eq_ignore_ascii_case("SUM") || name.eq_ignore_ascii_case("COUNT") || name.eq_ignore_ascii_case("AVG") || name.eq_ignore_ascii_case("MIN") || name.eq_ignore_ascii_case("MAX") || args.iter().any(Self::expr_contains_aggregate),
             SqlExpr::Case { when_then, else_expr } => when_then.iter().any(|(c, t)| Self::expr_contains_aggregate(c) || Self::expr_contains_aggregate(t)) || else_expr.as_ref().map_or(false, |e| Self::expr_contains_aggregate(e)),
             SqlExpr::BinaryOp { left, right, .. } => Self::expr_contains_aggregate(left) || Self::expr_contains_aggregate(right),
             SqlExpr::UnaryOp { expr, .. } | SqlExpr::Paren(expr) | SqlExpr::Cast { expr, .. } => Self::expr_contains_aggregate(expr),

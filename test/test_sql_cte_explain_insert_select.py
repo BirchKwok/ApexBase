@@ -7,12 +7,26 @@ from apexbase import ApexStorage
 
 
 def get_rows(result):
-    """Extract rows from execute() result dict."""
-    return result.get('rows', [])
+    """Extract rows from execute() result dict (handles both columns+rows and columns_dict formats)."""
+    if 'rows' in result:
+        return result['rows']
+    cd = result.get('columns_dict')
+    if cd:
+        cols = list(cd.keys())
+        if not cols:
+            return []
+        n = len(cd[cols[0]])
+        return [[cd[c][i] for c in cols] for i in range(n)]
+    return []
 
 def get_columns(result):
     """Extract column names from execute() result dict."""
-    return result.get('columns', [])
+    if 'columns' in result:
+        return result['columns']
+    cd = result.get('columns_dict')
+    if cd:
+        return list(cd.keys())
+    return []
 
 def get_scalar(result):
     """Extract scalar value (first cell) from result."""
@@ -23,6 +37,9 @@ def get_scalar(result):
 
 def get_col_values(result, col_name):
     """Extract all values from a specific column."""
+    cd = result.get('columns_dict')
+    if cd and col_name in cd:
+        return list(cd[col_name])
     cols = get_columns(result)
     if col_name not in cols:
         return []
