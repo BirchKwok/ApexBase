@@ -223,15 +223,22 @@ impl ApexExecutor {
                                 // FAST PATH 3: Try combined string + numeric filter for multi-condition
                                 } else if let Some(result) = Self::try_fast_multi_condition_filter(&backend, &stmt)? {
                                     result
+                                // FAST PATH 4: Mmap multi-condition AND on two different numeric columns
+                                } else if let Some(result) = Self::try_fast_mmap_multi_condition(&backend, &stmt)? {
+                                    return Ok(result);
                                 } else if backend.is_mmap_only() && !backend.has_pending_deltas() {
                                     // MMAP FAST PATH: byte-level scan + point lookups
                                     if let Some(where_clause) = &stmt.where_clause {
+                                        let _limit_with_off = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
                                         let matching_indices = if let Some((col, val)) = Self::extract_string_equality(where_clause) {
-                                            backend.scan_string_filter_mmap(&col, &val, stmt.limit.map(|l| l + stmt.offset.unwrap_or(0)))?
+                                            backend.scan_string_filter_mmap(&col, &val, _limit_with_off)?
                                         } else if let Some((col, low, high)) = Self::extract_between_range(where_clause) {
-                                            backend.scan_numeric_range_mmap(&col, low, high, stmt.limit.map(|l| l + stmt.offset.unwrap_or(0)))?
+                                            backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?
+                                        } else if let Some((col, low, high)) = Self::extract_two_sided_same_col_range(where_clause) {
+                                            // col >= N AND col <= M — logically equivalent to BETWEEN
+                                            backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?
                                         } else if let Some((col, low, high)) = Self::extract_single_comparison_as_range(where_clause) {
-                                            backend.scan_numeric_range_mmap(&col, low, high, stmt.limit.map(|l| l + stmt.offset.unwrap_or(0)))?
+                                            backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?
                                         } else {
                                             None
                                         };
@@ -1854,6 +1861,7 @@ impl ApexExecutor {
                         (f64::MIN, prev)
                     }
                     BinaryOperator::Le => (f64::MIN, val),
+                    BinaryOperator::Eq => (val, val),  // exact match as degenerate range [N, N]
                     _ => return None,
                 };
                 Some((col, low, high))
@@ -1862,6 +1870,120 @@ impl ApexExecutor {
         }
     }
     
+    /// Extract a two-sided AND range on the SAME column: col >= N AND col <= M etc.
+    /// Returns (col, inclusive_low, inclusive_high) with strict-inequality adjustment.
+    /// Each side is extracted via extract_single_comparison_as_range; the intersection
+    /// of the two (lo, hi) intervals gives the final range.
+    fn extract_two_sided_same_col_range(expr: &SqlExpr) -> Option<(String, f64, f64)> {
+        use crate::query::sql_parser::BinaryOperator;
+        match expr {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                let (col1, lo1, hi1) = Self::extract_single_comparison_as_range(left.as_ref())?;
+                let (col2, lo2, hi2) = Self::extract_single_comparison_as_range(right.as_ref())?;
+                if col1 != col2 { return None; }
+                let combined_low  = lo1.max(lo2);
+                let combined_high = hi1.min(hi2);
+                if combined_low > combined_high { return None; }
+                Some((col1, combined_low, combined_high))
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract any single-column numeric range from an expression.
+    /// Handles: BETWEEN, col op N (single comparison including equality).
+    fn extract_any_numeric_range(expr: &SqlExpr) -> Option<(String, f64, f64)> {
+        if let Some(r) = Self::extract_between_range(expr) { return Some(r); }
+        if let Some(r) = Self::extract_single_comparison_as_range(expr) { return Some(r); }
+        None
+    }
+
+    /// Merge-intersect two sorted index slices in O(n+m).
+    fn intersect_sorted_indices(a: &[usize], b: &[usize]) -> Vec<usize> {
+        let mut result = Vec::new();
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Equal   => { result.push(a[i]); i += 1; j += 1; }
+                std::cmp::Ordering::Less    => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+            }
+        }
+        result
+    }
+
+    /// MMAP fast path for AND of two numeric conditions on DIFFERENT columns.
+    /// Example: WHERE age > 30 AND score > 50 [LIMIT n]
+    /// Strategy: scan each column independently → merge-intersect sorted index sets → scatter read.
+    fn try_fast_mmap_multi_condition(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::sql_parser::BinaryOperator;
+        if !backend.is_mmap_only() || backend.has_pending_deltas() { return Ok(None); }
+        if !stmt.is_select_star() { return Ok(None); }
+        // Without LIMIT the result set can be very large; sequential Arrow scan is faster
+        // than index intersection + scatter read for high-selectivity filters.
+        if stmt.limit.is_none() { return Ok(None); }
+
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        // Must be top-level AND
+        let (left_cond, right_cond) = match where_clause {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                (left.as_ref(), right.as_ref())
+            }
+            _ => return Ok(None),
+        };
+
+        // Each side must resolve to a single-column numeric range
+        let (col1, low1, high1) = match Self::extract_any_numeric_range(left_cond) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let (col2, low2, high2) = match Self::extract_any_numeric_range(right_cond) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if col1 == col2 {
+            // Same column — already handled by the two-sided range helpers
+            return Ok(None);
+        }
+
+        // Scan both columns fully (no per-column limit — we need all matches to intersect)
+        let indices1 = match backend.scan_numeric_range_mmap(&col1, low1, high1, None)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let indices2 = match backend.scan_numeric_range_mmap(&col2, low2, high2, None)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let mut intersected = Self::intersect_sorted_indices(&indices1, &indices2);
+
+        // Apply offset + limit
+        let offset = stmt.offset.unwrap_or(0);
+        if offset > 0 {
+            if offset >= intersected.len() {
+                return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+            }
+            intersected = intersected[offset..].to_vec();
+        }
+        if let Some(lim) = stmt.limit {
+            intersected.truncate(lim);
+        }
+
+        if intersected.is_empty() {
+            return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+        }
+
+        let batch = backend.read_columns_by_indices_to_arrow(&intersected)?;
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
     /// Helper to extract boolean equality: col = true/false
     fn extract_bool_equality(expr: &SqlExpr) -> Option<(String, bool)> {
         use crate::query::sql_parser::BinaryOperator;
