@@ -14,8 +14,10 @@ pub mod planner;
 pub mod vector_ops;
 pub mod vectorized_join;
 pub mod scheduler;
+pub mod query_signature;
 
 pub use expr_compiler::sql_expr_to_filter;
+pub use query_signature::QuerySignature;
 pub use filter::{Filter, CompareOp, LikeMatcher, RegexpMatcher};
 pub use sql_parser::{
     SqlParser, SqlStatement, SelectStatement, SelectColumn, SqlExpr, OrderByClause, AggregateFunc,

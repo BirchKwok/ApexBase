@@ -1,0 +1,6 @@
+commit	bench_leaders	Q/s wins	single_Q/s	conc_Q/s	notes
+44a5f1d	29	0/2	47.2	~47	baseline (Python lock serializes all SELECT threads; DuckDB 348 Q/s wins)
+29f87e9	29	2/2	1331.7	1997.8	skip lock for SELECT + col>N mmap fast path (28x/42x vs baseline)
+993f941	29	2/2	1328.4	1990.2	expand mmap: col=N equality + col>=N AND col<=M + two-col AND LIMIT fast path
+f1c33dc	29	2/2	1329.0	2001.2	extend mmap multi-cond: string+numeric AND (city='X' AND age>N LIMIT n)
+de0f48b	29	2/2	1352.4	2010.6	IN filter mmap (72→31ms, 2.4x) + numeric pushdown mmap; 29/29 wins (was 28+1tie)

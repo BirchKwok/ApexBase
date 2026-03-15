@@ -949,10 +949,6 @@ def main():
                 if rss_before and rss_after:
                     mem_results[bench_name][eng_name] = rss_after - rss_before
 
-    # Cleanup
-    for name, bench in engines:
-        bench.close()
-
     # Print results table
     eng_names = [name for name, _ in engines]
     col_width = 16
@@ -1062,39 +1058,45 @@ def main():
         "SELECT * FROM bench WHERE age > 30 LIMIT 100",
     ]
 
-    def run_qps_benchmark(tmpdir, data, n_threads=4, min_duration=1.0, min_iterations=100):
+    def run_qps_benchmark(tmpdir, data, n_threads=4, min_duration=1.0, min_iterations=50,
+                           existing_engines=None):
         """Measure Q/s (queries per second) for single-threaded and concurrent scenarios.
         
         Args:
             min_duration: Minimum test duration in seconds for accurate timing
             min_iterations: Minimum number of query batches to run
+            existing_engines: dict of {name: bench} to reuse, avoids re-inserting data
         """
         results = {}
 
-        # Create fresh engines for Q/s tests
+        # Reuse existing engines (data already inserted) to avoid re-inserting 1M rows
         qps_engines = []
-        if HAS_APEXBASE:
-            qps_engines.append(("ApexBase", ApexBaseBench(tmpdir, data), QPS_QUERIES_APEX))
-        qps_engines.append(("SQLite", SQLiteBench(tmpdir, data), QPS_QUERIES_OTHER))
-        if HAS_DUCKDB:
-            qps_engines.append(("DuckDB", DuckDBBench(tmpdir, data), QPS_QUERIES_OTHER))
-
-        # Setup fresh engines and insert data
-        for name, bench, _ in qps_engines:
-            bench.setup()
-            # Insert data for Q/S tests
-            if hasattr(bench, 'bench_insert'):
-                bench.bench_insert()
+        if existing_engines is not None:
+            if HAS_APEXBASE and "ApexBase" in existing_engines:
+                qps_engines.append(("ApexBase", existing_engines["ApexBase"], QPS_QUERIES_APEX))
+            if "SQLite" in existing_engines:
+                qps_engines.append(("SQLite", existing_engines["SQLite"], QPS_QUERIES_OTHER))
+            if HAS_DUCKDB and "DuckDB" in existing_engines:
+                qps_engines.append(("DuckDB", existing_engines["DuckDB"], QPS_QUERIES_OTHER))
+        else:
+            # Fallback: create fresh engines (slow path)
+            if HAS_APEXBASE:
+                qps_engines.append(("ApexBase", ApexBaseBench(tmpdir, data), QPS_QUERIES_APEX))
+            qps_engines.append(("SQLite", SQLiteBench(tmpdir, data), QPS_QUERIES_OTHER))
+            if HAS_DUCKDB:
+                qps_engines.append(("DuckDB", DuckDBBench(tmpdir, data), QPS_QUERIES_OTHER))
+            for name, bench, _ in qps_engines:
+                bench.setup()
+                if hasattr(bench, 'bench_insert'):
+                    bench.bench_insert()
 
         # Pre-warm all engines - run each query once to ensure caching is comparable
         for name, bench, queries in qps_engines:
             try:
                 if hasattr(bench, 'client'):
-                    # ApexBase: execute and materialize results
                     for q in queries:
                         _ = bench.client.execute(q).to_pandas()
                 elif hasattr(bench, 'conn'):
-                    # DuckDB/SQLite: execute and materialize results
                     for q in queries:
                         _ = bench.conn.execute(q).fetchall()
             except Exception:
@@ -1102,6 +1104,7 @@ def main():
 
         # 1. Single-threaded Q/s
         print("\n--- Single-threaded Q/s ---")
+        iterations = min_iterations  # fallback default
         for name, bench, queries in qps_engines:
             try:
                 # Determine execute method - make it consistent across engines
@@ -1154,34 +1157,20 @@ def main():
                 print(f"  {name}: {qps:.1f} Q/s ({total_queries} queries in {elapsed:.3f}s)")
             except Exception as e:
                 print(f"  {name}: Error - {e}")
-            finally:
-                bench.close()
 
-        # 2. Concurrent Q/s (multiple threads)
+        # 2. Concurrent Q/s (multiple threads) — reuse qps_engines, no re-insert
         print(f"\n--- Concurrent Q/s ({n_threads} threads) ---")
-        
-        # Create engines for concurrent test - use fresh instances
-        concurrent_engines = []
-        if HAS_APEXBASE:
-            concurrent_engines.append(("ApexBase", ApexBaseBench(tmpdir, data), QPS_QUERIES_APEX))
-        concurrent_engines.append(("SQLite", SQLiteBench(tmpdir, data), QPS_QUERIES_OTHER))
-        if HAS_DUCKDB:
-            concurrent_engines.append(("DuckDB", DuckDBBench(tmpdir, data), QPS_QUERIES_OTHER))
 
-        for name, bench, _ in concurrent_engines:
-            bench.setup()
-            # Insert data for Q/S tests
-            if hasattr(bench, 'bench_insert'):
-                bench.bench_insert()
-
-        for name, bench, queries in concurrent_engines:
+        for name, bench, queries in qps_engines:
             try:
                 # For each thread, we need a separate connection for SQLite/DuckDB
                 # ApexBase handles concurrency internally
                 if hasattr(bench, 'client'):
                     # ApexBase: shared client
-                    def concurrent_worker_apex():
-                        for _ in range(iterations):
+                    # Compute per-engine iterations independently for concurrent test
+                    conc_iterations = max(min_iterations, iterations)
+                    def concurrent_worker_apex(its=conc_iterations):
+                        for _ in range(its):
                             for q in queries:
                                 list(bench.client.execute(q))
                     
@@ -1190,7 +1179,7 @@ def main():
                     with ThreadPoolExecutor(max_workers=n_threads) as executor:
                         list(executor.map(lambda _: concurrent_worker_apex(), range(n_threads)))
                     elapsed = time.perf_counter() - t0
-                    total_queries = n_threads * iterations * len(queries)
+                    total_queries = n_threads * conc_iterations * len(queries)
                     qps = total_queries / elapsed if elapsed > 0.001 else 0
                     
                 elif hasattr(bench, 'conn'):
@@ -1198,7 +1187,8 @@ def main():
                     db_path = bench.db_path
                     is_duckdb = 'duckdb' in str(type(bench.conn)).lower()
 
-                    def concurrent_worker_sql(db_path, is_duckdb, queries, iterations):
+                    conc_iterations = max(min_iterations, iterations)
+                    def concurrent_worker_sql(db_path, is_duckdb, queries, its=conc_iterations):
                         # Each thread creates its own connection
                         try:
                             if is_duckdb:
@@ -1207,7 +1197,7 @@ def main():
                             else:
                                 import sqlite3
                                 conn = sqlite3.connect(db_path, timeout=30)
-                            for _ in range(iterations):
+                            for _ in range(its):
                                 for q in queries:
                                     # Use Arrow for DuckDB (fair comparison with ApexBase)
                                     # For SQLite, use fetchall() as baseline
@@ -1227,11 +1217,11 @@ def main():
                     t0 = time.perf_counter()
                     with ThreadPoolExecutor(max_workers=n_threads) as executor:
                         list(executor.map(
-                            lambda _: concurrent_worker_sql(db_path, is_duckdb, queries, iterations),
+                            lambda _: concurrent_worker_sql(db_path, is_duckdb, queries),
                             range(n_threads)
                         ))
                     elapsed = time.perf_counter() - t0
-                    total_queries = n_threads * iterations * len(queries)
+                    total_queries = n_threads * conc_iterations * len(queries)
                     qps = total_queries / elapsed if elapsed > 0.001 else 0
                 else:
                     qps = 0
@@ -1245,8 +1235,6 @@ def main():
                     print(f"  {name}: Error - test time too short ({elapsed:.6f}s)")
             except Exception as e:
                 print(f"  {name}: Error - {e}")
-            finally:
-                bench.close()
 
         # Print Q/s Summary
         print("\n--- Q/s Summary ---")
@@ -1265,8 +1253,14 @@ def main():
 
         return results
 
-    # Run Q/s tests with improved timing
-    qps_results = run_qps_benchmark(tmpdir, data, n_threads=4, min_duration=3.0, min_iterations=500)
+    # Run Q/s tests — pass existing engines to avoid re-inserting data
+    existing_engines = {name: bench for name, bench in engines}
+    qps_results = run_qps_benchmark(tmpdir, data, n_threads=4, min_duration=2.0, min_iterations=50,
+                                    existing_engines=existing_engines)
+
+    # Cleanup (after Q/s tests, engines are still open)
+    for name, bench in engines:
+        bench.close()
 
     # Save JSON if requested
     if args.output:

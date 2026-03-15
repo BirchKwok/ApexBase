@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import queue
+import contextlib
 
 import json
 
@@ -26,6 +27,9 @@ ARROW_AVAILABLE = True
 POLARS_AVAILABLE = True
 
 import struct
+
+# Null context manager for lock-free SELECT execution paths
+_NULL_CONTEXT = contextlib.nullcontext()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auto Scheduler - Initialize scheduler lazily for parallel query execution
@@ -836,125 +840,95 @@ class ApexClient:
         return self._execute_impl(sql, show_internal_id)
     
     def _execute_impl(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
-        # DDL (CREATE TABLE) is allowed without a table selected
+        # ── Single-point classification (mirrors Rust QuerySignature) ──
         sql_upper = sql.strip().upper()
+        _trimmed = sql.strip().rstrip(';').strip()
+        is_multi_stmt = ';' in _trimmed
 
-        # ULTRA-FAST PATH: Pure COUNT(*) — bypass execute() overhead entirely.
-        # Uses fast_row_count() which directly returns active_row_count from cached backend.
-        # This is 2-3x faster than row_count() which goes through the engine.
-        if (sql_upper.startswith("SELECT COUNT(*) FROM ")
+        # Classify query type ONCE — no duplicate pattern matching
+        if is_multi_stmt:
+            _sig = 'multi'
+        elif (sql_upper.startswith("SELECT COUNT(*) FROM ")
                 and "WHERE" not in sql_upper and "GROUP" not in sql_upper
                 and "HAVING" not in sql_upper and "JOIN" not in sql_upper
                 and "DISTINCT" not in sql_upper):
-            self._ensure_table_selected()
-            try:
-                # Use fast_row_count for maximum speed
-                count = self._storage.fast_row_count()
-                # Use lazy_pydict for fastest path (avoid Arrow conversion)
-                rv = ResultView(lazy_pydict={'COUNT(*)': [count]})
-                rv._show_internal_id = False
-                return rv
-            except Exception:
-                pass  # fall through to normal path on error
-
-        # ULTRA-FAST PATH: _id point lookup — bypass regex, _should_show_internal_id, lock overhead.
-        # Detects "SELECT ... WHERE _ID = N" with no modifiers and routes directly to retrieve_rcix.
-        if (show_internal_id is None
-                and sql_upper.startswith('SELECT')
+            _sig = 'count_star'
+        elif (sql_upper.startswith('SELECT')
                 and ('WHERE _ID =' in sql_upper or 'WHERE _ID=' in sql_upper)
                 and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
                 and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
                 and ';' not in sql_upper):
-            self._ensure_table_selected()
-            try:
-                result = self._storage.execute(sql)
-                if result is not None:
-                    columns_dict = result.get('columns_dict')
-                    if columns_dict is not None:
-                        rv = ResultView(lazy_pydict=columns_dict)
-                        rv._show_internal_id = True
-                        return rv
-            except Exception:
-                pass  # fall through to normal path on error
-
-        # Detect multi-statement SQL: contains ';' with non-whitespace content after
-        _trimmed = sql.strip().rstrip(';').strip()
-        is_multi_stmt = ';' in _trimmed
-        
-        # FAST PATH: table-function queries (read_csv / read_parquet / read_json).
-        # Skip all table-existence checks, lock, and DML routing — go straight to Arrow FFI.
-        if (not is_multi_stmt and sql_upper.startswith('SELECT')
+            _sig = 'point_lookup'
+        elif (sql_upper.startswith('SELECT *') and 'LIMIT' in sql_upper
+                and 'WHERE' not in sql_upper and 'ORDER' not in sql_upper
+                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper):
+            _sig = 'scan_limit'
+        elif (sql_upper.startswith('SELECT')
                 and ('FROM READ_CSV(' in sql_upper
                      or 'FROM READ_PARQUET(' in sql_upper
                      or 'FROM READ_JSON(' in sql_upper)):
-            try:
-                schema_ptr, array_ptr = self._storage._execute_arrow_ffi(sql)
-                if schema_ptr != 0 and array_ptr != 0:
-                    batch = pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
-                    table = pa.Table.from_batches([batch]) if batch.num_rows > 0 else None
-                else:
-                    table = None
-                rv = ResultView(arrow_table=table, data=None)
-                rv._show_internal_id = False
-                return rv
-            except Exception:
-                pass  # fall through to normal path on error
-
-        if not is_multi_stmt:
-            # Allow execution without a selected table for DDL, CTE, or cross-database queries.
-            # Cross-db queries use qualified db.table references (e.g. FROM default.users,
-            # INSERT INTO analytics.events, UPDATE hr.employees, DELETE FROM default.logs).
-            _qualified = _RE_QUALIFIED_REF.search(sql)
-            _has_qualified_ref = bool(_qualified and '.' in _qualified.group(0))
-            if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE')
-                    or sql_upper.startswith('WITH ') or _has_qualified_ref
-                    or sql_upper.startswith('COPY ') or sql_upper.startswith('SET ')
-                    or sql_upper.startswith('RESET ')):
-                self._ensure_table_selected()
+            _sig = 'table_func'
+        elif (sql_upper.startswith('BEGIN') or
+              sql_upper in ('COMMIT', 'COMMIT;', 'ROLLBACK', 'ROLLBACK;') or
+              sql_upper.startswith('SAVEPOINT') or
+              sql_upper.startswith('RELEASE') or
+              sql_upper.startswith('ROLLBACK TO')):
+            _sig = 'transaction'
+        elif sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'TRUNCATE',
+                                    'ALTER', 'DROP', 'CREATE', 'COPY')):
+            _sig = 'write'
+        elif sql_upper.startswith(('SET ', 'RESET ')):
+            _sig = 'session'
+        elif (sql_upper.startswith('SELECT *') and ' LIKE ' in sql_upper
+                and 'WHERE' in sql_upper and 'NOT LIKE' not in sql_upper
+                and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+                and "'" in sql):
+            _sig = 'like'
         else:
-            # Multi-statement: only require table if we have one
+            _sig = 'complex'
+
+        # ── Table selection check ──
+        # Cross-db qualified refs (e.g. FROM default.users) don't need a selected table
+        _qualified = _RE_QUALIFIED_REF.search(sql)
+        _has_qualified_ref = bool(_qualified and '.' in _qualified.group(0))
+
+        if _sig == 'table_func' or _sig == 'session':
+            pass  # no table needed
+        elif _sig == 'write':
+            if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE')
+                    or sql_upper.startswith('COPY ') or _has_qualified_ref):
+                self._ensure_table_selected()
+        elif _sig == 'multi':
             try:
                 self._ensure_table_selected()
             except Exception:
                 pass
+        elif _has_qualified_ref or sql_upper.startswith('WITH '):
+            pass  # CTE or cross-db qualified refs don't need a selected table
+        elif _sig in ('count_star', 'point_lookup', 'scan_limit', 'like', 'complex'):
+            self._ensure_table_selected()
 
-        with self._lock:
-            # Determine if _id should be shown based on SQL (like ApexClient)
+        # ── Determine locking ──
+        _needs_lock = _sig in ('multi', 'write', 'transaction', 'session') or getattr(self, '_in_txn', False)
+
+        with (self._lock if _needs_lock else _NULL_CONTEXT):
             if show_internal_id is None:
                 show_internal_id = self._should_show_internal_id(sql)
-            
-            # MULTI-STATEMENT PATH: route through Arrow IPC which handles
-            # transactions (BEGIN/COMMIT/ROLLBACK) and cache invalidation in Rust
-            if is_multi_stmt:
-                ipc_bytes = self._storage._execute_arrow_ipc(sql)
-                # Sync transaction state: check if BEGIN/COMMIT/ROLLBACK changed txn state
-                su = sql_upper
-                if 'BEGIN' in su or 'COMMIT' in su or 'ROLLBACK' in su:
-                    # Determine final txn state from the SQL sequence
-                    # Last txn command wins
-                    for part in su.split(';'):
-                        part = part.strip()
-                        if part.startswith('BEGIN'):
-                            self._in_txn = True
-                        elif part in ('COMMIT', 'ROLLBACK') or part.startswith('COMMIT') or part == 'ROLLBACK':
-                            self._in_txn = False
-                if su.strip().rstrip(';').strip().startswith('CREATE TABLE'):
-                    self._current_table = self._storage.current_table()
-                reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
-                table = reader.read_all()
-                if table.num_rows == 0:
-                    table = None
-                rv = ResultView(arrow_table=table, data=None)
-                rv._show_internal_id = show_internal_id
-                return rv
-            
-            # FAST PATH: SELECT * WHERE _id = N — primary key lookup via retrieve_rcix in Rust.
-            # Not gated on _has_writes: retrieve_rcix reads current storage state unconditionally.
-            # Result IS cached; next write will call _query_cache.clear() invalidating it.
-            if (sql_upper.startswith('SELECT')
-                    and ('WHERE _ID =' in sql_upper or 'WHERE _ID=' in sql_upper)
-                    and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
-                    and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper):
+
+            # ── COUNT(*): ultra-fast atomic read ──
+            if _sig == 'count_star':
+                try:
+                    count = self._storage.fast_row_count()
+                    rv = ResultView(lazy_pydict={'COUNT(*)': [count]})
+                    rv._show_internal_id = False
+                    return rv
+                except Exception:
+                    pass  # fall through to Arrow FFI
+
+            # ── Point lookup: retrieve_rcix via execute() ──
+            if _sig == 'point_lookup':
                 try:
                     result = self._storage.execute(sql)
                     if result is not None:
@@ -972,13 +946,10 @@ class ApexClient:
                             rv._show_internal_id = show_internal_id
                             return rv
                 except Exception:
-                    pass
+                    pass  # fall through to Arrow FFI
 
-            # FAST PATH: SELECT * LIMIT N (small N) — direct columnar transfer (no IPC)
-            if (sql_upper.startswith('SELECT *') and 'LIMIT' in sql_upper
-                    and 'WHERE' not in sql_upper and 'ORDER' not in sql_upper
-                    and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper):
-                # Extract limit value — only use columnar path for small limits
+            # ── SELECT * LIMIT N: pread_rcix columnar via execute() ──
+            if _sig == 'scan_limit':
                 try:
                     limit_val = int(sql_upper.rsplit('LIMIT', 1)[1].strip().rstrip(';'))
                 except (ValueError, IndexError):
@@ -997,42 +968,11 @@ class ApexClient:
                                 rv._show_internal_id = show_internal_id
                                 return rv
                     except Exception:
-                        pass
+                        pass  # fall through to Arrow FFI
 
-            # FAST PATH: SELECT * WHERE col = 'val' — bypass pyarrow IPC for small results
-            # Only safe when no writes have occurred (avoids stale data via different backend path)
-            # Only for string equality (single-quoted value); skip numeric range / BETWEEN / IN
-            if (not self._has_writes and sql_upper.startswith('SELECT *') and 'WHERE' in sql_upper
-                    and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
-                    and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
-                    and 'BETWEEN' not in sql_upper and ' IN ' not in sql_upper
-                    and '>' not in sql_upper and '<' not in sql_upper
-                    and "'" in sql):
-                try:
-                    result = self._storage.execute(sql)
-                    if result is not None and 'columns' in result and 'rows' in result:
-                        cols = result['columns']
-                        rows = result['rows']
-                        if not rows:
-                            rv = ResultView(data=None)
-                            rv._show_internal_id = show_internal_id
-                            return rv
-                        col_dict = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
-                        rv = ResultView(lazy_pydict=col_dict)
-                        rv._show_internal_id = show_internal_id
-                        return rv
-                except Exception:
-                    pass
-            
-            # Transaction commands: route through session-aware execute() binding
-            is_txn_cmd = (sql_upper.startswith('BEGIN') or 
-                         sql_upper in ('COMMIT', 'COMMIT;', 'ROLLBACK', 'ROLLBACK;') or
-                         sql_upper.startswith('SAVEPOINT') or
-                         sql_upper.startswith('RELEASE') or
-                         sql_upper.startswith('ROLLBACK TO'))
-            if is_txn_cmd:
+            # ── Transaction commands ──
+            if _sig == 'transaction':
                 result = self._storage.execute(sql)
-                # Track transaction state in Python client
                 if sql_upper.startswith('BEGIN'):
                     self._in_txn = True
                 elif sql_upper in ('COMMIT', 'COMMIT;', 'ROLLBACK', 'ROLLBACK;'):
@@ -1041,50 +981,72 @@ class ApexClient:
                 rv._show_internal_id = show_internal_id
                 return rv
 
-            # Validate table name for non-fast-path queries (skip for DDL)
-            if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE')):
-                self._validate_table_in_sql(sql)
-            
-            # DML/SELECT within a transaction: route through session-aware execute() binding
-            if getattr(self, '_in_txn', False) and sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'SELECT')):
+            # ── DML/SELECT within a transaction (single-statement only) ──
+            if getattr(self, '_in_txn', False) and _sig != 'multi' and sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'SELECT')):
                 result = self._storage.execute(sql)
-                if sql_upper.startswith('SELECT') and isinstance(result, dict) and 'columns' in result and 'rows' in result:
-                    # Convert execute() dict result to columnar format for ResultView
-                    cols = result['columns']
-                    rows = result['rows']
-                    if cols and rows:
-                        col_dict = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
-                        rv = ResultView(lazy_pydict=col_dict)
+                if sql_upper.startswith('SELECT') and isinstance(result, dict):
+                    # Prefer columns_dict (columnar, zero-copy from Rust)
+                    columns_dict = result.get('columns_dict')
+                    if columns_dict is not None:
+                        rv = ResultView(lazy_pydict=columns_dict)
                         rv._show_internal_id = show_internal_id
                         return rv
+                    # Fallback: columns+rows format (transpose to columnar)
+                    if 'columns' in result and 'rows' in result:
+                        cols = result['columns']
+                        rows = result['rows']
+                        if cols and rows:
+                            col_dict = {c: [row[i] for row in rows] for i, c in enumerate(cols)}
+                            rv = ResultView(lazy_pydict=col_dict)
+                            rv._show_internal_id = show_internal_id
+                            return rv
                 rv = ResultView(data=None)
                 rv._show_internal_id = show_internal_id
                 return rv
 
-            # LIKE fast path: call execute() which has an optimized LIKE scan in Rust
-            # returning Arrow IPC bytes (skips ~40ms of Python object creation for large results).
-            # Not gated on _has_writes since the Rust LIKE scan reads the current mmap state.
-            if (sql_upper.startswith('SELECT') and ' LIKE ' in sql_upper
-                    and 'GROUP BY' not in sql_upper and 'ORDER BY' not in sql_upper
-                    and 'LIMIT' not in sql_upper and 'JOIN' not in sql_upper
-                    and not getattr(self, '_in_txn', False)):
-                try:
-                    result = self._storage.execute(sql)
-                    if result is not None:
-                        arrow_ipc = result.get('arrow_ipc')
-                        if arrow_ipc is not None:
-                            _reader = pa.ipc.open_stream(pa.BufferReader(arrow_ipc))
-                            _table = _reader.read_all()
-                            rv = ResultView(arrow_table=_table if _table.num_rows > 0 else None)
-                            rv._show_internal_id = show_internal_id
-                            return rv
-                except Exception:
-                    pass  # fall through to _execute_arrow_ffi on any error
+            # ── Multi-statement: Arrow IPC with transaction support ──
+            if _sig == 'multi':
+                ipc_bytes = self._storage._execute_arrow_ipc(sql)
+                if 'BEGIN' in sql_upper or 'COMMIT' in sql_upper or 'ROLLBACK' in sql_upper:
+                    for part in sql_upper.split(';'):
+                        part = part.strip()
+                        if part.startswith('BEGIN'):
+                            self._in_txn = True
+                        elif part in ('COMMIT', 'ROLLBACK') or part.startswith('COMMIT') or part == 'ROLLBACK':
+                            self._in_txn = False
+                if sql_upper.strip().rstrip(';').strip().startswith('CREATE TABLE'):
+                    self._current_table = self._storage.current_table()
+                reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
+                table = reader.read_all()
+                if table.num_rows == 0:
+                    table = None
+                rv = ResultView(arrow_table=table, data=None)
+                rv._show_internal_id = show_internal_id
+                return rv
 
-            if sql_upper.startswith(('INSERT', 'DELETE', 'UPDATE', 'TRUNCATE', 'ALTER', 'DROP', 'CREATE')):
+            # ── LIKE: zero-copy FFI scan ──
+            if _sig == 'like' and not getattr(self, '_in_txn', False):
+                try:
+                    schema_ptr, array_ptr = self._storage._execute_like_ffi(sql)
+                    if schema_ptr != 0 and array_ptr != 0:
+                        batch = pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
+                        table = pa.Table.from_batches([batch]) if batch.num_rows > 0 else None
+                        rv = ResultView(arrow_table=table, data=None)
+                        rv._show_internal_id = show_internal_id
+                        return rv
+                except Exception:
+                    pass  # fall through to Arrow FFI
+
+            # ── Validate table name for non-DDL queries ──
+            if _sig not in ('write', 'table_func', 'session') or not sql_upper.startswith(('CREATE ', 'DROP TABLE')):
+                if _sig == 'complex' or _sig == 'like':
+                    self._validate_table_in_sql(sql)
+
+            # Track write state
+            if _sig == 'write':
                 self._has_writes = True
-            
-            # Fast path: Arrow C Data Interface (zero-copy, no serialization)
+
+            # ── Default path: Arrow C Data Interface (zero-copy) ──
             try:
                 schema_ptr, array_ptr = self._storage._execute_arrow_ffi(sql)
                 if schema_ptr != 0 and array_ptr != 0:
@@ -1100,7 +1062,7 @@ class ApexClient:
                 if table.num_rows == 0:
                     table = None
 
-            # After CREATE TABLE or COPY FROM, sync Python-side _current_table
+            # Sync Python state after DDL
             if sql_upper.startswith('CREATE TABLE'):
                 self._current_table = self._storage.current_table()
             elif sql_upper.startswith('COPY '):
@@ -1108,7 +1070,7 @@ class ApexClient:
                 _m = _re.match(r'COPY\s+(\w+)\s+FROM\b', sql_upper)
                 if _m:
                     self._current_table = _m.group(1).lower()
-            
+
             rv = ResultView(arrow_table=table, data=None)
             rv._show_internal_id = show_internal_id
             return rv

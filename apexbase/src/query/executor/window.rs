@@ -370,11 +370,11 @@ impl ApexExecutor {
         
         for col in &stmt.columns {
             if let SelectColumn::WindowFunction { name, args, partition_by, order_by, alias } = col {
-                let upper = name.to_uppercase();
-                if !supported.contains(&upper.as_str()) {
+                if !supported.iter().any(|s| name.eq_ignore_ascii_case(s)) {
                     return Err(err_input(format!("Unsupported window function: {}", name)));
                 }
                 let out_name = alias.clone().unwrap_or_else(|| name.to_lowercase());
+                let upper = name.to_ascii_uppercase();
                 window_specs.push((upper, args.clone(), partition_by.clone(), order_by.clone(), out_name));
             }
         }

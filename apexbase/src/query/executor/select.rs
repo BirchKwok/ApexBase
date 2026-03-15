@@ -223,13 +223,37 @@ impl ApexExecutor {
                                 // FAST PATH 3: Try combined string + numeric filter for multi-condition
                                 } else if let Some(result) = Self::try_fast_multi_condition_filter(&backend, &stmt)? {
                                     result
+                                // FAST PATH 4: Mmap multi-condition AND on two different numeric columns
+                                } else if let Some(result) = Self::try_fast_mmap_multi_condition(&backend, &stmt)? {
+                                    return Ok(result);
+                                // FAST PATH 5: Mmap IN filter on string column
+                                } else if let Some(result) = Self::try_fast_mmap_in_filter(&backend, &stmt)? {
+                                    return Ok(result);
                                 } else if backend.is_mmap_only() && !backend.has_pending_deltas() {
                                     // MMAP FAST PATH: byte-level scan + point lookups
                                     if let Some(where_clause) = &stmt.where_clause {
+                                        let _limit_with_off = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
                                         let matching_indices = if let Some((col, val)) = Self::extract_string_equality(where_clause) {
-                                            backend.scan_string_filter_mmap(&col, &val, stmt.limit.map(|l| l + stmt.offset.unwrap_or(0)))?
+                                            backend.scan_string_filter_mmap(&col, &val, _limit_with_off)?
                                         } else if let Some((col, low, high)) = Self::extract_between_range(where_clause) {
-                                            backend.scan_numeric_range_mmap(&col, low, high, stmt.limit.map(|l| l + stmt.offset.unwrap_or(0)))?
+                                            backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?
+                                        } else if let Some((col, low, high)) = Self::extract_two_sided_same_col_range(where_clause) {
+                                            // col >= N AND col <= M — logically equivalent to BETWEEN
+                                            backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?
+                                        } else if let Some((col, low, high)) = Self::extract_single_comparison_as_range(where_clause) {
+                                            backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?
+                                        } else if let Some((col, values)) = Self::extract_in_string_filter(where_clause) {
+                                            // IN filter: scan each value, union indices
+                                            let mut all_idx: Vec<usize> = Vec::new();
+                                            for val in &values {
+                                                if let Some(mut idxs) = backend.scan_string_filter_mmap(&col, val, None)? {
+                                                    all_idx.append(&mut idxs);
+                                                }
+                                            }
+                                            all_idx.sort_unstable();
+                                            all_idx.dedup();
+                                            if let Some(lim) = _limit_with_off { all_idx.truncate(lim); }
+                                            if all_idx.is_empty() { None } else { Some(all_idx) }
                                         } else {
                                             None
                                         };
@@ -819,73 +843,26 @@ impl ApexExecutor {
             None => return Ok(None),
         };
 
-        // Get total row count
-        let total_rows = backend.row_count() as usize;
-        if total_rows == 0 {
-            return Ok(None);
-        }
-
-        // Analyze pattern for selectivity estimation
-        let is_prefix_like = pattern.ends_with("%") && !pattern.starts_with("%");
-        let estimated_selectivity = if is_prefix_like {
-            let prefix = &pattern[..pattern.len()-1];
-            if prefix.is_empty() {
-                1.0 // Match all
-            } else {
-                // Count trailing digits to estimate cardinality
-                let digit_count = prefix.chars().rev().take_while(|c| c.is_ascii_digit()).count();
-                if digit_count == 1 {
-                    0.1 // "user_1%" ~10%
-                } else if digit_count >= 2 {
-                    0.01 // "user_10%" ~1%
-                } else if prefix.len() > 0 {
-                    0.001 // Very low selectivity
-                } else {
-                    0.1 // Default
-                }
-            }
-        } else if pattern == "%" {
-            1.0 // Match all
-        } else {
-            0.1 // Default estimate
-        };
-
-        let estimated_matches = (total_rows as f64 * estimated_selectivity) as usize;
-
-        // Decision: use full scan for high-selectivity, index for low-selectivity
-        // Full scan threshold: >50K matches or >5% selectivity
-        let use_full_scan = estimated_matches > 50_000 || (estimated_selectivity > 0.05 && stmt.limit.is_none());
-
-        if use_full_scan {
-            // Full table scan + vectorized filter
-            let projected_cols: Option<Vec<String>> = if stmt.is_select_star() {
-                None
-            } else {
-                Some(stmt.required_columns().unwrap_or_default())
-            };
-            let col_refs: Option<Vec<&str>> = projected_cols.as_ref()
-                .map(|cols| cols.iter().map(|s| s.as_str()).collect());
-
-            // Read all data and filter in one pass
-            let col_refs_deref: Option<&[&str]> = col_refs.as_deref();
-            let full_batch = backend.read_columns_to_arrow(col_refs_deref, 0, None)?;
-            if full_batch.num_rows() == 0 {
-                return Ok(Some(full_batch));
-            }
-
-            // Evaluate predicate on full batch using vectorized operations
-            let storage_path = backend.path();
-            let mask = Self::evaluate_predicate_with_storage(&full_batch, where_clause, storage_path)?;
-
-            // Use Arrow's optimized filter
-            use arrow::compute::filter_record_batch;
-            return filter_record_batch(&full_batch, &mask)
-                .map(Some)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
-        }
-
-        // Low selectivity or has LIMIT: use index-based extraction
+        // Fast path: single-pass parallel scan+extract (V4 mmap, any selectivity).
+        // Avoids materializing non-matching rows — only builds Arrow arrays for hits.
+        // Returns None for compressed/non-RCIX files → falls through to old paths.
         let limit_with_offset = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+        if let Some(batch) = backend.scan_like_and_extract_mmap(&col_name, &pattern, limit_with_offset)? {
+            let offset = stmt.offset.unwrap_or(0);
+            let result = if offset > 0 {
+                let n = batch.num_rows().saturating_sub(offset);
+                batch.slice(offset, n)
+            } else {
+                batch
+            };
+            if let Some(lim) = stmt.limit {
+                let n = result.num_rows().min(lim);
+                return Ok(Some(result.slice(0, n)));
+            }
+            return Ok(Some(result));
+        }
+
+        // Fallback: index-based extraction (compressed/non-RCIX files)
         let mut indices = match backend.scan_like_filter_mmap(&col_name, &pattern, limit_with_offset)? {
             Some(v) => v,
             None => return Ok(None),
@@ -1846,7 +1823,282 @@ impl ApexExecutor {
             _ => None,
         }
     }
+
+    /// Convert a single-sided numeric comparison to an inclusive range for scan_numeric_range_mmap.
+    /// col > N  → (col, next_f64(N), MAX)   exclusive lower bound via next representable f64
+    /// col >= N → (col, N, MAX)
+    /// col < N  → (col, MIN, prev_f64(N))   exclusive upper bound via prev representable f64
+    /// col <= N → (col, MIN, N)
+    fn extract_single_comparison_as_range(expr: &SqlExpr) -> Option<(String, f64, f64)> {
+        use crate::query::sql_parser::BinaryOperator;
+        match expr {
+            SqlExpr::BinaryOp { left, op, right } => {
+                // col OP literal  OR  literal OP col (reversed)
+                let (col, effective_op, val) = match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(c), lit) => {
+                        let v = Self::extract_numeric_value(lit).ok()?;
+                        (c.trim_matches('"').to_string(), op.clone(), v)
+                    }
+                    (lit, SqlExpr::Column(c)) => {
+                        let v = Self::extract_numeric_value(lit).ok()?;
+                        // Flip: N > col → col < N
+                        let flipped = match op {
+                            BinaryOperator::Gt => BinaryOperator::Lt,
+                            BinaryOperator::Ge => BinaryOperator::Le,
+                            BinaryOperator::Lt => BinaryOperator::Gt,
+                            BinaryOperator::Le => BinaryOperator::Ge,
+                            _ => return None,
+                        };
+                        (c.trim_matches('"').to_string(), flipped, v)
+                    }
+                    _ => return None,
+                };
+                // Return next/prev representable f64 for strict inequalities so that
+                // scan_numeric_range_mmap (which uses inclusive bounds) is exact.
+                let (low, high) = match effective_op {
+                    BinaryOperator::Gt => {
+                        // col > N: smallest representable value strictly above N
+                        let next = if val >= 0.0 {
+                            f64::from_bits(val.to_bits() + 1)
+                        } else {
+                            f64::from_bits(val.to_bits() - 1)
+                        };
+                        (next, f64::MAX)
+                    }
+                    BinaryOperator::Ge => (val, f64::MAX),
+                    BinaryOperator::Lt => {
+                        // col < N: largest representable value strictly below N
+                        let prev = if val > 0.0 {
+                            f64::from_bits(val.to_bits() - 1)
+                        } else {
+                            f64::from_bits(val.to_bits() + 1)
+                        };
+                        (f64::MIN, prev)
+                    }
+                    BinaryOperator::Le => (f64::MIN, val),
+                    BinaryOperator::Eq => (val, val),  // exact match as degenerate range [N, N]
+                    _ => return None,
+                };
+                Some((col, low, high))
+            }
+            _ => None,
+        }
+    }
     
+    /// Extract a two-sided AND range on the SAME column: col >= N AND col <= M etc.
+    /// Returns (col, inclusive_low, inclusive_high) with strict-inequality adjustment.
+    /// Each side is extracted via extract_single_comparison_as_range; the intersection
+    /// of the two (lo, hi) intervals gives the final range.
+    fn extract_two_sided_same_col_range(expr: &SqlExpr) -> Option<(String, f64, f64)> {
+        use crate::query::sql_parser::BinaryOperator;
+        match expr {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                let (col1, lo1, hi1) = Self::extract_single_comparison_as_range(left.as_ref())?;
+                let (col2, lo2, hi2) = Self::extract_single_comparison_as_range(right.as_ref())?;
+                if col1 != col2 { return None; }
+                let combined_low  = lo1.max(lo2);
+                let combined_high = hi1.min(hi2);
+                if combined_low > combined_high { return None; }
+                Some((col1, combined_low, combined_high))
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract any single-column numeric range from an expression.
+    /// Handles: BETWEEN, col op N (single comparison including equality).
+    fn extract_any_numeric_range(expr: &SqlExpr) -> Option<(String, f64, f64)> {
+        if let Some(r) = Self::extract_between_range(expr) { return Some(r); }
+        if let Some(r) = Self::extract_single_comparison_as_range(expr) { return Some(r); }
+        None
+    }
+
+    /// Merge-intersect two sorted index slices in O(n+m).
+    fn intersect_sorted_indices(a: &[usize], b: &[usize]) -> Vec<usize> {
+        let mut result = Vec::new();
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Equal   => { result.push(a[i]); i += 1; j += 1; }
+                std::cmp::Ordering::Less    => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+            }
+        }
+        result
+    }
+
+    /// MMAP fast path for AND of two numeric conditions on DIFFERENT columns.
+    /// Example: WHERE age > 30 AND score > 50 [LIMIT n]
+    /// Strategy: scan each column independently → merge-intersect sorted index sets → scatter read.
+    fn try_fast_mmap_multi_condition(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::sql_parser::BinaryOperator;
+        if !backend.is_mmap_only() || backend.has_pending_deltas() { return Ok(None); }
+        if !stmt.is_select_star() { return Ok(None); }
+        // Without LIMIT the result set can be very large; sequential Arrow scan is faster
+        // than index intersection + scatter read for high-selectivity filters.
+        if stmt.limit.is_none() { return Ok(None); }
+
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        // Must be top-level AND
+        let (left_cond, right_cond) = match where_clause {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                (left.as_ref(), right.as_ref())
+            }
+            _ => return Ok(None),
+        };
+
+        // --- Case A: numeric AND numeric (two different columns) ---
+        if let (Some((col1, lo1, hi1)), Some((col2, lo2, hi2))) = (
+            Self::extract_any_numeric_range(left_cond),
+            Self::extract_any_numeric_range(right_cond),
+        ) {
+            if col1 != col2 {
+                let idxs1 = match backend.scan_numeric_range_mmap(&col1, lo1, hi1, None)? {
+                    Some(v) => v,
+                    None => return Ok(None),
+                };
+                let idxs2 = match backend.scan_numeric_range_mmap(&col2, lo2, hi2, None)? {
+                    Some(v) => v,
+                    None => return Ok(None),
+                };
+                let mut intersected = Self::intersect_sorted_indices(&idxs1, &idxs2);
+                let offset = stmt.offset.unwrap_or(0);
+                if offset > 0 {
+                    if offset >= intersected.len() {
+                        return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+                    }
+                    intersected = intersected[offset..].to_vec();
+                }
+                if let Some(lim) = stmt.limit { intersected.truncate(lim); }
+                if intersected.is_empty() {
+                    return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+                }
+                let batch = backend.read_columns_by_indices_to_arrow(&intersected)?;
+                return Ok(Some(ApexResult::Data(batch)));
+            }
+        }
+
+        // --- Case B: string equality AND numeric range ---
+        // Try both orderings: (str, num) and (num, str)
+        let str_num = Self::extract_string_equality(left_cond)
+            .and_then(|(sc, sv)| Self::extract_any_numeric_range(right_cond).map(|r| (sc, sv, r)))
+            .or_else(|| {
+                Self::extract_string_equality(right_cond)
+                    .and_then(|(sc, sv)| Self::extract_any_numeric_range(left_cond).map(|r| (sc, sv, r)))
+            });
+
+        let (str_col, str_val, (num_col, num_lo, num_hi)) = match str_num {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let str_indices = match backend.scan_string_filter_mmap(&str_col, &str_val, None)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let num_indices = match backend.scan_numeric_range_mmap(&num_col, num_lo, num_hi, None)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let mut intersected = Self::intersect_sorted_indices(&str_indices, &num_indices);
+
+        // Apply offset + limit
+        let offset = stmt.offset.unwrap_or(0);
+        if offset > 0 {
+            if offset >= intersected.len() {
+                return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+            }
+            intersected = intersected[offset..].to_vec();
+        }
+        if let Some(lim) = stmt.limit {
+            intersected.truncate(lim);
+        }
+
+        if intersected.is_empty() {
+            return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+        }
+
+        let batch = backend.read_columns_by_indices_to_arrow(&intersected)?;
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
+    /// Extract IN list of string values: col IN ('a', 'b', 'c')
+    /// Returns (column_name, vec_of_string_values) if all values are strings.
+    fn extract_in_string_filter(expr: &SqlExpr) -> Option<(String, Vec<String>)> {
+        match expr {
+            SqlExpr::In { column, values, negated } => {
+                if *negated { return None; }
+                let col = column.trim_matches('"').to_string();
+                let mut strs = Vec::with_capacity(values.len());
+                for v in values {
+                    match v {
+                        Value::String(s) => strs.push(s.clone()),
+                        _ => return None,
+                    }
+                }
+                if strs.is_empty() { return None; }
+                Some((col, strs))
+            }
+            _ => None,
+        }
+    }
+
+    /// MMAP fast path for IN filter on string column.
+    /// Strategy: scan each IN value independently, merge-union sorted indices, scatter read.
+    fn try_fast_mmap_in_filter(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        if !backend.is_mmap_only() || backend.has_pending_deltas() { return Ok(None); }
+        if !stmt.is_select_star() { return Ok(None); }
+
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        let (col, values) = match Self::extract_in_string_filter(where_clause) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // Scan each value and collect indices
+        let mut all_indices: Vec<usize> = Vec::new();
+        for val in &values {
+            if let Some(mut idxs) = backend.scan_string_filter_mmap(&col, val, None)? {
+                all_indices.append(&mut idxs);
+            }
+        }
+        // Sort and deduplicate (union of sorted sets)
+        all_indices.sort_unstable();
+        all_indices.dedup();
+
+        // Apply offset + limit
+        let offset = stmt.offset.unwrap_or(0);
+        if offset > 0 {
+            if offset >= all_indices.len() {
+                return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+            }
+            all_indices = all_indices[offset..].to_vec();
+        }
+        if let Some(lim) = stmt.limit {
+            all_indices.truncate(lim);
+        }
+
+        if all_indices.is_empty() {
+            return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+        }
+
+        let batch = backend.read_columns_by_indices_to_arrow(&all_indices)?;
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
     /// Helper to extract boolean equality: col = true/false
     fn extract_bool_equality(expr: &SqlExpr) -> Option<(String, bool)> {
         use crate::query::sql_parser::BinaryOperator;
@@ -1916,14 +2168,33 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
-        if backend.has_pending_deltas() || backend.is_mmap_only() {
-            return Ok(None);
-        }
+        if backend.has_pending_deltas() { return Ok(None); }
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
         };
-        // Try to extract a simple numeric comparison (col op literal)
+
+        // --- mmap_only path: scan → indices → scatter read (LIMIT only) ---
+        if backend.is_mmap_only() {
+            if stmt.limit.is_none() { return Ok(None); }
+            let (col, lo, hi) = match Self::extract_any_numeric_range(where_clause) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            let limit_with_off = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            let indices = match backend.scan_numeric_range_mmap(&col, lo, hi, limit_with_off)? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            if indices.is_empty() {
+                let schema = backend.read_columns_to_arrow(None, 0, Some(0))?;
+                return Ok(Some(schema));
+            }
+            let batch = backend.read_columns_by_indices_to_arrow(&indices)?;
+            return Ok(Some(batch));
+        }
+
+        // --- in-memory path: storage-level filtered read ---
         let (col_name, op_str, value) = match Self::extract_numeric_comparison(where_clause) {
             Some(v) => v,
             None => return Ok(None),
