@@ -226,6 +226,9 @@ impl ApexExecutor {
                                 // FAST PATH 4: Mmap multi-condition AND on two different numeric columns
                                 } else if let Some(result) = Self::try_fast_mmap_multi_condition(&backend, &stmt)? {
                                     return Ok(result);
+                                // FAST PATH 5: Mmap IN filter on string column
+                                } else if let Some(result) = Self::try_fast_mmap_in_filter(&backend, &stmt)? {
+                                    return Ok(result);
                                 } else if backend.is_mmap_only() && !backend.has_pending_deltas() {
                                     // MMAP FAST PATH: byte-level scan + point lookups
                                     if let Some(where_clause) = &stmt.where_clause {
@@ -239,6 +242,18 @@ impl ApexExecutor {
                                             backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?
                                         } else if let Some((col, low, high)) = Self::extract_single_comparison_as_range(where_clause) {
                                             backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?
+                                        } else if let Some((col, values)) = Self::extract_in_string_filter(where_clause) {
+                                            // IN filter: scan each value, union indices
+                                            let mut all_idx: Vec<usize> = Vec::new();
+                                            for val in &values {
+                                                if let Some(mut idxs) = backend.scan_string_filter_mmap(&col, val, None)? {
+                                                    all_idx.append(&mut idxs);
+                                                }
+                                            }
+                                            all_idx.sort_unstable();
+                                            all_idx.dedup();
+                                            if let Some(lim) = _limit_with_off { all_idx.truncate(lim); }
+                                            if all_idx.is_empty() { None } else { Some(all_idx) }
                                         } else {
                                             None
                                         };
@@ -2014,6 +2029,76 @@ impl ApexExecutor {
         Ok(Some(ApexResult::Data(batch)))
     }
 
+    /// Extract IN list of string values: col IN ('a', 'b', 'c')
+    /// Returns (column_name, vec_of_string_values) if all values are strings.
+    fn extract_in_string_filter(expr: &SqlExpr) -> Option<(String, Vec<String>)> {
+        match expr {
+            SqlExpr::In { column, values, negated } => {
+                if *negated { return None; }
+                let col = column.trim_matches('"').to_string();
+                let mut strs = Vec::with_capacity(values.len());
+                for v in values {
+                    match v {
+                        Value::String(s) => strs.push(s.clone()),
+                        _ => return None,
+                    }
+                }
+                if strs.is_empty() { return None; }
+                Some((col, strs))
+            }
+            _ => None,
+        }
+    }
+
+    /// MMAP fast path for IN filter on string column.
+    /// Strategy: scan each IN value independently, merge-union sorted indices, scatter read.
+    fn try_fast_mmap_in_filter(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        if !backend.is_mmap_only() || backend.has_pending_deltas() { return Ok(None); }
+        if !stmt.is_select_star() { return Ok(None); }
+
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        let (col, values) = match Self::extract_in_string_filter(where_clause) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // Scan each value and collect indices
+        let mut all_indices: Vec<usize> = Vec::new();
+        for val in &values {
+            if let Some(mut idxs) = backend.scan_string_filter_mmap(&col, val, None)? {
+                all_indices.append(&mut idxs);
+            }
+        }
+        // Sort and deduplicate (union of sorted sets)
+        all_indices.sort_unstable();
+        all_indices.dedup();
+
+        // Apply offset + limit
+        let offset = stmt.offset.unwrap_or(0);
+        if offset > 0 {
+            if offset >= all_indices.len() {
+                return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+            }
+            all_indices = all_indices[offset..].to_vec();
+        }
+        if let Some(lim) = stmt.limit {
+            all_indices.truncate(lim);
+        }
+
+        if all_indices.is_empty() {
+            return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+        }
+
+        let batch = backend.read_columns_by_indices_to_arrow(&all_indices)?;
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
     /// Helper to extract boolean equality: col = true/false
     fn extract_bool_equality(expr: &SqlExpr) -> Option<(String, bool)> {
         use crate::query::sql_parser::BinaryOperator;
@@ -2083,14 +2168,33 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
-        if backend.has_pending_deltas() || backend.is_mmap_only() {
-            return Ok(None);
-        }
+        if backend.has_pending_deltas() { return Ok(None); }
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
         };
-        // Try to extract a simple numeric comparison (col op literal)
+
+        // --- mmap_only path: scan → indices → scatter read (LIMIT only) ---
+        if backend.is_mmap_only() {
+            if stmt.limit.is_none() { return Ok(None); }
+            let (col, lo, hi) = match Self::extract_any_numeric_range(where_clause) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            let limit_with_off = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            let indices = match backend.scan_numeric_range_mmap(&col, lo, hi, limit_with_off)? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            if indices.is_empty() {
+                let schema = backend.read_columns_to_arrow(None, 0, Some(0))?;
+                return Ok(Some(schema));
+            }
+            let batch = backend.read_columns_by_indices_to_arrow(&indices)?;
+            return Ok(Some(batch));
+        }
+
+        // --- in-memory path: storage-level filtered read ---
         let (col_name, op_str, value) = match Self::extract_numeric_comparison(where_clause) {
             Some(v) => v,
             None => return Ok(None),
