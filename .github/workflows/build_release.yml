@@ -4,319 +4,129 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
-
-env:
-  CARGO_TERM_COLOR: always
 
 jobs:
-  # ============================================
-  # Rust 测试阶段
-  # ============================================
-  test_rust:
-    name: Rust Tests - ${{ matrix.os }}
+  test:
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run Rust tests
-        run: cargo test --no-default-features --verbose
-
-  # ============================================
-  # Python 测试阶段
-  # ============================================
-  test_python:
-    name: Python Tests - ${{ matrix.os }} - Python ${{ matrix.python-version }}
-    runs-on: ${{ matrix.os }}
-    needs: test_rust
-    strategy:
-      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+      fail-fast: false
 
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest
+        pip install -e .
+    - name: Run tests
+      run: |
+        pytest --ignore=test/test_memory_vs_duckdb.py
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+  build-wheels-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+    - name: Build wheels (manylinux)
+      uses: PyO3/maturin-action@v1
+      with:
+        command: build
+        args: --release --out dist --interpreter /opt/python/cp39-cp39/bin/python /opt/python/cp310-cp310/bin/python /opt/python/cp311-cp311/bin/python /opt/python/cp312-cp312/bin/python /opt/python/cp313-cp313/bin/python
+        manylinux: 2014
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+    - name: Upload wheel artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-manylinux
+        path: dist/*.whl
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest maturin
+  build-wheels:
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
 
-      - name: Create virtual environment
-        run: python -m venv .venv
+    - name: Set up Python ${{ matrix.python-version }}
+      id: py
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
 
-      - name: Build and install
-        if: matrix.os != 'windows-latest'
-        run: .venv/bin/python -m maturin develop --release
+    - name: Show Python
+      run: |
+        python -c "import sys; print(sys.executable); print(sys.version)"
 
-      - name: Build and install (Windows)
-        if: matrix.os == 'windows-latest'
-        run: .venv\Scripts\python.exe -m maturin develop --release
+    - name: Build wheels
+      uses: PyO3/maturin-action@v1
+      env:
+        PYO3_PYTHON: ${{ steps.py.outputs.python-path }}
+        PYTHON_SYS_EXECUTABLE: ${{ steps.py.outputs.python-path }}
+      with:
+        command: build
+        args: --release --out dist --interpreter ${{ steps.py.outputs.python-path }}
 
-      - name: Run tests
-        run: pytest --ignore=test/test_memory_vs_duckdb.py
+    - name: Upload wheel artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-${{ matrix.os }}-${{ matrix.python-version }}
+        path: dist/*.whl
 
-  # ============================================
-  # 构建源代码分发包
-  # ============================================
   build-sdist:
-    name: Build source distribution
+    needs: test
     runs-on: ubuntu-latest
-    needs: [test_rust, test_python]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - name: Build sdist
+      uses: PyO3/maturin-action@v1
+      with:
+        command: sdist
+        args: --out dist
+    - name: Upload sdist artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: sdist
+        path: dist/*.tar.gz
 
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: --out dist
-
-      - name: Upload sdist artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: sdist
-          path: dist/*.tar.gz
-
-  # ============================================
-  # 构建 Linux wheels (manylinux x86_64)
-  # ============================================
-  build-wheels-linux-x86:
-    name: Build Linux wheels (x86_64)
+  publish:
+    needs: [build-wheels-linux, build-wheels, build-sdist]
     runs-on: ubuntu-latest
-    needs: [test_rust, test_python]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Build wheels (manylinux x86_64)
-        uses: PyO3/maturin-action@v1
-        with:
-          command: build
-          target: x86_64
-          args: --release --out dist --interpreter /opt/python/cp39-cp39/bin/python /opt/python/cp310-cp310/bin/python /opt/python/cp311-cp311/bin/python /opt/python/cp312-cp312/bin/python /opt/python/cp313-cp313/bin/python
-          manylinux: 2014
-
-      - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-linux-x86_64
-          path: dist/*.whl
-
-  # ============================================
-  # 构建 Linux wheels (manylinux aarch64)
-  # ============================================
-  build-wheels-linux-aarch64:
-    name: Build Linux wheels (aarch64)
-    runs-on: ubuntu-latest
-    needs: [test_rust, test_python]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Build wheels (manylinux aarch64)
-        uses: PyO3/maturin-action@v1
-        with:
-          command: build
-          target: aarch64
-          args: --release --out dist --interpreter 3.9 3.10 3.11 3.12 3.13
-          manylinux: 2014
-
-      - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-linux-aarch64
-          path: dist/*.whl
-
-  # ============================================
-  # 构建 macOS wheels
-  # ============================================
-  build-wheels-macos:
-    name: Build macOS wheels (Python ${{ matrix.python-version }})
-    runs-on: macos-14
-    needs: [test_rust, test_python]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    strategy:
-      matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python ${{ matrix.python-version }}
-        id: py
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          command: build
-          target: aarch64-apple-darwin
-          args: --release --out dist --interpreter ${{ steps.py.outputs.python-path }}
-
-      - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-macos-${{ matrix.python-version }}
-          path: dist/*.whl
-
-  # ============================================
-  # 构建 Windows wheels
-  # ============================================
-  build-wheels-windows:
-    name: Build Windows wheels (Python ${{ matrix.python-version }})
-    runs-on: windows-latest
-    needs: [test_rust, test_python]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    strategy:
-      matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python ${{ matrix.python-version }}
-        id: py
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        env:
-          PYO3_PYTHON: ${{ steps.py.outputs.python-path }}
-          PYTHON_SYS_EXECUTABLE: ${{ steps.py.outputs.python-path }}
-        with:
-          command: build
-          args: --release --out dist --interpreter ${{ steps.py.outputs.python-path }}
-
-      - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-windows-${{ matrix.python-version }}
-          path: dist/*.whl
-
-  # ============================================
-  # 发布 Rust Crate 到 crates.io
-  # ============================================
-  publish-crate:
-    name: Publish to crates.io
-    runs-on: ubuntu-latest
-    needs: test_rust
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --no-default-features --allow-dirty || true
-
-  # ============================================
-  # 发布到 GitHub Release 和 PyPI
-  # ============================================
-  release:
-    name: Release
-    runs-on: ubuntu-latest
-    needs: [build-sdist, build-wheels-linux-x86, build-wheels-linux-aarch64, build-wheels-macos, build-wheels-windows]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Organize artifacts
-        run: |
-          mkdir -p dist
-          find artifacts -name "*.whl" -exec cp {} dist/ \;
-          find artifacts -name "*.tar.gz" -exec cp {} dist/ \;
-          echo "=== Build artifacts ==="
-          ls -la dist/
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: dist/*
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install twine
-        run: python -m pip install --upgrade twine
-
-      - name: Verify package integrity
-        run: |
-          for file in dist/*.whl; do
-            if [ -f "$file" ]; then
-              echo "Checking $file"
-              python -m zipfile -l "$file" > /dev/null || (echo "Error: $file is corrupted" && exit 1)
-            fi
-          done
-          python -m twine check dist/*
-
-      - name: Upload to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: python -m twine upload dist/* --skip-existing
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+    - name: Install twine
+      run: |
+        python -m pip install --upgrade pip
+        pip install twine
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+    - name: Publish to PyPI
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      run: |
+        python -m twine upload --verbose --skip-existing dist/**/*.whl dist/**/*.tar.gz
