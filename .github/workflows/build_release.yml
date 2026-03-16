@@ -6,6 +6,57 @@ on:
       - 'v*'
 
 jobs:
+  # ── Rust tests (core lib without PyO3, plus server/flight features) ──
+  rust-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        features:
+          - ""                  # core only (--no-default-features)
+          - "server"            # PG wire protocol
+          - "flight"            # Arrow Flight gRPC
+        rust: [stable]
+      fail-fast: false
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Install Rust ${{ matrix.rust }}
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.rust }}
+
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.os }}-${{ matrix.features }}
+
+    - name: Install system dependencies (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+
+    - name: Install system dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        brew install protobuf
+
+    - name: Install system dependencies (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        choco install protoc -y
+
+    - name: cargo test (no-default-features ${{ matrix.features && format('+ {0}', matrix.features) || '— core only' }})
+      run: |
+        cargo test --no-default-features ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --release
+      env:
+        RUST_BACKTRACE: 1
+
+  # ── Python tests (existing) ──
   test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -31,8 +82,9 @@ jobs:
       run: |
         pytest --ignore=test/test_memory_vs_duckdb.py
 
+  # ── Build Linux wheels (manylinux) ──
   build-wheels-linux:
-    needs: test
+    needs: [test, rust-test]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -52,8 +104,9 @@ jobs:
         name: wheels-manylinux
         path: dist/*.whl
 
+  # ── Build macOS / Windows wheels ──
   build-wheels:
-    needs: test
+    needs: [test, rust-test]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -90,8 +143,9 @@ jobs:
         name: wheels-${{ matrix.os }}-${{ matrix.python-version }}
         path: dist/*.whl
 
+  # ── Build source distribution ──
   build-sdist:
-    needs: test
+    needs: [test, rust-test]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -108,6 +162,7 @@ jobs:
         name: sdist
         path: dist/*.tar.gz
 
+  # ── Publish to PyPI ──
   publish:
     needs: [build-wheels-linux, build-wheels, build-sdist]
     runs-on: ubuntu-latest
@@ -130,3 +185,33 @@ jobs:
         TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
       run: |
         python -m twine upload --verbose --skip-existing dist/**/*.whl dist/**/*.tar.gz
+
+  # ── Publish to crates.io ──
+  publish-crate:
+    needs: [rust-test]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Install Rust stable
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+
+    - name: Verify crate packaging
+      run: |
+        cargo package --no-default-features --allow-dirty --list
+
+    - name: Publish to crates.io
+      run: |
+        cargo publish --no-default-features --allow-dirty
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
