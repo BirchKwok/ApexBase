@@ -7,9 +7,11 @@ Complete documentation for ApexBase — a high-performance HTAP embedded databas
 | Document | Description |
 |----------|-------------|
 | [Quick Start](QUICK_START.md) | Get started in 5 minutes |
-| [API Reference](API_REFERENCE.md) | Complete API documentation (100% coverage) |
+| [API Reference](API_REFERENCE.md) | Complete Python API documentation (100% coverage) |
+| [Rust Embedded API](RUST_EMBEDDED_API.md) | Rust native API — all types, methods, examples, concurrency |
 | [Examples](EXAMPLES.md) | Code examples and use cases |
 | [FTS Guide](FTS_GUIDE.md) | Full-text search SQL reference and examples |
+| [Float16 Vector Guide](FLOAT16_VECTOR_GUIDE.md) | f16 embedding storage and SIMD distance kernels |
 | [Storage Architecture](STORAGE_ARCHITECTURE.md) | V4 Row Group format, engine internals |
 | [HTAP Roadmap](HTAP_ROADMAP.md) | Roadmap and current status |
 | [Root README](../README.md) | Project overview, benchmarks, installation |
@@ -94,10 +96,12 @@ See [API_REFERENCE.md](API_REFERENCE.md) for complete details.
 ```
 docs/
 ├── README.md                 # This file — documentation index
-├── QUICK_START.md            # 5-minute quick start guide
-├── API_REFERENCE.md          # Complete API reference (100% coverage)
+├── QUICK_START.md            # 5-minute quick start guide (Python)
+├── API_REFERENCE.md          # Complete Python API reference (100% coverage)
+├── RUST_EMBEDDED_API.md      # Rust native API — types, methods, examples, concurrency
 ├── EXAMPLES.md               # Real-world usage examples
 ├── FTS_GUIDE.md              # Full-text search SQL reference and guide
+├── FLOAT16_VECTOR_GUIDE.md   # f16 vector storage, SIMD kernels, benchmarks
 ├── STORAGE_ARCHITECTURE.md   # V4 Row Group format, engine design
 └── HTAP_ROADMAP.md           # Roadmap and status
 

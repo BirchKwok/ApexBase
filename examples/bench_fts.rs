@@ -73,6 +73,7 @@ fn main() {
         HashMap::new(),
         HashMap::new(),
         HashMap::new(),
+        HashMap::new(),
         DurabilityLevel::Fast,
     ).expect("write_typed failed");
     let t_write = t.elapsed();

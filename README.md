@@ -38,6 +38,10 @@ ApexBase is an embedded columnar database designed for **Hybrid Transactional/An
   - [Python Client](#python-client)
   - [When to Use Arrow Flight vs PG Wire](#when-to-use-arrow-flight-vs-pg-wire)
   - [PyO3 Python API](#pyo3-python-api)
+- [Rust Native API](#rust-native-api)
+  - [Cargo Dependency](#cargo-dependency)
+  - [Rust Quick Start](#rust-quick-start)
+  - [Key Rust Types](#key-rust-types)
 - [Architecture](#architecture)
   - [Storage Format](#storage-format)
   - [Query Execution](#query-execution)
@@ -805,6 +809,118 @@ t2 = threading.Thread(target=start_flight_server, args=("/data", "0.0.0.0", 5005
 t1.start()
 t2.start()
 ```
+
+---
+
+## Rust Native API
+
+ApexBase can be used directly from Rust as a zero-overhead embedded database — no Python, no FFI, no server process required. The full SQL engine, Arrow-native query results, SIMD vector search, FTS, and transactions are all available from the same Rust API.
+
+### Cargo Dependency
+
+```toml
+[dependencies]
+# Local checkout
+apexbase = { path = "path/to/ApexBase", default-features = false }
+
+# Git
+apexbase = { git = "https://github.com/BirchKwok/ApexBase.git", default-features = false }
+```
+
+`default-features = false` disables PyO3/numpy and significantly reduces compile time. Add `features = ["server"]` or `features = ["flight"]` if you also need the wire protocol servers.
+
+### Rust Quick Start
+
+```rust
+use apexbase::embedded::{ApexDB, Row};
+use apexbase::data::Value;
+use apexbase::storage::DurabilityLevel;
+use apexbase::storage::on_demand::ColumnType;
+use std::collections::HashMap;
+
+fn main() -> apexbase::Result<()> {
+    // Open (or create) a database
+    let db = ApexDB::builder("./data")
+        .durability(DurabilityLevel::Fast)
+        .build()?;
+
+    // Create a table with a predefined schema
+    let users = db.create_table_with_schema("users", &[
+        ("name".to_string(),  ColumnType::String),
+        ("age".to_string(),   ColumnType::Int64),
+        ("score".to_string(), ColumnType::Float64),
+        ("city".to_string(),  ColumnType::String),
+    ])?;
+
+    // Insert rows
+    let id = users.insert([
+        ("name".to_string(),  Value::String("Alice".to_string())),
+        ("age".to_string(),   Value::Int64(30)),
+        ("score".to_string(), Value::Float64(92.5)),
+        ("city".to_string(),  Value::String("Beijing".to_string())),
+    ].into_iter().collect())?;
+
+    // Batch insert 1 000 rows
+    let bulk: Vec<Row> = (0..1_000i64).map(|i| {
+        [("name".to_string(),  Value::String(format!("user_{i}"))),
+         ("age".to_string(),   Value::Int64(20 + i % 50)),
+         ("score".to_string(), Value::Float64(50.0 + (i % 50) as f64)),
+         ("city".to_string(),  Value::String(if i % 2 == 0 { "A".to_string() } else { "B".to_string() })),
+        ].into_iter().collect()
+    }).collect();
+    users.insert_batch(&bulk)?;
+
+    // Full SQL query → Arrow RecordBatch
+    let rs = users.execute(
+        "SELECT city, COUNT(*) AS n, AVG(score) AS avg
+         FROM users GROUP BY city ORDER BY n DESC"
+    )?;
+    let batch = rs.to_record_batch()?;
+    println!("{} rows × {} columns", batch.num_rows(), batch.num_columns());
+
+    // Or Vec<HashMap<String, Value>>
+    let rows = users.execute("SELECT * FROM users WHERE age > 28 LIMIT 5")?.to_rows()?;
+    for row in &rows {
+        println!("{:?}", row.get("name"));
+    }
+
+    // Point lookup by _id
+    if let Some(row) = users.retrieve(id)? {
+        println!("Retrieved: {:?}", row.get("name"));
+    }
+
+    // O(1) row count
+    println!("Total rows: {}", users.count()?);
+
+    // Schema changes
+    users.add_column("active", apexbase::data::DataType::Bool)?;
+    println!("Columns: {:?}", users.columns()?);
+
+    Ok(())
+}
+```
+
+Run the full working example:
+
+```bash
+cargo run --example embedded --no-default-features
+```
+
+### Key Rust Types
+
+| Type | Import path | Description |
+|------|-------------|-------------|
+| `ApexDB` | `apexbase::embedded::ApexDB` | Database handle — `Clone + Send + Sync` |
+| `ApexDBBuilder` | `apexbase::embedded::ApexDB` (via `ApexDB::builder`) | Builder with durability / drop options |
+| `Table` | `apexbase::embedded::Table` | Table-scoped operations — `Clone + Send + Sync` |
+| `ResultSet` | `apexbase::embedded::ResultSet` | Query result (Arrow RecordBatch or scalar) |
+| `Row` | `apexbase::embedded::Row` | `HashMap<String, Value>` |
+| `Value` | `apexbase::data::Value` | `Int64` / `Float64` / `String` / `Bool` / `Binary` / `FixedList` / `Null` |
+| `ColumnType` | `apexbase::storage::on_demand::ColumnType` | Schema type for `create_table_with_schema` |
+| `DataType` | `apexbase::data::DataType` | Schema type for `add_column` / `schema()` |
+| `DurabilityLevel` | `apexbase::storage::DurabilityLevel` | `Fast` / `Safe` / `Max` |
+
+For the full Rust API reference — all methods, transactions, FTS, vector search, concurrency patterns, and performance notes — see [`docs/RUST_EMBEDDED_API.md`](docs/RUST_EMBEDDED_API.md).
 
 ---
 
