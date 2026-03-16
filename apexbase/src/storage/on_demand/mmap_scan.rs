@@ -222,12 +222,30 @@ impl OnDemandStorage {
         }
 
         let footer_byte_count = (file_len - footer_offset) as usize;
+        if footer_byte_count < 16 {
+            // Too small to hold even footer_size + magic trailer
+            return Ok(None);
+        }
         let mut footer_bytes = vec![0u8; footer_byte_count];
         mmap.read_at(file_handle, &mut footer_bytes, footer_offset)?;
         drop(mmap);
         drop(file_guard);
 
-        let footer = V4Footer::from_bytes(&footer_bytes)?;
+        // Validate footer magic before parsing.
+        // During concurrent append_row_group, the header may still reference the
+        // old footer_offset after the old footer has been overwritten with RG data.
+        // In that case the bytes here are not a valid footer — return None so the
+        // caller gracefully retries or falls back.
+        if footer_byte_count < 8
+            || &footer_bytes[footer_byte_count - 8..] != MAGIC_V4_FOOTER
+        {
+            return Ok(None);
+        }
+
+        let footer = match V4Footer::from_bytes(&footer_bytes) {
+            Ok(f) => f,
+            Err(_) => return Ok(None), // transient inconsistency during concurrent write
+        };
         // Cache the footer for subsequent reads
         *self.v4_footer.write() = Some(footer.clone());
         Ok(Some(footer))
