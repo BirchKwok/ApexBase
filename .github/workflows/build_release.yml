@@ -210,8 +210,15 @@ jobs:
       run: |
         cargo package --no-default-features --allow-dirty --list
 
-    - name: Publish to crates.io
+    - name: Publish to crates.io (if version not exists)
       run: |
+        VERSION=$(grep "^version" Cargo.toml | head -1 | cut -d'"' -f2)
+        echo "Checking if apexbase v${VERSION} exists on crates.io..."
+        if cargo search apexbase --limit 1 2>/dev/null | grep -q "apexbase = \"${VERSION}\""; then
+          echo "Version ${VERSION} already exists on crates.io, skipping publish."
+          exit 0
+        fi
+        echo "Publishing apexbase v${VERSION}..."
         cargo publish --no-default-features --allow-dirty
       env:
         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

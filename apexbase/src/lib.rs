@@ -34,6 +34,27 @@ use pyo3::prelude::*;
 #[cfg(feature = "python")]
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // On Windows, rayon's global thread pool threads survive past Python process exit.
+    // ExitProcess forcibly terminates them, triggering a panic in Rust's thread lifecycle
+    // code ("threads should not terminate unexpectedly"). Suppress this specific panic.
+    #[cfg(target_os = "windows")]
+    {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                *s
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.as_str()
+            } else {
+                ""
+            };
+            if msg.contains("should not terminate unexpectedly") {
+                return; // suppress Windows thread-shutdown panic
+            }
+            prev(info);
+        }));
+    }
+
     m.add_class::<python::ApexStorage>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
