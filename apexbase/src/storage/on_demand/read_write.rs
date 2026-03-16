@@ -3267,6 +3267,12 @@ impl OnDemandStorage {
         let file = open_for_sequential_read(&self.path)?;
         *self.file.write() = Some(file);
 
+        // Update the in-memory v4_footer cache so that subsequent reads
+        // (e.g. to_arrow_batch_mmap via get_or_load_footer) see the new
+        // column names immediately, even before the backend is evicted
+        // from insert_cache.
+        *self.v4_footer.write() = Some(footer);
+
         Ok(())
     }
 

@@ -2332,6 +2332,13 @@ impl OnDemandStorage {
         self.schema.read().columns.clone()
     }
 
+    /// Rename a column in the in-memory schema.
+    /// Must be called alongside `TableStorageBackend::rename_column` so that
+    /// `update_v4_footer_schema()` and `save()` persist the new name.
+    pub fn rename_column_in_schema(&self, old_name: &str, new_name: &str) -> bool {
+        self.schema.write().rename_column(old_name, new_name)
+    }
+
     /// Get header info: (footer_offset, row_count)
     #[inline]
     pub fn header_info(&self) -> (u64, u64) {

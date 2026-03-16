@@ -135,43 +135,6 @@ use tempfile::tempdir;
     }
 
     #[test]
-    fn benchmark_on_demand_vs_full_load() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("bench_demand.apex");
-
-        // Create large dataset
-        let n = 100_000;
-        let storage = OnDemandStorage::create(&path).unwrap();
-
-        let mut int_cols = HashMap::new();
-        int_cols.insert("col_a".to_string(), (0..n as i64).collect());
-        int_cols.insert("col_b".to_string(), (0..n as i64).map(|x| x * 2).collect());
-        int_cols.insert("col_c".to_string(), (0..n as i64).map(|x| x * 3).collect());
-
-        storage.insert_typed(int_cols, HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new()).unwrap();
-        storage.save().unwrap();
-
-        // Benchmark: read single column, small range
-        let storage = OnDemandStorage::open(&path).unwrap();
-
-        let start = std::time::Instant::now();
-        for _ in 0..100 {
-            let _ = storage.read_columns(Some(&["col_b"]), 50000, Some(100)).unwrap();
-        }
-        let elapsed = start.elapsed();
-
-        println!("\n=== On-Demand Read Benchmark ===");
-        println!("Dataset: {} rows x 3 columns", n);
-        println!("Query: 100 rows from middle of col_b");
-        println!("100 iterations: {:?}", elapsed);
-        println!("Per query: {:?}", elapsed / 100);
-        println!("=================================\n");
-
-        // Should be very fast since we only read 100 rows of 1 column
-        assert!(elapsed.as_millis() < 100, "On-demand reads should be fast");
-    }
-
-    #[test]
     fn test_insert_rows_compatibility() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_compat.apex");

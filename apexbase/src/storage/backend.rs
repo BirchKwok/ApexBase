@@ -1173,14 +1173,24 @@ impl TableStorageBackend {
     /// Rename a column
     pub fn rename_column(&self, old_name: &str, new_name: &str) -> io::Result<()> {
         let mut schema = self.schema.write();
+        let mut found = false;
         for (name, _) in schema.iter_mut() {
             if name == old_name {
                 *name = new_name.to_string();
-                *self.dirty.write() = true;
-                return Ok(());
+                found = true;
+                break;
             }
         }
-        Err(io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", old_name)))
+        if !found {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", old_name)));
+        }
+        *self.dirty.write() = true;
+        drop(schema);
+
+        // Also update the underlying OnDemandStorage schema so that
+        // save() and update_v4_footer_schema() persist the new name.
+        self.storage.rename_column_in_schema(old_name, new_name);
+        Ok(())
     }
 
     /// List all column names

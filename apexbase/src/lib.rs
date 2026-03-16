@@ -7,6 +7,7 @@ pub mod storage;
 pub mod table;
 pub mod query;
 pub mod data;
+pub mod embedded;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod fts;
@@ -22,6 +23,9 @@ pub use storage::{ColumnarStorage, ColumnType, ColumnValue, FileSchema};
 pub use table::TableCatalog;
 pub use data::{DataType, Value, Row};
 pub use query::{ApexExecutor, ApexResult};
+
+// Re-export embedded API for Rust users
+pub use embedded::{ApexDB, Table, ResultSet};
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;

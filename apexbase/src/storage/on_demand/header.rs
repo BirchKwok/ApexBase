@@ -578,6 +578,20 @@ impl OnDemandSchema {
         self.name_to_idx.get(name).copied()
     }
 
+    /// Rename a column in-place. Returns `true` if the column was found and renamed.
+    pub fn rename_column(&mut self, old_name: &str, new_name: &str) -> bool {
+        if let Some(&idx) = self.name_to_idx.get(old_name) {
+            self.columns[idx].0 = new_name.to_string();
+            let old_idx = self.name_to_idx.remove(old_name);
+            if let Some(i) = old_idx {
+                self.name_to_idx.insert(new_name.to_string(), i);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn column_count(&self) -> usize {
         self.columns.len()
     }

@@ -94,7 +94,7 @@ zstd = "0.13"
 once_cell = "1.19"
 
 # Full-text search engine (native Rust integration)
-nanofts = "0.6.0"
+nanofts = "0.7.0"
 
 # JIT compilation for query expressions (Cranelift)
 cranelift = "0.116"
