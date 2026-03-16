@@ -609,7 +609,23 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         invalidate_storage_cache(path);
         TableStorageBackend::open(path)?
     } else {
-        TableStorageBackend::open_with_file(path, file, file_len)?
+        match TableStorageBackend::open_with_file(path, file, file_len) {
+            Ok(b) => b,
+            Err(_) => {
+                // Transient footer corruption during concurrent write —
+                // return stale cached backend if available.
+                if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
+                    let pair = entry.pair();
+                    pair.1.2.store(now_nanos(), Ordering::Relaxed);
+                    return Ok(Arc::clone(&pair.1.0));
+                }
+                // No cached backend — retry after a brief sleep (write should finish quickly)
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let file2 = std::fs::File::open(path)?;
+                let meta2 = file2.metadata()?;
+                TableStorageBackend::open_with_file(path, file2, meta2.len())?
+            }
+        }
     });
 
     // Use current time as modified (avoid extra metadata call after compaction)
