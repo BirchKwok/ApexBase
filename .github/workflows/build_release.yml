@@ -67,18 +67,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest maturin
 
-      - name: Build and install (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          maturin build --release --out dist
-          pip install dist/*.whl
-
-      - name: Build and install (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          maturin build --release --out dist
-          pip install (Get-ChildItem dist\*.whl).FullName
-        shell: pwsh
+      - name: Build and install
+        run: maturin develop --release
 
       - name: Run tests
         run: pytest --ignore=test/test_memory_vs_duckdb.py
