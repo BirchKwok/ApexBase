@@ -156,7 +156,12 @@ impl ThreadPoolExecutor {
 
 impl Drop for ThreadPoolExecutor {
     fn drop(&mut self) {
-        self.shutdown();
+        // catch_unwind: on Windows, thread-local destructors may run after
+        // parking_lot's internal TLS is torn down, causing a panic in join().
+        // Absorb it so the process exits cleanly after all tests pass.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.shutdown();
+        }));
     }
 }
 

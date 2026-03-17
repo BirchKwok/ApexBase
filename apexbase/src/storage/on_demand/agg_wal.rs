@@ -2681,12 +2681,16 @@ impl OnDemandStorage {
 
 impl Drop for OnDemandStorage {
     fn drop(&mut self) {
-        // Release mmap first (critical for Windows)
-        // parking_lot's try_write returns Option, not Result
-        if let Some(mut cache) = self.mmap_cache.try_write() {
-            cache.invalidate();
-        }
-        // File handle will be dropped automatically after mmap is released
+        // catch_unwind: on Windows, this destructor may run after parking_lot's
+        // internal TLS is torn down, causing try_write() to panic.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Release mmap first (critical for Windows)
+            // parking_lot's try_write returns Option, not Result
+            if let Some(mut cache) = self.mmap_cache.try_write() {
+                cache.invalidate();
+            }
+            // File handle will be dropped automatically after mmap is released
+        }));
     }
 }
 
