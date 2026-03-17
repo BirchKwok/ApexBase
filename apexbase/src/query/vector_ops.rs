@@ -327,8 +327,14 @@ impl DistanceMetric {
             Self::LInf        => linf_distance(a, b),
             Self::InnerProduct => inner_product(a, b),
             Self::NegInnerProduct => -inner_product(a, b),
-            Self::CosineSimilarity => cosine_similarity(a, b),
-            Self::CosineDistance   => cosine_distance(a, b),
+            Self::CosineSimilarity => {
+                let nb_sq: f32 = b.iter().map(|x| x * x).sum();
+                if nb_sq == 0.0 { 0.0 } else { cosine_similarity_fused(a, b, 1.0 / nb_sq.sqrt()) }
+            }
+            Self::CosineDistance => {
+                let nb_sq: f32 = b.iter().map(|x| x * x).sum();
+                if nb_sq == 0.0 { 1.0 } else { 1.0 - cosine_similarity_fused(a, b, 1.0 / nb_sq.sqrt()) }
+            }
         }
     }
 }

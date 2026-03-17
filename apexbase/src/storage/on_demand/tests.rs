@@ -2,7 +2,7 @@ use super::*;
 use tempfile::tempdir;
 
     #[test]
-    fn test_v3_create_and_open() {
+    fn test_create_and_open() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.apex");
 
@@ -43,7 +43,7 @@ use tempfile::tempdir;
     }
 
     #[test]
-    fn test_v3_column_projection() {
+    fn test_column_projection() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_proj.apex");
 
@@ -74,7 +74,7 @@ use tempfile::tempdir;
     }
 
     #[test]
-    fn test_v3_row_range() {
+    fn test_row_range() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_range.apex");
 
@@ -101,7 +101,7 @@ use tempfile::tempdir;
     }
 
     #[test]
-    fn test_v3_string_column() {
+    fn test_string_column() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_string.apex");
 

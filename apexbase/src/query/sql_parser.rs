@@ -550,7 +550,8 @@ impl SelectStatement {
 
 /// SQL Parser
 pub struct SqlParser {
-    sql_chars: Vec<char>,
+    sql_raw: String,
+    sql_chars: Option<Vec<char>>,
     tokens: Vec<SpannedToken>,
     pos: usize,
 }
@@ -624,9 +625,10 @@ enum Token {
 impl SqlParser {
     /// Parse a SQL statement
     pub fn parse(sql: &str) -> Result<SqlStatement, ApexError> {
-        let (sql_chars, tokens) = Self::tokenize(sql)?;
+        let tokens = Self::tokenize(sql)?;
         let mut parser = SqlParser {
-            sql_chars,
+            sql_raw: sql.to_owned(),
+            sql_chars: None,
             tokens,
             pos: 0,
         };
@@ -649,9 +651,10 @@ impl SqlParser {
 
     /// Parse multiple SQL statements separated by semicolons.
     pub fn parse_multi(sql: &str) -> Result<Vec<SqlStatement>, ApexError> {
-        let (sql_chars, tokens) = Self::tokenize(sql)?;
+        let tokens = Self::tokenize(sql)?;
         let mut parser = SqlParser {
-            sql_chars,
+            sql_raw: sql.to_owned(),
+            sql_chars: None,
             tokens,
             pos: 0,
         };
@@ -662,9 +665,10 @@ impl SqlParser {
     ///
     /// This is used to unify the non-SQL query language with SQL semantics.
     pub fn parse_expression(expr: &str) -> Result<SqlExpr, ApexError> {
-        let (sql_chars, tokens) = Self::tokenize(expr)?;
+        let tokens = Self::tokenize(expr)?;
         let mut parser = SqlParser {
-            sql_chars,
+            sql_raw: expr.to_owned(),
+            sql_chars: None,
             tokens,
             pos: 0,
         };
@@ -681,10 +685,23 @@ impl SqlParser {
         Ok(e)
     }
 
-    /// Tokenize SQL string — returns (sql_chars for error reporting, token list).
+    /// Ensure sql_chars is populated (lazy — only for error reporting / CHECK extraction).
+    fn ensure_chars(&mut self) {
+        if self.sql_chars.is_none() {
+            self.sql_chars = Some(self.sql_raw.chars().collect());
+        }
+    }
+
+    /// Get sql_chars reference, building lazily if needed.
+    fn chars(&mut self) -> &[char] {
+        self.ensure_chars();
+        self.sql_chars.as_ref().unwrap()
+    }
+
+    /// Tokenize SQL string — returns token list.
     /// Uses byte-level scanning for cache-friendly 4x smaller working set vs Vec<char>.
     /// SQL is ASCII; `'`/`"` delimiters can never appear inside a multi-byte UTF-8 sequence.
-    fn tokenize(sql: &str) -> Result<(Vec<char>, Vec<SpannedToken>), ApexError> {
+    fn tokenize(sql: &str) -> Result<Vec<SpannedToken>, ApexError> {
         let mut tokens: Vec<SpannedToken> = Vec::with_capacity(sql.len() / 4 + 8);
         let bytes = sql.as_bytes(); // no allocation: reference into existing str
         let len = bytes.len();
@@ -966,9 +983,7 @@ impl SqlParser {
         }
 
         tokens.push(SpannedToken { token: Token::Eof, start: len, end: len });
-        // Build chars only once here, for error-reporting (format_near / format_position).
-        let chars = sql.chars().collect();
-        Ok((chars, tokens))
+        Ok(tokens)
     }
 
     fn current(&self) -> &Token {
@@ -998,22 +1013,26 @@ impl SqlParser {
         Ok(out)
     }
 
-    fn format_near(&self, at: usize) -> String {
-        if self.sql_chars.is_empty() {
+    fn format_near(&mut self, at: usize) -> String {
+        self.ensure_chars();
+        let chars = self.sql_chars.as_ref().unwrap();
+        if chars.is_empty() {
             return String::new();
         }
         let start = at.saturating_sub(16);
-        let end = (at + 16).min(self.sql_chars.len());
-        let snippet: String = self.sql_chars[start..end].iter().collect();
+        let end = (at + 16).min(chars.len());
+        let snippet: String = chars[start..end].iter().collect();
         snippet.replace('\n', " ")
     }
 
-    fn line_col(&self, at: usize) -> (usize, usize) {
+    fn line_col(&mut self, at: usize) -> (usize, usize) {
+        self.ensure_chars();
+        let chars = self.sql_chars.as_ref().unwrap();
         // 1-based line/col
         let mut line = 1usize;
         let mut col = 1usize;
-        let end = at.min(self.sql_chars.len());
-        for ch in self.sql_chars.iter().take(end) {
+        let end = at.min(chars.len());
+        for ch in chars.iter().take(end) {
             if *ch == '\n' {
                 line += 1;
                 col = 1;
@@ -1024,7 +1043,7 @@ impl SqlParser {
         (line, col)
     }
 
-    fn syntax_error(&self, at: usize, msg: String) -> ApexError {
+    fn syntax_error(&mut self, at: usize, msg: String) -> ApexError {
         let near = self.format_near(at);
         let (line, col) = self.line_col(at);
         ApexError::QueryParseError(format!(
@@ -3668,7 +3687,8 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                     }
                     let (expr_end, _) = self.current_span();
                     // Extract the SQL text between '(' and ')' from sql_chars
-                    let check_sql: String = self.sql_chars[expr_start..expr_end].iter().collect::<String>().trim().to_string();
+                    self.ensure_chars();
+                    let check_sql: String = self.sql_chars.as_ref().unwrap()[expr_start..expr_end].iter().collect::<String>().trim().to_string();
                     self.advance(); // consume final ')'
                     constraints.push(ColumnConstraintKind::Check(check_sql));
                 }

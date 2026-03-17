@@ -2596,8 +2596,8 @@ impl OnDemandStorage {
 
     /// Insert typed columns and immediately persist to disk
     /// 
-    /// This is the preferred method for V3 direct writes - data is immediately
-    /// visible to V3Executor after this call returns.
+    /// This is the preferred method for direct writes - data is immediately
+    /// visible to the executor after this call returns.
     pub fn insert_typed_and_persist(
         &self,
         int_columns: HashMap<String, Vec<i64>>,

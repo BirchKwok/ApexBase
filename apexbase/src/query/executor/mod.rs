@@ -1,10 +1,10 @@
-//! V3 Native Query Executor
+//! Native Query Executor
 //!
 //! This module provides a pure Arrow-based query execution engine that operates
 //! directly on OnDemandStorage without requiring ColumnTable.
 //!
 //! Architecture:
-//! - Reads columns on-demand from V3 storage
+//! - Reads columns on-demand from storage
 //! - Performs all filtering/projection/aggregation using Arrow compute kernels
 //! - Returns Arrow RecordBatch directly (zero-copy to Python)
 
@@ -645,10 +645,9 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     Ok(backend)
 }
 
-/// V3 Native Query Executor
+/// Native Query Executor
 /// 
-/// Executes SQL queries directly on V3 storage using Arrow compute kernels.
-/// This replaces the ColumnTable-based execution path.
+/// Executes SQL queries directly on storage using Arrow compute kernels.
 pub struct ApexExecutor;
 
 /// Query execution result
@@ -703,7 +702,7 @@ impl ApexExecutor {
         stmt.required_columns().filter(|cols| !cols.is_empty())
     }
     
-    /// Execute a SQL query on V3 storage (single table)
+    /// Execute a SQL query on storage (single table)
     pub fn execute(sql: &str, storage_path: &Path) -> io::Result<ApexResult> {
         let stmt = SqlParser::parse(sql)
             .map_err(|e| err_input( e.to_string()))?;

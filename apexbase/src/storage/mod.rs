@@ -1,7 +1,7 @@
-//! Storage module - ApexV3 On-Demand Columnar Storage
+//! Storage module - On-Demand Columnar Storage (V4)
 //!
 //! This module provides the core columnar storage format for ApexBase.
-//! The V3 format supports on-demand column/row reading without loading
+//! The V4 format supports on-demand column/row reading without loading
 //! the entire dataset into memory.
 //!
 //! Incremental writes use WAL (Write-Ahead Log) for fast append-only writes.

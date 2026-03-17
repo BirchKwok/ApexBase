@@ -17,9 +17,9 @@ pub struct OnDemandHeader {
     pub created_at: i64,
     pub modified_at: i64,
     pub checksum: u32,
-    /// V4: byte offset to V4Footer (0 for V3 files)
+    /// Byte offset to V4Footer
     pub footer_offset: u64,
-    /// V4: number of Row Groups (0 for V3 files)
+    /// Number of Row Groups
     pub row_group_count: u32,
 }
 
@@ -32,7 +32,7 @@ impl OnDemandHeader {
             row_count: 0,
             column_count: 0,
             row_group_size: DEFAULT_ROW_GROUP_SIZE,
-            schema_offset: HEADER_SIZE_V3 as u64,
+            schema_offset: HEADER_SIZE as u64,
             column_index_offset: 0,
             id_column_offset: 0,
             footer_offset: 0,
@@ -43,12 +43,12 @@ impl OnDemandHeader {
         }
     }
 
-    pub fn to_bytes(&self) -> [u8; HEADER_SIZE_V3] {
-        let mut buf = [0u8; HEADER_SIZE_V3];
+    pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
+        let mut buf = [0u8; HEADER_SIZE];
         let mut pos = 0;
 
         // Magic (8 bytes)
-        buf[pos..pos + 8].copy_from_slice(MAGIC_V3);
+        buf[pos..pos + 8].copy_from_slice(MAGIC);
         pos += 8;
 
         // Version (4 bytes)
@@ -104,14 +104,14 @@ impl OnDemandHeader {
         buf
     }
 
-    pub fn from_bytes(bytes: &[u8; HEADER_SIZE_V3]) -> io::Result<Self> {
+    pub fn from_bytes(bytes: &[u8; HEADER_SIZE]) -> io::Result<Self> {
         let mut pos = 0;
 
         // Verify magic
-        if &bytes[pos..pos + 8] != MAGIC_V3 {
+        if &bytes[pos..pos + 8] != MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Invalid V3 file magic",
+                "Invalid file magic",
             ));
         }
         pos += 8;
@@ -139,7 +139,7 @@ impl OnDemandHeader {
 
         let checksum = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
 
-        // Verify checksum (covers V3 fields only for backward compat)
+        // Verify checksum (covers core header fields)
         let computed = crc32fast::hash(&bytes[0..pos]);
         if computed != checksum {
             return Err(io::Error::new(
@@ -149,7 +149,7 @@ impl OnDemandHeader {
         }
         pos += 4;
 
-        // V4 fields (from reserved space — 0 for V3 files)
+        // V4 fields (from reserved space)
         let footer_offset = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
         pos += 8;
         let row_group_count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());

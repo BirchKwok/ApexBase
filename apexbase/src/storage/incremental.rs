@@ -7,7 +7,7 @@
 //!
 //! File Structure:
 //! ```text
-//! data.apex      - Main columnar file (V3 format)
+//! data.apex      - Main columnar file (V4 format)
 //! data.apex.wal  - WAL file (append-only records)
 //! ```
 //!

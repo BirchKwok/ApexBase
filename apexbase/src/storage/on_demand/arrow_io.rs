@@ -61,7 +61,7 @@ impl OnDemandStorage {
             }
         }
 
-        // At this point: V3 (data always in memory) or V4 with in-memory write buffer.
+        // At this point: V4 with in-memory write buffer.
         // No loading needed — data is already available in self.columns/ids.
         let schema = self.schema.read();
         let ids = self.ids.read();
@@ -537,7 +537,7 @@ impl OnDemandStorage {
             }
         }
 
-        // At this point: V3 (data always in memory) or V4 with in-memory write buffer.
+        // At this point: V4 with in-memory write buffer.
         let schema = self.schema.read();
         let ids = self.ids.read();
         let columns = self.columns.read();

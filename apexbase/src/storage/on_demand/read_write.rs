@@ -2453,7 +2453,7 @@ impl OnDemandStorage {
         }
     }
 
-    /// Save to file (full rewrite with V3 format)
+    /// Save to file (full rewrite with V4 format)
     /// 
     /// MEMORY OPTIMIZED: Processes one column at a time using placeholder + seek-back.
     /// Peak memory = original columns (already in memory) + 1 filtered column copy,
@@ -2701,7 +2701,7 @@ impl OnDemandStorage {
         let rg_size = DEFAULT_ROW_GROUP_SIZE as usize;
         
         // Write placeholder header
-        writer.write_all(&[0u8; HEADER_SIZE_V3])?;
+        writer.write_all(&[0u8; HEADER_SIZE])?;
         
         // Write Row Groups
         let mut rg_metas: Vec<RowGroupMeta> = Vec::new();

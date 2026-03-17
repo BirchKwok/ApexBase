@@ -1,4 +1,4 @@
-//! ApexBase V3 On-Demand Columnar Format
+//! ApexBase On-Demand Columnar Format (V4)
 //!
 //! A custom binary file format supporting:
 //! - Column projection: read only required columns
@@ -10,7 +10,7 @@
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │ Header (256 bytes)                                          │
-//! │   - Magic: "APEXV3\0\0" (8 bytes)                           │
+//! │   - Magic: "APEXV3\0\0" (8 bytes, retained for compat)      │
 //! │   - Version: u32                                            │
 //! │   - Flags: u32                                              │
 //! │   - Row count: u64                                          │
@@ -238,9 +238,9 @@ fn pread_fallback(file: &mut File, buf: &mut [u8], offset: u64) -> io::Result<()
 // Constants
 // ============================================================================
 
-const MAGIC_V3: &[u8; 8] = b"APEXV3\0\0";
+const MAGIC: &[u8; 8] = b"APEXV3\0\0";
 const FORMAT_VERSION_V4: u32 = 4;
-const HEADER_SIZE_V3: usize = 256;
+const HEADER_SIZE: usize = 256;
 const COLUMN_INDEX_ENTRY_SIZE: usize = 32;
 const DEFAULT_ROW_GROUP_SIZE: u32 = 65536;
 

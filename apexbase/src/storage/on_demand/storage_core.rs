@@ -99,12 +99,12 @@ pub struct OnDemandStorage {
 
 
 impl OnDemandStorage {
-    /// Create a new V3 storage file with default durability (Fast)
+    /// Create a new storage file with default durability (Fast)
     pub fn create(path: &Path) -> io::Result<Self> {
         Self::create_with_durability(path, super::DurabilityLevel::Fast)
     }
     
-    /// Create a new V3 storage file with specified durability level
+    /// Create a new storage file with specified durability level
     pub fn create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         Self::create_with_schema_and_durability(path, durability, &[])
     }
@@ -190,12 +190,12 @@ impl OnDemandStorage {
         wal_path
     }
 
-    /// Open existing V3 storage with default durability (Fast)
+    /// Open existing storage with default durability (Fast)
     pub fn open(path: &Path) -> io::Result<Self> {
         Self::open_with_durability(path, super::DurabilityLevel::Fast)
     }
     
-    /// Open existing V3 storage with specified durability level
+    /// Open existing storage with specified durability level
     /// Uses mmap for fast zero-copy reads with OS page cache
     pub fn open_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         // Clean up stale .tmp files from crashed atomic writes
@@ -222,72 +222,32 @@ impl OnDemandStorage {
         let mut mmap_cache = MmapCache::new();
         
         // Read header using mmap (zero-copy)
-        let mut header_bytes = [0u8; HEADER_SIZE_V3];
+        let mut header_bytes = [0u8; HEADER_SIZE];
         mmap_cache.read_at(&file, &mut header_bytes, 0)?;
         let header = OnDemandHeader::from_bytes(&header_bytes)?;
         
-        let is_v4 = header.footer_offset > 0;
-        
-        let schema: OnDemandSchema;
-        let column_index: Vec<ColumnIndexEntry>;
-        let id_count = header.row_count as usize;
-        let next_id: u64;
-        
-        let mut cached_v4_footer: Option<V4Footer> = None;
-        if is_v4 {
-            // V4 Row Group format: read schema from footer
-            // Use already-open file handle to avoid a second fs::metadata() syscall
-            let file_len = file.metadata()?.len();
-            let footer_byte_count = (file_len - header.footer_offset) as usize;
-            let mut footer_bytes = vec![0u8; footer_byte_count];
-            mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
-            let footer = V4Footer::from_bytes(&footer_bytes)?;
-            schema = footer.schema.clone();
-            cached_v4_footer = Some(footer);
-            column_index = Vec::new(); // Not used in V4
-            // Use max_id from non-empty RG metadata (row_count may be < max _id after deletes)
-            next_id = cached_v4_footer.as_ref().unwrap().row_groups.iter()
-                .filter(|rg| rg.row_count > 0)
-                .map(|rg| rg.max_id)
-                .max()
-                .map(|m| m + 1)
-                .unwrap_or(0);
-        } else {
-            // V3 format: read schema + column index from header area
-            let schema_size = header.column_index_offset - header.schema_offset;
-            let mut schema_bytes = vec![0u8; schema_size as usize];
-            mmap_cache.read_at(&file, &mut schema_bytes, header.schema_offset)?;
-            schema = OnDemandSchema::from_bytes(&schema_bytes)?;
-
-            let index_size = header.column_count as usize * COLUMN_INDEX_ENTRY_SIZE;
-            let mut index_bytes = vec![0u8; index_size];
-            mmap_cache.read_at(&file, &mut index_bytes, header.column_index_offset)?;
-            
-            let mut ci = Vec::with_capacity(header.column_count as usize);
-            for i in 0..header.column_count as usize {
-                let start = i * COLUMN_INDEX_ENTRY_SIZE;
-                let entry = ColumnIndexEntry::from_bytes(&index_bytes[start..start + COLUMN_INDEX_ENTRY_SIZE]);
-                ci.push(entry);
-            }
-            column_index = ci;
-            
-            // Read actual max ID from disk
-            next_id = if id_count > 0 {
-                let mut id_buf = vec![0u8; id_count * 8];
-                if mmap_cache.read_at(&file, &mut id_buf, header.id_column_offset).is_ok() {
-                    let mut max_id = 0u64;
-                    for i in 0..id_count {
-                        let id = u64::from_le_bytes(id_buf[i*8..(i+1)*8].try_into().unwrap_or([0u8; 8]));
-                        if id > max_id { max_id = id; }
-                    }
-                    max_id + 1
-                } else {
-                    header.row_count
-                }
-            } else {
-                0
-            };
+        if header.footer_offset == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Unsupported legacy file format (V3). Please re-create the table."));
         }
+        
+        let id_count = header.row_count as usize;
+        
+        // V4 Row Group format: read schema from footer
+        let file_len = file.metadata()?.len();
+        let footer_byte_count = (file_len - header.footer_offset) as usize;
+        let mut footer_bytes = vec![0u8; footer_byte_count];
+        mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
+        let footer = V4Footer::from_bytes(&footer_bytes)?;
+        let schema = footer.schema.clone();
+        let column_index: Vec<ColumnIndexEntry> = Vec::new();
+        // Use max_id from non-empty RG metadata (row_count may be < max _id after deletes)
+        let next_id = footer.row_groups.iter()
+            .filter(|rg| rg.row_count > 0)
+            .map(|rg| rg.max_id)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let cached_v4_footer: Option<V4Footer> = Some(footer);
 
         let columns: Vec<ColumnData> = schema.columns.iter()
             .map(|(_, col_type)| ColumnData::new(*col_type))
@@ -427,58 +387,28 @@ impl OnDemandStorage {
         let _ = apply_pending_deletes(path);
         let mut mmap_cache = MmapCache::new();
 
-        let mut header_bytes = [0u8; HEADER_SIZE_V3];
+        let mut header_bytes = [0u8; HEADER_SIZE];
         mmap_cache.read_at(&file, &mut header_bytes, 0)?;
         let header = OnDemandHeader::from_bytes(&header_bytes)?;
 
-        let is_v4 = header.footer_offset > 0;
-        let schema: OnDemandSchema;
-        let column_index: Vec<ColumnIndexEntry>;
-        let id_count = header.row_count as usize;
-        let next_id: u64;
-        let mut cached_v4_footer: Option<V4Footer> = None;
-
-        if is_v4 {
-            let footer_byte_count = (file_len - header.footer_offset) as usize;
-            let mut footer_bytes = vec![0u8; footer_byte_count];
-            mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
-            let footer = V4Footer::from_bytes(&footer_bytes)?;
-            schema = footer.schema.clone();
-            cached_v4_footer = Some(footer);
-            column_index = Vec::new();
-            next_id = cached_v4_footer.as_ref().unwrap().row_groups.iter()
-                .filter(|rg| rg.row_count > 0)
-                .map(|rg| rg.max_id)
-                .max()
-                .map(|m| m + 1)
-                .unwrap_or(0);
-        } else {
-            let schema_size = header.column_index_offset - header.schema_offset;
-            let mut schema_bytes = vec![0u8; schema_size as usize];
-            mmap_cache.read_at(&file, &mut schema_bytes, header.schema_offset)?;
-            schema = OnDemandSchema::from_bytes(&schema_bytes)?;
-            let index_size = header.column_count as usize * COLUMN_INDEX_ENTRY_SIZE;
-            let mut index_bytes = vec![0u8; index_size];
-            mmap_cache.read_at(&file, &mut index_bytes, header.column_index_offset)?;
-            let mut ci = Vec::with_capacity(header.column_count as usize);
-            for i in 0..header.column_count as usize {
-                let start = i * COLUMN_INDEX_ENTRY_SIZE;
-                let entry = ColumnIndexEntry::from_bytes(&index_bytes[start..start + COLUMN_INDEX_ENTRY_SIZE]);
-                ci.push(entry);
-            }
-            column_index = ci;
-            next_id = if id_count > 0 {
-                let mut id_buf = vec![0u8; id_count * 8];
-                if mmap_cache.read_at(&file, &mut id_buf, header.id_column_offset).is_ok() {
-                    let mut max_id = 0u64;
-                    for i in 0..id_count {
-                        let id = u64::from_le_bytes(id_buf[i*8..(i+1)*8].try_into().unwrap_or([0u8; 8]));
-                        if id > max_id { max_id = id; }
-                    }
-                    max_id + 1
-                } else { header.row_count }
-            } else { 0 };
+        if header.footer_offset == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Unsupported legacy file format (V3). Please re-create the table."));
         }
+        
+        let id_count = header.row_count as usize;
+        let footer_byte_count = (file_len - header.footer_offset) as usize;
+        let mut footer_bytes = vec![0u8; footer_byte_count];
+        mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
+        let footer = V4Footer::from_bytes(&footer_bytes)?;
+        let schema = footer.schema.clone();
+        let column_index: Vec<ColumnIndexEntry> = Vec::new();
+        let next_id = footer.row_groups.iter()
+            .filter(|rg| rg.row_count > 0)
+            .map(|rg| rg.max_id)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let cached_v4_footer: Option<V4Footer> = Some(footer);
 
         let columns: Vec<ColumnData> = schema.columns.iter()
             .map(|(_, col_type)| ColumnData::new(*col_type))
@@ -786,198 +716,13 @@ impl OnDemandStorage {
         Self::open_for_schema_change_with_durability(path, super::DurabilityLevel::Fast)
     }
     
-    /// Open for SCHEMA changes with specified durability - MOST memory efficient!
+    /// Open for SCHEMA changes with specified durability.
+    /// Delegates to open_with_durability (V4-only format).
     pub fn open_for_schema_change_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
         if !path.exists() {
             return Self::create_with_durability(path, durability);
         }
-        
-        // Quick V4 check: V4 files don't have V3 offsets, use general open path
-        {
-            let file = open_for_sequential_read(path)?;
-            let mut mc = MmapCache::new();
-            let mut hb = [0u8; HEADER_SIZE_V3];
-            mc.read_at(&file, &mut hb, 0)?;
-            let h = OnDemandHeader::from_bytes(&hb)?;
-            if h.footer_offset > 0 {
-                return Self::open_with_durability(path, durability);
-            }
-        }
-        
-        let file = open_for_sequential_read(path)?;
-        let mut mmap_cache = MmapCache::new();
-        
-        // Read header only
-        let mut header_bytes = [0u8; HEADER_SIZE_V3];
-        mmap_cache.read_at(&file, &mut header_bytes, 0)?;
-        let header = OnDemandHeader::from_bytes(&header_bytes)?;
-
-        // Read schema (V3 path)
-        let schema_size = header.column_index_offset - header.schema_offset;
-        let mut schema_bytes = vec![0u8; schema_size as usize];
-        mmap_cache.read_at(&file, &mut schema_bytes, header.schema_offset)?;
-        let schema = OnDemandSchema::from_bytes(&schema_bytes)?;
-
-        // Read column index
-        let index_size = header.column_count as usize * COLUMN_INDEX_ENTRY_SIZE;
-        let mut index_bytes = vec![0u8; index_size];
-        mmap_cache.read_at(&file, &mut index_bytes, header.column_index_offset)?;
-        
-        let mut column_index = Vec::with_capacity(header.column_count as usize);
-        for i in 0..header.column_count as usize {
-            let start = i * COLUMN_INDEX_ENTRY_SIZE;
-            let entry = ColumnIndexEntry::from_bytes(&index_bytes[start..start + COLUMN_INDEX_ENTRY_SIZE]);
-            column_index.push(entry);
-        }
-
-        // NOTE: Full IDs are NOT loaded into Vec - saves ~80MB for 10M rows
-        // But we must find the actual max ID to avoid collisions after deletes
-        // Read IDs from disk to find max (only reads 8 bytes per row, not full column data)
-        let mut next_id = 0u64;
-        if header.row_count > 0 {
-            // Read IDs from disk to find max
-            let mut id_buf = vec![0u8; header.row_count as usize * 8];
-            if mmap_cache.read_at(&file, &mut id_buf, header.id_column_offset).is_ok() {
-                for i in 0..header.row_count as usize {
-                    let id = u64::from_le_bytes(id_buf[i*8..(i+1)*8].try_into().unwrap_or([0u8; 8]));
-                    if id >= next_id {
-                        next_id = id + 1;
-                    }
-                }
-            } else {
-                // Fallback: use row_count (may cause issues after deletes)
-                next_id = header.row_count;
-            }
-        }
-        
-        // Check delta file for max ID (in case there are pending delta writes)
-        let delta_path = Self::delta_path(path);
-        if delta_path.exists() {
-            if let Ok(mut delta_file) = File::open(&delta_path) {
-                // Read delta IDs to find max
-                loop {
-                    // Read record count
-                    let mut count_buf = [0u8; 8];
-                    match delta_file.read_exact(&mut count_buf) {
-                        Ok(_) => {},
-                        Err(_) => break,
-                    }
-                    let record_count = u64::from_le_bytes(count_buf) as usize;
-                    
-                    // Read IDs and track max
-                    for _ in 0..record_count {
-                        let mut id_buf = [0u8; 8];
-                        if delta_file.read_exact(&mut id_buf).is_err() { break; }
-                        let id = u64::from_le_bytes(id_buf);
-                        if id >= next_id {
-                            next_id = id + 1;
-                        }
-                    }
-                    
-                    // Skip rest of record (columns)
-                    // Int columns
-                    let mut count_buf4 = [0u8; 4];
-                    if delta_file.read_exact(&mut count_buf4).is_err() { break; }
-                    let int_col_count = u32::from_le_bytes(count_buf4) as usize;
-                    for _ in 0..int_col_count {
-                        let mut len_buf = [0u8; 2];
-                        if delta_file.read_exact(&mut len_buf).is_err() { break; }
-                        let name_len = u16::from_le_bytes(len_buf) as usize;
-                        if delta_file.seek(SeekFrom::Current(name_len as i64 + record_count as i64 * 8)).is_err() { break; }
-                    }
-                    // Float columns
-                    if delta_file.read_exact(&mut count_buf4).is_err() { break; }
-                    let float_col_count = u32::from_le_bytes(count_buf4) as usize;
-                    for _ in 0..float_col_count {
-                        let mut len_buf = [0u8; 2];
-                        if delta_file.read_exact(&mut len_buf).is_err() { break; }
-                        let name_len = u16::from_le_bytes(len_buf) as usize;
-                        if delta_file.seek(SeekFrom::Current(name_len as i64 + record_count as i64 * 8)).is_err() { break; }
-                    }
-                    // String columns
-                    if delta_file.read_exact(&mut count_buf4).is_err() { break; }
-                    let string_col_count = u32::from_le_bytes(count_buf4) as usize;
-                    for _ in 0..string_col_count {
-                        let mut len_buf = [0u8; 2];
-                        if delta_file.read_exact(&mut len_buf).is_err() { break; }
-                        let name_len = u16::from_le_bytes(len_buf) as usize;
-                        if delta_file.seek(SeekFrom::Current(name_len as i64)).is_err() { break; }
-                        for _ in 0..record_count {
-                            let mut str_len_buf = [0u8; 4];
-                            if delta_file.read_exact(&mut str_len_buf).is_err() { break; }
-                            let str_len = u32::from_le_bytes(str_len_buf) as i64;
-                            if delta_file.seek(SeekFrom::Current(str_len)).is_err() { break; }
-                        }
-                    }
-                    // Bool columns
-                    if delta_file.read_exact(&mut count_buf4).is_err() { break; }
-                    let bool_col_count = u32::from_le_bytes(count_buf4) as usize;
-                    for _ in 0..bool_col_count {
-                        let mut len_buf = [0u8; 2];
-                        if delta_file.read_exact(&mut len_buf).is_err() { break; }
-                        let name_len = u16::from_le_bytes(len_buf) as usize;
-                        if delta_file.seek(SeekFrom::Current(name_len as i64 + record_count as i64)).is_err() { break; }
-                    }
-                }
-            }
-        }
-        
-        let row_count = header.row_count; // Cache before moving header
-        let column_count = header.column_count as usize;
-        let cached_fo = header.footer_offset;
-        let cached_flags = header.flags;
-        
-        // Empty columns - will be loaded on-demand if needed
-        let columns = vec![ColumnData::new(ColumnType::Int64); column_count];
-        let nulls = vec![Vec::new(); column_count];
-        let deleted_len = (row_count as usize + 7) / 8;
-        let deleted = vec![0u8; deleted_len];
-
-        // Handle WAL for durability
-        let wal_path = Self::wal_path(path);
-        let wal_writer = if durability != super::DurabilityLevel::Fast && wal_path.exists() {
-            Some(super::incremental::WalWriter::open(&wal_path)?)
-        } else if durability != super::DurabilityLevel::Fast {
-            Some(super::incremental::WalWriter::create(&wal_path, next_id)?)
-        } else {
-            None
-        };
-
-        Ok(Self {
-            path: path.to_path_buf(),
-            file: RwLock::new(Some(file)),
-            mmap_cache: RwLock::new(mmap_cache),
-            header: RwLock::new(header),
-            schema: RwLock::new(schema),
-            column_index: RwLock::new(column_index),
-            columns: RwLock::new(columns),
-            ids: RwLock::new(Vec::new()), // Empty - not loaded!
-            next_id: AtomicU64::new(next_id),
-            nulls: RwLock::new(nulls),
-            deleted: RwLock::new(deleted),
-            id_to_idx: RwLock::new(None), // Lazy loaded when needed
-            active_count: AtomicU64::new(row_count),
-            durability,
-            wal_writer: RwLock::new(wal_writer),
-            wal_buffer: RwLock::new(Vec::new()),
-            auto_flush_rows: AtomicU64::new(10000),
-            auto_flush_bytes: AtomicU64::new(500 * 1024 * 1024),
-            pending_rows: AtomicU64::new(0),
-            persisted_row_count: AtomicU64::new(row_count),
-            v4_base_loaded: AtomicBool::new(false),
-            cached_footer_offset: AtomicU64::new(cached_fo),
-            v4_footer: RwLock::new(None),
-            delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
-            compression: std::sync::atomic::AtomicU8::new(CompressionType::from_flags(cached_flags) as u8),
-            page_cache: RwLock::new(HashMap::new()),
-            scan_buf: std::sync::Mutex::new(Vec::new()),
-            scan_buf_file_size: std::sync::atomic::AtomicU64::new(0),
-            scan_buf_col: std::sync::Mutex::new(String::new()),
-            scan_buf_f16: std::sync::Mutex::new(Vec::new()),
-            scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
-            scan_buf_f16_col: std::sync::Mutex::new(String::new()),
-            global_lock: parking_lot::RwLock::new(()),
-        })
+        Self::open_with_durability(path, durability)
     }
     
     /// Get the delta file path for this storage
@@ -1012,7 +757,7 @@ impl OnDemandStorage {
     }
 
     /// Scan a numeric column for rows in [low, high] and return their row IDs directly.
-    /// Returns None if not applicable (V3 file, column not found, etc.).
+    /// Returns None if not applicable (column not found, etc.).
     pub fn scan_numeric_range_with_ids(&self, col_name: &str, low: f64, high: f64) -> io::Result<Option<Vec<u64>>> {
         self.scan_numeric_range_mmap_with_ids(col_name, low, high)
     }
@@ -1872,7 +1617,7 @@ impl OnDemandStorage {
         }
     }
     
-    // compact_column_streaming removed — was V3-only dead code (326 lines).
+    // compact_column_streaming removed — was legacy dead code (326 lines).
     // save() always produces V4 format; compact() uses in-memory merge path.
     
     /// Read delta file and merge into in-memory columns

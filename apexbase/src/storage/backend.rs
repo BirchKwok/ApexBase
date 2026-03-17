@@ -3,9 +3,9 @@
 //! This module bridges OnDemandStorage with ColumnTable, enabling:
 //! - Lazy loading: only load data when needed
 //! - Column projection: only load requested columns
-//! - Memory-efficient persistence using the V3 format
+//! Memory-efficient persistence using the V4 format
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1947,7 +1947,7 @@ impl TableStorageBackend {
 
     /// Batch retrieve multiple rows by IDs.
     /// Fast path: retrieve_many_mmap (one footer lock + one mmap slice per RG).
-    /// Fallback: per-ID retrieve_rcix loop (for V3/non-RCIX files).
+    /// Fallback: per-ID retrieve_rcix loop (for non-RCIX files).
     /// Returns a RecordBatch with all found rows (in original ID order, missing IDs skipped).
     pub fn read_rows_by_ids_to_arrow(&self, ids: &[u64]) -> io::Result<arrow::record_batch::RecordBatch> {
         use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
@@ -1968,7 +1968,7 @@ impl TableStorageBackend {
             }
         }
 
-        // Fallback: per-ID retrieve_rcix loop (V3 files / non-RCIX RGs)
+        // Fallback: per-ID retrieve_rcix loop (non-RCIX RGs)
         let mut all_rows = Vec::with_capacity(ids.len());
         for &id in ids {
             if let Ok(Some(row_vals)) = self.storage.retrieve_rcix(id) {
@@ -2878,6 +2878,8 @@ pub struct IncrementalStorageBackend {
     storage: IncrementalStorage,
     /// Schema mapping (column_name -> DataType)
     schema: RwLock<Vec<(String, DataType)>>,
+    /// Fast lookup for known column names (avoids O(n) scan per insert)
+    known_columns: RwLock<HashSet<String>>,
 }
 
 impl IncrementalStorageBackend {
@@ -2887,6 +2889,7 @@ impl IncrementalStorageBackend {
         Ok(Self {
             storage,
             schema: RwLock::new(Vec::new()),
+            known_columns: RwLock::new(HashSet::new()),
         })
     }
 
@@ -2897,10 +2900,12 @@ impl IncrementalStorageBackend {
             .into_iter()
             .map(|(name, ct)| (name, column_type_to_datatype(ct)))
             .collect();
+        let known: HashSet<String> = schema.iter().map(|(n, _)| n.clone()).collect();
         
         Ok(Self {
             storage,
             schema: RwLock::new(schema),
+            known_columns: RwLock::new(known),
         })
     }
 
@@ -2955,13 +2960,18 @@ impl IncrementalStorageBackend {
         // Insert into storage (fast WAL append)
         let ids = self.storage.insert_rows(&converted)?;
 
-        // Update schema if new columns
-        {
-            let mut schema = self.schema.write();
-            if let Some(row) = rows.first() {
+        // Update schema if new columns (O(1) HashSet lookup instead of O(n) scan)
+        if let Some(row) = rows.first() {
+            let known = self.known_columns.read();
+            let has_new = row.keys().any(|k| k != "_id" && !known.contains(k));
+            drop(known);
+            if has_new {
+                let mut schema = self.schema.write();
+                let mut known = self.known_columns.write();
                 for (k, v) in row {
-                    if k != "_id" && !schema.iter().any(|(n, _)| n == k) {
+                    if k != "_id" && !known.contains(k) {
                         schema.push((k.clone(), v.data_type()));
+                        known.insert(k.clone());
                     }
                 }
             }

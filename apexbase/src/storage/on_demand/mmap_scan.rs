@@ -146,7 +146,6 @@ pub(crate) fn classify_like_pattern(pattern: &str) -> Option<LikeKind> {
 
 impl OnDemandStorage {
     /// Get the V4 footer, using cached version when file hasn't changed.
-    /// Returns None for V3 files.
     /// Cache is invalidated when file size changes (another instance appended data)
     /// or explicitly via `invalidate_footer_cache()` after writes.
     pub(crate) fn get_or_load_footer(&self) -> io::Result<Option<V4Footer>> {
@@ -167,7 +166,7 @@ impl OnDemandStorage {
         let file_len = std::fs::metadata(&self.path)
             .map(|m| m.len())
             .unwrap_or(0);
-        if file_len < HEADER_SIZE_V3 as u64 {
+        if file_len < HEADER_SIZE as u64 {
             return Ok(None);
         }
 
@@ -209,7 +208,7 @@ impl OnDemandStorage {
         let mut mmap = self.mmap_cache.write();
 
         // Read the on-disk header fresh to get current footer_offset
-        let mut header_bytes = [0u8; HEADER_SIZE_V3];
+        let mut header_bytes = [0u8; HEADER_SIZE];
         mmap.read_at(file_handle, &mut header_bytes, 0)?;
         let on_disk_header = OnDemandHeader::from_bytes(&header_bytes)?;
 
@@ -279,7 +278,7 @@ impl OnDemandStorage {
 
         let footer = match self.get_or_load_footer()? {
             Some(f) => f,
-            None => return Ok(None), // V3 file — caller should use legacy path
+            None => return Ok(None), // footer not yet written (empty/new file)
         };
 
         let schema = &footer.schema;
@@ -799,76 +798,43 @@ impl OnDemandStorage {
         Ok(Some(batch))
     }
     
-    /// Read a single column for a contiguous row range, V3 or V4.
-    /// For V4 (in-memory): uses slice_range on loaded columns.
-    /// For V3 (mmap): uses read_column_range_mmap.
+    /// Read a single column for a contiguous row range (V4 in-memory path).
     fn read_column_auto(
         &self,
         col_idx: usize,
         col_type: ColumnType,
         start: usize,
         count: usize,
-        total_rows: usize,
-        is_v4: bool,
+        _total_rows: usize,
+        _is_v4: bool,
     ) -> io::Result<ColumnData> {
-        if is_v4 {
-            let columns = self.columns.read();
-            if col_idx < columns.len() && columns[col_idx].len() > 0 {
-                Ok(columns[col_idx].slice_range(start, start + count))
-            } else {
-                Ok(Self::create_default_column(col_type, count))
-            }
+        let columns = self.columns.read();
+        if col_idx < columns.len() && columns[col_idx].len() > 0 {
+            Ok(columns[col_idx].slice_range(start, start + count))
         } else {
-            let column_index = self.column_index.read();
-            if col_idx >= column_index.len() {
-                return Ok(Self::create_default_column(col_type, count));
-            }
-            let entry = column_index[col_idx].clone();
-            drop(column_index);
-            
-            let file_guard = self.file.read();
-            let file = file_guard.as_ref()
-                .ok_or_else(|| err_not_conn("File not open"))?;
-            let mut mmap = self.mmap_cache.write();
-            self.read_column_range_mmap(&mut mmap, file, &entry, col_type, start, count, total_rows)
+            Ok(Self::create_default_column(col_type, count))
         }
     }
     
-    /// Read a single column for scattered row indices, V3 or V4.
+    /// Read a single column for scattered row indices (V4 in-memory path).
     fn read_column_scattered_auto(
         &self,
         col_idx: usize,
         col_type: ColumnType,
         indices: &[usize],
-        total_rows: usize,
-        is_v4: bool,
+        _total_rows: usize,
+        _is_v4: bool,
     ) -> io::Result<ColumnData> {
-        if is_v4 {
-            let columns = self.columns.read();
-            if col_idx < columns.len() && columns[col_idx].len() > 0 {
-                Ok(columns[col_idx].filter_by_indices(indices))
-            } else {
-                Ok(Self::create_default_column(col_type, indices.len()))
-            }
+        let columns = self.columns.read();
+        if col_idx < columns.len() && columns[col_idx].len() > 0 {
+            Ok(columns[col_idx].filter_by_indices(indices))
         } else {
-            let column_index = self.column_index.read();
-            if col_idx >= column_index.len() {
-                return Ok(Self::create_default_column(col_type, indices.len()));
-            }
-            let entry = column_index[col_idx].clone();
-            drop(column_index);
-            
-            let file_guard = self.file.read();
-            let file = file_guard.as_ref()
-                .ok_or_else(|| err_not_conn("File not open"))?;
-            let mut mmap = self.mmap_cache.write();
-            self.read_column_scattered_mmap(&mut mmap, file, &entry, col_type, indices, total_rows)
+            Ok(Self::create_default_column(col_type, indices.len()))
         }
     }
 
-    /// Ensure IDs are loaded into memory (lazy loading optimization)
-    /// This is called on-demand when IDs are actually needed.
-    /// For V4: loads IDs from Row Groups via mmap (lightweight — only IDs, not column data).
+    /// Ensure IDs are loaded into memory (lazy loading optimization).
+    /// Loads IDs from V4 Row Groups via mmap (lightweight — only IDs, not column data).
     fn ensure_ids_loaded(&self) -> io::Result<()> {
         // Quick check without write lock
         if !self.ids.read().is_empty() {
@@ -882,36 +848,8 @@ impl OnDemandStorage {
             return Ok(());
         }
         
-        if self.cached_footer_offset.load(Ordering::Relaxed) > 0 {
-            // V4: Load IDs from Row Groups via mmap (no column data loaded)
-            drop(header);
-            return self.ensure_ids_loaded_v4();
-        }
-        
-        let file_guard = self.file.read();
-        let file = file_guard.as_ref().ok_or_else(|| {
-            err_not_conn("File not open")
-        })?;
-        
-        let mut mmap_cache = self.mmap_cache.write();
-        let mut ids = self.ids.write();
-        
-        // Double-check after acquiring write lock
-        if !ids.is_empty() {
-            return Ok(());
-        }
-        
-        // Load IDs from disk (V3)
-        let mut id_bytes = vec![0u8; id_count * 8];
-        mmap_cache.read_at(file, &mut id_bytes, header.id_column_offset)?;
-        
-        ids.reserve(id_count);
-        for i in 0..id_count {
-            let id = u64::from_le_bytes(id_bytes[i * 8..(i + 1) * 8].try_into().unwrap());
-            ids.push(id);
-        }
-        
-        Ok(())
+        drop(header);
+        self.ensure_ids_loaded_v4()
     }
 
     /// V4-specific: Load IDs + deletion vector from Row Groups via mmap.
@@ -1316,290 +1254,21 @@ impl OnDemandStorage {
             .collect())
     }
 
-    /// Execute Complex (Filter+Group+Order) query with single-pass optimization
-    /// Key optimization for: SELECT group_col, AGG(agg_col) FROM table WHERE filter_col = 'value'
-    /// GROUP BY group_col ORDER BY total DESC LIMIT n
+    /// Execute Complex (Filter+Group+Order) query with single-pass optimization.
+    /// Returns None — caller uses the general query path (V4 format).
     pub fn execute_filter_group_order(
         &self,
-        filter_col: &str,
-        filter_val: &str,
-        group_col: &str,
-        agg_col: Option<&str>,
-        agg_func: crate::query::AggregateFunc,
-        descending: bool,
-        limit: usize,
-        offset: usize,
+        _filter_col: &str,
+        _filter_val: &str,
+        _group_col: &str,
+        _agg_col: Option<&str>,
+        _agg_func: crate::query::AggregateFunc,
+        _descending: bool,
+        _limit: usize,
+        _offset: usize,
     ) -> io::Result<Option<RecordBatch>> {
-        use arrow::array::{Int64Array, StringArray};
-        use arrow::datatypes::{Field, Schema, DataType as ArrowDataType};
-        use std::collections::BinaryHeap;
-        use std::cmp::Ordering;
-        use std::sync::Arc;
-
-        // V4: mmap dict scan is V3-specific, let caller use general query path
-        // LOCK-FREE: use cached_footer_offset for V4 detection
-        if self.cached_footer_offset.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-            return Ok(None);
-        }
-
-        let schema = self.schema.read();
-        let column_index = self.column_index.read();
-        let header = self.header.read();
-
-        let total_rows = header.row_count as usize;
-        if total_rows == 0 {
-            return Ok(Some(RecordBatch::new_empty(Arc::new(Schema::empty()))));
-        }
-
-        // Get column indices
-        let filter_idx = match schema.get_index(filter_col) {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
-        let group_idx = match schema.get_index(group_col) {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
-
-        let file_guard = self.file.read();
-        let file = file_guard.as_ref().ok_or_else(|| {
-            err_not_conn("File not open")
-        })?;
-        
-        let mut mmap_cache = self.mmap_cache.write();
-
-        // Read filter column to find matching rows
-        let filter_index = &column_index[filter_idx];
-        let (_, filter_col_type) = &schema.columns[filter_idx];
-        
-        if *filter_col_type != ColumnType::StringDict {
-            return Ok(None); // Only optimized for dictionary-encoded strings
-        }
-
-        // Read filter column header and dictionary
-        let filter_base = filter_index.data_offset;
-        let mut header_buf = [0u8; 16];
-        mmap_cache.read_at(file, &mut header_buf, filter_base)?;
-        let stored_rows = u64::from_le_bytes(header_buf[0..8].try_into().unwrap()) as usize;
-        let dict_size = u64::from_le_bytes(header_buf[8..16].try_into().unwrap()) as usize;
-        
-        // Read dictionary
-        let dict_offsets_offset = filter_base + 16 + (stored_rows * 4) as u64;
-        let mut dict_offsets_buf = vec![0u8; dict_size * 4];
-        mmap_cache.read_at(file, &mut dict_offsets_buf, dict_offsets_offset)?;
-        let dict_offsets: Vec<u32> = (0..dict_size)
-            .map(|i| u32::from_le_bytes(dict_offsets_buf[i*4..(i+1)*4].try_into().unwrap()))
-            .collect();
-        
-        let data_len_offset = dict_offsets_offset + (dict_size * 4) as u64;
-        let mut data_len_buf = [0u8; 8];
-        mmap_cache.read_at(file, &mut data_len_buf, data_len_offset)?;
-        let dict_data_len = u64::from_le_bytes(data_len_buf) as usize;
-        
-        let dict_data_offset = data_len_offset + 8;
-        let mut dict_data = vec![0u8; dict_data_len];
-        if dict_data_len > 0 {
-            mmap_cache.read_at(file, &mut dict_data, dict_data_offset)?;
-        }
-        
-        // Find filter value in dictionary
-        let filter_bytes = filter_val.as_bytes();
-        let mut target_dict_idx: Option<u32> = None;
-        for i in 0..dict_size.saturating_sub(1) {
-            let start = dict_offsets[i] as usize;
-            let end = if i + 1 < dict_size { dict_offsets[i + 1] as usize } else { dict_data_len };
-            if &dict_data[start..end] == filter_bytes {
-                target_dict_idx = Some((i + 1) as u32);
-                break;
-            }
-        }
-        
-        let target_idx = match target_dict_idx {
-            Some(idx) => idx,
-            None => return Ok(Some(RecordBatch::new_empty(Arc::new(Schema::empty())))),
-        };
-        
-        // Read group column dictionary
-        let group_index = &column_index[group_idx];
-        let (_, group_col_type) = &schema.columns[group_idx];
-        
-        if *group_col_type != ColumnType::StringDict {
-            return Ok(None);
-        }
-        
-        let group_base = group_index.data_offset;
-        let mut group_header = [0u8; 16];
-        mmap_cache.read_at(file, &mut group_header, group_base)?;
-        let group_rows = u64::from_le_bytes(group_header[0..8].try_into().unwrap()) as usize;
-        let group_dict_size = u64::from_le_bytes(group_header[8..16].try_into().unwrap()) as usize;
-        
-        let group_dict_offsets_offset = group_base + 16 + (group_rows * 4) as u64;
-        let mut group_dict_offsets_buf = vec![0u8; group_dict_size * 4];
-        mmap_cache.read_at(file, &mut group_dict_offsets_buf, group_dict_offsets_offset)?;
-        let group_dict_offsets: Vec<u32> = (0..group_dict_size)
-            .map(|i| u32::from_le_bytes(group_dict_offsets_buf[i*4..(i+1)*4].try_into().unwrap()))
-            .collect();
-        
-        let group_data_len_offset = group_dict_offsets_offset + (group_dict_size * 4) as u64;
-        let mut group_data_len_buf = [0u8; 8];
-        mmap_cache.read_at(file, &mut group_data_len_buf, group_data_len_offset)?;
-        let group_dict_data_len = u64::from_le_bytes(group_data_len_buf) as usize;
-        
-        let group_dict_data_offset = group_data_len_offset + 8;
-        let mut group_dict_data = vec![0u8; group_dict_data_len];
-        if group_dict_data_len > 0 {
-            mmap_cache.read_at(file, &mut group_dict_data, group_dict_data_offset)?;
-        }
-        
-        // Aggregate: group_idx -> (count, sum)
-        let mut group_counts: Vec<i64> = vec![0; group_dict_size];
-        let mut group_sums: Vec<f64> = vec![0.0; group_dict_size];
-        
-        // Read filter indices and aggregate
-        let filter_indices_offset = filter_base + 16;
-        let group_indices_offset = group_base + 16;
-        
-        // Read agg column if specified
-        let agg_idx = agg_col.and_then(|name| schema.get_index(name));
-        let agg_values: Option<Vec<f64>> = if let Some(idx) = agg_idx {
-            let agg_index = &column_index[idx];
-            let (_, agg_col_type) = &schema.columns[idx];
-            if *agg_col_type == ColumnType::Float64 || *agg_col_type == ColumnType::Int64 {
-                let agg_base = agg_index.data_offset + 8; // Skip count header
-                let mut agg_buf = vec![0u8; stored_rows * 8];
-                mmap_cache.read_at(file, &mut agg_buf, agg_base)?;
-                let values: Vec<f64> = (0..stored_rows)
-                    .map(|i| {
-                        let bytes = &agg_buf[i*8..(i+1)*8];
-                        f64::from_le_bytes(bytes.try_into().unwrap())
-                    })
-                    .collect();
-                Some(values)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        
-        // Single-pass aggregation
-        const CHUNK_SIZE: usize = 8192;
-        let mut filter_chunk = vec![0u32; CHUNK_SIZE];
-        let mut group_chunk = vec![0u32; CHUNK_SIZE];
-        
-        let mut row = 0;
-        while row < stored_rows {
-            let chunk_rows = CHUNK_SIZE.min(stored_rows - row);
-            
-            // Read filter indices chunk
-            let filter_bytes = unsafe {
-                std::slice::from_raw_parts_mut(filter_chunk.as_mut_ptr() as *mut u8, chunk_rows * 4)
-            };
-            mmap_cache.read_at(file, filter_bytes, filter_indices_offset + (row * 4) as u64)?;
-            
-            // Read group indices chunk
-            let group_bytes = unsafe {
-                std::slice::from_raw_parts_mut(group_chunk.as_mut_ptr() as *mut u8, chunk_rows * 4)
-            };
-            mmap_cache.read_at(file, group_bytes, group_indices_offset + (row * 4) as u64)?;
-            
-            // Aggregate
-            for i in 0..chunk_rows {
-                if filter_chunk[i] == target_idx {
-                    let g_idx = group_chunk[i] as usize;
-                    if g_idx > 0 && g_idx < group_dict_size {
-                        group_counts[g_idx] += 1;
-                        if let Some(ref vals) = agg_values {
-                            group_sums[g_idx] += vals[row + i];
-                        }
-                    }
-                }
-            }
-            row += chunk_rows;
-        }
-        
-        // Build result with top-k
-        #[derive(Clone, Copy)]
-        struct HeapItem { idx: usize, count: i64, sum: f64 }
-        
-        impl Ord for HeapItem {
-            fn cmp(&self, other: &Self) -> Ordering {
-                let self_val = self.count;
-                let other_val = other.count;
-                self_val.cmp(&other_val)
-            }
-        }
-        
-        impl PartialOrd for HeapItem {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        
-        impl Eq for HeapItem {}
-        impl PartialEq for HeapItem {
-            fn eq(&self, other: &Self) -> bool {
-                self.count == other.count
-            }
-        }
-        
-        let mut heap = BinaryHeap::new();
-        for i in 1..group_dict_size {
-            if group_counts[i] > 0 {
-                if heap.len() < limit + offset {
-                    heap.push(HeapItem { idx: i, count: group_counts[i], sum: group_sums[i] });
-                } else if let Some(min) = heap.peek() {
-                    if group_counts[i] > min.count {
-                        heap.pop();
-                        heap.push(HeapItem { idx: i, count: group_counts[i], sum: group_sums[i] });
-                    }
-                }
-            }
-        }
-        
-        // Extract results
-        let mut results: Vec<HeapItem> = heap.into_vec();
-        results.sort_by(|a, b| {
-            if descending {
-                b.count.cmp(&a.count)
-            } else {
-                a.count.cmp(&b.count)
-            }
-        });
-        
-        // Apply offset and limit
-        let final_results: Vec<HeapItem> = results.into_iter().skip(offset).take(limit).collect();
-        
-        if final_results.is_empty() {
-            return Ok(Some(RecordBatch::new_empty(Arc::new(Schema::empty()))));
-        }
-        
-        // Build Arrow arrays
-        let group_strings: Vec<&str> = final_results.iter()
-            .map(|item| {
-                let dict_idx = item.idx - 1;
-                let start = group_dict_offsets[dict_idx] as usize;
-                let end = if dict_idx + 1 < group_dict_size { group_dict_offsets[dict_idx + 1] as usize } else { group_dict_data_len };
-                std::str::from_utf8(&group_dict_data[start..end]).unwrap_or("")
-            })
-            .collect();
-        
-        let counts: Vec<i64> = final_results.iter().map(|item| item.count).collect();
-        
-        let result_schema = Arc::new(Schema::new(vec![
-            Field::new(group_col, ArrowDataType::Utf8, false),
-            Field::new("total", ArrowDataType::Int64, false),
-        ]));
-        
-        let result_batch = RecordBatch::try_new(
-            result_schema,
-            vec![
-                Arc::new(StringArray::from(group_strings)) as ArrayRef,
-                Arc::new(Int64Array::from(counts)) as ArrayRef,
-            ],
-        ).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        
-        Ok(Some(result_batch))
+        // V4 format uses the general query path; this was a V3-only optimization.
+        Ok(None)
     }
 
     // ========================================================================
@@ -2194,6 +1863,89 @@ impl OnDemandStorage {
         Ok(result)
     }
 
+    /// Optimized scattered read for fixed-size vector types (FixedList/Float16List).
+    /// `elem_bytes` is bytes per element: 4 for f32 (FixedList), 2 for f16 (Float16List).
+    /// Uses row-group batching for large reads instead of per-row I/O.
+    fn read_fixed_scattered_optimized(
+        mmap_cache: &mut MmapCache,
+        file: &File,
+        index: &ColumnIndexEntry,
+        row_indices: &[usize],
+        elem_bytes: usize,
+    ) -> io::Result<(Vec<u8>, u32)> {
+        // Read dim from header: [count:u64][dim:u32][data...]
+        let mut dim_buf = [0u8; 4];
+        mmap_cache.read_at(file, &mut dim_buf, index.data_offset + 8)?;
+        let dim = u32::from_le_bytes(dim_buf);
+        let dim_usize = dim as usize;
+        let row_byte_len = dim_usize * elem_bytes;
+
+        if row_indices.is_empty() || dim_usize == 0 {
+            return Ok((Vec::new(), dim));
+        }
+
+        let n = row_indices.len();
+        let data_base = index.data_offset + 12; // skip count(8) + dim(4)
+        let mut result = vec![0u8; n * row_byte_len];
+
+        if n <= 256 {
+            // Small: sequential reads using thread-local buffer
+            SCATTERED_READ_BUF.with(|buf| {
+                let mut buf = buf.borrow_mut();
+                buf.resize(row_byte_len, 0);
+                for (out_i, &row) in row_indices.iter().enumerate() {
+                    mmap_cache.read_at(file, &mut buf[..row_byte_len], data_base + (row * row_byte_len) as u64)?;
+                    result[out_i * row_byte_len..(out_i + 1) * row_byte_len].copy_from_slice(&buf[..row_byte_len]);
+                }
+                Ok::<(), io::Error>(())
+            })?;
+        } else {
+            // Large: sort indices, batch into contiguous span reads
+            const ROW_GROUP_SIZE: usize = 8192;
+            let mut indexed: Vec<(usize, usize)> = row_indices.iter().enumerate().map(|(i, &idx)| (idx, i)).collect();
+            indexed.sort_unstable_by_key(|&(idx, _)| idx);
+
+            let mut i = 0;
+            while i < indexed.len() {
+                let first_idx = indexed[i].0;
+                let group_start = (first_idx / ROW_GROUP_SIZE) * ROW_GROUP_SIZE;
+                let group_end = group_start + ROW_GROUP_SIZE;
+
+                let mut group_indices = Vec::new();
+                while i < indexed.len() && indexed[i].0 < group_end {
+                    group_indices.push(indexed[i]);
+                    i += 1;
+                }
+
+                let span = group_indices.last().unwrap().0 - group_indices.first().unwrap().0 + 1;
+                let indices_in_group = group_indices.len();
+
+                if indices_in_group * 4 >= span || span <= 256 {
+                    // Dense or small span: read contiguous range
+                    let read_start = group_indices.first().unwrap().0;
+                    let buf_len = span * row_byte_len;
+                    let mut buf = vec![0u8; buf_len];
+                    mmap_cache.read_at(file, &mut buf, data_base + (read_start * row_byte_len) as u64)?;
+                    for (idx, orig_pos) in group_indices {
+                        let offset = (idx - read_start) * row_byte_len;
+                        result[orig_pos * row_byte_len..(orig_pos + 1) * row_byte_len]
+                            .copy_from_slice(&buf[offset..offset + row_byte_len]);
+                    }
+                } else {
+                    // Sparse: individual reads
+                    let mut buf = vec![0u8; row_byte_len];
+                    for (idx, orig_pos) in group_indices {
+                        mmap_cache.read_at(file, &mut buf, data_base + (idx * row_byte_len) as u64)?;
+                        result[orig_pos * row_byte_len..(orig_pos + 1) * row_byte_len]
+                            .copy_from_slice(&buf);
+                    }
+                }
+            }
+        }
+
+        Ok((result, dim))
+    }
+
     fn read_column_scattered_mmap(
         &self,
         mmap_cache: &mut MmapCache,
@@ -2255,36 +2007,12 @@ impl OnDemandStorage {
                 self.read_string_dict_column_scattered_mmap(mmap_cache, file, index, row_indices)
             }
             ColumnType::FixedList => {
-                let mut dim_buf = [0u8; 4];
-                let _ = mmap_cache.read_at(file, &mut dim_buf, index.data_offset + 8);
-                let dim = u32::from_le_bytes(dim_buf);
-                let dim_usize = dim as usize;
-                let mut data = Vec::with_capacity(row_indices.len() * dim_usize * 4);
-                for &row in row_indices {
-                    let byte_offset = index.data_offset + 12 + (row * dim_usize * 4) as u64;
-                    let mut row_data = vec![0u8; dim_usize * 4];
-                    if dim_usize > 0 {
-                        let _ = mmap_cache.read_at(file, &mut row_data, byte_offset);
-                    }
-                    data.extend_from_slice(&row_data);
-                }
-                Ok(ColumnData::FixedList { data, dim })
+                Self::read_fixed_scattered_optimized(mmap_cache, file, index, row_indices, 4)
+                    .map(|(data, dim)| ColumnData::FixedList { data, dim })
             }
             ColumnType::Float16List => {
-                let mut dim_buf = [0u8; 4];
-                let _ = mmap_cache.read_at(file, &mut dim_buf, index.data_offset + 8);
-                let dim = u32::from_le_bytes(dim_buf);
-                let dim_usize = dim as usize;
-                let mut data = Vec::with_capacity(row_indices.len() * dim_usize * 2);
-                for &row in row_indices {
-                    let byte_offset = index.data_offset + 12 + (row * dim_usize * 2) as u64;
-                    let mut row_data = vec![0u8; dim_usize * 2];
-                    if dim_usize > 0 {
-                        let _ = mmap_cache.read_at(file, &mut row_data, byte_offset);
-                    }
-                    data.extend_from_slice(&row_data);
-                }
-                Ok(ColumnData::Float16List { data, dim })
+                Self::read_fixed_scattered_optimized(mmap_cache, file, index, row_indices, 2)
+                    .map(|(data, dim)| ColumnData::Float16List { data, dim })
             }
             ColumnType::Null => {
                 Ok(ColumnData::Int64(vec![0i64; row_indices.len()]))

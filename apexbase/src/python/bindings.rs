@@ -1,6 +1,6 @@
-//! V3 PyO3 bindings - On-demand storage engine without ColumnTable
+//! PyO3 bindings - On-demand storage engine
 //!
-//! This module provides Python bindings that use V3 storage directly,
+//! This module provides Python bindings that use on-demand storage directly,
 //! enabling on-demand reading without loading entire tables into memory.
 
 use crate::data::Value;
@@ -138,9 +138,9 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
     }
 }
 
-/// ApexStorage - On-demand columnar storage engine (V3)
+/// ApexStorage - On-demand columnar storage engine
 ///
-/// This storage engine uses V3 format (.apex) for persistence and supports:
+/// This storage engine uses V4 format (.apex) for persistence and supports:
 /// - On-demand column reading (only loads requested columns)
 /// - On-demand row range reading (only loads requested rows)
 /// - Soft delete with deleted bitmap
@@ -401,7 +401,7 @@ impl ApexStorageImpl {
 
 #[pymethods]
 impl ApexStorageImpl {
-    /// Create or open a V3 storage
+    /// Create or open a storage
     ///
     /// Parameters:
     /// - path: Path to the storage file (will use .apex extension)
@@ -1921,7 +1921,7 @@ impl ApexStorageImpl {
 
     /// Save current table
     fn save(&self) -> PyResult<()> {
-        // V3 storage auto-saves on each operation
+        // Storage auto-saves on each operation
         Ok(())
     }
     
@@ -2217,7 +2217,7 @@ impl ApexStorageImpl {
                 return Ok(out.into());
             }
 
-            // Fallback: per-row retrieve_rcix (V3 files / non-RCIX RGs)
+            // Fallback: per-row retrieve_rcix (non-RCIX RGs)
             let mut all_rows: Vec<Vec<(String, Value)>> = Vec::with_capacity(ids_u64.len());
             for &id in &ids_u64 {
                 if let Ok(Some(row)) = backend.storage.retrieve_rcix(id) {

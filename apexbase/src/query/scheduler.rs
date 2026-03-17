@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::thread;
 use std::collections::VecDeque;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, Condvar};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::path::PathBuf;
@@ -35,6 +35,7 @@ pub struct QueryTask {
 pub struct ThreadPoolExecutor {
     worker_handles: Vec<thread::JoinHandle<()>>,
     task_queue: Arc<Mutex<VecDeque<QueryTask>>>,
+    condvar: Arc<Condvar>,
     shutdown_flag: Arc<AtomicBool>,
     active_count: Arc<AtomicUsize>,
 }
@@ -43,6 +44,7 @@ impl ThreadPoolExecutor {
     /// Create a new thread pool with specified number of threads
     pub fn new(num_threads: usize) -> Self {
         let task_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let condvar = Arc::new(Condvar::new());
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let active_count = Arc::new(AtomicUsize::new(0));
 
@@ -50,29 +52,28 @@ impl ThreadPoolExecutor {
 
         for _ in 0..num_threads {
             let queue = Arc::clone(&task_queue);
+            let cvar = Arc::clone(&condvar);
             let flag = Arc::clone(&shutdown_flag);
             let active = Arc::clone(&active_count);
 
             let handle = thread::spawn(move || {
                 loop {
-                    if flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-
                     let task = {
                         let mut queue = queue.lock();
+                        // Park on condvar until a task arrives or shutdown is requested
+                        while queue.is_empty() && !flag.load(Ordering::Relaxed) {
+                            cvar.wait(&mut queue);
+                        }
+                        if flag.load(Ordering::Relaxed) {
+                            break;
+                        }
                         queue.pop_front()
                     };
 
-                    match task {
-                        Some(t) => {
-                            active.fetch_add(1, Ordering::Relaxed);
-                            Self::execute_query(t);
-                            active.fetch_sub(1, Ordering::Relaxed);
-                        }
-                        None => {
-                            thread::sleep(std::time::Duration::from_micros(100));
-                        }
+                    if let Some(t) = task {
+                        active.fetch_add(1, Ordering::Relaxed);
+                        Self::execute_query(t);
+                        active.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
             });
@@ -83,6 +84,7 @@ impl ThreadPoolExecutor {
         Self {
             worker_handles,
             task_queue,
+            condvar,
             shutdown_flag,
             active_count,
         }
@@ -136,6 +138,7 @@ impl ThreadPoolExecutor {
             let mut queue = self.task_queue.lock();
             queue.push_back(task);
         }
+        self.condvar.notify_one();
 
         receiver
     }
@@ -148,6 +151,7 @@ impl ThreadPoolExecutor {
     /// Shutdown the thread pool
     pub fn shutdown(&mut self) {
         self.shutdown_flag.store(true, Ordering::Relaxed);
+        self.condvar.notify_all();
         for handle in self.worker_handles.drain(..) {
             let _ = handle.join();
         }
