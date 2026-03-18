@@ -2961,8 +2961,27 @@ impl OnDemandStorage {
         
         // Phase 3: Atomic rename .tmp → .apex
         // POSIX rename is atomic; on crash the original file remains intact.
+        // On Windows, retry on transient failures from antivirus / Search Indexer / cloud sync
+        // that may briefly hold a sharing lock on the destination file.
         drop(header);
         drop(writer);
+        #[cfg(windows)]
+        {
+            let mut last_err = None;
+            for attempt in 0u64..5 {
+                match std::fs::rename(&tmp_path, &self.path) {
+                    Ok(()) => { last_err = None; break; }
+                    Err(e) => {
+                        last_err = Some(e);
+                        if attempt < 4 {
+                            std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1)));
+                        }
+                    }
+                }
+            }
+            if let Some(e) = last_err { return Err(e); }
+        }
+        #[cfg(not(windows))]
         std::fs::rename(&tmp_path, &self.path)?;
         
         // Write column stats sidecar for O(1) aggregation fast path
@@ -3748,10 +3767,14 @@ impl OnDemandStorage {
         }
         #[cfg(not(unix))]
         {
-            // Non-Unix: fall back to full mmap invalidation + seek-based writes
+            // Non-Unix: full mmap invalidation + seek-based writes.
+            // On Windows, invalidate engine cache first to release mmap handles
+            // that would otherwise block file writes (OS error 1224).
             self.mmap_cache.write().invalidate();
             self.invalidate_page_cache();
             *self.file.write() = None;
+            #[cfg(windows)]
+            super::engine::engine().invalidate(&self.path);
             crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
 
             let mut file_mut = OpenOptions::new().read(true).write(true).open(&self.path)?;
@@ -3765,14 +3788,20 @@ impl OnDemandStorage {
             file_mut.seek(SeekFrom::Start(footer_offset))?;
             let new_footer_bytes = footer_mut.to_bytes();
             file_mut.write_all(&new_footer_bytes)?;
-            let new_end = footer_offset + new_footer_bytes.len() as u64;
-            file_mut.set_len(new_end)?;
+            // Footer size is identical for deletion-only ops; skip set_len on Windows
+            // to avoid an unnecessary syscall (deletion counts change but entry count doesn't).
+            #[cfg(not(windows))]
+            {
+                let new_end = footer_offset + new_footer_bytes.len() as u64;
+                file_mut.set_len(new_end)?;
+            }
             {
                 let mut hdr = self.header.write();
                 hdr.row_count = new_total_active;
                 file_mut.seek(SeekFrom::Start(0))?;
                 file_mut.write_all(&hdr.to_bytes())?;
             }
+            file_mut.flush()?;
             *self.file.write() = Some(file_mut);
         }
 
@@ -3874,6 +3903,8 @@ impl OnDemandStorage {
         self.mmap_cache.write().invalidate();
         self.invalidate_page_cache();
         *self.file.write() = None;
+        #[cfg(windows)]
+        super::engine::engine().invalidate(&self.path);
         crate::query::ApexExecutor::invalidate_cache_for_path(&self.path);
 
         let mut file = OpenOptions::new().write(true).open(&self.path)?;

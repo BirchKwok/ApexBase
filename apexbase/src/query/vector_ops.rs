@@ -39,7 +39,23 @@ fn rsqrt_positive_f32(x: f32) -> f32 {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn rsqrt_positive_f32(x: f32) -> f32 {
+    // SSE RSQRTSS + one Newton-Raphson step (~12→23-bit precision).
+    // Matches the NEON FRSQRTE approach on AArch64.
+    // Always available on x86_64 — no runtime detection needed.
+    unsafe {
+        use std::arch::x86_64::*;
+        let v = _mm_set_ss(x);
+        let est = _mm_rsqrt_ss(v);
+        let e = _mm_cvtss_f32(est);
+        // Newton-Raphson: e' = e * (3 - x·e²) / 2
+        e * (1.5 - 0.5 * x * e * e)
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 #[inline(always)]
 fn rsqrt_positive_f32(x: f32) -> f32 {
     1.0 / x.sqrt()
@@ -79,6 +95,12 @@ pub fn bytes_to_query_vec_f32(bytes: &[u8]) -> Option<Vec<f32>> {
 /// separate SIMD register, sustaining near-peak multiply-add throughput.
 #[inline(always)]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { l2_squared_avx2(a, b) };
+        }
+    }
     let n = a.len().min(b.len());
     let mut s0 = 0.0f32;
     let mut s1 = 0.0f32;
@@ -116,6 +138,12 @@ pub fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 /// NEON maps abs to `FABS`, AVX2 uses a sign-mask `VANDNPS`.
 #[inline(always)]
 pub fn l1_distance(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { l1_distance_avx2(a, b) };
+        }
+    }
     let n = a.len().min(b.len());
     let mut s0 = 0.0f32;
     let mut s1 = 0.0f32;
@@ -141,6 +169,12 @@ pub fn l1_distance(a: &[f32], b: &[f32]) -> f32 {
 /// 4 independent max lanes allow SIMD vectorization (NEON `FMAX`, AVX2 `VMAXPS`).
 #[inline(always)]
 pub fn linf_distance(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { linf_distance_avx2(a, b) };
+        }
+    }
     let n = a.len().min(b.len());
     let mut m0 = 0.0f32;
     let mut m1 = 0.0f32;
@@ -167,6 +201,12 @@ pub fn linf_distance(a: &[f32], b: &[f32]) -> f32 {
 /// out-of-order execution across 4 NEON/AVX2 multiply-add pipelines.
 #[inline(always)]
 pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { inner_product_avx2(a, b) };
+        }
+    }
     let n = a.len().min(b.len());
     let mut s0 = 0.0f32;
     let mut s1 = 0.0f32;
@@ -207,6 +247,12 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// `nb_recip` is pre-computed once per query by `DistanceComputer::new`.
 #[inline(always)]
 pub fn cosine_similarity_fused(a: &[f32], b: &[f32], nb_recip: f32) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { cosine_fused_avx2(a, b, nb_recip) };
+        }
+    }
     let n = a.len().min(b.len());
     let mut dot0 = 0.0f32; let mut na0 = 0.0f32;
     let mut dot1 = 0.0f32; let mut na1 = 0.0f32;
@@ -238,6 +284,148 @@ pub fn cosine_similarity_fused(a: &[f32], b: &[f32], nb_recip: f32) -> f32 {
 #[inline(always)]
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - cosine_similarity(a, b)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// x86_64 AVX2+FMA f32 distance kernels (explicit SIMD for distribution builds)
+// ─────────────────────────────────────────────────────────────────────────────
+// Distribution wheels are built with baseline SSE2 target-cpu, so LLVM cannot
+// auto-vectorise the scalar kernels above to AVX2. These explicit AVX2+FMA
+// implementations are selected at runtime via is_x86_feature_detected!, giving
+// full 256-bit SIMD throughput on Windows/Linux x86_64 with AVX2 support
+// (Intel Haswell+, AMD Excavator+).
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn l2_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let chunks = n / 16;
+    let (mut acc0, mut acc1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    for i in 0..chunks {
+        let o = i * 16;
+        let a0 = _mm256_loadu_ps(a.as_ptr().add(o));
+        let a1 = _mm256_loadu_ps(a.as_ptr().add(o + 8));
+        let b0 = _mm256_loadu_ps(b.as_ptr().add(o));
+        let b1 = _mm256_loadu_ps(b.as_ptr().add(o + 8));
+        let d0 = _mm256_sub_ps(a0, b0);
+        let d1 = _mm256_sub_ps(a1, b1);
+        acc0 = _mm256_fmadd_ps(d0, d0, acc0);
+        acc1 = _mm256_fmadd_ps(d1, d1, acc1);
+    }
+    let mut s = hsum256(_mm256_add_ps(acc0, acc1));
+    for i in (chunks * 16)..n {
+        let d = *a.get_unchecked(i) - *b.get_unchecked(i);
+        s += d * d;
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn inner_product_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let chunks = n / 16;
+    let (mut acc0, mut acc1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    for i in 0..chunks {
+        let o = i * 16;
+        let a0 = _mm256_loadu_ps(a.as_ptr().add(o));
+        let a1 = _mm256_loadu_ps(a.as_ptr().add(o + 8));
+        let b0 = _mm256_loadu_ps(b.as_ptr().add(o));
+        let b1 = _mm256_loadu_ps(b.as_ptr().add(o + 8));
+        acc0 = _mm256_fmadd_ps(a0, b0, acc0);
+        acc1 = _mm256_fmadd_ps(a1, b1, acc1);
+    }
+    let mut s = hsum256(_mm256_add_ps(acc0, acc1));
+    for i in (chunks * 16)..n {
+        s += *a.get_unchecked(i) * *b.get_unchecked(i);
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn cosine_fused_avx2(a: &[f32], b: &[f32], nb_recip: f32) -> f32 {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let chunks = n / 16;
+    let (mut dot0, mut dot1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    let (mut na0, mut na1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    for i in 0..chunks {
+        let o = i * 16;
+        let a0 = _mm256_loadu_ps(a.as_ptr().add(o));
+        let a1 = _mm256_loadu_ps(a.as_ptr().add(o + 8));
+        let b0 = _mm256_loadu_ps(b.as_ptr().add(o));
+        let b1 = _mm256_loadu_ps(b.as_ptr().add(o + 8));
+        dot0 = _mm256_fmadd_ps(a0, b0, dot0);
+        dot1 = _mm256_fmadd_ps(a1, b1, dot1);
+        na0 = _mm256_fmadd_ps(a0, a0, na0);
+        na1 = _mm256_fmadd_ps(a1, a1, na1);
+    }
+    let mut dot = hsum256(_mm256_add_ps(dot0, dot1));
+    let mut na_sq = hsum256(_mm256_add_ps(na0, na1));
+    for i in (chunks * 16)..n {
+        let ai = *a.get_unchecked(i);
+        let bi = *b.get_unchecked(i);
+        dot += ai * bi;
+        na_sq += ai * ai;
+    }
+    if na_sq == 0.0 || nb_recip == 0.0 { return 0.0; }
+    dot * rsqrt_positive_f32(na_sq) * nb_recip
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn l1_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let chunks = n / 16;
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let (mut acc0, mut acc1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    for i in 0..chunks {
+        let o = i * 16;
+        let a0 = _mm256_loadu_ps(a.as_ptr().add(o));
+        let a1 = _mm256_loadu_ps(a.as_ptr().add(o + 8));
+        let b0 = _mm256_loadu_ps(b.as_ptr().add(o));
+        let b1 = _mm256_loadu_ps(b.as_ptr().add(o + 8));
+        acc0 = _mm256_add_ps(acc0, _mm256_andnot_ps(sign_mask, _mm256_sub_ps(a0, b0)));
+        acc1 = _mm256_add_ps(acc1, _mm256_andnot_ps(sign_mask, _mm256_sub_ps(a1, b1)));
+    }
+    let mut s = hsum256(_mm256_add_ps(acc0, acc1));
+    for i in (chunks * 16)..n {
+        s += (*a.get_unchecked(i) - *b.get_unchecked(i)).abs();
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn linf_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let chunks = n / 16;
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let (mut acc0, mut acc1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    for i in 0..chunks {
+        let o = i * 16;
+        let a0 = _mm256_loadu_ps(a.as_ptr().add(o));
+        let a1 = _mm256_loadu_ps(a.as_ptr().add(o + 8));
+        let b0 = _mm256_loadu_ps(b.as_ptr().add(o));
+        let b1 = _mm256_loadu_ps(b.as_ptr().add(o + 8));
+        acc0 = _mm256_max_ps(acc0, _mm256_andnot_ps(sign_mask, _mm256_sub_ps(a0, b0)));
+        acc1 = _mm256_max_ps(acc1, _mm256_andnot_ps(sign_mask, _mm256_sub_ps(a1, b1)));
+    }
+    let m = _mm256_max_ps(acc0, acc1);
+    let hi = _mm256_extractf128_ps(m, 1);
+    let lo = _mm256_castps256_ps128(m);
+    let s = _mm_max_ps(lo, hi);
+    let s = _mm_max_ps(s, _mm_movehl_ps(s, s));
+    let mut mv = _mm_cvtss_f32(_mm_max_ss(s, _mm_shuffle_ps(s, s, 1)));
+    for i in (chunks * 16)..n {
+        mv = mv.max((*a.get_unchecked(i) - *b.get_unchecked(i)).abs());
+    }
+    mv
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

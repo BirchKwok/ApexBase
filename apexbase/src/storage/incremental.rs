@@ -1446,7 +1446,7 @@ impl ConcurrentWalWriter {
             .open(&self.path)?;
         
         #[cfg(windows)]
-        let mut writer = BufWriter::new(file);
+        let mut writer = BufWriter::with_capacity(512 * 1024, file);
         #[cfg(not(windows))]
         let mut writer = BufWriter::with_capacity(64 * 1024, file);
         
