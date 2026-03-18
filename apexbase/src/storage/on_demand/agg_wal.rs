@@ -975,19 +975,19 @@ impl OnDemandStorage {
                                 let n = count.min(rg_rows).min(rg_n).min((payload.len() - 8) / 8);
                                 let col_type = schema.columns[col_idx].1;
                                 if matches!(col_type, ColumnType::Float64 | ColumnType::Float32) {
-                                    let vals: Vec<f64> = payload[8..].chunks_exact(8).take(n).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+                                    let bp = unsafe { payload.as_ptr().add(8) };
                                     if !has_deleted {
-                                        for i in 0..n { let gid = unsafe { *gids_slice.get_unchecked(i) } as usize; unsafe { *flat_counts.get_unchecked_mut(gid) += 1; *flat_sums.get_unchecked_mut(gid) += *vals.get_unchecked(i); } }
+                                        for i in 0..n { let gid = unsafe { *gids_slice.get_unchecked(i) } as usize; let v = unsafe { std::ptr::read_unaligned(bp.add(i * 8) as *const f64) }; unsafe { *flat_counts.get_unchecked_mut(gid) += 1; *flat_sums.get_unchecked_mut(gid) += v; } }
                                     } else {
-                                        for i in 0..n { if !del_bytes.is_empty() && (del_bytes[i/8] >> (i%8)) & 1 != 0 { continue; } let gid = unsafe { *gids_slice.get_unchecked(i) } as usize; unsafe { *flat_counts.get_unchecked_mut(gid) += 1; *flat_sums.get_unchecked_mut(gid) += *vals.get_unchecked(i); } }
+                                        for i in 0..n { if !del_bytes.is_empty() && (del_bytes[i/8] >> (i%8)) & 1 != 0 { continue; } let gid = unsafe { *gids_slice.get_unchecked(i) } as usize; let v = unsafe { std::ptr::read_unaligned(bp.add(i * 8) as *const f64) }; unsafe { *flat_counts.get_unchecked_mut(gid) += 1; *flat_sums.get_unchecked_mut(gid) += v; } }
                                     }
                                     rg_row_offset += rg_rows; continue;
                                 } else if matches!(col_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64) {
-                                    let vals: Vec<i64> = payload[8..].chunks_exact(8).take(n).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+                                    let bp = unsafe { payload.as_ptr().add(8) };
                                     if !has_deleted {
-                                        for i in 0..n { let gid = unsafe { *gids_slice.get_unchecked(i) } as usize; unsafe { *flat_counts.get_unchecked_mut(gid) += 1; *flat_sums.get_unchecked_mut(gid) += *vals.get_unchecked(i) as f64; } }
+                                        for i in 0..n { let gid = unsafe { *gids_slice.get_unchecked(i) } as usize; let v = unsafe { std::ptr::read_unaligned(bp.add(i * 8) as *const i64) }; unsafe { *flat_counts.get_unchecked_mut(gid) += 1; *flat_sums.get_unchecked_mut(gid) += v as f64; } }
                                     } else {
-                                        for i in 0..n { if !del_bytes.is_empty() && (del_bytes[i/8] >> (i%8)) & 1 != 0 { continue; } let gid = unsafe { *gids_slice.get_unchecked(i) } as usize; unsafe { *flat_counts.get_unchecked_mut(gid) += 1; *flat_sums.get_unchecked_mut(gid) += *vals.get_unchecked(i) as f64; } }
+                                        for i in 0..n { if !del_bytes.is_empty() && (del_bytes[i/8] >> (i%8)) & 1 != 0 { continue; } let gid = unsafe { *gids_slice.get_unchecked(i) } as usize; let v = unsafe { std::ptr::read_unaligned(bp.add(i * 8) as *const i64) }; unsafe { *flat_counts.get_unchecked_mut(gid) += 1; *flat_sums.get_unchecked_mut(gid) += v as f64; } }
                                     }
                                     rg_row_offset += rg_rows; continue;
                                 }
@@ -1021,9 +1021,13 @@ impl OnDemandStorage {
                     let col_type = schema.columns[col_idx].1;
                     let n = cnt.min(rg_rows).min((payload.len() - 8) / 8);
                     if matches!(col_type, ColumnType::Float64 | ColumnType::Float32) {
-                        rg_slices.push(RgColSlice::F64(payload[8..].chunks_exact(8).take(n).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect()));
+                        let mut vals = vec![0f64; n];
+                        unsafe { std::ptr::copy_nonoverlapping(payload[8..].as_ptr(), vals.as_mut_ptr() as *mut u8, n * 8); }
+                        rg_slices.push(RgColSlice::F64(vals));
                     } else if matches!(col_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64) {
-                        rg_slices.push(RgColSlice::I64(payload[8..].chunks_exact(8).take(n).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect()));
+                        let mut vals = vec![0i64; n];
+                        unsafe { std::ptr::copy_nonoverlapping(payload[8..].as_ptr(), vals.as_mut_ptr() as *mut u8, n * 8); }
+                        rg_slices.push(RgColSlice::I64(vals));
                     } else { ok = false; break; }
                 }
                 if ok && !has_deleted {
@@ -1222,36 +1226,179 @@ impl OnDemandStorage {
                     unsafe { *flat_counts.get_unchecked_mut(composite * num_aggs) += 1; }
                 }
             } else {
-                let (scanned, del_bytes) = self.scan_columns_mmap(&needed, &footer)?;
-                let has_deleted = del_bytes.iter().any(|&b| b != 0);
-                struct AggSl<'a> { f64v: Option<&'a [f64]>, i64v: Option<&'a [i64]>, is_count: bool }
-                let slices: Vec<AggSl> = agg_col_indices.iter().map(|opt_idx| {
-                    if opt_idx.is_none() { return AggSl { f64v: None, i64v: None, is_count: true }; }
-                    let col_idx = opt_idx.unwrap();
-                    let pos = needed.iter().position(|&x| x == col_idx);
-                    if let Some(pos) = pos {
-                        if pos < scanned.len() {
-                            match &scanned[pos] {
-                                ColumnData::Float64(v) => return AggSl { f64v: Some(v.as_slice()), i64v: None, is_count: false },
-                                ColumnData::Int64(v)   => return AggSl { f64v: None, i64v: Some(v.as_slice()), is_count: false },
-                                _ => {}
+                // STREAMING ZERO-COPY: per-RG direct mmap scan+aggregate (avoids 8MB+ column copy)
+                let max_ci = needed.iter().copied().max().unwrap_or(0);
+                let all_rcix = footer.row_groups.iter().enumerate().all(|(rg_i, rm)| {
+                    rm.row_count == 0 || footer.col_offsets.get(rg_i).map_or(false, |v| v.len() > max_ci)
+                });
+                let mut streaming_done = false;
+                if all_rcix {
+                    let file_guard = self.file.read();
+                    if let Some(file) = file_guard.as_ref() {
+                        let mut mmap_guard = self.mmap_cache.write();
+                        if let Ok(mmap_ref) = mmap_guard.get_or_create(file) {
+                            let mut row_off = 0usize;
+                            let mut ok = true;
+                            for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+                                let rg_rows = rg_meta.row_count as usize;
+                                if rg_rows == 0 { continue; }
+                                let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+                                if rg_end > mmap_ref.len() { ok = false; break; }
+                                let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+                                if rg_bytes.len() < 32 || rg_bytes[28] != RG_COMPRESS_NONE || rg_bytes[29] < 1 {
+                                    ok = false; break;
+                                }
+                                let body = &rg_bytes[32..];
+                                let nbm = (rg_rows + 7) / 8;
+                                let has_del = rg_meta.deletion_count > 0;
+                                let del_start = rg_rows * 8;
+                                let del_bm: &[u8] = if has_del && del_start + nbm <= body.len() { &body[del_start..del_start + nbm] } else { &[] };
+                                let rcix = &footer.col_offsets[rg_i];
+                                let g1e = (row_off + rg_rows).min(group_ids1.len());
+                                let g2e = (row_off + rg_rows).min(group_ids2.len());
+                                if row_off >= g1e || row_off >= g2e { row_off += rg_rows; continue; }
+                                let gids1 = &group_ids1[row_off..g1e];
+                                let gids2 = &group_ids2[row_off..g2e];
+                                let rg_n = gids1.len().min(gids2.len());
+
+                                // Specialized 2-agg [COUNT(*), F64/I64] — most common: COUNT(*)+AVG/SUM
+                                if num_aggs == 2 && agg_cols[0].1 {
+                                    if let Some(&ci) = needed.first() {
+                                        if ci < rcix.len() {
+                                            let co = rcix[ci] as usize;
+                                            let doff = co + nbm;
+                                            if doff + 9 <= body.len() && body[doff] == 0u8 {
+                                                let pl = &body[doff + 1..];
+                                                if pl.len() >= 8 {
+                                                    let cnt = u64::from_le_bytes(pl[0..8].try_into().unwrap()) as usize;
+                                                    let n = cnt.min(rg_rows).min(rg_n).min((pl.len() - 8) / 8);
+                                                    let base_ptr = unsafe { pl.as_ptr().add(8) };
+                                                    let ct = schema.columns[ci].1;
+                                                    if matches!(ct, ColumnType::Float64 | ColumnType::Float32) {
+                                                        if !has_del {
+                                                            for i in 0..n {
+                                                                let i1 = unsafe { *gids1.get_unchecked(i) } as usize;
+                                                                let i2 = unsafe { *gids2.get_unchecked(i) } as usize;
+                                                                if i1 >= dict1_size || i2 >= dict2_size { continue; }
+                                                                let c = (i1 * dict2_size + i2) * 2;
+                                                                let v = unsafe { std::ptr::read_unaligned(base_ptr.add(i * 8) as *const f64) };
+                                                                unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_sums.get_unchecked_mut(c + 1) += v; }
+                                                            }
+                                                        } else {
+                                                            for i in 0..n {
+                                                                if !del_bm.is_empty() && (del_bm[i/8] >> (i%8)) & 1 != 0 { continue; }
+                                                                let i1 = unsafe { *gids1.get_unchecked(i) } as usize;
+                                                                let i2 = unsafe { *gids2.get_unchecked(i) } as usize;
+                                                                if i1 >= dict1_size || i2 >= dict2_size { continue; }
+                                                                let c = (i1 * dict2_size + i2) * 2;
+                                                                let v = unsafe { std::ptr::read_unaligned(base_ptr.add(i * 8) as *const f64) };
+                                                                unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_sums.get_unchecked_mut(c + 1) += v; }
+                                                            }
+                                                        }
+                                                        for comp in 0..total_size { flat_counts[comp * 2 + 1] = flat_counts[comp * 2]; }
+                                                        row_off += rg_rows; continue;
+                                                    } else if matches!(ct, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date) {
+                                                        if !has_del {
+                                                            for i in 0..n {
+                                                                let i1 = unsafe { *gids1.get_unchecked(i) } as usize;
+                                                                let i2 = unsafe { *gids2.get_unchecked(i) } as usize;
+                                                                if i1 >= dict1_size || i2 >= dict2_size { continue; }
+                                                                let c = (i1 * dict2_size + i2) * 2;
+                                                                let v = unsafe { std::ptr::read_unaligned(base_ptr.add(i * 8) as *const i64) };
+                                                                unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_sums.get_unchecked_mut(c + 1) += v as f64; }
+                                                            }
+                                                        } else {
+                                                            for i in 0..n {
+                                                                if !del_bm.is_empty() && (del_bm[i/8] >> (i%8)) & 1 != 0 { continue; }
+                                                                let i1 = unsafe { *gids1.get_unchecked(i) } as usize;
+                                                                let i2 = unsafe { *gids2.get_unchecked(i) } as usize;
+                                                                if i1 >= dict1_size || i2 >= dict2_size { continue; }
+                                                                let c = (i1 * dict2_size + i2) * 2;
+                                                                let v = unsafe { std::ptr::read_unaligned(base_ptr.add(i * 8) as *const i64) };
+                                                                unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_sums.get_unchecked_mut(c + 1) += v as f64; }
+                                                            }
+                                                        }
+                                                        for comp in 0..total_size { flat_counts[comp * 2 + 1] = flat_counts[comp * 2]; }
+                                                        row_off += rg_rows; continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // General multi-agg: read each agg col directly from mmap
+                                let mut rg_ok = true;
+                                for (ai, &opt_ci) in agg_col_indices.iter().enumerate() {
+                                    if agg_cols[ai].1 || opt_ci.is_none() { continue; }
+                                    let ci = opt_ci.unwrap();
+                                    if ci >= rcix.len() { rg_ok = false; break; }
+                                    let co = rcix[ci] as usize + nbm;
+                                    if co + 9 > body.len() || body[co] != 0u8 { rg_ok = false; break; }
+                                }
+                                if !rg_ok { ok = false; break; }
+                                // Multi-agg aggregation loop
+                                for i in 0..rg_n {
+                                    if has_del && !del_bm.is_empty() && (del_bm[i/8] >> (i%8)) & 1 != 0 { continue; }
+                                    let i1 = unsafe { *gids1.get_unchecked(i) } as usize;
+                                    let i2 = unsafe { *gids2.get_unchecked(i) } as usize;
+                                    if i1 >= dict1_size || i2 >= dict2_size { continue; }
+                                    let base = (i1 * dict2_size + i2) * num_aggs;
+                                    for (ai, &opt_ci) in agg_col_indices.iter().enumerate() {
+                                        unsafe { *flat_counts.get_unchecked_mut(base + ai) += 1; }
+                                        if agg_cols[ai].1 || opt_ci.is_none() { continue; }
+                                        let ci = opt_ci.unwrap();
+                                        let co = rcix[ci] as usize + nbm;
+                                        let pl = &body[co + 1..];
+                                        let ct = schema.columns[ci].1;
+                                        let bp = unsafe { pl.as_ptr().add(8) };
+                                        if matches!(ct, ColumnType::Float64 | ColumnType::Float32) {
+                                            let v = unsafe { std::ptr::read_unaligned(bp.add(i * 8) as *const f64) };
+                                            unsafe { *flat_sums.get_unchecked_mut(base + ai) += v; }
+                                        } else {
+                                            let v = unsafe { std::ptr::read_unaligned(bp.add(i * 8) as *const i64) };
+                                            unsafe { *flat_sums.get_unchecked_mut(base + ai) += v as f64; }
+                                        }
+                                    }
+                                }
+                                row_off += rg_rows;
                             }
+                            streaming_done = ok;
                         }
                     }
-                    AggSl { f64v: None, i64v: None, is_count: true }
-                }).collect();
-                for i in 0..scan_rows {
-                    if has_deleted { let b = i/8; let bit = i%8; if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { continue; } }
-                    let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
-                    let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
-                    if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
-                    let composite = idx1 * dict2_size + idx2;
-                    let base = composite * num_aggs;
-                    for (ai, sl) in slices.iter().enumerate() {
-                        unsafe { *flat_counts.get_unchecked_mut(base + ai) += 1; }
-                        if !sl.is_count {
-                            if let Some(v) = sl.f64v { if i < v.len() { unsafe { *flat_sums.get_unchecked_mut(base + ai) += *v.get_unchecked(i); } } }
-                            else if let Some(v) = sl.i64v { if i < v.len() { unsafe { *flat_sums.get_unchecked_mut(base + ai) += *v.get_unchecked(i) as f64; } } }
+                }
+                if !streaming_done {
+                    // FALLBACK: full materialization via scan_columns_mmap (compressed or no RCIX)
+                    let (scanned, del_bytes) = self.scan_columns_mmap(&needed, &footer)?;
+                    let has_deleted = del_bytes.iter().any(|&b| b != 0);
+                    struct AggSl<'a> { f64v: Option<&'a [f64]>, i64v: Option<&'a [i64]>, is_count: bool }
+                    let slices: Vec<AggSl> = agg_col_indices.iter().map(|opt_idx| {
+                        if opt_idx.is_none() { return AggSl { f64v: None, i64v: None, is_count: true }; }
+                        let col_idx = opt_idx.unwrap();
+                        let pos = needed.iter().position(|&x| x == col_idx);
+                        if let Some(pos) = pos {
+                            if pos < scanned.len() {
+                                match &scanned[pos] {
+                                    ColumnData::Float64(v) => return AggSl { f64v: Some(v.as_slice()), i64v: None, is_count: false },
+                                    ColumnData::Int64(v)   => return AggSl { f64v: None, i64v: Some(v.as_slice()), is_count: false },
+                                    _ => {}
+                                }
+                            }
+                        }
+                        AggSl { f64v: None, i64v: None, is_count: true }
+                    }).collect();
+                    for i in 0..scan_rows {
+                        if has_deleted { let b = i/8; let bit = i%8; if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { continue; } }
+                        let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
+                        let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
+                        if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
+                        let composite = idx1 * dict2_size + idx2;
+                        let base = composite * num_aggs;
+                        for (ai, sl) in slices.iter().enumerate() {
+                            unsafe { *flat_counts.get_unchecked_mut(base + ai) += 1; }
+                            if !sl.is_count {
+                                if let Some(v) = sl.f64v { if i < v.len() { unsafe { *flat_sums.get_unchecked_mut(base + ai) += *v.get_unchecked(i); } } }
+                                else if let Some(v) = sl.i64v { if i < v.len() { unsafe { *flat_sums.get_unchecked_mut(base + ai) += *v.get_unchecked(i) as f64; } } }
+                            }
                         }
                     }
                 }
