@@ -163,7 +163,8 @@ class ApexClient:
         self._durability = durability
         
         # Initialize storage: use shared if available, otherwise create new
-        if self._shared_storage is not None:
+        # When drop_if_exists=True, always create fresh storage (ignore shared)
+        if self._shared_storage is not None and not drop_if_exists:
             # Use shared storage from another client
             self._storage = self._shared_storage
         else:
