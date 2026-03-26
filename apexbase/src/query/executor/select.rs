@@ -1,5 +1,13 @@
 // SELECT execution: fast paths, index scans, late materialization
 
+/// Represents a single scannable leaf predicate from an OR decomposition.
+enum OrLeafPredicate {
+    StringEq(String, String),           // (col, value)
+    NumericRange(String, f64, f64),     // (col, low, high) — covers =, >, >=, <, <=, BETWEEN
+    NumericIn(String, Vec<i64>),        // (col, values)
+    StringIn(String, Vec<String>),      // (col, values)
+}
+
 impl ApexExecutor {
     /// Execute SELECT statement with base_dir for proper subquery table resolution
     fn execute_select_with_base_dir(mut stmt: SelectStatement, storage_path: &Path, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
@@ -115,13 +123,15 @@ impl ApexExecutor {
                             }
                         }
                         
-                        // Late Materialization for WHERE: SELECT * with WHERE (no ORDER BY)
+                        // Late Materialization for WHERE: with WHERE (no ORDER BY)
+                        // Works for both SELECT * and projected column queries.
                         let where_cols = stmt.where_columns();
-                        let can_late_materialize_where = stmt.is_select_star()
-                            && stmt.where_clause.is_some()
+                        let has_window_func = stmt.columns.iter().any(|col| matches!(col, SelectColumn::WindowFunction { .. }));
+                        let can_late_materialize_where = stmt.where_clause.is_some()
                             && stmt.order_by.is_empty()
                             && stmt.group_by.is_empty()
                             && !has_aggregation_check
+                            && !has_window_func
                             && !where_cols.is_empty();
                         
                         // Late Materialization for ORDER BY: SELECT * with ORDER BY + LIMIT (no WHERE)
@@ -213,9 +223,17 @@ impl ApexExecutor {
                                     result
                                 // FAST PATH 1b: String equality without LIMIT - storage-level scan
                                 } else if let Some(result) = Self::try_fast_string_filter_no_limit(&backend, &stmt)? {
+                                    if !stmt.is_select_star() {
+                                        let projected = Self::apply_projection_with_storage(&result, &stmt.columns, Some(storage_path))?;
+                                        return Ok(ApexResult::Data(projected));
+                                    }
                                     return Ok(ApexResult::Data(result));
                                 // FAST PATH 1c: LIKE pattern scan (prefix/suffix/contains)
                                 } else if let Some(result) = Self::try_fast_like_filter(&backend, &stmt)? {
+                                    if !stmt.is_select_star() {
+                                        let projected = Self::apply_projection_with_storage(&result, &stmt.columns, Some(storage_path))?;
+                                        return Ok(ApexResult::Data(projected));
+                                    }
                                     return Ok(ApexResult::Data(result));
                                 // FAST PATH 2: Try numeric range filter for BETWEEN
                                 } else if let Some(result) = Self::try_fast_numeric_range_filter(&backend, &stmt)? {
@@ -224,10 +242,10 @@ impl ApexExecutor {
                                 } else if let Some(result) = Self::try_fast_multi_condition_filter(&backend, &stmt)? {
                                     result
                                 // FAST PATH 4: Mmap multi-condition AND on two different numeric columns
-                                } else if let Some(result) = Self::try_fast_mmap_multi_condition(&backend, &stmt)? {
+                                } else if let Some(result) = Self::try_fast_mmap_multi_condition(&backend, &stmt, storage_path)? {
                                     return Ok(result);
                                 // FAST PATH 5: Mmap IN filter on string column
-                                } else if let Some(result) = Self::try_fast_mmap_in_filter(&backend, &stmt)? {
+                                } else if let Some(result) = Self::try_fast_mmap_in_filter(&backend, &stmt, storage_path)? {
                                     return Ok(result);
                                 } else if backend.is_mmap_only() && !backend.has_pending_deltas() {
                                     // MMAP FAST PATH: byte-level scan + point lookups
@@ -254,6 +272,18 @@ impl ApexExecutor {
                                             all_idx.dedup();
                                             if let Some(lim) = _limit_with_off { all_idx.truncate(lim); }
                                             if all_idx.is_empty() { None } else { Some(all_idx) }
+                                        } else if let Some((col, nums)) = Self::extract_in_numeric_filter(where_clause)
+                                            .or_else(|| Self::extract_or_numeric_equalities(where_clause))
+                                        {
+                                            // Numeric IN or OR-of-equalities: single-pass mmap scan
+                                            backend.scan_numeric_in_mmap(&col, &nums, _limit_with_off)?
+                                        } else if let Some(leaves) = Self::extract_or_leaf_predicates(where_clause) {
+                                            // General OR decomposition: scan each leaf, union indices
+                                            match Self::scan_or_leaves_mmap(&backend, &leaves, _limit_with_off)? {
+                                                Some(v) if !v.is_empty() => Some(v),
+                                                Some(_) => None, // empty result
+                                                None => None,
+                                            }
                                         } else {
                                             None
                                         };
@@ -262,7 +292,9 @@ impl ApexExecutor {
                                                 return Ok(ApexResult::Empty(Arc::new(Schema::empty())));
                                             }
                                             // Use index-based extraction for all result sizes (avoids full table scan)
-                                            let batch = backend.read_columns_by_indices_to_arrow(&indices)?;
+                                            let col_refs = Self::get_col_refs(&stmt);
+                                            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+                                            let batch = backend.read_columns_by_indices_to_arrow(&indices, col_refs_vec.as_deref())?;
                                             
                                             // Apply ORDER BY with LIMIT if needed
                                             if !stmt.order_by.is_empty() {
@@ -274,6 +306,10 @@ impl ApexExecutor {
                                                 return Ok(ApexResult::Data(projected));
                                             }
                                             
+                                            if !stmt.is_select_star() {
+                                                let projected = Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
+                                                return Ok(ApexResult::Data(projected));
+                                            }
                                             return Ok(ApexResult::Data(batch));
                                         }
                                     }
@@ -281,13 +317,21 @@ impl ApexExecutor {
                                     if filtered.num_rows() == 0 {
                                         return Ok(ApexResult::Empty(filtered.schema()));
                                     }
+                                    if !stmt.is_select_star() {
+                                        let projected = Self::apply_projection_with_storage(&filtered, &stmt.columns, Some(storage_path))?;
+                                        return Ok(ApexResult::Data(projected));
+                                    }
                                     return Ok(ApexResult::Data(filtered));
                                 } else {
-                                    // Late materialization for SELECT * WHERE path
+                                    // Late materialization for WHERE path
                                     // Return directly to avoid applying WHERE filter twice
                                     let filtered = Self::execute_with_late_materialization(&backend, &stmt, storage_path)?;
                                     if filtered.num_rows() == 0 {
                                         return Ok(ApexResult::Empty(filtered.schema()));
+                                    }
+                                    if !stmt.is_select_star() {
+                                        let projected = Self::apply_projection_with_storage(&filtered, &stmt.columns, Some(storage_path))?;
+                                        return Ok(ApexResult::Data(projected));
                                     }
                                     return Ok(ApexResult::Data(filtered));
                                 }
@@ -891,7 +935,7 @@ impl ApexExecutor {
             indices.truncate(lim);
         }
 
-        Ok(Some(backend.read_columns_by_indices_to_arrow(&indices)?))
+        Ok(Some(backend.read_columns_by_indices_to_arrow(&indices, col_refs.as_deref())?))
     }
     
     /// Unified implementation for string equality filter fast path
@@ -1074,8 +1118,8 @@ impl ApexExecutor {
         
         if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
 
-        // Must be SELECT * with LIMIT
-        if !stmt.is_select_star() || stmt.limit.is_none() {
+        // Must have LIMIT
+        if stmt.limit.is_none() {
             return Ok(None);
         }
         
@@ -1933,10 +1977,10 @@ impl ApexExecutor {
     fn try_fast_mmap_multi_condition(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
+        storage_path: &Path,
     ) -> io::Result<Option<ApexResult>> {
         use crate::query::sql_parser::BinaryOperator;
         if !backend.is_mmap_only() || backend.has_pending_deltas() { return Ok(None); }
-        if !stmt.is_select_star() { return Ok(None); }
         // Without LIMIT the result set can be very large; sequential Arrow scan is faster
         // than index intersection + scatter read for high-selectivity filters.
         if stmt.limit.is_none() { return Ok(None); }
@@ -1979,7 +2023,13 @@ impl ApexExecutor {
                 if intersected.is_empty() {
                     return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
                 }
-                let batch = backend.read_columns_by_indices_to_arrow(&intersected)?;
+                let col_refs = Self::get_col_refs(stmt);
+                let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+                let batch = backend.read_columns_by_indices_to_arrow(&intersected, col_refs_vec.as_deref())?;
+                if !stmt.is_select_star() {
+                    let projected = Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
+                    return Ok(Some(ApexResult::Data(projected)));
+                }
                 return Ok(Some(ApexResult::Data(batch)));
             }
         }
@@ -2025,7 +2075,13 @@ impl ApexExecutor {
             return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
         }
 
-        let batch = backend.read_columns_by_indices_to_arrow(&intersected)?;
+        let col_refs = Self::get_col_refs(stmt);
+        let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+        let batch = backend.read_columns_by_indices_to_arrow(&intersected, col_refs_vec.as_deref())?;
+        if !stmt.is_select_star() {
+            let projected = Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
+            return Ok(Some(ApexResult::Data(projected)));
+        }
         Ok(Some(ApexResult::Data(batch)))
     }
 
@@ -2050,14 +2106,175 @@ impl ApexExecutor {
         }
     }
 
+    /// Extract IN list of numeric (integer) values: col IN (1, 2, 3)
+    /// Returns (column_name, vec_of_i64_values) if all values are integers.
+    fn extract_in_numeric_filter(expr: &SqlExpr) -> Option<(String, Vec<i64>)> {
+        match expr {
+            SqlExpr::In { column, values, negated } => {
+                if *negated { return None; }
+                let col = column.trim_matches('"').to_string();
+                let mut nums = Vec::with_capacity(values.len());
+                for v in values {
+                    match v {
+                        Value::Int64(n) => nums.push(*n),
+                        Value::Int32(n) => nums.push(*n as i64),
+                        _ => return None,
+                    }
+                }
+                if nums.is_empty() { return None; }
+                Some((col, nums))
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract OR chain of same-column numeric equalities: col = 1 OR col = 2 OR ...
+    /// Returns (column_name, vec_of_i64_values) — equivalent to numeric IN.
+    fn extract_or_numeric_equalities(expr: &SqlExpr) -> Option<(String, Vec<i64>)> {
+        use crate::query::sql_parser::BinaryOperator;
+        let mut values = Vec::new();
+        let mut col_name: Option<String> = None;
+        Self::collect_or_numeric_equalities(expr, &mut col_name, &mut values)?;
+        let col = col_name?;
+        if values.len() < 2 { return None; }
+        Some((col, values))
+    }
+
+    /// Recursively collect col = N leaves from an OR tree.
+    fn collect_or_numeric_equalities(expr: &SqlExpr, col_name: &mut Option<String>, values: &mut Vec<i64>) -> Option<()> {
+        use crate::query::sql_parser::BinaryOperator;
+        match expr {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+                Self::collect_or_numeric_equalities(left, col_name, values)?;
+                Self::collect_or_numeric_equalities(right, col_name, values)?;
+                Some(())
+            }
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                let (c, v) = match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(c), lit) | (lit, SqlExpr::Column(c)) => {
+                        let val = match lit {
+                            SqlExpr::Literal(Value::Int64(n)) => *n,
+                            SqlExpr::Literal(Value::Int32(n)) => *n as i64,
+                            _ => return None,
+                        };
+                        (c.trim_matches('"').to_string(), val)
+                    }
+                    _ => return None,
+                };
+                match col_name {
+                    Some(ref existing) => {
+                        if *existing != c { return None; }
+                    }
+                    None => { *col_name = Some(c); }
+                }
+                values.push(v);
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// Decompose an OR tree into leaf predicates that can each be scanned via mmap.
+    /// Returns None if any leaf is not a simple scannable predicate.
+    fn extract_or_leaf_predicates(expr: &SqlExpr) -> Option<Vec<OrLeafPredicate>> {
+        use crate::query::sql_parser::BinaryOperator;
+        match expr {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+                let mut left_leaves = Self::extract_or_leaf_predicates(left)?;
+                let right_leaves = Self::extract_or_leaf_predicates(right)?;
+                left_leaves.extend(right_leaves);
+                Some(left_leaves)
+            }
+            _ => {
+                // Try to classify this as a single scannable predicate
+                if let Some((col, val)) = Self::extract_string_equality(expr) {
+                    Some(vec![OrLeafPredicate::StringEq(col, val)])
+                } else if let Some((col, low, high)) = Self::extract_single_comparison_as_range(expr) {
+                    Some(vec![OrLeafPredicate::NumericRange(col, low, high)])
+                } else if let Some((col, low, high)) = Self::extract_between_range(expr) {
+                    Some(vec![OrLeafPredicate::NumericRange(col, low, high)])
+                } else if let Some((col, nums)) = Self::extract_in_numeric_filter(expr) {
+                    Some(vec![OrLeafPredicate::NumericIn(col, nums)])
+                } else if let Some((col, strs)) = Self::extract_in_string_filter(expr) {
+                    Some(vec![OrLeafPredicate::StringIn(col, strs)])
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Execute each OR leaf via the appropriate mmap scan, union all index sets.
+    /// For 2+ leaves, uses parallel scanning (single mmap lock, rayon dispatch).
+    fn scan_or_leaves_mmap(
+        backend: &TableStorageBackend,
+        leaves: &[OrLeafPredicate],
+        limit: Option<usize>,
+    ) -> io::Result<Option<Vec<usize>>> {
+        use crate::storage::on_demand::MmapScanPred;
+
+        // Try parallel path: convert leaves to MmapScanPred (skip StringIn — rare, needs multi-call)
+        let has_string_in = leaves.iter().any(|l| matches!(l, OrLeafPredicate::StringIn(..)));
+        if leaves.len() >= 2 && !has_string_in {
+            let preds: Vec<MmapScanPred> = leaves.iter().map(|leaf| match leaf {
+                OrLeafPredicate::StringEq(col, val) => MmapScanPred::StringEq { col, value: val },
+                OrLeafPredicate::NumericRange(col, low, high) => MmapScanPred::NumericRange { col, low: *low, high: *high },
+                OrLeafPredicate::NumericIn(col, nums) => MmapScanPred::NumericIn { col, values: nums },
+                OrLeafPredicate::StringIn(..) => unreachable!(),
+            }).collect();
+            if let Some(mut indices) = backend.scan_multi_predicates_parallel(&preds)? {
+                if let Some(lim) = limit { indices.truncate(lim); }
+                return Ok(Some(indices));
+            }
+            // Parallel path returned None (e.g. compressed data) — fall through to sequential
+        }
+
+        // Sequential fallback
+        let mut all_indices: Vec<usize> = Vec::new();
+        for leaf in leaves {
+            let indices = match leaf {
+                OrLeafPredicate::StringEq(col, val) => {
+                    backend.scan_string_filter_mmap(col, val, None)?
+                }
+                OrLeafPredicate::NumericRange(col, low, high) => {
+                    backend.scan_numeric_range_mmap(col, *low, *high, None)?
+                }
+                OrLeafPredicate::NumericIn(col, nums) => {
+                    backend.scan_numeric_in_mmap(col, nums, None)?
+                }
+                OrLeafPredicate::StringIn(col, strs) => {
+                    let mut idx: Vec<usize> = Vec::new();
+                    for val in strs {
+                        if let Some(mut idxs) = backend.scan_string_filter_mmap(col, val, None)? {
+                            idx.append(&mut idxs);
+                        }
+                    }
+                    if idx.is_empty() { None } else { idx.sort_unstable(); idx.dedup(); Some(idx) }
+                }
+            };
+            if let Some(mut idxs) = indices {
+                all_indices.append(&mut idxs);
+            }
+        }
+        if all_indices.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        all_indices.sort_unstable();
+        all_indices.dedup();
+        if let Some(lim) = limit {
+            all_indices.truncate(lim);
+        }
+        Ok(Some(all_indices))
+    }
+
     /// MMAP fast path for IN filter on string column.
     /// Strategy: scan each IN value independently, merge-union sorted indices, scatter read.
     fn try_fast_mmap_in_filter(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
+        storage_path: &Path,
     ) -> io::Result<Option<ApexResult>> {
         if !backend.is_mmap_only() || backend.has_pending_deltas() { return Ok(None); }
-        if !stmt.is_select_star() { return Ok(None); }
 
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
@@ -2095,7 +2312,13 @@ impl ApexExecutor {
             return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
         }
 
-        let batch = backend.read_columns_by_indices_to_arrow(&all_indices)?;
+        let col_refs = Self::get_col_refs(stmt);
+        let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+        let batch = backend.read_columns_by_indices_to_arrow(&all_indices, col_refs_vec.as_deref())?;
+        if !stmt.is_select_star() {
+            let projected = Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
+            return Ok(Some(ApexResult::Data(projected)));
+        }
         Ok(Some(ApexResult::Data(batch)))
     }
 
@@ -2190,7 +2413,9 @@ impl ApexExecutor {
                 let schema = backend.read_columns_to_arrow(None, 0, Some(0))?;
                 return Ok(Some(schema));
             }
-            let batch = backend.read_columns_by_indices_to_arrow(&indices)?;
+            let col_refs = Self::get_col_refs(stmt);
+            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+            let batch = backend.read_columns_by_indices_to_arrow(&indices, col_refs_vec.as_deref())?;
             return Ok(Some(batch));
         }
 
@@ -2259,14 +2484,27 @@ impl ApexExecutor {
                                 .filter(|(_, v)| *v == Some(true))
                                 .map(|(i, _)| i)
                                 .collect();
-                            return backend.read_columns_by_indices_to_arrow(&indices);
+                            let col_refs = Self::get_col_refs(stmt);
+                            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+                            return backend.read_columns_by_indices_to_arrow(&indices, col_refs_vec.as_deref());
                         }
                         // ≥ 40% matched: full sequential + filter is cheaper
                     }
                 }
             }
             // Fallback: full sequential read + vectorized Arrow filter
-            let full_batch = backend.read_columns_to_arrow(None, 0, None)?;
+            // Need both SELECT columns and WHERE columns (WHERE is applied on this batch)
+            // For SELECT *, required_columns() returns None → read all columns
+            let col_refs_vec: Option<Vec<String>> = stmt.required_columns().map(|mut sel_cols| {
+                for wc in stmt.where_columns() {
+                    if !sel_cols.iter().any(|c| c.eq_ignore_ascii_case(&wc)) {
+                        sel_cols.push(wc);
+                    }
+                }
+                sel_cols
+            });
+            let col_refs_strs: Option<Vec<&str>> = col_refs_vec.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+            let full_batch = backend.read_columns_to_arrow(col_refs_strs.as_deref(), 0, None)?;
             if full_batch.num_rows() > 0 {
                 let mask = Self::evaluate_predicate_with_storage(&full_batch, where_clause, storage_path)?;
                 return compute::filter_record_batch(&full_batch, &mask)
@@ -2375,7 +2613,9 @@ impl ApexExecutor {
         // same full-read + take path, so physical==active there too.
         if backend.is_mmap_only() {
             use arrow::array::ArrayRef;
-            let full_batch = backend.read_columns_to_arrow(None, 0, None)?;
+            let col_refs = Self::get_col_refs(stmt);
+            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+            let full_batch = backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, None)?;
             let indices_arr = arrow::array::UInt32Array::from(
                 limited_indices.iter().map(|&i| i as u32).collect::<Vec<_>>()
             );
@@ -2386,7 +2626,9 @@ impl ApexExecutor {
             arrow::record_batch::RecordBatch::try_new(full_batch.schema(), taken_cols)
                 .map_err(|e| err_data(e.to_string()))
         } else {
-            backend.read_columns_by_indices_to_arrow(&limited_indices)
+            let col_refs = Self::get_col_refs(stmt);
+            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+            backend.read_columns_by_indices_to_arrow(&limited_indices, col_refs_vec.as_deref())
         }
     }
 
@@ -2414,7 +2656,7 @@ impl ApexExecutor {
                 c0, !o0.descending, c1, !o1.descending, k, stmt.offset.unwrap_or(0),
             )? {
                 if !indices.is_empty() {
-                    return backend.read_columns_by_indices_to_arrow(&indices);
+                    return backend.read_columns_by_indices_to_arrow(&indices, None);
                 }
                 return backend.read_columns_to_arrow(None, 0, Some(0));
             }
@@ -2429,7 +2671,7 @@ impl ApexExecutor {
                 let offset = stmt.offset.unwrap_or(0);
                 let final_indices: Vec<usize> = heap.into_iter().skip(offset).map(|(idx, _)| idx).collect();
                 if !final_indices.is_empty() {
-                    return backend.read_columns_by_indices_to_arrow(&final_indices);
+                    return backend.read_columns_by_indices_to_arrow(&final_indices, None);
                 }
             }
         }
@@ -2554,7 +2796,7 @@ impl ApexExecutor {
         }
 
         // Step 3: Read ALL columns but only for top-k row indices
-        backend.read_columns_by_indices_to_arrow(&final_indices)
+        backend.read_columns_by_indices_to_arrow(&final_indices, None)
     }
 
     /// Pre-evaluate SELECT expression aliases that are referenced by ORDER BY clauses.
@@ -3030,7 +3272,7 @@ impl ApexExecutor {
                 .map_err(|e| err_data( e.to_string()))
         } else {
             // Need to read additional columns for matching rows
-            let other_batch = backend.read_columns_by_indices_to_arrow(&indices)?;
+            let other_batch = backend.read_columns_by_indices_to_arrow(&indices, None)?;
             
             // Also filter the WHERE columns batch
             let indices_array = arrow::array::UInt64Array::from(

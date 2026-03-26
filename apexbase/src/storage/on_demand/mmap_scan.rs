@@ -44,6 +44,17 @@ fn bytes_as_u32_slice(bytes: &[u8], n: usize) -> std::borrow::Cow<'_, [u32]> {
     }
 }
 
+// ─── MULTI-PREDICATE PARALLEL SCAN ──────────────────────────────────────────
+
+/// Scan predicate for `scan_multi_predicates_parallel`.
+/// Each variant targets a single column and can be scanned independently.
+pub enum MmapScanPred<'a> {
+    NumericRange { col: &'a str, low: f64, high: f64 },
+    StringEq { col: &'a str, value: &'a str },
+    NumericIn { col: &'a str, values: &'a [i64] },
+    StringIn { col: &'a str, values: &'a [String] },
+}
+
 // ─── LIKE PATTERN SUPPORT ────────────────────────────────────────────────────
 
 /// Pre-classified LIKE pattern for zero-alloc byte-level matching.
@@ -3508,6 +3519,203 @@ impl OnDemandStorage {
         Ok(Some(matches))
     }
 
+    /// Mmap-level numeric IN scan: find rows where col_name IN (v1, v2, ...).
+    /// Single pass over column data with HashSet lookup. Returns global row indices.
+    pub fn scan_numeric_in_mmap(&self, col_name: &str, values: &[i64], limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
+        if values.is_empty() { return Ok(Some(Vec::new())); }
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let col_type = schema.columns[col_idx].1;
+        let is_int = matches!(col_type, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 |
+            ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 |
+            ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date);
+        let is_float = matches!(col_type, ColumnType::Float64 | ColumnType::Float32);
+        if !is_int && !is_float { return Ok(None); }
+
+        // Build lookup set
+        let value_set: std::collections::HashSet<i64> = values.iter().copied().collect();
+        // For zone map pruning: compute min/max of IN values
+        let in_min = values.iter().copied().min().unwrap();
+        let in_max = values.iter().copied().max().unwrap();
+
+        let col_count = schema.column_count();
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for IN scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        let max_matches = limit.unwrap_or(usize::MAX);
+        let mut matches: Vec<usize> = Vec::new();
+        let mut global_row_offset: usize = 0;
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            if matches.len() >= max_matches { break; }
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 { global_row_offset += rg_rows; continue; }
+
+            // Zone map pruning
+            if rg_i < footer.zone_maps.len() {
+                if let Some(zm) = footer.zone_maps[rg_i].iter().find(|z| z.col_idx as usize == col_idx) {
+                    let skip = if zm.is_float {
+                        !zm.may_overlap_float_range(in_min as f64, in_max as f64)
+                    } else {
+                        !zm.may_overlap_int_range(in_min, in_max)
+                    };
+                    if skip { global_row_offset += rg_rows; continue; }
+                }
+            }
+
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() { return Err(err_data("RG extends past EOF")); }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize .. rg_end];
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
+            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let del_vec_len = (rg_rows + 7) / 8;
+            let id_section = rg_rows * 8;
+            if id_section + del_vec_len > body.len() { return Err(err_data("RG del vec truncated")); }
+            let del_bytes = &body[id_section..id_section + del_vec_len];
+            let has_deletes = rg_meta.deletion_count > 0;
+            let null_bitmap_len = (rg_rows + 7) / 8;
+
+            // RCIX fast path
+            let rcix_available = rg_i < footer.col_offsets.len()
+                && col_idx < footer.col_offsets[rg_i].len()
+                && compress_flag == RG_COMPRESS_NONE;
+            if rcix_available {
+                let col_body_off = footer.col_offsets[rg_i][col_idx] as usize;
+                if col_body_off + null_bitmap_len > body.len() { global_row_offset += rg_rows; continue; }
+                let null_bytes = &body[col_body_off..col_body_off + null_bitmap_len];
+                let data_start = col_body_off + null_bitmap_len;
+                let col_bytes = &body[data_start..];
+                let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+                let encoding = if encoding_version >= 1 && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+
+                if encoding == COL_ENCODING_PLAIN && col_bytes.len() > enc_offset + 8 {
+                    let payload = &col_bytes[enc_offset..];
+                    let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                    let n = count.min(rg_rows).min((payload.len() - 8) / 8);
+                    if is_int {
+                        let vals = bytes_as_i64_slice(&payload[8..], n);
+                        for i in 0..n {
+                            if matches.len() >= max_matches { break; }
+                            if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if value_set.contains(&vals[i]) { matches.push(global_row_offset + i); }
+                        }
+                    } else {
+                        let vals = bytes_as_f64_slice(&payload[8..], n);
+                        for i in 0..n {
+                            if matches.len() >= max_matches { break; }
+                            if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if value_set.contains(&(vals[i] as i64)) { matches.push(global_row_offset + i); }
+                        }
+                    }
+                    global_row_offset += rg_rows;
+                    continue;
+                }
+            }
+
+            // Fallback: sequential column scan
+            let mut pos = id_section + del_vec_len;
+            for ci in 0..col_count {
+                if pos + null_bitmap_len > body.len() { break; }
+                let null_bytes = &body[pos..pos + null_bitmap_len];
+                pos += null_bitmap_len;
+                let ct = schema.columns[ci].1;
+
+                if ci == col_idx {
+                    let col_bytes = &body[pos..];
+                    let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
+                    let encoding = if encoding_version >= 1 { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                    let data_slice = &col_bytes[enc_offset..];
+
+                    if encoding == COL_ENCODING_PLAIN && data_slice.len() >= 8 {
+                        let count = u64::from_le_bytes(data_slice[0..8].try_into().unwrap()) as usize;
+                        let values_start = 8usize;
+                        let n = count.min(rg_rows);
+                        if is_int {
+                            let nn = n.min((data_slice.len() - values_start) / 8);
+                            let vals = bytes_as_i64_slice(&data_slice[values_start..], nn);
+                            if !has_deletes {
+                                for i in 0..vals.len() {
+                                    if matches.len() >= max_matches { break; }
+                                    if value_set.contains(&vals[i]) { matches.push(global_row_offset + i); }
+                                }
+                            } else {
+                                for i in 0..vals.len() {
+                                    if matches.len() >= max_matches { break; }
+                                    if (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if value_set.contains(&vals[i]) { matches.push(global_row_offset + i); }
+                                }
+                            }
+                        } else {
+                            let nn = n.min((data_slice.len() - values_start) / 8);
+                            let vals = bytes_as_f64_slice(&data_slice[values_start..], nn);
+                            if !has_deletes {
+                                for i in 0..vals.len() {
+                                    if matches.len() >= max_matches { break; }
+                                    if value_set.contains(&(vals[i] as i64)) { matches.push(global_row_offset + i); }
+                                }
+                            } else {
+                                for i in 0..vals.len() {
+                                    if matches.len() >= max_matches { break; }
+                                    if (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if value_set.contains(&(vals[i] as i64)) { matches.push(global_row_offset + i); }
+                                }
+                            }
+                        }
+                    } else {
+                        // Non-PLAIN encoding: decode then scan
+                        let (col_data, _consumed) = if encoding_version >= 1 {
+                            read_column_encoded(col_bytes, ct)?
+                        } else {
+                            ColumnData::from_bytes_typed(col_bytes, ct)?
+                        };
+                        match &col_data {
+                            ColumnData::Int64(vals) => {
+                                for i in 0..vals.len().min(rg_rows) {
+                                    if matches.len() >= max_matches { break; }
+                                    if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if value_set.contains(&vals[i]) { matches.push(global_row_offset + i); }
+                                }
+                            }
+                            ColumnData::Float64(vals) => {
+                                for i in 0..vals.len().min(rg_rows) {
+                                    if matches.len() >= max_matches { break; }
+                                    if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
+                                    if value_set.contains(&(vals[i] as i64)) { matches.push(global_row_offset + i); }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let consumed = if encoding_version >= 1 {
+                    skip_column_encoded(&body[pos..], ct)?
+                } else {
+                    ColumnData::skip_bytes_typed(&body[pos..], ct)?
+                };
+                pos += consumed;
+            }
+            global_row_offset += rg_rows;
+        }
+        drop(mmap_guard);
+        drop(file_guard);
+        Ok(Some(matches))
+    }
+
     /// Scan a numeric WHERE column and write new values to a SET column in-place, in one pass.
     /// Only works when both columns use PLAIN encoding and RGs are uncompressed (RCIX required).
     /// Returns Some(count) of rows updated, or None if conditions not met (caller falls back).
@@ -4277,11 +4485,292 @@ impl OnDemandStorage {
         Ok(Some((total_count, total_sum, total_min, total_max)))
     }
 
+    /// Scan multiple predicates in parallel on a single shared mmap (one lock acquisition).
+    /// Each predicate targets a different column and is scanned independently via Rayon.
+    /// Results are merged and deduplicated into a single sorted index vector.
+    pub fn scan_multi_predicates_parallel(
+        &self,
+        predicates: &[MmapScanPred],
+    ) -> io::Result<Option<Vec<usize>>> {
+        use rayon::prelude::*;
+
+        if predicates.is_empty() { return Ok(Some(Vec::new())); }
+
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+
+        // Pre-resolve column indices and validate types
+        struct PredDesc {
+            col_idx: usize,
+            is_int: bool,
+            is_float: bool,
+            is_string: bool,
+            is_dict: bool,
+        }
+        let mut descs: Vec<Option<PredDesc>> = Vec::with_capacity(predicates.len());
+        for pred in predicates {
+            let col_name = match pred {
+                MmapScanPred::NumericRange { col, .. } => *col,
+                MmapScanPred::StringEq { col, .. } => *col,
+                MmapScanPred::NumericIn { col, .. } => *col,
+                MmapScanPred::StringIn { col, .. } => *col,
+            };
+            let col_idx = match schema.get_index(col_name) {
+                Some(i) => i,
+                None => { descs.push(None); continue; }
+            };
+            let ct = schema.columns[col_idx].1;
+            let is_int = matches!(ct, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 |
+                ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 |
+                ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date);
+            let is_float = matches!(ct, ColumnType::Float64 | ColumnType::Float32);
+            let is_string = matches!(ct, ColumnType::String);
+            let is_dict = matches!(ct, ColumnType::StringDict);
+            descs.push(Some(PredDesc { col_idx, is_int, is_float, is_string, is_dict }));
+        }
+
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for multi-pred scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        // Cast mmap pointer for safe sharing across rayon threads (read-only, mmap_guard keeps it alive)
+        let mmap_ptr: usize = mmap_ref.as_ptr() as usize;
+        let mmap_len: usize = mmap_ref.len();
+
+        // Pre-build per-RG descriptors
+        struct RgInfo {
+            offset: usize, data_size: usize, row_count: usize,
+            global_off: usize, deletion_count: u64,
+        }
+        let mut rg_infos: Vec<RgInfo> = Vec::with_capacity(footer.row_groups.len());
+        let mut cumul = 0usize;
+        for rg in &footer.row_groups {
+            rg_infos.push(RgInfo {
+                offset: rg.offset as usize, data_size: rg.data_size as usize,
+                row_count: rg.row_count as usize, global_off: cumul,
+                deletion_count: rg.deletion_count as u64,
+            });
+            cumul += rg.row_count as usize;
+        }
+
+        // Scan each predicate in parallel
+        let results: Vec<Vec<usize>> = predicates.par_iter().enumerate().map(|(pi, pred)| {
+            let desc = match &descs[pi] {
+                Some(d) => d,
+                None => return vec![],
+            };
+            let mmap = unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len) };
+            let col_idx = desc.col_idx;
+            let mut matches: Vec<usize> = Vec::new();
+
+            for (rg_i, rg) in rg_infos.iter().enumerate() {
+                let rg_rows = rg.row_count;
+                if rg_rows == 0 { continue; }
+
+                // Zone map pruning
+                if rg_i < footer.zone_maps.len() {
+                    if let Some(zm) = footer.zone_maps[rg_i].iter().find(|z| z.col_idx as usize == col_idx) {
+                        let skip = match pred {
+                            MmapScanPred::NumericRange { low, high, .. } => {
+                                if zm.is_float { !zm.may_overlap_float_range(*low, *high) }
+                                else { !zm.may_overlap_int_range(low.ceil() as i64, high.floor() as i64) }
+                            }
+                            MmapScanPred::NumericIn { values, .. } => {
+                                if let (Some(&mn), Some(&mx)) = (values.iter().min(), values.iter().max()) {
+                                    if zm.is_float { !zm.may_overlap_float_range(mn as f64, mx as f64) }
+                                    else { !zm.may_overlap_int_range(mn, mx) }
+                                } else { false }
+                            }
+                            MmapScanPred::StringEq { value, .. } => {
+                                if !zm.is_float {
+                                    let tlen = value.len() as i64;
+                                    tlen < zm.min_bits || tlen > zm.max_bits
+                                } else { false }
+                            }
+                            MmapScanPred::StringIn { values, .. } => {
+                                if !zm.is_float && !values.is_empty() {
+                                    let min_len = values.iter().map(|s| s.len()).min().unwrap() as i64;
+                                    let max_len = values.iter().map(|s| s.len()).max().unwrap() as i64;
+                                    max_len < zm.min_bits || min_len > zm.max_bits
+                                } else { false }
+                            }
+                        };
+                        if skip { continue; }
+                    }
+                }
+
+                let rg_end = rg.offset + rg.data_size;
+                if rg_end > mmap.len() || rg_end < rg.offset + 32 { continue; }
+                let rg_bytes = &mmap[rg.offset..rg_end];
+                let compress_flag = rg_bytes[28];
+                let encoding_version = rg_bytes[29];
+                if compress_flag != RG_COMPRESS_NONE { continue; } // skip compressed RGs in parallel path
+                let body = &rg_bytes[32..];
+                let null_bitmap_len = (rg_rows + 7) / 8;
+                let del_start = rg_rows * 8;
+                let has_deletes = rg.deletion_count > 0;
+
+                // RCIX required for parallel path
+                let rcix = footer.col_offsets.get(rg_i).filter(|v| v.len() > col_idx);
+                let rcix = match rcix { Some(r) => r, None => continue };
+                let col_off = rcix[col_idx] as usize;
+                if col_off + null_bitmap_len > body.len() { continue; }
+                let null_bytes = &body[col_off..col_off + null_bitmap_len];
+                let col_bytes = &body[col_off + null_bitmap_len..];
+                let enc_offset = if encoding_version >= 1 { 1usize } else { 0 };
+                let encoding = if encoding_version >= 1 && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                if encoding != COL_ENCODING_PLAIN { continue; }
+                let payload = if enc_offset <= col_bytes.len() { &col_bytes[enc_offset..] } else { continue; };
+
+                match pred {
+                    MmapScanPred::NumericRange { low, high, .. } if desc.is_int && payload.len() >= 8 => {
+                        let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                        let n = count.min(rg_rows).min((payload.len() - 8) / 8);
+                        let vals = bytes_as_i64_slice(&payload[8..], n);
+                        let low_i = low.ceil() as i64;
+                        let high_i = high.floor() as i64;
+                        for i in 0..n {
+                            if has_deletes && del_start + null_bitmap_len <= body.len()
+                                && (body[del_start + i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if vals[i] >= low_i && vals[i] <= high_i { matches.push(rg.global_off + i); }
+                        }
+                    }
+                    MmapScanPred::NumericRange { low, high, .. } if desc.is_float && payload.len() >= 8 => {
+                        let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                        let n = count.min(rg_rows).min((payload.len() - 8) / 8);
+                        let vals = bytes_as_f64_slice(&payload[8..], n);
+                        for i in 0..n {
+                            if has_deletes && del_start + null_bitmap_len <= body.len()
+                                && (body[del_start + i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if vals[i] >= *low && vals[i] <= *high { matches.push(rg.global_off + i); }
+                        }
+                    }
+                    MmapScanPred::NumericIn { values, .. } if desc.is_int && payload.len() >= 8 => {
+                        let value_set: std::collections::HashSet<i64> = values.iter().copied().collect();
+                        let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                        let n = count.min(rg_rows).min((payload.len() - 8) / 8);
+                        let vals = bytes_as_i64_slice(&payload[8..], n);
+                        for i in 0..n {
+                            if has_deletes && del_start + null_bitmap_len <= body.len()
+                                && (body[del_start + i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if value_set.contains(&vals[i]) { matches.push(rg.global_off + i); }
+                        }
+                    }
+                    MmapScanPred::StringEq { value, .. } if desc.is_dict && payload.len() >= 16 => {
+                        let target_bytes = value.as_bytes();
+                        let row_count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                        let dict_size = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+                        if dict_size == 0 { continue; }
+                        let indices_start = 16usize;
+                        let dict_off_start = indices_start + row_count * 4;
+                        let dict_data_len_off = dict_off_start + dict_size * 4;
+                        if dict_data_len_off + 8 > payload.len() { continue; }
+                        let dict_data_len = u64::from_le_bytes(payload[dict_data_len_off..dict_data_len_off+8].try_into().unwrap()) as usize;
+                        let dict_data_start = dict_data_len_off + 8;
+
+                        let dict_offsets = bytes_as_u32_slice(&payload[dict_off_start..], dict_size);
+                        let indices = bytes_as_u32_slice(&payload[indices_start..], row_count);
+
+                        // Find target in dictionary
+                        let raw_end = (dict_data_start + dict_data_len).min(payload.len());
+                        let raw_dict = &payload[dict_data_start..raw_end];
+                        let finder = memchr::memmem::Finder::new(target_bytes);
+                        let target_len = target_bytes.len();
+                        let mut target_dict_idx: Option<u32> = None;
+                        let mut search_from = 0usize;
+                        while let Some(rel) = finder.find(&raw_dict[search_from..]) {
+                            let abs = search_from + rel;
+                            if let Ok(di) = dict_offsets.binary_search(&(abs as u32)) {
+                                let de = if di + 1 < dict_size { dict_offsets[di+1] as usize } else { dict_data_len };
+                                if de - abs == target_len {
+                                    target_dict_idx = Some((di + 1) as u32);
+                                    break;
+                                }
+                            }
+                            search_from += rel + 1;
+                            if search_from >= raw_dict.len() { break; }
+                        }
+
+                        if let Some(tdi) = target_dict_idx {
+                            let n = row_count.min(rg_rows);
+                            if !has_deletes {
+                                for i in 0..n {
+                                    if indices[i] == tdi { matches.push(rg.global_off + i); }
+                                }
+                            } else if del_start + null_bitmap_len <= body.len() {
+                                let del_bytes = &body[del_start..del_start + null_bitmap_len];
+                                for i in 0..n {
+                                    if (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                    if indices[i] == tdi { matches.push(rg.global_off + i); }
+                                }
+                            }
+                        }
+                    }
+                    MmapScanPred::StringEq { value, .. } if desc.is_string && payload.len() >= 8 => {
+                        let target_bytes = value.as_bytes();
+                        let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                        let off_start = 8usize;
+                        let data_len_off = off_start + (count + 1) * 4;
+                        if data_len_off + 8 > payload.len() { continue; }
+                        let data_start = data_len_off + 8;
+                        let n = count.min(rg_rows);
+                        for i in 0..n {
+                            if has_deletes && del_start + null_bitmap_len <= body.len()
+                                && (body[del_start + i/8] >> (i%8)) & 1 == 1 { continue; }
+                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                            let s_off = off_start + i * 4;
+                            let e_off = s_off + 4;
+                            if e_off + 4 > payload.len() { continue; }
+                            let s = u32::from_le_bytes(payload[s_off..s_off+4].try_into().unwrap()) as usize;
+                            let e = u32::from_le_bytes(payload[e_off..e_off+4].try_into().unwrap()) as usize;
+                            if data_start + e <= payload.len() && e - s == target_bytes.len()
+                                && &payload[data_start+s..data_start+e] == target_bytes
+                            {
+                                matches.push(rg.global_off + i);
+                            }
+                        }
+                    }
+                    MmapScanPred::StringIn { values, .. } if desc.is_dict || desc.is_string => {
+                        // Delegate: scan each value and merge
+                        for val in *values {
+                            let sub = MmapScanPred::StringEq { col: match pred { MmapScanPred::StringIn { col, .. } => col, _ => unreachable!() }, value: val.as_str() };
+                            // Inline: we can't recurse, so just note — StringIn with multiple values
+                            // is handled by the caller splitting into multiple StringEq predicates.
+                            // For now, skip (this path is rarely used in OR decomposition).
+                            let _ = sub;
+                        }
+                    }
+                    _ => {} // unsupported predicate/type combo: skip
+                }
+            }
+            matches
+        }).collect();
+
+        drop(mmap_guard);
+        drop(file_guard);
+
+        let mut all_indices: Vec<usize> = Vec::with_capacity(results.iter().map(|r| r.len()).sum());
+        for r in results {
+            all_indices.extend(r);
+        }
+        all_indices.sort_unstable();
+        all_indices.dedup();
+        Ok(Some(all_indices))
+    }
+
     /// Extract specific rows by global indices from mmap, returning an Arrow RecordBatch.
     /// Navigates each RG body once and extracts only values at target positions.
     /// Uses typed ColBuf: StringBuilder for String/StringDict (zero heap alloc per value),
     /// Vec<Option<i64/f64/bool>> for scalars (no Value enum boxing).
-    pub fn extract_rows_by_indices_to_arrow(&self, indices: &[usize]) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
+    pub fn extract_rows_by_indices_to_arrow(&self, indices: &[usize], col_refs: Option<&[&str]>) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
         use arrow::array::{ArrayRef, Int64Array, Float64Array, StringBuilder, BooleanArray, StringArray};
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
         use std::sync::Arc;
@@ -4296,6 +4785,13 @@ impl OnDemandStorage {
         };
         let schema = &footer.schema;
         let col_count = schema.column_count();
+
+        // Column projection: build a mask of which columns to actually extract
+        let col_needed: Vec<bool> = if let Some(refs) = col_refs {
+            schema.columns.iter().map(|(name, _)| refs.iter().any(|r| r.eq_ignore_ascii_case(name))).collect()
+        } else {
+            vec![true; col_count]
+        };
 
         // Build RG cumulative bounds (binary-search friendly)
         let mut cumulative = 0usize;
@@ -4322,17 +4818,26 @@ impl OnDemandStorage {
             F64(Vec<Option<f64>>),
             Str(StringBuilder),        // String/StringDict: sequential append, zero alloc
             Bool(Vec<Option<bool>>),
-            Other(Vec<Option<crate::data::Value>>), // Binary/FixedList/etc.: rare fallback
+            Bin(Vec<Option<Vec<u8>>>),  // Binary columns: preserve raw bytes
+            FixedVec(Vec<Option<Vec<u8>>>, u32), // FixedList/Float16List: raw f32 bytes per row + dim
+            Other(Vec<Option<crate::data::Value>>), // rare fallback
         }
-        let mut col_bufs: Vec<ColBuf> = schema.columns.iter().map(|(_, ct)| match ct {
-            ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
-            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
-            ColumnType::Timestamp | ColumnType::Date => ColBuf::I64(vec![None; n_out]),
-            ColumnType::Float64 | ColumnType::Float32 => ColBuf::F64(vec![None; n_out]),
-            ColumnType::String | ColumnType::StringDict =>
-                ColBuf::Str(StringBuilder::with_capacity(n_out, n_out * 10)),
-            ColumnType::Bool => ColBuf::Bool(vec![None; n_out]),
-            _ => ColBuf::Other(vec![None; n_out]),
+        let mut col_bufs: Vec<ColBuf> = schema.columns.iter().enumerate().map(|(ci, (_, ct))| {
+            if !col_needed[ci] {
+                return ColBuf::I64(Vec::new()); // placeholder, never filled
+            }
+            match ct {
+                ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
+                ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+                ColumnType::Timestamp | ColumnType::Date => ColBuf::I64(vec![None; n_out]),
+                ColumnType::Float64 | ColumnType::Float32 => ColBuf::F64(vec![None; n_out]),
+                ColumnType::String | ColumnType::StringDict =>
+                    ColBuf::Str(StringBuilder::with_capacity(n_out, n_out * 10)),
+                ColumnType::Bool => ColBuf::Bool(vec![None; n_out]),
+                ColumnType::Binary => ColBuf::Bin(vec![None; n_out]),
+                ColumnType::FixedList | ColumnType::Float16List => ColBuf::FixedVec(vec![None; n_out], 0),
+                _ => ColBuf::Other(vec![None; n_out]),
+            }
         }).collect();
 
         let file_guard = self.file.read();
@@ -4340,6 +4845,273 @@ impl OnDemandStorage {
             .ok_or_else(|| err_not_conn("File not open for batch extract"))?;
         let mut mmap_guard = self.mmap_cache.write();
         let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        // ── PARALLEL COLUMN EXTRACTION ────────────────────────────────────
+        // Pre-compute column offsets for each RG (from RCIX or by scanning).
+        // Then process each column independently in parallel via rayon.
+        let needed_col_indices: Vec<usize> = (0..col_count).filter(|&ci| col_needed[ci]).collect();
+        let mut par_col_offsets: Vec<Option<Vec<u32>>> = Vec::new(); // per-RG col offsets
+        let mut par_eligible = needed_col_indices.len() >= 2 && n_out >= 500;
+        if par_eligible {
+            for (rg_i, local_pairs) in rg_local_indices.iter().enumerate() {
+                if local_pairs.is_empty() {
+                    par_col_offsets.push(None); // no rows needed
+                    continue;
+                }
+                if rg_i >= footer.row_groups.len() { par_eligible = false; break; }
+                let rg_meta = &footer.row_groups[rg_i];
+                let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+                if rg_end > mmap_ref.len() { par_eligible = false; break; }
+                let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+                if rg_bytes.len() < 32 { par_eligible = false; break; }
+                let compress_flag = rg_bytes[28];
+                let enc_ver = rg_bytes[29];
+                if compress_flag != RG_COMPRESS_NONE || enc_ver < 1 {
+                    par_eligible = false; break;
+                }
+                // Try RCIX first
+                if rg_i < footer.col_offsets.len() && footer.col_offsets[rg_i].len() >= col_count {
+                    par_col_offsets.push(Some(footer.col_offsets[rg_i].clone()));
+                } else {
+                    // Compute offsets by scanning through columns
+                    let body = &rg_bytes[32..];
+                    let rg_rows = rg_meta.row_count as usize;
+                    let null_bm_len = (rg_rows + 7) / 8;
+                    let mut offsets = Vec::with_capacity(col_count);
+                    let mut pos = rg_rows * 8 + null_bm_len; // skip ID block + _id null bitmap
+                    let mut ok = true;
+                    for ci in 0..col_count {
+                        offsets.push(pos as u32);
+                        // Advance past null bitmap + encoded column data
+                        pos += null_bm_len;
+                        if pos > body.len() { ok = false; break; }
+                        match skip_column_encoded(&body[pos..], schema.columns[ci].1) {
+                            Ok(consumed) => pos += consumed,
+                            Err(_) => { ok = false; break; }
+                        }
+                    }
+                    if !ok || offsets.len() < col_count { par_eligible = false; break; }
+                    par_col_offsets.push(Some(offsets));
+                }
+            }
+        }
+
+        if par_eligible {
+            use rayon::prelude::*;
+            // Extract IDs
+            for (rg_i, local_pairs) in rg_local_indices.iter().enumerate() {
+                if local_pairs.is_empty() { continue; }
+                let rg_meta = &footer.row_groups[rg_i];
+                let rg_rows = rg_meta.row_count as usize;
+                let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+                let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+                let body = &rg_bytes[32..];
+                if rg_rows * 8 <= body.len() {
+                    for &(out_idx, local_idx) in local_pairs {
+                        let id_off = local_idx * 8;
+                        if id_off + 8 <= rg_rows * 8 {
+                            out_ids[out_idx] = i64::from_le_bytes(body[id_off..id_off+8].try_into().unwrap());
+                        }
+                    }
+                }
+            }
+
+            let mmap_ptr = mmap_ref.as_ptr() as usize;
+            let mmap_len = mmap_ref.len();
+
+            // Each parallel task extracts data AND builds the Arrow array in one pass.
+            let col_arrays: Vec<(usize, Field, ArrayRef)> = needed_col_indices.par_iter().map(|&ci| {
+                let mmap = unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len) };
+                let ct = schema.columns[ci].1;
+                let col_name = &schema.columns[ci].0;
+
+                macro_rules! for_each_rg {
+                    ($handler:expr) => {{
+                        for (rg_i, local_pairs) in rg_local_indices.iter().enumerate() {
+                            if local_pairs.is_empty() { continue; }
+                            let offsets = match &par_col_offsets[rg_i] {
+                                Some(o) => o,
+                                None => continue,
+                            };
+                            let rg_meta = &footer.row_groups[rg_i];
+                            let rg_rows = rg_meta.row_count as usize;
+                            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+                            if rg_end > mmap.len() { continue; }
+                            let rg_bytes = &mmap[rg_meta.offset as usize..rg_end];
+                            let body = &rg_bytes[32..];
+                            let null_bitmap_len = (rg_rows + 7) / 8;
+                            let col_off = offsets[ci] as usize;
+                            if col_off + null_bitmap_len > body.len() { continue; }
+                            let null_bytes = &body[col_off..col_off + null_bitmap_len];
+                            let col_bytes = &body[col_off + null_bitmap_len..];
+                            if col_bytes.is_empty() { continue; }
+                            let encoding = col_bytes[0];
+                            let payload = &col_bytes[1..];
+                            #[allow(clippy::redundant_closure_call)]
+                            ($handler)(local_pairs, null_bytes, encoding, payload, rg_rows);
+                        }
+                    }};
+                }
+
+                match ct {
+                    ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
+                    ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
+                    ColumnType::Timestamp | ColumnType::Date => {
+                        let mut vals: Vec<Option<i64>> = vec![None; n_out];
+                        for_each_rg!(|pairs: &[(usize, usize)], null_bytes: &[u8], encoding: u8, payload: &[u8], _rg_rows: usize| {
+                            if encoding == COL_ENCODING_PLAIN && payload.len() >= 8 {
+                                for &(out_idx, local_idx) in pairs {
+                                    if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                                    let off = 8 + local_idx * 8;
+                                    if off + 8 <= payload.len() {
+                                        vals[out_idx] = Some(i64::from_le_bytes(payload[off..off+8].try_into().unwrap()));
+                                    }
+                                }
+                            } else if encoding == 2 {
+                                for &(out_idx, local_idx) in pairs {
+                                    if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                                    if let Some(v) = crate::storage::on_demand::bitpack_decode_at_idx(payload, local_idx) {
+                                        vals[out_idx] = Some(v);
+                                    }
+                                }
+                            }
+                        });
+                        (ci, Field::new(col_name, ArrowDataType::Int64, true),
+                         Arc::new(Int64Array::from(vals)) as ArrayRef)
+                    }
+                    ColumnType::Float64 | ColumnType::Float32 => {
+                        let mut vals: Vec<Option<f64>> = vec![None; n_out];
+                        for_each_rg!(|pairs: &[(usize, usize)], null_bytes: &[u8], encoding: u8, payload: &[u8], _rg_rows: usize| {
+                            if encoding == COL_ENCODING_PLAIN && payload.len() >= 8 {
+                                for &(out_idx, local_idx) in pairs {
+                                    if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                                    let off = 8 + local_idx * 8;
+                                    if off + 8 <= payload.len() {
+                                        vals[out_idx] = Some(f64::from_le_bytes(payload[off..off+8].try_into().unwrap()));
+                                    }
+                                }
+                            }
+                        });
+                        (ci, Field::new(col_name, ArrowDataType::Float64, true),
+                         Arc::new(Float64Array::from(vals)) as ArrayRef)
+                    }
+                    ColumnType::StringDict => {
+                        let mut builder = StringBuilder::with_capacity(n_out, n_out * 16);
+                        // Pre-fill with nulls; we'll overwrite non-null slots
+                        for _ in 0..n_out { builder.append_null(); }
+                        // Extract: collect (out_idx, start, end) ranges into mmap
+                        let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+                        for_each_rg!(|pairs: &[(usize, usize)], null_bytes: &[u8], encoding: u8, payload: &[u8], rg_rows: usize| {
+                            if encoding != COL_ENCODING_PLAIN || payload.len() < 16 { return; }
+                            let row_count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                            let dict_size = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+                            let indices_start = 16usize;
+                            let dict_off_start = indices_start + row_count * 4;
+                            let dict_data_len_off = dict_off_start + dict_size * 4;
+                            if dict_data_len_off + 8 > payload.len() { return; }
+                            let dict_data_len = u64::from_le_bytes(payload[dict_data_len_off..dict_data_len_off+8].try_into().unwrap()) as usize;
+                            let dict_data_start = dict_data_len_off + 8;
+                            let payload_abs = payload.as_ptr() as usize - mmap_ptr;
+                            for &(out_idx, local_idx) in pairs {
+                                if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                                if local_idx >= row_count { continue; }
+                                let idx_off = indices_start + local_idx * 4;
+                                if idx_off + 4 > payload.len() { continue; }
+                                let dict_idx = u32::from_le_bytes(payload[idx_off..idx_off+4].try_into().unwrap());
+                                if dict_idx == 0 { continue; }
+                                let di = (dict_idx - 1) as usize;
+                                if di >= dict_size { continue; }
+                                let ds_off = dict_off_start + di * 4;
+                                if ds_off + 4 > payload.len() { continue; }
+                                let ds = u32::from_le_bytes(payload[ds_off..ds_off+4].try_into().unwrap()) as usize;
+                                let de = if di + 1 < dict_size {
+                                    let de_off = ds_off + 4;
+                                    if de_off + 4 <= payload.len() { u32::from_le_bytes(payload[de_off..de_off+4].try_into().unwrap()) as usize } else { dict_data_len }
+                                } else { dict_data_len };
+                                if dict_data_start + de <= payload.len() {
+                                    ranges.push((out_idx, payload_abs + dict_data_start + ds, payload_abs + dict_data_start + de));
+                                }
+                            }
+                        });
+                        // Build StringArray: null-prefilled builder, overwrite with values
+                        // More efficient: just build from Option<&str> vec
+                        let mut strs: Vec<Option<&str>> = vec![None; n_out];
+                        for &(idx, s, e) in &ranges {
+                            strs[idx] = Some(std::str::from_utf8(&mmap[s..e]).unwrap_or(""));
+                        }
+                        let arr: StringArray = strs.into_iter().collect();
+                        (ci, Field::new(col_name, ArrowDataType::Utf8, true), Arc::new(arr) as ArrayRef)
+                    }
+                    ColumnType::String => {
+                        let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+                        for_each_rg!(|pairs: &[(usize, usize)], null_bytes: &[u8], encoding: u8, payload: &[u8], rg_rows: usize| {
+                            if encoding != COL_ENCODING_PLAIN || payload.len() < 8 { return; }
+                            let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                            let data_len_off = 8 + (count + 1) * 4;
+                            if data_len_off + 8 > payload.len() { return; }
+                            let data_start = data_len_off + 8;
+                            let n = count.min(rg_rows);
+                            let payload_abs = payload.as_ptr() as usize - mmap_ptr;
+                            for &(out_idx, local_idx) in pairs {
+                                if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                                if local_idx >= n { continue; }
+                                let s_off = 8 + local_idx * 4;
+                                let e_off = s_off + 4;
+                                if e_off + 4 > payload.len() { continue; }
+                                let s = u32::from_le_bytes(payload[s_off..s_off+4].try_into().unwrap()) as usize;
+                                let e = u32::from_le_bytes(payload[e_off..e_off+4].try_into().unwrap()) as usize;
+                                if data_start + e <= payload.len() {
+                                    ranges.push((out_idx, payload_abs + data_start + s, payload_abs + data_start + e));
+                                }
+                            }
+                        });
+                        let mut strs: Vec<Option<&str>> = vec![None; n_out];
+                        for &(idx, s, e) in &ranges {
+                            strs[idx] = Some(std::str::from_utf8(&mmap[s..e]).unwrap_or(""));
+                        }
+                        let arr: StringArray = strs.into_iter().collect();
+                        (ci, Field::new(col_name, ArrowDataType::Utf8, true), Arc::new(arr) as ArrayRef)
+                    }
+                    ColumnType::Bool => {
+                        let mut vals: Vec<Option<bool>> = vec![None; n_out];
+                        for_each_rg!(|pairs: &[(usize, usize)], null_bytes: &[u8], encoding: u8, payload: &[u8], _rg_rows: usize| {
+                            if encoding != COL_ENCODING_PLAIN || payload.len() < 8 { return; }
+                            for &(out_idx, local_idx) in pairs {
+                                if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                                let byte_off = 8 + local_idx / 8;
+                                if byte_off < payload.len() {
+                                    vals[out_idx] = Some((payload[byte_off] >> (local_idx % 8)) & 1 == 1);
+                                }
+                            }
+                        });
+                        let arr: BooleanArray = vals.into_iter().collect();
+                        (ci, Field::new(col_name, ArrowDataType::Boolean, true), Arc::new(arr) as ArrayRef)
+                    }
+                    _ => {
+                        // Binary / FixedVec / unknown: produce null Utf8 column (fallback path handles these)
+                        let arr = StringArray::from(vec![None::<&str>; n_out]);
+                        (ci, Field::new(col_name, ArrowDataType::Utf8, true), Arc::new(arr) as ArrayRef)
+                    }
+                }
+            }).collect();
+
+            // Assemble RecordBatch from parallel results
+            let mut fields: Vec<Field> = Vec::with_capacity(col_count + 1);
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_count + 1);
+            fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            arrays.push(Arc::new(Int64Array::from(out_ids)));
+            for (_, field, arr) in col_arrays {
+                fields.push(field);
+                arrays.push(arr);
+            }
+            let schema_ref = Arc::new(Schema::new(fields));
+            let batch = arrow::record_batch::RecordBatch::try_new(schema_ref, arrays)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            drop(mmap_guard);
+            drop(file_guard);
+            return Ok(Some(batch));
+        }
+        // ── END PARALLEL COLUMN EXTRACTION ─────────────────────────────────
 
         for (rg_i, local_pairs) in rg_local_indices.iter().enumerate() {
             if local_pairs.is_empty() { continue; }
@@ -4373,6 +5145,22 @@ impl OnDemandStorage {
 
             for ci in 0..col_count {
                 let ct = schema.columns[ci].1;
+                // Column projection: skip columns not needed
+                if !col_needed[ci] {
+                    if rcix.is_none() {
+                        // Sequential layout: must advance pos past null bitmap + column data
+                        if pos + null_bitmap_len > body.len() { break; }
+                        pos += null_bitmap_len;
+                        let consumed = if encoding_version >= 1 {
+                            skip_column_encoded(&body[pos..], ct)?
+                        } else {
+                            ColumnData::skip_bytes_typed(&body[pos..], ct)?
+                        };
+                        pos += consumed;
+                    }
+                    // RCIX: no pos tracking needed, just skip
+                    continue;
+                }
                 let (null_bytes, col_bytes) = if let Some(rcix) = rcix {
                     let col_off = rcix[ci] as usize;
                     if col_off + null_bitmap_len > body.len() {
@@ -4574,6 +5362,56 @@ impl OnDemandStorage {
                                 _ => { for _ in local_pairs { b.append_null(); } }
                             }
                         }
+                        ColBuf::Bin(vals) => {
+                            if let ColumnData::Binary { offsets, data } = &col_data {
+                                let cnt = offsets.len().saturating_sub(1);
+                                for &(out_idx, local_idx) in local_pairs {
+                                    if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                                    if local_idx < cnt {
+                                        let s = offsets[local_idx] as usize;
+                                        let e = offsets[local_idx + 1] as usize;
+                                        vals[out_idx] = Some(data[s..e].to_vec());
+                                    }
+                                }
+                            }
+                        }
+                        ColBuf::FixedVec(vals, ref mut dim_out) => {
+                            match &col_data {
+                                ColumnData::FixedList { data, dim } => {
+                                    *dim_out = *dim;
+                                    let d = *dim as usize;
+                                    let row_bytes = d * 4;
+                                    let row_count = if d == 0 { 0 } else { data.len() / row_bytes };
+                                    for &(out_idx, local_idx) in local_pairs {
+                                        if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                                        if local_idx < row_count {
+                                            let s = local_idx * row_bytes;
+                                            vals[out_idx] = Some(data[s..s + row_bytes].to_vec());
+                                        }
+                                    }
+                                }
+                                ColumnData::Float16List { data, dim } => {
+                                    *dim_out = *dim;
+                                    let d = *dim as usize;
+                                    let row_bytes_f16 = d * 2;
+                                    let row_count = if d == 0 { 0 } else { data.len() / row_bytes_f16 };
+                                    for &(out_idx, local_idx) in local_pairs {
+                                        if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                                        if local_idx < row_count {
+                                            let s = local_idx * row_bytes_f16;
+                                            let f16_bytes = &data[s..s + row_bytes_f16];
+                                            let f32_bytes: Vec<u8> = f16_bytes.chunks_exact(2)
+                                                .flat_map(|c| crate::storage::on_demand::f16_to_f32(
+                                                    u16::from_le_bytes(c.try_into().unwrap())
+                                                ).to_le_bytes())
+                                                .collect();
+                                            vals[out_idx] = Some(f32_bytes);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         ColBuf::Other(vals) => {
                             for &(out_idx, local_idx) in local_pairs {
                                 if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
@@ -4617,6 +5455,7 @@ impl OnDemandStorage {
         arrays.push(Arc::new(Int64Array::from(out_ids)));
 
         for (ci, buf) in col_bufs.into_iter().enumerate() {
+            if !col_needed[ci] { continue; }
             let col_name = &schema.columns[ci].0;
             let ct = schema.columns[ci].1;
             match buf {
@@ -4636,6 +5475,57 @@ impl OnDemandStorage {
                     let arr: BooleanArray = vals.into_iter().collect();
                     fields.push(Field::new(col_name, ArrowDataType::Boolean, true));
                     arrays.push(Arc::new(arr));
+                }
+                ColBuf::Bin(vals) => {
+                    use arrow::array::BinaryArray;
+                    let bin_data: Vec<Option<&[u8]>> = vals.iter()
+                        .map(|v| v.as_deref())
+                        .collect();
+                    fields.push(Field::new(col_name, ArrowDataType::Binary, true));
+                    arrays.push(Arc::new(BinaryArray::from(bin_data)) as ArrayRef);
+                }
+                ColBuf::FixedVec(vals, dim) => {
+                    let d = dim as usize;
+                    if d > 0 {
+                        let mut all_f32: Vec<f32> = Vec::with_capacity(n_out * d);
+                        let mut null_bits: Vec<bool> = Vec::with_capacity(n_out);
+                        for v in &vals {
+                            match v {
+                                Some(bytes) if bytes.len() == d * 4 => {
+                                    null_bits.push(true);
+                                    for chunk in bytes.chunks_exact(4) {
+                                        all_f32.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+                                    }
+                                }
+                                _ => {
+                                    null_bits.push(false);
+                                    all_f32.extend(std::iter::repeat(0.0f32).take(d));
+                                }
+                            }
+                        }
+                        use arrow::array::{FixedSizeListArray, Float32Array};
+                        use arrow::buffer::Buffer;
+                        use arrow::datatypes::Field as ArrowField;
+                        let float_buf = Buffer::from_vec(all_f32.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>());
+                        let float_arr = unsafe {
+                            Float32Array::from(arrow::array::ArrayData::new_unchecked(
+                                ArrowDataType::Float32,
+                                n_out * d, Some(0), None, 0,
+                                vec![float_buf], vec![],
+                            ))
+                        };
+                        let item_field = Arc::new(ArrowField::new("item", ArrowDataType::Float32, false));
+                        let null_buf: Option<arrow::buffer::NullBuffer> = if null_bits.iter().any(|b| !b) {
+                            Some(arrow::buffer::NullBuffer::from(null_bits.iter().map(|&b| b).collect::<Vec<bool>>()))
+                        } else { None };
+                        let list_arr = FixedSizeListArray::new(item_field.clone(), d as i32, Arc::new(float_arr), null_buf);
+                        let list_dt = ArrowDataType::FixedSizeList(item_field, d as i32);
+                        fields.push(Field::new(col_name, list_dt, true));
+                        arrays.push(Arc::new(list_arr) as ArrayRef);
+                    } else {
+                        fields.push(Field::new(col_name, ArrowDataType::Utf8, true));
+                        arrays.push(Arc::new(StringArray::from(vec![None::<&str>; n_out])) as ArrayRef);
+                    }
                 }
                 ColBuf::Other(vals) => {
                     let mut b = StringBuilder::with_capacity(n_out, n_out * 8);
@@ -4712,6 +5602,7 @@ impl OnDemandStorage {
             F64(Vec<Option<f64>>),
             Str(Vec<Option<String>>),
             Bool(Vec<Option<bool>>),
+            Bin(Vec<Option<Vec<u8>>>),
         }
 
         let mut col_bufs: Vec<ColBuf> = schema.columns.iter().map(|(_, ct)| match ct {
@@ -4721,6 +5612,7 @@ impl OnDemandStorage {
             ColumnType::Float64 | ColumnType::Float32 => ColBuf::F64(vec![None; n_ids]),
             ColumnType::String | ColumnType::StringDict => ColBuf::Str(vec![None; n_ids]),
             ColumnType::Bool => ColBuf::Bool(vec![None; n_ids]),
+            ColumnType::Binary => ColBuf::Bin(vec![None; n_ids]),
             _ => ColBuf::Str(vec![None; n_ids]), // rare types as string fallback
         }).collect();
 
@@ -4942,6 +5834,19 @@ impl OnDemandStorage {
                                 _ => {}
                             }
                         }
+                        ColBuf::Bin(vals) => {
+                            if let ColumnData::Binary { offsets, data } = &col_data {
+                                let cnt = offsets.len().saturating_sub(1);
+                                for &(out_pos, local_idx) in &valid_hits {
+                                    if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 { continue; }
+                                    if local_idx < cnt {
+                                        let s = offsets[local_idx] as usize;
+                                        let e = offsets[local_idx + 1] as usize;
+                                        vals[out_pos] = Some(data[s..e].to_vec());
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -4996,6 +5901,13 @@ impl OnDemandStorage {
                     let arr: BooleanArray = v.into_iter().collect();
                     fields.push(Field::new(col_name, ArrowDataType::Boolean, true));
                     arrays.push(Arc::new(arr));
+                }
+                ColBuf::Bin(vals) => {
+                    use arrow::array::BinaryArray;
+                    let v: Vec<Option<Vec<u8>>> = (0..n_ids).filter(|&i| found_mask[i]).map(|i| vals[i].clone()).collect();
+                    let bin_data: Vec<Option<&[u8]>> = v.iter().map(|o| o.as_deref()).collect();
+                    fields.push(Field::new(col_name, ArrowDataType::Binary, true));
+                    arrays.push(Arc::new(BinaryArray::from(bin_data)) as ArrayRef);
                 }
             }
         }

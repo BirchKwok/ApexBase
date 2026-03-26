@@ -2828,8 +2828,14 @@ impl ApexExecutor {
                         .map(|i| if ba.is_null(i) { None } else { Some((ba.value(i).len() / 4) as i64) })
                         .collect();
                     Ok(Arc::new(Int64Array::from(result)) as ArrayRef)
+                } else if let Some(fsl) = arr.as_any().downcast_ref::<arrow::array::FixedSizeListArray>() {
+                    let dim = fsl.value_length() as i64;
+                    let result: Vec<Option<i64>> = (0..fsl.len())
+                        .map(|i| if fsl.is_null(i) { None } else { Some(dim) })
+                        .collect();
+                    Ok(Arc::new(Int64Array::from(result)) as ArrayRef)
                 } else {
-                    Err(err_input("VECTOR_DIM requires a binary vector column"))
+                    Err(err_input("VECTOR_DIM requires a binary or fixed-size list vector column"))
                 }
             }
             "VECTOR_NORM" | "L2_NORM" => {
@@ -2849,8 +2855,21 @@ impl ApexExecutor {
                         })
                         .collect();
                     Ok(Arc::new(Float64Array::from(result)) as ArrayRef)
+                } else if let Some(fsl) = arr.as_any().downcast_ref::<arrow::array::FixedSizeListArray>() {
+                    let values = fsl.values().as_any().downcast_ref::<arrow::array::Float32Array>()
+                        .ok_or_else(|| err_input("VECTOR_NORM: FixedSizeList must contain Float32"))?;
+                    let dim = fsl.value_length() as usize;
+                    let result: Vec<Option<f64>> = (0..fsl.len())
+                        .map(|i| {
+                            if fsl.is_null(i) { return None; }
+                            let offset = i * dim;
+                            let sum_sq: f64 = (0..dim).map(|j| { let v = values.value(offset + j) as f64; v * v }).sum();
+                            Some(sum_sq.sqrt())
+                        })
+                        .collect();
+                    Ok(Arc::new(Float64Array::from(result)) as ArrayRef)
                 } else {
-                    Err(err_input("VECTOR_NORM requires a binary vector column"))
+                    Err(err_input("VECTOR_NORM requires a binary or fixed-size list vector column"))
                 }
             }
             "VECTOR_TO_STRING" | "ARRAY_TO_STRING" => {
@@ -2868,8 +2887,21 @@ impl ApexExecutor {
                         })
                         .collect();
                     Ok(Arc::new(StringArray::from(result)) as ArrayRef)
+                } else if let Some(fsl) = arr.as_any().downcast_ref::<arrow::array::FixedSizeListArray>() {
+                    let values = fsl.values().as_any().downcast_ref::<arrow::array::Float32Array>()
+                        .ok_or_else(|| err_input("VECTOR_TO_STRING: FixedSizeList must contain Float32"))?;
+                    let dim = fsl.value_length() as usize;
+                    let result: Vec<Option<String>> = (0..fsl.len())
+                        .map(|i| {
+                            if fsl.is_null(i) { return None; }
+                            let offset = i * dim;
+                            let floats: Vec<String> = (0..dim).map(|j| values.value(offset + j).to_string()).collect();
+                            Some(format!("[{}]", floats.join(",")))
+                        })
+                        .collect();
+                    Ok(Arc::new(StringArray::from(result)) as ArrayRef)
                 } else {
-                    Err(err_input("VECTOR_TO_STRING requires a binary vector column"))
+                    Err(err_input("VECTOR_TO_STRING requires a binary or fixed-size list vector column"))
                 }
             }
             _ => Err(io::Error::new(

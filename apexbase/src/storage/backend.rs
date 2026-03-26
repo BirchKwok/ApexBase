@@ -1728,6 +1728,7 @@ impl TableStorageBackend {
     pub fn read_columns_by_indices_to_arrow(
         &self,
         row_indices: &[usize],
+        col_refs: Option<&[&str]>,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
         use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
@@ -1737,13 +1738,13 @@ impl TableStorageBackend {
             return self.read_columns_to_arrow(None, 0, Some(0));
         }
 
-        // V4 mmap-only: always use indexed extraction — never load the full table
-        if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
-            if let Some(batch) = self.storage.extract_rows_by_indices_to_arrow(row_indices)? {
+        // V4: use mmap indexed extraction when available (faster than full-table read + take)
+        if self.storage.is_v4_format() {
+            if let Some(batch) = self.storage.extract_rows_by_indices_to_arrow(row_indices, col_refs)? {
                 return Ok(batch);
             }
             // Fallback (extraction returned None) — load full table
-            let full_batch = self.read_columns_to_arrow(None, 0, None)?;
+            let full_batch = self.read_columns_to_arrow(col_refs, 0, None)?;
             if full_batch.num_rows() == 0 {
                 return Ok(full_batch);
             }
@@ -1768,8 +1769,18 @@ impl TableStorageBackend {
         fields.push(Field::new("_id", ArrowDataType::Int64, false));
         arrays.push(Arc::new(Int64Array::from(filtered_ids)));
 
+        // Build column filter set if col_refs provided
+        let col_set: Option<std::collections::HashSet<&str>> = col_refs.map(|refs| {
+            refs.iter().copied().collect()
+        });
+
         // Read each column for the specified row indices
         for (col_name, _dt) in schema.iter() {
+            if let Some(ref set) = col_set {
+                if !set.iter().any(|r| r.eq_ignore_ascii_case(col_name)) {
+                    continue;
+                }
+            }
             let col_data = self.storage.read_column_by_indices(col_name, row_indices)?;
             
             let (arrow_dt, array): (ArrowDataType, ArrayRef) = match col_data {
@@ -1862,6 +1873,10 @@ impl TableStorageBackend {
                         Value::Float64(v) => (ArrowDataType::Float64, Arc::new(Float64Array::from(vec![*v]))),
                         Value::String(s) => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![s.as_str()]))),
                         Value::Bool(b) => (ArrowDataType::Boolean, Arc::new(BooleanArray::from(vec![*b]))),
+                        Value::Binary(bytes) => {
+                            use arrow::array::BinaryArray;
+                            (ArrowDataType::Binary, Arc::new(BinaryArray::from(vec![Some(bytes.as_slice())])) as ArrayRef)
+                        }
                         Value::Null => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![None as Option<&str>]))),
                         _ => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![None as Option<&str>]))),
                     };
@@ -2096,7 +2111,7 @@ impl TableStorageBackend {
                 if indices.is_empty() {
                     return self.read_columns_to_arrow(column_names, 0, Some(0));
                 }
-                return self.read_columns_by_indices_to_arrow(&indices);
+                return self.read_columns_by_indices_to_arrow(&indices, column_names);
             }
         }
 
@@ -2553,6 +2568,16 @@ impl TableStorageBackend {
     /// Mmap-level numeric range scan: find matching row indices without Arrow arrays.
     pub fn scan_numeric_range_mmap(&self, col_name: &str, low: f64, high: f64, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
         self.storage.scan_numeric_range_mmap(col_name, low, high, limit)
+    }
+
+    /// Mmap-level numeric IN scan: find rows where col_name IN (v1, v2, ...).
+    pub fn scan_numeric_in_mmap(&self, col_name: &str, values: &[i64], limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
+        self.storage.scan_numeric_in_mmap(col_name, values, limit)
+    }
+
+    /// Scan multiple predicates in parallel on a single shared mmap (one lock acquisition).
+    pub fn scan_multi_predicates_parallel(&self, predicates: &[crate::storage::on_demand::MmapScanPred]) -> io::Result<Option<Vec<usize>>> {
+        self.storage.scan_multi_predicates_parallel(predicates)
     }
 
     /// Mmap-level boolean equality scan: find matching row indices without Arrow arrays.

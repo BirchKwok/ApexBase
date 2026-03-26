@@ -316,6 +316,21 @@ class SQLiteBench:
             "SELECT * FROM bench WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"
         ).fetchall()
 
+    def bench_filter_numeric_in(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE age IN (20, 25, 30, 35, 40, 45, 50, 55, 60)"
+        ).fetchall()
+
+    def bench_filter_or_cross_col(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE age = 25 OR city = 'Beijing'"
+        ).fetchall()
+
+    def bench_filter_numeric_or(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE age = 20 OR age = 30 OR age = 40 OR age = 50"
+        ).fetchall()
+
     def bench_update_1k(self):
         self.conn.execute("UPDATE bench SET score = 50.0 WHERE age = 25")
         self.conn.commit()
@@ -506,6 +521,21 @@ class DuckDBBench:
             "SELECT * FROM bench WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"
         ).fetchall()
 
+    def bench_filter_numeric_in(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE age IN (20, 25, 30, 35, 40, 45, 50, 55, 60)"
+        ).fetchall()
+
+    def bench_filter_or_cross_col(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE age = 25 OR city = 'Beijing'"
+        ).fetchall()
+
+    def bench_filter_numeric_or(self):
+        return self.conn.execute(
+            "SELECT * FROM bench WHERE age = 20 OR age = 30 OR age = 40 OR age = 50"
+        ).fetchall()
+
     def bench_update_1k(self):
         self.conn.execute("UPDATE bench SET score = 50.0 WHERE age = 25")
 
@@ -683,6 +713,21 @@ class ApexBaseBench:
             "SELECT * FROM default WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"
         )
 
+    def bench_filter_numeric_in(self):
+        return self.client.execute(
+            "SELECT * FROM default WHERE age IN (20, 25, 30, 35, 40, 45, 50, 55, 60)"
+        )
+
+    def bench_filter_or_cross_col(self):
+        return self.client.execute(
+            "SELECT * FROM default WHERE age = 25 OR city = 'Beijing'"
+        )
+
+    def bench_filter_numeric_or(self):
+        return self.client.execute(
+            "SELECT * FROM default WHERE age = 20 OR age = 30 OR age = 40 OR age = 50"
+        )
+
     def bench_update_1k(self):
         return self.client.execute(
             "UPDATE default SET score = 50.0 WHERE age = 25"
@@ -781,6 +826,9 @@ BENCHMARKS = [
     ("ORDER BY city,score DESC LIMIT100","bench_order_by_multi",   False, False, False, None),
     ("COUNT(DISTINCT city)",             "bench_count_distinct",   False, False, False, None),
     ("IN filter (city IN 3 cities)",     "bench_filter_in",        False, False, False, None),
+    ("Numeric IN (age IN 9 values)",      "bench_filter_numeric_in",False, False, False, None),
+    ("OR cross-col (age=25 OR city=BJ)",  "bench_filter_or_cross_col",False,False,False, None),
+    ("Numeric OR (age=20|30|40|50)",      "bench_filter_numeric_or",False, False, False, None),
     ("UPDATE rows (age=25, idempotent)", "bench_update_1k",        False, False, False, None),
     # --- Delete / Window / FTS ---
     ("Store+DELETE 1K (combined)",           "bench_delete_1k",         False, False, False, None),
