@@ -26,7 +26,7 @@ ARROW_AVAILABLE = True
 import polars as pl
 POLARS_AVAILABLE = True
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 
 
 class _InstanceRegistry:
