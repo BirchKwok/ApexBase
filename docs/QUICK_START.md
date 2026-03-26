@@ -202,6 +202,18 @@ results = client.execute("""
 client.close()
 ```
 
+### Quoted Identifiers
+
+If a column name is a SQL reserved keyword (e.g. `order`, `group`), wrap it in backticks or double quotes:
+
+```python
+# Backtick style (Hive/MySQL)
+results = client.execute("SELECT `order`, `group` FROM t WHERE `order` > 10")
+
+# Double-quote style (SQL standard)
+results = client.execute('SELECT "order", "group" FROM t WHERE "order" > 10')
+```
+
 ## Full-Text Search
 
 ```python

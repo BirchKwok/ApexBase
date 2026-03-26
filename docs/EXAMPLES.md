@@ -401,6 +401,41 @@ count = client.count_rows("users")  # Specific table
 client.close()
 ```
 
+### Quoted Identifiers (Reserved Keyword Column Names)
+
+```python
+client = ApexClient("./data")
+client.create_table("events")
+
+# Store data with columns named after SQL keywords
+client.store([
+    {"order": 1, "group": "A", "select": 100},
+    {"order": 2, "group": "B", "select": 200},
+    {"order": 3, "group": "A", "select": 150},
+])
+
+# Use backticks (Hive/MySQL style) to quote reserved keywords
+results = client.execute("SELECT `order`, `group` FROM events WHERE `order` > 1")
+print(results.to_pandas())
+
+# Double quotes (SQL standard) also work
+results = client.execute('SELECT "order", "group" FROM events ORDER BY "order" DESC')
+
+# GROUP BY with quoted column
+results = client.execute("""
+    SELECT `group`, COUNT(*), AVG(`select`)
+    FROM events
+    GROUP BY `group`
+""")
+for row in results:
+    print(row)
+
+# INSERT with quoted column names
+client.execute("INSERT INTO events (`order`, `group`, `select`) VALUES (4, 'C', 300)")
+
+client.close()
+```
+
 ### Using query() Method
 
 ```python

@@ -951,7 +951,37 @@ from apexbase import (
 
 ## SQL Support
 
-ApexBase supports standard SQL for querying:
+ApexBase supports standard SQL for querying.
+
+### Quoted Identifiers
+
+When a column name collides with a SQL reserved keyword (e.g. `order`, `group`, `select`, `table`), wrap it in **backticks** (Hive/MySQL style) or **double quotes** (SQL standard) so the parser treats it as an identifier instead of a keyword.
+
+| Style | Syntax | Example |
+|-------|--------|---------|
+| Backtick (Hive/MySQL) | `` `column` `` | `` SELECT `order`, `group` FROM t `` |
+| Double-quote (SQL standard) | `"column"` | `SELECT "order", "group" FROM t` |
+
+Both styles produce identical results — use whichever you prefer.
+
+**Examples:**
+
+```sql
+-- Backtick style
+SELECT `order`, `group`, `select` FROM orders WHERE `order` > 100 ORDER BY `order` DESC
+
+-- Double-quote style
+SELECT "order", "group", "select" FROM orders WHERE "order" > 100 ORDER BY "order" DESC
+
+-- Mixed (both styles in one query)
+SELECT `order`, "group" FROM orders
+
+-- Works in all clauses: SELECT, WHERE, ORDER BY, GROUP BY, HAVING, INSERT, etc.
+INSERT INTO t (`order`, `group`) VALUES (1, 'A')
+SELECT `group`, COUNT(*) FROM t GROUP BY `group` HAVING COUNT(*) > 5
+```
+
+> **Tip:** Quoting is only needed when the column name is a reserved keyword. Regular column names like `name`, `age`, `city` do not need quoting.
 
 ### SELECT
 ```sql

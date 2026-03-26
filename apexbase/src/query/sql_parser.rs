@@ -786,6 +786,25 @@ impl SqlParser {
                 tokens.push(SpannedToken { token: Token::Identifier(ident), start: start0, end: i });
                 continue;
             }
+            // Backtick-quoted identifier: `identifier` (Hive/MySQL style)
+            if c == b'`' {
+                let start0 = i;
+                i += 1;
+                let start = i;
+                while i < len && bytes[i] != b'`' {
+                    i += 1;
+                }
+                if i >= len {
+                    return Err(ApexError::QueryParseError(format!(
+                        "Syntax error at byte {}: Unterminated backtick-quoted identifier",
+                        start0
+                    )));
+                }
+                let ident = sql[start..i].to_string();
+                i += 1;
+                tokens.push(SpannedToken { token: Token::Identifier(ident), start: start0, end: i });
+                continue;
+            }
             if c == b'\'' {
                 let start0 = i;
                 i += 1;
@@ -4151,5 +4170,58 @@ mod tests {
         } else {
             panic!("Expected CreateTable");
         }
+    }
+
+    // ====== Backtick-quoted identifier parsing ======
+
+    #[test]
+    fn test_backtick_quoted_select() {
+        let sql = "SELECT `order`, `group`, `select` FROM t";
+        let stmt = SqlParser::parse(sql).unwrap();
+        let SqlStatement::Select(s) = stmt else {
+            panic!("expected select");
+        };
+        assert_eq!(s.columns.len(), 3);
+        match &s.columns[0] {
+            SelectColumn::Column(c) => assert_eq!(c, "order"),
+            other => panic!("unexpected column: {:?}", other),
+        }
+        match &s.columns[1] {
+            SelectColumn::Column(c) => assert_eq!(c, "group"),
+            other => panic!("unexpected column: {:?}", other),
+        }
+        match &s.columns[2] {
+            SelectColumn::Column(c) => assert_eq!(c, "select"),
+            other => panic!("unexpected column: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_backtick_quoted_where() {
+        let sql = "SELECT * FROM t WHERE `order` > 10";
+        let stmt = SqlParser::parse(sql).unwrap();
+        let SqlStatement::Select(s) = stmt else {
+            panic!("expected select");
+        };
+        assert!(s.where_clause.is_some());
+    }
+
+    #[test]
+    fn test_backtick_quoted_order_by() {
+        let sql = "SELECT `order` FROM t ORDER BY `order` DESC";
+        let stmt = SqlParser::parse(sql).unwrap();
+        let SqlStatement::Select(s) = stmt else {
+            panic!("expected select");
+        };
+        assert_eq!(s.order_by.len(), 1);
+        assert_eq!(s.order_by[0].column, "order");
+        assert!(s.order_by[0].descending);
+    }
+
+    #[test]
+    fn test_backtick_unterminated_error() {
+        let err = SqlParser::parse("SELECT `order FROM t").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unterminated backtick-quoted identifier"));
     }
 }
