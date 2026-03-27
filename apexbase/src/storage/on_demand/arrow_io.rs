@@ -124,8 +124,9 @@ impl OnDemandStorage {
             }
         }
 
-        // Data columns
-        for &col_idx in &col_indices {
+        // Data columns — parallel for large tables with multiple columns
+        use arrow::array::ArrayRef;
+        let convert_column = |col_idx: usize| -> io::Result<(Field, ArrayRef)> {
             let (col_name, _col_type) = &schema.columns[col_idx];
             let col_data = if col_idx < columns.len() { Some(&columns[col_idx]) } else { None };
 
@@ -310,12 +311,22 @@ impl OnDemandStorage {
                                 (ArrowDataType::Utf8, Arc::new(StringArray::from_iter_values(strings)))
                             }
                         } else {
-                            let strings: Vec<&str> = (0..row_count).map(|i| {
-                                let start = offsets[i] as usize;
-                                let end = offsets[i + 1] as usize;
-                                std::str::from_utf8(&data[start..end]).unwrap_or("")
-                            }).collect();
-                            (ArrowDataType::Utf8, Arc::new(StringArray::from_iter_values(strings)))
+                            // OPTIMIZATION: build StringArray directly from u32 offsets + data bytes
+                            // Avoids intermediate Vec<&str> and per-string from_utf8 validation
+                            let data_end = offsets[row_count] as usize;
+                            let mut offsets_i32: Vec<i32> = Vec::with_capacity(row_count + 1);
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    offsets[..row_count + 1].as_ptr() as *const i32,
+                                    offsets_i32.as_mut_ptr(),
+                                    row_count + 1,
+                                );
+                                offsets_i32.set_len(row_count + 1);
+                            }
+                            let offset_buf = unsafe { arrow::buffer::OffsetBuffer::new_unchecked(ScalarBuffer::from(offsets_i32)) };
+                            let data_buf = Buffer::from_slice_ref(&data[..data_end]);
+                            // SAFETY: data written by our storage engine is valid UTF-8
+                            (ArrowDataType::Utf8, Arc::new(unsafe { StringArray::new_unchecked(offset_buf, data_buf, None) }) as ArrayRef)
                         }
                     }
                 }
@@ -475,8 +486,24 @@ impl OnDemandStorage {
                 }
             };
 
-            fields.push(Field::new(col_name, arrow_dt, true));
-            arrays.push(array);
+            Ok((Field::new(col_name, arrow_dt, true), array))
+        };
+
+        if active_count >= 50_000 && col_indices.len() >= 2 {
+            use rayon::prelude::*;
+            let results: Vec<io::Result<(Field, ArrayRef)>> = col_indices.par_iter()
+                .map(|&ci| convert_column(ci)).collect();
+            for r in results {
+                let (f, a) = r?;
+                fields.push(f);
+                arrays.push(a);
+            }
+        } else {
+            for &ci in &col_indices {
+                let (f, a) = convert_column(ci)?;
+                fields.push(f);
+                arrays.push(a);
+            }
         }
 
         let arrow_schema = Arc::new(Schema::new(fields));

@@ -407,38 +407,84 @@ impl OnDemandStorage {
                 }
 
                 // Direct column reads via RCIX — no sequential scan of preceding columns
-                for (out_pos, &col_idx) in col_indices.iter().enumerate() {
-                    if col_idx >= col_offsets.len() {
-                        // Schema evolution: column added after this RG was written
+                // OPTIMIZATION: parallelize column reads for large RGs with multiple columns
+                if rows_to_take >= 50_000 && col_indices.len() >= 2 {
+                    use rayon::prelude::*;
+                    let create_default = Self::create_default_column;
+                    let rg_col_results: Vec<io::Result<(ColumnData, Vec<bool>)>> = col_indices.par_iter()
+                        .map(|&col_idx| {
+                            if col_idx >= col_offsets.len() {
+                                let col_type = schema.columns[col_idx].1;
+                                let default_col = create_default(col_type, rows_to_take);
+                                let nulls = vec![true; rows_to_take];
+                                return Ok((default_col, nulls));
+                            }
+                            let col_abs = rg_body_abs + col_offsets[col_idx] as usize;
+                            if col_abs + null_bitmap_len > mmap_ref.len() {
+                                let col_type = schema.columns[col_idx].1;
+                                return Ok((create_default(col_type, rows_to_take), vec![true; rows_to_take]));
+                            }
+                            let null_bytes = &mmap_ref[col_abs..col_abs + null_bitmap_len];
+                            let data_abs = col_abs + null_bitmap_len;
+                            if data_abs >= mmap_ref.len() {
+                                let col_type = schema.columns[col_idx].1;
+                                return Ok((create_default(col_type, rows_to_take), vec![true; rows_to_take]));
+                            }
+                            let col_type = schema.columns[col_idx].1;
+                            let (col_data, _) = if rows_to_take < rg_rows {
+                                read_column_encoded_partial(&mmap_ref[data_abs..], col_type, rows_to_take)?
+                            } else {
+                                read_column_encoded(&mmap_ref[data_abs..], col_type)?
+                            };
+                            let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                                col_data.decode_string_dict()
+                            } else {
+                                col_data
+                            };
+                            let mut nulls = Vec::with_capacity(rows_to_take);
+                            for i in 0..rows_to_take {
+                                nulls.push((null_bytes[i / 8] >> (i % 8)) & 1 == 1);
+                            }
+                            Ok((col_data, nulls))
+                        }).collect();
+                    for (out_pos, result) in rg_col_results.into_iter().enumerate() {
+                        let (col_data, nulls) = result?;
+                        col_accumulators[out_pos].append(&col_data);
+                        null_accumulators[out_pos].extend(nulls);
+                    }
+                } else {
+                    for (out_pos, &col_idx) in col_indices.iter().enumerate() {
+                        if col_idx >= col_offsets.len() {
+                            let col_type = schema.columns[col_idx].1;
+                            let default_col = Self::create_default_column(col_type, rows_to_take);
+                            col_accumulators[out_pos].append(&default_col);
+                            null_accumulators[out_pos].extend(std::iter::repeat(true).take(rows_to_take));
+                            continue;
+                        }
+                        let col_abs = rg_body_abs + col_offsets[col_idx] as usize;
+                        if col_abs + null_bitmap_len > mmap_ref.len() {
+                            continue;
+                        }
+                        let null_bytes = &mmap_ref[col_abs..col_abs + null_bitmap_len];
+                        let data_abs = col_abs + null_bitmap_len;
+                        if data_abs >= mmap_ref.len() {
+                            continue;
+                        }
                         let col_type = schema.columns[col_idx].1;
-                        let default_col = Self::create_default_column(col_type, rows_to_take);
-                        col_accumulators[out_pos].append(&default_col);
-                        null_accumulators[out_pos].extend(std::iter::repeat(true).take(rows_to_take));
-                        continue;
-                    }
-                    let col_abs = rg_body_abs + col_offsets[col_idx] as usize;
-                    if col_abs + null_bitmap_len > mmap_ref.len() {
-                        continue;
-                    }
-                    let null_bytes = &mmap_ref[col_abs..col_abs + null_bitmap_len];
-                    let data_abs = col_abs + null_bitmap_len;
-                    if data_abs >= mmap_ref.len() {
-                        continue;
-                    }
-                    let col_type = schema.columns[col_idx].1;
-                    let (col_data, _) = if rows_to_take < rg_rows {
-                        read_column_encoded_partial(&mmap_ref[data_abs..], col_type, rows_to_take)?
-                    } else {
-                        read_column_encoded(&mmap_ref[data_abs..], col_type)?
-                    };
-                    let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
-                        col_data.decode_string_dict()
-                    } else {
-                        col_data
-                    };
-                    col_accumulators[out_pos].append(&col_data);
-                    for i in 0..rows_to_take {
-                        null_accumulators[out_pos].push((null_bytes[i / 8] >> (i % 8)) & 1 == 1);
+                        let (col_data, _) = if rows_to_take < rg_rows {
+                            read_column_encoded_partial(&mmap_ref[data_abs..], col_type, rows_to_take)?
+                        } else {
+                            read_column_encoded(&mmap_ref[data_abs..], col_type)?
+                        };
+                        let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                            col_data.decode_string_dict()
+                        } else {
+                            col_data
+                        };
+                        col_accumulators[out_pos].append(&col_data);
+                        for i in 0..rows_to_take {
+                            null_accumulators[out_pos].push((null_bytes[i / 8] >> (i % 8)) & 1 == 1);
+                        }
                     }
                 }
 
@@ -608,8 +654,9 @@ impl OnDemandStorage {
             arrays.push(Arc::new(Int64Array::from(all_ids)));
         }
 
-        // Data columns
-        for (out_idx, &col_idx) in col_indices.iter().enumerate() {
+        // Data columns — parallel conversion for large tables
+        use arrow::array::ArrayRef;
+        let convert_mmap_column = |out_idx: usize, col_idx: usize| -> io::Result<(Field, ArrayRef)> {
             let (col_name, schema_col_type_ref) = &schema.columns[col_idx];
             let schema_col_type = *schema_col_type_ref;
             let col_data = &col_accumulators[out_idx];
@@ -675,12 +722,21 @@ impl OnDemandStorage {
                         }).collect();
                         (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
                     } else {
-                        let strings: Vec<&str> = (0..count.min(active_count)).map(|i| {
-                            let start = offsets[i] as usize;
-                            let end = offsets[i + 1] as usize;
-                            std::str::from_utf8(&data[start..end]).unwrap_or("")
-                        }).collect();
-                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                        // OPTIMIZATION: build StringArray directly from u32 offsets + data bytes
+                        let row_count = count.min(active_count);
+                        let data_end = offsets[row_count] as usize;
+                        let mut offsets_i32: Vec<i32> = Vec::with_capacity(row_count + 1);
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                offsets[..row_count + 1].as_ptr() as *const i32,
+                                offsets_i32.as_mut_ptr(),
+                                row_count + 1,
+                            );
+                            offsets_i32.set_len(row_count + 1);
+                        }
+                        let offset_buf = unsafe { arrow::buffer::OffsetBuffer::new_unchecked(ScalarBuffer::from(offsets_i32)) };
+                        let data_buf = Buffer::from_slice_ref(&data[..data_end]);
+                        (ArrowDataType::Utf8, Arc::new(unsafe { StringArray::new_unchecked(offset_buf, data_buf, None) }) as ArrayRef)
                     }
                 }
                 ColumnData::Bool { data: bool_data, len: bool_len } => {
@@ -791,8 +847,27 @@ impl OnDemandStorage {
                 }
             };
 
-            fields.push(Field::new(col_name, arrow_dt, true));
-            arrays.push(array);
+            Ok((Field::new(col_name, arrow_dt, true), array))
+        };
+
+        if active_count >= 50_000 && col_indices.len() >= 2 {
+            use rayon::prelude::*;
+            let results: Vec<io::Result<(Field, ArrayRef)>> = col_indices.iter().enumerate()
+                .collect::<Vec<_>>()
+                .par_iter()
+                .map(|&(out_idx, &col_idx)| convert_mmap_column(out_idx, col_idx))
+                .collect();
+            for r in results {
+                let (f, a) = r?;
+                fields.push(f);
+                arrays.push(a);
+            }
+        } else {
+            for (out_idx, &col_idx) in col_indices.iter().enumerate() {
+                let (f, a) = convert_mmap_column(out_idx, col_idx)?;
+                fields.push(f);
+                arrays.push(a);
+            }
         }
 
         let arrow_schema = Arc::new(Schema::new(fields));
