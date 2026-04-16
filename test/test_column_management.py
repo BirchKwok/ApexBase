@@ -49,7 +49,7 @@ class TestColumnAddition:
             client.store({"name": "Bob", "age": 30, "city": "NYC"})
             
             # Verify new data includes new column
-            result = client.retrieve(1)
+            result = client.retrieve(2)
             assert result is not None
             # The city field should be stored
             if "city" in result:
@@ -85,7 +85,7 @@ class TestColumnAddition:
             })
             
             # Verify data types are preserved in stored data
-            result = client.retrieve(1)
+            result = client.retrieve(2)
             assert result is not None
             assert result["age"] == 30
             assert result["salary"] == 50000.50
@@ -118,7 +118,7 @@ class TestColumnAddition:
             client.store({"name": "Diana", "age": 28, "city": "Boston"})
             
             # Verify the new record has the city
-            diana = client.retrieve(3)
+            diana = client.retrieve(4)
             assert diana is not None
             assert diana["name"] == "Diana"
             if "city" in diana:
@@ -143,7 +143,7 @@ class TestColumnAddition:
                 print(f"Duplicate column handled: {e}")
             
             # Verify data is still accessible
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             assert result["name"] == "Alice"
             
@@ -166,7 +166,7 @@ class TestColumnAddition:
                 print(f"Invalid type handled: {e}")
             
             # Verify data is still accessible
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             assert result["name"] == "Alice"
             
@@ -244,7 +244,7 @@ class TestColumnDeletion:
                 client.drop_column("city")
                 
                 # Verify existing records may no longer have the column
-                result = client.retrieve(0)
+                result = client.retrieve(1)
                 if result is not None:
                     # City should be dropped
                     assert "name" in result
@@ -271,7 +271,7 @@ class TestColumnDeletion:
                 print(f"Drop nonexistent: {e}")
             
             # Verify data is still accessible
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             assert result["name"] == "Alice"
             
@@ -291,7 +291,7 @@ class TestColumnDeletion:
                 client.drop_column("_id")
             
             # Verify _id column still exists (internally)
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             # _id should still be managed internally
             
             client.close()
@@ -321,7 +321,7 @@ class TestColumnDeletion:
                 print(f"Drop multiple: {e}")
             
             # Verify data is still accessible
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             assert result["name"] == "Alice"
             
@@ -349,7 +349,7 @@ class TestColumnDeletion:
             
             # Verify records are still accessible
             for i in range(3):
-                result = client.retrieve(i)
+                result = client.retrieve(i + 1)
                 assert result is not None
                 assert "name" in result
                 assert "age" in result
@@ -374,7 +374,7 @@ class TestColumnRenaming:
                 client.rename_column("city", "location")
                 
                 # Verify data is accessible
-                result = client.retrieve(0)
+                result = client.retrieve(1)
                 assert result is not None
             except Exception as e:
                 print(f"rename_column: {e}")
@@ -397,7 +397,7 @@ class TestColumnRenaming:
                 print(f"Rename nonexistent: {e}")
             
             # Verify data is still accessible
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             assert result["name"] == "Alice"
             
@@ -419,7 +419,7 @@ class TestColumnRenaming:
                 print(f"Rename to existing: {e}")
             
             # Verify data is still accessible
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             
             client.close()
@@ -438,7 +438,7 @@ class TestColumnRenaming:
                 client.rename_column("_id", "new_id")
             
             # Verify _id column is still managed internally
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             
             client.close()
     
@@ -464,7 +464,7 @@ class TestColumnRenaming:
             
             # Verify all records are still accessible
             for i in range(3):
-                result = client.retrieve(i)
+                result = client.retrieve(i + 1)
                 assert result is not None
                 assert "name" in result
             
@@ -487,7 +487,7 @@ class TestColumnRenaming:
                 assert "age" not in fields
                 
                 # Verify data is accessible
-                result = client.retrieve(0)
+                result = client.retrieve(1)
                 assert result["new_age_with_underscores"] == 25
             except Exception as e:
                 print(f"Special character rename not supported: {e}")
@@ -615,7 +615,7 @@ class TestColumnOperationsEdgeCases:
             
             # Store some data to verify
             client.store({"test": "data"})
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             
             client.close()
@@ -670,7 +670,7 @@ class TestColumnOperationsEdgeCases:
             assert add_time < 10.0
             
             # Verify data is still accessible
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             assert result["id"] == 0
             
@@ -698,7 +698,7 @@ class TestColumnOperationsEdgeCases:
                 print(f"add_column various: {e}")
             
             # Verify existing data is preserved
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             assert result["string_field"] == "test_string"
             assert result["int_field"] == 42
@@ -727,12 +727,12 @@ class TestColumnOperationsEdgeCases:
             
             # Verify data is accessible from both tables
             client.use_table("default")
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             assert result["name"] == "Alice"
             
             client.use_table("users")
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             assert result["username"] == "bob123"
             

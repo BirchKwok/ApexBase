@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 use parking_lot::RwLock;
 
+use crate::storage::FIRST_ROW_ID;
+
 use super::on_demand::{ColumnData, ColumnType, ColumnValue, OnDemandStorage};
 
 // ============================================================================
@@ -747,7 +749,7 @@ impl IncrementalStorage {
     pub fn create(path: &Path) -> io::Result<Self> {
         let main_storage = OnDemandStorage::create(path)?;
         let wal_path = Self::wal_path(path);
-        let wal_writer = WalWriter::create(&wal_path, 0)?;
+        let wal_writer = WalWriter::create(&wal_path, FIRST_ROW_ID)?;
         
         Ok(Self {
             path: path.to_path_buf(),
@@ -756,7 +758,7 @@ impl IncrementalStorage {
             wal_buffer: RwLock::new(Vec::new()),
             memory_buffer: RwLock::new(HashMap::new()),
             memory_ids: RwLock::new(Vec::new()),
-            next_id: AtomicU64::new(0),
+            next_id: AtomicU64::new(FIRST_ROW_ID),
             deleted_ids: RwLock::new(std::collections::HashSet::new()),
             compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
             auto_checkpoint_threshold: AUTO_CHECKPOINT_THRESHOLD,
@@ -768,7 +770,7 @@ impl IncrementalStorage {
     /// Open existing incremental storage
     pub fn open(path: &Path) -> io::Result<Self> {
         let main_storage = OnDemandStorage::open(path)?;
-        let next_id = main_storage.row_count();
+        let next_id = main_storage.next_id_value();
         
         let wal_path = Self::wal_path(path);
         let (wal_writer, wal_buffer, max_wal_id) = if wal_path.exists() {
@@ -780,14 +782,14 @@ impl IncrementalStorage {
                     WalRecord::Insert { id, .. } => Some(*id),
                     _ => None,
                 }
-            }).max().unwrap_or(next_id);
+            }).max().unwrap_or(next_id.saturating_sub(1));
             
             // Open for append
             let writer = WalWriter::open(&wal_path)?;
             (Some(writer), records, max_id)
         } else {
             let writer = WalWriter::create(&wal_path, next_id)?;
-            (Some(writer), Vec::new(), next_id)
+            (Some(writer), Vec::new(), next_id.saturating_sub(1))
         };
         
         // Extract deleted IDs from WAL
@@ -798,7 +800,7 @@ impl IncrementalStorage {
             })
             .collect();
         
-        let final_next_id = max_wal_id.max(next_id) + 1;
+        let final_next_id = max_wal_id.max(next_id.saturating_sub(1)) + 1;
         
         // Build memory buffer from WAL records for fast reads
         let mut memory_buffer = HashMap::new();

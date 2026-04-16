@@ -1034,8 +1034,8 @@ mod tests {
         let count = engine.row_count(&table_path).unwrap();
         assert_eq!(count, 2);
         
-        // Check exists — use actual returned IDs (not hardcoded 0/1)
-        // because StorageEngine::global() is shared and next_id may not start at 0
+        // Check exists — use actual returned IDs (not hardcoded 1/2)
+        // because StorageEngine::global() is shared and next_id may not start at 1
         assert!(engine.exists(&table_path, ids[0]).unwrap());
         assert!(engine.exists(&table_path, ids[1]).unwrap());
         assert!(!engine.exists(&table_path, 999).unwrap());

@@ -3327,7 +3327,7 @@ impl ApexExecutor {
                         .unwrap_or_default()
                 };
                 if ids.is_empty() {
-                    // _id < 0  — guaranteed empty (all valid _id are >= 0)
+                    // _id < 0  — guaranteed empty (all valid _id are >= 1)
                     Ok(SqlExpr::BinaryOp {
                         left:  Box::new(SqlExpr::Column("_id".to_string())),
                         op:    crate::query::sql_parser::BinaryOperator::Lt,

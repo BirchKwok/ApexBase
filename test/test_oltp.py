@@ -127,7 +127,7 @@ class TestOltpPointLookup:
         assert len(result) == 0
 
     def test_retrieve_by_id(self, oltp_client):
-        row = oltp_client.retrieve(1)
+        row = oltp_client.retrieve(2)
         assert row is not None
 
     def test_retrieve_nonexistent(self, oltp_client):

@@ -67,7 +67,7 @@ class TestSingleRecordStorage:
             count = client.count_rows()
             assert count == 1
             
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result["name"] == "Alice"
             assert result["age"] == 25
             assert result["city"] == "NYC"
@@ -95,7 +95,7 @@ class TestSingleRecordStorage:
             
             client.store(data)
             
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result["string_field"] == "test_string"
             assert result["int_field"] == 42
             assert result["float_field"] == 3.14159
@@ -125,7 +125,7 @@ class TestSingleRecordStorage:
             }
             
             client.store(data)
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             
             assert result["large_int"] == 2**63 - 1
             assert abs(result["small_float"] - 1e-10) < 1e-15
@@ -145,8 +145,8 @@ class TestSingleRecordStorage:
             count = client.count_rows()
             assert count == 1
             
-            result = client.retrieve(0)
-            assert result == {} or result == {"_id": 0}  # May include auto-generated ID
+            result = client.retrieve(1)
+            assert result == {} or result == {"_id": 1}  # May include auto-generated ID
             
             client.close()
     
@@ -165,7 +165,7 @@ class TestSingleRecordStorage:
             }
             
             client.store(data)
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             
             for key, value in data.items():
                 assert result[key] == value
@@ -282,11 +282,11 @@ class TestBatchStorage:
             assert count == 1000
             
             # Test a few records
-            result_0 = client.retrieve(0)
+            result_0 = client.retrieve(1)
             assert result_0["id"] == 0
             assert result_0["value"] == "record_0"
             
-            result_999 = client.retrieve(999)
+            result_999 = client.retrieve(1000)
             assert result_999["id"] == 999
             assert result_999["value"] == "record_999"
             
@@ -396,7 +396,7 @@ class TestColumnarStorage:
             count = client.count_rows()
             assert count == 1
             
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result["single"] == "only_value"
             
             client.close()
@@ -470,10 +470,10 @@ class TestNumPyStorage:
             assert count == size
             
             # Test a few values
-            result_0 = client.retrieve(0)
+            result_0 = client.retrieve(1)
             assert result_0["large_int"] == 0
             
-            result_last = client.retrieve(size - 1)
+            result_last = client.retrieve(size)
             assert result_last["large_int"] == size - 1
             
             client.close()
@@ -816,7 +816,7 @@ class TestStorageEdgeCases:
             
             client.store(data)
             
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert len(result["long_string"]) == 1000000
             assert result["normal"] == "test"
             
@@ -837,7 +837,7 @@ class TestStorageEdgeCases:
             
             try:
                 client.store(data)
-                result = client.retrieve(0)
+                result = client.retrieve(1)
                 # Check how nested structures are handled
                 assert "normal" in result
             except Exception as e:
@@ -863,7 +863,7 @@ class TestStorageEdgeCases:
             
             client.store(data)
             
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             for key, expected in data.items():
                 assert result[key] == expected
             

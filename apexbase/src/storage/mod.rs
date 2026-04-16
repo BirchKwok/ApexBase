@@ -16,6 +16,9 @@ pub mod delta;
 pub mod mvcc;
 pub mod concurrent;
 
+/// First user-visible row ID. ApexBase uses 1-based `_id` values.
+pub const FIRST_ROW_ID: u64 = 1;
+
 // ============================================================================
 // Durability Level - Controls fsync behavior for ACID guarantees
 // ============================================================================
@@ -132,4 +135,3 @@ pub use concurrent::{
 
 // Type alias for backward compatibility
 pub type ColumnarStorage = OnDemandStorage;
-

@@ -777,7 +777,7 @@ class TestFTSStatistics:
             client.store(documents)
             
             # Delete some documents
-            client.delete(1)
+            client.delete(2)
             
             # Compact index (should not raise errors)
             client.compact_fts_index()

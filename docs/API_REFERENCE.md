@@ -387,8 +387,8 @@ Get a single record by its internal _id.
 
 **Example:**
 ```python
-record = client.retrieve(0)
-print(record)  # {'_id': 0, 'name': 'Alice', 'age': 30}
+record = client.retrieve(1)
+print(record)  # {'_id': 1, 'name': 'Alice', 'age': 30}
 ```
 
 #### retrieve_many
@@ -399,7 +399,7 @@ Get multiple records by their internal _ids.
 
 **Example:**
 ```python
-results = client.retrieve_many([0, 1, 2, 5])
+results = client.retrieve_many([1, 2, 3, 6])
 df = results.to_pandas()
 ```
 

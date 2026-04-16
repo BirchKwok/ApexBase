@@ -1091,6 +1091,11 @@ impl TableStorageBackend {
         self.storage.active_row_count()
     }
 
+    /// Get the next `_id` that will be assigned to a new row.
+    pub fn next_id_value(&self) -> u64 {
+        self.storage.next_id_value()
+    }
+
     /// Fast path: Get base table row count only (no delta scan)
     /// Use this for COUNT(*) without WHERE clause - O(1) lock-free read
     pub fn base_row_count(&self) -> u64 {

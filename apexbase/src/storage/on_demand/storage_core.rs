@@ -133,7 +133,7 @@ impl OnDemandStorage {
         // Initialize WAL for safe/max durability modes
         let wal_writer = if durability != super::DurabilityLevel::Fast {
             let wal_path = Self::wal_path(path);
-            Some(super::incremental::WalWriter::create(&wal_path, 0)?)
+            Some(super::incremental::WalWriter::create(&wal_path, crate::storage::FIRST_ROW_ID)?)
         } else {
             None
         };
@@ -147,7 +147,7 @@ impl OnDemandStorage {
             column_index: RwLock::new(Vec::new()),
             columns: RwLock::new(columns),
             ids: RwLock::new(Vec::new()),
-            next_id: AtomicU64::new(0),
+            next_id: AtomicU64::new(crate::storage::FIRST_ROW_ID),
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(Vec::new()),
             id_to_idx: RwLock::new(Some(ahash::AHashMap::new())),
@@ -246,7 +246,7 @@ impl OnDemandStorage {
             .map(|rg| rg.max_id)
             .max()
             .map(|m| m + 1)
-            .unwrap_or(0);
+            .unwrap_or(crate::storage::FIRST_ROW_ID);
         let cached_v4_footer: Option<V4Footer> = Some(footer);
 
         let columns: Vec<ColumnData> = schema.columns.iter()
@@ -407,7 +407,7 @@ impl OnDemandStorage {
             .map(|rg| rg.max_id)
             .max()
             .map(|m| m + 1)
-            .unwrap_or(0);
+            .unwrap_or(crate::storage::FIRST_ROW_ID);
         let cached_v4_footer: Option<V4Footer> = Some(footer);
 
         let columns: Vec<ColumnData> = schema.columns.iter()

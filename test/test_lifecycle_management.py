@@ -44,7 +44,7 @@ class TestContextManager:
                 
                 # Perform operations
                 client.store({"name": "Alice", "age": 25})
-                result = client.retrieve(0)
+                result = client.retrieve(1)
                 assert result["name"] == "Alice"
             
             # Client should be closed after context
@@ -141,7 +141,7 @@ class TestManualCloseOperations:
             
             # Perform operations
             client.store({"name": "Alice", "age": 25})
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result["name"] == "Alice"
             
             # Manual close
@@ -348,7 +348,7 @@ class TestLifecycleStateTransitions:
             operations = [
                 lambda: client.store({"test": "data"}),
                 lambda: client.query(),
-                lambda: client.retrieve(0),
+                lambda: client.retrieve(1),
                 lambda: client.list_tables(),
                 lambda: client.count_rows(),
             ]
@@ -489,7 +489,7 @@ class TestExceptionHandling:
             
             # Client should still be usable
             client.store({"recovery": "test"})
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result["recovery"] == "test"
             
             client.close()
@@ -673,7 +673,7 @@ class TestLifecycleWithFTS:
                 
                 # Modify data - behavior may vary
                 try:
-                    client.replace(0, {"content": "JavaScript programming"})
+                    client.replace(1, {"content": "JavaScript programming"})
                 except Exception as e:
                     print(f"FTS lifecycle replace: {e}")
             

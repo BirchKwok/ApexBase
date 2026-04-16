@@ -49,19 +49,19 @@ class TestDeleteOperations:
             assert client.count_rows() == 3
             
             # Delete single record
-            result = client.delete(1)  # Delete Bob
+            result = client.delete(2)  # Delete Bob
             
             assert result is True
             assert client.count_rows() == 2
             
             # Verify Bob is deleted
-            alice = client.retrieve(0)
+            alice = client.retrieve(1)
             assert alice["name"] == "Alice"
             
-            bob = client.retrieve(1)
+            bob = client.retrieve(2)
             assert bob is None  # Should be deleted
             
-            charlie = client.retrieve(2)
+            charlie = client.retrieve(3)
             assert charlie["name"] == "Charlie"
             
             client.close()
@@ -104,25 +104,25 @@ class TestDeleteOperations:
             assert client.count_rows() == 5
             
             # Delete multiple records
-            result = client.delete([1, 3])  # Delete Bob and Diana
+            result = client.delete([2, 4])  # Delete Bob and Diana
             
             assert result is True
             assert client.count_rows() == 3
             
             # Verify specific records are deleted
-            alice = client.retrieve(0)
+            alice = client.retrieve(1)
             assert alice["name"] == "Alice"
             
-            bob = client.retrieve(1)
+            bob = client.retrieve(2)
             assert bob is None
             
-            charlie = client.retrieve(2)
+            charlie = client.retrieve(3)
             assert charlie["name"] == "Charlie"
             
-            diana = client.retrieve(3)
+            diana = client.retrieve(4)
             assert diana is None
             
-            eve = client.retrieve(4)
+            eve = client.retrieve(5)
             assert eve["name"] == "Eve"
             
             client.close()
@@ -143,9 +143,9 @@ class TestDeleteOperations:
             
             # Delete mix of existing and nonexistent IDs - behavior may vary
             try:
-                result = client.delete([0, 999, 2, 888])
+                result = client.delete([1, 999, 3, 888])
                 # After deletion, Bob should remain
-                bob = client.retrieve(1)
+                bob = client.retrieve(2)
                 assert bob is not None
                 assert bob["name"] == "Bob"
             except Exception as e:
@@ -195,10 +195,10 @@ class TestDeleteOperations:
             client.create_table("default")
             
             # Try to delete from empty database
-            result = client.delete(0)
+            result = client.delete(1)
             assert result is False
             
-            result = client.delete([0, 1, 2])
+            result = client.delete([1, 2, 3])
             assert result is False
             
             client.close()
@@ -227,10 +227,10 @@ class TestDeleteOperations:
             client.store(test_data)
             
             # Delete first record
-            result = client.delete(0)
+            result = client.delete(1)
             
             # Verify remaining record is accessible
-            remaining = client.retrieve(1)
+            remaining = client.retrieve(2)
             assert remaining is not None
             assert remaining["string_field"] == "another_string"
             assert remaining["int_field"] == -100
@@ -256,19 +256,19 @@ class TestReplaceOperations:
             
             # Replace Alice's record
             new_data = {"name": "Alice Updated", "age": 26, "city": "Boston", "status": "active"}
-            result = client.replace(0, new_data)
+            result = client.replace(1, new_data)
             
             assert result is True
             
             # Verify the replacement
-            alice = client.retrieve(0)
+            alice = client.retrieve(1)
             assert alice["name"] == "Alice Updated"
             assert alice["age"] == 26
             assert alice["city"] == "Boston"
             assert alice["status"] == "active"
             
             # Verify Bob is unchanged
-            bob = client.retrieve(1)
+            bob = client.retrieve(2)
             assert bob["name"] == "Bob"
             assert bob["age"] == 30
             assert bob["city"] == "LA"
@@ -292,7 +292,7 @@ class TestReplaceOperations:
             assert client.count_rows() == 1  # Should not create new record
             
             # Verify original record is unchanged
-            alice = client.retrieve(0)
+            alice = client.retrieve(1)
             assert alice["name"] == "Alice"
             assert alice["age"] == 25
             
@@ -314,10 +314,10 @@ class TestReplaceOperations:
                 "department": "Engineering",
             }
             try:
-                result = client.replace(0, new_data)
+                result = client.replace(1, new_data)
                 
                 # Verify the replacement
-                updated = client.retrieve(0)
+                updated = client.retrieve(1)
                 assert updated is not None
             except Exception as e:
                 print(f"Replace different schema: {e}")
@@ -340,13 +340,13 @@ class TestReplaceOperations:
             # Replace with fewer fields - behavior may vary
             new_data = {"name": "Alice Updated", "age": 26}
             try:
-                result = client.replace(0, new_data)
+                result = client.replace(1, new_data)
                 # Result may be True or False depending on implementation
             except Exception as e:
                 print(f"Replace partial: {e}")
             
             # Verify data is still accessible
-            updated = client.retrieve(0)
+            updated = client.retrieve(1)
             assert updated is not None
             
             client.close()
@@ -362,9 +362,9 @@ class TestReplaceOperations:
             
             # Replace with empty data - behavior may vary
             try:
-                result = client.replace(0, {})
+                result = client.replace(1, {})
                 # Verify result is accessible
-                updated = client.retrieve(0)
+                updated = client.retrieve(1)
                 # May be empty or have _id only
             except Exception as e:
                 print(f"Replace empty: {e}")
@@ -388,10 +388,10 @@ class TestReplaceOperations:
                 "bool_field": True,
             }
             try:
-                result = client.replace(0, new_data)
+                result = client.replace(1, new_data)
                 
                 # Verify types are preserved
-                updated = client.retrieve(0)
+                updated = client.retrieve(1)
                 assert updated is not None
                 assert updated["string_field"] == "test_string"
                 assert updated["int_field"] == 42
@@ -420,25 +420,25 @@ class TestBatchReplaceOperations:
             
             # Batch replace
             replace_data = {
-                0: {"name": "Alice Updated", "age": 26},
-                2: {"name": "Charlie Updated", "age": 36},
+                1: {"name": "Alice Updated", "age": 26},
+                3: {"name": "Charlie Updated", "age": 36},
             }
             success_ids = client.batch_replace(replace_data)
             
             assert len(success_ids) == 2
-            assert 0 in success_ids
-            assert 2 in success_ids
+            assert 1 in success_ids
+            assert 3 in success_ids
             
             # Verify replacements
-            alice = client.retrieve(0)
+            alice = client.retrieve(1)
             assert alice["name"] == "Alice Updated"
             assert alice["age"] == 26
             
-            bob = client.retrieve(1)
+            bob = client.retrieve(2)
             assert bob["name"] == "Bob"  # Unchanged
             assert bob["age"] == 30
             
-            charlie = client.retrieve(2)
+            charlie = client.retrieve(3)
             assert charlie["name"] == "Charlie Updated"
             assert charlie["age"] == 36
             
@@ -459,22 +459,22 @@ class TestBatchReplaceOperations:
             
             # Batch replace with mix of existing and nonexistent IDs
             replace_data = {
-                0: {"name": "Alice Updated", "age": 26},
+                1: {"name": "Alice Updated", "age": 26},
                 999: {"name": "Nonexistent", "age": 99},
-                1: {"name": "Bob Updated", "age": 31},
+                2: {"name": "Bob Updated", "age": 31},
             }
             success_ids = client.batch_replace(replace_data)
             
             # Should only succeed for existing IDs
-            assert 0 in success_ids
             assert 1 in success_ids
+            assert 2 in success_ids
             assert 999 not in success_ids
             
             # Verify successful replacements
-            alice = client.retrieve(0)
+            alice = client.retrieve(1)
             assert alice["name"] == "Alice Updated"
             
-            bob = client.retrieve(1)
+            bob = client.retrieve(2)
             assert bob["name"] == "Bob Updated"
             
             client.close()
@@ -541,7 +541,7 @@ class TestModificationWithFTS:
             assert len(results) > 0
             
             # Delete a document
-            result = client.delete(0)  # Delete Python document
+            result = client.delete(1)  # Delete Python document
             assert result is True
             
             # Verify search reflects the deletion
@@ -571,9 +571,9 @@ class TestModificationWithFTS:
             # Replace the document - FTS update behavior may vary
             new_data = {"content": "JavaScript development guide"}
             try:
-                result = client.replace(0, new_data)
+                result = client.replace(1, new_data)
                 # Verify document was replaced
-                updated = client.retrieve(0)
+                updated = client.retrieve(1)
                 assert updated is not None
             except Exception as e:
                 print(f"Replace with FTS: {e}")
@@ -596,7 +596,7 @@ class TestModificationWithFTS:
             client.store(documents)
             
             # Batch delete
-            result = client.delete([0, 2])  # Delete Python and Database
+            result = client.delete([1, 3])  # Delete Python and Database
             assert result is True
             
             # Verify search reflects deletions
@@ -623,16 +623,16 @@ class TestModificationEdgeCases:
             client.close()
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
-                client.delete(0)
+                client.delete(1)
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
-                client.delete([0, 1])
+                client.delete([1, 2])
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
-                client.replace(0, {"test": "data"})
+                client.replace(1, {"test": "data"})
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
-                client.batch_replace({0: {"test": "data"}})
+                client.batch_replace({1: {"test": "data"}})
     
     def test_delete_invalid_id_types(self):
         """Test delete with invalid ID types"""
@@ -650,7 +650,7 @@ class TestModificationEdgeCases:
                 pass  # Expected
             
             # Verify data is still accessible
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             
             client.close()
@@ -671,7 +671,7 @@ class TestModificationEdgeCases:
                 pass  # Expected
             
             # Verify original data is still accessible
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             assert result["name"] == "Alice"
             
@@ -696,9 +696,9 @@ class TestModificationEdgeCases:
                 "french": "Bonjour le monde",
             }
             try:
-                result = client.replace(0, new_unicode_data)
+                result = client.replace(1, new_unicode_data)
                 # Verify unicode data is accessible
-                updated = client.retrieve(0)
+                updated = client.retrieve(1)
                 assert updated is not None
             except Exception as e:
                 print(f"Unicode replace: {e}")
@@ -726,9 +726,9 @@ class TestModificationEdgeCases:
                 "another_field": "updated",
             }
             try:
-                result = client.replace(0, new_large_data)
+                result = client.replace(1, new_large_data)
                 # Verify large data replacement
-                updated = client.retrieve(0)
+                updated = client.retrieve(1)
                 assert updated is not None
             except Exception as e:
                 print(f"Large data replace: {e}")
@@ -750,8 +750,8 @@ class TestModificationEdgeCases:
             client.store(initial_data)
             
             # Perform various modifications
-            client.delete(1)  # Delete Bob
-            client.replace(0, {"id": 1, "name": "Alice Updated", "age": 26})
+            client.delete(2)  # Delete Bob
+            client.replace(1, {"id": 1, "name": "Alice Updated", "age": 26})
             
             # Add new data
             client.store({"id": 4, "name": "Diana", "age": 28})
@@ -761,17 +761,17 @@ class TestModificationEdgeCases:
             assert len(all_records) == 3
             
             # Check specific records
-            alice = client.retrieve(0)
+            alice = client.retrieve(1)
             assert alice["name"] == "Alice Updated"
             assert alice["age"] == 26
             
-            bob = client.retrieve(1)
+            bob = client.retrieve(2)
             assert bob is None  # Should be deleted
             
-            charlie = client.retrieve(2)
+            charlie = client.retrieve(3)
             assert charlie["name"] == "Charlie"
             
-            diana = client.retrieve(3)
+            diana = client.retrieve(4)
             assert diana["name"] == "Diana"
             
             client.close()
@@ -791,7 +791,7 @@ class TestModificationEdgeCases:
             # Test delete performance - behavior may vary
             start_time = time.time()
             try:
-                result = client.delete([0, 10, 20])
+                result = client.delete([1, 10, 20])
             except Exception as e:
                 print(f"Delete perf: {e}")
             delete_time = time.time() - start_time
@@ -820,17 +820,17 @@ class TestModificationWithDifferentTables:
             # Modify in default table
             client.use_table("default")
             try:
-                client.replace(0, {"name": "Alice Updated", "table": "default"})
+                client.replace(1, {"name": "Alice Updated", "table": "default"})
             except Exception as e:
                 print(f"Replace isolation: {e}")
             
             # Verify data is accessible in both tables
             client.use_table("default")
-            alice = client.retrieve(0)
+            alice = client.retrieve(1)
             assert alice is not None
             
             client.use_table("users")
-            bob = client.retrieve(0)
+            bob = client.retrieve(1)
             assert bob is not None
             assert bob["name"] == "Bob"
             
@@ -855,11 +855,11 @@ class TestModificationWithDifferentTables:
             
             # Verify data in both tables
             client.use_table("articles")
-            article = client.retrieve(0)
+            article = client.retrieve(1)
             assert article is not None
             
             client.use_table("comments")
-            comment = client.retrieve(0)
+            comment = client.retrieve(1)
             assert comment is not None
             
             client.close()

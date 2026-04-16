@@ -60,7 +60,7 @@ class TestSingleRetrieve:
             client.store(test_data)
             
             # Retrieve the record
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             
             assert result is not None
             assert isinstance(result, dict)
@@ -93,7 +93,7 @@ class TestSingleRetrieve:
             client.create_table("default")
             
             # Try to retrieve from empty database
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is None
             
             client.close()
@@ -114,16 +114,16 @@ class TestSingleRetrieve:
             client.store(test_data)
             
             # Retrieve specific records
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result["name"] == "Alice"
             
-            result = client.retrieve(1)
+            result = client.retrieve(2)
             assert result["name"] == "Bob"
             
-            result = client.retrieve(2)
+            result = client.retrieve(3)
             assert result["name"] == "Charlie"
             
-            result = client.retrieve(3)
+            result = client.retrieve(4)
             assert result["name"] == "Diana"
             
             client.close()
@@ -151,7 +151,7 @@ class TestSingleRetrieve:
             client.store(test_data)
             
             # Retrieve and verify all types
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             
             assert result["string_field"] == "test_string"
             assert result["int_field"] == 42
@@ -184,7 +184,7 @@ class TestSingleRetrieve:
             client.store(test_data)
             
             # Retrieve and verify unicode data
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             
             for key, expected in test_data.items():
                 assert result[key] == expected
@@ -211,7 +211,7 @@ class TestSingleRetrieve:
             client.store(test_data)
             
             # Retrieve and verify special characters
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             
             for key, expected in test_data.items():
                 assert result[key] == expected
@@ -239,7 +239,7 @@ class TestRetrieveMany:
             client.store(test_data)
             
             # Retrieve multiple records
-            results = client.retrieve_many([0, 2, 4])
+            results = client.retrieve_many([1, 3, 5])
             
             assert isinstance(results, ResultView)
             assert len(results) == 3
@@ -270,7 +270,7 @@ class TestRetrieveMany:
             client.store(test_data)
             
             # Retrieve with unordered IDs
-            results = client.retrieve_many([3, 1, 0])
+            results = client.retrieve_many([4, 2, 1])
             
             assert len(results) == 3
             
@@ -295,7 +295,7 @@ class TestRetrieveMany:
             client.store(test_data)
             
             # Retrieve with duplicate IDs
-            results = client.retrieve_many([0, 1, 0, 2, 1])
+            results = client.retrieve_many([1, 2, 1, 3, 2])
             
             # Behavior may vary - either deduplicate or return duplicates
             # Test that we get at least the unique records
@@ -338,7 +338,7 @@ class TestRetrieveMany:
             client.store(test_data)
             
             # Retrieve with mix of existing and nonexistent IDs
-            results = client.retrieve_many([0, 999, 1, 888, 2])
+            results = client.retrieve_many([1, 999, 2, 888, 3])
             
             # Should only return existing records
             assert len(results) == 3
@@ -377,15 +377,16 @@ class TestRetrieveMany:
             client.store(large_data)
             
             # Retrieve every 10th record
-            ids_to_retrieve = list(range(0, 1000, 10))
+            ids_to_retrieve = list(range(1, 1001, 10))
             results = client.retrieve_many(ids_to_retrieve)
             
             assert len(results) == 100
             
             # Verify some records
-            for i, result in zip(ids_to_retrieve, results):
-                assert result["id"] == i
-                assert result["value"] == f"item_{i}"
+            for internal_id, result in zip(ids_to_retrieve, results):
+                user_id = internal_id - 1
+                assert result["id"] == user_id
+                assert result["value"] == f"item_{user_id}"
             
             client.close()
 
@@ -516,7 +517,7 @@ class TestRetrieveResultViewConversions:
             client.store(test_data)
             
             # Retrieve multiple records and convert to pandas
-            results = client.retrieve_many([0, 2])
+            results = client.retrieve_many([1, 3])
             df = results.to_pandas()
             
             assert isinstance(df, pd.DataFrame)
@@ -575,7 +576,7 @@ class TestRetrieveResultViewConversions:
             client.store(test_data)
             
             # Retrieve multiple records and convert to Arrow
-            results = client.retrieve_many([0, 1, 2])
+            results = client.retrieve_many([1, 2, 3])
             table = results.to_arrow()
             
             assert isinstance(table, pa.Table)
@@ -602,14 +603,14 @@ class TestRetrieveResultViewConversions:
             client.store(test_data)
             
             # Test retrieve_many get_ids
-            results = client.retrieve_many([1, 3])
+            results = client.retrieve_many([2, 4])
             ids = results.get_ids()
             
             assert isinstance(ids, np.ndarray)
             assert len(ids) == 2
             # Should contain the requested IDs
-            assert 1 in ids or 1 in ids.tolist()
-            assert 3 in ids or 3 in ids.tolist()
+            assert 2 in ids or 2 in ids.tolist()
+            assert 4 in ids or 4 in ids.tolist()
             
             # Test retrieve_all get_ids
             all_results = client.retrieve_all()
@@ -640,7 +641,7 @@ class TestRetrievePerformance:
             # If Arrow is available, retrieve should use Arrow optimization
             if ARROW_AVAILABLE and PYARROW_AVAILABLE:
                 # Test that Arrow conversion works efficiently
-                results = client.retrieve_many([0, 1, 2])
+                results = client.retrieve_many([1, 2, 3])
                 
                 # Should be able to convert to Arrow without issues
                 table = results.to_arrow()
@@ -663,7 +664,7 @@ class TestRetrievePerformance:
             import time
             
             # Test retrieve_many performance
-            ids_to_retrieve = list(range(0, data_size, 10))  # Every 10th item
+            ids_to_retrieve = list(range(1, data_size + 1, 10))  # Every 10th item
             
             start_time = time.time()
             results = client.retrieve_many(ids_to_retrieve)
@@ -701,7 +702,7 @@ class TestRetrievePerformance:
             client.store(large_data)
             
             # Retrieve large record
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             
             assert result is not None
             assert result["id"] == 1
@@ -722,10 +723,10 @@ class TestRetrieveEdgeCases:
             client.close()
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
-                client.retrieve(0)
+                client.retrieve(1)
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
-                client.retrieve_many([0, 1, 2])
+                client.retrieve_many([1, 2, 3])
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
                 client.retrieve_all()
@@ -780,13 +781,13 @@ class TestRetrieveEdgeCases:
             
             # Retrieve from default table
             client.use_table("default")
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result["name"] == "Alice"
             assert result["table"] == "default"
             
             # Retrieve from users table
             client.use_table("users")
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result["name"] == "Bob"
             assert result["table"] == "users"
             
@@ -807,7 +808,7 @@ class TestRetrieveEdgeCases:
             client.store(test_data)
             
             # Retrieve records normally
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result["content"] == "searchable text"
             assert result["metadata"] == "test1"
             
@@ -832,21 +833,21 @@ class TestRetrieveEdgeCases:
             client.store(test_data)
             
             # Delete some records
-            client.delete(1)  # Delete Bob
-            client.delete([2])  # Delete Charlie
+            client.delete(2)  # Delete Bob
+            client.delete([3])  # Delete Charlie
             
             # Retrieve remaining records
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result["name"] == "Alice"
             
-            result = client.retrieve(3)
+            result = client.retrieve(4)
             assert result["name"] == "Diana"
             
             # Deleted records should return None
-            result = client.retrieve(1)
+            result = client.retrieve(2)
             assert result is None
             
-            result = client.retrieve(2)
+            result = client.retrieve(3)
             assert result is None
             
             client.close()
@@ -863,10 +864,10 @@ class TestRetrieveEdgeCases:
             
             # Replace a record - note: replace may have specific behavior
             try:
-                success = client.replace(0, {"name": "Alice Updated", "age": 26})
+                success = client.replace(1, {"name": "Alice Updated", "age": 26})
                 if success:
                     # Retrieve and verify the update
-                    result = client.retrieve(0)
+                    result = client.retrieve(1)
                     if result is not None:
                         assert result["name"] == "Alice Updated"
                         assert result["age"] == 26

@@ -462,11 +462,11 @@ client = ApexClient("./data")
 client.use_table("users")
 
 # Single record
-record = client.retrieve(0)
-print(record)  # {'_id': 0, 'name': 'Alice', ...}
+record = client.retrieve(1)
+print(record)  # {'_id': 1, 'name': 'Alice', ...}
 
 # Multiple records
-results = client.retrieve_many([0, 5, 10, 15])
+results = client.retrieve_many([1, 6, 11, 16])
 df = results.to_pandas()
 
 # All records

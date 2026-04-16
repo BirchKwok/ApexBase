@@ -403,7 +403,7 @@ class TestDurabilityLevels:
             
             # Test store and retrieve
             client.store({"name": "test", "value": 123})
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result is not None
             assert result["name"] == "test"
             assert result["value"] == 123
@@ -454,7 +454,7 @@ class TestDurabilityExceptionScenarios:
             
             # Verify data integrity
             for i in range(3):
-                result = client2.retrieve(i)
+                result = client2.retrieve(i + 1)
                 assert result is not None, f"Record {i} missing after reopen"
                 assert result["id"] == i + 1
             
@@ -484,7 +484,7 @@ class TestDurabilityExceptionScenarios:
             assert count_after_reopen == count_before_close, \
                 f"flush() did not persist data with durability='{durability}'"
             
-            result = client2.retrieve(0)
+            result = client2.retrieve(1)
             assert result["test"] == "flush_data"
             assert result["value"] == 42
             
@@ -516,7 +516,7 @@ class TestDurabilityExceptionScenarios:
             
             # Spot check some records
             for idx in [0, 49, 99]:
-                result = client2.retrieve(idx)
+                result = client2.retrieve(idx + 1)
                 assert result is not None
                 assert result["idx"] == idx
                 assert result["data"] == f"item_{idx}"
@@ -651,7 +651,7 @@ class TestDurabilityExceptionScenarios:
             assert client2.count_rows() == 50
             
             # Verify content integrity
-            result = client2.retrieve(25)
+            result = client2.retrieve(26)
             assert result["id"] == 25
             assert result["content"] == large_string
             assert result["index"] == 2500
@@ -673,7 +673,7 @@ class TestDurabilityExceptionScenarios:
             client2.use_table("default")
             assert client2.count_rows() == 1
             
-            result = client2.retrieve(0)
+            result = client2.retrieve(1)
             assert result["created_with"] == "safe"
             
             # Add more data with 'max' durability
@@ -703,7 +703,7 @@ class TestDurabilityExceptionScenarios:
             client2.use_table("default")
             assert client2.count_rows() == 1
             
-            result = client2.retrieve(0)
+            result = client2.retrieve(1)
             assert result["created_with"] == "max"
             
             # Add data with 'fast' durability

@@ -711,11 +711,11 @@ class TestConversionEdgeCases:
             df_result = results.to_pandas()
             
             # Verify special characters are preserved
-            assert df_result["quotes"][0] == df["quotes"][0]
-            assert df_result["newlines"][0] == df["newlines"][0]
-            assert df_result["tabs"][0] == df["tabs"][0]
-            assert df_result["unicode"][0] == df["unicode"][0]
-            assert df_result["emoji"][0] == df["emoji"][0]
+            assert df_result["quotes"].iloc[0] == df["quotes"].iloc[0]
+            assert df_result["newlines"].iloc[0] == df["newlines"].iloc[0]
+            assert df_result["tabs"].iloc[0] == df["tabs"].iloc[0]
+            assert df_result["unicode"].iloc[0] == df["unicode"].iloc[0]
+            assert df_result["emoji"].iloc[0] == df["emoji"].iloc[0]
             
             client.close()
 

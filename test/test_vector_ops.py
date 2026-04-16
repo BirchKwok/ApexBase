@@ -997,7 +997,7 @@ def test_topk_distance_large_table(client):
     n, dim = 500, 16
     vecs = rng.random((n, dim), dtype=np.float32)
     query = rng.random(dim, dtype=np.float32)
-    # Store with no extra columns so _id == row index (0-based insertion order)
+    # Store with no extra columns so _id == row index + 1 (1-based insertion order)
     client.store([{"vec": encode_vector(vecs[i])} for i in range(n)])
 
     k = 10
@@ -1006,7 +1006,7 @@ def test_topk_distance_large_table(client):
 
     # Ground truth: top-k by L2 via numpy (use _id as the row index proxy)
     dists = np.linalg.norm(vecs - query, axis=1)
-    gt_ids = set(int(i) for i in np.argsort(dists)[:k])
+    gt_ids = set(int(i) + 1 for i in np.argsort(dists)[:k])
     result_ids = set(int(r["_id"]) for r in topk)
     assert result_ids == gt_ids
 
@@ -1058,7 +1058,7 @@ def test_f16_topk_distance_l2(f16_client):
 
     # Ground-truth via numpy (f16 quantization shifts distances slightly)
     dists_np = np.linalg.norm(vecs - query, axis=1)
-    gt_top20_ids = set(int(i) for i in np.argsort(dists_np)[:20])
+    gt_top20_ids = set(int(i) + 1 for i in np.argsort(dists_np)[:20])
     result_ids = set(int(r["_id"]) for r in topk)
     # Top-5 results should mostly overlap with numpy top-20 (f16 has ~3e-4 rel error)
     assert len(result_ids & gt_top20_ids) >= 4
@@ -1171,7 +1171,7 @@ def test_f16_topk_l1(f16_client):
     # Ground-truth: L1 via numpy with f16 quantization
     vecs_q = vecs.astype(np.float16).astype(np.float32)
     np_l1 = np.sum(np.abs(vecs_q - query), axis=1)
-    gt_top20 = set(int(i) for i in np.argsort(np_l1)[:20])
+    gt_top20 = set(int(i) + 1 for i in np.argsort(np_l1)[:20])
     result_ids = set(int(r["_id"]) for r in rows)
     assert len(result_ids & gt_top20) >= 4
 
@@ -1225,7 +1225,7 @@ def test_f16_l2_correctness_vs_numpy(f16_client):
 
     vecs_q = _f16_quantize(vecs)
     for r in rows:
-        idx = int(r["_id"])
+        idx = int(r["_id"]) - 1
         expected = float(np.sqrt(np.sum((vecs_q[idx] - query) ** 2)))
         assert r["dist"] == pytest.approx(expected, rel=5e-3, abs=1e-4), \
             f"id={idx} got={r['dist']} expected={expected}"
@@ -1243,7 +1243,7 @@ def test_f16_cosine_correctness_vs_numpy(f16_client):
 
     vecs_q = _f16_quantize(vecs)
     for r in rows:
-        idx = int(r["_id"])
+        idx = int(r["_id"]) - 1
         a, b = vecs_q[idx], query
         na, nb = np.linalg.norm(a), np.linalg.norm(b)
         expected = 1.0 - float(np.dot(a, b)) / (na * nb) if na > 0 and nb > 0 else 0.0
@@ -1263,7 +1263,7 @@ def test_f16_l1_correctness_vs_numpy(f16_client):
 
     vecs_q = _f16_quantize(vecs)
     for r in rows:
-        idx = int(r["_id"])
+        idx = int(r["_id"]) - 1
         expected = float(np.sum(np.abs(vecs_q[idx] - query)))
         assert r["dist"] == pytest.approx(expected, rel=5e-3, abs=1e-4), \
             f"id={idx} got={r['dist']} expected={expected}"
@@ -1348,7 +1348,7 @@ def test_f16_large_dim_128(f16_client):
     # Nearest neighbour should be in numpy top-30 (f16 ≈3e-4 rel error)
     vecs_q = _f16_quantize(vecs)
     np_dists = np.linalg.norm(vecs_q - query, axis=1)
-    gt_top30 = set(int(i) for i in np.argsort(np_dists)[:30])
+    gt_top30 = set(int(i) + 1 for i in np.argsort(np_dists)[:30])
     result_ids = set(int(r["_id"]) for r in rows)
     assert len(result_ids & gt_top30) >= 8
 

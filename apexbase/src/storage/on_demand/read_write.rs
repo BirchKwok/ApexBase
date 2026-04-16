@@ -3196,7 +3196,7 @@ impl OnDemandStorage {
         let next_id = if max_id_seen > 0 {
             max_id_seen + 1
         } else {
-            all_ids.iter().max().map(|&id| id + 1).unwrap_or(0)
+            all_ids.iter().max().map(|&id| id + 1).unwrap_or(crate::storage::FIRST_ROW_ID)
         };
         
         // Store flat data
@@ -4133,7 +4133,7 @@ impl OnDemandStorage {
             let mut ids = self.ids.write();
             ids.extend_from_slice(new_ids);
         }
-        let next_id = new_ids.iter().max().map(|&id| id + 1).unwrap_or(0);
+        let next_id = new_ids.iter().max().map(|&id| id + 1).unwrap_or(crate::storage::FIRST_ROW_ID);
         let current_next = self.next_id.load(Ordering::SeqCst);
         if next_id > current_next {
             self.next_id.store(next_id, Ordering::SeqCst);

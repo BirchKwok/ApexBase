@@ -472,13 +472,13 @@ See [`docs/API_REFERENCE.md#vector-search`](docs/API_REFERENCE.md#vector-search)
 ### Record-Level Operations
 
 ```python
-record = client.retrieve(0)               # by internal _id
-records = client.retrieve_many([0, 1, 2])
+record = client.retrieve(1)               # by internal _id
+records = client.retrieve_many([1, 2, 3])
 all_data = client.retrieve_all()
 
-client.replace(0, {"name": "Alice2", "age": 31})
-client.delete(0)
-client.delete([1, 2, 3])
+client.replace(1, {"name": "Alice2", "age": 31})
+client.delete(1)
+client.delete([2, 3, 4])
 ```
 
 ### Column Operations

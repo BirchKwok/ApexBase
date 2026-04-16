@@ -733,7 +733,7 @@ class TestCreateTableWithSchema:
             })
 
             client.store({"count": 42, "ratio": 3.14, "label": "test", "flag": True})
-            row = client.retrieve(0)
+            row = client.retrieve(1)
             assert row["count"] == 42
             assert abs(row["ratio"] - 3.14) < 0.001
             assert row["label"] == "test"

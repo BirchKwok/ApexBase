@@ -151,7 +151,7 @@ class TestResourceExhaustion:
                 client.store(large_data)
                 
                 # Try to retrieve it
-                result = client.retrieve(0)
+                result = client.retrieve(1)
                 assert len(result["large_field"]) == 100_000_000
                 
             except MemoryError:
@@ -377,7 +377,7 @@ class TestDataCorruptionScenarios:
                 client.store(large_data)
                 
                 # Verify data integrity
-                result = client.retrieve(0)
+                result = client.retrieve(1)
                 assert len(result["field1"]) == 1_000_000
                 assert len(result["field2"]) == 1_000_000
                 assert len(result["field3"]) == 1_000_000
@@ -411,7 +411,7 @@ class TestDataCorruptionScenarios:
                 
                 # Try to retrieve all data
                 for i in range(len(problematic_data)):
-                    result = client.retrieve(i)
+                    result = client.retrieve(i + 1)
                     assert result is not None  # Should not be corrupted to None
                     
             except Exception as e:
@@ -441,7 +441,7 @@ class TestDataCorruptionScenarios:
                 
                 # Verify unicode integrity
                 for i, original in enumerate(unicode_data):
-                    result = client.retrieve(i)
+                    result = client.retrieve(i + 1)
                     assert result["text"] == original["text"]
                     
             except Exception as e:
@@ -591,7 +591,7 @@ class TestMemoryPressure:
                     assert len(results) == 1
                     
                     # Retrieve data
-                    result = client.retrieve(i)
+                    result = client.retrieve(i + 1)
                     assert result is not None
                     
                     # Clean up references
@@ -629,10 +629,10 @@ class TestInvalidStateTransitions:
                 client.query()
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
-                client.retrieve(0)
+                client.retrieve(1)
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
-                client.delete(0)
+                client.delete(1)
             
             with pytest.raises(RuntimeError, match="connection has been closed"):
                 client.create_table("test")
@@ -805,7 +805,7 @@ class TestExceptionPropagation:
             
             # Client should still be usable
             client.store({"recovery": "test"})
-            result = client.retrieve(0)
+            result = client.retrieve(1)
             assert result["recovery"] == "test"
             
             client.close()

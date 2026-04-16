@@ -465,8 +465,8 @@ class TestBasicSQLExecute:
             rows = result.to_dict()
             assert isinstance(rows, list)
             assert len(rows) == 1
-            assert rows[0]["min_id"] == 0
-            assert rows[0]["max_id"] == 9
+            assert rows[0]["min_id"] == 1
+            assert rows[0]["max_id"] == 10
             assert rows[0]["count"] == 10
 
             client.close()
@@ -486,8 +486,8 @@ class TestBasicSQLExecute:
             rows = result.to_dict()
             assert isinstance(rows, list)
             assert len(rows) == 1
-            assert rows[0]["min_id"] == 0
-            assert rows[0]["max_id"] == 9
+            assert rows[0]["min_id"] == 1
+            assert rows[0]["max_id"] == 10
             assert rows[0]["count"] == 10
 
             client.close()
@@ -505,8 +505,8 @@ class TestBasicSQLExecute:
             rows = result.to_dict()
             assert isinstance(rows, list)
             assert len(rows) == 1
-            assert rows[0]["MIN(_id)"] == 0
-            assert rows[0]["MAX(_id)"] == 99
+            assert rows[0]["MIN(_id)"] == 1
+            assert rows[0]["MAX(_id)"] == 100
             assert rows[0]["COUNT(1)"] == 100
 
             client.close()
@@ -524,8 +524,8 @@ class TestBasicSQLExecute:
             rows = result.to_dict()
             assert isinstance(rows, list)
             assert len(rows) == 1
-            assert rows[0]["MIN(_id)"] == 0
-            assert rows[0]["MAX(_id)"] == 9
+            assert rows[0]["MIN(_id)"] == 1
+            assert rows[0]["MAX(_id)"] == 10
             assert rows[0]["COUNT(1)"] == 10
 
             client.close()
@@ -543,8 +543,8 @@ class TestBasicSQLExecute:
             rows = result.to_dict()
             assert isinstance(rows, list)
             assert len(rows) == 1
-            assert rows[0]["MIN(_id)"] == 0
-            assert rows[0]["MAX(_id)"] == 99
+            assert rows[0]["MIN(_id)"] == 1
+            assert rows[0]["MAX(_id)"] == 100
             assert rows[0]["COUNT(*)"] == 100
 
             client.close()
@@ -590,8 +590,8 @@ class TestBasicSQLExecute:
             result = client.execute("SELECT default._id, name FROM default ORDER BY default._id")
             assert "_id" in result.columns
             rows = result.to_dict()
-            assert rows[0]["_id"] == 0
-            assert rows[1]["_id"] == 1
+            assert rows[0]["_id"] == 1
+            assert rows[1]["_id"] == 2
 
             client.close()
 
@@ -609,8 +609,8 @@ class TestBasicSQLExecute:
             result = client.execute('SELECT "_id", name FROM default ORDER BY "_id"')
             assert "_id" in result.columns
             rows = result.to_dict()
-            assert rows[0]["_id"] == 0
-            assert rows[1]["_id"] == 1
+            assert rows[0]["_id"] == 1
+            assert rows[1]["_id"] == 2
 
             client.close()
 
@@ -630,8 +630,8 @@ class TestBasicSQLExecute:
             # _id should appear at the user-specified position (after '*')
             assert result.columns[-1] == "_id"
             rows = result.to_dict()
-            assert rows[0]["_id"] == 0
-            assert rows[1]["_id"] == 1
+            assert rows[0]["_id"] == 1
+            assert rows[1]["_id"] == 2
 
             client.close()
 
@@ -653,8 +653,8 @@ class TestBasicSQLExecute:
             assert isinstance(rows, list)
             assert len(rows) == 2
             assert "_id" in rows[0]
-            assert rows[0]["_id"] == 0
-            assert rows[1]["_id"] == 1
+            assert rows[0]["_id"] == 1
+            assert rows[1]["_id"] == 2
 
             client.close()
 

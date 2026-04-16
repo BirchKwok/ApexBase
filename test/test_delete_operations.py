@@ -50,7 +50,7 @@ class TestDeleteOperations:
         initial_count = client.count_rows()
         
         # Delete records with ids 1, 2, 3
-        result = client.delete(id=[1, 2, 3])
+        result = client.delete(id=[2, 3, 4])
         
         assert result == True
         assert client.count_rows() == initial_count - 3

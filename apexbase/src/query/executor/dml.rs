@@ -221,11 +221,14 @@ impl ApexExecutor {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 let storage = TableStorageBackend::open(&table_path)?;
                 let schema = storage.get_schema();
-                // Use existing write count + active rows as base to ensure unique synthetic row IDs
-                let existing_writes = mgr.with_context(txn_id, |ctx| {
-                    Ok(ctx.write_set().len() as u64)
+                // Reserve synthetic row IDs from the storage allocator so transactional
+                // inserts follow the same 1-based monotonic sequence as committed rows.
+                let existing_inserts = mgr.with_context(txn_id, |ctx| {
+                    Ok(ctx.write_set().iter().filter(|write| {
+                        matches!(write, crate::txn::context::TxnWrite::Insert { table: t, .. } if t == &table)
+                    }).count() as u64)
                 })?;
-                let base_id = storage.active_row_count() + existing_writes;
+                let base_id = storage.next_id_value().max(crate::storage::FIRST_ROW_ID) + existing_inserts;
                 let mut buffered = 0i64;
                 for (ri, row_values) in values.iter().enumerate() {
                     let row_id = base_id + ri as u64;
