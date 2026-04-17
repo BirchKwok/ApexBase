@@ -167,7 +167,12 @@ impl TxnContext {
     // ========================================================================
 
     /// Buffer an insert operation
-    pub fn buffer_insert(&mut self, table: &str, row_id: u64, data: HashMap<String, Value>) -> io::Result<()> {
+    pub fn buffer_insert(
+        &mut self,
+        table: &str,
+        row_id: u64,
+        data: HashMap<String, Value>,
+    ) -> io::Result<()> {
         if self.read_only {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -178,7 +183,10 @@ impl TxnContext {
         if self.write_keys.contains(&key) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                format!("Row {} in table '{}' already written in this transaction", row_id, table),
+                format!(
+                    "Row {} in table '{}' already written in this transaction",
+                    row_id, table
+                ),
             ));
         }
         self.write_keys.insert(key);
@@ -282,7 +290,11 @@ impl TxnContext {
 
     /// Create a savepoint at the current write-set position
     pub fn savepoint(&mut self, name: &str) {
-        self.savepoints.push((name.to_string(), self.write_set.len(), self.write_keys.clone()));
+        self.savepoints.push((
+            name.to_string(),
+            self.write_set.len(),
+            self.write_keys.clone(),
+        ));
     }
 
     /// Rollback to a named savepoint — truncate write_set and restore write_keys
@@ -295,7 +307,10 @@ impl TxnContext {
             self.savepoints.truncate(pos);
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::NotFound, format!("Savepoint '{}' not found", name)))
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Savepoint '{}' not found", name),
+            ))
         }
     }
 
@@ -305,7 +320,10 @@ impl TxnContext {
             self.savepoints.remove(pos);
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::NotFound, format!("Savepoint '{}' not found", name)))
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Savepoint '{}' not found", name),
+            ))
         }
     }
 
@@ -346,7 +364,8 @@ mod tests {
     fn test_write_buffering() {
         let mut ctx = TxnContext::new(1, 100, false);
         ctx.buffer_insert("users", 0, make_row("alice")).unwrap();
-        ctx.buffer_update("users", 1, make_row("bob"), make_row("bob2")).unwrap();
+        ctx.buffer_update("users", 1, make_row("bob"), make_row("bob2"))
+            .unwrap();
         ctx.buffer_delete("users", 2, make_row("carol")).unwrap();
 
         assert_eq!(ctx.write_count(), 3);

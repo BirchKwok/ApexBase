@@ -551,6 +551,15 @@ impl OnDemandStorage {
             Some(idx) => idx,
             None => return Ok(dict_strings.iter().filter(|s| s.as_str() != NULL_MARKER).count() as i64),
         };
+        let col_type = footer.schema.columns[col_idx].1;
+        let has_any_deleted = footer.row_groups.iter().any(|rg| rg.deletion_count > 0);
+
+        // Warm fast path for dictionary-encoded mmap columns:
+        // the on-disk dictionary already contains only non-null distinct values,
+        // so without deletions COUNT(DISTINCT) is just the dictionary cardinality.
+        if !has_any_deleted && matches!(col_type, crate::storage::ColumnType::StringDict) {
+            return Ok(num_groups as i64);
+        }
 
         let max_col_idx = col_idx;
         let all_rcix = footer.row_groups.iter().enumerate().all(|(rg_i, rg_meta)| {
@@ -611,7 +620,9 @@ impl OnDemandStorage {
             rg_row_offset += rg_rows;
         }
 
-        Ok(seen.iter().filter(|&&b| b).count() as i64)
+        Ok((0..num_groups)
+            .filter(|&g| seen[g] && dict_strings[g].as_str() != NULL_MARKER)
+            .count() as i64)
     }
 
     /// Fast top-k for ORDER BY (string_col, float_col) without Arrow string conversion.
@@ -2840,5 +2851,4 @@ impl Drop for OnDemandStorage {
         }));
     }
 }
-
 

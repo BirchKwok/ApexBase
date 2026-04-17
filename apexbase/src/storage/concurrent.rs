@@ -38,7 +38,10 @@ impl AlignedCounter {
         // Use CAS loop for fetch_max (not directly available in atomic)
         let mut current = self.0.load(order);
         while current < val {
-            match self.0.compare_exchange_weak(current, val, order, Ordering::Relaxed) {
+            match self
+                .0
+                .compare_exchange_weak(current, val, order, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(v) => current = v,
             }
@@ -48,7 +51,7 @@ impl AlignedCounter {
 }
 
 /// Storage operation statistics
-/// 
+///
 /// Thread-safe statistics collection using lock-free atomics
 /// for high-performance concurrent access monitoring.
 pub struct StorageStats {
@@ -154,13 +157,14 @@ impl StorageStats {
     #[inline]
     pub fn begin_read(&self) -> ReadGuard<'_> {
         let current = self.active_readers.fetch_add(1, Ordering::Relaxed) + 1;
-        
+
         // Update peak if necessary
         let peak = self.peak_concurrent_readers.load(Ordering::Relaxed);
         if current as u64 > peak {
-            self.peak_concurrent_readers.fetch_max(current as u64, Ordering::Relaxed);
+            self.peak_concurrent_readers
+                .fetch_max(current as u64, Ordering::Relaxed);
         }
-        
+
         ReadGuard { stats: self }
     }
 
@@ -168,13 +172,14 @@ impl StorageStats {
     #[inline]
     pub fn begin_write(&self) -> WriteGuard<'_> {
         let current = self.active_writers.fetch_add(1, Ordering::Relaxed) + 1;
-        
+
         // Update peak if necessary
         let peak = self.peak_concurrent_writers.load(Ordering::Relaxed);
         if current as u64 > peak {
-            self.peak_concurrent_writers.fetch_max(current as u64, Ordering::Relaxed);
+            self.peak_concurrent_writers
+                .fetch_max(current as u64, Ordering::Relaxed);
         }
-        
+
         WriteGuard { stats: self }
     }
 
@@ -367,30 +372,32 @@ pub type BackendStats = StorageStats;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
     use std::sync::Arc;
+    use std::thread;
     use tempfile::tempdir;
 
     #[test]
     fn test_concurrent_stats() {
         let stats = Arc::new(StorageStats::new());
-        
+
         // Spawn multiple threads writing concurrently
-        let handles: Vec<_> = (0..4).map(|_| {
-            let stats = Arc::clone(&stats);
-            thread::spawn(move || {
-                for _ in 0..1000 {
-                    stats.record_read(1024);
-                    stats.record_write(512);
-                    let _guard = stats.begin_read();
-                }
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let stats = Arc::clone(&stats);
+                thread::spawn(move || {
+                    for _ in 0..1000 {
+                        stats.record_read(1024);
+                        stats.record_write(512);
+                        let _guard = stats.begin_read();
+                    }
+                })
             })
-        }).collect();
-        
+            .collect();
+
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.read_count, 4000);
         assert_eq!(snapshot.write_count, 4000);
@@ -401,11 +408,11 @@ mod tests {
     #[test]
     fn test_cache_hit_rate() {
         let stats = StorageStats::new();
-        
+
         stats.record_cache_hit();
         stats.record_cache_hit();
         stats.record_cache_miss();
-        
+
         let rate = stats.cache_hit_rate();
         assert!((rate - 66.66).abs() < 0.1, "Expected ~66.66%, got {}", rate);
     }
@@ -413,16 +420,14 @@ mod tests {
     #[test]
     fn test_peak_concurrent() {
         let stats = StorageStats::new();
-        
-        let guards: Vec<_> = (0..5)
-            .map(|_| stats.begin_read())
-            .collect();
-        
+
+        let guards: Vec<_> = (0..5).map(|_| stats.begin_read()).collect();
+
         assert_eq!(stats.active_readers_count(), 5);
         assert!(stats.peak_concurrent_readers.load(Ordering::Relaxed) >= 5);
-        
+
         drop(guards);
-        
+
         assert_eq!(stats.active_readers_count(), 0);
     }
 }

@@ -526,52 +526,68 @@ with ApexClient("./data") as client:
 
 ### ApexBase vs SQLite vs DuckDB (1M rows)
 
-Three-way comparison on macOS 26.3, Apple arm (10 cores), 32 GB RAM.
+Three-way comparison on macOS 26.4.1, Apple arm (10 cores), 32 GB RAM.
 Python 3.12.4, ApexBase v1.14.0, SQLite v3.45.3, DuckDB v1.1.3, PyArrow v23.0.1.
 
 Dataset: 1,000,000 rows × 5 columns (name, age, score, city, category).
 Average of 5 timed iterations after 2 warmup runs.
+Read benchmarks materialize full results for fairness; ID lookups use shared deterministic inputs.
 
 | Query | ApexBase | SQLite | DuckDB | vs Best Other |
 |-------|----------|--------|--------|---------------|
-| Bulk Insert (1M rows) | 285.69ms | 1.05s | 194.69s | **3.7x faster** |
-| COUNT(\*) | 0.068ms | 8.91ms | 0.533ms | **7.8x faster** |
-| SELECT \* LIMIT 100 [cold] | 0.032ms | 0.075ms | 0.251ms | **2.3x faster** |
-| SELECT \* LIMIT 100 [warm] | 0.028ms | 0.080ms | 0.215ms | **2.9x faster** |
-| SELECT \* LIMIT 10K [cold] | 0.818ms | 8.03ms | 4.81ms | **5.9x faster** |
-| SELECT \* LIMIT 10K [warm] | 0.757ms | 8.08ms | 4.81ms | **6.4x faster** |
-| Filter (name = 'user\_5000') | 0.202ms | 42.24ms | 1.66ms | **8.2x faster** |
-| Filter (age BETWEEN 25 AND 35) | 14.81ms | 196.48ms | 99.11ms | **6.7x faster** |
-| GROUP BY city (10 groups) | 1.50ms | 376.15ms | 4.19ms | **2.8x faster** |
-| GROUP BY + HAVING | 1.54ms | 360.91ms | 4.96ms | **3.2x faster** |
-| ORDER BY score LIMIT 100 | 1.91ms | 62.41ms | 5.67ms | **3.0x faster** |
-| Aggregation (5 funcs) | 0.218ms | 87.68ms | 1.36ms | **6.2x faster** |
-| Complex (Filter+Group+Order) | 1.40ms | 173.33ms | 3.20ms | **2.3x faster** |
-| Point Lookup (by \_id) | 0.023ms | 0.051ms | 3.31ms | **2.2x faster** |
-| Retrieve Many (100 IDs) | 0.206ms | 0.396ms | 5.69ms | **1.9x faster** |
-| Insert 1K rows | 0.622ms | 1.38ms | 155.78ms | **2.2x faster** |
-| SELECT \* → pandas (full scan) | 27.06ms | 1.34s | 212.68ms | **7.9x faster** |
-| GROUP BY city, category (100 grp) | 2.41ms | 702.13ms | 6.74ms | **2.8x faster** |
-| LIKE filter (name LIKE 'user\_1%') | 18.68ms | 149.12ms | 57.28ms | **3.1x faster** |
-| Multi-cond (age>30 AND score>50) | 33.06ms | 405.24ms | 212.05ms | **6.4x faster** |
-| ORDER BY city, score DESC LIMIT 100 | 3.28ms | 71.78ms | 8.56ms | **2.6x faster** |
-| COUNT(DISTINCT city) | 0.667ms | 92.21ms | 4.78ms | **7.2x faster** |
-| IN filter (city IN 3 cities) | 21.28ms | 359.22ms | 165.09ms | **7.8x faster** |
-| Numeric IN (age IN 9 values) | 24.37ms | 205.52ms | 89.10ms | **3.7x faster** |
-| OR cross-col (age=25 OR city='Beijing') | 6.20ms | 169.20ms | 69.00ms | **11.1x faster** |
-| Numeric OR (age=20\|30\|40\|50) | 18.28ms | 107.97ms | 41.34ms | **2.3x faster** |
-| UPDATE rows (age = 25) | 7.56ms | 39.07ms | 16.05ms | **2.1x faster** |
-| Store+DELETE 1K (combined) | 0.892ms | 35.75ms | 200.90ms | **40.1x faster** |
-| DELETE 1K [pure delete only] | 0.141ms | 34.59ms | 0.432ms | **3.1x faster** |
-| Window ROW\_NUMBER PARTITION BY city | 0.342ms | 515.92ms | 52.36ms | **153x faster** |
-| FTS Index Build (1M rows) | 744.71ms | 1.62s | 1.21s | **1.6x faster** |
-| FTS Search ('Electronics') | 0.161ms | 26.94ms | 27.57ms | **167x faster** |
-| Single-threaded Q/s | 1400.2 Q/s | 6.2 Q/s | 393.2 Q/s | **3.6x faster** |
-| Concurrent Q/s (4 threads)| 2083.1 Q/s | 22.8 Q/s | 631.5 Q/s | **3.3x faster** |
+| Bulk Insert (1M rows) | 293.68ms | 1.02s | 195.62s | **3.5x faster** |
+| COUNT(\*) | 0.077ms | 8.26ms | 0.545ms | **7.1x faster** |
+| SELECT \* LIMIT 100 [cold] | 0.046ms | 0.132ms | 0.644ms | **2.9x faster** |
+| SELECT \* LIMIT 100 [warm] | 0.045ms | 0.112ms | 0.222ms | **2.5x faster** |
+| SELECT \* LIMIT 10K [cold] | 4.47ms | 12.01ms | 7.90ms | **1.8x faster** |
+| SELECT \* LIMIT 10K [warm] | 4.30ms | 12.09ms | 7.95ms | **1.8x faster** |
+| Filter (name = 'user\_5000') | 0.152ms | 41.03ms | 1.72ms | **11.3x faster** |
+| Filter (age BETWEEN 25 AND 35) | 91.94ms | 273.85ms | 159.88ms | **1.7x faster** |
+| GROUP BY city (10 groups) | 0.238ms | 355.98ms | 3.73ms | **15.7x faster** |
+| GROUP BY + HAVING | 0.239ms | 363.91ms | 4.33ms | **18.1x faster** |
+| ORDER BY score LIMIT 100 | 0.535ms | 52.14ms | 5.46ms | **10.2x faster** |
+| Aggregation (5 funcs) | 0.287ms | 85.76ms | 1.72ms | **6.0x faster** |
+| Complex (Filter+Group+Order) | 0.216ms | 173.72ms | 5.25ms | **24.3x faster** |
+| Point Lookup (SQL by ID) | 0.047ms | 0.061ms | 2.95ms | **1.3x faster** |
+| Retrieve Many (SQL, 100 IDs) | 0.244ms | 0.334ms | 4.94ms | **1.4x faster** |
+| Insert 1K rows | 0.704ms | 1.65ms | 217.65ms | **2.3x faster** |
+| SELECT \* -> pandas (full scan) | 23.78ms | 1.40s | 222.45ms | **9.4x faster** |
+| GROUP BY city,category (100 grp) | 0.378ms | 713.27ms | 9.16ms | **24.2x faster** |
+| LIKE filter (name LIKE user\_1%) | 61.14ms | 191.31ms | 97.38ms | **1.6x faster** |
+| Multi-cond (age>30 AND score>50) | 213.82ms | 561.74ms | 350.96ms | **1.6x faster** |
+| ORDER BY city,score DESC LIMIT100 | 0.508ms | 71.53ms | 8.38ms | **16.5x faster** |
+| COUNT(DISTINCT city) | 0.187ms | 91.07ms | 4.49ms | **24.0x faster** |
+| IN filter (city IN 3 cities) | 153.70ms | 484.42ms | 268.56ms | **1.7x faster** |
+| Numeric IN (age IN 9 values) | 85.26ms | 260.28ms | 133.30ms | **1.6x faster** |
+| OR cross-col (age=25 OR city=BJ) | 45.98ms | 214.88ms | 104.00ms | **2.3x faster** |
+| Numeric OR (age=20\|30\|40\|50) | 42.45ms | 135.50ms | 56.95ms | **1.3x faster** |
+| UPDATE rows (age=25, idempotent) | 7.87ms | 38.69ms | 15.85ms | **2.0x faster** |
+| Store+DELETE 1K (combined) | 0.949ms | 35.51ms | 186.08ms | **37.4x faster** |
+| DELETE 1K [pure delete only] | 0.186ms | 33.61ms | 0.400ms | **2.2x faster** |
+| Window ROW\_NUMBER PARTITION BY city | 1.80ms | 514.42ms | 62.08ms | **34.5x faster** |
+| FTS Index Build (name,city,category) | 777.31ms | 1.62s | 1.21s | **1.6x faster** |
+| FTS Search ('Electronics') | 0.165ms | 28.83ms | 25.46ms | **154x faster** |
+| Single-threaded Q/s | 9027.5 Q/s | 6.2 Q/s | 503.6 Q/s | **17.9x faster** |
+| Concurrent Q/s (4 threads) | 12140.7 Q/s | 22.5 Q/s | 889.5 Q/s | **13.6x faster** |
 
-**Summary**: wins 32/32 benchmarks. "Cold" = fresh DB open per iteration; "warm" = cached backend.
+**Summary**: ApexBase wins 32/32 benchmarks. "Cold" = fresh DB open per iteration; "warm" = cached backend.
 
-Cold comparison is fair: all three engines measured without gc.collect() interference.
+Q/s uses a scan-heavy mixed workload: COUNT + two full-table GROUP BY scans + filtered LIMIT 100, materialized to Python rows.
+
+### ApexBase Result Materialization APIs
+
+The cross-engine table above keeps result materialization comparable across engines. The table below uses a fresh ApexBase copy of the same 1M-row generated data and isolates ApexBase's Python result conversion APIs. It is not part of the SQLite/DuckDB ranking.
+
+| Query | to_dict | to_arrow | to_pandas | Arrow vs dict | Shape |
+|-------|---------|----------|-----------|---------------|-------|
+| Point Lookup | 0.045ms | 0.167ms | 0.395ms | 3.7x slower | 1x6 |
+| SELECT \* LIMIT 10K | 4.53ms | 3.71ms | 7.20ms | 1.2x faster | 10000x6 |
+| IN filter (city IN 3) | 145.07ms | 104.82ms | 195.27ms | 1.4x faster | 300321x6 |
+| Multi-cond filter | 211.38ms | 161.91ms | 274.44ms | 1.3x faster | 396569x6 |
+| GROUP BY city | 0.225ms | 0.171ms | 0.596ms | 1.3x faster | 10x3 |
+| Full scan | 2.37s | 25.30ms | 40.01ms | 93.5x faster | 1000000x6 |
+
+For tiny one-row results, `to_dict()` can be faster because Python object creation is minimal. For large scans and filters, `to_arrow()` avoids row-dict materialization and exposes ApexBase's Arrow-native path.
 
 Reproduce: `python benchmarks/bench_vs_sqlite_duckdb.py --rows 1000000`
 

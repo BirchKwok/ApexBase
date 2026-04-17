@@ -46,24 +46,28 @@ impl ConflictResult {
     pub fn to_io_result(&self) -> io::Result<()> {
         match self {
             ConflictResult::NoConflict => Ok(()),
-            ConflictResult::ReadWriteConflict { table, row_id, conflicting_txn } => {
-                Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!(
-                        "Read-write conflict: row {} in table '{}' was modified by txn {}",
-                        row_id, table, conflicting_txn
-                    ),
-                ))
-            }
-            ConflictResult::WriteWriteConflict { table, row_id, conflicting_txn } => {
-                Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!(
-                        "Write-write conflict: row {} in table '{}' was also written by txn {}",
-                        row_id, table, conflicting_txn
-                    ),
-                ))
-            }
+            ConflictResult::ReadWriteConflict {
+                table,
+                row_id,
+                conflicting_txn,
+            } => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Read-write conflict: row {} in table '{}' was modified by txn {}",
+                    row_id, table, conflicting_txn
+                ),
+            )),
+            ConflictResult::WriteWriteConflict {
+                table,
+                row_id,
+                conflicting_txn,
+            } => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Write-write conflict: row {} in table '{}' was also written by txn {}",
+                    row_id, table, conflicting_txn
+                ),
+            )),
         }
     }
 }
@@ -276,7 +280,8 @@ mod tests {
 
         // Txn 2 (snapshot at 100) tries to write to the same row
         let mut ctx2 = TxnContext::new(2, 100, false);
-        ctx2.buffer_update("users", 0, make_row("alice"), make_row("alice2")).unwrap();
+        ctx2.buffer_update("users", 0, make_row("alice"), make_row("alice2"))
+            .unwrap();
 
         let result = detector.validate(&ctx2);
         assert!(!result.is_ok());
@@ -292,13 +297,15 @@ mod tests {
 
         // Txn 1 commits a write to row 5
         let mut ctx1 = TxnContext::new(1, 100, false);
-        ctx1.buffer_update("users", 5, make_row("old"), make_row("new")).unwrap();
+        ctx1.buffer_update("users", 5, make_row("old"), make_row("new"))
+            .unwrap();
         detector.record_commit(&ctx1, 110);
 
         // Txn 2 (snapshot at 100) read row 5 and now tries to commit
         let mut ctx2 = TxnContext::new(2, 100, false);
         ctx2.record_read("users", 5, 50);
-        ctx2.buffer_insert("users", 99, make_row("unrelated")).unwrap();
+        ctx2.buffer_insert("users", 99, make_row("unrelated"))
+            .unwrap();
 
         let result = detector.validate(&ctx2);
         assert!(!result.is_ok());

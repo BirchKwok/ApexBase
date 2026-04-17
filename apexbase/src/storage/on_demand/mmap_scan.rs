@@ -2926,6 +2926,307 @@ impl OnDemandStorage {
         Ok(Some(matches))
     }
 
+    /// Mmap-level string IN scan: find rows where col_name IN (v1, v2, ...).
+    /// Uses a single pass over the target column when all RGs are uncompressed+RCIX.
+    /// Falls back to repeated equality scans for correctness on unsupported layouts.
+    pub fn scan_string_in_mmap(
+        &self,
+        col_name: &str,
+        values: &[String],
+        limit: Option<usize>,
+    ) -> io::Result<Option<Vec<usize>>> {
+        use rayon::prelude::*;
+
+        if values.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if values.len() == 1 {
+            return self.scan_string_filter_mmap(col_name, &values[0], limit);
+        }
+
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let col_type = schema.columns[col_idx].1;
+        let is_dict = matches!(col_type, ColumnType::StringDict);
+        let is_string = matches!(col_type, ColumnType::String);
+        if !is_dict && !is_string {
+            return Ok(None);
+        }
+
+        let file_guard = self.file.read();
+        let file = file_guard.as_ref()
+            .ok_or_else(|| err_not_conn("File not open for string IN scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        let all_fast = footer.row_groups.iter().enumerate().all(|(rg_i, rg_meta)| {
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return false;
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
+            let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
+            compress_flag == RG_COMPRESS_NONE
+                && enc_ver >= 1
+                && footer.col_offsets.get(rg_i).map_or(false, |v| v.len() > col_idx)
+        });
+
+        if !all_fast {
+            drop(mmap_guard);
+            drop(file_guard);
+            let mut all_indices: Vec<usize> = Vec::new();
+            for value in values {
+                if let Some(mut idxs) = self.scan_string_filter_mmap(col_name, value, None)? {
+                    all_indices.append(&mut idxs);
+                }
+            }
+            all_indices.sort_unstable();
+            all_indices.dedup();
+            if let Some(lim) = limit {
+                all_indices.truncate(lim);
+            }
+            return Ok(Some(all_indices));
+        }
+
+        let target_bytes: Vec<&[u8]> = values.iter().map(|s| s.as_bytes()).collect();
+        let min_len = values.iter().map(|s| s.len()).min().unwrap_or(0) as i64;
+        let max_len = values.iter().map(|s| s.len()).max().unwrap_or(0) as i64;
+        let matches_any = |bytes: &[u8]| -> bool {
+            target_bytes
+                .iter()
+                .any(|target| target.len() == bytes.len() && *target == bytes)
+        };
+
+        struct RgDesc {
+            rg_idx: usize,
+            rg_offset: usize,
+            rg_data_size: usize,
+            rg_rows: usize,
+            global_off: usize,
+            col_rcix: usize,
+            has_deletes: bool,
+        }
+
+        let mut rg_descs: Vec<RgDesc> = Vec::with_capacity(footer.row_groups.len());
+        let mut off = 0usize;
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            rg_descs.push(RgDesc {
+                rg_idx: rg_i,
+                rg_offset: rg_meta.offset as usize,
+                rg_data_size: rg_meta.data_size as usize,
+                rg_rows: rg_meta.row_count as usize,
+                global_off: off,
+                col_rcix: footer.col_offsets[rg_i][col_idx] as usize,
+                has_deletes: rg_meta.deletion_count > 0,
+            });
+            off += rg_meta.row_count as usize;
+        }
+
+        let scan_rg = |desc: &RgDesc, mmap: &[u8]| -> Vec<usize> {
+            let rg_end = desc.rg_offset + desc.rg_data_size;
+            if rg_end > mmap.len() || rg_end < desc.rg_offset + 32 {
+                return vec![];
+            }
+            let body = &mmap[desc.rg_offset + 32..rg_end];
+            let bitmap_len = (desc.rg_rows + 7) / 8;
+            let del_start = desc.rg_rows * 8;
+            if desc.col_rcix + bitmap_len > body.len() {
+                return vec![];
+            }
+
+            let null_bytes = &body[desc.col_rcix..desc.col_rcix + bitmap_len];
+            let col_bytes = &body[desc.col_rcix + bitmap_len..];
+            if col_bytes.is_empty() || col_bytes[0] != COL_ENCODING_PLAIN {
+                return vec![];
+            }
+            let payload = &col_bytes[1..];
+            let mut local: Vec<usize> = Vec::new();
+
+            if is_string {
+                if payload.len() < 8 {
+                    return local;
+                }
+                let count = u64::from_le_bytes(payload[0..8].try_into().unwrap_or([0; 8])) as usize;
+                let offsets_len = (count + 1) * 4;
+                let data_len_off = 8 + offsets_len;
+                if data_len_off + 8 > payload.len() {
+                    return local;
+                }
+                let data_len = u64::from_le_bytes(
+                    payload[data_len_off..data_len_off + 8]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                ) as usize;
+                let data_start = data_len_off + 8;
+                let data_end = (data_start + data_len).min(payload.len());
+                if data_end < data_start {
+                    return local;
+                }
+                let raw = &payload[data_start..data_end];
+                let offsets_cow = bytes_as_u32_slice(&payload[8..], count + 1);
+                let offsets: &[u32] = &offsets_cow;
+                let n = count.min(desc.rg_rows);
+
+                if !desc.has_deletes {
+                    for i in 0..n {
+                        if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                            continue;
+                        }
+                        let s = offsets[i] as usize;
+                        let e = offsets[i + 1] as usize;
+                        if e >= s && e <= raw.len() && matches_any(&raw[s..e]) {
+                            local.push(desc.global_off + i);
+                        }
+                    }
+                } else {
+                    if del_start + bitmap_len > body.len() {
+                        return local;
+                    }
+                    let del_bytes = &body[del_start..del_start + bitmap_len];
+                    for i in 0..n {
+                        if (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                            continue;
+                        }
+                        if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                            continue;
+                        }
+                        let s = offsets[i] as usize;
+                        let e = offsets[i + 1] as usize;
+                        if e >= s && e <= raw.len() && matches_any(&raw[s..e]) {
+                            local.push(desc.global_off + i);
+                        }
+                    }
+                }
+            } else {
+                if payload.len() < 16 {
+                    return local;
+                }
+                let row_count = u64::from_le_bytes(payload[0..8].try_into().unwrap_or([0; 8])) as usize;
+                let dict_size = u64::from_le_bytes(payload[8..16].try_into().unwrap_or([0; 8])) as usize;
+                if dict_size == 0 {
+                    return local;
+                }
+                let dict_off_start = 16 + row_count * 4;
+                let dict_data_len_off = dict_off_start + dict_size * 4;
+                if dict_data_len_off + 8 > payload.len() {
+                    return local;
+                }
+                let dict_data_len = u64::from_le_bytes(
+                    payload[dict_data_len_off..dict_data_len_off + 8]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                ) as usize;
+                let dict_data_start = dict_data_len_off + 8;
+                let raw_end = (dict_data_start + dict_data_len).min(payload.len());
+                let raw_dict = &payload[dict_data_start..raw_end];
+                let dict_offsets_cow = bytes_as_u32_slice(&payload[dict_off_start..], dict_size);
+                let dict_offsets: &[u32] = &dict_offsets_cow;
+                let indices_cow = bytes_as_u32_slice(&payload[16..], row_count);
+                let indices: &[u32] = &indices_cow;
+
+                let mut match_flags = vec![false; dict_size + 1];
+                for di in 0..dict_size {
+                    let ds = dict_offsets[di] as usize;
+                    let de = if di + 1 < dict_size {
+                        dict_offsets[di + 1] as usize
+                    } else {
+                        dict_data_len
+                    };
+                    if ds <= de && de <= raw_dict.len() && matches_any(&raw_dict[ds..de]) {
+                        match_flags[di + 1] = true;
+                    }
+                }
+
+                let n = row_count.min(desc.rg_rows);
+                if !desc.has_deletes {
+                    for i in 0..n {
+                        if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                            continue;
+                        }
+                        let idx = indices[i] as usize;
+                        if idx < match_flags.len() && match_flags[idx] {
+                            local.push(desc.global_off + i);
+                        }
+                    }
+                } else {
+                    if del_start + bitmap_len > body.len() {
+                        return local;
+                    }
+                    let del_bytes = &body[del_start..del_start + bitmap_len];
+                    for i in 0..n {
+                        if (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                            continue;
+                        }
+                        if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                            continue;
+                        }
+                        let idx = indices[i] as usize;
+                        if idx < match_flags.len() && match_flags[idx] {
+                            local.push(desc.global_off + i);
+                        }
+                    }
+                }
+            }
+
+            local
+        };
+
+        let max_matches = limit.unwrap_or(usize::MAX);
+        let mut matches: Vec<usize> = if limit.is_none() && rg_descs.len() > 1 {
+            let mmap_ptr = mmap_ref.as_ptr() as usize;
+            let mmap_len = mmap_ref.len();
+            rg_descs
+                .par_iter()
+                .filter_map(|desc| {
+                    if let Some(zmaps) = footer.zone_maps.get(desc.rg_idx) {
+                        if let Some(zm) = zmaps.iter().find(|z| z.col_idx as usize == col_idx && !z.is_float) {
+                            if max_len < zm.min_bits || min_len > zm.max_bits {
+                                return None;
+                            }
+                        }
+                    }
+                    let mmap = unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len) };
+                    Some(scan_rg(desc, mmap))
+                })
+                .flatten()
+                .collect()
+        } else {
+            let mut out = Vec::new();
+            for desc in &rg_descs {
+                if out.len() >= max_matches {
+                    break;
+                }
+                if let Some(zmaps) = footer.zone_maps.get(desc.rg_idx) {
+                    if let Some(zm) = zmaps.iter().find(|z| z.col_idx as usize == col_idx && !z.is_float) {
+                        if max_len < zm.min_bits || min_len > zm.max_bits {
+                            continue;
+                        }
+                    }
+                }
+                let mut local = scan_rg(desc, mmap_ref);
+                out.append(&mut local);
+                if out.len() >= max_matches {
+                    out.truncate(max_matches);
+                    break;
+                }
+            }
+            out
+        };
+
+        if let Some(lim) = limit {
+            matches.truncate(lim);
+        }
+        Ok(Some(matches))
+    }
+
     /// Mmap-level boolean column filter: find rows where col = target_value (true/false).
     /// Uses Rayon parallel scan across row groups for maximum performance.
     pub fn scan_bool_filter_mmap(

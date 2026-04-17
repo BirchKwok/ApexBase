@@ -8,39 +8,45 @@
 //! - Performs all filtering/projection/aggregation using Arrow compute kernels
 //! - Returns Arrow RecordBatch directly (zero-copy to Python)
 
+use ahash::AHashMap;
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
-    UInt64Array, RecordBatch,
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
-use arrow::compute::{self, SortOptions};
 use arrow::compute::kernels::cmp;
 use arrow::compute::kernels::numeric as arith;
+use arrow::compute::{self, SortOptions};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-use ahash::AHashMap;
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use parking_lot::RwLock;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use crate::query::{SqlParser, SqlStatement, SelectStatement, SqlExpr, SelectColumn, JoinType, JoinClause, UnionStatement, AggregateFunc};
+use crate::query::jit::{
+    simd_max_i64, simd_min_i64, simd_sum_f64, simd_sum_i64, ExprJIT, FilterFnI64,
+};
+use crate::query::planner::{
+    get_table_stats, invalidate_table_stats, ExecutionStrategy, QueryPlanner,
+};
 use crate::query::sql_parser::BinaryOperator;
 use crate::query::sql_parser::FromItem;
-use crate::query::jit::{ExprJIT, FilterFnI64, simd_sum_i64, simd_sum_f64, simd_min_i64, simd_max_i64};
-use crate::query::planner::{QueryPlanner, ExecutionStrategy, get_table_stats, invalidate_table_stats};
+use crate::query::{
+    AggregateFunc, JoinClause, JoinType, SelectColumn, SelectStatement, SqlExpr, SqlParser,
+    SqlStatement, UnionStatement,
+};
 
 /// Zone Map optimization result for filter pruning
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum ZoneMapResult {
-    NoMatch,    // Filter definitely won't match any rows
-    MayMatch,   // Filter might match some rows
+    NoMatch,  // Filter definitely won't match any rows
+    MayMatch, // Filter might match some rows
 }
-use crate::storage::TableStorageBackend;
 use crate::data::{DataType, Value};
-use std::collections::HashSet;
+use crate::storage::TableStorageBackend;
 use ahash::AHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 // ============================================================================
@@ -128,20 +134,38 @@ fn err_not_found(msg: impl Into<String>) -> io::Error {
 
 /// Helper to apply a unary function on numeric arrays
 #[inline]
-fn map_numeric_unary<F1, F2>(arr: &ArrayRef, batch_rows: usize, int_fn: F1, float_fn: F2, func_name: &str) -> io::Result<ArrayRef>
+fn map_numeric_unary<F1, F2>(
+    arr: &ArrayRef,
+    batch_rows: usize,
+    int_fn: F1,
+    float_fn: F2,
+    func_name: &str,
+) -> io::Result<ArrayRef>
 where
     F1: Fn(i64) -> i64,
     F2: Fn(f64) -> f64,
 {
     if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-        let result: Vec<Option<i64>> = (0..batch_rows).map(|i| {
-            if int_arr.is_null(i) { None } else { Some(int_fn(int_arr.value(i))) }
-        }).collect();
+        let result: Vec<Option<i64>> = (0..batch_rows)
+            .map(|i| {
+                if int_arr.is_null(i) {
+                    None
+                } else {
+                    Some(int_fn(int_arr.value(i)))
+                }
+            })
+            .collect();
         Ok(Arc::new(Int64Array::from(result)))
     } else if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-        let result: Vec<Option<f64>> = (0..batch_rows).map(|i| {
-            if float_arr.is_null(i) { None } else { Some(float_fn(float_arr.value(i))) }
-        }).collect();
+        let result: Vec<Option<f64>> = (0..batch_rows)
+            .map(|i| {
+                if float_arr.is_null(i) {
+                    None
+                } else {
+                    Some(float_fn(float_arr.value(i)))
+                }
+            })
+            .collect();
         Ok(Arc::new(Float64Array::from(result)))
     } else {
         Err(err_data(format!("{} requires numeric argument", func_name)))
@@ -150,15 +174,28 @@ where
 
 /// Helper to apply a unary string function
 #[inline]
-fn map_string_unary<F>(arr: &ArrayRef, batch_rows: usize, f: F, func_name: &str) -> io::Result<ArrayRef>
+fn map_string_unary<F>(
+    arr: &ArrayRef,
+    batch_rows: usize,
+    f: F,
+    func_name: &str,
+) -> io::Result<ArrayRef>
 where
     F: Fn(&str) -> String,
 {
     if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-        let result: Vec<Option<String>> = (0..batch_rows).map(|i| {
-            if str_arr.is_null(i) { None } else { Some(f(str_arr.value(i))) }
-        }).collect();
-        Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+        let result: Vec<Option<String>> = (0..batch_rows)
+            .map(|i| {
+                if str_arr.is_null(i) {
+                    None
+                } else {
+                    Some(f(str_arr.value(i)))
+                }
+            })
+            .collect();
+        Ok(Arc::new(StringArray::from(
+            result.iter().map(|s| s.as_deref()).collect::<Vec<_>>(),
+        )))
     } else {
         Err(err_data(format!("{} requires string argument", func_name)))
     }
@@ -166,14 +203,25 @@ where
 
 /// Helper to apply a unary string function returning &str (no allocation)
 #[inline]
-fn map_string_unary_ref<'a, F>(arr: &'a ArrayRef, batch_rows: usize, f: F, func_name: &str) -> io::Result<ArrayRef>
+fn map_string_unary_ref<'a, F>(
+    arr: &'a ArrayRef,
+    batch_rows: usize,
+    f: F,
+    func_name: &str,
+) -> io::Result<ArrayRef>
 where
     F: Fn(&'a str) -> &'a str,
 {
     if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-        let result: Vec<Option<&str>> = (0..batch_rows).map(|i| {
-            if str_arr.is_null(i) { None } else { Some(f(str_arr.value(i))) }
-        }).collect();
+        let result: Vec<Option<&str>> = (0..batch_rows)
+            .map(|i| {
+                if str_arr.is_null(i) {
+                    None
+                } else {
+                    Some(f(str_arr.value(i)))
+                }
+            })
+            .collect();
         Ok(Arc::new(StringArray::from(result)))
     } else {
         Err(err_data(format!("{} requires string argument", func_name)))
@@ -182,14 +230,25 @@ where
 
 /// Helper to apply a string-to-int function
 #[inline]
-fn map_string_to_int<F>(arr: &ArrayRef, batch_rows: usize, f: F, func_name: &str) -> io::Result<ArrayRef>
+fn map_string_to_int<F>(
+    arr: &ArrayRef,
+    batch_rows: usize,
+    f: F,
+    func_name: &str,
+) -> io::Result<ArrayRef>
 where
     F: Fn(&str) -> i64,
 {
     if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-        let result: Vec<Option<i64>> = (0..batch_rows).map(|i| {
-            if str_arr.is_null(i) { None } else { Some(f(str_arr.value(i))) }
-        }).collect();
+        let result: Vec<Option<i64>> = (0..batch_rows)
+            .map(|i| {
+                if str_arr.is_null(i) {
+                    None
+                } else {
+                    Some(f(str_arr.value(i)))
+                }
+            })
+            .collect();
         Ok(Arc::new(Int64Array::from(result)))
     } else {
         Err(err_data(format!("{} requires string argument", func_name)))
@@ -198,15 +257,28 @@ where
 
 /// Helper to apply an int-to-string function
 #[inline]
-fn map_int_to_string<F>(arr: &ArrayRef, batch_rows: usize, f: F, func_name: &str) -> io::Result<ArrayRef>
+fn map_int_to_string<F>(
+    arr: &ArrayRef,
+    batch_rows: usize,
+    f: F,
+    func_name: &str,
+) -> io::Result<ArrayRef>
 where
     F: Fn(i64) -> Option<String>,
 {
     if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-        let result: Vec<Option<String>> = (0..batch_rows).map(|i| {
-            if int_arr.is_null(i) { None } else { f(int_arr.value(i)) }
-        }).collect();
-        Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+        let result: Vec<Option<String>> = (0..batch_rows)
+            .map(|i| {
+                if int_arr.is_null(i) {
+                    None
+                } else {
+                    f(int_arr.value(i))
+                }
+            })
+            .collect();
+        Ok(Arc::new(StringArray::from(
+            result.iter().map(|s| s.as_deref()).collect::<Vec<_>>(),
+        )))
     } else {
         Err(err_data(format!("{} requires int argument", func_name)))
     }
@@ -215,9 +287,13 @@ where
 // Global storage cache to avoid repeated open() calls which load all IDs
 // Key: canonical path, Value: (backend, last_modified_time, last_access_time)
 // Uses LRU eviction when cache exceeds MAX_CACHE_ENTRIES
-const MAX_CACHE_ENTRIES: usize = 64;  // Limit cache to 64 tables
+const MAX_CACHE_ENTRIES: usize = 64; // Limit cache to 64 tables
 
-type CacheEntry = (Arc<TableStorageBackend>, std::time::SystemTime, Arc<AtomicU64>);
+type CacheEntry = (
+    Arc<TableStorageBackend>,
+    std::time::SystemTime,
+    Arc<AtomicU64>,
+);
 // DashMap provides fine-grained locking - concurrent reads don't block each other
 static STORAGE_CACHE: Lazy<DashMap<PathBuf, CacheEntry>> = Lazy::new(DashMap::new);
 
@@ -265,7 +341,11 @@ fn get_table_lock(table_path: &Path) -> Arc<TableLock> {
     // Slow path: create lock + open sidecar .lock file once
     let lock_path = {
         let mut p = table_path.to_path_buf();
-        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         p.set_file_name(format!("{}.lock", name));
         p
     };
@@ -279,7 +359,8 @@ fn get_table_lock(table_path: &Path) -> Arc<TableLock> {
         file,
     });
     let mut locks = TABLE_WRITE_LOCKS.write();
-    locks.entry(table_path.to_path_buf())
+    locks
+        .entry(table_path.to_path_buf())
         .or_insert_with(|| entry.clone());
     entry
 }
@@ -332,12 +413,16 @@ fn evict_lru_cache_entries() {
 // ============================================================================
 // Key: base_dir path, Value: table_name -> IndexManager
 // Lazily loaded from disk catalog on first access per table
-static INDEX_CACHE: Lazy<RwLock<AHashMap<PathBuf, Arc<parking_lot::Mutex<crate::storage::index::IndexManager>>>>> =
-    Lazy::new(|| RwLock::new(AHashMap::with_capacity(32)));
+static INDEX_CACHE: Lazy<
+    RwLock<AHashMap<PathBuf, Arc<parking_lot::Mutex<crate::storage::index::IndexManager>>>>,
+> = Lazy::new(|| RwLock::new(AHashMap::with_capacity(32)));
 
 /// Get or create an IndexManager for a table. Returns None if base_dir is not available.
 /// The key is base_dir/table_name to uniquely identify each table's index manager.
-fn get_index_manager(base_dir: &Path, table_name: &str) -> Arc<parking_lot::Mutex<crate::storage::index::IndexManager>> {
+fn get_index_manager(
+    base_dir: &Path,
+    table_name: &str,
+) -> Arc<parking_lot::Mutex<crate::storage::index::IndexManager>> {
     use crate::storage::index::IndexManager;
     let cache_key = base_dir.join(table_name);
 
@@ -350,7 +435,8 @@ fn get_index_manager(base_dir: &Path, table_name: &str) -> Arc<parking_lot::Mute
     }
 
     // Slow path: create and cache
-    let mgr = IndexManager::load(table_name, base_dir).unwrap_or_else(|_| IndexManager::new(table_name, base_dir));
+    let mgr = IndexManager::load(table_name, base_dir)
+        .unwrap_or_else(|_| IndexManager::new(table_name, base_dir));
     let mgr = Arc::new(parking_lot::Mutex::new(mgr));
 
     let mut cache = INDEX_CACHE.write();
@@ -386,7 +472,9 @@ pub fn get_fts_manager(base_dir: &Path) -> Option<Arc<crate::fts::FtsManager>> {
 /// Register (or replace) the FtsManager for a base_dir.
 /// Called by Python `_init_fts()` and by the `CREATE FTS INDEX` DDL handler.
 pub fn register_fts_manager(base_dir: &Path, manager: Arc<crate::fts::FtsManager>) {
-    FTS_MANAGER_CACHE.write().insert(base_dir.to_path_buf(), manager);
+    FTS_MANAGER_CACHE
+        .write()
+        .insert(base_dir.to_path_buf(), manager);
 }
 
 /// Get or lazily create a FtsManager for a base_dir.
@@ -396,8 +484,14 @@ fn get_or_create_fts_manager(base_dir: &Path) -> Arc<crate::fts::FtsManager> {
         return mgr;
     }
     let fts_dir = base_dir.join("fts_indexes");
-    let mgr = Arc::new(crate::fts::FtsManager::new(&fts_dir, crate::fts::FtsConfig::default()));
-    FTS_MANAGER_CACHE.write().entry(base_dir.to_path_buf()).or_insert_with(|| mgr.clone());
+    let mgr = Arc::new(crate::fts::FtsManager::new(
+        &fts_dir,
+        crate::fts::FtsConfig::default(),
+    ));
+    FTS_MANAGER_CACHE
+        .write()
+        .entry(base_dir.to_path_buf())
+        .or_insert_with(|| mgr.clone());
     mgr
 }
 
@@ -408,8 +502,12 @@ fn base_dir_and_table(storage_path: &Path) -> (PathBuf, String) {
 
 /// Public (crate-visible) version for use in submodules.
 pub(crate) fn base_dir_and_table_pub(storage_path: &Path) -> (PathBuf, String) {
-    let base_dir = storage_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let table_name = storage_path.file_stem()
+    let base_dir = storage_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let table_name = storage_path
+        .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "default".to_string());
     (base_dir, table_name)
@@ -431,7 +529,7 @@ impl ZoneMap {
         let mut min_val: Option<i64> = None;
         let mut max_val: Option<i64> = None;
         let mut has_nulls = false;
-        
+
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 has_nulls = true;
@@ -441,15 +539,21 @@ impl ZoneMap {
                 max_val = Some(max_val.map_or(v, |m| m.max(v)));
             }
         }
-        
-        Self { min_int: min_val, max_int: max_val, min_float: None, max_float: None, has_nulls }
+
+        Self {
+            min_int: min_val,
+            max_int: max_val,
+            min_float: None,
+            max_float: None,
+            has_nulls,
+        }
     }
-    
+
     fn from_float64_array(arr: &Float64Array) -> Self {
         let mut min_val: Option<f64> = None;
         let mut max_val: Option<f64> = None;
         let mut has_nulls = false;
-        
+
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 has_nulls = true;
@@ -459,10 +563,16 @@ impl ZoneMap {
                 max_val = Some(max_val.map_or(v, |m| m.max(v)));
             }
         }
-        
-        Self { min_int: None, max_int: None, min_float: min_val, max_float: max_val, has_nulls }
+
+        Self {
+            min_int: None,
+            max_int: None,
+            min_float: min_val,
+            max_float: max_val,
+            has_nulls,
+        }
     }
-    
+
     /// Check if a comparison can potentially match any rows
     /// Returns true if the filter might match, false if it definitely won't match
     #[inline]
@@ -473,14 +583,14 @@ impl ZoneMap {
             _ => true, // Can't optimize, assume might match
         }
     }
-    
+
     #[inline]
     fn can_match_int(&self, v: i64, op: &BinaryOperator) -> bool {
         let (min, max) = match (self.min_int, self.max_int) {
             (Some(min), Some(max)) => (min, max),
             _ => return true, // No stats, assume might match
         };
-        
+
         match op {
             BinaryOperator::Eq => v >= min && v <= max,
             BinaryOperator::NotEq => true, // Can't optimize !=
@@ -491,7 +601,7 @@ impl ZoneMap {
             _ => true,
         }
     }
-    
+
     #[inline]
     fn can_match_float(&self, v: f64, op: &BinaryOperator) -> bool {
         let (min, max) = match (self.min_float, self.max_float) {
@@ -505,7 +615,7 @@ impl ZoneMap {
                 }
             }
         };
-        
+
         match op {
             BinaryOperator::Eq => v >= min && v <= max,
             BinaryOperator::NotEq => true,
@@ -567,7 +677,9 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     let file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
     let file_len = metadata.len();
-    let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let modified = metadata
+        .modified()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
     // Check for delta file - combine path construction with existence check
     let delta_path = {
@@ -580,8 +692,17 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     // Check delta metadata (also gets modified time if exists)
     let (has_delta, effective_modified) = match std::fs::metadata(&delta_path) {
         Ok(delta_meta) => {
-            let delta_modified = delta_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            (true, if delta_modified > modified { delta_modified } else { modified })
+            let delta_modified = delta_meta
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            (
+                true,
+                if delta_modified > modified {
+                    delta_modified
+                } else {
+                    modified
+                },
+            )
         }
         Err(_) => (false, modified),
     };
@@ -616,8 +737,8 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
                 // return stale cached backend if available.
                 if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
                     let pair = entry.pair();
-                    pair.1.2.store(now_nanos(), Ordering::Relaxed);
-                    return Ok(Arc::clone(&pair.1.0));
+                    pair.1 .2.store(now_nanos(), Ordering::Relaxed);
+                    return Ok(Arc::clone(&pair.1 .0));
                 }
                 // No cached backend — retry after a brief sleep (write should finish quickly)
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -640,13 +761,20 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         evict_lru_cache_entries();
     }
 
-    STORAGE_CACHE.insert(cache_key, (Arc::clone(&backend), new_modified, Arc::new(AtomicU64::new(now_nanos()))));
+    STORAGE_CACHE.insert(
+        cache_key,
+        (
+            Arc::clone(&backend),
+            new_modified,
+            Arc::new(AtomicU64::new(now_nanos())),
+        ),
+    );
 
     Ok(backend)
 }
 
 /// Native Query Executor
-/// 
+///
 /// Executes SQL queries directly on storage using Arrow compute kernels.
 pub struct ApexExecutor;
 
@@ -666,12 +794,13 @@ impl ApexResult {
             ApexResult::Data(batch) => Ok(batch),
             ApexResult::Empty(schema) => Ok(RecordBatch::new_empty(schema)),
             ApexResult::Scalar(val) => {
-                let schema = Arc::new(Schema::new(vec![
-                    Field::new("result", ArrowDataType::Int64, false),
-                ]));
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "result",
+                    ArrowDataType::Int64,
+                    false,
+                )]));
                 let array: ArrayRef = Arc::new(Int64Array::from(vec![val]));
-                RecordBatch::try_new(schema, vec![array])
-                    .map_err(|e| err_data( e.to_string()))
+                RecordBatch::try_new(schema, vec![array]).map_err(|e| err_data(e.to_string()))
             }
         }
     }
@@ -690,24 +819,43 @@ impl ApexExecutor {
     pub fn invalidate_cache_for_path(path: &Path) {
         invalidate_storage_cache(path);
     }
-    
+
     /// Invalidate all storage cache entries under a directory
     pub fn invalidate_cache_for_dir(dir: &Path) {
         invalidate_storage_cache_dir(dir);
     }
-    
+
     /// Helper to get column refs from statement's required columns
     #[inline]
     fn get_col_refs(stmt: &SelectStatement) -> Option<Vec<String>> {
         stmt.required_columns().filter(|cols| !cols.is_empty())
     }
-    
+
+    #[inline]
+    fn project_batch_by_names(
+        batch: &RecordBatch,
+        columns: &[String],
+    ) -> io::Result<Option<RecordBatch>> {
+        let schema = batch.schema();
+        let mut fields = Vec::with_capacity(columns.len());
+        let mut arrays = Vec::with_capacity(columns.len());
+        for column in columns {
+            let idx = match schema.index_of(column) {
+                Ok(idx) => idx,
+                Err(_) => return Ok(None),
+            };
+            fields.push(schema.field(idx).as_ref().clone());
+            arrays.push(batch.column(idx).clone());
+        }
+        let projected = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(Some(projected))
+    }
+
     /// Execute a SQL query on storage (single table)
     pub fn execute(sql: &str, storage_path: &Path) -> io::Result<ApexResult> {
-        let stmt = SqlParser::parse(sql)
-            .map_err(|e| err_input( e.to_string()))?;
-
-        Self::execute_parsed(stmt, storage_path)
+        let base_dir = storage_path.parent().unwrap_or(storage_path);
+        Self::execute_with_base_dir(sql, base_dir, storage_path)
     }
 
     /// Execute a SQL query with multi-table support (for JOINs)
@@ -715,7 +863,11 @@ impl ApexExecutor {
     /// Uses `QuerySignature::classify()` for single-point pre-parse dispatch.
     /// Fast paths (COUNT*, point lookup) are executed here without SQL parsing.
     /// Everything else falls through to the SQL parser + executor pipeline.
-    pub fn execute_with_base_dir(sql: &str, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+    pub fn execute_with_base_dir(
+        sql: &str,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<ApexResult> {
         use crate::query::query_signature::{self, QuerySignature};
 
         let sig = query_signature::classify(sql);
@@ -726,9 +878,11 @@ impl ApexExecutor {
                 let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
                 if let Ok(backend) = get_cached_backend(&table_path) {
                     let count = backend.active_row_count() as i64;
-                    let schema = Arc::new(Schema::new(vec![
-                        Field::new("COUNT(*)", ArrowDataType::Int64, false),
-                    ]));
+                    let schema = Arc::new(Schema::new(vec![Field::new(
+                        "COUNT(*)",
+                        ArrowDataType::Int64,
+                        false,
+                    )]));
                     let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
                     let batch = RecordBatch::try_new(schema, vec![array])
                         .map_err(|e| err_data(e.to_string()))?;
@@ -737,18 +891,10 @@ impl ApexExecutor {
                 // Fall through to full parse if backend open fails
             }
             QuerySignature::PointLookup { id, ref table } => {
-                // Use pre-extracted table name from classify() — avoids redundant to_ascii_uppercase()
-                let table_path = if let Some(tname) = table {
-                    let default_stem = default_table_path.file_stem()
-                        .and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                    if *tname == default_stem {
-                        default_table_path.to_path_buf()
-                    } else {
-                        base_dir.join(format!("{}.apex", tname))
-                    }
-                } else {
-                    default_table_path.to_path_buf()
-                };
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
                     if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
                         if let Ok(Some(vals)) = backend.storage.retrieve_rcix(*id) {
@@ -758,11 +904,27 @@ impl ApexExecutor {
                             for (col_name, val) in &vals {
                                 let nullable = matches!(val, V::Null);
                                 let (dt, arr): (ArrowDataType, ArrayRef) = match val {
-                                    V::Int64(v)   => (ArrowDataType::Int64,   Arc::new(Int64Array::from(vec![*v]))),
-                                    V::Float64(v) => (ArrowDataType::Float64, Arc::new(arrow::array::Float64Array::from(vec![*v]))),
-                                    V::String(s)  => (ArrowDataType::Utf8,    Arc::new(arrow::array::StringArray::from(vec![s.as_str()]))),
-                                    V::Bool(b)    => (ArrowDataType::Boolean, Arc::new(arrow::array::BooleanArray::from(vec![*b]))),
-                                    _             => (ArrowDataType::Utf8,    Arc::new(arrow::array::StringArray::from(vec![None as Option<&str>]))),
+                                    V::Int64(v) => {
+                                        (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![*v])))
+                                    }
+                                    V::Float64(v) => (
+                                        ArrowDataType::Float64,
+                                        Arc::new(arrow::array::Float64Array::from(vec![*v])),
+                                    ),
+                                    V::String(s) => (
+                                        ArrowDataType::Utf8,
+                                        Arc::new(arrow::array::StringArray::from(vec![s.as_str()])),
+                                    ),
+                                    V::Bool(b) => (
+                                        ArrowDataType::Boolean,
+                                        Arc::new(arrow::array::BooleanArray::from(vec![*b])),
+                                    ),
+                                    _ => (
+                                        ArrowDataType::Utf8,
+                                        Arc::new(arrow::array::StringArray::from(vec![
+                                            None as Option<&str>,
+                                        ])),
+                                    ),
                                 };
                                 fields.push(Field::new(col_name, dt, nullable));
                                 arrays.push(arr);
@@ -772,6 +934,197 @@ impl ApexExecutor {
                                 return Ok(ApexResult::Data(batch));
                             }
                         }
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::ProjectedPointLookup {
+                id,
+                ref table,
+                columns,
+            } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(*id) {
+                        if let Some(projected) = Self::project_batch_by_names(&batch, columns)? {
+                            return Ok(ApexResult::Data(projected));
+                        }
+                    }
+                    let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                    if let Ok(empty) =
+                        backend.read_columns_to_arrow(Some(col_refs.as_slice()), 0, Some(0))
+                    {
+                        return Ok(ApexResult::Data(empty));
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::IdBatchLookup { ids, ref table } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    let mut sorted_ids = ids.clone();
+                    sorted_ids.sort_unstable();
+                    sorted_ids.dedup();
+                    if let Ok(batch) = backend.read_rows_by_ids_to_arrow(&sorted_ids) {
+                        if batch.num_rows() > 0 {
+                            return Ok(ApexResult::Data(batch));
+                        }
+                        if let Ok(empty) = backend.read_columns_to_arrow(None, 0, Some(0)) {
+                            return Ok(ApexResult::Data(empty));
+                        }
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::ProjectedIdBatchLookup {
+                ids,
+                ref table,
+                columns,
+            } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    let mut sorted_ids = ids.clone();
+                    sorted_ids.sort_unstable();
+                    sorted_ids.dedup();
+                    if let Ok(batch) = backend.read_rows_by_ids_to_arrow(&sorted_ids) {
+                        if batch.num_rows() > 0 {
+                            if let Some(projected) = Self::project_batch_by_names(&batch, columns)?
+                            {
+                                return Ok(ApexResult::Data(projected));
+                            }
+                        }
+                        let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                        if let Ok(empty) =
+                            backend.read_columns_to_arrow(Some(col_refs.as_slice()), 0, Some(0))
+                        {
+                            return Ok(ApexResult::Data(empty));
+                        }
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::FullScan { ref table } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    if let Ok(batch) = backend.read_columns_to_arrow(None, 0, None) {
+                        return Ok(ApexResult::Data(batch));
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::ProjectedFullScan { ref table, columns } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                    if let Ok(batch) =
+                        backend.read_columns_to_arrow(Some(col_refs.as_slice()), 0, None)
+                    {
+                        return Ok(ApexResult::Data(batch));
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::SimpleScanLimit { limit, ref table } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    if let Ok(batch) = backend.read_columns_to_arrow(None, 0, Some(*limit)) {
+                        return Ok(ApexResult::Data(batch));
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::ProjectedScanLimit {
+                limit,
+                ref table,
+                columns,
+            } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                    if let Ok(batch) =
+                        backend.read_columns_to_arrow(Some(col_refs.as_slice()), 0, Some(*limit))
+                    {
+                        return Ok(ApexResult::Data(batch));
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::StringEqualityFilter {
+                ref table,
+                column,
+                value,
+            } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    if let Ok(batch) =
+                        backend.read_columns_filtered_string_to_arrow(None, column, value, true)
+                    {
+                        return Ok(ApexResult::Data(batch));
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::ProjectedStringEqualityFilter {
+                ref table,
+                columns,
+                column,
+                value,
+            } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                    if let Ok(batch) = backend.read_columns_filtered_string_to_arrow(
+                        Some(col_refs.as_slice()),
+                        column,
+                        value,
+                        true,
+                    ) {
+                        return Ok(ApexResult::Data(batch));
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::LikeFilter {
+                ref table,
+                column,
+                pattern,
+            } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    if let Ok(Some(batch)) =
+                        backend.scan_like_and_extract_mmap(column, pattern, None)
+                    {
+                        return Ok(ApexResult::Data(batch));
                     }
                 }
                 // Fall through to full parse if fast path unavailable
@@ -790,12 +1143,20 @@ impl ApexExecutor {
                             let table_raw = after_df[..where_pos].trim();
                             let after_where = after_df[where_pos + 7..].trim();
                             let after_where_u = after_df_u[where_pos + 7..].to_ascii_uppercase();
-                            if !after_where_u.contains(" AND ") && !after_where_u.contains(" OR ")
-                                && !after_where_u.contains("NOT ") && !after_where_u.contains(" IN ")
+                            if !after_where_u.contains(" AND ")
+                                && !after_where_u.contains(" OR ")
+                                && !after_where_u.contains("NOT ")
+                                && !after_where_u.contains(" IN ")
                                 && !table_raw.contains(' ')
                             {
-                                if let Some(expr) = Self::try_parse_delete_numeric_where(after_where) {
-                                    let table_path = Self::resolve_table_path(table_raw, base_dir, default_table_path);
+                                if let Some(expr) =
+                                    Self::try_parse_delete_numeric_where(after_where)
+                                {
+                                    let table_path = Self::resolve_table_path(
+                                        table_raw,
+                                        base_dir,
+                                        default_table_path,
+                                    );
                                     if table_path.exists() {
                                         return with_table_write_lock(&table_path, || {
                                             Self::execute_delete(&table_path, Some(&expr))
@@ -810,8 +1171,7 @@ impl ApexExecutor {
             }
             QuerySignature::MultiStatement => {
                 // Multi-statement: parse all at once and execute
-                let stmts = SqlParser::parse_multi(sql)
-                    .map_err(|e| err_input(e.to_string()))?;
+                let stmts = SqlParser::parse_multi(sql).map_err(|e| err_input(e.to_string()))?;
                 return Self::execute_parsed_multi_statements(stmts, base_dir, default_table_path);
             }
             _ => {
@@ -827,10 +1187,11 @@ impl ApexExecutor {
             if let Some(stmts) = cached {
                 stmts
             } else {
-                let stmts = SqlParser::parse_multi(sql)
-                    .map_err(|e| err_input(e.to_string()))?;
+                let stmts = SqlParser::parse_multi(sql).map_err(|e| err_input(e.to_string()))?;
                 // Only cache read-only statements (SELECT) to avoid stale DDL/DML
-                let is_select_only = stmts.iter().all(|s| matches!(s, SqlStatement::Select(_) | SqlStatement::Union(_)));
+                let is_select_only = stmts
+                    .iter()
+                    .all(|s| matches!(s, SqlStatement::Select(_) | SqlStatement::Union(_)));
                 if is_select_only {
                     let mut cache = SQL_PARSE_CACHE.write();
                     if cache.len() < 1024 {
@@ -842,7 +1203,10 @@ impl ApexExecutor {
         };
 
         if stmts.len() > 1
-            || matches!(stmts.first(), Some(SqlStatement::CreateView { .. } | SqlStatement::DropView { .. }))
+            || matches!(
+                stmts.first(),
+                Some(SqlStatement::CreateView { .. } | SqlStatement::DropView { .. })
+            )
         {
             return Self::execute_parsed_multi_statements(stmts, base_dir, default_table_path);
         }
@@ -850,7 +1214,7 @@ impl ApexExecutor {
         let stmt = stmts
             .into_iter()
             .next()
-            .ok_or_else(|| err_input( "No statement to execute"))?;
+            .ok_or_else(|| err_input("No statement to execute"))?;
 
         Self::execute_parsed_multi(stmt, base_dir, default_table_path)
     }
@@ -860,19 +1224,35 @@ impl ApexExecutor {
         match stmt {
             SqlStatement::Select(select) => Self::execute_select(select, storage_path),
             SqlStatement::Union(union) => Self::execute_union(union, storage_path, storage_path),
-            SqlStatement::Insert { values, columns, .. } => {
-                with_table_write_lock(storage_path, || {
-                    Self::execute_insert(storage_path, columns.as_deref(), &values)
-                })
-            }
-            SqlStatement::InsertOnConflict { values, columns, conflict_columns, do_update, .. } => {
-                with_table_write_lock(storage_path, || {
-                    Self::execute_insert_on_conflict(storage_path, columns.as_deref(), &values, &conflict_columns, do_update.as_deref())
-                })
-            }
+            SqlStatement::Insert {
+                values, columns, ..
+            } => with_table_write_lock(storage_path, || {
+                Self::execute_insert(storage_path, columns.as_deref(), &values)
+            }),
+            SqlStatement::InsertOnConflict {
+                values,
+                columns,
+                conflict_columns,
+                do_update,
+                ..
+            } => with_table_write_lock(storage_path, || {
+                Self::execute_insert_on_conflict(
+                    storage_path,
+                    columns.as_deref(),
+                    &values,
+                    &conflict_columns,
+                    do_update.as_deref(),
+                )
+            }),
             SqlStatement::InsertSelect { columns, query, .. } => {
                 with_table_write_lock(storage_path, || {
-                    Self::execute_insert_select(storage_path, columns.as_deref(), *query, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
+                    Self::execute_insert_select(
+                        storage_path,
+                        columns.as_deref(),
+                        *query,
+                        storage_path.parent().unwrap_or(Path::new(".")),
+                        storage_path,
+                    )
                 })
             }
             SqlStatement::Delete { where_clause, .. } => {
@@ -880,31 +1260,44 @@ impl ApexExecutor {
                     Self::execute_delete(storage_path, where_clause.as_ref())
                 })
             }
-            SqlStatement::Update { assignments, where_clause, .. } => {
-                with_table_write_lock(storage_path, || {
-                    Self::execute_update(storage_path, &assignments, where_clause.as_ref())
-                })
-            }
+            SqlStatement::Update {
+                assignments,
+                where_clause,
+                ..
+            } => with_table_write_lock(storage_path, || {
+                Self::execute_update(storage_path, &assignments, where_clause.as_ref())
+            }),
             SqlStatement::TruncateTable { .. } => {
-                with_table_write_lock(storage_path, || {
-                    Self::execute_truncate(storage_path)
-                })
+                with_table_write_lock(storage_path, || Self::execute_truncate(storage_path))
             }
-            SqlStatement::Explain { stmt, analyze } => {
-                Self::execute_explain(*stmt, analyze, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
-            }
-            SqlStatement::Cte { name, column_aliases, body, main, recursive } => {
-                Self::execute_cte(&name, &column_aliases, *body, *main, recursive, storage_path.parent().unwrap_or(Path::new(".")), storage_path)
-            }
-            SqlStatement::BeginTransaction { read_only } => {
-                Self::execute_begin(read_only)
-            }
-            SqlStatement::Commit => {
-                Err(err_input("COMMIT requires txn_id context - use execute_commit_txn()"))
-            }
-            SqlStatement::Rollback => {
-                Err(err_input("ROLLBACK requires txn_id context - use execute_rollback_txn()"))
-            }
+            SqlStatement::Explain { stmt, analyze } => Self::execute_explain(
+                *stmt,
+                analyze,
+                storage_path.parent().unwrap_or(Path::new(".")),
+                storage_path,
+            ),
+            SqlStatement::Cte {
+                name,
+                column_aliases,
+                body,
+                main,
+                recursive,
+            } => Self::execute_cte(
+                &name,
+                &column_aliases,
+                *body,
+                *main,
+                recursive,
+                storage_path.parent().unwrap_or(Path::new(".")),
+                storage_path,
+            ),
+            SqlStatement::BeginTransaction { read_only } => Self::execute_begin(read_only),
+            SqlStatement::Commit => Err(err_input(
+                "COMMIT requires txn_id context - use execute_commit_txn()",
+            )),
+            SqlStatement::Rollback => Err(err_input(
+                "ROLLBACK requires txn_id context - use execute_rollback_txn()",
+            )),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "DDL statements require base_dir context - use execute_with_base_dir()",
@@ -913,20 +1306,34 @@ impl ApexExecutor {
     }
 
     /// Execute a parsed SQL statement with multi-table support
-    pub fn execute_parsed_multi(stmt: SqlStatement, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+    pub fn execute_parsed_multi(
+        stmt: SqlStatement,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<ApexResult> {
         match stmt {
             SqlStatement::Select(select) => {
                 if select.joins.is_empty() {
                     // Resolve the actual table path from FROM clause for non-join queries
-                    let actual_path = Self::resolve_from_table_path(&select, base_dir, default_table_path);
-                    Self::execute_select_with_base_dir(select, &actual_path, base_dir, default_table_path)
+                    let actual_path =
+                        Self::resolve_from_table_path(&select, base_dir, default_table_path);
+                    Self::execute_select_with_base_dir(
+                        select,
+                        &actual_path,
+                        base_dir,
+                        default_table_path,
+                    )
                 } else {
                     Self::execute_select_with_joins(select, base_dir, default_table_path)
                 }
             }
             SqlStatement::Union(union) => Self::execute_union(union, base_dir, default_table_path),
             // DDL Statements — acquire per-table write lock for concurrency safety
-            SqlStatement::CreateTable { table, columns, if_not_exists } => {
+            SqlStatement::CreateTable {
+                table,
+                columns,
+                if_not_exists,
+            } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
                     Self::execute_create_table(&table_path, &table, &columns, if_not_exists)
@@ -946,21 +1353,35 @@ impl ApexExecutor {
             }
             SqlStatement::TruncateTable { table } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
-                with_table_write_lock(&table_path, || {
-                    Self::execute_truncate(&table_path)
-                })
+                with_table_write_lock(&table_path, || Self::execute_truncate(&table_path))
             }
             // DML Statements — acquire per-table write lock for concurrency safety
-            SqlStatement::Insert { table, columns, values } => {
+            SqlStatement::Insert {
+                table,
+                columns,
+                values,
+            } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
                     Self::execute_insert(&table_path, columns.as_deref(), &values)
                 })
             }
-            SqlStatement::InsertOnConflict { table, columns, values, conflict_columns, do_update } => {
+            SqlStatement::InsertOnConflict {
+                table,
+                columns,
+                values,
+                conflict_columns,
+                do_update,
+            } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
-                    Self::execute_insert_on_conflict(&table_path, columns.as_deref(), &values, &conflict_columns, do_update.as_deref())
+                    Self::execute_insert_on_conflict(
+                        &table_path,
+                        columns.as_deref(),
+                        &values,
+                        &conflict_columns,
+                        do_update.as_deref(),
+                    )
                 })
             }
             SqlStatement::AnalyzeTable { table } => {
@@ -974,58 +1395,117 @@ impl ApexExecutor {
             SqlStatement::CopyFromParquet { table, file_path } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
-                    Self::execute_copy_from_parquet(&table_path, &table, &file_path, base_dir.as_ref(), default_table_path.as_ref())
+                    Self::execute_copy_from_parquet(
+                        &table_path,
+                        &table,
+                        &file_path,
+                        base_dir.as_ref(),
+                        default_table_path.as_ref(),
+                    )
                 })
             }
-            SqlStatement::InsertSelect { table, columns, query } => {
+            SqlStatement::InsertSelect {
+                table,
+                columns,
+                query,
+            } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
-                    Self::execute_insert_select(&table_path, columns.as_deref(), *query, base_dir, default_table_path)
+                    Self::execute_insert_select(
+                        &table_path,
+                        columns.as_deref(),
+                        *query,
+                        base_dir,
+                        default_table_path,
+                    )
                 })
             }
-            SqlStatement::CreateTableAs { table, query, if_not_exists } => {
+            SqlStatement::CreateTableAs {
+                table,
+                query,
+                if_not_exists,
+            } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
-                    Self::execute_create_table_as(base_dir, default_table_path, &table, *query, if_not_exists)
+                    Self::execute_create_table_as(
+                        base_dir,
+                        default_table_path,
+                        &table,
+                        *query,
+                        if_not_exists,
+                    )
                 })
             }
-            SqlStatement::Delete { table, where_clause } => {
+            SqlStatement::Delete {
+                table,
+                where_clause,
+            } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
                     Self::execute_delete(&table_path, where_clause.as_ref())
                 })
             }
-            SqlStatement::Update { table, assignments, where_clause } => {
+            SqlStatement::Update {
+                table,
+                assignments,
+                where_clause,
+            } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
                     Self::execute_update(&table_path, &assignments, where_clause.as_ref())
                 })
             }
             // Index Statements
-            SqlStatement::CreateIndex { name, table, columns, unique, index_type, if_not_exists } => {
-                Self::execute_create_index(base_dir, default_table_path, &name, &table, &columns, unique, index_type.as_deref(), if_not_exists)
-            }
-            SqlStatement::DropIndex { name, table, if_exists } => {
-                Self::execute_drop_index(base_dir, &name, &table, if_exists)
-            }
+            SqlStatement::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+                index_type,
+                if_not_exists,
+            } => Self::execute_create_index(
+                base_dir,
+                default_table_path,
+                &name,
+                &table,
+                &columns,
+                unique,
+                index_type.as_deref(),
+                if_not_exists,
+            ),
+            SqlStatement::DropIndex {
+                name,
+                table,
+                if_exists,
+            } => Self::execute_drop_index(base_dir, &name, &table, if_exists),
             // EXPLAIN
             SqlStatement::Explain { stmt, analyze } => {
                 Self::execute_explain(*stmt, analyze, base_dir, default_table_path)
             }
             // CTE
-            SqlStatement::Cte { name, column_aliases, body, main, recursive } => {
-                Self::execute_cte(&name, &column_aliases, *body, *main, recursive, base_dir, default_table_path)
-            }
+            SqlStatement::Cte {
+                name,
+                column_aliases,
+                body,
+                main,
+                recursive,
+            } => Self::execute_cte(
+                &name,
+                &column_aliases,
+                *body,
+                *main,
+                recursive,
+                base_dir,
+                default_table_path,
+            ),
             // Transaction Statements
-            SqlStatement::BeginTransaction { read_only } => {
-                Self::execute_begin(read_only)
-            }
-            SqlStatement::Commit => {
-                Err(err_input("COMMIT requires txn_id context - use execute_commit_txn()"))
-            }
-            SqlStatement::Rollback => {
-                Err(err_input("ROLLBACK requires txn_id context - use execute_rollback_txn()"))
-            }
+            SqlStatement::BeginTransaction { read_only } => Self::execute_begin(read_only),
+            SqlStatement::Commit => Err(err_input(
+                "COMMIT requires txn_id context - use execute_commit_txn()",
+            )),
+            SqlStatement::Rollback => Err(err_input(
+                "ROLLBACK requires txn_id context - use execute_rollback_txn()",
+            )),
             SqlStatement::Reindex { table } => {
                 Self::execute_reindex(base_dir, default_table_path, &table)
             }
@@ -1033,21 +1513,26 @@ impl ApexExecutor {
                 Self::execute_pragma(base_dir, default_table_path, &name, arg.as_deref())
             }
             // FTS DDL Statements
-            SqlStatement::CreateFtsIndex { table, fields, lazy_load, cache_size } => {
-                Self::execute_create_fts_index(base_dir, &table, fields.as_deref(), lazy_load, cache_size)
-            }
-            SqlStatement::DropFtsIndex { table } => {
-                Self::execute_drop_fts_index(base_dir, &table)
-            }
+            SqlStatement::CreateFtsIndex {
+                table,
+                fields,
+                lazy_load,
+                cache_size,
+            } => Self::execute_create_fts_index(
+                base_dir,
+                &table,
+                fields.as_deref(),
+                lazy_load,
+                cache_size,
+            ),
+            SqlStatement::DropFtsIndex { table } => Self::execute_drop_fts_index(base_dir, &table),
             SqlStatement::AlterFtsIndexDisable { table } => {
                 Self::execute_alter_fts_index_disable(base_dir, &table)
             }
             SqlStatement::AlterFtsIndexEnable { table } => {
                 Self::execute_alter_fts_index_enable(base_dir, &table)
             }
-            SqlStatement::ShowFtsIndexes => {
-                Self::execute_show_fts_indexes(base_dir)
-            }
+            SqlStatement::ShowFtsIndexes => Self::execute_show_fts_indexes(base_dir),
             SqlStatement::SetVariable { name, value } => {
                 set_session_variable(&name, value);
                 Ok(ApexResult::Scalar(0))
@@ -1056,10 +1541,23 @@ impl ApexExecutor {
                 reset_session_variable(&name);
                 Ok(ApexResult::Scalar(0))
             }
-            SqlStatement::CopyImport { table, file_path, format, options } => {
+            SqlStatement::CopyImport {
+                table,
+                file_path,
+                format,
+                options,
+            } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
-                    Self::execute_copy_import(&table_path, &table, &file_path, &format, &options, base_dir, default_table_path)
+                    Self::execute_copy_import(
+                        &table_path,
+                        &table,
+                        &file_path,
+                        &format,
+                        &options,
+                        base_dir,
+                        default_table_path,
+                    )
                 })
             }
             _ => Err(io::Error::new(
@@ -1076,7 +1574,8 @@ impl ApexExecutor {
         base_dir: &Path,
         default_table_path: &Path,
     ) -> io::Result<ApexResult> {
-        let (result, _txn_id) = Self::execute_multi_with_txn(stmts, base_dir, default_table_path, None)?;
+        let (result, _txn_id) =
+            Self::execute_multi_with_txn(stmts, base_dir, default_table_path, None)?;
         Ok(result)
     }
 
@@ -1098,14 +1597,20 @@ impl ApexExecutor {
 
         for stmt in stmts {
             // Determine if this is a write operation (for cache invalidation)
-            let is_write = matches!(&stmt,
-                SqlStatement::Insert { .. } | SqlStatement::InsertOnConflict { .. } |
-                SqlStatement::InsertSelect { .. } |
-                SqlStatement::Delete { .. } | SqlStatement::Update { .. } |
-                SqlStatement::TruncateTable { .. } | SqlStatement::AlterTable { .. } |
-                SqlStatement::CreateTable { .. } | SqlStatement::DropTable { .. } |
-                SqlStatement::CreateIndex { .. } | SqlStatement::DropIndex { .. } |
-                SqlStatement::Reindex { .. }
+            let is_write = matches!(
+                &stmt,
+                SqlStatement::Insert { .. }
+                    | SqlStatement::InsertOnConflict { .. }
+                    | SqlStatement::InsertSelect { .. }
+                    | SqlStatement::Delete { .. }
+                    | SqlStatement::Update { .. }
+                    | SqlStatement::TruncateTable { .. }
+                    | SqlStatement::AlterTable { .. }
+                    | SqlStatement::CreateTable { .. }
+                    | SqlStatement::DropTable { .. }
+                    | SqlStatement::CreateIndex { .. }
+                    | SqlStatement::DropIndex { .. }
+                    | SqlStatement::Reindex { .. }
             );
 
             match stmt {
@@ -1119,7 +1624,8 @@ impl ApexExecutor {
                 }
                 SqlStatement::Commit => {
                     if let Some(txn_id) = current_txn {
-                        let result = Self::execute_commit_txn(txn_id, base_dir, default_table_path)?;
+                        let result =
+                            Self::execute_commit_txn(txn_id, base_dir, default_table_path)?;
                         // Invalidate cache after commit to ensure fresh data
                         invalidate_storage_cache(default_table_path);
                         crate::storage::engine::engine().invalidate(default_table_path);
@@ -1153,20 +1659,18 @@ impl ApexExecutor {
                 SqlStatement::RollbackToSavepoint { name } => {
                     if let Some(txn_id) = current_txn {
                         let mgr = crate::txn::txn_manager();
-                        mgr.with_context(txn_id, |ctx| {
-                            ctx.rollback_to_savepoint(&name)
-                        })?;
+                        mgr.with_context(txn_id, |ctx| ctx.rollback_to_savepoint(&name))?;
                         last_result = Some(ApexResult::Scalar(0));
                     } else {
-                        return Err(err_input("ROLLBACK TO SAVEPOINT without active transaction"));
+                        return Err(err_input(
+                            "ROLLBACK TO SAVEPOINT without active transaction",
+                        ));
                     }
                 }
                 SqlStatement::ReleaseSavepoint { name } => {
                     if let Some(txn_id) = current_txn {
                         let mgr = crate::txn::txn_manager();
-                        mgr.with_context(txn_id, |ctx| {
-                            ctx.release_savepoint(&name)
-                        })?;
+                        mgr.with_context(txn_id, |ctx| ctx.release_savepoint(&name))?;
                         last_result = Some(ApexResult::Scalar(0));
                     } else {
                         return Err(err_input("RELEASE SAVEPOINT without active transaction"));
@@ -1176,13 +1680,14 @@ impl ApexExecutor {
                 SqlStatement::CreateView { name, stmt } => {
                     let view_name = name.trim_matches('"').to_string();
                     if view_name.eq_ignore_ascii_case("default") {
-                        return Err(err_input( "View name conflicts with default table"));
+                        return Err(err_input("View name conflicts with default table"));
                     }
 
                     // Disallow conflict with existing table file
-                    let table_path = Self::resolve_table_path(&view_name, base_dir, default_table_path);
+                    let table_path =
+                        Self::resolve_table_path(&view_name, base_dir, default_table_path);
                     if table_path.exists() {
-                        return Err(err_input( "View name conflicts with existing table"));
+                        return Err(err_input("View name conflicts with existing table"));
                     }
 
                     views.insert(view_name, stmt);
@@ -1195,9 +1700,18 @@ impl ApexExecutor {
                 SqlStatement::Select(mut select) => {
                     select = Self::rewrite_select_views(select, &views);
                     if let Some(txn_id) = current_txn {
-                        last_result = Some(Self::execute_in_txn(txn_id, SqlStatement::Select(select), base_dir, default_table_path)?);
+                        last_result = Some(Self::execute_in_txn(
+                            txn_id,
+                            SqlStatement::Select(select),
+                            base_dir,
+                            default_table_path,
+                        )?);
                     } else {
-                        last_result = Some(Self::execute_parsed_multi(SqlStatement::Select(select), base_dir, default_table_path)?);
+                        last_result = Some(Self::execute_parsed_multi(
+                            SqlStatement::Select(select),
+                            base_dir,
+                            default_table_path,
+                        )?);
                     }
                 }
                 SqlStatement::Union(union) => {
@@ -1207,10 +1721,19 @@ impl ApexExecutor {
                 other => {
                     if let Some(txn_id) = current_txn {
                         // Inside transaction: buffer DML through execute_in_txn
-                        last_result = Some(Self::execute_in_txn(txn_id, other, base_dir, default_table_path)?);
+                        last_result = Some(Self::execute_in_txn(
+                            txn_id,
+                            other,
+                            base_dir,
+                            default_table_path,
+                        )?);
                     } else {
                         // Outside transaction: execute directly
-                        last_result = Some(Self::execute_parsed_multi(other, base_dir, default_table_path)?);
+                        last_result = Some(Self::execute_parsed_multi(
+                            other,
+                            base_dir,
+                            default_table_path,
+                        )?);
                         // Invalidate cache after write operations to ensure next statement sees fresh data
                         if is_write {
                             invalidate_storage_cache(default_table_path);
@@ -1221,11 +1744,14 @@ impl ApexExecutor {
             }
         }
 
-        let result = last_result.ok_or_else(|| err_input( "No query to execute"))?;
+        let result = last_result.ok_or_else(|| err_input("No query to execute"))?;
         Ok((result, current_txn))
     }
 
-    fn rewrite_select_views(mut select: SelectStatement, views: &AHashMap<String, SelectStatement>) -> SelectStatement {
+    fn rewrite_select_views(
+        mut select: SelectStatement,
+        views: &AHashMap<String, SelectStatement>,
+    ) -> SelectStatement {
         // Rewrite FROM clause if it references a VIEW
         if let Some(from) = &select.from {
             match from {
@@ -1299,9 +1825,17 @@ impl ApexExecutor {
             return None;
         };
         let col = col_s.trim().trim_matches('"');
-        if col.is_empty() || col.contains(' ') || col.contains('(') { return None; }
+        if col.is_empty() || col.contains(' ') || col.contains('(') {
+            return None;
+        }
         // Column name must be a valid identifier (starts with letter or _), not a numeric literal
-        if !col.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_') { return None; }
+        if !col
+            .chars()
+            .next()
+            .map_or(false, |c| c.is_alphabetic() || c == '_')
+        {
+            return None;
+        }
         let val: f64 = val_s.trim().parse().ok()?;
         Some(SqlExpr::BinaryOp {
             left: Box::new(SqlExpr::Column(col.to_string())),
@@ -1321,7 +1855,6 @@ impl ApexExecutor {
         };
         Self::execute_select_with_base_dir(stmt, &actual_path, base_dir, storage_path)
     }
-
 }
 
 // Split impl blocks for ApexExecutor methods

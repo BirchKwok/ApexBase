@@ -1,8 +1,8 @@
 //! Query filter implementation
 
 use crate::data::{Row, Value};
-use crate::table::column_table::{TypedColumn, ColumnSchema, BitVec};
 use crate::table::arrow_column::ArrowStringColumn;
+use crate::table::column_table::{BitVec, ColumnSchema, TypedColumn};
 
 #[inline]
 fn indices_to_bitvec(indices: &[usize], len: usize) -> BitVec {
@@ -67,7 +67,23 @@ impl RegexpMatcher {
         if let Some(prefix) = pattern.strip_suffix('*') {
             if !prefix.is_empty() && !prefix.contains('*') {
                 // Reject common regex metas; keep this fast path strict to avoid semantic surprises
-                let has_meta = prefix.chars().any(|c| matches!(c, '.' | '+' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'));
+                let has_meta = prefix.chars().any(|c| {
+                    matches!(
+                        c,
+                        '.' | '+'
+                            | '?'
+                            | '^'
+                            | '$'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '|'
+                            | '\\'
+                    )
+                });
                 if !has_meta {
                     return RegexpMatcher::Prefix(prefix.to_string());
                 }
@@ -92,7 +108,7 @@ impl RegexpMatcher {
 }
 
 /// High-performance LIKE pattern matcher with pre-classified pattern type
-/// 
+///
 /// Pre-classifies the pattern once and reuses for all matches.
 /// This avoids re-parsing the pattern for each string comparison.
 #[derive(Debug, Clone)]
@@ -119,24 +135,24 @@ impl LikeMatcher {
     pub fn new(pattern: &str) -> Self {
         let pattern_bytes = pattern.as_bytes();
         let len = pattern_bytes.len();
-        
+
         if len == 0 {
             return LikeMatcher::Exact(String::new());
         }
-        
+
         // Single '%' matches anything
         if pattern == "%" {
             return LikeMatcher::Any;
         }
-        
+
         let starts_wild = pattern_bytes[0] == b'%';
         let ends_wild = pattern_bytes[len - 1] == b'%';
-        
+
         // Check if pattern has no wildcards at all
         if !starts_wild && !ends_wild && !pattern.contains('%') && !pattern.contains('_') {
             return LikeMatcher::Exact(pattern.to_string());
         }
-        
+
         // Pure prefix match 'abc%' (no other wildcards)
         if !starts_wild && ends_wild {
             let prefix = &pattern[..len - 1];
@@ -144,7 +160,7 @@ impl LikeMatcher {
                 return LikeMatcher::Prefix(prefix.to_string());
             }
         }
-        
+
         // Pure suffix match '%abc' (no other wildcards)
         if starts_wild && !ends_wild {
             let suffix = &pattern[1..];
@@ -152,7 +168,7 @@ impl LikeMatcher {
                 return LikeMatcher::Suffix(suffix.to_string());
             }
         }
-        
+
         // Pure contains match '%abc%' (no other wildcards)
         if starts_wild && ends_wild && len > 2 {
             let middle = &pattern[1..len - 1];
@@ -160,16 +176,17 @@ impl LikeMatcher {
                 return LikeMatcher::Contains(middle.to_string());
             }
         }
-        
+
         // Complex pattern - build regex
         let mut regex_pattern = String::with_capacity(pattern.len() * 2);
         regex_pattern.push('^');
-        
+
         for c in pattern.chars() {
             match c {
                 '%' => regex_pattern.push_str(".*"),
                 '_' => regex_pattern.push('.'),
-                '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+                | '\\' => {
                     regex_pattern.push('\\');
                     regex_pattern.push(c);
                 }
@@ -177,13 +194,13 @@ impl LikeMatcher {
             }
         }
         regex_pattern.push('$');
-        
+
         match regex::Regex::new(&regex_pattern) {
             Ok(re) => LikeMatcher::Regex(re),
             Err(_) => LikeMatcher::Never,
         }
     }
-    
+
     /// Check if a string matches this pattern
     #[inline(always)]
     pub fn matches(&self, s: &str) -> bool {
@@ -237,20 +254,11 @@ pub enum Filter {
         high_inclusive: bool,
     },
     /// LIKE pattern match
-    Like {
-        field: String,
-        pattern: String,
-    },
+    Like { field: String, pattern: String },
     /// REGEXP match
-    Regexp {
-        field: String,
-        pattern: String,
-    },
+    Regexp { field: String, pattern: String },
     /// IN list
-    In {
-        field: String,
-        values: Vec<Value>,
-    },
+    In { field: String, values: Vec<Value> },
     /// AND combination
     And(Vec<Filter>),
     /// OR combination
@@ -273,7 +281,13 @@ impl Filter {
                     false
                 }
             }
-            Filter::Range { field, low, high, low_inclusive, high_inclusive } => {
+            Filter::Range {
+                field,
+                low,
+                high,
+                low_inclusive,
+                high_inclusive,
+            } => {
                 if let Some(row_value) = row.get(field) {
                     Self::value_in_range(row_value, low, high, *low_inclusive, *high_inclusive)
                 } else {
@@ -310,7 +324,13 @@ impl Filter {
 
     /// Check if value is in range [low, high]
     #[inline(always)]
-    fn value_in_range(val: &Value, low: &Value, high: &Value, low_inc: bool, high_inc: bool) -> bool {
+    fn value_in_range(
+        val: &Value,
+        low: &Value,
+        high: &Value,
+        low_inc: bool,
+        high_inc: bool,
+    ) -> bool {
         // Fast path for Int64
         if let (Value::Int64(v), Value::Int64(l), Value::Int64(h)) = (val, low, high) {
             let low_ok = if low_inc { v >= l } else { v > l };
@@ -352,7 +372,7 @@ impl Filter {
                 _ => false,
             };
         }
-        
+
         // Fast path for Float64 comparisons
         if let (Value::Float64(l), Value::Float64(r)) = (left, right) {
             return match op {
@@ -365,7 +385,7 @@ impl Filter {
                 _ => false,
             };
         }
-        
+
         // Fast path for String comparisons
         if let (Value::String(l), Value::String(r)) = (left, right) {
             return match op {
@@ -379,7 +399,7 @@ impl Filter {
                 _ => false,
             };
         }
-        
+
         // Fallback to generic comparison
         Self::compare(left, op, right)
     }
@@ -391,11 +411,17 @@ impl Filter {
             CompareOp::NotEqual => left != right,
             CompareOp::LessThan => left.partial_cmp(right) == Some(std::cmp::Ordering::Less),
             CompareOp::LessEqual => {
-                matches!(left.partial_cmp(right), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal))
+                matches!(
+                    left.partial_cmp(right),
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                )
             }
             CompareOp::GreaterThan => left.partial_cmp(right) == Some(std::cmp::Ordering::Greater),
             CompareOp::GreaterEqual => {
-                matches!(left.partial_cmp(right), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))
+                matches!(
+                    left.partial_cmp(right),
+                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                )
             }
             CompareOp::Like => {
                 if let (Value::String(l), Value::String(r)) = (left, right) {
@@ -409,7 +435,7 @@ impl Filter {
     }
 
     /// SQL LIKE pattern matching - ULTRA-OPTIMIZED for common patterns
-    /// 
+    ///
     /// Performance hierarchy (fastest to slowest):
     /// 1. Prefix match 'abc%' -> starts_with() - ~7ns per string
     /// 2. Suffix match '%abc' -> ends_with() - ~7ns per string  
@@ -426,19 +452,19 @@ impl Filter {
     fn like_match_fast(s: &str, pattern: &str) -> bool {
         let pattern_bytes = pattern.as_bytes();
         let len = pattern_bytes.len();
-        
+
         if len == 0 {
             return s.is_empty();
         }
-        
+
         let starts_wild = pattern_bytes[0] == b'%';
         let ends_wild = pattern_bytes[len - 1] == b'%';
-        
+
         // Fast path: Check if pattern has no wildcards at all
         if !starts_wild && !ends_wild && !pattern.contains('%') && !pattern.contains('_') {
             return s == pattern;
         }
-        
+
         // Fast path: Pure prefix match 'abc%' (no other wildcards)
         if !starts_wild && ends_wild {
             let prefix = &pattern[..len - 1];
@@ -447,7 +473,7 @@ impl Filter {
                 return s.starts_with(prefix);
             }
         }
-        
+
         // Fast path: Pure suffix match '%abc' (no other wildcards)
         if starts_wild && !ends_wild {
             let suffix = &pattern[1..];
@@ -456,7 +482,7 @@ impl Filter {
                 return s.ends_with(suffix);
             }
         }
-        
+
         // Fast path: Pure contains match '%abc%' (no other wildcards)
         if starts_wild && ends_wild && len > 2 {
             let middle = &pattern[1..len - 1];
@@ -465,7 +491,7 @@ impl Filter {
                 return s.contains(middle);
             }
         }
-        
+
         // Fallback: Complex pattern with multiple wildcards or '_'
         Self::like_match_complex(s, pattern)
     }
@@ -476,12 +502,13 @@ impl Filter {
         // Escape regex special chars except % and _
         let mut regex_pattern = String::with_capacity(pattern.len() * 2);
         regex_pattern.push('^');
-        
+
         for c in pattern.chars() {
             match c {
                 '%' => regex_pattern.push_str(".*"),
                 '_' => regex_pattern.push('.'),
-                '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+                | '\\' => {
                     regex_pattern.push('\\');
                     regex_pattern.push(c);
                 }
@@ -489,7 +516,7 @@ impl Filter {
             }
         }
         regex_pattern.push('$');
-        
+
         if let Ok(re) = regex::Regex::new(&regex_pattern) {
             re.is_match(s)
         } else {
@@ -519,23 +546,39 @@ impl Filter {
             Filter::Compare { field, op, value } => {
                 self.filter_compare_column(schema, columns, row_count, deleted, field, op, value)
             }
-            Filter::Range { field, low, high, low_inclusive, high_inclusive } => {
-                self.filter_range_column(schema, columns, row_count, deleted, field, low, high, *low_inclusive, *high_inclusive)
-            }
+            Filter::Range {
+                field,
+                low,
+                high,
+                low_inclusive,
+                high_inclusive,
+            } => self.filter_range_column(
+                schema,
+                columns,
+                row_count,
+                deleted,
+                field,
+                low,
+                high,
+                *low_inclusive,
+                *high_inclusive,
+            ),
             Filter::And(filters) => {
                 // OPTIMIZED: Parallel fused AND filter - evaluates all conditions in single pass
                 if filters.is_empty() {
                     return (0..row_count).filter(|&i| !deleted.get(i)).collect();
                 }
-                
+
                 // Lower threshold for fused AND - complex queries benefit from fusion
                 // Try parallel fused evaluation for compound conditions
                 if row_count >= 10_000 && filters.len() >= 2 {
-                    if let Some(result) = self.filter_and_parallel_fused(schema, columns, row_count, deleted, filters) {
+                    if let Some(result) =
+                        self.filter_and_parallel_fused(schema, columns, row_count, deleted, filters)
+                    {
                         return result;
                     }
                 }
-                
+
                 // Fallback: sequential with BitVec intersection (lower overhead than HashSet)
                 let mut result = filters[0].filter_columns(schema, columns, row_count, deleted);
                 for filter in filters.iter().skip(1) {
@@ -636,7 +679,7 @@ impl Filter {
         value: &Value,
     ) -> Vec<usize> {
         use rayon::prelude::*;
-        
+
         let col_idx = match schema.get_index(field) {
             Some(idx) => idx,
             None => return Vec::new(),
@@ -644,7 +687,7 @@ impl Filter {
 
         let column = &columns[col_idx];
         let no_deletes = deleted.all_false();
-        
+
         // Use parallel processing for large datasets (> 10K rows)
         // Lowered from 100K for better responsiveness on common query sizes
         let use_parallel = row_count >= 10_000;
@@ -655,13 +698,17 @@ impl Filter {
                 let no_nulls = nulls.all_false();
                 let target = *target;
                 let data_len = data.len().min(row_count);
-                
+
                 if use_parallel {
                     // Parallel filtering using rayon
-                    (0..data_len).into_par_iter()
+                    (0..data_len)
+                        .into_par_iter()
                         .filter(|&i| {
-                            let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
-                            if skip { return false; }
+                            let skip =
+                                (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                            if skip {
+                                return false;
+                            }
                             let val = data[i];
                             match op {
                                 CompareOp::Equal => val == target,
@@ -679,7 +726,9 @@ impl Filter {
                     let mut result = Vec::with_capacity(row_count / 4);
                     for i in 0..data_len {
                         let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
-                        if skip { continue; }
+                        if skip {
+                            continue;
+                        }
                         let val = data[i];
                         let matches = match op {
                             CompareOp::Equal => val == target,
@@ -690,7 +739,9 @@ impl Filter {
                             CompareOp::GreaterEqual => val >= target,
                             _ => false,
                         };
-                        if matches { result.push(i); }
+                        if matches {
+                            result.push(i);
+                        }
                     }
                     result
                 }
@@ -700,12 +751,16 @@ impl Filter {
                 let no_nulls = nulls.all_false();
                 let target = *target;
                 let data_len = data.len().min(row_count);
-                
+
                 if use_parallel {
-                    (0..data_len).into_par_iter()
+                    (0..data_len)
+                        .into_par_iter()
                         .filter(|&i| {
-                            let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
-                            if skip { return false; }
+                            let skip =
+                                (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                            if skip {
+                                return false;
+                            }
                             let val = data[i];
                             match op {
                                 CompareOp::Equal => (val - target).abs() < f64::EPSILON,
@@ -722,7 +777,9 @@ impl Filter {
                     let mut result = Vec::with_capacity(row_count / 4);
                     for i in 0..data_len {
                         let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
-                        if skip { continue; }
+                        if skip {
+                            continue;
+                        }
                         let val = data[i];
                         let matches = match op {
                             CompareOp::Equal => (val - target).abs() < f64::EPSILON,
@@ -733,7 +790,9 @@ impl Filter {
                             CompareOp::GreaterEqual => val >= target,
                             _ => false,
                         };
-                        if matches { result.push(i); }
+                        if matches {
+                            result.push(i);
+                        }
                     }
                     result
                 }
@@ -741,12 +800,15 @@ impl Filter {
             // Fast path: String column with String value
             (TypedColumn::String(col), Value::String(target)) => {
                 let data_len = col.len().min(row_count);
-                
+
                 if use_parallel {
-                    (0..data_len).into_par_iter()
+                    (0..data_len)
+                        .into_par_iter()
                         .filter(|&i| {
                             let skip = (!no_deletes && deleted.get(i)) || col.is_null(i);
-                            if skip { return false; }
+                            if skip {
+                                return false;
+                            }
                             match col.get(i) {
                                 Some(val) => match op {
                                     CompareOp::Equal => val == target,
@@ -766,7 +828,9 @@ impl Filter {
                     let mut result = Vec::with_capacity(row_count / 4);
                     for i in 0..data_len {
                         let skip = (!no_deletes && deleted.get(i)) || col.is_null(i);
-                        if skip { continue; }
+                        if skip {
+                            continue;
+                        }
                         if let Some(val) = col.get(i) {
                             let matches = match op {
                                 CompareOp::Equal => val == target,
@@ -778,7 +842,9 @@ impl Filter {
                                 CompareOp::Like => Self::like_match(val, target),
                                 _ => false,
                             };
-                            if matches { result.push(i); }
+                            if matches {
+                                result.push(i);
+                            }
                         }
                     }
                     result
@@ -802,13 +868,13 @@ impl Filter {
     }
 
     /// ULTRA-FAST LIKE filter on column data with pattern-specific optimizations
-    /// 
+    ///
     /// Performance for 10M rows:
     /// - Prefix 'abc%': ~15ms (parallel starts_with)
     /// - Suffix '%abc': ~20ms (parallel ends_with)
     /// - Contains '%abc%': ~40ms (parallel contains)
     /// - Complex: ~500ms (regex fallback)
-    /// 
+    ///
     /// Optimizations applied:
     /// - Lower parallel threshold (10K rows) for better responsiveness
     /// - Pattern pre-classification to avoid repeated parsing
@@ -823,38 +889,43 @@ impl Filter {
         pattern: &str,
     ) -> Vec<usize> {
         use rayon::prelude::*;
-        
+
         let col_idx = match schema.get_index(field) {
             Some(idx) => idx,
             None => return Vec::new(),
         };
 
         let column = &columns[col_idx];
-        
+
         if let TypedColumn::String(col) = column {
             let no_deletes = deleted.all_false();
             let data_len = col.len().min(row_count);
-            
+
             // Classify pattern for optimized matching
             let matcher = LikeMatcher::new(pattern);
-            
+
             // Lower threshold for LIKE - pattern matching is expensive
             // Use parallel for datasets >= 10K rows (was 100K)
             if data_len >= 10_000 {
-                return (0..data_len).into_par_iter()
+                return (0..data_len)
+                    .into_par_iter()
                     .filter(|&i| {
                         let skip = (!no_deletes && deleted.get(i)) || col.is_null(i);
-                        if skip { return false; }
+                        if skip {
+                            return false;
+                        }
                         col.get(i).map(|s| matcher.matches(s)).unwrap_or(false)
                     })
                     .collect();
             }
-            
+
             // Sequential for smaller datasets
             let mut result = Vec::with_capacity(data_len / 10); // Estimate 10% match
             for i in 0..data_len {
                 let skip = (!no_deletes && deleted.get(i)) || col.is_null(i);
-                if skip { continue; }
+                if skip {
+                    continue;
+                }
                 if let Some(s) = col.get(i) {
                     if matcher.matches(s) {
                         result.push(i);
@@ -880,7 +951,7 @@ impl Filter {
     ) -> Vec<usize> {
         use rayon::prelude::*;
         use std::collections::HashSet;
-        
+
         let col_idx = match schema.get_index(field) {
             Some(idx) => idx,
             None => return Vec::new(),
@@ -894,23 +965,33 @@ impl Filter {
             // Fast path: String column with String values - use HashSet
             TypedColumn::String(col) => {
                 // Build HashSet for O(1) lookup
-                let value_set: HashSet<&str> = values.iter()
+                let value_set: HashSet<&str> = values
+                    .iter()
                     .filter_map(|v| {
-                        if let Value::String(s) = v { Some(s.as_str()) } else { None }
+                        if let Value::String(s) = v {
+                            Some(s.as_str())
+                        } else {
+                            None
+                        }
                     })
                     .collect();
-                
+
                 if value_set.is_empty() {
                     return Vec::new();
                 }
-                
+
                 let data_len = col.len().min(row_count);
-                
+
                 if use_parallel {
-                    (0..data_len).into_par_iter()
+                    (0..data_len)
+                        .into_par_iter()
                         .filter(|&i| {
-                            if !no_deletes && deleted.get(i) { return false; }
-                            if col.is_null(i) { return false; }
+                            if !no_deletes && deleted.get(i) {
+                                return false;
+                            }
+                            if col.is_null(i) {
+                                return false;
+                            }
                             if let Some(s) = col.get(i) {
                                 value_set.contains(s)
                             } else {
@@ -922,7 +1003,9 @@ impl Filter {
                     let mut result = Vec::with_capacity(values.len().min(row_count));
                     for i in 0..data_len {
                         let skip = (!no_deletes && deleted.get(i)) || col.is_null(i);
-                        if skip { continue; }
+                        if skip {
+                            continue;
+                        }
                         if let Some(s) = col.get(i) {
                             if value_set.contains(s) {
                                 result.push(i);
@@ -934,24 +1017,34 @@ impl Filter {
             }
             // Fast path: Int64 column with Int64 values - use HashSet
             TypedColumn::Int64 { data, nulls } => {
-                let value_set: HashSet<i64> = values.iter()
+                let value_set: HashSet<i64> = values
+                    .iter()
                     .filter_map(|v| {
-                        if let Value::Int64(i) = v { Some(*i) } else { None }
+                        if let Value::Int64(i) = v {
+                            Some(*i)
+                        } else {
+                            None
+                        }
                     })
                     .collect();
-                
+
                 if value_set.is_empty() {
                     return Vec::new();
                 }
-                
+
                 let no_nulls = nulls.all_false();
                 let data_len = data.len().min(row_count);
-                
+
                 if use_parallel {
-                    (0..data_len).into_par_iter()
+                    (0..data_len)
+                        .into_par_iter()
                         .filter(|&i| {
-                            if !no_deletes && deleted.get(i) { return false; }
-                            if !no_nulls && nulls.get(i) { return false; }
+                            if !no_deletes && deleted.get(i) {
+                                return false;
+                            }
+                            if !no_nulls && nulls.get(i) {
+                                return false;
+                            }
                             value_set.contains(&data[i])
                         })
                         .collect()
@@ -959,7 +1052,9 @@ impl Filter {
                     let mut result = Vec::with_capacity(values.len().min(row_count));
                     for i in 0..data_len {
                         let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
-                        if skip { continue; }
+                        if skip {
+                            continue;
+                        }
                         if value_set.contains(&data[i]) {
                             result.push(i);
                         }
@@ -970,27 +1065,37 @@ impl Filter {
             // Fast path: Float64 column with Float64 values - use direct comparison
             TypedColumn::Float64 { data, nulls } => {
                 // For Float64 IN queries, use a sorted vector + binary search for efficiency
-                let mut value_vec: Vec<f64> = values.iter()
+                let mut value_vec: Vec<f64> = values
+                    .iter()
                     .filter_map(|v| {
-                        if let Value::Float64(f) = v { Some(*f) } else { None }
+                        if let Value::Float64(f) = v {
+                            Some(*f)
+                        } else {
+                            None
+                        }
                     })
                     .collect();
                 value_vec.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 value_vec.dedup_by(|a, b| a == b);
-                
+
                 if value_vec.is_empty() {
                     return Vec::new();
                 }
-                
+
                 let no_nulls = nulls.all_false();
                 let data_len = data.len().min(row_count);
-                
+
                 if use_parallel {
                     let value_vec = value_vec; // Move into closure
-                    (0..data_len).into_par_iter()
+                    (0..data_len)
+                        .into_par_iter()
                         .filter(|&i| {
-                            if !no_deletes && deleted.get(i) { return false; }
-                            if !no_nulls && nulls.get(i) { return false; }
+                            if !no_deletes && deleted.get(i) {
+                                return false;
+                            }
+                            if !no_nulls && nulls.get(i) {
+                                return false;
+                            }
                             let val = data[i];
                             value_vec.iter().any(|&v| (val - v).abs() < f64::EPSILON)
                         })
@@ -999,7 +1104,9 @@ impl Filter {
                     let mut result = Vec::with_capacity(values.len().min(row_count));
                     for i in 0..data_len {
                         let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
-                        if skip { continue; }
+                        if skip {
+                            continue;
+                        }
                         let val = data[i];
                         if value_vec.iter().any(|&v| (val - v).abs() < f64::EPSILON) {
                             result.push(i);
@@ -1040,7 +1147,7 @@ impl Filter {
         high_inc: bool,
     ) -> Vec<usize> {
         use rayon::prelude::*;
-        
+
         let col_idx = match schema.get_index(field) {
             Some(idx) => idx,
             None => return Vec::new(),
@@ -1058,15 +1165,27 @@ impl Filter {
                 let low_val = *low_val;
                 let high_val = *high_val;
                 let data_len = data.len().min(row_count);
-                
+
                 if use_parallel {
-                    (0..data_len).into_par_iter()
+                    (0..data_len)
+                        .into_par_iter()
                         .filter(|&i| {
-                            let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
-                            if skip { return false; }
+                            let skip =
+                                (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                            if skip {
+                                return false;
+                            }
                             let val = data[i];
-                            let low_ok = if low_inc { val >= low_val } else { val > low_val };
-                            let high_ok = if high_inc { val <= high_val } else { val < high_val };
+                            let low_ok = if low_inc {
+                                val >= low_val
+                            } else {
+                                val > low_val
+                            };
+                            let high_ok = if high_inc {
+                                val <= high_val
+                            } else {
+                                val < high_val
+                            };
                             low_ok && high_ok
                         })
                         .collect()
@@ -1074,30 +1193,58 @@ impl Filter {
                     let mut result = Vec::with_capacity(row_count / 10);
                     for i in 0..data_len {
                         let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
-                        if skip { continue; }
+                        if skip {
+                            continue;
+                        }
                         let val = data[i];
-                        let low_ok = if low_inc { val >= low_val } else { val > low_val };
-                        let high_ok = if high_inc { val <= high_val } else { val < high_val };
-                        if low_ok && high_ok { result.push(i); }
+                        let low_ok = if low_inc {
+                            val >= low_val
+                        } else {
+                            val > low_val
+                        };
+                        let high_ok = if high_inc {
+                            val <= high_val
+                        } else {
+                            val < high_val
+                        };
+                        if low_ok && high_ok {
+                            result.push(i);
+                        }
                     }
                     result
                 }
             }
             // Fast path: Float64 column with Float64 bounds
-            (TypedColumn::Float64 { data, nulls }, Value::Float64(low_val), Value::Float64(high_val)) => {
+            (
+                TypedColumn::Float64 { data, nulls },
+                Value::Float64(low_val),
+                Value::Float64(high_val),
+            ) => {
                 let no_nulls = nulls.all_false();
                 let low_val = *low_val;
                 let high_val = *high_val;
                 let data_len = data.len().min(row_count);
-                
+
                 if use_parallel {
-                    (0..data_len).into_par_iter()
+                    (0..data_len)
+                        .into_par_iter()
                         .filter(|&i| {
-                            let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
-                            if skip { return false; }
+                            let skip =
+                                (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
+                            if skip {
+                                return false;
+                            }
                             let val = data[i];
-                            let low_ok = if low_inc { val >= low_val } else { val > low_val };
-                            let high_ok = if high_inc { val <= high_val } else { val < high_val };
+                            let low_ok = if low_inc {
+                                val >= low_val
+                            } else {
+                                val > low_val
+                            };
+                            let high_ok = if high_inc {
+                                val <= high_val
+                            } else {
+                                val < high_val
+                            };
                             low_ok && high_ok
                         })
                         .collect()
@@ -1105,11 +1252,23 @@ impl Filter {
                     let mut result = Vec::with_capacity(row_count / 10);
                     for i in 0..data_len {
                         let skip = (!no_deletes && deleted.get(i)) || (!no_nulls && nulls.get(i));
-                        if skip { continue; }
+                        if skip {
+                            continue;
+                        }
                         let val = data[i];
-                        let low_ok = if low_inc { val >= low_val } else { val > low_val };
-                        let high_ok = if high_inc { val <= high_val } else { val < high_val };
-                        if low_ok && high_ok { result.push(i); }
+                        let low_ok = if low_inc {
+                            val >= low_val
+                        } else {
+                            val > low_val
+                        };
+                        let high_ok = if high_inc {
+                            val <= high_val
+                        } else {
+                            val < high_val
+                        };
+                        if low_ok && high_ok {
+                            result.push(i);
+                        }
                     }
                     result
                 }
@@ -1120,7 +1279,9 @@ impl Filter {
                 for i in 0..row_count {
                     if !deleted.get(i) {
                         if let Some(row_value) = column.get(i) {
-                            if !row_value.is_null() && Self::value_in_range(&row_value, low, high, low_inc, high_inc) {
+                            if !row_value.is_null()
+                                && Self::value_in_range(&row_value, low, high, low_inc, high_inc)
+                            {
                                 result.push(i);
                             }
                         }
@@ -1130,7 +1291,7 @@ impl Filter {
             }
         }
     }
-    
+
     /// Parallel fused AND filter - evaluates all conditions in single pass
     /// Returns None if conditions can't be fused (falls back to sequential)
     fn filter_and_parallel_fused(
@@ -1142,10 +1303,10 @@ impl Filter {
         filters: &[Filter],
     ) -> Option<Vec<usize>> {
         use rayon::prelude::*;
-        
+
         // Try to extract optimized matchers for each filter
         let mut matchers: Vec<FusedMatcher> = Vec::with_capacity(filters.len());
-        
+
         for filter in filters {
             match filter {
                 Filter::Like { field, pattern } => {
@@ -1187,10 +1348,16 @@ impl Filter {
                         return None;
                     }
                 }
-                Filter::Range { field, low, high, .. } => {
+                Filter::Range {
+                    field, low, high, ..
+                } => {
                     if let Some(col_idx) = schema.get_index(field) {
-                        if let (TypedColumn::Int64 { data, nulls }, Value::Int64(l), Value::Int64(h)) = 
-                            (&columns[col_idx], low, high) {
+                        if let (
+                            TypedColumn::Int64 { data, nulls },
+                            Value::Int64(l),
+                            Value::Int64(h),
+                        ) = (&columns[col_idx], low, high)
+                        {
                             matchers.push(FusedMatcher::RangeInt64 {
                                 data,
                                 nulls,
@@ -1226,28 +1393,52 @@ impl Filter {
                 _ => return None, // Can't fuse this filter type
             }
         }
-        
+
         let no_deletes = deleted.all_false();
-        
+
         // Parallel fused evaluation
-        let result: Vec<usize> = (0..row_count).into_par_iter()
+        let result: Vec<usize> = (0..row_count)
+            .into_par_iter()
             .filter(|&i| {
-                if !no_deletes && deleted.get(i) { return false; }
+                if !no_deletes && deleted.get(i) {
+                    return false;
+                }
                 matchers.iter().all(|m| m.matches(i))
             })
             .collect();
-        
+
         Some(result)
     }
 }
 
 /// Fused matcher for parallel AND evaluation
 enum FusedMatcher<'a> {
-    Like { col: &'a ArrowStringColumn, matcher: LikeMatcher },
-    NotLike { col: &'a ArrowStringColumn, matcher: LikeMatcher },
-    CompareInt64 { data: &'a [i64], nulls: &'a BitVec, op: CompareOp, target: i64 },
-    CompareFloat64 { data: &'a [f64], nulls: &'a BitVec, op: CompareOp, target: f64 },
-    RangeInt64 { data: &'a [i64], nulls: &'a BitVec, low: i64, high: i64 },
+    Like {
+        col: &'a ArrowStringColumn,
+        matcher: LikeMatcher,
+    },
+    NotLike {
+        col: &'a ArrowStringColumn,
+        matcher: LikeMatcher,
+    },
+    CompareInt64 {
+        data: &'a [i64],
+        nulls: &'a BitVec,
+        op: CompareOp,
+        target: i64,
+    },
+    CompareFloat64 {
+        data: &'a [f64],
+        nulls: &'a BitVec,
+        op: CompareOp,
+        target: f64,
+    },
+    RangeInt64 {
+        data: &'a [i64],
+        nulls: &'a BitVec,
+        low: i64,
+        high: i64,
+    },
 }
 
 impl<'a> FusedMatcher<'a> {
@@ -1260,8 +1451,15 @@ impl<'a> FusedMatcher<'a> {
             FusedMatcher::NotLike { col, matcher } => {
                 col.get(i).map(|s| !matcher.matches(s)).unwrap_or(false)
             }
-            FusedMatcher::CompareInt64 { data, nulls, op, target } => {
-                if i >= data.len() || nulls.get(i) { return false; }
+            FusedMatcher::CompareInt64 {
+                data,
+                nulls,
+                op,
+                target,
+            } => {
+                if i >= data.len() || nulls.get(i) {
+                    return false;
+                }
                 let val = data[i];
                 match op {
                     CompareOp::Equal => val == *target,
@@ -1273,8 +1471,15 @@ impl<'a> FusedMatcher<'a> {
                     _ => false,
                 }
             }
-            FusedMatcher::CompareFloat64 { data, nulls, op, target } => {
-                if i >= data.len() || nulls.get(i) { return false; }
+            FusedMatcher::CompareFloat64 {
+                data,
+                nulls,
+                op,
+                target,
+            } => {
+                if i >= data.len() || nulls.get(i) {
+                    return false;
+                }
                 let val = data[i];
                 match op {
                     CompareOp::Equal => (val - target).abs() < f64::EPSILON,
@@ -1286,8 +1491,15 @@ impl<'a> FusedMatcher<'a> {
                     _ => false,
                 }
             }
-            FusedMatcher::RangeInt64 { data, nulls, low, high } => {
-                if i >= data.len() || nulls.get(i) { return false; }
+            FusedMatcher::RangeInt64 {
+                data,
+                nulls,
+                low,
+                high,
+            } => {
+                if i >= data.len() || nulls.get(i) {
+                    return false;
+                }
                 let val = data[i];
                 val >= *low && val <= *high
             }
@@ -1380,4 +1592,3 @@ mod tests {
         assert!(filter.matches(&row));
     }
 }
-

@@ -193,7 +193,9 @@ impl HashIndex {
             let serializable = HashIndexSer {
                 column_name: self.column_name.clone(),
                 unique: self.unique,
-                entries: self.map.iter()
+                entries: self
+                    .map
+                    .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
                 entry_count: self.entry_count,
@@ -297,6 +299,9 @@ mod tests {
         idx.save().unwrap();
 
         let loaded = HashIndex::load(&path).unwrap();
-        assert_eq!(loaded.get(&IndexKey::Str("hello".into())), Some(&[42u64][..]));
+        assert_eq!(
+            loaded.get(&IndexKey::Str("hello".into())),
+            Some(&[42u64][..])
+        );
     }
 }

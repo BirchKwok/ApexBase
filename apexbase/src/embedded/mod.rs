@@ -40,13 +40,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef,
-    BooleanArray,
-    Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-    StringArray, LargeStringArray,
-    BinaryArray, LargeBinaryArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, StringArray, UInt16Array,
+    UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{DataType as ArrowDataType, Schema};
 use arrow::record_batch::RecordBatch;
@@ -54,8 +50,8 @@ use parking_lot::RwLock;
 
 use crate::data::{DataType, Value};
 use crate::query::{ApexExecutor, ApexResult};
-use crate::storage::DurabilityLevel;
 use crate::storage::on_demand::ColumnType;
+use crate::storage::DurabilityLevel;
 use crate::{ApexError, Result};
 
 // ============================================================================
@@ -222,7 +218,11 @@ impl ApexDB {
         let engine = crate::storage::engine::engine();
         engine.create_table(&path, self.inner.durability)?;
         self.inner.register_table(name, path.clone());
-        Ok(Table { inner: self.inner.clone(), name: name.to_string(), path })
+        Ok(Table {
+            inner: self.inner.clone(),
+            name: name.to_string(),
+            path,
+        })
     }
 
     /// Create a new table with a predefined schema.
@@ -253,7 +253,11 @@ impl ApexDB {
         let engine = crate::storage::engine::engine();
         engine.create_table_with_schema(&path, self.inner.durability, schema)?;
         self.inner.register_table(name, path.clone());
-        Ok(Table { inner: self.inner.clone(), name: name.to_string(), path })
+        Ok(Table {
+            inner: self.inner.clone(),
+            name: name.to_string(),
+            path,
+        })
     }
 
     /// Open an existing table by name.
@@ -261,7 +265,11 @@ impl ApexDB {
     /// Returns [`ApexError::TableNotFound`] if the table does not exist.
     pub fn table(&self, name: &str) -> Result<Table> {
         let path = self.inner.resolve_table(name)?;
-        Ok(Table { inner: self.inner.clone(), name: name.to_string(), path })
+        Ok(Table {
+            inner: self.inner.clone(),
+            name: name.to_string(),
+            path,
+        })
     }
 
     /// Drop (permanently delete) a table.
@@ -492,7 +500,11 @@ impl Table {
         }
 
         // Fallback: SQL IN (…)
-        let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        let id_list = ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!("SELECT * FROM \"{}\" WHERE _id IN ({})", self.name, id_list);
         self.execute(&sql)?.to_record_batch()
     }
@@ -549,20 +561,33 @@ impl Table {
 
     /// Add a new column (all existing rows are set to `NULL`).
     pub fn add_column(&self, name: &str, dtype: DataType) -> Result<()> {
-        Ok(crate::storage::engine::engine()
-            .add_column(&self.path, name, dtype, self.inner.durability)?)
+        Ok(crate::storage::engine::engine().add_column(
+            &self.path,
+            name,
+            dtype,
+            self.inner.durability,
+        )?)
     }
 
     /// Drop a column.
     pub fn drop_column(&self, name: &str) -> Result<()> {
-        Ok(crate::storage::engine::engine()
-            .drop_column(&self.path, name, self.inner.durability)?)
+        Ok(
+            crate::storage::engine::engine().drop_column(
+                &self.path,
+                name,
+                self.inner.durability,
+            )?,
+        )
     }
 
     /// Rename a column.
     pub fn rename_column(&self, old_name: &str, new_name: &str) -> Result<()> {
-        Ok(crate::storage::engine::engine()
-            .rename_column(&self.path, old_name, new_name, self.inner.durability)?)
+        Ok(crate::storage::engine::engine().rename_column(
+            &self.path,
+            old_name,
+            new_name,
+            self.inner.durability,
+        )?)
     }
 
     // ── Maintenance ───────────────────────────────────────────────────────────
@@ -597,9 +622,9 @@ impl ResultSet {
     ///
     /// This is a zero-copy operation for `Data` variants.
     pub fn to_record_batch(self) -> Result<RecordBatch> {
-        self.inner.to_record_batch().map_err(|e| {
-            ApexError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
-        })
+        self.inner
+            .to_record_batch()
+            .map_err(|e| ApexError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))
     }
 
     /// Consume and convert to `Vec<`[`Row`]`>`.
@@ -646,7 +671,11 @@ impl ResultSet {
 // Internal helpers
 // ============================================================================
 
-fn open_db(path: impl AsRef<Path>, durability: DurabilityLevel, drop_if_exists: bool) -> Result<ApexDB> {
+fn open_db(
+    path: impl AsRef<Path>,
+    durability: DurabilityLevel,
+    drop_if_exists: bool,
+) -> Result<ApexDB> {
     let root_dir = to_absolute(path.as_ref());
     fs::create_dir_all(&root_dir)?;
 
@@ -715,43 +744,69 @@ pub fn arrow_value_at(arr: &ArrayRef, row: usize) -> Value {
         return Value::Null;
     }
     match arr.data_type() {
-        ArrowDataType::Int64 => {
-            Value::Int64(arr.as_any().downcast_ref::<Int64Array>().unwrap().value(row))
-        }
-        ArrowDataType::Int32 => {
-            Value::Int64(arr.as_any().downcast_ref::<Int32Array>().unwrap().value(row) as i64)
-        }
-        ArrowDataType::Int16 => {
-            Value::Int64(arr.as_any().downcast_ref::<Int16Array>().unwrap().value(row) as i64)
-        }
+        ArrowDataType::Int64 => Value::Int64(
+            arr.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        ArrowDataType::Int32 => Value::Int64(
+            arr.as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        ArrowDataType::Int16 => Value::Int64(
+            arr.as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
         ArrowDataType::Int8 => {
             Value::Int64(arr.as_any().downcast_ref::<Int8Array>().unwrap().value(row) as i64)
         }
-        ArrowDataType::UInt64 => {
-            Value::Int64(
-                arr.as_any().downcast_ref::<UInt64Array>().unwrap().value(row) as i64,
-            )
-        }
-        ArrowDataType::UInt32 => {
-            Value::Int64(arr.as_any().downcast_ref::<UInt32Array>().unwrap().value(row) as i64)
-        }
-        ArrowDataType::UInt16 => {
-            Value::Int64(arr.as_any().downcast_ref::<UInt16Array>().unwrap().value(row) as i64)
-        }
-        ArrowDataType::UInt8 => {
-            Value::Int64(arr.as_any().downcast_ref::<UInt8Array>().unwrap().value(row) as i64)
-        }
-        ArrowDataType::Float64 => {
-            Value::Float64(arr.as_any().downcast_ref::<Float64Array>().unwrap().value(row))
-        }
-        ArrowDataType::Float32 => {
-            Value::Float64(
-                arr.as_any().downcast_ref::<Float32Array>().unwrap().value(row) as f64,
-            )
-        }
-        ArrowDataType::Boolean => {
-            Value::Bool(arr.as_any().downcast_ref::<BooleanArray>().unwrap().value(row))
-        }
+        ArrowDataType::UInt64 => Value::Int64(
+            arr.as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        ArrowDataType::UInt32 => Value::Int64(
+            arr.as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        ArrowDataType::UInt16 => Value::Int64(
+            arr.as_any()
+                .downcast_ref::<UInt16Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        ArrowDataType::UInt8 => Value::Int64(
+            arr.as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        ArrowDataType::Float64 => Value::Float64(
+            arr.as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        ArrowDataType::Float32 => Value::Float64(
+            arr.as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row) as f64,
+        ),
+        ArrowDataType::Boolean => Value::Bool(
+            arr.as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(row),
+        ),
         ArrowDataType::Utf8 => Value::String(
             arr.as_any()
                 .downcast_ref::<StringArray>()
@@ -804,10 +859,10 @@ mod tests {
 
     fn row1(name: &str, age: i64, score: f64, city: &str) -> Row {
         let mut r = Row::new();
-        r.insert("name".to_string(),  Value::String(name.to_string()));
-        r.insert("age".to_string(),   Value::Int64(age));
+        r.insert("name".to_string(), Value::String(name.to_string()));
+        r.insert("age".to_string(), Value::Int64(age));
         r.insert("score".to_string(), Value::Float64(score));
-        r.insert("city".to_string(),  Value::String(city.to_string()));
+        r.insert("city".to_string(), Value::String(city.to_string()));
         r
     }
 
@@ -821,7 +876,7 @@ mod tests {
         assert_eq!(table.count().unwrap(), 1);
         let row = table.retrieve(id).unwrap().unwrap();
         assert_eq!(row.get("name"), Some(&Value::String("Alice".to_string())));
-        assert_eq!(row.get("age"),  Some(&Value::Int64(30)));
+        assert_eq!(row.get("age"), Some(&Value::Int64(30)));
     }
 
     #[test]
@@ -853,29 +908,39 @@ mod tests {
         let id = table.insert(row1("Alice", 30, 90.0, "NY")).unwrap();
 
         let mut updated = Row::new();
-        updated.insert("name".to_string(),  Value::String("Alice-v2".to_string()));
-        updated.insert("age".to_string(),   Value::Int64(31));
+        updated.insert("name".to_string(), Value::String("Alice-v2".to_string()));
+        updated.insert("age".to_string(), Value::Int64(31));
         updated.insert("score".to_string(), Value::Float64(99.0));
-        updated.insert("city".to_string(),  Value::String("LA".to_string()));
+        updated.insert("city".to_string(), Value::String("LA".to_string()));
         assert!(table.replace(id, updated).unwrap());
 
         // Verify new values
-        let rs = table.execute(&format!("SELECT name, age, score FROM rep_t WHERE _id = {}", id)).unwrap();
+        let rs = table
+            .execute(&format!(
+                "SELECT name, age, score FROM rep_t WHERE _id = {}",
+                id
+            ))
+            .unwrap();
         let rows = rs.to_rows().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get("name"), Some(&Value::String("Alice-v2".to_string())));
-        assert_eq!(rows[0].get("age"),  Some(&Value::Int64(31)));
+        assert_eq!(
+            rows[0].get("name"),
+            Some(&Value::String("Alice-v2".to_string()))
+        );
+        assert_eq!(rows[0].get("age"), Some(&Value::Int64(31)));
     }
 
     #[test]
     fn test_delete_batch() {
         let (_dir, db) = temp_db();
         let table = db.create_table("del_batch_t").unwrap();
-        let ids: Vec<u64> = (0..5i64).map(|i| {
-            let mut r = Row::new();
-            r.insert("i".to_string(), Value::Int64(i));
-            table.insert(r).unwrap()
-        }).collect();
+        let ids: Vec<u64> = (0..5i64)
+            .map(|i| {
+                let mut r = Row::new();
+                r.insert("i".to_string(), Value::Int64(i));
+                table.insert(r).unwrap()
+            })
+            .collect();
 
         let deleted = table.delete_batch(&ids[0..3]).unwrap();
         assert_eq!(deleted, 3);
@@ -886,11 +951,13 @@ mod tests {
     fn test_retrieve_many_ids() {
         let (_dir, db) = temp_db();
         let table = db.create_table("rmany_t").unwrap();
-        let ids: Vec<u64> = (0..5i64).map(|i| {
-            let mut r = Row::new();
-            r.insert("v".to_string(), Value::Int64(i * 10));
-            table.insert(r).unwrap()
-        }).collect();
+        let ids: Vec<u64> = (0..5i64)
+            .map(|i| {
+                let mut r = Row::new();
+                r.insert("v".to_string(), Value::Int64(i * 10));
+                table.insert(r).unwrap()
+            })
+            .collect();
 
         let batch = table.retrieve_many(&ids[0..3]).unwrap();
         assert_eq!(batch.num_rows(), 3);
@@ -933,11 +1000,13 @@ mod tests {
     fn test_insert_batch() {
         let (_dir, db) = temp_db();
         let table = db.create_table("batch_t").unwrap();
-        let records: Vec<Row> = (0..100i64).map(|i| {
-            let mut r = Row::new();
-            r.insert("i".to_string(), Value::Int64(i));
-            r
-        }).collect();
+        let records: Vec<Row> = (0..100i64)
+            .map(|i| {
+                let mut r = Row::new();
+                r.insert("i".to_string(), Value::Int64(i));
+                r
+            })
+            .collect();
         let ids = table.insert_batch(&records).unwrap();
         assert_eq!(ids.len(), 100);
         assert_eq!(table.count().unwrap(), 100);
@@ -952,11 +1021,13 @@ mod tests {
         for (name, age) in &[("A", 20i64), ("B", 30), ("C", 40), ("D", 25), ("E", 35)] {
             let mut r = Row::new();
             r.insert("name".to_string(), Value::String(name.to_string()));
-            r.insert("age".to_string(),  Value::Int64(*age));
+            r.insert("age".to_string(), Value::Int64(*age));
             table.insert(r).unwrap();
         }
         // age > 28 → B(30), C(40), E(35)
-        let rs = table.execute("SELECT name FROM filter_t WHERE age > 28").unwrap();
+        let rs = table
+            .execute("SELECT name FROM filter_t WHERE age > 28")
+            .unwrap();
         assert_eq!(rs.num_rows(), 3);
     }
 
@@ -973,7 +1044,11 @@ mod tests {
         let batch = rs.to_record_batch().unwrap();
         assert_eq!(batch.num_rows(), 1);
         // Extract count value
-        let rows = table.execute("SELECT COUNT(*) FROM cnt_t").unwrap().to_rows().unwrap();
+        let rows = table
+            .execute("SELECT COUNT(*) FROM cnt_t")
+            .unwrap()
+            .to_rows()
+            .unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -984,12 +1059,12 @@ mod tests {
         for city in &["NY", "NY", "LA", "LA", "LA", "Tokyo"] {
             let mut r = Row::new();
             r.insert("city".to_string(), Value::String(city.to_string()));
-            r.insert("v".to_string(),    Value::Int64(1));
+            r.insert("v".to_string(), Value::Int64(1));
             table.insert(r).unwrap();
         }
-        let rs = table.execute(
-            "SELECT city, COUNT(*) AS n FROM grp_t GROUP BY city ORDER BY n DESC"
-        ).unwrap();
+        let rs = table
+            .execute("SELECT city, COUNT(*) AS n FROM grp_t GROUP BY city ORDER BY n DESC")
+            .unwrap();
         let rows = rs.to_rows().unwrap();
         assert_eq!(rows.len(), 3);
         // LA has 3, NY has 2, Tokyo has 1
@@ -1005,7 +1080,9 @@ mod tests {
             r.insert("score".to_string(), Value::Int64(*score));
             table.insert(r).unwrap();
         }
-        let rs = table.execute("SELECT score FROM ord_t ORDER BY score DESC LIMIT 3").unwrap();
+        let rs = table
+            .execute("SELECT score FROM ord_t ORDER BY score DESC LIMIT 3")
+            .unwrap();
         let rows = rs.to_rows().unwrap();
         assert_eq!(rows.len(), 3);
         // Top-3 scores: 90, 70, 50
@@ -1020,12 +1097,16 @@ mod tests {
         let table = db.create_table("upd_t").unwrap();
         for i in 0..5i64 {
             let mut r = Row::new();
-            r.insert("n".to_string(),     Value::Int64(i));
+            r.insert("n".to_string(), Value::Int64(i));
             r.insert("status".to_string(), Value::String("old".to_string()));
             table.insert(r).unwrap();
         }
-        table.execute("UPDATE upd_t SET status = 'new' WHERE n >= 3").unwrap();
-        let rs = table.execute("SELECT n FROM upd_t WHERE status = 'new'").unwrap();
+        table
+            .execute("UPDATE upd_t SET status = 'new' WHERE n >= 3")
+            .unwrap();
+        let rs = table
+            .execute("SELECT n FROM upd_t WHERE status = 'new'")
+            .unwrap();
         assert_eq!(rs.num_rows(), 2); // n=3 and n=4
     }
 
@@ -1060,16 +1141,23 @@ mod tests {
     fn test_sql_having() {
         let (_dir, db) = temp_db();
         let table = db.create_table("hav_t").unwrap();
-        for (cat, v) in &[("A", 1i64), ("A", 2), ("B", 3), ("C", 4), ("C", 5), ("C", 6)] {
+        for (cat, v) in &[
+            ("A", 1i64),
+            ("A", 2),
+            ("B", 3),
+            ("C", 4),
+            ("C", 5),
+            ("C", 6),
+        ] {
             let mut r = Row::new();
             r.insert("cat".to_string(), Value::String(cat.to_string()));
-            r.insert("v".to_string(),   Value::Int64(*v));
+            r.insert("v".to_string(), Value::Int64(*v));
             table.insert(r).unwrap();
         }
         // Groups with COUNT > 1: A(2), C(3)
-        let rs = table.execute(
-            "SELECT cat, COUNT(*) AS n FROM hav_t GROUP BY cat HAVING COUNT(*) > 1"
-        ).unwrap();
+        let rs = table
+            .execute("SELECT cat, COUNT(*) AS n FROM hav_t GROUP BY cat HAVING COUNT(*) > 1")
+            .unwrap();
         assert_eq!(rs.num_rows(), 2);
     }
 
@@ -1080,16 +1168,19 @@ mod tests {
         let (_dir, db) = temp_db();
         let table = db.create_table("types_t").unwrap();
         let mut r = Row::new();
-        r.insert("int_col".to_string(),    Value::Int64(12345));
-        r.insert("float_col".to_string(),  Value::Float64(3.14));
-        r.insert("str_col".to_string(),    Value::String("hello".to_string()));
-        r.insert("bool_col".to_string(),   Value::Bool(true));
+        r.insert("int_col".to_string(), Value::Int64(12345));
+        r.insert("float_col".to_string(), Value::Float64(3.14));
+        r.insert("str_col".to_string(), Value::String("hello".to_string()));
+        r.insert("bool_col".to_string(), Value::Bool(true));
         let id = table.insert(r).unwrap();
 
         let row = table.retrieve(id).unwrap().unwrap();
-        assert_eq!(row.get("int_col"),   Some(&Value::Int64(12345)));
-        assert_eq!(row.get("str_col"),   Some(&Value::String("hello".to_string())));
-        assert_eq!(row.get("bool_col"),  Some(&Value::Bool(true)));
+        assert_eq!(row.get("int_col"), Some(&Value::Int64(12345)));
+        assert_eq!(
+            row.get("str_col"),
+            Some(&Value::String("hello".to_string()))
+        );
+        assert_eq!(row.get("bool_col"), Some(&Value::Bool(true)));
         // Float comparison with tolerance
         if let Some(Value::Float64(v)) = row.get("float_col") {
             assert!((v - 3.14).abs() < 1e-9);
@@ -1120,9 +1211,13 @@ mod tests {
             r.insert("flag".to_string(), Value::Bool(*b));
             table.insert(r).unwrap();
         }
-        let rs = table.execute("SELECT flag FROM bool_t WHERE flag = true").unwrap();
+        let rs = table
+            .execute("SELECT flag FROM bool_t WHERE flag = true")
+            .unwrap();
         assert_eq!(rs.num_rows(), 2);
-        let rs = table.execute("SELECT flag FROM bool_t WHERE flag = false").unwrap();
+        let rs = table
+            .execute("SELECT flag FROM bool_t WHERE flag = false")
+            .unwrap();
         assert_eq!(rs.num_rows(), 2);
     }
 
@@ -1137,7 +1232,9 @@ mod tests {
             table.insert(r).unwrap();
         }
         assert_eq!(table.count().unwrap(), 5);
-        let rs = table.execute("SELECT s FROM str_t WHERE s = 'hello'").unwrap();
+        let rs = table
+            .execute("SELECT s FROM str_t WHERE s = 'hello'")
+            .unwrap();
         assert_eq!(rs.num_rows(), 1);
     }
 
@@ -1145,18 +1242,24 @@ mod tests {
     fn test_large_batch_and_filter() {
         let (_dir, db) = temp_db();
         let table = db.create_table("large_t").unwrap();
-        let records: Vec<Row> = (0..500i64).map(|i| {
-            let mut r = Row::new();
-            r.insert("n".to_string(),    Value::Int64(i));
-            r.insert("even".to_string(), Value::Bool(i % 2 == 0));
-            r
-        }).collect();
+        let records: Vec<Row> = (0..500i64)
+            .map(|i| {
+                let mut r = Row::new();
+                r.insert("n".to_string(), Value::Int64(i));
+                r.insert("even".to_string(), Value::Bool(i % 2 == 0));
+                r
+            })
+            .collect();
         table.insert_batch(&records).unwrap();
         assert_eq!(table.count().unwrap(), 500);
 
-        let rs = table.execute("SELECT n FROM large_t WHERE even = true").unwrap();
+        let rs = table
+            .execute("SELECT n FROM large_t WHERE even = true")
+            .unwrap();
         assert_eq!(rs.num_rows(), 250);
-        let rs = table.execute("SELECT COUNT(*) FROM large_t WHERE n >= 250").unwrap();
+        let rs = table
+            .execute("SELECT COUNT(*) FROM large_t WHERE n >= 250")
+            .unwrap();
         assert_eq!(rs.num_rows(), 1);
     }
 
@@ -1184,11 +1287,13 @@ mod tests {
         let table = db.create_table("cols_t").unwrap();
         let mut r = Row::new();
         r.insert("alpha".to_string(), Value::Int64(1));
-        r.insert("beta".to_string(),  Value::Float64(2.0));
+        r.insert("beta".to_string(), Value::Float64(2.0));
         r.insert("gamma".to_string(), Value::String("x".to_string()));
         table.insert(r).unwrap();
 
-        let rs = table.execute("SELECT alpha, beta, gamma FROM cols_t").unwrap();
+        let rs = table
+            .execute("SELECT alpha, beta, gamma FROM cols_t")
+            .unwrap();
         let cols = rs.columns();
         assert!(cols.contains(&"alpha".to_string()));
         assert!(cols.contains(&"beta".to_string()));
@@ -1203,7 +1308,9 @@ mod tests {
         r.insert("n".to_string(), Value::Int64(5));
         table.insert(r).unwrap();
 
-        let rs = table.execute("SELECT * FROM empty_t WHERE n > 1000").unwrap();
+        let rs = table
+            .execute("SELECT * FROM empty_t WHERE n > 1000")
+            .unwrap();
         assert!(rs.is_empty());
         assert_eq!(rs.num_rows(), 0);
     }
@@ -1217,7 +1324,9 @@ mod tests {
             r.insert("i".to_string(), Value::Int64(i));
             table.insert(r).unwrap();
         }
-        let rs = table.execute("SELECT * FROM numrows_t WHERE i < 10").unwrap();
+        let rs = table
+            .execute("SELECT * FROM numrows_t WHERE i < 10")
+            .unwrap();
         assert_eq!(rs.num_rows(), 10);
     }
 
@@ -1244,11 +1353,16 @@ mod tests {
     fn test_create_table_with_schema() {
         use crate::storage::on_demand::ColumnType;
         let (_dir, db) = temp_db();
-        let table = db.create_table_with_schema("schema_t", &[
-            ("id".to_string(),   ColumnType::Int64),
-            ("name".to_string(), ColumnType::String),
-            ("val".to_string(),  ColumnType::Float64),
-        ]).unwrap();
+        let table = db
+            .create_table_with_schema(
+                "schema_t",
+                &[
+                    ("id".to_string(), ColumnType::Int64),
+                    ("name".to_string(), ColumnType::String),
+                    ("val".to_string(), ColumnType::Float64),
+                ],
+            )
+            .unwrap();
 
         let cols = table.columns().unwrap();
         // _id is always added; our 3 columns should also be present
@@ -1257,9 +1371,9 @@ mod tests {
 
         // Insert should work with predefined schema
         let mut r = Row::new();
-        r.insert("id".to_string(),   Value::Int64(1));
+        r.insert("id".to_string(), Value::Int64(1));
         r.insert("name".to_string(), Value::String("test".to_string()));
-        r.insert("val".to_string(),  Value::Float64(1.5));
+        r.insert("val".to_string(), Value::Float64(1.5));
         let id = table.insert(r).unwrap();
         assert_eq!(table.count().unwrap(), 1);
         let row = table.retrieve(id).unwrap().unwrap();
@@ -1303,11 +1417,13 @@ mod tests {
     fn test_rename_column() {
         let (_dir, db) = temp_db();
         let table = db.create_table("ren_t").unwrap();
-        let records: Vec<Row> = (0..5i64).map(|i| {
-            let mut r = Row::new();
-            r.insert("old_name".to_string(), Value::Int64(i * 10));
-            r
-        }).collect();
+        let records: Vec<Row> = (0..5i64)
+            .map(|i| {
+                let mut r = Row::new();
+                r.insert("old_name".to_string(), Value::Int64(i * 10));
+                r
+            })
+            .collect();
         table.insert_batch(&records).unwrap();
 
         // rename_column must not panic or return an error (same guarantee as Python API)
@@ -1323,11 +1439,13 @@ mod tests {
     fn test_rename_column_columns_reflect_new_name() {
         let (_dir, db) = temp_db();
         let table = db.create_table("renref_t").unwrap();
-        let records: Vec<Row> = (0..5i64).map(|i| {
-            let mut r = Row::new();
-            r.insert("alpha".to_string(), Value::Int64(i));
-            r
-        }).collect();
+        let records: Vec<Row> = (0..5i64)
+            .map(|i| {
+                let mut r = Row::new();
+                r.insert("alpha".to_string(), Value::Int64(i));
+                r
+            })
+            .collect();
         table.insert_batch(&records).unwrap();
         table.flush().unwrap();
 
@@ -1336,18 +1454,21 @@ mod tests {
         let cols = table.columns().unwrap();
         assert!(
             cols.iter().any(|c| c == "beta"),
-            "columns() should contain 'beta' after rename, got {:?}", cols
+            "columns() should contain 'beta' after rename, got {:?}",
+            cols
         );
         assert!(
             !cols.iter().any(|c| c == "alpha"),
-            "columns() should NOT contain 'alpha' after rename, got {:?}", cols
+            "columns() should NOT contain 'alpha' after rename, got {:?}",
+            cols
         );
 
         // Also verify schema() reflects it
         let schema = table.schema().unwrap();
         assert!(
             schema.iter().any(|(name, _)| name == "beta"),
-            "schema() should contain 'beta' after rename, got {:?}", schema
+            "schema() should contain 'beta' after rename, got {:?}",
+            schema
         );
     }
 
@@ -1470,8 +1591,8 @@ mod tests {
         let table = db.create_table("arrow_t").unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("name", ArrowDT::Utf8,  false),
-            Field::new("age",  ArrowDT::Int64, false),
+            Field::new("name", ArrowDT::Utf8, false),
+            Field::new("age", ArrowDT::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema,
@@ -1479,13 +1600,16 @@ mod tests {
                 Arc::new(StringArray::from(vec!["Alice", "Bob", "Carol"])),
                 Arc::new(Int64Array::from(vec![30i64, 25, 35])),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         let ids = table.insert_arrow(&batch).unwrap();
         assert_eq!(ids.len(), 3);
         assert_eq!(table.count().unwrap(), 3);
 
-        let rs = table.execute("SELECT name FROM arrow_t WHERE age > 26").unwrap();
+        let rs = table
+            .execute("SELECT name FROM arrow_t WHERE age > 26")
+            .unwrap();
         assert_eq!(rs.num_rows(), 2); // Alice(30), Carol(35)
     }
 
@@ -1498,13 +1622,14 @@ mod tests {
         let (_dir, db) = temp_db();
         let table = db.create_table("arrow_empty_t").unwrap();
 
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("x", ArrowDT::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(Vec::<i64>::new()))],
-        ).unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "x",
+            ArrowDT::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(Vec::<i64>::new()))])
+                .unwrap();
 
         let ids = table.insert_arrow(&batch).unwrap();
         assert!(ids.is_empty());
@@ -1520,9 +1645,9 @@ mod tests {
         use arrow::record_batch::RecordBatch;
 
         let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id",   ArrowDT::Int64,   false),
-            Field::new("name", ArrowDT::Utf8,    false),
-            Field::new("val",  ArrowDT::Float64, false),
+            Field::new("id", ArrowDT::Int64, false),
+            Field::new("name", ArrowDT::Utf8, false),
+            Field::new("val", ArrowDT::Float64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema,
@@ -1531,13 +1656,14 @@ mod tests {
                 Arc::new(StringArray::from(vec!["a", "b"])),
                 Arc::new(Float64Array::from(vec![1.1_f64, 2.2])),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         let rows = record_batch_to_rows(&batch).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].get("id"),   Some(&Value::Int64(1)));
+        assert_eq!(rows[0].get("id"), Some(&Value::Int64(1)));
         assert_eq!(rows[0].get("name"), Some(&Value::String("a".to_string())));
-        assert_eq!(rows[1].get("id"),   Some(&Value::Int64(2)));
+        assert_eq!(rows[1].get("id"), Some(&Value::Int64(2)));
 
         if let Some(Value::Float64(v)) = rows[0].get("val") {
             assert!((v - 1.1).abs() < 1e-9);
@@ -1553,9 +1679,9 @@ mod tests {
         use arrow::record_batch::RecordBatch;
 
         let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("i", ArrowDT::Int64,   false),
+            Field::new("i", ArrowDT::Int64, false),
             Field::new("f", ArrowDT::Float64, false),
-            Field::new("s", ArrowDT::Utf8,    false),
+            Field::new("s", ArrowDT::Utf8, false),
             Field::new("b", ArrowDT::Boolean, false),
         ]));
         let batch = RecordBatch::try_new(
@@ -1566,10 +1692,14 @@ mod tests {
                 Arc::new(StringArray::from(vec!["hi"])),
                 Arc::new(BooleanArray::from(vec![true])),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(arrow_value_at(batch.column(0), 0), Value::Int64(42));
-        assert_eq!(arrow_value_at(batch.column(2), 0), Value::String("hi".to_string()));
+        assert_eq!(
+            arrow_value_at(batch.column(2), 0),
+            Value::String("hi".to_string())
+        );
         assert_eq!(arrow_value_at(batch.column(3), 0), Value::Bool(true));
     }
 
@@ -1626,7 +1756,7 @@ mod tests {
         let table = db.create_table("null_t").unwrap();
         let mut r = Row::new();
         r.insert("name".to_string(), Value::String("Alice".to_string()));
-        r.insert("age".to_string(),  Value::Null);
+        r.insert("age".to_string(), Value::Null);
         let id = table.insert(r).unwrap();
 
         let row = table.retrieve(id).unwrap().unwrap();
@@ -1635,7 +1765,8 @@ mod tests {
         let age_val = row.get("age");
         assert!(
             age_val.is_none() || age_val == Some(&Value::Null),
-            "NULL column should be None or Value::Null, got {:?}", age_val
+            "NULL column should be None or Value::Null, got {:?}",
+            age_val
         );
     }
 
@@ -1661,16 +1792,18 @@ mod tests {
         // Insert some rows with and without NULLs
         let mut r1 = Row::new();
         r1.insert("name".to_string(), Value::String("A".to_string()));
-        r1.insert("val".to_string(),  Value::Int64(10));
+        r1.insert("val".to_string(), Value::Int64(10));
         table.insert(r1).unwrap();
 
         let mut r2 = Row::new();
         r2.insert("name".to_string(), Value::String("B".to_string()));
-        r2.insert("val".to_string(),  Value::Null);
+        r2.insert("val".to_string(), Value::Null);
         table.insert(r2).unwrap();
 
         // Filtering should work correctly
-        let rs = table.execute("SELECT name FROM nullfilt_t WHERE val = 10").unwrap();
+        let rs = table
+            .execute("SELECT name FROM nullfilt_t WHERE val = 10")
+            .unwrap();
         assert_eq!(rs.num_rows(), 1);
     }
 
@@ -1680,10 +1813,12 @@ mod tests {
         let table = db.create_table("nullcoal_t").unwrap();
         let mut r = Row::new();
         r.insert("name".to_string(), Value::String("A".to_string()));
-        r.insert("val".to_string(),  Value::Null);
+        r.insert("val".to_string(), Value::Null);
         table.insert(r).unwrap();
 
-        let rs = table.execute("SELECT COALESCE(val, 0) AS v FROM nullcoal_t").unwrap();
+        let rs = table
+            .execute("SELECT COALESCE(val, 0) AS v FROM nullcoal_t")
+            .unwrap();
         assert_eq!(rs.num_rows(), 1);
     }
 
@@ -1698,7 +1833,9 @@ mod tests {
             r.insert("n".to_string(), Value::Int64(i));
             table.insert(r).unwrap();
         }
-        let rs = table.execute("SELECT n FROM between_t WHERE n BETWEEN 5 AND 14").unwrap();
+        let rs = table
+            .execute("SELECT n FROM between_t WHERE n BETWEEN 5 AND 14")
+            .unwrap();
         assert_eq!(rs.num_rows(), 10);
     }
 
@@ -1711,7 +1848,9 @@ mod tests {
             r.insert("name".to_string(), Value::String(name.to_string()));
             table.insert(r).unwrap();
         }
-        let rs = table.execute("SELECT name FROM like_t WHERE name LIKE 'Ali%'").unwrap();
+        let rs = table
+            .execute("SELECT name FROM like_t WHERE name LIKE 'Ali%'")
+            .unwrap();
         assert_eq!(rs.num_rows(), 3); // Alice, Alice2, Alicia
     }
 
@@ -1724,7 +1863,9 @@ mod tests {
             r.insert("city".to_string(), Value::String(city.to_string()));
             table.insert(r).unwrap();
         }
-        let rs = table.execute("SELECT city FROM in_t WHERE city IN ('NY', 'LA', 'Miami')").unwrap();
+        let rs = table
+            .execute("SELECT city FROM in_t WHERE city IN ('NY', 'LA', 'Miami')")
+            .unwrap();
         assert_eq!(rs.num_rows(), 3);
     }
 
@@ -1737,7 +1878,9 @@ mod tests {
             r.insert("city".to_string(), Value::String(city.to_string()));
             table.insert(r).unwrap();
         }
-        let rs = table.execute("SELECT COUNT(DISTINCT city) FROM cd_t").unwrap();
+        let rs = table
+            .execute("SELECT COUNT(DISTINCT city) FROM cd_t")
+            .unwrap();
         let batch = rs.to_record_batch().unwrap();
         assert_eq!(batch.num_rows(), 1);
     }
@@ -1772,13 +1915,13 @@ mod tests {
         let table = db.create_table("mcord_t").unwrap();
         for (city, score) in &[("NY", 80i64), ("LA", 90), ("NY", 70), ("LA", 60)] {
             let mut r = Row::new();
-            r.insert("city".to_string(),  Value::String(city.to_string()));
+            r.insert("city".to_string(), Value::String(city.to_string()));
             r.insert("score".to_string(), Value::Int64(*score));
             table.insert(r).unwrap();
         }
-        let rs = table.execute(
-            "SELECT city, score FROM mcord_t ORDER BY city ASC, score DESC"
-        ).unwrap();
+        let rs = table
+            .execute("SELECT city, score FROM mcord_t ORDER BY city ASC, score DESC")
+            .unwrap();
         let rows = rs.to_rows().unwrap();
         assert_eq!(rows.len(), 4);
         // LA first (sorted asc), LA scores desc: 90, 60
@@ -1797,7 +1940,9 @@ mod tests {
             r.insert("i".to_string(), Value::Int64(i));
             table.insert(r).unwrap();
         }
-        let rs = table.execute("SELECT * FROM whlim_t WHERE i >= 10 LIMIT 5").unwrap();
+        let rs = table
+            .execute("SELECT * FROM whlim_t WHERE i >= 10 LIMIT 5")
+            .unwrap();
         assert_eq!(rs.num_rows(), 5);
     }
 
@@ -1810,9 +1955,9 @@ mod tests {
             r.insert("v".to_string(), Value::Int64(i));
             table.insert(r).unwrap();
         }
-        let rs = table.execute(
-            "SELECT COUNT(*), SUM(v), MIN(v), MAX(v), AVG(v) FROM magg_t"
-        ).unwrap();
+        let rs = table
+            .execute("SELECT COUNT(*), SUM(v), MIN(v), MAX(v), AVG(v) FROM magg_t")
+            .unwrap();
         let rows = rs.to_rows().unwrap();
         assert_eq!(rows.len(), 1);
     }
@@ -1843,7 +1988,7 @@ mod tests {
         let table = db.create_table("win_rn_t").unwrap();
         for (city, score) in &[("NY", 90i64), ("NY", 80), ("LA", 70), ("LA", 95)] {
             let mut r = Row::new();
-            r.insert("city".to_string(),  Value::String(city.to_string()));
+            r.insert("city".to_string(), Value::String(city.to_string()));
             r.insert("score".to_string(), Value::Int64(*score));
             table.insert(r).unwrap();
         }
@@ -1863,9 +2008,9 @@ mod tests {
             r.insert("score".to_string(), Value::Int64(*score));
             table.insert(r).unwrap();
         }
-        let rs = table.execute(
-            "SELECT score, RANK() OVER (ORDER BY score DESC) AS rnk FROM win_rank_t"
-        ).unwrap();
+        let rs = table
+            .execute("SELECT score, RANK() OVER (ORDER BY score DESC) AS rnk FROM win_rank_t")
+            .unwrap();
         let rows = rs.to_rows().unwrap();
         assert_eq!(rows.len(), 4);
     }
@@ -1877,12 +2022,12 @@ mod tests {
         for (cat, v) in &[("A", 10i64), ("A", 20), ("B", 30)] {
             let mut r = Row::new();
             r.insert("cat".to_string(), Value::String(cat.to_string()));
-            r.insert("v".to_string(),   Value::Int64(*v));
+            r.insert("v".to_string(), Value::Int64(*v));
             table.insert(r).unwrap();
         }
-        let rs = table.execute(
-            "SELECT cat, v, SUM(v) OVER (PARTITION BY cat) AS cat_total FROM win_sum_t"
-        ).unwrap();
+        let rs = table
+            .execute("SELECT cat, v, SUM(v) OVER (PARTITION BY cat) AS cat_total FROM win_sum_t")
+            .unwrap();
         let rows = rs.to_rows().unwrap();
         assert_eq!(rows.len(), 3);
     }
@@ -1899,37 +2044,47 @@ mod tests {
             table.insert(r).unwrap();
         }
 
-        let handles: Vec<_> = (0..4).map(|_| {
-            let t = table.clone();
-            std::thread::spawn(move || {
-                let rs = t.execute("SELECT COUNT(*) FROM conc_r_t").unwrap();
-                let batch = rs.to_record_batch().unwrap();
-                assert_eq!(batch.num_rows(), 1);
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let t = table.clone();
+                std::thread::spawn(move || {
+                    let rs = t.execute("SELECT COUNT(*) FROM conc_r_t").unwrap();
+                    let batch = rs.to_record_batch().unwrap();
+                    assert_eq!(batch.num_rows(), 1);
+                })
             })
-        }).collect();
-        for h in handles { h.join().unwrap(); }
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]
     fn test_concurrent_writes_separate_tables() {
         let (_dir, db) = temp_db();
         // Each thread writes to its own table — no cross-file race
-        let handles: Vec<_> = (0..4).map(|thread_id| {
-            let d = db.clone();
-            std::thread::spawn(move || {
-                let name = format!("conc_t_{}", thread_id);
-                let t = d.create_table(&name).unwrap();
-                let batch: Vec<Row> = (0..25i64).map(|i| {
-                    let mut r = Row::new();
-                    r.insert("tid".to_string(), Value::Int64(thread_id));
-                    r.insert("i".to_string(),   Value::Int64(i));
-                    r
-                }).collect();
-                t.insert_batch(&batch).unwrap();
-                assert_eq!(t.count().unwrap(), 25);
+        let handles: Vec<_> = (0..4)
+            .map(|thread_id| {
+                let d = db.clone();
+                std::thread::spawn(move || {
+                    let name = format!("conc_t_{}", thread_id);
+                    let t = d.create_table(&name).unwrap();
+                    let batch: Vec<Row> = (0..25i64)
+                        .map(|i| {
+                            let mut r = Row::new();
+                            r.insert("tid".to_string(), Value::Int64(thread_id));
+                            r.insert("i".to_string(), Value::Int64(i));
+                            r
+                        })
+                        .collect();
+                    t.insert_batch(&batch).unwrap();
+                    assert_eq!(t.count().unwrap(), 25);
+                })
             })
-        }).collect();
-        for h in handles { h.join().unwrap(); }
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
 
         // Verify all 4 tables exist
         let tables = db.list_tables();
@@ -1940,24 +2095,30 @@ mod tests {
     fn test_concurrent_reads_multiple_threads() {
         let (_dir, db) = temp_db();
         let table = db.create_table("conc_rw_t").unwrap();
-        let records: Vec<Row> = (0..100i64).map(|i| {
-            let mut r = Row::new();
-            r.insert("n".to_string(), Value::Int64(i));
-            r
-        }).collect();
+        let records: Vec<Row> = (0..100i64)
+            .map(|i| {
+                let mut r = Row::new();
+                r.insert("n".to_string(), Value::Int64(i));
+                r
+            })
+            .collect();
         table.insert_batch(&records).unwrap();
         table.flush().unwrap();
 
         // Multiple threads reading simultaneously
-        let handles: Vec<_> = (0..8).map(|_| {
-            let t = table.clone();
-            std::thread::spawn(move || {
-                assert_eq!(t.count().unwrap(), 100);
-                let rs = t.execute("SELECT n FROM conc_rw_t WHERE n >= 50").unwrap();
-                assert_eq!(rs.num_rows(), 50);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let t = table.clone();
+                std::thread::spawn(move || {
+                    assert_eq!(t.count().unwrap(), 100);
+                    let rs = t.execute("SELECT n FROM conc_rw_t WHERE n >= 50").unwrap();
+                    assert_eq!(rs.num_rows(), 50);
+                })
             })
-        }).collect();
-        for h in handles { h.join().unwrap(); }
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]
@@ -2020,10 +2181,10 @@ mod tests {
         let (_dir, db) = temp_db();
         let table = db.create_table("spec_t").unwrap();
         let strings = [
-            "hello\nworld",           // newline
-            "tab\there",              // tab
-            "quote'inside",           // single quote
-            "back\\slash",            // backslash
+            "hello\nworld", // newline
+            "tab\there",    // tab
+            "quote'inside", // single quote
+            "back\\slash",  // backslash
         ];
         for s in &strings {
             let mut r = Row::new();
@@ -2055,10 +2216,15 @@ mod tests {
     fn test_empty_table_count_and_schema() {
         let (_dir, db) = temp_db();
         use crate::storage::on_demand::ColumnType;
-        let table = db.create_table_with_schema("empty_sch_t", &[
-            ("a".to_string(), ColumnType::Int64),
-            ("b".to_string(), ColumnType::String),
-        ]).unwrap();
+        let table = db
+            .create_table_with_schema(
+                "empty_sch_t",
+                &[
+                    ("a".to_string(), ColumnType::Int64),
+                    ("b".to_string(), ColumnType::String),
+                ],
+            )
+            .unwrap();
 
         assert_eq!(table.count().unwrap(), 0);
         let cols = table.columns().unwrap();
@@ -2070,9 +2236,9 @@ mod tests {
     fn test_empty_table_select() {
         let (_dir, db) = temp_db();
         use crate::storage::on_demand::ColumnType;
-        let table = db.create_table_with_schema("empty_sel_t", &[
-            ("x".to_string(), ColumnType::Int64),
-        ]).unwrap();
+        let table = db
+            .create_table_with_schema("empty_sel_t", &[("x".to_string(), ColumnType::Int64)])
+            .unwrap();
 
         let rs = table.execute("SELECT * FROM empty_sel_t").unwrap();
         assert!(rs.is_empty());
@@ -2246,7 +2412,9 @@ mod tests {
         r.insert("n".to_string(), Value::Int64(42));
         table.insert(r).unwrap();
 
-        let rs = table.execute("SELECT CAST(n AS DOUBLE) AS f FROM cast_t").unwrap();
+        let rs = table
+            .execute("SELECT CAST(n AS DOUBLE) AS f FROM cast_t")
+            .unwrap();
         let rows = rs.to_rows().unwrap();
         assert_eq!(rows.len(), 1);
     }
@@ -2258,7 +2426,7 @@ mod tests {
         for (name, age) in &[("A", 15i64), ("B", 25), ("C", 65)] {
             let mut r = Row::new();
             r.insert("name".to_string(), Value::String(name.to_string()));
-            r.insert("age".to_string(),  Value::Int64(*age));
+            r.insert("age".to_string(), Value::Int64(*age));
             table.insert(r).unwrap();
         }
         let rs = table.execute(
@@ -2266,9 +2434,18 @@ mod tests {
         ).unwrap();
         let rows = rs.to_rows().unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].get("category"), Some(&Value::String("minor".to_string())));
-        assert_eq!(rows[1].get("category"), Some(&Value::String("adult".to_string())));
-        assert_eq!(rows[2].get("category"), Some(&Value::String("senior".to_string())));
+        assert_eq!(
+            rows[0].get("category"),
+            Some(&Value::String("minor".to_string()))
+        );
+        assert_eq!(
+            rows[1].get("category"),
+            Some(&Value::String("adult".to_string()))
+        );
+        assert_eq!(
+            rows[2].get("category"),
+            Some(&Value::String("senior".to_string()))
+        );
     }
 
     #[test]
@@ -2293,13 +2470,18 @@ mod tests {
         r.insert("s".to_string(), Value::String("Hello World".to_string()));
         table.insert(r).unwrap();
 
-        let rs = table.execute("SELECT LENGTH(s) AS len FROM strfn_t").unwrap();
+        let rs = table
+            .execute("SELECT LENGTH(s) AS len FROM strfn_t")
+            .unwrap();
         let rows = rs.to_rows().unwrap();
         assert_eq!(rows.len(), 1);
 
         let rs = table.execute("SELECT LOWER(s) AS lo FROM strfn_t").unwrap();
         let rows = rs.to_rows().unwrap();
-        assert_eq!(rows[0].get("lo"), Some(&Value::String("hello world".to_string())));
+        assert_eq!(
+            rows[0].get("lo"),
+            Some(&Value::String("hello world".to_string()))
+        );
     }
 
     #[test]
@@ -2311,10 +2493,12 @@ mod tests {
         r.insert("b".to_string(), Value::Int64(3));
         table.insert(r).unwrap();
 
-        let rs = table.execute("SELECT a + b AS sum, a - b AS diff, a * b AS prod FROM arith_t").unwrap();
+        let rs = table
+            .execute("SELECT a + b AS sum, a - b AS diff, a * b AS prod FROM arith_t")
+            .unwrap();
         let rows = rs.to_rows().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get("sum"),  Some(&Value::Int64(13)));
+        assert_eq!(rows[0].get("sum"), Some(&Value::Int64(13)));
         assert_eq!(rows[0].get("diff"), Some(&Value::Int64(7)));
         assert_eq!(rows[0].get("prod"), Some(&Value::Int64(30)));
     }
@@ -2328,9 +2512,9 @@ mod tests {
             r.insert("n".to_string(), Value::Int64(*i));
             table.insert(r).unwrap();
         }
-        let rs = table.execute(
-            "SELECT n AS val FROM alias_t ORDER BY val LIMIT 3"
-        ).unwrap();
+        let rs = table
+            .execute("SELECT n AS val FROM alias_t ORDER BY val LIMIT 3")
+            .unwrap();
         let rows = rs.to_rows().unwrap();
         assert_eq!(rows.len(), 3);
     }
@@ -2355,13 +2539,13 @@ mod tests {
         for (name, val) in &[("A", 10i64), ("B", 20), ("C", 30), ("D", 40)] {
             let mut r = Row::new();
             r.insert("name".to_string(), Value::String(name.to_string()));
-            r.insert("val".to_string(),  Value::Int64(*val));
+            r.insert("val".to_string(), Value::Int64(*val));
             table.insert(r).unwrap();
         }
         // Get rows where val > avg(val) (avg = 25 → C(30), D(40))
-        let rs = table.execute(
-            "SELECT name FROM sub_t WHERE val > (SELECT AVG(val) FROM sub_t)"
-        ).unwrap();
+        let rs = table
+            .execute("SELECT name FROM sub_t WHERE val > (SELECT AVG(val) FROM sub_t)")
+            .unwrap();
         assert_eq!(rs.num_rows(), 2);
     }
 
@@ -2391,10 +2575,10 @@ mod tests {
         let id = table.insert(row1("Alice", 30, 90.0, "NY")).unwrap();
 
         let mut updated = Row::new();
-        updated.insert("name".to_string(),  Value::String("Alice-v2".to_string()));
-        updated.insert("age".to_string(),   Value::Int64(31));
+        updated.insert("name".to_string(), Value::String("Alice-v2".to_string()));
+        updated.insert("age".to_string(), Value::Int64(31));
         updated.insert("score".to_string(), Value::Float64(95.0));
-        updated.insert("city".to_string(),  Value::String("SF".to_string()));
+        updated.insert("city".to_string(), Value::String("SF".to_string()));
         table.replace(id, updated).unwrap();
 
         // After replace, count should still be 1 (same id)
@@ -2406,20 +2590,22 @@ mod tests {
     fn test_batch_insert_then_filter() {
         let (_dir, db) = temp_db();
         let table = db.create_table("bif_t").unwrap();
-        let records: Vec<Row> = (0..1000i64).map(|i| {
-            let mut r = Row::new();
-            r.insert("n".to_string(),    Value::Int64(i));
-            r.insert("even".to_string(), Value::Bool(i % 2 == 0));
-            r.insert("cat".to_string(),  Value::String(format!("cat_{}", i % 5)));
-            r
-        }).collect();
+        let records: Vec<Row> = (0..1000i64)
+            .map(|i| {
+                let mut r = Row::new();
+                r.insert("n".to_string(), Value::Int64(i));
+                r.insert("even".to_string(), Value::Bool(i % 2 == 0));
+                r.insert("cat".to_string(), Value::String(format!("cat_{}", i % 5)));
+                r
+            })
+            .collect();
         table.insert_batch(&records).unwrap();
         assert_eq!(table.count().unwrap(), 1000);
 
         // Complex filter
-        let rs = table.execute(
-            "SELECT COUNT(*) FROM bif_t WHERE even = true AND n BETWEEN 100 AND 200"
-        ).unwrap();
+        let rs = table
+            .execute("SELECT COUNT(*) FROM bif_t WHERE even = true AND n BETWEEN 100 AND 200")
+            .unwrap();
         let batch = rs.to_record_batch().unwrap();
         assert_eq!(batch.num_rows(), 1);
     }

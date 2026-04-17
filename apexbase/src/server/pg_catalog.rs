@@ -68,23 +68,39 @@ pub fn try_handle_catalog_query(sql: &str, base_dir: &Path) -> Option<RecordBatc
     }
 
     if sql_lower.contains("pg_catalog.pg_am") || sql_lower.contains("from pg_am") {
-        return Some(make_empty_batch_with_schema(&[("amname", ArrowDataType::Utf8), ("oid", ArrowDataType::Int32)]));
+        return Some(make_empty_batch_with_schema(&[
+            ("amname", ArrowDataType::Utf8),
+            ("oid", ArrowDataType::Int32),
+        ]));
     }
 
     if sql_lower.contains("pg_catalog.pg_index") || sql_lower.contains("from pg_index") {
-        return Some(make_empty_batch_with_schema(&[("indexrelid", ArrowDataType::Int32), ("indrelid", ArrowDataType::Int32)]));
+        return Some(make_empty_batch_with_schema(&[
+            ("indexrelid", ArrowDataType::Int32),
+            ("indrelid", ArrowDataType::Int32),
+        ]));
     }
 
     if sql_lower.contains("pg_catalog.pg_constraint") || sql_lower.contains("from pg_constraint") {
-        return Some(make_empty_batch_with_schema(&[("conname", ArrowDataType::Utf8), ("contype", ArrowDataType::Utf8)]));
+        return Some(make_empty_batch_with_schema(&[
+            ("conname", ArrowDataType::Utf8),
+            ("contype", ArrowDataType::Utf8),
+        ]));
     }
 
     if sql_lower.contains("pg_catalog.pg_proc") || sql_lower.contains("from pg_proc") {
-        return Some(make_empty_batch_with_schema(&[("proname", ArrowDataType::Utf8), ("oid", ArrowDataType::Int32)]));
+        return Some(make_empty_batch_with_schema(&[
+            ("proname", ArrowDataType::Utf8),
+            ("oid", ArrowDataType::Int32),
+        ]));
     }
 
-    if sql_lower.contains("pg_catalog.pg_description") || sql_lower.contains("from pg_description") {
-        return Some(make_empty_batch_with_schema(&[("objoid", ArrowDataType::Int32), ("description", ArrowDataType::Utf8)]));
+    if sql_lower.contains("pg_catalog.pg_description") || sql_lower.contains("from pg_description")
+    {
+        return Some(make_empty_batch_with_schema(&[
+            ("objoid", ArrowDataType::Int32),
+            ("description", ArrowDataType::Utf8),
+        ]));
     }
 
     // Transaction control: treat as no-ops (auto-commit semantics)
@@ -108,13 +124,19 @@ pub fn try_handle_catalog_query(sql: &str, base_dir: &Path) -> Option<RecordBatc
     // SHOW statements
     if sql_lower.starts_with("show ") {
         if sql_lower.contains("transaction isolation level") {
-            return Some(make_single_string_batch("transaction_isolation", "read committed"));
+            return Some(make_single_string_batch(
+                "transaction_isolation",
+                "read committed",
+            ));
         }
         if sql_lower.contains("server_version") {
             return Some(make_single_string_batch("server_version", "15.0"));
         }
         if sql_lower.contains("standard_conforming_strings") {
-            return Some(make_single_string_batch("standard_conforming_strings", "on"));
+            return Some(make_single_string_batch(
+                "standard_conforming_strings",
+                "on",
+            ));
         }
         if sql_lower.contains("search_path") {
             return Some(make_single_string_batch("search_path", "public"));
@@ -130,27 +152,31 @@ pub fn try_handle_catalog_query(sql: &str, base_dir: &Path) -> Option<RecordBatc
 // ============================================================================
 
 fn make_version_batch() -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("version", ArrowDataType::Utf8, false),
-    ]));
-    let array: ArrayRef = Arc::new(StringArray::from(vec![
-        "PostgreSQL 15.0 (ApexBase)",
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "version",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let array: ArrayRef = Arc::new(StringArray::from(vec!["PostgreSQL 15.0 (ApexBase)"]));
     RecordBatch::try_new(schema, vec![array]).unwrap()
 }
 
 fn make_current_database_batch() -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("current_database", ArrowDataType::Utf8, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "current_database",
+        ArrowDataType::Utf8,
+        false,
+    )]));
     let array: ArrayRef = Arc::new(StringArray::from(vec!["apexbase"]));
     RecordBatch::try_new(schema, vec![array]).unwrap()
 }
 
 fn make_current_schema_batch() -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("current_schema", ArrowDataType::Utf8, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "current_schema",
+        ArrowDataType::Utf8,
+        false,
+    )]));
     let array: ArrayRef = Arc::new(StringArray::from(vec!["public"]));
     RecordBatch::try_new(schema, vec![array]).unwrap()
 }
@@ -194,11 +220,7 @@ fn make_pg_settings_batch() -> RecordBatch {
         "search_path",
     ]));
     let settings: ArrayRef = Arc::new(StringArray::from(vec![
-        "15.0",
-        "UTF8",
-        "UTF8",
-        "on",
-        "public",
+        "15.0", "UTF8", "UTF8", "on", "public",
     ]));
     RecordBatch::try_new(schema, vec![names, settings]).unwrap()
 }
@@ -210,9 +232,19 @@ fn make_pg_type_batch() -> RecordBatch {
         Field::new("typnamespace", ArrowDataType::Int32, false),
         Field::new("typlen", ArrowDataType::Int32, false),
     ]));
-    let oids: ArrayRef = Arc::new(Int32Array::from(vec![20, 23, 25, 701, 16, 17, 1043, 1082, 1114]));
+    let oids: ArrayRef = Arc::new(Int32Array::from(vec![
+        20, 23, 25, 701, 16, 17, 1043, 1082, 1114,
+    ]));
     let names: ArrayRef = Arc::new(StringArray::from(vec![
-        "int8", "int4", "text", "float8", "bool", "bytea", "varchar", "date", "timestamp",
+        "int8",
+        "int4",
+        "text",
+        "float8",
+        "bool",
+        "bytea",
+        "varchar",
+        "date",
+        "timestamp",
     ]));
     let ns: ArrayRef = Arc::new(Int32Array::from(vec![11; 9]));
     let lens: ArrayRef = Arc::new(Int32Array::from(vec![8, 4, -1, 8, 1, -1, -1, 4, 8]));
@@ -237,8 +269,14 @@ fn discover_tables(base_dir: &Path) -> Vec<String> {
                     // Check if it contains .apex files
                     if let Ok(sub_entries) = std::fs::read_dir(&path) {
                         for sub_entry in sub_entries.flatten() {
-                            if sub_entry.path().extension().map_or(false, |ext| ext == "apex") {
-                                if let Some(tbl_name) = sub_entry.path().file_stem().and_then(|s| s.to_str()) {
+                            if sub_entry
+                                .path()
+                                .extension()
+                                .map_or(false, |ext| ext == "apex")
+                            {
+                                if let Some(tbl_name) =
+                                    sub_entry.path().file_stem().and_then(|s| s.to_str())
+                                {
                                     tables.push(tbl_name.to_string());
                                 }
                             }
@@ -268,16 +306,15 @@ fn get_table_columns(base_dir: &Path, table_name: &str) -> Vec<(String, ArrowDat
 
     // Execute a LIMIT 0 query to get schema
     match ApexExecutor::execute("SELECT * FROM data LIMIT 0", &table_path) {
-        Ok(result) => {
-            match result.to_record_batch() {
-                Ok(batch) => {
-                    batch.schema().fields().iter().map(|f| {
-                        (f.name().clone(), f.data_type().clone())
-                    }).collect()
-                }
-                Err(_) => vec![("_id".to_string(), ArrowDataType::Int64)],
-            }
-        }
+        Ok(result) => match result.to_record_batch() {
+            Ok(batch) => batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), f.data_type().clone()))
+                .collect(),
+            Err(_) => vec![("_id".to_string(), ArrowDataType::Int64)],
+        },
         Err(_) => vec![("_id".to_string(), ArrowDataType::Int64)],
     }
 }
@@ -320,33 +357,33 @@ fn make_pg_class_batch(base_dir: &Path) -> RecordBatch {
 
     let oid_vals: Vec<i32> = (0..n as i32).map(|i| 16384 + i).collect();
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(Int32Array::from(oid_vals.clone())),                          // oid
-        Arc::new(StringArray::from(tables)),                                   // relname
-        Arc::new(Int32Array::from(vec![2200; n])),                             // relnamespace (public)
-        Arc::new(Int32Array::from(vec![0; n])),                                // reltype
-        Arc::new(Int32Array::from(vec![0; n])),                                // reloftype
-        Arc::new(Int32Array::from(vec![10; n])),                               // relowner
-        Arc::new(Int32Array::from(vec![2; n])),                                // relam (heap)
-        Arc::new(Int32Array::from(oid_vals)),                                  // relfilenode = oid
-        Arc::new(Int32Array::from(vec![0; n])),                                // reltablespace
-        Arc::new(Int32Array::from(vec![0; n])),                                // relpages
-        Arc::new(arrow::array::Float64Array::from(vec![-1.0; n])),             // reltuples (-1 = unknown)
-        Arc::new(Int32Array::from(vec![0; n])),                                // relallvisible
-        Arc::new(Int32Array::from(vec![0; n])),                                // reltoastrelid
-        Arc::new(BooleanArray::from(vec![false; n])),                          // relhasindex
-        Arc::new(BooleanArray::from(vec![false; n])),                          // relisshared
-        Arc::new(StringArray::from(vec!["p"; n])),                             // relpersistence (permanent)
-        Arc::new(StringArray::from(vec!["r"; n])),                             // relkind (regular table)
-        Arc::new(Int32Array::from(vec![0; n])),                                // relnatts (filled below would need per-table)
-        Arc::new(Int32Array::from(vec![0; n])),                                // relchecks
-        Arc::new(BooleanArray::from(vec![false; n])),                          // relhasrules
-        Arc::new(BooleanArray::from(vec![false; n])),                          // relhastriggers
-        Arc::new(BooleanArray::from(vec![false; n])),                          // relhassubclass
-        Arc::new(BooleanArray::from(vec![false; n])),                          // relrowsecurity
-        Arc::new(BooleanArray::from(vec![false; n])),                          // relforcerowsecurity
-        Arc::new(BooleanArray::from(vec![true; n])),                           // relispopulated
-        Arc::new(StringArray::from(vec!["d"; n])),                             // relreplident (default)
-        Arc::new(BooleanArray::from(vec![false; n])),                          // relispartition
+        Arc::new(Int32Array::from(oid_vals.clone())), // oid
+        Arc::new(StringArray::from(tables)),          // relname
+        Arc::new(Int32Array::from(vec![2200; n])),    // relnamespace (public)
+        Arc::new(Int32Array::from(vec![0; n])),       // reltype
+        Arc::new(Int32Array::from(vec![0; n])),       // reloftype
+        Arc::new(Int32Array::from(vec![10; n])),      // relowner
+        Arc::new(Int32Array::from(vec![2; n])),       // relam (heap)
+        Arc::new(Int32Array::from(oid_vals)),         // relfilenode = oid
+        Arc::new(Int32Array::from(vec![0; n])),       // reltablespace
+        Arc::new(Int32Array::from(vec![0; n])),       // relpages
+        Arc::new(arrow::array::Float64Array::from(vec![-1.0; n])), // reltuples (-1 = unknown)
+        Arc::new(Int32Array::from(vec![0; n])),       // relallvisible
+        Arc::new(Int32Array::from(vec![0; n])),       // reltoastrelid
+        Arc::new(BooleanArray::from(vec![false; n])), // relhasindex
+        Arc::new(BooleanArray::from(vec![false; n])), // relisshared
+        Arc::new(StringArray::from(vec!["p"; n])),    // relpersistence (permanent)
+        Arc::new(StringArray::from(vec!["r"; n])),    // relkind (regular table)
+        Arc::new(Int32Array::from(vec![0; n])), // relnatts (filled below would need per-table)
+        Arc::new(Int32Array::from(vec![0; n])), // relchecks
+        Arc::new(BooleanArray::from(vec![false; n])), // relhasrules
+        Arc::new(BooleanArray::from(vec![false; n])), // relhastriggers
+        Arc::new(BooleanArray::from(vec![false; n])), // relhassubclass
+        Arc::new(BooleanArray::from(vec![false; n])), // relrowsecurity
+        Arc::new(BooleanArray::from(vec![false; n])), // relforcerowsecurity
+        Arc::new(BooleanArray::from(vec![true; n])), // relispopulated
+        Arc::new(StringArray::from(vec!["d"; n])), // relreplident (default)
+        Arc::new(BooleanArray::from(vec![false; n])), // relispartition
     ];
 
     RecordBatch::try_new(schema, columns).unwrap()
@@ -394,7 +431,9 @@ fn make_pg_stat_tables_batch(base_dir: &Path) -> RecordBatch {
     ]));
 
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(Int32Array::from((0..n as i32).map(|i| 16384 + i).collect::<Vec<_>>())),
+        Arc::new(Int32Array::from(
+            (0..n as i32).map(|i| 16384 + i).collect::<Vec<_>>(),
+        )),
         Arc::new(StringArray::from(vec!["public"; n])),
         Arc::new(StringArray::from(tables)),
         Arc::new(Int64Array::from(vec![0i64; n])),
@@ -502,7 +541,13 @@ fn make_information_schema_columns(base_dir: &Path) -> RecordBatch {
     let types: ArrayRef = Arc::new(StringArray::from(col_types));
     let nullables: ArrayRef = Arc::new(StringArray::from(col_nullables));
 
-    RecordBatch::try_new(schema, vec![catalogs, schemas, tables_arr, names, positions, types, nullables]).unwrap()
+    RecordBatch::try_new(
+        schema,
+        vec![
+            catalogs, schemas, tables_arr, names, positions, types, nullables,
+        ],
+    )
+    .unwrap()
 }
 
 // ============================================================================
@@ -510,22 +555,29 @@ fn make_information_schema_columns(base_dir: &Path) -> RecordBatch {
 // ============================================================================
 
 fn make_empty_ok_batch() -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("result", ArrowDataType::Utf8, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "result",
+        ArrowDataType::Utf8,
+        false,
+    )]));
     RecordBatch::new_empty(schema)
 }
 
 fn make_single_string_batch(col_name: &str, value: &str) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(col_name, ArrowDataType::Utf8, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        col_name,
+        ArrowDataType::Utf8,
+        false,
+    )]));
     let array: ArrayRef = Arc::new(StringArray::from(vec![value]));
     RecordBatch::try_new(schema, vec![array]).unwrap()
 }
 
 fn make_empty_batch_with_schema(cols: &[(&str, ArrowDataType)]) -> RecordBatch {
-    let fields: Vec<Field> = cols.iter().map(|(name, dt)| Field::new(*name, dt.clone(), true)).collect();
+    let fields: Vec<Field> = cols
+        .iter()
+        .map(|(name, dt)| Field::new(*name, dt.clone(), true))
+        .collect();
     let schema = Arc::new(Schema::new(fields));
     RecordBatch::new_empty(schema)
 }
@@ -533,7 +585,10 @@ fn make_empty_batch_with_schema(cols: &[(&str, ArrowDataType)]) -> RecordBatch {
 fn arrow_type_to_pg_oid(dt: &ArrowDataType) -> i32 {
     match dt {
         ArrowDataType::Boolean => 16,
-        ArrowDataType::Int8 | ArrowDataType::UInt8 | ArrowDataType::Int16 | ArrowDataType::UInt16 => 21,
+        ArrowDataType::Int8
+        | ArrowDataType::UInt8
+        | ArrowDataType::Int16
+        | ArrowDataType::UInt16 => 21,
         ArrowDataType::Int32 | ArrowDataType::UInt32 => 23,
         ArrowDataType::Int64 | ArrowDataType::UInt64 => 20,
         ArrowDataType::Float32 => 700,
@@ -550,7 +605,10 @@ fn arrow_type_to_pg_oid(dt: &ArrowDataType) -> i32 {
 fn arrow_type_to_pg_name(dt: &ArrowDataType) -> String {
     match dt {
         ArrowDataType::Boolean => "boolean".to_string(),
-        ArrowDataType::Int8 | ArrowDataType::UInt8 | ArrowDataType::Int16 | ArrowDataType::UInt16 => "smallint".to_string(),
+        ArrowDataType::Int8
+        | ArrowDataType::UInt8
+        | ArrowDataType::Int16
+        | ArrowDataType::UInt16 => "smallint".to_string(),
         ArrowDataType::Int32 | ArrowDataType::UInt32 => "integer".to_string(),
         ArrowDataType::Int64 | ArrowDataType::UInt64 => "bigint".to_string(),
         ArrowDataType::Float32 => "real".to_string(),

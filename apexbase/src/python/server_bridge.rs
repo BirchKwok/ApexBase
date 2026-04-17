@@ -3,8 +3,8 @@
 //! Exposes `start_pg_server` as a Python function so `pip install apexbase`
 //! users can launch the server without a separate Rust binary.
 
-use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
 use std::path::PathBuf;
 
 use crate::server::{self, ServerConfig};
@@ -29,11 +29,13 @@ pub fn start_pg_server(py: Python<'_>, data_dir: String, host: String, port: u16
     // Release the GIL so Python threads remain responsive, then block on the
     // tokio runtime running the server.
     py.allow_threads(|| {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create tokio runtime: {}", e)))?;
+        let rt = tokio::runtime::Runtime::new().map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to create tokio runtime: {}", e))
+        })?;
 
         rt.block_on(async {
-            server::start_server(config).await
+            server::start_server(config)
+                .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Server error: {}", e)))
         })
     })

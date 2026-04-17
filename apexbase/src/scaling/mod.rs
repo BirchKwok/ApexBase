@@ -29,12 +29,12 @@
 //! └──────────────────────────────────────────────────────────┘
 //! ```
 
-pub mod partition;
-pub mod shard;
-pub mod router;
 pub mod node;
+pub mod partition;
+pub mod router;
+pub mod shard;
 
-pub use partition::{PartitionStrategy, PartitionKey, HashPartitioner, RangePartitioner};
-pub use shard::{ShardManager, ShardId, ShardMeta, ShardStatus};
-pub use router::{ShardRouter, RoutingDecision};
-pub use node::{NodeManager, NodeId, NodeInfo, NodeStatus};
+pub use node::{NodeId, NodeInfo, NodeManager, NodeStatus};
+pub use partition::{HashPartitioner, PartitionKey, PartitionStrategy, RangePartitioner};
+pub use router::{RoutingDecision, ShardRouter};
+pub use shard::{ShardId, ShardManager, ShardMeta, ShardStatus};

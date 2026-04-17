@@ -17,7 +17,7 @@
 use std::io;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BinaryArray, Float64Array, Float32Array, StringArray};
+use arrow::array::{Array, ArrayRef, BinaryArray, Float32Array, Float64Array, StringArray};
 use rayon::prelude::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ fn rsqrt_positive_f32(x: f32) -> f32 {
     unsafe {
         use std::arch::aarch64::*;
         let e = vrsqrtes_f32(x);
-        let step = vrsqrtss_f32(x * e, e);  // (3 - x·e²) / 2
+        let step = vrsqrtss_f32(x * e, e); // (3 - x·e²) / 2
         e * step
     }
 }
@@ -109,14 +109,34 @@ pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     let c = n / 16;
     for i in 0..c {
         let o = i * 16;
-        let (d0,  d1,  d2,  d3)  = (a[o]    - b[o],    a[o+1]  - b[o+1],  a[o+2]  - b[o+2],  a[o+3]  - b[o+3]);
-        let (d4,  d5,  d6,  d7)  = (a[o+4]  - b[o+4],  a[o+5]  - b[o+5],  a[o+6]  - b[o+6],  a[o+7]  - b[o+7]);
-        let (d8,  d9,  d10, d11) = (a[o+8]  - b[o+8],  a[o+9]  - b[o+9],  a[o+10] - b[o+10], a[o+11] - b[o+11]);
-        let (d12, d13, d14, d15) = (a[o+12] - b[o+12], a[o+13] - b[o+13], a[o+14] - b[o+14], a[o+15] - b[o+15]);
-        s0 += d0*d0   + d1*d1   + d2*d2   + d3*d3;
-        s1 += d4*d4   + d5*d5   + d6*d6   + d7*d7;
-        s2 += d8*d8   + d9*d9   + d10*d10 + d11*d11;
-        s3 += d12*d12 + d13*d13 + d14*d14 + d15*d15;
+        let (d0, d1, d2, d3) = (
+            a[o] - b[o],
+            a[o + 1] - b[o + 1],
+            a[o + 2] - b[o + 2],
+            a[o + 3] - b[o + 3],
+        );
+        let (d4, d5, d6, d7) = (
+            a[o + 4] - b[o + 4],
+            a[o + 5] - b[o + 5],
+            a[o + 6] - b[o + 6],
+            a[o + 7] - b[o + 7],
+        );
+        let (d8, d9, d10, d11) = (
+            a[o + 8] - b[o + 8],
+            a[o + 9] - b[o + 9],
+            a[o + 10] - b[o + 10],
+            a[o + 11] - b[o + 11],
+        );
+        let (d12, d13, d14, d15) = (
+            a[o + 12] - b[o + 12],
+            a[o + 13] - b[o + 13],
+            a[o + 14] - b[o + 14],
+            a[o + 15] - b[o + 15],
+        );
+        s0 += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+        s1 += d4 * d4 + d5 * d5 + d6 * d6 + d7 * d7;
+        s2 += d8 * d8 + d9 * d9 + d10 * d10 + d11 * d11;
+        s3 += d12 * d12 + d13 * d13 + d14 * d14 + d15 * d15;
     }
     let mut s = s0 + s1 + s2 + s3;
     for i in (c * 16)..n {
@@ -152,10 +172,22 @@ pub fn l1_distance(a: &[f32], b: &[f32]) -> f32 {
     let c = n / 16;
     for i in 0..c {
         let o = i * 16;
-        s0 += (a[o]    - b[o]).abs()    + (a[o+1]  - b[o+1]).abs()  + (a[o+2]  - b[o+2]).abs()  + (a[o+3]  - b[o+3]).abs();
-        s1 += (a[o+4]  - b[o+4]).abs()  + (a[o+5]  - b[o+5]).abs()  + (a[o+6]  - b[o+6]).abs()  + (a[o+7]  - b[o+7]).abs();
-        s2 += (a[o+8]  - b[o+8]).abs()  + (a[o+9]  - b[o+9]).abs()  + (a[o+10] - b[o+10]).abs() + (a[o+11] - b[o+11]).abs();
-        s3 += (a[o+12] - b[o+12]).abs() + (a[o+13] - b[o+13]).abs() + (a[o+14] - b[o+14]).abs() + (a[o+15] - b[o+15]).abs();
+        s0 += (a[o] - b[o]).abs()
+            + (a[o + 1] - b[o + 1]).abs()
+            + (a[o + 2] - b[o + 2]).abs()
+            + (a[o + 3] - b[o + 3]).abs();
+        s1 += (a[o + 4] - b[o + 4]).abs()
+            + (a[o + 5] - b[o + 5]).abs()
+            + (a[o + 6] - b[o + 6]).abs()
+            + (a[o + 7] - b[o + 7]).abs();
+        s2 += (a[o + 8] - b[o + 8]).abs()
+            + (a[o + 9] - b[o + 9]).abs()
+            + (a[o + 10] - b[o + 10]).abs()
+            + (a[o + 11] - b[o + 11]).abs();
+        s3 += (a[o + 12] - b[o + 12]).abs()
+            + (a[o + 13] - b[o + 13]).abs()
+            + (a[o + 14] - b[o + 14]).abs()
+            + (a[o + 15] - b[o + 15]).abs();
     }
     let mut s = s0 + s1 + s2 + s3;
     for i in (c * 16)..n {
@@ -183,10 +215,26 @@ pub fn linf_distance(a: &[f32], b: &[f32]) -> f32 {
     let c = n / 16;
     for i in 0..c {
         let o = i * 16;
-        m0 = m0.max((a[o]    - b[o]).abs()).max((a[o+1]  - b[o+1]).abs()).max((a[o+2]  - b[o+2]).abs()).max((a[o+3]  - b[o+3]).abs());
-        m1 = m1.max((a[o+4]  - b[o+4]).abs()).max((a[o+5]  - b[o+5]).abs()).max((a[o+6]  - b[o+6]).abs()).max((a[o+7]  - b[o+7]).abs());
-        m2 = m2.max((a[o+8]  - b[o+8]).abs()).max((a[o+9]  - b[o+9]).abs()).max((a[o+10] - b[o+10]).abs()).max((a[o+11] - b[o+11]).abs());
-        m3 = m3.max((a[o+12] - b[o+12]).abs()).max((a[o+13] - b[o+13]).abs()).max((a[o+14] - b[o+14]).abs()).max((a[o+15] - b[o+15]).abs());
+        m0 = m0
+            .max((a[o] - b[o]).abs())
+            .max((a[o + 1] - b[o + 1]).abs())
+            .max((a[o + 2] - b[o + 2]).abs())
+            .max((a[o + 3] - b[o + 3]).abs());
+        m1 = m1
+            .max((a[o + 4] - b[o + 4]).abs())
+            .max((a[o + 5] - b[o + 5]).abs())
+            .max((a[o + 6] - b[o + 6]).abs())
+            .max((a[o + 7] - b[o + 7]).abs());
+        m2 = m2
+            .max((a[o + 8] - b[o + 8]).abs())
+            .max((a[o + 9] - b[o + 9]).abs())
+            .max((a[o + 10] - b[o + 10]).abs())
+            .max((a[o + 11] - b[o + 11]).abs());
+        m3 = m3
+            .max((a[o + 12] - b[o + 12]).abs())
+            .max((a[o + 13] - b[o + 13]).abs())
+            .max((a[o + 14] - b[o + 14]).abs())
+            .max((a[o + 15] - b[o + 15]).abs());
     }
     let mut m = m0.max(m1).max(m2).max(m3);
     for i in (c * 16)..n {
@@ -215,10 +263,16 @@ pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
     let c = n / 16;
     for i in 0..c {
         let o = i * 16;
-        s0 += a[o]*b[o]     + a[o+1]*b[o+1]   + a[o+2]*b[o+2]   + a[o+3]*b[o+3];
-        s1 += a[o+4]*b[o+4] + a[o+5]*b[o+5]   + a[o+6]*b[o+6]   + a[o+7]*b[o+7];
-        s2 += a[o+8]*b[o+8] + a[o+9]*b[o+9]   + a[o+10]*b[o+10] + a[o+11]*b[o+11];
-        s3 += a[o+12]*b[o+12] + a[o+13]*b[o+13] + a[o+14]*b[o+14] + a[o+15]*b[o+15];
+        s0 += a[o] * b[o] + a[o + 1] * b[o + 1] + a[o + 2] * b[o + 2] + a[o + 3] * b[o + 3];
+        s1 += a[o + 4] * b[o + 4] + a[o + 5] * b[o + 5] + a[o + 6] * b[o + 6] + a[o + 7] * b[o + 7];
+        s2 += a[o + 8] * b[o + 8]
+            + a[o + 9] * b[o + 9]
+            + a[o + 10] * b[o + 10]
+            + a[o + 11] * b[o + 11];
+        s3 += a[o + 12] * b[o + 12]
+            + a[o + 13] * b[o + 13]
+            + a[o + 14] * b[o + 14]
+            + a[o + 15] * b[o + 15];
     }
     let mut s = s0 + s1 + s2 + s3;
     for i in (c * 16)..n {
@@ -234,7 +288,11 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot = inner_product(a, b);
     let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 /// Cosine similarity with **pre-computed reciprocal query norm** `nb_recip = 1/‖b‖`.
@@ -254,29 +312,49 @@ pub fn cosine_similarity_fused(a: &[f32], b: &[f32], nb_recip: f32) -> f32 {
         }
     }
     let n = a.len().min(b.len());
-    let mut dot0 = 0.0f32; let mut na0 = 0.0f32;
-    let mut dot1 = 0.0f32; let mut na1 = 0.0f32;
-    let mut dot2 = 0.0f32; let mut na2 = 0.0f32;
-    let mut dot3 = 0.0f32; let mut na3 = 0.0f32;
+    let mut dot0 = 0.0f32;
+    let mut na0 = 0.0f32;
+    let mut dot1 = 0.0f32;
+    let mut na1 = 0.0f32;
+    let mut dot2 = 0.0f32;
+    let mut na2 = 0.0f32;
+    let mut dot3 = 0.0f32;
+    let mut na3 = 0.0f32;
     let c = n / 16;
     for i in 0..c {
         let o = i * 16;
-        dot0 += a[o]*b[o]     + a[o+1]*b[o+1]   + a[o+2]*b[o+2]   + a[o+3]*b[o+3];
-        na0  += a[o]*a[o]     + a[o+1]*a[o+1]   + a[o+2]*a[o+2]   + a[o+3]*a[o+3];
-        dot1 += a[o+4]*b[o+4] + a[o+5]*b[o+5]   + a[o+6]*b[o+6]   + a[o+7]*b[o+7];
-        na1  += a[o+4]*a[o+4] + a[o+5]*a[o+5]   + a[o+6]*a[o+6]   + a[o+7]*a[o+7];
-        dot2 += a[o+8]*b[o+8] + a[o+9]*b[o+9]   + a[o+10]*b[o+10] + a[o+11]*b[o+11];
-        na2  += a[o+8]*a[o+8] + a[o+9]*a[o+9]   + a[o+10]*a[o+10] + a[o+11]*a[o+11];
-        dot3 += a[o+12]*b[o+12] + a[o+13]*b[o+13] + a[o+14]*b[o+14] + a[o+15]*b[o+15];
-        na3  += a[o+12]*a[o+12] + a[o+13]*a[o+13] + a[o+14]*a[o+14] + a[o+15]*a[o+15];
+        dot0 += a[o] * b[o] + a[o + 1] * b[o + 1] + a[o + 2] * b[o + 2] + a[o + 3] * b[o + 3];
+        na0 += a[o] * a[o] + a[o + 1] * a[o + 1] + a[o + 2] * a[o + 2] + a[o + 3] * a[o + 3];
+        dot1 +=
+            a[o + 4] * b[o + 4] + a[o + 5] * b[o + 5] + a[o + 6] * b[o + 6] + a[o + 7] * b[o + 7];
+        na1 +=
+            a[o + 4] * a[o + 4] + a[o + 5] * a[o + 5] + a[o + 6] * a[o + 6] + a[o + 7] * a[o + 7];
+        dot2 += a[o + 8] * b[o + 8]
+            + a[o + 9] * b[o + 9]
+            + a[o + 10] * b[o + 10]
+            + a[o + 11] * b[o + 11];
+        na2 += a[o + 8] * a[o + 8]
+            + a[o + 9] * a[o + 9]
+            + a[o + 10] * a[o + 10]
+            + a[o + 11] * a[o + 11];
+        dot3 += a[o + 12] * b[o + 12]
+            + a[o + 13] * b[o + 13]
+            + a[o + 14] * b[o + 14]
+            + a[o + 15] * b[o + 15];
+        na3 += a[o + 12] * a[o + 12]
+            + a[o + 13] * a[o + 13]
+            + a[o + 14] * a[o + 14]
+            + a[o + 15] * a[o + 15];
     }
     let mut dot = dot0 + dot1 + dot2 + dot3;
     let mut na_sq = na0 + na1 + na2 + na3;
     for i in (c * 16)..n {
-        dot  += a[i] * b[i];
+        dot += a[i] * b[i];
         na_sq += a[i] * a[i];
     }
-    if na_sq == 0.0 || nb_recip == 0.0 { return 0.0; }
+    if na_sq == 0.0 || nb_recip == 0.0 {
+        return 0.0;
+    }
     dot * rsqrt_positive_f32(na_sq) * nb_recip
 }
 
@@ -371,7 +449,9 @@ unsafe fn cosine_fused_avx2(a: &[f32], b: &[f32], nb_recip: f32) -> f32 {
         dot += ai * bi;
         na_sq += ai * ai;
     }
-    if na_sq == 0.0 || nb_recip == 0.0 { return 0.0; }
+    if na_sq == 0.0 || nb_recip == 0.0 {
+        return 0.0;
+    }
     dot * rsqrt_positive_f32(na_sq) * nb_recip
 }
 
@@ -438,7 +518,7 @@ unsafe fn linf_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
 /// This avoids recomputing the query norm O(n) times in batch/TopK scans.
 pub struct DistanceComputer {
     pub metric: DistanceMetric,
-    pub query:  Vec<f32>,
+    pub query: Vec<f32>,
     /// Pre-computed ‖query‖ for cosine metrics (0.0 for others).
     query_norm: f32,
     /// Pre-computed 1/‖query‖ for cosine metrics (0.0 for others).
@@ -453,23 +533,34 @@ impl DistanceComputer {
             }
             _ => 0.0,
         };
-        let query_norm_recip = if query_norm > 0.0 { 1.0 / query_norm } else { 0.0 };
-        Self { metric, query, query_norm, query_norm_recip }
+        let query_norm_recip = if query_norm > 0.0 {
+            1.0 / query_norm
+        } else {
+            0.0
+        };
+        Self {
+            metric,
+            query,
+            query_norm,
+            query_norm_recip,
+        }
     }
 
     #[inline(always)]
     pub fn compute(&self, a: &[f32]) -> f32 {
         match self.metric {
-            DistanceMetric::L2             => l2_distance(a, &self.query),
-            DistanceMetric::L2Squared      => l2_squared(a, &self.query),
-            DistanceMetric::L1             => l1_distance(a, &self.query),
-            DistanceMetric::LInf           => linf_distance(a, &self.query),
-            DistanceMetric::InnerProduct   => inner_product(a, &self.query),
+            DistanceMetric::L2 => l2_distance(a, &self.query),
+            DistanceMetric::L2Squared => l2_squared(a, &self.query),
+            DistanceMetric::L1 => l1_distance(a, &self.query),
+            DistanceMetric::LInf => linf_distance(a, &self.query),
+            DistanceMetric::InnerProduct => inner_product(a, &self.query),
             DistanceMetric::NegInnerProduct => -inner_product(a, &self.query),
-            DistanceMetric::CosineSimilarity =>
-                cosine_similarity_fused(a, &self.query, self.query_norm_recip),
-            DistanceMetric::CosineDistance =>
-                1.0 - cosine_similarity_fused(a, &self.query, self.query_norm_recip),
+            DistanceMetric::CosineSimilarity => {
+                cosine_similarity_fused(a, &self.query, self.query_norm_recip)
+            }
+            DistanceMetric::CosineDistance => {
+                1.0 - cosine_similarity_fused(a, &self.query, self.query_norm_recip)
+            }
         }
     }
 }
@@ -499,8 +590,12 @@ impl DistanceMetric {
             "L1" | "MANHATTAN" | "L1_DISTANCE" => Some(Self::L1),
             "LINF" | "CHEBYSHEV" | "LINF_DISTANCE" => Some(Self::LInf),
             "DOT" | "INNER_PRODUCT" | "ARRAY_INNER_PRODUCT" => Some(Self::InnerProduct),
-            "NEG_INNER_PRODUCT" | "NEGATIVE_INNER_PRODUCT" | "ARRAY_NEGATIVE_INNER_PRODUCT" => Some(Self::NegInnerProduct),
-            "COSINE" | "COSINE_SIMILARITY" | "ARRAY_COSINE_SIMILARITY" => Some(Self::CosineSimilarity),
+            "NEG_INNER_PRODUCT" | "NEGATIVE_INNER_PRODUCT" | "ARRAY_NEGATIVE_INNER_PRODUCT" => {
+                Some(Self::NegInnerProduct)
+            }
+            "COSINE" | "COSINE_SIMILARITY" | "ARRAY_COSINE_SIMILARITY" => {
+                Some(Self::CosineSimilarity)
+            }
             "COSINE_DISTANCE" | "ARRAY_COSINE_DISTANCE" => Some(Self::CosineDistance),
             _ => None,
         }
@@ -509,19 +604,27 @@ impl DistanceMetric {
     #[inline(always)]
     pub fn compute(&self, a: &[f32], b: &[f32]) -> f32 {
         match self {
-            Self::L2          => l2_distance(a, b),
-            Self::L2Squared   => l2_squared(a, b),
-            Self::L1          => l1_distance(a, b),
-            Self::LInf        => linf_distance(a, b),
+            Self::L2 => l2_distance(a, b),
+            Self::L2Squared => l2_squared(a, b),
+            Self::L1 => l1_distance(a, b),
+            Self::LInf => linf_distance(a, b),
             Self::InnerProduct => inner_product(a, b),
             Self::NegInnerProduct => -inner_product(a, b),
             Self::CosineSimilarity => {
                 let nb_sq: f32 = b.iter().map(|x| x * x).sum();
-                if nb_sq == 0.0 { 0.0 } else { cosine_similarity_fused(a, b, 1.0 / nb_sq.sqrt()) }
+                if nb_sq == 0.0 {
+                    0.0
+                } else {
+                    cosine_similarity_fused(a, b, 1.0 / nb_sq.sqrt())
+                }
             }
             Self::CosineDistance => {
                 let nb_sq: f32 = b.iter().map(|x| x * x).sum();
-                if nb_sq == 0.0 { 1.0 } else { 1.0 - cosine_similarity_fused(a, b, 1.0 / nb_sq.sqrt()) }
+                if nb_sq == 0.0 {
+                    1.0
+                } else {
+                    1.0 - cosine_similarity_fused(a, b, 1.0 / nb_sq.sqrt())
+                }
             }
         }
     }
@@ -549,7 +652,10 @@ pub fn extract_query_vector(arr: &dyn Array) -> io::Result<Vec<f32>> {
                 }
             }
         }
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty or invalid binary vector"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Empty or invalid binary vector",
+        ));
     }
 
     if let Some(fa) = arr.as_any().downcast_ref::<Float32Array>() {
@@ -581,7 +687,7 @@ pub fn extract_query_vector(arr: &dyn Array) -> io::Result<Vec<f32>> {
                 let s = sa.value(i).trim();
                 // Try JSON array "[1.0, 2.0, …]"
                 if s.starts_with('[') && s.ends_with(']') {
-                    let inner = &s[1..s.len()-1];
+                    let inner = &s[1..s.len() - 1];
                     let parsed: Result<Vec<f32>, _> = inner
                         .split(',')
                         .map(|tok| tok.trim().parse::<f32>())
@@ -596,7 +702,10 @@ pub fn extract_query_vector(arr: &dyn Array) -> io::Result<Vec<f32>> {
         }
     }
 
-    Err(io::Error::new(io::ErrorKind::InvalidInput, "Cannot extract query vector from argument"))
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "Cannot extract query vector from argument",
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -618,9 +727,13 @@ pub fn batch_distance(
         let distances: Vec<Option<f64>> = (0..ba.len())
             .into_par_iter()
             .map(|i| {
-                if ba.is_null(i) { return None; }
+                if ba.is_null(i) {
+                    return None;
+                }
                 let bytes = ba.value(i);
-                if bytes.len() != expected_bytes { return None; }
+                if bytes.len() != expected_bytes {
+                    return None;
+                }
                 // SAFETY: length is exactly dim*4 and aligned to 4 bytes
                 let vec = unsafe { bytes_to_f32(bytes) };
                 Some(metric.compute(vec, query) as f64)
@@ -630,19 +743,28 @@ pub fn batch_distance(
     }
 
     // ── FixedSizeList<Float32> column path (Float16List decoded → f32) ────────
-    if let Some(fsl) = col.as_any().downcast_ref::<arrow::array::FixedSizeListArray>() {
+    if let Some(fsl) = col
+        .as_any()
+        .downcast_ref::<arrow::array::FixedSizeListArray>()
+    {
         use arrow::array::Float32Array;
         let dim = query.len() as i32;
         if fsl.value_length() != dim {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("array_distance: FixedSizeList dim {} != query dim {}", fsl.value_length(), dim),
+                format!(
+                    "array_distance: FixedSizeList dim {} != query dim {}",
+                    fsl.value_length(),
+                    dim
+                ),
             ));
         }
         let distances: Vec<Option<f64>> = (0..fsl.len())
             .into_par_iter()
             .map(|i| {
-                if fsl.is_null(i) { return None; }
+                if fsl.is_null(i) {
+                    return None;
+                }
                 let vals = fsl.value(i);
                 let f32arr = vals.as_any().downcast_ref::<Float32Array>()?;
                 let slice: Vec<f32> = (0..f32arr.len()).map(|j| f32arr.value(j)).collect();
@@ -657,16 +779,20 @@ pub fn batch_distance(
         let distances: Vec<Option<f64>> = (0..sa.len())
             .into_par_iter()
             .map(|i| {
-                if sa.is_null(i) { return None; }
+                if sa.is_null(i) {
+                    return None;
+                }
                 let s = sa.value(i).trim();
-                if !(s.starts_with('[') && s.ends_with(']')) { return None; }
-                let inner = &s[1..s.len()-1];
-                let parsed: Result<Vec<f32>, _> = inner
-                    .split(',')
-                    .map(|t| t.trim().parse::<f32>())
-                    .collect();
+                if !(s.starts_with('[') && s.ends_with(']')) {
+                    return None;
+                }
+                let inner = &s[1..s.len() - 1];
+                let parsed: Result<Vec<f32>, _> =
+                    inner.split(',').map(|t| t.trim().parse::<f32>()).collect();
                 let vec = parsed.ok()?;
-                if vec.len() != query.len() { return None; }
+                if vec.len() != query.len() {
+                    return None;
+                }
                 Some(metric.compute(&vec, query) as f64)
             })
             .collect();
@@ -688,24 +814,40 @@ pub fn batch_distance(
 ///
 /// This is O(n log k) — much faster than full sort for small k.
 pub fn topk_indices_asc(distances: &Float64Array, k: usize) -> Vec<usize> {
-    use std::collections::BinaryHeap;
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
 
-    if k == 0 { return vec![]; }
+    if k == 0 {
+        return vec![];
+    }
 
     // Max-heap of (dist_bits, idx) — we keep the k smallest
     #[derive(Copy, Clone)]
     struct Entry(u64, usize); // (distance bits for ordering, original row idx)
 
-    impl PartialEq for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
+    impl PartialEq for Entry {
+        fn eq(&self, o: &Self) -> bool {
+            self.0 == o.0
+        }
+    }
     impl Eq for Entry {}
-    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-    impl Ord for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for Entry {
+        fn cmp(&self, o: &Self) -> Ordering {
+            self.0.cmp(&o.0)
+        }
+    }
 
     let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k + 1);
 
     for i in 0..distances.len() {
-        if distances.is_null(i) { continue; }
+        if distances.is_null(i) {
+            continue;
+        }
         let d = distances.value(i);
         let bits = d.to_bits();
         if heap.len() < k {
@@ -718,7 +860,8 @@ pub fn topk_indices_asc(distances: &Float64Array, k: usize) -> Vec<usize> {
         }
     }
 
-    let mut result: Vec<(f64, usize)> = heap.into_iter()
+    let mut result: Vec<(f64, usize)> = heap
+        .into_iter()
         .map(|Entry(b, i)| (f64::from_bits(b), i))
         .collect();
     result.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
@@ -729,23 +872,39 @@ pub fn topk_indices_asc(distances: &Float64Array, k: usize) -> Vec<usize> {
 /// return the indices of the `k` *largest* non-null values in descending order.
 /// (Used for cosine_similarity / inner_product ORDER BY … DESC LIMIT k.)
 pub fn topk_indices_desc(distances: &Float64Array, k: usize) -> Vec<usize> {
-    use std::collections::BinaryHeap;
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
 
-    if k == 0 { return vec![]; }
+    if k == 0 {
+        return vec![];
+    }
 
     #[derive(Copy, Clone)]
     struct Entry(u64, usize); // negated bits to turn max-heap into min-heap
 
-    impl PartialEq for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
+    impl PartialEq for Entry {
+        fn eq(&self, o: &Self) -> bool {
+            self.0 == o.0
+        }
+    }
     impl Eq for Entry {}
-    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-    impl Ord for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for Entry {
+        fn cmp(&self, o: &Self) -> Ordering {
+            self.0.cmp(&o.0)
+        }
+    }
 
     let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k + 1);
 
     for i in 0..distances.len() {
-        if distances.is_null(i) { continue; }
+        if distances.is_null(i) {
+            continue;
+        }
         let d = distances.value(i);
         // negate to turn max into min ordering in the heap
         let neg_bits = (-d).to_bits();
@@ -759,7 +918,8 @@ pub fn topk_indices_desc(distances: &Float64Array, k: usize) -> Vec<usize> {
         }
     }
 
-    let mut result: Vec<(f64, usize)> = heap.into_iter()
+    let mut result: Vec<(f64, usize)> = heap
+        .into_iter()
         .map(|Entry(b, i)| (-f64::from_bits(b), i))
         .collect();
     result.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
@@ -783,8 +943,8 @@ pub fn topk_heap_direct(
     k: usize,
     metric: DistanceMetric,
 ) -> Vec<(usize, f32)> {
-    use std::collections::BinaryHeap;
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
 
     if k == 0 || col.len() == 0 || query.is_empty() {
         return vec![];
@@ -797,19 +957,33 @@ pub fn topk_heap_direct(
     // so direct bit comparison is correct for non-NaN, non-negative distances.
     #[derive(Copy, Clone)]
     struct Entry(u32, usize);
-    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
-    impl Eq         for Entry {}
-    impl PartialOrd for Entry {
-        fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) }
+    impl PartialEq for Entry {
+        fn eq(&self, o: &Self) -> bool {
+            self.0 == o.0
+        }
     }
-    impl Ord for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+    impl Eq for Entry {}
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for Entry {
+        fn cmp(&self, o: &Self) -> Ordering {
+            self.0.cmp(&o.0)
+        }
+    }
 
     let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
 
     for i in 0..col.len() {
-        if col.is_null(i) { continue; }
+        if col.is_null(i) {
+            continue;
+        }
         let bytes = col.value(i);
-        if bytes.len() != expected_bytes { continue; }
+        if bytes.len() != expected_bytes {
+            continue;
+        }
         // SAFETY: length == query.len()*4, bytes are valid LE f32 values.
         let vec = unsafe { bytes_to_f32(bytes) };
         let dist = metric.compute(vec, query);
@@ -850,8 +1024,8 @@ pub fn topk_heap_direct_parallel(
     k: usize,
 ) -> Vec<(usize, f32)> {
     use rayon::prelude::*;
-    use std::collections::BinaryHeap;
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
 
     let n = col.len();
     if k == 0 || n == 0 || computer.query.is_empty() {
@@ -863,24 +1037,36 @@ pub fn topk_heap_direct_parallel(
 
     #[derive(Copy, Clone)]
     struct Entry(u32, usize);
-    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
-    impl Eq         for Entry {}
-    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-    impl Ord        for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+    impl PartialEq for Entry {
+        fn eq(&self, o: &Self) -> bool {
+            self.0 == o.0
+        }
+    }
+    impl Eq for Entry {}
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for Entry {
+        fn cmp(&self, o: &Self) -> Ordering {
+            self.0.cmp(&o.0)
+        }
+    }
 
     // Grab raw buffer slices ONCE — avoid Arc deref + bounds checks inside the hot loop.
     // SAFETY: these references live for the duration of the function, col is immutable.
-    let values: &[u8]  = col.values().as_slice();
+    let values: &[u8] = col.values().as_slice();
     let offsets: &[i32] = col.offsets().as_ref(); // len = n+1
-    // Null bitmap: Option<&[u8]> pointing into Arrow's validity buffer.
+                                                  // Null bitmap: Option<&[u8]> pointing into Arrow's validity buffer.
     let null_bytes: Option<&[u8]> = col.nulls().map(|nb| nb.buffer().as_slice());
 
     // Capture raw pointers as usize so they are Send across Rayon threads.
     // SAFETY: values, offsets, null_bytes are all derived from `col` which is
     //         immutable and outlives the parallel section below.
-    let val_ptr  = values.as_ptr() as usize;
-    let val_len  = values.len();
-    let off_ptr  = offsets.as_ptr() as usize;
+    let val_ptr = values.as_ptr() as usize;
+    let val_len = values.len();
+    let off_ptr = offsets.as_ptr() as usize;
     let null_ptr: Option<(usize, usize)> = null_bytes.map(|nb| (nb.as_ptr() as usize, nb.len()));
 
     // Split into exactly T chunks (one per Rayon worker thread).
@@ -891,12 +1077,14 @@ pub fn topk_heap_direct_parallel(
         .into_par_iter()
         .map(|tid| {
             let start = tid * chunk_size;
-            if start >= n { return vec![]; }
+            if start >= n {
+                return vec![];
+            }
             let end = (start + chunk_size).min(n);
 
             // SAFETY: pointers are valid for `col`'s lifetime (enforced by borrow above).
-            let values  = unsafe { std::slice::from_raw_parts(val_ptr  as *const u8,  val_len) };
-            let offsets = unsafe { std::slice::from_raw_parts(off_ptr  as *const i32, n + 1)  };
+            let values = unsafe { std::slice::from_raw_parts(val_ptr as *const u8, val_len) };
+            let offsets = unsafe { std::slice::from_raw_parts(off_ptr as *const i32, n + 1) };
 
             let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
 
@@ -907,20 +1095,22 @@ pub fn topk_heap_direct_parallel(
                     if byte_idx < nb_len {
                         // SAFETY: byte_idx < nb_len.
                         let byte = unsafe { *(nb_ptr as *const u8).add(byte_idx) };
-                        if (byte >> (i & 7)) & 1 == 0 { continue; }
+                        if (byte >> (i & 7)) & 1 == 0 {
+                            continue;
+                        }
                     }
                 }
 
                 // SAFETY: offsets has n+1 elements; i and i+1 are within bounds.
-                let off_s = unsafe { *offsets.get_unchecked(i)   } as usize;
-                let off_e = unsafe { *offsets.get_unchecked(i+1) } as usize;
-                if off_e - off_s != expected_bytes { continue; }
+                let off_s = unsafe { *offsets.get_unchecked(i) } as usize;
+                let off_e = unsafe { *offsets.get_unchecked(i + 1) } as usize;
+                if off_e - off_s != expected_bytes {
+                    continue;
+                }
 
                 // SAFETY: off_s..off_e is within values (enforced by BinaryArray invariants).
                 let bytes = unsafe { values.get_unchecked(off_s..off_e) };
-                let vec   = unsafe {
-                    std::slice::from_raw_parts(bytes.as_ptr() as *const f32, dim)
-                };
+                let vec = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, dim) };
 
                 let dist = computer.compute(vec);
                 let bits = dist.to_bits();
@@ -933,7 +1123,9 @@ pub fn topk_heap_direct_parallel(
                     }
                 }
             }
-            heap.into_iter().map(|Entry(b, i)| (i, f32::from_bits(b))).collect()
+            heap.into_iter()
+                .map(|Entry(b, i)| (i, f32::from_bits(b)))
+                .collect()
         })
         .collect();
 
@@ -975,8 +1167,8 @@ pub fn topk_heap_direct_parallel_fixed(
     k: usize,
 ) -> Vec<(usize, f32)> {
     use rayon::prelude::*;
-    use std::collections::BinaryHeap;
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
 
     let n = col.len();
     if k == 0 || n == 0 || computer.query.is_empty() {
@@ -999,10 +1191,22 @@ pub fn topk_heap_direct_parallel_fixed(
 
     #[derive(Copy, Clone)]
     struct Entry(u32, usize);
-    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
-    impl Eq         for Entry {}
-    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-    impl Ord        for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+    impl PartialEq for Entry {
+        fn eq(&self, o: &Self) -> bool {
+            self.0 == o.0
+        }
+    }
+    impl Eq for Entry {}
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for Entry {
+        fn cmp(&self, o: &Self) -> Ordering {
+            self.0.cmp(&o.0)
+        }
+    }
 
     let t = rayon::current_num_threads().max(1);
     let chunk_size = (n + t - 1) / t;
@@ -1011,7 +1215,9 @@ pub fn topk_heap_direct_parallel_fixed(
         .into_par_iter()
         .map(|tid| {
             let start = tid * chunk_size;
-            if start >= n { return vec![]; }
+            if start >= n {
+                return vec![];
+            }
             let end = (start + chunk_size).min(n);
 
             // SAFETY: float_ptr is valid for `col`'s lifetime (borrow above).
@@ -1020,7 +1226,9 @@ pub fn topk_heap_direct_parallel_fixed(
 
             for i in start..end {
                 let off = i * dim;
-                if off + dim > float_len { break; }
+                if off + dim > float_len {
+                    break;
+                }
                 // SAFETY: bounds checked above.
                 let vec = unsafe { floats.get_unchecked(off..off + dim) };
                 let dist = computer.compute(vec);
@@ -1034,7 +1242,9 @@ pub fn topk_heap_direct_parallel_fixed(
                     }
                 }
             }
-            heap.into_iter().map(|Entry(b, i)| (i, f32::from_bits(b))).collect()
+            heap.into_iter()
+                .map(|Entry(b, i)| (i, f32::from_bits(b)))
+                .collect()
         })
         .collect();
 
@@ -1073,8 +1283,8 @@ pub fn topk_heap_on_floats(
     k: usize,
 ) -> Vec<(usize, f32)> {
     use rayon::prelude::*;
-    use std::collections::BinaryHeap;
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
 
     if k == 0 || n_rows == 0 || dim == 0 || computer.query.is_empty() {
         return vec![];
@@ -1083,10 +1293,22 @@ pub fn topk_heap_on_floats(
 
     #[derive(Copy, Clone)]
     struct Entry(u32, usize);
-    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
-    impl Eq         for Entry {}
-    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-    impl Ord        for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+    impl PartialEq for Entry {
+        fn eq(&self, o: &Self) -> bool {
+            self.0 == o.0
+        }
+    }
+    impl Eq for Entry {}
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for Entry {
+        fn cmp(&self, o: &Self) -> Ordering {
+            self.0.cmp(&o.0)
+        }
+    }
 
     let float_ptr = floats.as_ptr() as usize;
     let float_len = floats.len();
@@ -1097,23 +1319,32 @@ pub fn topk_heap_on_floats(
         .into_par_iter()
         .map(|tid| {
             let start = tid * chunk_size;
-            if start >= n_rows { return vec![]; }
+            if start >= n_rows {
+                return vec![];
+            }
             let end = (start + chunk_size).min(n_rows);
             let floats = unsafe { std::slice::from_raw_parts(float_ptr as *const f32, float_len) };
             let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
             for i in start..end {
                 let off = i * dim;
-                if off + dim > float_len { break; }
+                if off + dim > float_len {
+                    break;
+                }
                 let vec = unsafe { floats.get_unchecked(off..off + dim) };
                 let dist = computer.compute(vec);
                 let bits = dist.to_bits();
                 if heap.len() < k_capped {
                     heap.push(Entry(bits, i));
                 } else if let Some(&Entry(top, _)) = heap.peek() {
-                    if bits < top { heap.pop(); heap.push(Entry(bits, i)); }
+                    if bits < top {
+                        heap.pop();
+                        heap.push(Entry(bits, i));
+                    }
                 }
             }
-            heap.into_iter().map(|Entry(b, i)| (i, f32::from_bits(b))).collect()
+            heap.into_iter()
+                .map(|Entry(b, i)| (i, f32::from_bits(b)))
+                .collect()
         })
         .collect();
 
@@ -1124,7 +1355,10 @@ pub fn topk_heap_on_floats(
             if final_heap.len() < k_capped {
                 final_heap.push(Entry(bits, idx));
             } else if let Some(&Entry(top, _)) = final_heap.peek() {
-                if bits < top { final_heap.pop(); final_heap.push(Entry(bits, idx)); }
+                if bits < top {
+                    final_heap.pop();
+                    final_heap.push(Entry(bits, idx));
+                }
             }
         }
     }
@@ -1150,31 +1384,49 @@ fn topk_sequential_on_floats(
     computer: &DistanceComputer,
     k: usize,
 ) -> Vec<(usize, f32)> {
-    use std::collections::BinaryHeap;
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
 
     #[derive(Copy, Clone)]
     struct Entry(u32, usize);
-    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
-    impl Eq         for Entry {}
-    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-    impl Ord        for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+    impl PartialEq for Entry {
+        fn eq(&self, o: &Self) -> bool {
+            self.0 == o.0
+        }
+    }
+    impl Eq for Entry {}
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for Entry {
+        fn cmp(&self, o: &Self) -> Ordering {
+            self.0.cmp(&o.0)
+        }
+    }
 
     let float_len = floats.len();
     let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k + 1);
     for i in 0..n_rows {
         let off = i * dim;
-        if off + dim > float_len { break; }
+        if off + dim > float_len {
+            break;
+        }
         let vec = unsafe { floats.get_unchecked(off..off + dim) };
         let dist = computer.compute(vec);
         let bits = dist.to_bits();
         if heap.len() < k {
             heap.push(Entry(bits, i));
         } else if let Some(&Entry(top, _)) = heap.peek() {
-            if bits < top { heap.pop(); heap.push(Entry(bits, i)); }
+            if bits < top {
+                heap.pop();
+                heap.push(Entry(bits, i));
+            }
         }
     }
-    let mut result: Vec<(usize, f32)> = heap.into_iter()
+    let mut result: Vec<(usize, f32)> = heap
+        .into_iter()
         .map(|Entry(b, i)| (i, f32::from_bits(b)))
         .collect();
     result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
@@ -1208,31 +1460,36 @@ pub fn batch_topk_on_floats(
     if k == 0 || n_rows == 0 || dim == 0 || n_queries == 0 {
         return vec![vec![]; n_queries];
     }
-    let k_capped   = k.min(n_rows);
-    let t          = rayon::current_num_threads().max(1);
-    let float_ptr  = floats.as_ptr()  as usize;
-    let float_len  = floats.len();
-    let query_ptr  = queries.as_ptr() as usize;
-    let query_len  = queries.len();
+    let k_capped = k.min(n_rows);
+    let t = rayon::current_num_threads().max(1);
+    let float_ptr = floats.as_ptr() as usize;
+    let float_len = floats.len();
+    let query_ptr = queries.as_ptr() as usize;
+    let query_len = queries.len();
 
     if n_queries < t {
         // N < threads: inner-parallel per query (full Rayon pool on each query's rows).
         // Same perf as N individual topk_heap_on_floats calls, but all within one
         // py.allow_threads scope → saves N-1 Python→Rust transitions + N-1 _id reads.
-        (0..n_queries).map(|qi| {
-            let queries = unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
-            let q_slice = &queries[qi * dim..(qi + 1) * dim];
-            let computer = DistanceComputer::new(metric, q_slice.to_vec());
-            topk_heap_on_floats(floats, n_rows, dim, &computer, k_capped)
-        }).collect()
+        (0..n_queries)
+            .map(|qi| {
+                let queries =
+                    unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
+                let q_slice = &queries[qi * dim..(qi + 1) * dim];
+                let computer = DistanceComputer::new(metric, q_slice.to_vec());
+                topk_heap_on_floats(floats, n_rows, dim, &computer, k_capped)
+            })
+            .collect()
     } else {
         // N >= threads: outer-parallel over queries, sequential inner per query.
         // Each Rayon thread handles N/T queries sequentially — no nested contention.
         (0..n_queries)
             .into_par_iter()
             .map(|qi| {
-                let floats  = unsafe { std::slice::from_raw_parts(float_ptr as *const f32, float_len) };
-                let queries = unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
+                let floats =
+                    unsafe { std::slice::from_raw_parts(float_ptr as *const f32, float_len) };
+                let queries =
+                    unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
                 let q_slice = &queries[qi * dim..(qi + 1) * dim];
                 let computer = DistanceComputer::new(metric, q_slice.to_vec());
                 topk_sequential_on_floats(floats, n_rows, dim, &computer, k_capped)
@@ -1250,17 +1507,27 @@ pub fn batch_topk_on_floats(
 #[inline(always)]
 fn f16_bits_to_f32(bits: u16) -> f32 {
     let b = bits as u32;
-    f32::from_bits(((b & 0x8000) << 16) | (((b >> 10) & 0x1F).wrapping_add(112) << 23) | ((b & 0x03FF) << 13))
+    f32::from_bits(
+        ((b & 0x8000) << 16) | (((b >> 10) & 0x1F).wrapping_add(112) << 23) | ((b & 0x03FF) << 13),
+    )
 }
 #[inline(always)]
-fn f16u(d: &[u8], i: usize) -> f32 { f16_bits_to_f32(u16::from_le_bytes([d[i*2], d[i*2+1]])) }
+fn f16u(d: &[u8], i: usize) -> f32 {
+    f16_bits_to_f32(u16::from_le_bytes([d[i * 2], d[i * 2 + 1]]))
+}
 
 // ── aarch64 NEON + fp16 (hardware FCVTL via inline asm, stable Rust) ────────
 /// Load 8 packed f16 LE bytes and return two float32x4_t halves.
 /// Uses FCVTL/FCVTL2 ARM instructions (ARMv8.2-A fp16, always on Apple Silicon).
 /// No stdarch_neon_f16 unstable feature needed — conversion done via inline asm.
-#[cfg(target_arch="aarch64")] #[target_feature(enable="neon,fp16")]
-unsafe fn f16x8_to_f32pair(ptr: *const u8) -> (std::arch::aarch64::float32x4_t, std::arch::aarch64::float32x4_t) {
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,fp16")]
+unsafe fn f16x8_to_f32pair(
+    ptr: *const u8,
+) -> (
+    std::arch::aarch64::float32x4_t,
+    std::arch::aarch64::float32x4_t,
+) {
     use std::arch::aarch64::*;
     let src: uint16x8_t = vld1q_u16(ptr as *const u16);
     let lo: float32x4_t;
@@ -1275,197 +1542,352 @@ unsafe fn f16x8_to_f32pair(ptr: *const u8) -> (std::arch::aarch64::float32x4_t, 
     );
     (lo, hi)
 }
-#[cfg(target_arch="aarch64")] #[target_feature(enable="neon,fp16")]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,fp16")]
 unsafe fn l2sq_f16_neon(d: &[u8], q: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-    let (dim, n) = (q.len(), q.len()/8);
+    let (dim, n) = (q.len(), q.len() / 8);
     let (mut a, mut b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
     for i in 0..n {
-        let (x0,x1) = f16x8_to_f32pair(d.as_ptr().add(i*16));
-        let (q0,q1) = (vld1q_f32(q.as_ptr().add(i*8)), vld1q_f32(q.as_ptr().add(i*8+4)));
-        let (d0,d1) = (vsubq_f32(q0,x0), vsubq_f32(q1,x1));
-        a = vfmaq_f32(a,d0,d0); b = vfmaq_f32(b,d1,d1);
+        let (x0, x1) = f16x8_to_f32pair(d.as_ptr().add(i * 16));
+        let (q0, q1) = (
+            vld1q_f32(q.as_ptr().add(i * 8)),
+            vld1q_f32(q.as_ptr().add(i * 8 + 4)),
+        );
+        let (d0, d1) = (vsubq_f32(q0, x0), vsubq_f32(q1, x1));
+        a = vfmaq_f32(a, d0, d0);
+        b = vfmaq_f32(b, d1, d1);
     }
-    let mut s = vaddvq_f32(vaddq_f32(a,b));
-    for i in n*8..dim { let e = q[i]-f16u(d,i); s += e*e; }
+    let mut s = vaddvq_f32(vaddq_f32(a, b));
+    for i in n * 8..dim {
+        let e = q[i] - f16u(d, i);
+        s += e * e;
+    }
     s
 }
-#[cfg(target_arch="aarch64")] #[target_feature(enable="neon,fp16")]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,fp16")]
 unsafe fn dot_f16_neon(d: &[u8], q: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-    let (dim, n) = (q.len(), q.len()/8);
+    let (dim, n) = (q.len(), q.len() / 8);
     let (mut a, mut b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
     for i in 0..n {
-        let (x0,x1) = f16x8_to_f32pair(d.as_ptr().add(i*16));
-        let (q0,q1) = (vld1q_f32(q.as_ptr().add(i*8)), vld1q_f32(q.as_ptr().add(i*8+4)));
-        a = vfmaq_f32(a,x0,q0); b = vfmaq_f32(b,x1,q1);
+        let (x0, x1) = f16x8_to_f32pair(d.as_ptr().add(i * 16));
+        let (q0, q1) = (
+            vld1q_f32(q.as_ptr().add(i * 8)),
+            vld1q_f32(q.as_ptr().add(i * 8 + 4)),
+        );
+        a = vfmaq_f32(a, x0, q0);
+        b = vfmaq_f32(b, x1, q1);
     }
-    let mut s = vaddvq_f32(vaddq_f32(a,b));
-    for i in n*8..dim { s += f16u(d,i) * q[i]; }
+    let mut s = vaddvq_f32(vaddq_f32(a, b));
+    for i in n * 8..dim {
+        s += f16u(d, i) * q[i];
+    }
     s
 }
-#[cfg(target_arch="aarch64")] #[target_feature(enable="neon,fp16")]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,fp16")]
 unsafe fn cosine_f16_neon(d: &[u8], q: &[f32], qnr: f32) -> f32 {
     use std::arch::aarch64::*;
-    let (dim, n) = (q.len(), q.len()/8);
-    let (mut da,mut db,mut na,mut nb) = (vdupq_n_f32(0.0),vdupq_n_f32(0.0),vdupq_n_f32(0.0),vdupq_n_f32(0.0));
+    let (dim, n) = (q.len(), q.len() / 8);
+    let (mut da, mut db, mut na, mut nb) = (
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+    );
     for i in 0..n {
-        let (x0,x1) = f16x8_to_f32pair(d.as_ptr().add(i*16));
-        let (q0,q1) = (vld1q_f32(q.as_ptr().add(i*8)), vld1q_f32(q.as_ptr().add(i*8+4)));
-        da=vfmaq_f32(da,x0,q0); db=vfmaq_f32(db,x1,q1);
-        na=vfmaq_f32(na,x0,x0); nb=vfmaq_f32(nb,x1,x1);
+        let (x0, x1) = f16x8_to_f32pair(d.as_ptr().add(i * 16));
+        let (q0, q1) = (
+            vld1q_f32(q.as_ptr().add(i * 8)),
+            vld1q_f32(q.as_ptr().add(i * 8 + 4)),
+        );
+        da = vfmaq_f32(da, x0, q0);
+        db = vfmaq_f32(db, x1, q1);
+        na = vfmaq_f32(na, x0, x0);
+        nb = vfmaq_f32(nb, x1, x1);
     }
-    let (mut dot, mut ns) = (vaddvq_f32(vaddq_f32(da,db)), vaddvq_f32(vaddq_f32(na,nb)));
-    for i in n*8..dim { let x=f16u(d,i); dot+=x*q[i]; ns+=x*x; }
-    if ns==0.0||qnr==0.0 { return 0.0; }
+    let (mut dot, mut ns) = (vaddvq_f32(vaddq_f32(da, db)), vaddvq_f32(vaddq_f32(na, nb)));
+    for i in n * 8..dim {
+        let x = f16u(d, i);
+        dot += x * q[i];
+        ns += x * x;
+    }
+    if ns == 0.0 || qnr == 0.0 {
+        return 0.0;
+    }
     dot * rsqrt_positive_f32(ns) * qnr
 }
-#[cfg(target_arch="aarch64")] #[target_feature(enable="neon,fp16")]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,fp16")]
 unsafe fn l1_f16_neon(d: &[u8], q: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-    let (dim, n) = (q.len(), q.len()/8);
+    let (dim, n) = (q.len(), q.len() / 8);
     let (mut a, mut b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
     for i in 0..n {
-        let (x0,x1) = f16x8_to_f32pair(d.as_ptr().add(i*16));
-        let (q0,q1) = (vld1q_f32(q.as_ptr().add(i*8)), vld1q_f32(q.as_ptr().add(i*8+4)));
-        a=vaddq_f32(a,vabsq_f32(vsubq_f32(q0,x0))); b=vaddq_f32(b,vabsq_f32(vsubq_f32(q1,x1)));
+        let (x0, x1) = f16x8_to_f32pair(d.as_ptr().add(i * 16));
+        let (q0, q1) = (
+            vld1q_f32(q.as_ptr().add(i * 8)),
+            vld1q_f32(q.as_ptr().add(i * 8 + 4)),
+        );
+        a = vaddq_f32(a, vabsq_f32(vsubq_f32(q0, x0)));
+        b = vaddq_f32(b, vabsq_f32(vsubq_f32(q1, x1)));
     }
-    let mut s = vaddvq_f32(vaddq_f32(a,b));
-    for i in n*8..dim { s += (q[i]-f16u(d,i)).abs(); }
+    let mut s = vaddvq_f32(vaddq_f32(a, b));
+    for i in n * 8..dim {
+        s += (q[i] - f16u(d, i)).abs();
+    }
     s
 }
-#[cfg(target_arch="aarch64")] #[target_feature(enable="neon,fp16")]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,fp16")]
 unsafe fn linf_f16_neon(d: &[u8], q: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-    let (dim, n) = (q.len(), q.len()/8);
+    let (dim, n) = (q.len(), q.len() / 8);
     let (mut a, mut b) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
     for i in 0..n {
-        let (x0,x1) = f16x8_to_f32pair(d.as_ptr().add(i*16));
-        let (q0,q1) = (vld1q_f32(q.as_ptr().add(i*8)), vld1q_f32(q.as_ptr().add(i*8+4)));
-        a=vmaxq_f32(a,vabsq_f32(vsubq_f32(q0,x0))); b=vmaxq_f32(b,vabsq_f32(vsubq_f32(q1,x1)));
+        let (x0, x1) = f16x8_to_f32pair(d.as_ptr().add(i * 16));
+        let (q0, q1) = (
+            vld1q_f32(q.as_ptr().add(i * 8)),
+            vld1q_f32(q.as_ptr().add(i * 8 + 4)),
+        );
+        a = vmaxq_f32(a, vabsq_f32(vsubq_f32(q0, x0)));
+        b = vmaxq_f32(b, vabsq_f32(vsubq_f32(q1, x1)));
     }
-    let mut m = vmaxvq_f32(vmaxq_f32(a,b));
-    for i in n*8..dim { m = m.max((q[i]-f16u(d,i)).abs()); }
+    let mut m = vmaxvq_f32(vmaxq_f32(a, b));
+    for i in n * 8..dim {
+        m = m.max((q[i] - f16u(d, i)).abs());
+    }
     m
 }
 
 // ── x86_64 AVX2 + F16C + FMA ─────────────────────────────────────────────────
-#[cfg(target_arch="x86_64")] #[inline]
+#[cfg(target_arch = "x86_64")]
+#[inline]
 unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;
-    let hi=_mm256_extractf128_ps(v,1); let lo=_mm256_castps256_ps128(v);
-    let s=_mm_add_ps(lo,hi); let s=_mm_add_ps(s,_mm_movehl_ps(s,s));
-    _mm_cvtss_f32(_mm_add_ss(s,_mm_shuffle_ps(s,s,1)))
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let s = _mm_add_ps(lo, hi);
+    let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    _mm_cvtss_f32(_mm_add_ss(s, _mm_shuffle_ps(s, s, 1)))
 }
-#[cfg(target_arch="x86_64")] #[target_feature(enable="avx2,f16c,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
 unsafe fn l2sq_f16_avx(d: &[u8], q: &[f32]) -> f32 {
     use std::arch::x86_64::*;
-    let (dim, n) = (q.len(), q.len()/16);
+    let (dim, n) = (q.len(), q.len() / 16);
     let (mut a, mut b) = (_mm256_setzero_ps(), _mm256_setzero_ps());
     for i in 0..n {
-        let p = d.as_ptr().add(i*32) as *const __m128i;
-        let (x0,x1)=(_mm256_cvtph_ps(_mm_loadu_si128(p)),_mm256_cvtph_ps(_mm_loadu_si128(p.add(1))));
-        let (q0,q1)=(_mm256_loadu_ps(q.as_ptr().add(i*16)),_mm256_loadu_ps(q.as_ptr().add(i*16+8)));
-        let (d0,d1)=(_mm256_sub_ps(q0,x0),_mm256_sub_ps(q1,x1));
-        a=_mm256_fmadd_ps(d0,d0,a); b=_mm256_fmadd_ps(d1,d1,b);
+        let p = d.as_ptr().add(i * 32) as *const __m128i;
+        let (x0, x1) = (
+            _mm256_cvtph_ps(_mm_loadu_si128(p)),
+            _mm256_cvtph_ps(_mm_loadu_si128(p.add(1))),
+        );
+        let (q0, q1) = (
+            _mm256_loadu_ps(q.as_ptr().add(i * 16)),
+            _mm256_loadu_ps(q.as_ptr().add(i * 16 + 8)),
+        );
+        let (d0, d1) = (_mm256_sub_ps(q0, x0), _mm256_sub_ps(q1, x1));
+        a = _mm256_fmadd_ps(d0, d0, a);
+        b = _mm256_fmadd_ps(d1, d1, b);
     }
-    let mut s = hsum256(_mm256_add_ps(a,b));
-    for i in n*16..dim { let e=q[i]-f16u(d,i); s+=e*e; }
+    let mut s = hsum256(_mm256_add_ps(a, b));
+    for i in n * 16..dim {
+        let e = q[i] - f16u(d, i);
+        s += e * e;
+    }
     s
 }
-#[cfg(target_arch="x86_64")] #[target_feature(enable="avx2,f16c,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
 unsafe fn dot_f16_avx(d: &[u8], q: &[f32]) -> f32 {
     use std::arch::x86_64::*;
-    let (dim, n) = (q.len(), q.len()/16);
+    let (dim, n) = (q.len(), q.len() / 16);
     let (mut a, mut b) = (_mm256_setzero_ps(), _mm256_setzero_ps());
     for i in 0..n {
-        let p = d.as_ptr().add(i*32) as *const __m128i;
-        let (x0,x1)=(_mm256_cvtph_ps(_mm_loadu_si128(p)),_mm256_cvtph_ps(_mm_loadu_si128(p.add(1))));
-        let (q0,q1)=(_mm256_loadu_ps(q.as_ptr().add(i*16)),_mm256_loadu_ps(q.as_ptr().add(i*16+8)));
-        a=_mm256_fmadd_ps(x0,q0,a); b=_mm256_fmadd_ps(x1,q1,b);
+        let p = d.as_ptr().add(i * 32) as *const __m128i;
+        let (x0, x1) = (
+            _mm256_cvtph_ps(_mm_loadu_si128(p)),
+            _mm256_cvtph_ps(_mm_loadu_si128(p.add(1))),
+        );
+        let (q0, q1) = (
+            _mm256_loadu_ps(q.as_ptr().add(i * 16)),
+            _mm256_loadu_ps(q.as_ptr().add(i * 16 + 8)),
+        );
+        a = _mm256_fmadd_ps(x0, q0, a);
+        b = _mm256_fmadd_ps(x1, q1, b);
     }
-    let mut s = hsum256(_mm256_add_ps(a,b));
-    for i in n*16..dim { s += f16u(d,i)*q[i]; }
+    let mut s = hsum256(_mm256_add_ps(a, b));
+    for i in n * 16..dim {
+        s += f16u(d, i) * q[i];
+    }
     s
 }
-#[cfg(target_arch="x86_64")] #[target_feature(enable="avx2,f16c,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
 unsafe fn cosine_f16_avx(d: &[u8], q: &[f32], qnr: f32) -> f32 {
     use std::arch::x86_64::*;
-    let (dim, n) = (q.len(), q.len()/16);
-    let (mut da,mut db,mut na,mut nb) = (_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps());
+    let (dim, n) = (q.len(), q.len() / 16);
+    let (mut da, mut db, mut na, mut nb) = (
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+    );
     for i in 0..n {
-        let p = d.as_ptr().add(i*32) as *const __m128i;
-        let (x0,x1)=(_mm256_cvtph_ps(_mm_loadu_si128(p)),_mm256_cvtph_ps(_mm_loadu_si128(p.add(1))));
-        let (q0,q1)=(_mm256_loadu_ps(q.as_ptr().add(i*16)),_mm256_loadu_ps(q.as_ptr().add(i*16+8)));
-        da=_mm256_fmadd_ps(x0,q0,da); db=_mm256_fmadd_ps(x1,q1,db);
-        na=_mm256_fmadd_ps(x0,x0,na); nb=_mm256_fmadd_ps(x1,x1,nb);
+        let p = d.as_ptr().add(i * 32) as *const __m128i;
+        let (x0, x1) = (
+            _mm256_cvtph_ps(_mm_loadu_si128(p)),
+            _mm256_cvtph_ps(_mm_loadu_si128(p.add(1))),
+        );
+        let (q0, q1) = (
+            _mm256_loadu_ps(q.as_ptr().add(i * 16)),
+            _mm256_loadu_ps(q.as_ptr().add(i * 16 + 8)),
+        );
+        da = _mm256_fmadd_ps(x0, q0, da);
+        db = _mm256_fmadd_ps(x1, q1, db);
+        na = _mm256_fmadd_ps(x0, x0, na);
+        nb = _mm256_fmadd_ps(x1, x1, nb);
     }
-    let (mut dot,mut ns) = (hsum256(_mm256_add_ps(da,db)), hsum256(_mm256_add_ps(na,nb)));
-    for i in n*16..dim { let x=f16u(d,i); dot+=x*q[i]; ns+=x*x; }
-    if ns==0.0||qnr==0.0 { return 0.0; }
+    let (mut dot, mut ns) = (
+        hsum256(_mm256_add_ps(da, db)),
+        hsum256(_mm256_add_ps(na, nb)),
+    );
+    for i in n * 16..dim {
+        let x = f16u(d, i);
+        dot += x * q[i];
+        ns += x * x;
+    }
+    if ns == 0.0 || qnr == 0.0 {
+        return 0.0;
+    }
     dot * rsqrt_positive_f32(ns) * qnr
 }
-#[cfg(target_arch="x86_64")] #[target_feature(enable="avx2,f16c")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
 unsafe fn l1_f16_avx(d: &[u8], q: &[f32]) -> f32 {
     use std::arch::x86_64::*;
-    let (dim, n) = (q.len(), q.len()/16); let sm=_mm256_set1_ps(-0.0);
+    let (dim, n) = (q.len(), q.len() / 16);
+    let sm = _mm256_set1_ps(-0.0);
     let (mut a, mut b) = (_mm256_setzero_ps(), _mm256_setzero_ps());
     for i in 0..n {
-        let p = d.as_ptr().add(i*32) as *const __m128i;
-        let (x0,x1)=(_mm256_cvtph_ps(_mm_loadu_si128(p)),_mm256_cvtph_ps(_mm_loadu_si128(p.add(1))));
-        let (q0,q1)=(_mm256_loadu_ps(q.as_ptr().add(i*16)),_mm256_loadu_ps(q.as_ptr().add(i*16+8)));
-        a=_mm256_add_ps(a,_mm256_andnot_ps(sm,_mm256_sub_ps(q0,x0)));
-        b=_mm256_add_ps(b,_mm256_andnot_ps(sm,_mm256_sub_ps(q1,x1)));
+        let p = d.as_ptr().add(i * 32) as *const __m128i;
+        let (x0, x1) = (
+            _mm256_cvtph_ps(_mm_loadu_si128(p)),
+            _mm256_cvtph_ps(_mm_loadu_si128(p.add(1))),
+        );
+        let (q0, q1) = (
+            _mm256_loadu_ps(q.as_ptr().add(i * 16)),
+            _mm256_loadu_ps(q.as_ptr().add(i * 16 + 8)),
+        );
+        a = _mm256_add_ps(a, _mm256_andnot_ps(sm, _mm256_sub_ps(q0, x0)));
+        b = _mm256_add_ps(b, _mm256_andnot_ps(sm, _mm256_sub_ps(q1, x1)));
     }
-    let mut s = hsum256(_mm256_add_ps(a,b));
-    for i in n*16..dim { s += (q[i]-f16u(d,i)).abs(); }
+    let mut s = hsum256(_mm256_add_ps(a, b));
+    for i in n * 16..dim {
+        s += (q[i] - f16u(d, i)).abs();
+    }
     s
 }
-#[cfg(target_arch="x86_64")] #[target_feature(enable="avx2,f16c")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
 unsafe fn linf_f16_avx(d: &[u8], q: &[f32]) -> f32 {
     use std::arch::x86_64::*;
-    let (dim, n) = (q.len(), q.len()/16); let sm=_mm256_set1_ps(-0.0);
+    let (dim, n) = (q.len(), q.len() / 16);
+    let sm = _mm256_set1_ps(-0.0);
     let (mut a, mut b) = (_mm256_setzero_ps(), _mm256_setzero_ps());
     for i in 0..n {
-        let p = d.as_ptr().add(i*32) as *const __m128i;
-        let (x0,x1)=(_mm256_cvtph_ps(_mm_loadu_si128(p)),_mm256_cvtph_ps(_mm_loadu_si128(p.add(1))));
-        let (q0,q1)=(_mm256_loadu_ps(q.as_ptr().add(i*16)),_mm256_loadu_ps(q.as_ptr().add(i*16+8)));
-        a=_mm256_max_ps(a,_mm256_andnot_ps(sm,_mm256_sub_ps(q0,x0)));
-        b=_mm256_max_ps(b,_mm256_andnot_ps(sm,_mm256_sub_ps(q1,x1)));
+        let p = d.as_ptr().add(i * 32) as *const __m128i;
+        let (x0, x1) = (
+            _mm256_cvtph_ps(_mm_loadu_si128(p)),
+            _mm256_cvtph_ps(_mm_loadu_si128(p.add(1))),
+        );
+        let (q0, q1) = (
+            _mm256_loadu_ps(q.as_ptr().add(i * 16)),
+            _mm256_loadu_ps(q.as_ptr().add(i * 16 + 8)),
+        );
+        a = _mm256_max_ps(a, _mm256_andnot_ps(sm, _mm256_sub_ps(q0, x0)));
+        b = _mm256_max_ps(b, _mm256_andnot_ps(sm, _mm256_sub_ps(q1, x1)));
     }
-    let m=_mm256_max_ps(a,b); let hi=_mm256_extractf128_ps(m,1); let lo=_mm256_castps256_ps128(m);
-    let s=_mm_max_ps(lo,hi); let s=_mm_max_ps(s,_mm_movehl_ps(s,s));
-    let mut mv=_mm_cvtss_f32(_mm_max_ss(s,_mm_shuffle_ps(s,s,1)));
-    for i in n*16..dim { mv=mv.max((q[i]-f16u(d,i)).abs()); }
+    let m = _mm256_max_ps(a, b);
+    let hi = _mm256_extractf128_ps(m, 1);
+    let lo = _mm256_castps256_ps128(m);
+    let s = _mm_max_ps(lo, hi);
+    let s = _mm_max_ps(s, _mm_movehl_ps(s, s));
+    let mut mv = _mm_cvtss_f32(_mm_max_ss(s, _mm_shuffle_ps(s, s, 1)));
+    for i in n * 16..dim {
+        mv = mv.max((q[i] - f16u(d, i)).abs());
+    }
     mv
 }
 
 // ── Scalar fallbacks (all targets; also used as aarch64/non-fp16 fallback) ────
 fn l2sq_f16_scalar(d: &[u8], q: &[f32]) -> f32 {
-    let (mut s0,mut s1,mut s2,mut s3) = (0f32,0f32,0f32,0f32);
-    let c = q.len()/4;
-    for i in 0..c { let o=i*4;
-        let (d0,d1,d2,d3)=(q[o]-f16u(d,o),q[o+1]-f16u(d,o+1),q[o+2]-f16u(d,o+2),q[o+3]-f16u(d,o+3));
-        s0+=d0*d0; s1+=d1*d1; s2+=d2*d2; s3+=d3*d3; }
-    let mut s=s0+s1+s2+s3; for i in c*4..q.len() { let e=q[i]-f16u(d,i); s+=e*e; } s
+    let (mut s0, mut s1, mut s2, mut s3) = (0f32, 0f32, 0f32, 0f32);
+    let c = q.len() / 4;
+    for i in 0..c {
+        let o = i * 4;
+        let (d0, d1, d2, d3) = (
+            q[o] - f16u(d, o),
+            q[o + 1] - f16u(d, o + 1),
+            q[o + 2] - f16u(d, o + 2),
+            q[o + 3] - f16u(d, o + 3),
+        );
+        s0 += d0 * d0;
+        s1 += d1 * d1;
+        s2 += d2 * d2;
+        s3 += d3 * d3;
+    }
+    let mut s = s0 + s1 + s2 + s3;
+    for i in c * 4..q.len() {
+        let e = q[i] - f16u(d, i);
+        s += e * e;
+    }
+    s
 }
 fn dot_f16_scalar(d: &[u8], q: &[f32]) -> f32 {
-    let (mut s0,mut s1,mut s2,mut s3) = (0f32,0f32,0f32,0f32);
-    let c = q.len()/4;
-    for i in 0..c { let o=i*4;
-        s0+=f16u(d,o)*q[o]; s1+=f16u(d,o+1)*q[o+1]; s2+=f16u(d,o+2)*q[o+2]; s3+=f16u(d,o+3)*q[o+3]; }
-    let mut s=s0+s1+s2+s3; for i in c*4..q.len() { s+=f16u(d,i)*q[i]; } s
+    let (mut s0, mut s1, mut s2, mut s3) = (0f32, 0f32, 0f32, 0f32);
+    let c = q.len() / 4;
+    for i in 0..c {
+        let o = i * 4;
+        s0 += f16u(d, o) * q[o];
+        s1 += f16u(d, o + 1) * q[o + 1];
+        s2 += f16u(d, o + 2) * q[o + 2];
+        s3 += f16u(d, o + 3) * q[o + 3];
+    }
+    let mut s = s0 + s1 + s2 + s3;
+    for i in c * 4..q.len() {
+        s += f16u(d, i) * q[i];
+    }
+    s
 }
 fn cosine_f16_scalar(d: &[u8], q: &[f32], qnr: f32) -> f32 {
-    let (mut dot,mut ns) = (0f32,0f32);
-    for i in 0..q.len() { let x=f16u(d,i); dot+=x*q[i]; ns+=x*x; }
-    if ns==0.0||qnr==0.0 { return 0.0; } dot * rsqrt_positive_f32(ns) * qnr
+    let (mut dot, mut ns) = (0f32, 0f32);
+    for i in 0..q.len() {
+        let x = f16u(d, i);
+        dot += x * q[i];
+        ns += x * x;
+    }
+    if ns == 0.0 || qnr == 0.0 {
+        return 0.0;
+    }
+    dot * rsqrt_positive_f32(ns) * qnr
 }
 fn l1_f16_scalar(d: &[u8], q: &[f32]) -> f32 {
-    let mut s = 0f32; for i in 0..q.len() { s+=(q[i]-f16u(d,i)).abs(); } s
+    let mut s = 0f32;
+    for i in 0..q.len() {
+        s += (q[i] - f16u(d, i)).abs();
+    }
+    s
 }
 fn linf_f16_scalar(d: &[u8], q: &[f32]) -> f32 {
-    let mut m = 0f32; for i in 0..q.len() { m=m.max((q[i]-f16u(d,i)).abs()); } m
+    let mut m = 0f32;
+    for i in 0..q.len() {
+        m = m.max((q[i] - f16u(d, i)).abs());
+    }
+    m
 }
 
 // ── Runtime dispatcher ────────────────────────────────────────────────────────
@@ -1475,51 +1897,51 @@ fn compute_f16_row_distance(row: &[u8], c: &DistanceComputer) -> f32 {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("fp16") {
         return match c.metric {
-            DistanceMetric::L2Squared       => unsafe { l2sq_f16_neon(row, q) },
-            DistanceMetric::L2              => unsafe { l2sq_f16_neon(row, q) }.sqrt(),
-            DistanceMetric::InnerProduct    => unsafe { dot_f16_neon(row, q) },
+            DistanceMetric::L2Squared => unsafe { l2sq_f16_neon(row, q) },
+            DistanceMetric::L2 => unsafe { l2sq_f16_neon(row, q) }.sqrt(),
+            DistanceMetric::InnerProduct => unsafe { dot_f16_neon(row, q) },
             DistanceMetric::NegInnerProduct => -unsafe { dot_f16_neon(row, q) },
             DistanceMetric::CosineSimilarity => unsafe { cosine_f16_neon(row, q, qnr) },
-            DistanceMetric::CosineDistance  => 1.0 - unsafe { cosine_f16_neon(row, q, qnr) },
-            DistanceMetric::L1              => unsafe { l1_f16_neon(row, q) },
-            DistanceMetric::LInf            => unsafe { linf_f16_neon(row, q) },
+            DistanceMetric::CosineDistance => 1.0 - unsafe { cosine_f16_neon(row, q, qnr) },
+            DistanceMetric::L1 => unsafe { l1_f16_neon(row, q) },
+            DistanceMetric::LInf => unsafe { linf_f16_neon(row, q) },
         };
     }
     #[cfg(target_arch = "aarch64")]
     return match c.metric {
-        DistanceMetric::L2Squared       => l2sq_f16_scalar(row, q),
-        DistanceMetric::L2              => l2sq_f16_scalar(row, q).sqrt(),
-        DistanceMetric::InnerProduct    => dot_f16_scalar(row, q),
+        DistanceMetric::L2Squared => l2sq_f16_scalar(row, q),
+        DistanceMetric::L2 => l2sq_f16_scalar(row, q).sqrt(),
+        DistanceMetric::InnerProduct => dot_f16_scalar(row, q),
         DistanceMetric::NegInnerProduct => -dot_f16_scalar(row, q),
         DistanceMetric::CosineSimilarity => cosine_f16_scalar(row, q, qnr),
-        DistanceMetric::CosineDistance  => 1.0 - cosine_f16_scalar(row, q, qnr),
-        DistanceMetric::L1              => l1_f16_scalar(row, q),
-        DistanceMetric::LInf            => linf_f16_scalar(row, q),
+        DistanceMetric::CosineDistance => 1.0 - cosine_f16_scalar(row, q, qnr),
+        DistanceMetric::L1 => l1_f16_scalar(row, q),
+        DistanceMetric::LInf => linf_f16_scalar(row, q),
     };
     #[cfg(not(target_arch = "aarch64"))]
     {
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx2") {
             return match c.metric {
-                DistanceMetric::L2Squared       => unsafe { l2sq_f16_avx(row, q) },
-                DistanceMetric::L2              => unsafe { l2sq_f16_avx(row, q) }.sqrt(),
-                DistanceMetric::InnerProduct    => unsafe { dot_f16_avx(row, q) },
+                DistanceMetric::L2Squared => unsafe { l2sq_f16_avx(row, q) },
+                DistanceMetric::L2 => unsafe { l2sq_f16_avx(row, q) }.sqrt(),
+                DistanceMetric::InnerProduct => unsafe { dot_f16_avx(row, q) },
                 DistanceMetric::NegInnerProduct => -unsafe { dot_f16_avx(row, q) },
                 DistanceMetric::CosineSimilarity => unsafe { cosine_f16_avx(row, q, qnr) },
-                DistanceMetric::CosineDistance  => 1.0 - unsafe { cosine_f16_avx(row, q, qnr) },
-                DistanceMetric::L1              => unsafe { l1_f16_avx(row, q) },
-                DistanceMetric::LInf            => unsafe { linf_f16_avx(row, q) },
+                DistanceMetric::CosineDistance => 1.0 - unsafe { cosine_f16_avx(row, q, qnr) },
+                DistanceMetric::L1 => unsafe { l1_f16_avx(row, q) },
+                DistanceMetric::LInf => unsafe { linf_f16_avx(row, q) },
             };
         }
         match c.metric {
-            DistanceMetric::L2Squared       => l2sq_f16_scalar(row, q),
-            DistanceMetric::L2              => l2sq_f16_scalar(row, q).sqrt(),
-            DistanceMetric::InnerProduct    => dot_f16_scalar(row, q),
+            DistanceMetric::L2Squared => l2sq_f16_scalar(row, q),
+            DistanceMetric::L2 => l2sq_f16_scalar(row, q).sqrt(),
+            DistanceMetric::InnerProduct => dot_f16_scalar(row, q),
             DistanceMetric::NegInnerProduct => -dot_f16_scalar(row, q),
             DistanceMetric::CosineSimilarity => cosine_f16_scalar(row, q, qnr),
-            DistanceMetric::CosineDistance  => 1.0 - cosine_f16_scalar(row, q, qnr),
-            DistanceMetric::L1              => l1_f16_scalar(row, q),
-            DistanceMetric::LInf            => linf_f16_scalar(row, q),
+            DistanceMetric::CosineDistance => 1.0 - cosine_f16_scalar(row, q, qnr),
+            DistanceMetric::L1 => l1_f16_scalar(row, q),
+            DistanceMetric::LInf => linf_f16_scalar(row, q),
         }
     }
 }
@@ -1535,47 +1957,68 @@ pub fn topk_heap_on_f16_bytes(
     k: usize,
 ) -> Vec<(usize, f32)> {
     use rayon::prelude::*;
-    use std::collections::BinaryHeap;
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
 
     if k == 0 || n_rows == 0 || dim == 0 || computer.query.is_empty() {
         return vec![];
     }
-    let k_capped  = k.min(n_rows);
+    let k_capped = k.min(n_rows);
     let row_bytes = dim * 2;
 
     #[derive(Copy, Clone)]
     struct Entry(u32, usize);
-    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
-    impl Eq         for Entry {}
-    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-    impl Ord        for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+    impl PartialEq for Entry {
+        fn eq(&self, o: &Self) -> bool {
+            self.0 == o.0
+        }
+    }
+    impl Eq for Entry {}
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for Entry {
+        fn cmp(&self, o: &Self) -> Ordering {
+            self.0.cmp(&o.0)
+        }
+    }
 
     let bytes_ptr = f16_bytes.as_ptr() as usize;
     let bytes_len = f16_bytes.len();
-    let t         = rayon::current_num_threads().max(1);
-    let chunk     = (n_rows + t - 1) / t;
+    let t = rayon::current_num_threads().max(1);
+    let chunk = (n_rows + t - 1) / t;
 
     let per_chunk: Vec<Vec<(usize, f32)>> = (0..t)
         .into_par_iter()
         .map(|tid| {
             let start = tid * chunk;
-            if start >= n_rows { return vec![]; }
-            let end   = (start + chunk).min(n_rows);
+            if start >= n_rows {
+                return vec![];
+            }
+            let end = (start + chunk).min(n_rows);
             let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
             let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
             for i in start..end {
                 let off = i * row_bytes;
-                if off + row_bytes > bytes_len { break; }
+                if off + row_bytes > bytes_len {
+                    break;
+                }
                 let dist = compute_f16_row_distance(&bytes[off..off + row_bytes], computer);
                 let dist_bits = dist.to_bits();
                 if heap.len() < k_capped {
                     heap.push(Entry(dist_bits, i));
                 } else if let Some(&Entry(top, _)) = heap.peek() {
-                    if dist_bits < top { heap.pop(); heap.push(Entry(dist_bits, i)); }
+                    if dist_bits < top {
+                        heap.pop();
+                        heap.push(Entry(dist_bits, i));
+                    }
                 }
             }
-            heap.into_iter().map(|Entry(b, i)| (i, f32::from_bits(b))).collect()
+            heap.into_iter()
+                .map(|Entry(b, i)| (i, f32::from_bits(b)))
+                .collect()
         })
         .collect();
 
@@ -1586,7 +2029,10 @@ pub fn topk_heap_on_f16_bytes(
             if final_heap.len() < k_capped {
                 final_heap.push(Entry(bits, idx));
             } else if let Some(&Entry(top, _)) = final_heap.peek() {
-                if bits < top { final_heap.pop(); final_heap.push(Entry(bits, idx)); }
+                if bits < top {
+                    final_heap.pop();
+                    final_heap.push(Entry(bits, idx));
+                }
             }
         }
     }
@@ -1607,31 +2053,49 @@ fn topk_sequential_on_f16_bytes(
     computer: &DistanceComputer,
     k: usize,
 ) -> Vec<(usize, f32)> {
-    use std::collections::BinaryHeap;
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
 
     #[derive(Copy, Clone)]
     struct Entry(u32, usize);
-    impl PartialEq  for Entry { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
-    impl Eq         for Entry {}
-    impl PartialOrd for Entry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-    impl Ord        for Entry { fn cmp(&self, o: &Self) -> Ordering { self.0.cmp(&o.0) } }
+    impl PartialEq for Entry {
+        fn eq(&self, o: &Self) -> bool {
+            self.0 == o.0
+        }
+    }
+    impl Eq for Entry {}
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for Entry {
+        fn cmp(&self, o: &Self) -> Ordering {
+            self.0.cmp(&o.0)
+        }
+    }
 
     let row_bytes = dim * 2;
     let bytes_len = f16_bytes.len();
     let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k + 1);
     for i in 0..n_rows {
         let off = i * row_bytes;
-        if off + row_bytes > bytes_len { break; }
+        if off + row_bytes > bytes_len {
+            break;
+        }
         let dist = compute_f16_row_distance(&f16_bytes[off..off + row_bytes], computer);
         let dist_bits = dist.to_bits();
         if heap.len() < k {
             heap.push(Entry(dist_bits, i));
         } else if let Some(&Entry(top, _)) = heap.peek() {
-            if dist_bits < top { heap.pop(); heap.push(Entry(dist_bits, i)); }
+            if dist_bits < top {
+                heap.pop();
+                heap.push(Entry(dist_bits, i));
+            }
         }
     }
-    let mut result: Vec<(usize, f32)> = heap.into_iter()
+    let mut result: Vec<(usize, f32)> = heap
+        .into_iter()
         .map(|Entry(b, i)| (i, f32::from_bits(b)))
         .collect();
     result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1657,27 +2121,31 @@ pub fn batch_topk_on_f16_bytes(
     if k == 0 || n_rows == 0 || dim == 0 || n_queries == 0 {
         return vec![vec![]; n_queries];
     }
-    let k_capped   = k.min(n_rows);
-    let t          = rayon::current_num_threads().max(1);
-    let bytes_ptr  = f16_bytes.as_ptr() as usize;
-    let bytes_len  = f16_bytes.len();
-    let query_ptr  = queries.as_ptr() as usize;
-    let query_len  = queries.len();
+    let k_capped = k.min(n_rows);
+    let t = rayon::current_num_threads().max(1);
+    let bytes_ptr = f16_bytes.as_ptr() as usize;
+    let bytes_len = f16_bytes.len();
+    let query_ptr = queries.as_ptr() as usize;
+    let query_len = queries.len();
 
     if n_queries < t {
-        (0..n_queries).map(|qi| {
-            let f16_b  = unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
-            let qs     = unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
-            let q_slice = &qs[qi * dim..(qi + 1) * dim];
-            let computer = DistanceComputer::new(metric, q_slice.to_vec());
-            topk_heap_on_f16_bytes(f16_b, n_rows, dim, &computer, k_capped)
-        }).collect()
+        (0..n_queries)
+            .map(|qi| {
+                let f16_b =
+                    unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
+                let qs = unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
+                let q_slice = &qs[qi * dim..(qi + 1) * dim];
+                let computer = DistanceComputer::new(metric, q_slice.to_vec());
+                topk_heap_on_f16_bytes(f16_b, n_rows, dim, &computer, k_capped)
+            })
+            .collect()
     } else {
         (0..n_queries)
             .into_par_iter()
             .map(|qi| {
-                let f16_b   = unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
-                let qs      = unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
+                let f16_b =
+                    unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
+                let qs = unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
                 let q_slice = &qs[qi * dim..(qi + 1) * dim];
                 let computer = DistanceComputer::new(metric, q_slice.to_vec());
                 topk_sequential_on_f16_bytes(f16_b, n_rows, dim, &computer, k_capped)
@@ -1701,7 +2169,9 @@ pub fn encode_f32_vec(floats: &[f32]) -> Vec<u8> {
 
 /// Decode raw LE bytes to a Vec<f32>.
 pub fn decode_f32_vec(bytes: &[u8]) -> Option<Vec<f32>> {
-    if bytes.len() % 4 != 0 { return None; }
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
     let len = bytes.len() / 4;
     let mut out = Vec::with_capacity(len);
     for chunk in bytes.chunks_exact(4) {
@@ -1722,7 +2192,7 @@ mod tests {
 
         let a = vec![1.0f32, 2.0, 3.0];
         let b = vec![4.0f32, 5.0, 6.0];
-        let expected = ((3.0f32*3.0 + 3.0*3.0 + 3.0*3.0) as f32).sqrt();
+        let expected = ((3.0f32 * 3.0 + 3.0 * 3.0 + 3.0 * 3.0) as f32).sqrt();
         assert!((l2_distance(&a, &b) - expected).abs() < 1e-5);
     }
 
@@ -1776,7 +2246,7 @@ mod tests {
 
         let out = batch_distance(&col, &query, DistanceMetric::L2).unwrap();
         let fa = out.as_any().downcast_ref::<Float64Array>().unwrap();
-        assert!((fa.value(0)).abs() < 1e-5);          // distance to itself
+        assert!((fa.value(0)).abs() < 1e-5); // distance to itself
         assert!((fa.value(1) - 1.4142135).abs() < 1e-4); // √2
     }
 }

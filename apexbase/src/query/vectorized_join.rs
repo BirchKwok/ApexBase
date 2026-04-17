@@ -1,7 +1,7 @@
 // Vectorized JOIN utilities and filter optimization
 // This module provides helper functions for vectorized operations
 
-use arrow::array::{Array, ArrayRef, Int64Array, Float64Array, BooleanArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array};
 
 /// Zone map for column statistics
 #[derive(Debug, Clone)]
@@ -26,8 +26,12 @@ impl ZoneMapStats {
         let mut max = i64::MIN;
 
         for &v in values {
-            if v < min { min = v; }
-            if v > max { max = v; }
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
         }
 
         Self {
@@ -51,8 +55,12 @@ impl ZoneMapStats {
         let mut max = f64::MIN;
 
         for &v in values {
-            if v < min { min = v; }
-            if v > max { max = v; }
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
         }
 
         Self {
@@ -67,7 +75,7 @@ impl ZoneMapStats {
         match (self.min, self.max, is_greater) {
             (Some(min), Some(max), true) => max > predicate, // v > predicate, need max > predicate
             (Some(min), Some(max), false) => min < predicate, // v < predicate, need min < predicate
-            _ => true, // Unknown range, assume can match
+            _ => true,                                       // Unknown range, assume can match
         }
     }
 }
@@ -135,7 +143,12 @@ pub mod filter_optimize {
 /// Returns indices where values match the predicate
 /// is_greater: true for > or >=, false for < or <=
 /// is_equal: true for >= or <= (inclusive), false for > or < (exclusive)
-pub fn filter_int64_batch(values: &[i64], predicate: i64, is_greater: bool, is_equal: bool) -> Vec<usize> {
+pub fn filter_int64_batch(
+    values: &[i64],
+    predicate: i64,
+    is_greater: bool,
+    is_equal: bool,
+) -> Vec<usize> {
     let mut result = Vec::with_capacity(values.len() / 2);
 
     if is_greater {
@@ -178,7 +191,12 @@ pub fn filter_int64_batch(values: &[i64], predicate: i64, is_greater: bool, is_e
 /// SIMD-optimized batch filter for Float64 arrays
 /// is_greater: true for > or >=, false for < or <=
 /// is_equal: true for >= or <= (inclusive), false for > or < (exclusive)
-pub fn filter_float64_batch(values: &[f64], predicate: f64, is_greater: bool, is_equal: bool) -> Vec<usize> {
+pub fn filter_float64_batch(
+    values: &[f64],
+    predicate: f64,
+    is_greater: bool,
+    is_equal: bool,
+) -> Vec<usize> {
     let mut result = Vec::with_capacity(values.len() / 2);
 
     if is_greater {
@@ -238,8 +256,14 @@ pub fn count_matching_float64(values: &[f64], predicate: f64, op: &str) -> usize
         "<" => values.iter().filter(|&&v| v < predicate).count(),
         ">=" => values.iter().filter(|&&v| v >= predicate).count(),
         "<=" => values.iter().filter(|&&v| v <= predicate).count(),
-        "=" | "==" => values.iter().filter(|&&v| (v - predicate).abs() < f64::EPSILON).count(),
-        "!=" => values.iter().filter(|&&v| (v - predicate).abs() >= f64::EPSILON).count(),
+        "=" | "==" => values
+            .iter()
+            .filter(|&&v| (v - predicate).abs() < f64::EPSILON)
+            .count(),
+        "!=" => values
+            .iter()
+            .filter(|&&v| (v - predicate).abs() >= f64::EPSILON)
+            .count(),
         _ => 0,
     }
 }
@@ -253,37 +277,53 @@ pub fn all_values_match_int64(values: &[i64], predicate: i64, op: &str) -> Optio
     match op {
         ">" => {
             for &v in values.iter().take(64) {
-                if !(v > predicate) { return Some(false); }
+                if !(v > predicate) {
+                    return Some(false);
+                }
             }
             for &v in &values[64..] {
-                if !(v > predicate) { return Some(false); }
+                if !(v > predicate) {
+                    return Some(false);
+                }
             }
             Some(true)
         }
         "<" => {
             for &v in values.iter().take(64) {
-                if !(v < predicate) { return Some(false); }
+                if !(v < predicate) {
+                    return Some(false);
+                }
             }
             for &v in &values[64..] {
-                if !(v < predicate) { return Some(false); }
+                if !(v < predicate) {
+                    return Some(false);
+                }
             }
             Some(true)
         }
         ">=" => {
             for &v in values.iter().take(64) {
-                if !(v >= predicate) { return Some(false); }
+                if !(v >= predicate) {
+                    return Some(false);
+                }
             }
             for &v in &values[64..] {
-                if !(v >= predicate) { return Some(false); }
+                if !(v >= predicate) {
+                    return Some(false);
+                }
             }
             Some(true)
         }
         "<=" => {
             for &v in values.iter().take(64) {
-                if !(v <= predicate) { return Some(false); }
+                if !(v <= predicate) {
+                    return Some(false);
+                }
             }
             for &v in &values[64..] {
-                if !(v <= predicate) { return Some(false); }
+                if !(v <= predicate) {
+                    return Some(false);
+                }
             }
             Some(true)
         }
@@ -300,37 +340,53 @@ pub fn any_value_matches_int64(values: &[i64], predicate: i64, op: &str) -> Opti
     match op {
         ">" => {
             for &v in values.iter().take(64) {
-                if v > predicate { return Some(true); }
+                if v > predicate {
+                    return Some(true);
+                }
             }
             for &v in &values[64..] {
-                if v > predicate { return Some(true); }
+                if v > predicate {
+                    return Some(true);
+                }
             }
             Some(false)
         }
         "<" => {
             for &v in values.iter().take(64) {
-                if v < predicate { return Some(true); }
+                if v < predicate {
+                    return Some(true);
+                }
             }
             for &v in &values[64..] {
-                if v < predicate { return Some(true); }
+                if v < predicate {
+                    return Some(true);
+                }
             }
             Some(false)
         }
         ">=" => {
             for &v in values.iter().take(64) {
-                if v >= predicate { return Some(true); }
+                if v >= predicate {
+                    return Some(true);
+                }
             }
             for &v in &values[64..] {
-                if v >= predicate { return Some(true); }
+                if v >= predicate {
+                    return Some(true);
+                }
             }
             Some(false)
         }
         "<=" => {
             for &v in values.iter().take(64) {
-                if v <= predicate { return Some(true); }
+                if v <= predicate {
+                    return Some(true);
+                }
             }
             for &v in &values[64..] {
-                if v <= predicate { return Some(true); }
+                if v <= predicate {
+                    return Some(true);
+                }
             }
             Some(false)
         }
@@ -339,7 +395,7 @@ pub fn any_value_matches_int64(values: &[i64], predicate: i64, op: &str) -> Opti
 }
 
 /// Re-export filter_optimize for external use
-pub use filter_optimize::{is_all_false, is_all_true, has_any_null};
+pub use filter_optimize::{has_any_null, is_all_false, is_all_true};
 
 #[cfg(test)]
 mod tests {

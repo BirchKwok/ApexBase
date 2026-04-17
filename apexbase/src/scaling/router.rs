@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
-use super::partition::{PartitionStrategy, PartitionKey};
+use super::partition::{PartitionKey, PartitionStrategy};
 use super::shard::{ShardId, ShardManager, ShardMeta};
 
 // ============================================================================
@@ -20,17 +20,11 @@ use super::shard::{ShardId, ShardManager, ShardMeta};
 #[derive(Debug, Clone)]
 pub enum RoutingDecision {
     /// Query targets a single shard
-    SingleShard {
-        shard_id: ShardId,
-    },
+    SingleShard { shard_id: ShardId },
     /// Query targets a subset of shards
-    MultiShard {
-        shard_ids: Vec<ShardId>,
-    },
+    MultiShard { shard_ids: Vec<ShardId> },
     /// Query must scatter to all shards (full scan)
-    AllShards {
-        shard_ids: Vec<ShardId>,
-    },
+    AllShards { shard_ids: Vec<ShardId> },
     /// Table is not sharded (single-node mode)
     Local,
 }
@@ -48,12 +42,18 @@ impl RoutingDecision {
 
     /// Whether this is a single-shard operation
     pub fn is_single_shard(&self) -> bool {
-        matches!(self, RoutingDecision::SingleShard { .. } | RoutingDecision::Local)
+        matches!(
+            self,
+            RoutingDecision::SingleShard { .. } | RoutingDecision::Local
+        )
     }
 
     /// Whether this requires scatter-gather
     pub fn is_scatter_gather(&self) -> bool {
-        matches!(self, RoutingDecision::MultiShard { .. } | RoutingDecision::AllShards { .. })
+        matches!(
+            self,
+            RoutingDecision::MultiShard { .. } | RoutingDecision::AllShards { .. }
+        )
     }
 }
 
@@ -95,7 +95,8 @@ impl ShardRouter {
         strategy: Box<dyn PartitionStrategy>,
     ) {
         self.strategies.insert(table_name.to_string(), strategy);
-        self.partition_columns.insert(table_name.to_string(), partition_column.to_string());
+        self.partition_columns
+            .insert(table_name.to_string(), partition_column.to_string());
     }
 
     /// Get the partition column for a table
@@ -192,7 +193,9 @@ impl ShardRouter {
                     .filter_map(|idx| readable.get(idx as usize).map(|s| s.id))
                     .collect();
                 if shard_ids.len() == 1 {
-                    RoutingDecision::SingleShard { shard_id: shard_ids[0] }
+                    RoutingDecision::SingleShard {
+                        shard_id: shard_ids[0],
+                    }
                 } else {
                     RoutingDecision::MultiShard { shard_ids }
                 }
@@ -235,8 +238,8 @@ impl ShardRouter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::partition::HashPartitioner;
+    use super::*;
 
     #[test]
     fn test_local_routing() {
@@ -267,7 +270,9 @@ mod tests {
         assert!(single.is_single_shard());
         assert!(!single.is_scatter_gather());
 
-        let multi = RoutingDecision::MultiShard { shard_ids: vec![1, 2, 3] };
+        let multi = RoutingDecision::MultiShard {
+            shard_ids: vec![1, 2, 3],
+        };
         assert!(!multi.is_single_shard());
         assert!(multi.is_scatter_gather());
         assert_eq!(multi.shard_ids().len(), 3);

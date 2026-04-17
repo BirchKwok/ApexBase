@@ -2,13 +2,12 @@
 //!
 //! Provides table catalog and Arrow-based column storage.
 
-mod catalog;
-mod schema;
-pub mod column_table;
 pub mod arrow_column;
+mod catalog;
+pub mod column_table;
+mod schema;
 
+pub use arrow_column::{ArrowStringColumn, ArrowTypedColumn};
 pub use catalog::{TableCatalog, TableEntry};
+pub use column_table::{BitVec, ColumnSchema, TypedColumn};
 pub use schema::Schema;
-pub use column_table::{BitVec, TypedColumn, ColumnSchema};
-pub use arrow_column::{ArrowTypedColumn, ArrowStringColumn};
-

@@ -67,9 +67,7 @@ impl PgWireHandlerFactory for ApexBaseServerFactory {
 /// Start the PostgreSQL wire protocol server
 pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let handler = Arc::new(ApexBaseHandler::new(config.data_dir.clone()));
-    let factory = Arc::new(ApexBaseServerFactory {
-        handler,
-    });
+    let factory = Arc::new(ApexBaseServerFactory { handler });
 
     let addr = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&addr).await?;

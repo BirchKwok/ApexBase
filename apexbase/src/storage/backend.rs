@@ -17,8 +17,8 @@ use arrow::record_batch::RecordBatch;
 
 use crate::data::{DataType, Value};
 use crate::storage::on_demand::{ColumnData, ColumnType, CompressionType, OnDemandStorage};
-use crate::table::column_table::{BitVec, TypedColumn};
 use crate::table::arrow_column::ArrowStringColumn;
+use crate::table::column_table::{BitVec, TypedColumn};
 
 // ============================================================================
 // Global Dict Cache — persists across backend opens for GROUP BY acceleration
@@ -26,10 +26,9 @@ use crate::table::arrow_column::ArrowStringColumn;
 
 /// Global string dictionary cache keyed by (file_path, column_name).
 /// Invalidated by file modification time.
-static GLOBAL_DICT_CACHE: once_cell::sync::Lazy<RwLock<HashMap<
-    (PathBuf, String),
-    (SystemTime, Arc<(Vec<String>, Vec<u16>)>),
->>> = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
+static GLOBAL_DICT_CACHE: once_cell::sync::Lazy<
+    RwLock<HashMap<(PathBuf, String), (SystemTime, Arc<(Vec<String>, Vec<u16>)>)>>,
+> = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// Get or build a global dict cache entry. Returns Arc to avoid cloning 1M+ entries.
 pub fn get_global_dict_cache(
@@ -41,7 +40,7 @@ pub fn get_global_dict_cache(
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let key = (path.to_path_buf(), col_name.to_string());
-    
+
     // Check cache
     {
         let cache = GLOBAL_DICT_CACHE.read();
@@ -51,7 +50,7 @@ pub fn get_global_dict_cache(
             }
         }
     }
-    
+
     // Build and cache
     if let Some((dict_strings, group_ids)) = storage.build_string_dict_cache(col_name)? {
         let data = Arc::new((dict_strings, group_ids));
@@ -90,8 +89,14 @@ pub fn datatype_to_column_type(dt: &DataType) -> ColumnType {
 /// Convert OnDemand ColumnType to DataType
 pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
     match ct {
-        ColumnType::Int64 | ColumnType::Int32 | ColumnType::Int16 | ColumnType::Int8 |
-        ColumnType::UInt64 | ColumnType::UInt32 | ColumnType::UInt16 | ColumnType::UInt8 => DataType::Int64,
+        ColumnType::Int64
+        | ColumnType::Int32
+        | ColumnType::Int16
+        | ColumnType::Int8
+        | ColumnType::UInt64
+        | ColumnType::UInt32
+        | ColumnType::UInt16
+        | ColumnType::UInt8 => DataType::Int64,
         ColumnType::Float64 | ColumnType::Float32 => DataType::Float64,
         ColumnType::String | ColumnType::StringDict => DataType::String,
         ColumnType::Bool => DataType::Bool,
@@ -185,7 +190,10 @@ pub fn column_data_to_typed_column(cd: &ColumnData, _dtype: DataType) -> TypedCo
                 bit_data.push(val);
                 nulls.push(false);
             }
-            TypedColumn::Bool { data: bit_data, nulls }
+            TypedColumn::Bool {
+                data: bit_data,
+                nulls,
+            }
         }
         ColumnData::String { offsets, data } => {
             let mut arrow_col = ArrowStringColumn::new();
@@ -212,9 +220,16 @@ pub fn column_data_to_typed_column(cd: &ColumnData, _dtype: DataType) -> TypedCo
                 values.push(Value::Binary(data[start..end].to_vec()));
                 nulls.push(false);
             }
-            TypedColumn::Mixed { data: values, nulls }
+            TypedColumn::Mixed {
+                data: values,
+                nulls,
+            }
         }
-        ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+        ColumnData::StringDict {
+            indices,
+            dict_offsets,
+            dict_data,
+        } => {
             // Convert dictionary-encoded string to regular String column
             let mut arrow_col = ArrowStringColumn::new();
             for &idx in indices {
@@ -242,61 +257,102 @@ pub fn column_data_to_typed_column(cd: &ColumnData, _dtype: DataType) -> TypedCo
             let mut values = Vec::new();
             let mut nulls = BitVec::new();
             let dim_usize = *dim as usize;
-            let row_count = if dim_usize == 0 { 0 } else { data.len() / (dim_usize * 4) };
+            let row_count = if dim_usize == 0 {
+                0
+            } else {
+                data.len() / (dim_usize * 4)
+            };
             for i in 0..row_count {
                 let start = i * dim_usize * 4;
                 let end = start + dim_usize * 4;
                 values.push(Value::Binary(data[start..end].to_vec()));
                 nulls.push(false);
             }
-            TypedColumn::Mixed { data: values, nulls }
+            TypedColumn::Mixed {
+                data: values,
+                nulls,
+            }
         }
         ColumnData::Float16List { data, dim } => {
             let mut values = Vec::new();
             let mut nulls = BitVec::new();
             let dim_usize = *dim as usize;
-            let row_count = if dim_usize == 0 { 0 } else { data.len() / (dim_usize * 2) };
+            let row_count = if dim_usize == 0 {
+                0
+            } else {
+                data.len() / (dim_usize * 2)
+            };
             for i in 0..row_count {
                 let start = i * dim_usize * 2;
                 let end = start + dim_usize * 2;
                 values.push(Value::Binary(data[start..end].to_vec()));
                 nulls.push(false);
             }
-            TypedColumn::Mixed { data: values, nulls }
+            TypedColumn::Mixed {
+                data: values,
+                nulls,
+            }
         }
     }
 }
 
 /// Convert ColumnData::Float16List to (ArrowDataType, ArrayRef) - decodes f16->f32
-fn float16list_to_arrow_pair(data: &[u8], dim: u32) -> (arrow::datatypes::DataType, std::sync::Arc<dyn arrow::array::Array>) {
+fn float16list_to_arrow_pair(
+    data: &[u8],
+    dim: u32,
+) -> (
+    arrow::datatypes::DataType,
+    std::sync::Arc<dyn arrow::array::Array>,
+) {
     use crate::storage::on_demand::f16_to_f32;
-    let f32_bytes: Vec<u8> = data.chunks_exact(2)
+    let f32_bytes: Vec<u8> = data
+        .chunks_exact(2)
         .flat_map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())).to_le_bytes())
         .collect();
     fixedlist_to_arrow_pair(&f32_bytes, dim)
 }
 
 /// Convert ColumnData::FixedList to (ArrowDataType, ArrayRef)
-fn fixedlist_to_arrow_pair(data: &[u8], dim: u32) -> (arrow::datatypes::DataType, std::sync::Arc<dyn arrow::array::Array>) {
+fn fixedlist_to_arrow_pair(
+    data: &[u8],
+    dim: u32,
+) -> (
+    arrow::datatypes::DataType,
+    std::sync::Arc<dyn arrow::array::Array>,
+) {
     use arrow::array::{FixedSizeListArray, Float32Array};
     use arrow::buffer::Buffer;
-    use arrow::datatypes::{Field, DataType as ArrowDataType};
+    use arrow::datatypes::{DataType as ArrowDataType, Field};
     let dim_usize = dim as usize;
-    let row_count = if dim_usize == 0 { 0 } else { data.len() / (dim_usize * 4) };
+    let row_count = if dim_usize == 0 {
+        0
+    } else {
+        data.len() / (dim_usize * 4)
+    };
     let float_buf = Buffer::from_vec(data.to_vec());
     let float_arr = unsafe {
         Float32Array::from(arrow::array::ArrayData::new_unchecked(
             ArrowDataType::Float32,
             row_count * dim_usize,
-            Some(0), None, 0,
+            Some(0),
+            None,
+            0,
             vec![float_buf],
             vec![],
         ))
     };
     let item_field = std::sync::Arc::new(Field::new("item", ArrowDataType::Float32, false));
     let list_dt = ArrowDataType::FixedSizeList(item_field.clone(), dim_usize as i32);
-    let arr = FixedSizeListArray::new(item_field, dim_usize as i32, std::sync::Arc::new(float_arr), None);
-    (list_dt, std::sync::Arc::new(arr) as std::sync::Arc<dyn arrow::array::Array>)
+    let arr = FixedSizeListArray::new(
+        item_field,
+        dim_usize as i32,
+        std::sync::Arc::new(float_arr),
+        None,
+    );
+    (
+        list_dt,
+        std::sync::Arc::new(arr) as std::sync::Arc<dyn arrow::array::Array>,
+    )
 }
 
 // ============================================================================
@@ -312,7 +368,7 @@ pub struct TableMetadata {
 }
 
 /// Storage backend with lazy loading support
-/// 
+///
 /// This backend uses OnDemandStorage for persistence and supports:
 /// - Lazy loading: data is only loaded when requested
 /// - Column projection: only load specific columns
@@ -359,8 +415,11 @@ impl TableStorageBackend {
     pub fn create(path: &Path) -> io::Result<Self> {
         Self::create_with_durability(path, super::DurabilityLevel::Fast)
     }
-    
-    pub fn create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+
+    pub fn create_with_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+    ) -> io::Result<Self> {
         Self::create_with_schema_and_durability(path, durability, &[])
     }
 
@@ -369,7 +428,8 @@ impl TableStorageBackend {
         durability: super::DurabilityLevel,
         schema_cols: &[(String, ColumnType)],
     ) -> io::Result<Self> {
-        let storage = OnDemandStorage::create_with_schema_and_durability(path, durability, schema_cols)?;
+        let storage =
+            OnDemandStorage::create_with_schema_and_durability(path, durability, schema_cols)?;
         let schema: Vec<(String, DataType)> = schema_cols
             .iter()
             .map(|(name, ct)| (name.clone(), column_type_to_datatype(*ct)))
@@ -388,8 +448,11 @@ impl TableStorageBackend {
     pub fn open(path: &Path) -> io::Result<Self> {
         Self::open_with_durability(path, super::DurabilityLevel::Fast)
     }
-    
-    pub fn open_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+
+    pub fn open_with_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+    ) -> io::Result<Self> {
         let storage = OnDemandStorage::open_with_durability(path, durability)?;
         Ok(Self::from_storage(path, storage))
     }
@@ -404,8 +467,11 @@ impl TableStorageBackend {
     pub fn open_or_create(path: &Path) -> io::Result<Self> {
         Self::open_or_create_with_durability(path, super::DurabilityLevel::Fast)
     }
-    
-    pub fn open_or_create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+
+    pub fn open_or_create_with_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+    ) -> io::Result<Self> {
         if path.exists() {
             Self::open_with_durability(path, durability)
         } else {
@@ -416,29 +482,35 @@ impl TableStorageBackend {
     pub fn open_for_write(path: &Path) -> io::Result<Self> {
         Self::open_for_write_with_durability(path, super::DurabilityLevel::Fast)
     }
-    
-    pub fn open_for_write_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+
+    pub fn open_for_write_with_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+    ) -> io::Result<Self> {
         let storage = OnDemandStorage::open_for_write_with_durability(path, durability)?;
         Ok(Self::from_storage(path, storage))
     }
-    
+
     /// Open for compaction only — loads metadata, NOT column data.
     /// The streaming compact reads columns one at a time from mmap.
     pub fn open_for_compact(path: &Path) -> io::Result<Self> {
-        let storage = OnDemandStorage::open_for_insert_with_durability(
-            path, super::DurabilityLevel::Fast)?;
+        let storage =
+            OnDemandStorage::open_for_insert_with_durability(path, super::DurabilityLevel::Fast)?;
         Ok(Self::from_storage(path, storage))
     }
-    
+
     pub fn open_for_insert(path: &Path) -> io::Result<Self> {
         Self::open_for_insert_with_durability(path, super::DurabilityLevel::Fast)
     }
-    
-    pub fn open_for_insert_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+
+    pub fn open_for_insert_with_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+    ) -> io::Result<Self> {
         let storage = OnDemandStorage::open_for_insert_with_durability(path, durability)?;
         Ok(Self::from_storage(path, storage))
     }
-    
+
     /// Open for DELETE operations — mmap only, does NOT load column data into memory.
     /// Used by execute_delete to avoid the expensive load_all_columns_into_memory() + save_v4()
     /// cycle. Deletion vectors are updated in-place via save_delete_only().
@@ -457,39 +529,47 @@ impl TableStorageBackend {
     pub fn open_for_schema_change(path: &Path) -> io::Result<Self> {
         Self::open_for_schema_change_with_durability(path, super::DurabilityLevel::Fast)
     }
-    
-    pub fn open_for_schema_change_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+
+    pub fn open_for_schema_change_with_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+    ) -> io::Result<Self> {
         let storage = OnDemandStorage::open_for_schema_change_with_durability(path, durability)?;
         Ok(Self::from_storage(path, storage))
     }
-    
+
     /// Insert rows to delta file (memory efficient - doesn't load existing column data)
     /// Auto-compacts when delta exceeds threshold
     pub fn insert_rows_to_delta(&self, rows: &[HashMap<String, Value>]) -> io::Result<Vec<u64>> {
         use crate::storage::on_demand::ColumnValue;
-        
+
         // Convert Value to ColumnValue
-        let converted: Vec<HashMap<String, ColumnValue>> = rows.iter().map(|row| {
-            row.iter().map(|(k, v)| {
-                let cv = match v {
-                    Value::Int64(i) => ColumnValue::Int64(*i),
-                    Value::Float64(f) => ColumnValue::Float64(*f),
-                    Value::String(s) => ColumnValue::String(s.clone()),
-                    Value::Bool(b) => ColumnValue::Bool(*b),
-                    Value::Binary(b) => ColumnValue::Binary(b.clone()),
-                    Value::FixedList(b) => ColumnValue::Binary(b.clone()),
-                    _ => ColumnValue::Null,
-                };
-                (k.clone(), cv)
-            }).collect()
-        }).collect();
-        
+        let converted: Vec<HashMap<String, ColumnValue>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|(k, v)| {
+                        let cv = match v {
+                            Value::Int64(i) => ColumnValue::Int64(*i),
+                            Value::Float64(f) => ColumnValue::Float64(*f),
+                            Value::String(s) => ColumnValue::String(s.clone()),
+                            Value::Bool(b) => ColumnValue::Bool(*b),
+                            Value::Binary(b) => ColumnValue::Binary(b.clone()),
+                            Value::FixedList(b) => ColumnValue::Binary(b.clone()),
+                            _ => ColumnValue::Null,
+                        };
+                        (k.clone(), cv)
+                    })
+                    .collect()
+            })
+            .collect();
+
         let ids = self.storage.insert_rows_to_delta(&converted)?;
-        
+
         // Auto-compact if delta file is too large (> 10MB or > 100K rows)
         const DELTA_SIZE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
         const DELTA_ROWS_THRESHOLD: usize = 100_000;
-        
+
         let delta_path = Self::delta_path(&self.path);
         if delta_path.exists() {
             let delta_size = std::fs::metadata(&delta_path).map(|m| m.len()).unwrap_or(0);
@@ -499,10 +579,10 @@ impl TableStorageBackend {
                 *self.dirty.write() = true;
             }
         }
-        
+
         Ok(ids)
     }
-    
+
     /// Get delta file path
     fn delta_path(base_path: &Path) -> std::path::PathBuf {
         let mut delta = base_path.to_path_buf();
@@ -510,17 +590,17 @@ impl TableStorageBackend {
         delta.set_file_name(format!("{}.delta", name));
         delta
     }
-    
+
     /// Check if delta file exists
     pub fn has_delta(&self) -> bool {
         self.storage.has_delta()
     }
-    
+
     /// Compact delta into base file
     pub fn compact(&self) -> io::Result<()> {
         self.storage.compact()
     }
-    
+
     /// Check if compaction is needed
     pub fn needs_compaction(&self) -> bool {
         self.storage.needs_compaction()
@@ -529,7 +609,9 @@ impl TableStorageBackend {
     /// Get metadata without loading data
     pub fn metadata(&self) -> TableMetadata {
         TableMetadata {
-            name: self.path.file_stem()
+            name: self
+                .path
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string(),
@@ -561,7 +643,7 @@ impl TableStorageBackend {
     pub fn read_lock(&self) -> parking_lot::RwLockReadGuard<()> {
         self.storage.read_lock()
     }
-    
+
     /// Acquire global write lock for thread-safe writes.
     /// Only one writer can hold the lock; readers are blocked while held.
     #[inline]
@@ -590,17 +672,18 @@ impl TableStorageBackend {
 
         // Read columns from storage
         let col_data = self.storage.read_columns(Some(&to_load), 0, None)?;
-        
+
         // Convert and cache
         let schema = self.schema.read();
         let mut cached = self.cached_columns.write();
-        
+
         for (name, data) in col_data {
-            let dtype = schema.iter()
+            let dtype = schema
+                .iter()
                 .find(|(n, _)| n == &name)
                 .map(|(_, dt)| dt.clone())
                 .unwrap_or(DataType::String);
-            
+
             let typed_col = column_data_to_typed_column(&data, dtype);
             cached.insert(name, typed_col);
         }
@@ -691,7 +774,9 @@ impl TableStorageBackend {
                                 Value::Binary(b) => ColumnValue::Binary(b.clone()),
                                 Value::FixedList(b) => ColumnValue::Binary(b.clone()),
                                 Value::Null => ColumnValue::Null,
-                                _ => ColumnValue::String(serde_json::to_string(v).unwrap_or_default()),
+                                _ => ColumnValue::String(
+                                    serde_json::to_string(v).unwrap_or_default(),
+                                ),
                             };
                             (k.clone(), cv)
                         })
@@ -713,7 +798,9 @@ impl TableStorageBackend {
                                 Value::Binary(b) => ColumnValue::Binary(b.clone()),
                                 Value::FixedList(b) => ColumnValue::Binary(b.clone()),
                                 Value::Null => ColumnValue::Null,
-                                _ => ColumnValue::String(serde_json::to_string(v).unwrap_or_default()),
+                                _ => ColumnValue::String(
+                                    serde_json::to_string(v).unwrap_or_default(),
+                                ),
                             };
                             (k.clone(), cv)
                         })
@@ -759,11 +846,11 @@ impl TableStorageBackend {
     ) -> io::Result<Vec<u64>> {
         // Delegate to storage
         let ids = self.storage.insert_typed(
-            int_columns.clone(), 
-            float_columns.clone(), 
-            string_columns.clone(), 
-            binary_columns.clone(), 
-            bool_columns.clone()
+            int_columns.clone(),
+            float_columns.clone(),
+            string_columns.clone(),
+            binary_columns.clone(),
+            bool_columns.clone(),
         )?;
 
         // Update schema if new columns
@@ -818,12 +905,12 @@ impl TableStorageBackend {
     ) -> io::Result<Vec<u64>> {
         // Delegate to storage with null tracking
         let ids = self.storage.insert_typed_with_nulls(
-            int_columns.clone(), 
-            float_columns.clone(), 
-            string_columns.clone(), 
-            binary_columns.clone(), 
+            int_columns.clone(),
+            float_columns.clone(),
+            string_columns.clone(),
+            binary_columns.clone(),
             bool_columns.clone(),
-            null_positions
+            null_positions,
         )?;
 
         // Update schema if new columns
@@ -949,7 +1036,11 @@ impl TableStorageBackend {
 
     /// Record cell-level updates for a row in the delta store.
     /// This avoids delete+insert for UPDATE operations.
-    pub fn delta_update_row(&self, row_id: u64, values: &std::collections::HashMap<String, crate::data::Value>) {
+    pub fn delta_update_row(
+        &self,
+        row_id: u64,
+        values: &std::collections::HashMap<String, crate::data::Value>,
+    ) {
         self.storage.delta_update_row(row_id, values);
     }
 
@@ -959,15 +1050,28 @@ impl TableStorageBackend {
     }
 
     /// Scan a numeric column for rows in [low, high] and return matching row IDs.
-    pub fn scan_numeric_range_with_ids(&self, col_name: &str, low: f64, high: f64) -> io::Result<Option<Vec<u64>>> {
-        self.storage.scan_numeric_range_with_ids(col_name, low, high)
+    pub fn scan_numeric_range_with_ids(
+        &self,
+        col_name: &str,
+        low: f64,
+        high: f64,
+    ) -> io::Result<Option<Vec<u64>>> {
+        self.storage
+            .scan_numeric_range_with_ids(col_name, low, high)
     }
 
     /// Single-pass scan+write: find WHERE column matches and overwrite SET column in-place.
     /// Returns Some(count) if successful, None if fallback to DeltaStore needed.
-    pub fn scan_and_update_inplace(&self, where_col: &str, low: f64, high: f64,
-        set_col: &str, new_value_bytes: &[u8; 8]) -> io::Result<Option<i64>> {
-        self.storage.scan_and_update_inplace(where_col, low, high, set_col, new_value_bytes)
+    pub fn scan_and_update_inplace(
+        &self,
+        where_col: &str,
+        low: f64,
+        high: f64,
+        set_col: &str,
+        new_value_bytes: &[u8; 8],
+    ) -> io::Result<Option<i64>> {
+        self.storage
+            .scan_and_update_inplace(where_col, low, high, set_col, new_value_bytes)
     }
 
     /// Save the delta store to disk.
@@ -1000,34 +1104,34 @@ impl TableStorageBackend {
     pub fn compact_deltas(&self) -> io::Result<()> {
         self.storage.compact_deltas()
     }
-    
+
     /// Explicitly sync data to disk (fsync)
-    /// 
+    ///
     /// This ensures all buffered data is written to persistent storage.
     /// For Safe/Max durability levels, save() automatically calls fsync.
     /// For Fast durability, use this method when you need explicit durability.
     pub fn sync(&self) -> io::Result<()> {
         self.storage.sync()
     }
-    
+
     /// Get the current durability level
     pub fn durability(&self) -> super::DurabilityLevel {
         self.storage.durability()
     }
-    
+
     /// Set auto-flush thresholds
-    /// 
-    /// When either threshold is exceeded during writes, data is automatically 
+    ///
+    /// When either threshold is exceeded during writes, data is automatically
     /// written to file. Set to 0 to disable the respective threshold.
     pub fn set_auto_flush(&self, rows: u64, bytes: u64) {
         self.storage.set_auto_flush(rows, bytes);
     }
-    
+
     /// Get current auto-flush configuration
     pub fn get_auto_flush(&self) -> (u64, u64) {
         self.storage.get_auto_flush()
     }
-    
+
     /// Estimate current in-memory data size in bytes
     pub fn estimate_memory_bytes(&self) -> u64 {
         self.storage.estimate_memory_bytes()
@@ -1105,9 +1209,10 @@ impl TableStorageBackend {
     /// Replace a row (delete + insert new)
     pub fn replace(&self, id: u64, data: &HashMap<String, Value>) -> io::Result<bool> {
         use crate::storage::on_demand::ColumnValue;
-        
+
         // Convert Value to ColumnValue
-        let cv_data: HashMap<String, ColumnValue> = data.iter()
+        let cv_data: HashMap<String, ColumnValue> = data
+            .iter()
             .map(|(k, v)| {
                 let cv = match v {
                     Value::Int64(i) => ColumnValue::Int64(*i),
@@ -1123,7 +1228,7 @@ impl TableStorageBackend {
                 (k.clone(), cv)
             })
             .collect();
-        
+
         let result = self.storage.replace(id, &cv_data)?;
         if result {
             *self.dirty.write() = true;
@@ -1145,13 +1250,16 @@ impl TableStorageBackend {
         {
             let schema = self.schema.read();
             if schema.iter().any(|(n, _)| n == name) {
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("Column '{}' already exists", name)));
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("Column '{}' already exists", name),
+                ));
             }
         }
-        
+
         // Use the underlying storage's add_column_with_padding for proper data alignment
         self.storage.add_column_with_padding(name, dtype)?;
-        
+
         // Update our schema cache
         let mut schema = self.schema.write();
         schema.push((name.to_string(), dtype));
@@ -1163,14 +1271,14 @@ impl TableStorageBackend {
     pub fn drop_column(&self, name: &str) -> io::Result<()> {
         // Drop from underlying storage (removes schema, data, nulls, index)
         self.storage.drop_column(name)?;
-        
+
         // Also update the cached schema
         let mut schema = self.schema.write();
         let pos = schema.iter().position(|(n, _)| n == name);
         if let Some(idx) = pos {
             schema.remove(idx);
         }
-        
+
         *self.dirty.write() = true;
         Ok(())
     }
@@ -1187,7 +1295,10 @@ impl TableStorageBackend {
             }
         }
         if !found {
-            return Err(io::Error::new(io::ErrorKind::NotFound, format!("Column '{}' not found", old_name)));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Column '{}' not found", old_name),
+            ));
         }
         *self.dirty.write() = true;
         drop(schema);
@@ -1205,7 +1316,9 @@ impl TableStorageBackend {
 
     /// Get column data type
     pub fn get_column_type(&self, name: &str) -> Option<DataType> {
-        self.schema.read().iter()
+        self.schema
+            .read()
+            .iter()
             .find(|(n, _)| n == name)
             .map(|(_, dt)| dt.clone())
     }
@@ -1247,7 +1360,8 @@ impl TableStorageBackend {
         k: usize,
         metric: crate::query::vector_ops::DistanceMetric,
     ) -> io::Result<Option<Vec<Vec<(usize, f32)>>>> {
-        self.storage.batch_topk_fixedlist_direct(col_name, queries, n_queries, k, metric)
+        self.storage
+            .batch_topk_fixedlist_direct(col_name, queries, n_queries, k, metric)
     }
 
     /// Batch parallel TopK for a Binary vector column — N queries in one call.
@@ -1259,7 +1373,8 @@ impl TableStorageBackend {
         k: usize,
         metric: crate::query::vector_ops::DistanceMetric,
     ) -> io::Result<Option<Vec<Vec<(usize, f32)>>>> {
-        self.storage.batch_topk_binary_direct(col_name, queries, n_queries, k, metric)
+        self.storage
+            .batch_topk_binary_direct(col_name, queries, n_queries, k, metric)
     }
 
     /// Read columns to Arrow with dictionary encoding for low-cardinality string columns.
@@ -1268,8 +1383,10 @@ impl TableStorageBackend {
         &self,
         column_names: Option<&[&str]>,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
-        if let Ok(batch) = self.storage.to_arrow_batch_dict(column_names,
-            column_names.map(|c| c.contains(&"_id")).unwrap_or(true)) {
+        if let Ok(batch) = self.storage.to_arrow_batch_dict(
+            column_names,
+            column_names.map(|c| c.contains(&"_id")).unwrap_or(true),
+        ) {
             if batch.num_rows() > 0 || batch.num_columns() > 0 {
                 return Ok(batch);
             }
@@ -1279,15 +1396,15 @@ impl TableStorageBackend {
     }
 
     /// Read specific columns directly to Arrow RecordBatch (TRUE on-demand read)
-    /// 
+    ///
     /// This method bypasses ColumnTable and reads only the requested columns
     /// from storage, converting directly to Arrow format.
-    /// 
+    ///
     /// Features:
     /// - Column projection: only reads requested columns from disk
     /// - Row range: supports start_row and row_count for partial reads
     /// - Caching: caches full column reads for repeated access
-    /// 
+    ///
     /// # Arguments
     /// * `column_names` - Columns to read (None = all columns)
     /// * `start_row` - Starting row index
@@ -1298,36 +1415,41 @@ impl TableStorageBackend {
         start_row: usize,
         row_count: Option<usize>,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
-        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
         let use_cache = start_row == 0 && row_count.is_none();
-        
+
         // OPTIMIZATION: V4 fast path — build Arrow directly from in-memory or mmap columns
         // Bypasses read_columns→HashMap→get_null_mask→Vec<bool> pipeline entirely
         if use_cache {
-            if let Ok(batch) = self.storage.to_arrow_batch(column_names, 
-                column_names.map(|c| c.contains(&"_id")).unwrap_or(true)) {
+            if let Ok(batch) = self.storage.to_arrow_batch(
+                column_names,
+                column_names.map(|c| c.contains(&"_id")).unwrap_or(true),
+            ) {
                 if batch.num_rows() > 0 || batch.num_columns() > 0 {
                     return Ok(batch);
                 }
             }
         }
-        
+
         // OPTIMIZATION: V4 fast path for LIMIT reads (start_row=0, row_count=Some)
         // Use to_arrow_batch_with_limit which leverages RCIX for O(1) column seeks —
         // reads only the needed rows instead of loading the full table.
         if start_row == 0 && row_count.is_some() {
             let limit = row_count.unwrap();
-            if let Ok(batch) = self.storage.to_arrow_batch_with_limit(column_names,
-                column_names.map(|c| c.contains(&"_id")).unwrap_or(true), limit) {
+            if let Ok(batch) = self.storage.to_arrow_batch_with_limit(
+                column_names,
+                column_names.map(|c| c.contains(&"_id")).unwrap_or(true),
+                limit,
+            ) {
                 if batch.num_rows() > 0 || batch.num_columns() > 0 {
                     return Ok(batch);
                 }
             }
         }
-        
+
         // Handle SELECT _id ONLY case FIRST (before reading columns)
         if let Some(cols) = column_names {
             if cols.len() == 1 && cols[0] == "_id" {
@@ -1345,24 +1467,33 @@ impl TableStorageBackend {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
             }
         }
-        
+
         // Read columns from storage (only the requested ones!)
-        let mut col_data = self.storage.read_columns(column_names, start_row, row_count)?;
-        
+        let mut col_data = self
+            .storage
+            .read_columns(column_names, start_row, row_count)?;
+
         if col_data.is_empty() {
             // Return empty batch with schema (including _id if requested)
             let schema = self.schema.read();
-            let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+            let include_id = column_names
+                .map(|cols| cols.contains(&"_id"))
+                .unwrap_or(true);
             let mut fields: Vec<Field> = Vec::new();
-            
+
             if include_id {
                 fields.push(Field::new("_id", ArrowDataType::Int64, false));
             }
-            
+
             for (name, dt) in schema.iter() {
-                if column_names.map(|cols| cols.contains(&name.as_str())).unwrap_or(true) {
+                if column_names
+                    .map(|cols| cols.contains(&name.as_str()))
+                    .unwrap_or(true)
+                {
                     let arrow_dt = match dt {
-                        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => ArrowDataType::Int64,
+                        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
+                            ArrowDataType::Int64
+                        }
                         DataType::Float64 | DataType::Float32 => ArrowDataType::Float64,
                         DataType::String => ArrowDataType::Utf8,
                         DataType::Bool => ArrowDataType::Boolean,
@@ -1381,7 +1512,9 @@ impl TableStorageBackend {
         let mut arrays: Vec<ArrayRef> = Vec::new();
 
         // Always include _id as the first column (unless explicitly excluded)
-        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        let include_id = column_names
+            .map(|cols| cols.contains(&"_id"))
+            .unwrap_or(true);
         let expected_row_count: usize;
         if include_id {
             let ids = self.storage.read_ids(start_row, row_count)?;
@@ -1400,8 +1533,9 @@ impl TableStorageBackend {
 
         // Determine column order from schema (or from column_names if specified)
         let col_order: Vec<String> = if let Some(names) = column_names {
-            names.iter()
-                .filter(|&s| *s != "_id")  // Skip _id, already handled
+            names
+                .iter()
+                .filter(|&s| *s != "_id") // Skip _id, already handled
                 .map(|s| s.to_string())
                 .collect()
         } else {
@@ -1411,29 +1545,42 @@ impl TableStorageBackend {
         // Get actual start_row and row_count for null mask lookup
         let actual_start = start_row;
         let actual_count = expected_row_count;
-        
+
         for col_name in &col_order {
             // Get null mask for this column
-            let null_mask = self.storage.get_null_mask(col_name, actual_start, actual_count);
+            let null_mask = self
+                .storage
+                .get_null_mask(col_name, actual_start, actual_count);
             let has_nulls = null_mask.iter().any(|&is_null| is_null);
-            
+
             // Use remove() to take ownership and avoid clone
             if let Some(data) = col_data.remove(col_name) {
                 let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
                     ColumnData::Int64(values) => {
                         // Apply null mask if there are any nulls
                         if has_nulls {
-                            let with_nulls: Vec<Option<i64>> = values.into_iter()
+                            let with_nulls: Vec<Option<i64>> = values
+                                .into_iter()
                                 .enumerate()
-                                .map(|(i, v)| if i < null_mask.len() && null_mask[i] { None } else { Some(v) })
+                                .map(|(i, v)| {
+                                    if i < null_mask.len() && null_mask[i] {
+                                        None
+                                    } else {
+                                        Some(v)
+                                    }
+                                })
                                 .collect();
                             (ArrowDataType::Int64, Arc::new(Int64Array::from(with_nulls)))
                         } else if values.len() < expected_row_count {
-                            let mut padded: Vec<Option<i64>> = values.into_iter().map(Some).collect();
-                            padded.extend(std::iter::repeat(None).take(expected_row_count - padded.len()));
+                            let mut padded: Vec<Option<i64>> =
+                                values.into_iter().map(Some).collect();
+                            padded.extend(
+                                std::iter::repeat(None).take(expected_row_count - padded.len()),
+                            );
                             (ArrowDataType::Int64, Arc::new(Int64Array::from(padded)))
                         } else if values.len() > expected_row_count {
-                            let truncated: Vec<i64> = values.into_iter().take(expected_row_count).collect();
+                            let truncated: Vec<i64> =
+                                values.into_iter().take(expected_row_count).collect();
                             (ArrowDataType::Int64, Arc::new(Int64Array::from(truncated)))
                         } else {
                             (ArrowDataType::Int64, Arc::new(Int64Array::from(values)))
@@ -1441,26 +1588,46 @@ impl TableStorageBackend {
                     }
                     ColumnData::Float64(values) => {
                         if has_nulls {
-                            let with_nulls: Vec<Option<f64>> = values.into_iter()
+                            let with_nulls: Vec<Option<f64>> = values
+                                .into_iter()
                                 .enumerate()
-                                .map(|(i, v)| if i < null_mask.len() && null_mask[i] { None } else { Some(v) })
+                                .map(|(i, v)| {
+                                    if i < null_mask.len() && null_mask[i] {
+                                        None
+                                    } else {
+                                        Some(v)
+                                    }
+                                })
                                 .collect();
-                            (ArrowDataType::Float64, Arc::new(Float64Array::from(with_nulls)))
+                            (
+                                ArrowDataType::Float64,
+                                Arc::new(Float64Array::from(with_nulls)),
+                            )
                         } else if values.len() < expected_row_count {
-                            let mut padded: Vec<Option<f64>> = values.into_iter().map(Some).collect();
-                            padded.extend(std::iter::repeat(None).take(expected_row_count - padded.len()));
+                            let mut padded: Vec<Option<f64>> =
+                                values.into_iter().map(Some).collect();
+                            padded.extend(
+                                std::iter::repeat(None).take(expected_row_count - padded.len()),
+                            );
                             (ArrowDataType::Float64, Arc::new(Float64Array::from(padded)))
                         } else if values.len() > expected_row_count {
-                            let truncated: Vec<f64> = values.into_iter().take(expected_row_count).collect();
-                            (ArrowDataType::Float64, Arc::new(Float64Array::from(truncated)))
+                            let truncated: Vec<f64> =
+                                values.into_iter().take(expected_row_count).collect();
+                            (
+                                ArrowDataType::Float64,
+                                Arc::new(Float64Array::from(truncated)),
+                            )
                         } else {
                             (ArrowDataType::Float64, Arc::new(Float64Array::from(values)))
                         }
                     }
-                    ColumnData::String { offsets, data: bytes } => {
+                    ColumnData::String {
+                        offsets,
+                        data: bytes,
+                    } => {
                         // Build StringArray with null mask support
                         let count = offsets.len().saturating_sub(1);
-                        
+
                         // Always use the path that supports nulls when has_nulls is true
                         let strings: Vec<Option<String>> = (0..count.min(expected_row_count))
                             .map(|i| {
@@ -1475,10 +1642,12 @@ impl TableStorageBackend {
                                     .map(|s| s.to_string())
                             })
                             .collect();
-                        
+
                         if strings.len() < expected_row_count {
                             let mut owned = strings;
-                            owned.extend(std::iter::repeat(None).take(expected_row_count - owned.len()));
+                            owned.extend(
+                                std::iter::repeat(None).take(expected_row_count - owned.len()),
+                            );
                             (ArrowDataType::Utf8, Arc::new(StringArray::from(owned)))
                         } else {
                             (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
@@ -1493,17 +1662,25 @@ impl TableStorageBackend {
                                 }
                                 let byte_idx = i / 8;
                                 let bit_idx = i % 8;
-                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                                Some(
+                                    byte_idx < packed.len()
+                                        && (packed[byte_idx] >> bit_idx) & 1 == 1,
+                                )
                             })
                             .collect();
                         if bools.len() < expected_row_count {
-                            bools.extend(std::iter::repeat(None).take(expected_row_count - bools.len()));
+                            bools.extend(
+                                std::iter::repeat(None).take(expected_row_count - bools.len()),
+                            );
                         } else if bools.len() > expected_row_count {
                             bools.truncate(expected_row_count);
                         }
                         (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
                     }
-                    ColumnData::Binary { offsets, data: bytes } => {
+                    ColumnData::Binary {
+                        offsets,
+                        data: bytes,
+                    } => {
                         use arrow::array::BinaryArray;
                         let count = offsets.len().saturating_sub(1);
                         let binary_data: Vec<Option<&[u8]>> = (0..count)
@@ -1515,28 +1692,43 @@ impl TableStorageBackend {
                             .collect();
                         if binary_data.len() < expected_row_count {
                             // Need owned data for padding
-                            let mut owned: Vec<Option<Vec<u8>>> = binary_data.into_iter()
+                            let mut owned: Vec<Option<Vec<u8>>> = binary_data
+                                .into_iter()
                                 .map(|b| b.map(|s| s.to_vec()))
                                 .collect();
-                            owned.extend(std::iter::repeat(None).take(expected_row_count - owned.len()));
-                            let refs: Vec<Option<&[u8]>> = owned.iter()
+                            owned.extend(
+                                std::iter::repeat(None).take(expected_row_count - owned.len()),
+                            );
+                            let refs: Vec<Option<&[u8]>> = owned
+                                .iter()
                                 .map(|o| o.as_ref().map(|v| v.as_slice()))
                                 .collect();
                             (ArrowDataType::Binary, Arc::new(BinaryArray::from(refs)))
                         } else if binary_data.len() > expected_row_count {
                             // Truncate to expected row count
-                            let truncated: Vec<Option<&[u8]>> = binary_data.into_iter().take(expected_row_count).collect();
-                            (ArrowDataType::Binary, Arc::new(BinaryArray::from(truncated)))
+                            let truncated: Vec<Option<&[u8]>> =
+                                binary_data.into_iter().take(expected_row_count).collect();
+                            (
+                                ArrowDataType::Binary,
+                                Arc::new(BinaryArray::from(truncated)),
+                            )
                         } else {
-                            (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                            (
+                                ArrowDataType::Binary,
+                                Arc::new(BinaryArray::from(binary_data)),
+                            )
                         }
                     }
-                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                    ColumnData::StringDict {
+                        indices,
+                        dict_offsets,
+                        dict_data,
+                    } => {
                         // OPTIMIZATION: Use Arrow DictionaryArray to preserve dictionary encoding
                         // This avoids string decoding and allows executor to use indices directly
                         use arrow::array::{DictionaryArray, UInt32Array};
                         use arrow::datatypes::UInt32Type;
-                        
+
                         // Build dictionary values (unique strings)
                         let dict_count = dict_offsets.len().saturating_sub(1);
                         let dict_strings: Vec<Option<&str>> = (0..dict_count)
@@ -1547,33 +1739,47 @@ impl TableStorageBackend {
                             })
                             .collect();
                         let values = StringArray::from(dict_strings);
-                        
+
                         // Convert indices (0 = NULL, 1+ = dict index)
                         // Arrow DictionaryArray uses 0-based indices, NULL is separate
                         // Truncate or pad indices to match expected_row_count
                         let keys: Vec<Option<u32>> = if indices.len() > expected_row_count {
-                            indices.iter().take(expected_row_count)
+                            indices
+                                .iter()
+                                .take(expected_row_count)
                                 .map(|&idx| if idx == 0 { None } else { Some(idx - 1) })
                                 .collect()
                         } else if indices.len() < expected_row_count {
-                            let mut keys: Vec<Option<u32>> = indices.iter()
+                            let mut keys: Vec<Option<u32>> = indices
+                                .iter()
                                 .map(|&idx| if idx == 0 { None } else { Some(idx - 1) })
                                 .collect();
-                            keys.extend(std::iter::repeat(None).take(expected_row_count - keys.len()));
+                            keys.extend(
+                                std::iter::repeat(None).take(expected_row_count - keys.len()),
+                            );
                             keys
                         } else {
-                            indices.iter()
+                            indices
+                                .iter()
                                 .map(|&idx| if idx == 0 { None } else { Some(idx - 1) })
                                 .collect()
                         };
                         let keys_array = UInt32Array::from(keys);
-                        
+
                         // Create DictionaryArray
-                        let dict_array = DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                        
-                        (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)), 
-                         Arc::new(dict_array) as ArrayRef)
+                        let dict_array =
+                            DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
+                                .map_err(|e| {
+                                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                                })?;
+
+                        (
+                            ArrowDataType::Dictionary(
+                                Box::new(ArrowDataType::UInt32),
+                                Box::new(ArrowDataType::Utf8),
+                            ),
+                            Arc::new(dict_array) as ArrayRef,
+                        )
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(&data, dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(&data, dim),
@@ -1603,26 +1809,36 @@ impl TableStorageBackend {
         filter_op: &str,
         filter_value: f64,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
-        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
         let (col_data, matching_indices) = self.storage.read_columns_filtered(
-            column_names, filter_column, filter_op, filter_value
+            column_names,
+            filter_column,
+            filter_op,
+            filter_value,
         )?;
-        
+
         if col_data.is_empty() || matching_indices.is_empty() {
             // Return empty batch with proper schema
             let schema = self.schema.read();
-            let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+            let include_id = column_names
+                .map(|cols| cols.contains(&"_id"))
+                .unwrap_or(true);
             let mut fields: Vec<Field> = Vec::new();
             if include_id {
                 fields.push(Field::new("_id", ArrowDataType::Int64, false));
             }
             for (name, dt) in schema.iter() {
-                if column_names.map(|cols| cols.contains(&name.as_str())).unwrap_or(true) {
+                if column_names
+                    .map(|cols| cols.contains(&name.as_str()))
+                    .unwrap_or(true)
+                {
                     let arrow_dt = match dt {
-                        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => ArrowDataType::Int64,
+                        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
+                            ArrowDataType::Int64
+                        }
                         DataType::Float64 | DataType::Float32 => ArrowDataType::Float64,
                         DataType::String => ArrowDataType::Utf8,
                         DataType::Bool => ArrowDataType::Boolean,
@@ -1642,7 +1858,9 @@ impl TableStorageBackend {
         let expected_row_count = matching_indices.len();
 
         // Include _id column with filtered indices
-        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        let include_id = column_names
+            .map(|cols| cols.contains(&"_id"))
+            .unwrap_or(true);
         if include_id {
             // OPTIMIZED: Read only the IDs we need instead of all IDs
             let filtered_ids = self.storage.read_ids_by_indices(&matching_indices)?;
@@ -1652,7 +1870,11 @@ impl TableStorageBackend {
 
         // Determine column order
         let col_order: Vec<String> = if let Some(names) = column_names {
-            names.iter().filter(|&s| *s != "_id").map(|s| s.to_string()).collect()
+            names
+                .iter()
+                .filter(|&s| *s != "_id")
+                .map(|s| s.to_string())
+                .collect()
         } else {
             schema.iter().map(|(n, _)| n.clone()).collect()
         };
@@ -1660,13 +1882,18 @@ impl TableStorageBackend {
         for col_name in &col_order {
             if let Some(data) = col_data.get(col_name) {
                 let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
-                    ColumnData::Int64(values) => {
-                        (ArrowDataType::Int64, Arc::new(Int64Array::from_iter_values(values.iter().copied())))
-                    }
-                    ColumnData::Float64(values) => {
-                        (ArrowDataType::Float64, Arc::new(Float64Array::from_iter_values(values.iter().copied())))
-                    }
-                    ColumnData::String { offsets, data: bytes } => {
+                    ColumnData::Int64(values) => (
+                        ArrowDataType::Int64,
+                        Arc::new(Int64Array::from_iter_values(values.iter().copied())),
+                    ),
+                    ColumnData::Float64(values) => (
+                        ArrowDataType::Float64,
+                        Arc::new(Float64Array::from_iter_values(values.iter().copied())),
+                    ),
+                    ColumnData::String {
+                        offsets,
+                        data: bytes,
+                    } => {
                         let count = offsets.len().saturating_sub(1);
                         let strings: Vec<Option<&str>> = (0..count)
                             .map(|i| {
@@ -1682,12 +1909,18 @@ impl TableStorageBackend {
                             .map(|i| {
                                 let byte_idx = i / 8;
                                 let bit_idx = i % 8;
-                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                                Some(
+                                    byte_idx < packed.len()
+                                        && (packed[byte_idx] >> bit_idx) & 1 == 1,
+                                )
                             })
                             .collect();
                         (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
                     }
-                    ColumnData::Binary { offsets, data: bytes } => {
+                    ColumnData::Binary {
+                        offsets,
+                        data: bytes,
+                    } => {
                         use arrow::array::BinaryArray;
                         let count = offsets.len().saturating_sub(1);
                         let binary_data: Vec<Option<&[u8]>> = (0..count)
@@ -1697,18 +1930,32 @@ impl TableStorageBackend {
                                 Some(&bytes[start..end] as &[u8])
                             })
                             .collect();
-                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                        (
+                            ArrowDataType::Binary,
+                            Arc::new(BinaryArray::from(binary_data)),
+                        )
                     }
-                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
-                        let strings: Vec<Option<String>> = indices.iter()
+                    ColumnData::StringDict {
+                        indices,
+                        dict_offsets,
+                        dict_data,
+                    } => {
+                        let strings: Vec<Option<String>> = indices
+                            .iter()
                             .map(|&idx| {
-                                if idx == 0 { None } else {
+                                if idx == 0 {
+                                    None
+                                } else {
                                     let dict_idx = (idx - 1) as usize;
                                     if dict_idx + 1 < dict_offsets.len() {
                                         let start = dict_offsets[dict_idx] as usize;
                                         let end = dict_offsets[dict_idx + 1] as usize;
-                                        std::str::from_utf8(&dict_data[start..end]).ok().map(|s| s.to_string())
-                                    } else { None }
+                                        std::str::from_utf8(&dict_data[start..end])
+                                            .ok()
+                                            .map(|s| s.to_string())
+                                    } else {
+                                        None
+                                    }
                                 }
                             })
                             .collect();
@@ -1735,8 +1982,8 @@ impl TableStorageBackend {
         row_indices: &[usize],
         col_refs: Option<&[&str]>,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
-        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
         if row_indices.is_empty() {
@@ -1745,7 +1992,10 @@ impl TableStorageBackend {
 
         // V4: use mmap indexed extraction when available (faster than full-table read + take)
         if self.storage.is_v4_format() {
-            if let Some(batch) = self.storage.extract_rows_by_indices_to_arrow(row_indices, col_refs)? {
+            if let Some(batch) = self
+                .storage
+                .extract_rows_by_indices_to_arrow(row_indices, col_refs)?
+            {
                 return Ok(batch);
             }
             // Fallback (extraction returned None) — load full table
@@ -1754,11 +2004,15 @@ impl TableStorageBackend {
                 return Ok(full_batch);
             }
             let indices_arr = arrow::array::UInt32Array::from(
-                row_indices.iter().map(|&i| i as u32).collect::<Vec<_>>()
+                row_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
             );
-            let taken_columns: Vec<ArrayRef> = full_batch.columns().iter()
-                .map(|col| arrow::compute::take(col.as_ref(), &indices_arr, None)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())))
+            let taken_columns: Vec<ArrayRef> = full_batch
+                .columns()
+                .iter()
+                .map(|col| {
+                    arrow::compute::take(col.as_ref(), &indices_arr, None)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                })
                 .collect::<io::Result<Vec<_>>>()?;
             return arrow::record_batch::RecordBatch::try_new(full_batch.schema(), taken_columns)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
@@ -1775,9 +2029,8 @@ impl TableStorageBackend {
         arrays.push(Arc::new(Int64Array::from(filtered_ids)));
 
         // Build column filter set if col_refs provided
-        let col_set: Option<std::collections::HashSet<&str>> = col_refs.map(|refs| {
-            refs.iter().copied().collect()
-        });
+        let col_set: Option<std::collections::HashSet<&str>> =
+            col_refs.map(|refs| refs.iter().copied().collect());
 
         // Read each column for the specified row indices
         for (col_name, _dt) in schema.iter() {
@@ -1787,7 +2040,7 @@ impl TableStorageBackend {
                 }
             }
             let col_data = self.storage.read_column_by_indices(col_name, row_indices)?;
-            
+
             let (arrow_dt, array): (ArrowDataType, ArrayRef) = match col_data {
                 ColumnData::Int64(values) => {
                     (ArrowDataType::Int64, Arc::new(Int64Array::from(values)))
@@ -1795,7 +2048,10 @@ impl TableStorageBackend {
                 ColumnData::Float64(values) => {
                     (ArrowDataType::Float64, Arc::new(Float64Array::from(values)))
                 }
-                ColumnData::String { offsets, data: bytes } => {
+                ColumnData::String {
+                    offsets,
+                    data: bytes,
+                } => {
                     let count = offsets.len().saturating_sub(1);
                     let strings: Vec<Option<&str>> = (0..count)
                         .map(|i| {
@@ -1816,7 +2072,10 @@ impl TableStorageBackend {
                         .collect();
                     (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
                 }
-                ColumnData::Binary { offsets, data: bytes } => {
+                ColumnData::Binary {
+                    offsets,
+                    data: bytes,
+                } => {
                     use arrow::array::BinaryArray;
                     let count = offsets.len().saturating_sub(1);
                     let binary_data: Vec<Option<&[u8]>> = (0..count)
@@ -1826,18 +2085,32 @@ impl TableStorageBackend {
                             Some(&bytes[start..end] as &[u8])
                         })
                         .collect();
-                    (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    (
+                        ArrowDataType::Binary,
+                        Arc::new(BinaryArray::from(binary_data)),
+                    )
                 }
-                ColumnData::StringDict { indices, dict_offsets, dict_data } => {
-                    let strings: Vec<Option<String>> = indices.iter()
+                ColumnData::StringDict {
+                    indices,
+                    dict_offsets,
+                    dict_data,
+                } => {
+                    let strings: Vec<Option<String>> = indices
+                        .iter()
                         .map(|&idx| {
-                            if idx == 0 { None } else {
+                            if idx == 0 {
+                                None
+                            } else {
                                 let dict_idx = (idx - 1) as usize;
                                 if dict_idx + 1 < dict_offsets.len() {
                                     let start = dict_offsets[dict_idx] as usize;
                                     let end = dict_offsets[dict_idx + 1] as usize;
-                                    std::str::from_utf8(&dict_data[start..end]).ok().map(|s| s.to_string())
-                                } else { None }
+                                    std::str::from_utf8(&dict_data[start..end])
+                                        .ok()
+                                        .map(|s| s.to_string())
+                                } else {
+                                    None
+                                }
                             }
                         })
                         .collect();
@@ -1846,7 +2119,7 @@ impl TableStorageBackend {
                 ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(&data, dim),
                 ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(&data, dim),
             };
-            
+
             fields.push(Field::new(col_name, arrow_dt, true));
             arrays.push(array);
         }
@@ -1858,11 +2131,14 @@ impl TableStorageBackend {
 
     /// OPTIMIZED: Read a single row by ID using O(1) index lookup
     /// Much faster than WHERE _id = X which scans all data
-    pub fn read_row_by_id_to_arrow(&self, id: u64) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
-        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
-        use std::sync::Arc;
+    pub fn read_row_by_id_to_arrow(
+        &self,
+        id: u64,
+    ) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
         use crate::data::DataType;
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use std::sync::Arc;
 
         // V4 mmap-only: user-space page cache path — avoids mmap page faults and hash map build.
         // retrieve_rcix reads field values using cached 4KB pages (~50ns/page after warmup).
@@ -1874,16 +2150,37 @@ impl TableStorageBackend {
                 let mut arrays: Vec<ArrayRef> = Vec::with_capacity(row_vals.len());
                 for (col_name, val) in &row_vals {
                     let (dt, arr): (ArrowDataType, ArrayRef) = match val {
-                        Value::Int64(v) => (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![*v]))),
-                        Value::Float64(v) => (ArrowDataType::Float64, Arc::new(Float64Array::from(vec![*v]))),
-                        Value::String(s) => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![s.as_str()]))),
-                        Value::Bool(b) => (ArrowDataType::Boolean, Arc::new(BooleanArray::from(vec![*b]))),
+                        Value::Int64(v) => {
+                            (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![*v])))
+                        }
+                        Value::Float64(v) => (
+                            ArrowDataType::Float64,
+                            Arc::new(Float64Array::from(vec![*v])),
+                        ),
+                        Value::String(s) => (
+                            ArrowDataType::Utf8,
+                            Arc::new(StringArray::from(vec![s.as_str()])),
+                        ),
+                        Value::Bool(b) => (
+                            ArrowDataType::Boolean,
+                            Arc::new(BooleanArray::from(vec![*b])),
+                        ),
                         Value::Binary(bytes) => {
                             use arrow::array::BinaryArray;
-                            (ArrowDataType::Binary, Arc::new(BinaryArray::from(vec![Some(bytes.as_slice())])) as ArrayRef)
+                            (
+                                ArrowDataType::Binary,
+                                Arc::new(BinaryArray::from(vec![Some(bytes.as_slice())]))
+                                    as ArrayRef,
+                            )
                         }
-                        Value::Null => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![None as Option<&str>]))),
-                        _ => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![None as Option<&str>]))),
+                        Value::Null => (
+                            ArrowDataType::Utf8,
+                            Arc::new(StringArray::from(vec![None as Option<&str>])),
+                        ),
+                        _ => (
+                            ArrowDataType::Utf8,
+                            Arc::new(StringArray::from(vec![None as Option<&str>])),
+                        ),
                     };
                     let nullable = matches!(val, Value::Null);
                     fields.push(Field::new(col_name, dt, nullable));
@@ -1912,15 +2209,22 @@ impl TableStorageBackend {
 
         // Add other columns in schema order - ensure all have length 1
         for (col_name, dt) in schema.iter() {
-            let (arrow_dt, array): (ArrowDataType, ArrayRef) = if let Some(col_data) = row_data.get(col_name) {
+            let (arrow_dt, array): (ArrowDataType, ArrayRef) = if let Some(col_data) =
+                row_data.get(col_name)
+            {
                 match col_data {
-                    ColumnData::Int64(values) if !values.is_empty() => {
-                        (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![values[0]])))
-                    }
-                    ColumnData::Float64(values) if !values.is_empty() => {
-                        (ArrowDataType::Float64, Arc::new(Float64Array::from(vec![values[0]])))
-                    }
-                    ColumnData::String { offsets, data: bytes } if offsets.len() > 1 => {
+                    ColumnData::Int64(values) if !values.is_empty() => (
+                        ArrowDataType::Int64,
+                        Arc::new(Int64Array::from(vec![values[0]])),
+                    ),
+                    ColumnData::Float64(values) if !values.is_empty() => (
+                        ArrowDataType::Float64,
+                        Arc::new(Float64Array::from(vec![values[0]])),
+                    ),
+                    ColumnData::String {
+                        offsets,
+                        data: bytes,
+                    } if offsets.len() > 1 => {
                         let start = offsets[0] as usize;
                         let end = offsets[1] as usize;
                         let s = std::str::from_utf8(&bytes[start..end]).ok();
@@ -1928,23 +2232,42 @@ impl TableStorageBackend {
                     }
                     ColumnData::Bool { data: packed, len } if *len > 0 => {
                         let val = !packed.is_empty() && (packed[0] & 1) == 1;
-                        (ArrowDataType::Boolean, Arc::new(BooleanArray::from(vec![Some(val)])))
+                        (
+                            ArrowDataType::Boolean,
+                            Arc::new(BooleanArray::from(vec![Some(val)])),
+                        )
                     }
-                    ColumnData::Binary { offsets, data: bytes } if offsets.len() > 1 => {
+                    ColumnData::Binary {
+                        offsets,
+                        data: bytes,
+                    } if offsets.len() > 1 => {
                         use arrow::array::BinaryArray;
                         let start = offsets[0] as usize;
                         let end = offsets[1] as usize;
-                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(vec![Some(&bytes[start..end] as &[u8])])))
+                        (
+                            ArrowDataType::Binary,
+                            Arc::new(BinaryArray::from(vec![Some(&bytes[start..end] as &[u8])])),
+                        )
                     }
-                    ColumnData::StringDict { indices, dict_offsets, dict_data } if !indices.is_empty() => {
+                    ColumnData::StringDict {
+                        indices,
+                        dict_offsets,
+                        dict_data,
+                    } if !indices.is_empty() => {
                         let idx = indices[0];
-                        let s = if idx == 0 { None } else {
+                        let s = if idx == 0 {
+                            None
+                        } else {
                             let dict_idx = (idx - 1) as usize;
                             if dict_idx + 1 < dict_offsets.len() {
                                 let start = dict_offsets[dict_idx] as usize;
                                 let end = dict_offsets[dict_idx + 1] as usize;
-                                std::str::from_utf8(&dict_data[start..end]).ok().map(|s| s.to_string())
-                            } else { None }
+                                std::str::from_utf8(&dict_data[start..end])
+                                    .ok()
+                                    .map(|s| s.to_string())
+                            } else {
+                                None
+                            }
                         };
                         (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![s])))
                     }
@@ -1969,12 +2292,15 @@ impl TableStorageBackend {
     /// Fast path: retrieve_many_mmap (one footer lock + one mmap slice per RG).
     /// Fallback: per-ID retrieve_rcix loop (for non-RCIX files).
     /// Returns a RecordBatch with all found rows (in original ID order, missing IDs skipped).
-    pub fn read_rows_by_ids_to_arrow(&self, ids: &[u64]) -> io::Result<arrow::record_batch::RecordBatch> {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
-        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+    pub fn read_rows_by_ids_to_arrow(
+        &self,
+        ids: &[u64],
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        use crate::data::Value;
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use std::sync::Arc;
-        use crate::data::Value;
 
         if ids.is_empty() {
             let schema = Arc::new(Schema::new(Vec::<Field>::new()));
@@ -1997,9 +2323,11 @@ impl TableStorageBackend {
         }
 
         if all_rows.is_empty() {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("_id", ArrowDataType::Int64, false)
-            ]));
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "_id",
+                ArrowDataType::Int64,
+                false,
+            )]));
             return Ok(RecordBatch::new_empty(schema));
         }
 
@@ -2055,8 +2383,14 @@ impl TableStorageBackend {
                         }
                         (ArrowDataType::Boolean, Arc::new(BooleanArray::from(values)))
                     }
-                    Value::Null => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![""; num_rows]))),
-                    _ => (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![""; num_rows]))),
+                    Value::Null => (
+                        ArrowDataType::Utf8,
+                        Arc::new(StringArray::from(vec![""; num_rows])),
+                    ),
+                    _ => (
+                        ArrowDataType::Utf8,
+                        Arc::new(StringArray::from(vec![""; num_rows])),
+                    ),
                 }
             };
             fields.push(Field::new(col_name, arrow_dt, false));
@@ -2070,26 +2404,38 @@ impl TableStorageBackend {
     }
 
     /// Create a typed null array with a single null value
-    fn create_typed_null_array(dt: &crate::data::DataType) -> (arrow::datatypes::DataType, arrow::array::ArrayRef) {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
+    fn create_typed_null_array(
+        dt: &crate::data::DataType,
+    ) -> (arrow::datatypes::DataType, arrow::array::ArrayRef) {
+        use crate::data::DataType;
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
         use arrow::datatypes::DataType as ArrowDataType;
         use std::sync::Arc;
-        use crate::data::DataType;
 
         match dt {
-            DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 |
-            DataType::UInt64 | DataType::UInt32 | DataType::UInt16 | DataType::UInt8 => {
-                (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![None as Option<i64>])) as ArrayRef)
-            }
-            DataType::Float64 | DataType::Float32 => {
-                (ArrowDataType::Float64, Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef)
-            }
-            DataType::Bool => {
-                (ArrowDataType::Boolean, Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef)
-            }
-            DataType::String | _ => {
-                (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef)
-            }
+            DataType::Int64
+            | DataType::Int32
+            | DataType::Int16
+            | DataType::Int8
+            | DataType::UInt64
+            | DataType::UInt32
+            | DataType::UInt16
+            | DataType::UInt8 => (
+                ArrowDataType::Int64,
+                Arc::new(Int64Array::from(vec![None as Option<i64>])) as ArrayRef,
+            ),
+            DataType::Float64 | DataType::Float32 => (
+                ArrowDataType::Float64,
+                Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef,
+            ),
+            DataType::Bool => (
+                ArrowDataType::Boolean,
+                Arc::new(BooleanArray::from(vec![None as Option<bool>])) as ArrayRef,
+            ),
+            DataType::String | _ => (
+                ArrowDataType::Utf8,
+                Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef,
+            ),
         }
     }
 
@@ -2102,8 +2448,8 @@ impl TableStorageBackend {
         filter_value: &str,
         filter_eq: bool,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
-        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
         // FAST PATH: mmap-native string equality scan + late materialization.
@@ -2111,7 +2457,9 @@ impl TableStorageBackend {
         // Works for cold backends — scan_string_filter_mmap loads the footer lazily.
         // Skip when there is in-memory data not yet flushed (would miss pending writes).
         if filter_eq && !self.has_pending_deltas() {
-            let scan_res = self.storage.scan_string_filter_mmap(filter_column, filter_value, None)?;
+            let scan_res =
+                self.storage
+                    .scan_string_filter_mmap(filter_column, filter_value, None)?;
             if let Some(indices) = scan_res {
                 if indices.is_empty() {
                     return self.read_columns_to_arrow(column_names, 0, Some(0));
@@ -2135,7 +2483,8 @@ impl TableStorageBackend {
                         cmp::eq(str_arr, &scalar)
                     } else {
                         cmp::neq(str_arr, &scalar)
-                    }.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    }
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     let filtered = arrow::compute::filter_record_batch(&full_batch, &mask)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     return Ok(filtered);
@@ -2145,9 +2494,12 @@ impl TableStorageBackend {
         }
 
         let (col_data, matching_indices) = self.storage.read_columns_filtered_string(
-            column_names, filter_column, filter_value, filter_eq
+            column_names,
+            filter_column,
+            filter_value,
+            filter_eq,
         )?;
-        
+
         if col_data.is_empty() || matching_indices.is_empty() {
             // Return empty batch with proper schema
             return self.read_columns_to_arrow(column_names, 0, Some(0));
@@ -2158,7 +2510,9 @@ impl TableStorageBackend {
         let mut arrays: Vec<ArrayRef> = Vec::new();
 
         // Include _id column with filtered indices
-        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        let include_id = column_names
+            .map(|cols| cols.contains(&"_id"))
+            .unwrap_or(true);
         if include_id {
             // OPTIMIZED: Read only the IDs we need instead of all IDs
             let filtered_ids = self.storage.read_ids_by_indices(&matching_indices)?;
@@ -2168,7 +2522,11 @@ impl TableStorageBackend {
 
         // Determine column order
         let col_order: Vec<String> = if let Some(names) = column_names {
-            names.iter().filter(|&s| *s != "_id").map(|s| s.to_string()).collect()
+            names
+                .iter()
+                .filter(|&s| *s != "_id")
+                .map(|s| s.to_string())
+                .collect()
         } else {
             schema.iter().map(|(n, _)| n.clone()).collect()
         };
@@ -2176,13 +2534,18 @@ impl TableStorageBackend {
         for col_name in &col_order {
             if let Some(data) = col_data.get(col_name) {
                 let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
-                    ColumnData::Int64(values) => {
-                        (ArrowDataType::Int64, Arc::new(Int64Array::from_iter_values(values.iter().copied())))
-                    }
-                    ColumnData::Float64(values) => {
-                        (ArrowDataType::Float64, Arc::new(Float64Array::from_iter_values(values.iter().copied())))
-                    }
-                    ColumnData::String { offsets, data: bytes } => {
+                    ColumnData::Int64(values) => (
+                        ArrowDataType::Int64,
+                        Arc::new(Int64Array::from_iter_values(values.iter().copied())),
+                    ),
+                    ColumnData::Float64(values) => (
+                        ArrowDataType::Float64,
+                        Arc::new(Float64Array::from_iter_values(values.iter().copied())),
+                    ),
+                    ColumnData::String {
+                        offsets,
+                        data: bytes,
+                    } => {
                         let count = offsets.len().saturating_sub(1);
                         let strings: Vec<Option<&str>> = (0..count)
                             .map(|i| {
@@ -2198,12 +2561,18 @@ impl TableStorageBackend {
                             .map(|i| {
                                 let byte_idx = i / 8;
                                 let bit_idx = i % 8;
-                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                                Some(
+                                    byte_idx < packed.len()
+                                        && (packed[byte_idx] >> bit_idx) & 1 == 1,
+                                )
                             })
                             .collect();
                         (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
                     }
-                    ColumnData::Binary { offsets, data: bytes } => {
+                    ColumnData::Binary {
+                        offsets,
+                        data: bytes,
+                    } => {
                         use arrow::array::BinaryArray;
                         let count = offsets.len().saturating_sub(1);
                         let binary_data: Vec<Option<&[u8]>> = (0..count)
@@ -2213,18 +2582,32 @@ impl TableStorageBackend {
                                 Some(&bytes[start..end] as &[u8])
                             })
                             .collect();
-                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                        (
+                            ArrowDataType::Binary,
+                            Arc::new(BinaryArray::from(binary_data)),
+                        )
                     }
-                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
-                        let strings: Vec<Option<String>> = indices.iter()
+                    ColumnData::StringDict {
+                        indices,
+                        dict_offsets,
+                        dict_data,
+                    } => {
+                        let strings: Vec<Option<String>> = indices
+                            .iter()
                             .map(|&idx| {
-                                if idx == 0 { None } else {
+                                if idx == 0 {
+                                    None
+                                } else {
                                     let dict_idx = (idx - 1) as usize;
                                     if dict_idx + 1 < dict_offsets.len() {
                                         let start = dict_offsets[dict_idx] as usize;
                                         let end = dict_offsets[dict_idx + 1] as usize;
-                                        std::str::from_utf8(&dict_data[start..end]).ok().map(|s| s.to_string())
-                                    } else { None }
+                                        std::str::from_utf8(&dict_data[start..end])
+                                            .ok()
+                                            .map(|s| s.to_string())
+                                    } else {
+                                        None
+                                    }
                                 }
                             })
                             .collect();
@@ -2243,7 +2626,7 @@ impl TableStorageBackend {
         arrow::record_batch::RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
-    
+
     /// Read columns with STRING predicate pushdown and LIMIT early termination
     /// Much faster for queries like SELECT * WHERE col = 'value' LIMIT n
     pub fn read_columns_filtered_string_with_limit_to_arrow(
@@ -2255,8 +2638,8 @@ impl TableStorageBackend {
         limit: usize,
         offset: usize,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
-        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
         // V4 mmap-only: fall back to full batch read + Arrow filter
@@ -2267,9 +2650,18 @@ impl TableStorageBackend {
             }
             if let Some(col) = full_batch.column_by_name(filter_column) {
                 if let Some(str_arr) = col.as_any().downcast_ref::<StringArray>() {
-                    let mask: arrow::array::BooleanArray = str_arr.iter().map(|v| {
-                        v.map(|s| if filter_eq { s == filter_value } else { s != filter_value })
-                    }).collect();
+                    let mask: arrow::array::BooleanArray = str_arr
+                        .iter()
+                        .map(|v| {
+                            v.map(|s| {
+                                if filter_eq {
+                                    s == filter_value
+                                } else {
+                                    s != filter_value
+                                }
+                            })
+                        })
+                        .collect();
                     let filtered = arrow::compute::filter_record_batch(&full_batch, &mask)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     // Apply offset + limit
@@ -2282,9 +2674,14 @@ impl TableStorageBackend {
         }
 
         let (col_data, matching_indices) = self.storage.read_columns_filtered_string_with_limit(
-            column_names, filter_column, filter_value, filter_eq, limit, offset
+            column_names,
+            filter_column,
+            filter_value,
+            filter_eq,
+            limit,
+            offset,
         )?;
-        
+
         if col_data.is_empty() || matching_indices.is_empty() {
             return self.read_columns_to_arrow(column_names, 0, Some(0));
         }
@@ -2293,7 +2690,9 @@ impl TableStorageBackend {
         let mut fields: Vec<Field> = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
 
-        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        let include_id = column_names
+            .map(|cols| cols.contains(&"_id"))
+            .unwrap_or(true);
         if include_id {
             // OPTIMIZED: Read only the IDs we need instead of all IDs
             let filtered_ids = self.storage.read_ids_by_indices(&matching_indices)?;
@@ -2302,7 +2701,11 @@ impl TableStorageBackend {
         }
 
         let col_order: Vec<String> = if let Some(names) = column_names {
-            names.iter().filter(|&s| *s != "_id").map(|s| s.to_string()).collect()
+            names
+                .iter()
+                .filter(|&s| *s != "_id")
+                .map(|s| s.to_string())
+                .collect()
         } else {
             schema.iter().map(|(n, _)| n.clone()).collect()
         };
@@ -2310,13 +2713,18 @@ impl TableStorageBackend {
         for col_name in &col_order {
             if let Some(data) = col_data.get(col_name) {
                 let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
-                    ColumnData::Int64(values) => {
-                        (ArrowDataType::Int64, Arc::new(Int64Array::from_iter_values(values.iter().copied())))
-                    }
-                    ColumnData::Float64(values) => {
-                        (ArrowDataType::Float64, Arc::new(Float64Array::from_iter_values(values.iter().copied())))
-                    }
-                    ColumnData::String { offsets, data: bytes } => {
+                    ColumnData::Int64(values) => (
+                        ArrowDataType::Int64,
+                        Arc::new(Int64Array::from_iter_values(values.iter().copied())),
+                    ),
+                    ColumnData::Float64(values) => (
+                        ArrowDataType::Float64,
+                        Arc::new(Float64Array::from_iter_values(values.iter().copied())),
+                    ),
+                    ColumnData::String {
+                        offsets,
+                        data: bytes,
+                    } => {
                         let count = offsets.len().saturating_sub(1);
                         let strings: Vec<Option<&str>> = (0..count)
                             .map(|i| {
@@ -2332,12 +2740,18 @@ impl TableStorageBackend {
                             .map(|i| {
                                 let byte_idx = i / 8;
                                 let bit_idx = i % 8;
-                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                                Some(
+                                    byte_idx < packed.len()
+                                        && (packed[byte_idx] >> bit_idx) & 1 == 1,
+                                )
                             })
                             .collect();
                         (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
                     }
-                    ColumnData::Binary { offsets, data: bytes } => {
+                    ColumnData::Binary {
+                        offsets,
+                        data: bytes,
+                    } => {
                         use arrow::array::BinaryArray;
                         let count = offsets.len().saturating_sub(1);
                         let binary_data: Vec<Option<&[u8]>> = (0..count)
@@ -2347,13 +2761,20 @@ impl TableStorageBackend {
                                 Some(&bytes[start..end] as &[u8])
                             })
                             .collect();
-                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                        (
+                            ArrowDataType::Binary,
+                            Arc::new(BinaryArray::from(binary_data)),
+                        )
                     }
-                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                    ColumnData::StringDict {
+                        indices,
+                        dict_offsets,
+                        dict_data,
+                    } => {
                         // OPTIMIZED: Use Arrow DictionaryArray to avoid string allocations
                         use arrow::array::{DictionaryArray, UInt32Array};
                         use arrow::datatypes::UInt32Type;
-                        
+
                         // Build dictionary values (unique strings) - use &str references
                         let dict_count = dict_offsets.len().saturating_sub(1);
                         let dict_strings: Vec<Option<&str>> = (0..dict_count)
@@ -2364,17 +2785,26 @@ impl TableStorageBackend {
                             })
                             .collect();
                         let values = StringArray::from(dict_strings);
-                        
+
                         // Convert indices (0 = NULL, 1+ = dict index)
-                        let keys: Vec<Option<u32>> = indices.iter()
+                        let keys: Vec<Option<u32>> = indices
+                            .iter()
                             .map(|&idx| if idx == 0 { None } else { Some(idx - 1) })
                             .collect();
                         let keys_array = UInt32Array::from(keys);
-                        
-                        let dict_array = DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                        (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)),
-                         Arc::new(dict_array) as ArrayRef)
+
+                        let dict_array =
+                            DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
+                                .map_err(|e| {
+                                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                                })?;
+                        (
+                            ArrowDataType::Dictionary(
+                                Box::new(ArrowDataType::UInt32),
+                                Box::new(ArrowDataType::Utf8),
+                            ),
+                            Arc::new(dict_array) as ArrayRef,
+                        )
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
@@ -2400,14 +2830,19 @@ impl TableStorageBackend {
         limit: usize,
         offset: usize,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
-        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
         let (col_data, matching_indices) = self.storage.read_columns_filtered_range_with_limit(
-            column_names, filter_column, low, high, limit, offset
+            column_names,
+            filter_column,
+            low,
+            high,
+            limit,
+            offset,
         )?;
-        
+
         if col_data.is_empty() || matching_indices.is_empty() {
             return self.read_columns_to_arrow(column_names, 0, Some(0));
         }
@@ -2416,7 +2851,9 @@ impl TableStorageBackend {
         let mut fields: Vec<Field> = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
 
-        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        let include_id = column_names
+            .map(|cols| cols.contains(&"_id"))
+            .unwrap_or(true);
         if include_id {
             let filtered_ids = self.storage.read_ids_by_indices(&matching_indices)?;
             fields.push(Field::new("_id", ArrowDataType::Int64, false));
@@ -2424,7 +2861,11 @@ impl TableStorageBackend {
         }
 
         let col_order: Vec<String> = if let Some(names) = column_names {
-            names.iter().filter(|&s| *s != "_id").map(|s| s.to_string()).collect()
+            names
+                .iter()
+                .filter(|&s| *s != "_id")
+                .map(|s| s.to_string())
+                .collect()
         } else {
             schema.iter().map(|(n, _)| n.clone()).collect()
         };
@@ -2432,13 +2873,18 @@ impl TableStorageBackend {
         for col_name in &col_order {
             if let Some(data) = col_data.get(col_name) {
                 let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
-                    ColumnData::Int64(values) => {
-                        (ArrowDataType::Int64, Arc::new(Int64Array::from_iter_values(values.iter().copied())))
-                    }
-                    ColumnData::Float64(values) => {
-                        (ArrowDataType::Float64, Arc::new(Float64Array::from_iter_values(values.iter().copied())))
-                    }
-                    ColumnData::String { offsets, data: bytes } => {
+                    ColumnData::Int64(values) => (
+                        ArrowDataType::Int64,
+                        Arc::new(Int64Array::from_iter_values(values.iter().copied())),
+                    ),
+                    ColumnData::Float64(values) => (
+                        ArrowDataType::Float64,
+                        Arc::new(Float64Array::from_iter_values(values.iter().copied())),
+                    ),
+                    ColumnData::String {
+                        offsets,
+                        data: bytes,
+                    } => {
                         let count = offsets.len().saturating_sub(1);
                         let strings: Vec<Option<&str>> = (0..count)
                             .map(|i| {
@@ -2454,12 +2900,18 @@ impl TableStorageBackend {
                             .map(|i| {
                                 let byte_idx = i / 8;
                                 let bit_idx = i % 8;
-                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                                Some(
+                                    byte_idx < packed.len()
+                                        && (packed[byte_idx] >> bit_idx) & 1 == 1,
+                                )
                             })
                             .collect();
                         (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
                     }
-                    ColumnData::Binary { offsets, data: bytes } => {
+                    ColumnData::Binary {
+                        offsets,
+                        data: bytes,
+                    } => {
                         use arrow::array::BinaryArray;
                         let count = offsets.len().saturating_sub(1);
                         let binary_data: Vec<Option<&[u8]>> = (0..count)
@@ -2469,13 +2921,20 @@ impl TableStorageBackend {
                                 Some(&bytes[start..end])
                             })
                             .collect();
-                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                        (
+                            ArrowDataType::Binary,
+                            Arc::new(BinaryArray::from(binary_data)),
+                        )
                     }
-                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                    ColumnData::StringDict {
+                        indices,
+                        dict_offsets,
+                        dict_data,
+                    } => {
                         // OPTIMIZED: Use Arrow DictionaryArray to avoid string allocations
                         use arrow::array::{DictionaryArray, UInt32Array};
                         use arrow::datatypes::UInt32Type;
-                        
+
                         // Build dictionary values (unique strings) - use &str references
                         let dict_count = dict_offsets.len().saturating_sub(1);
                         let dict_strings: Vec<Option<&str>> = (0..dict_count)
@@ -2486,18 +2945,27 @@ impl TableStorageBackend {
                             })
                             .collect();
                         let values = StringArray::from(dict_strings);
-                        
+
                         // Convert indices (0 = NULL, 1+ = dict index)
-                        let keys: Vec<Option<u32>> = indices.iter()
+                        let keys: Vec<Option<u32>> = indices
+                            .iter()
                             .map(|&idx| if idx == 0 { None } else { Some(idx - 1) })
                             .collect();
                         let keys_array = UInt32Array::from(keys);
-                        
-                        let dict_array = DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                        
-                        (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)), 
-                         Arc::new(dict_array) as ArrayRef)
+
+                        let dict_array =
+                            DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
+                                .map_err(|e| {
+                                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                                })?;
+
+                        (
+                            ArrowDataType::Dictionary(
+                                Box::new(ArrowDataType::UInt32),
+                                Box::new(ArrowDataType::Utf8),
+                            ),
+                            Arc::new(dict_array) as ArrayRef,
+                        )
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
@@ -2514,7 +2982,10 @@ impl TableStorageBackend {
 
     /// Compute numeric column aggregates directly without Arrow arrays.
     /// Returns (count, sum, min, max) for the specified column.
-    pub fn compute_column_stats_mmap(&self, col_name: &str) -> io::Result<Option<(u64, f64, f64, f64)>> {
+    pub fn compute_column_stats_mmap(
+        &self,
+        col_name: &str,
+    ) -> io::Result<Option<(u64, f64, f64, f64)>> {
         // mmap path: reads only the requested column via RCIX fast seek
         if let Ok(Some(stats)) = self.storage.compute_column_stats_mmap(col_name) {
             return Ok(Some(stats));
@@ -2529,31 +3000,71 @@ impl TableStorageBackend {
     }
 
     /// Mmap-level string equality scan: find matching row indices without Arrow arrays.
-    pub fn scan_string_filter_mmap(&self, col_name: &str, target: &str, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
-        self.storage.scan_string_filter_mmap(col_name, target, limit)
+    pub fn scan_string_filter_mmap(
+        &self,
+        col_name: &str,
+        target: &str,
+        limit: Option<usize>,
+    ) -> io::Result<Option<Vec<usize>>> {
+        self.storage
+            .scan_string_filter_mmap(col_name, target, limit)
+    }
+
+    /// Mmap-level string IN scan: find matching row indices without Arrow arrays.
+    pub fn scan_string_in_mmap(
+        &self,
+        col_name: &str,
+        values: &[String],
+        limit: Option<usize>,
+    ) -> io::Result<Option<Vec<usize>>> {
+        self.storage.scan_string_in_mmap(col_name, values, limit)
     }
 
     /// Mmap-level LIKE pattern scan: find matching row indices without Arrow arrays.
-    pub fn scan_like_filter_mmap(&self, col_name: &str, pattern: &str, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
+    pub fn scan_like_filter_mmap(
+        &self,
+        col_name: &str,
+        pattern: &str,
+        limit: Option<usize>,
+    ) -> io::Result<Option<Vec<usize>>> {
         self.storage.scan_like_filter_mmap(col_name, pattern, limit)
     }
 
     /// Single-pass parallel LIKE scan + row extraction: no separate scan/extract passes.
-    pub fn scan_like_and_extract_mmap(&self, col_name: &str, pattern: &str, limit: Option<usize>) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
-        self.storage.scan_like_and_extract_mmap(col_name, pattern, limit)
+    pub fn scan_like_and_extract_mmap(
+        &self,
+        col_name: &str,
+        pattern: &str,
+        limit: Option<usize>,
+    ) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
+        self.storage
+            .scan_like_and_extract_mmap(col_name, pattern, limit)
     }
 
     /// Numeric range scan returning matching row IDs directly (not indices).
     /// Uses zone maps to prune Row Groups — O(matching_RGs) not O(all_rows).
-    pub fn scan_numeric_range_mmap_with_ids(&self, col_name: &str, low: f64, high: f64) -> io::Result<Option<Vec<u64>>> {
-        self.storage.scan_numeric_range_mmap_with_ids(col_name, low, high)
+    pub fn scan_numeric_range_mmap_with_ids(
+        &self,
+        col_name: &str,
+        low: f64,
+        high: f64,
+    ) -> io::Result<Option<Vec<u64>>> {
+        self.storage
+            .scan_numeric_range_mmap_with_ids(col_name, low, high)
     }
 
     /// Single-pass scan + mark deleted + save for numeric predicates.
     /// Returns `Some(deleted_count)` on success, `None` if fast path unavailable.
     /// Never builds an id_to_idx HashMap — works directly with flat row indices.
-    pub fn delete_where_numeric_range_inplace(&self, col_name: &str, low: f64, high: f64) -> io::Result<Option<i64>> {
-        let result = self.storage.delete_where_numeric_range_inplace(col_name, low, high)?;
+    pub fn delete_where_numeric_range_inplace(
+        &self,
+        col_name: &str,
+        low: f64,
+        high: f64,
+    ) -> io::Result<Option<i64>> {
+        let result = self
+            .storage
+            .delete_where_numeric_range_inplace(col_name, low, high)?;
         if result.is_some() {
             *self.dirty.write() = false; // written directly to disk
         }
@@ -2571,28 +3082,55 @@ impl TableStorageBackend {
     }
 
     /// Mmap-level numeric range scan: find matching row indices without Arrow arrays.
-    pub fn scan_numeric_range_mmap(&self, col_name: &str, low: f64, high: f64, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
-        self.storage.scan_numeric_range_mmap(col_name, low, high, limit)
+    pub fn scan_numeric_range_mmap(
+        &self,
+        col_name: &str,
+        low: f64,
+        high: f64,
+        limit: Option<usize>,
+    ) -> io::Result<Option<Vec<usize>>> {
+        self.storage
+            .scan_numeric_range_mmap(col_name, low, high, limit)
     }
 
     /// Mmap-level numeric IN scan: find rows where col_name IN (v1, v2, ...).
-    pub fn scan_numeric_in_mmap(&self, col_name: &str, values: &[i64], limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
+    pub fn scan_numeric_in_mmap(
+        &self,
+        col_name: &str,
+        values: &[i64],
+        limit: Option<usize>,
+    ) -> io::Result<Option<Vec<usize>>> {
         self.storage.scan_numeric_in_mmap(col_name, values, limit)
     }
 
     /// Scan multiple predicates in parallel on a single shared mmap (one lock acquisition).
-    pub fn scan_multi_predicates_parallel(&self, predicates: &[crate::storage::on_demand::MmapScanPred]) -> io::Result<Option<Vec<usize>>> {
+    pub fn scan_multi_predicates_parallel(
+        &self,
+        predicates: &[crate::storage::on_demand::MmapScanPred],
+    ) -> io::Result<Option<Vec<usize>>> {
         self.storage.scan_multi_predicates_parallel(predicates)
     }
 
     /// Mmap-level boolean equality scan: find matching row indices without Arrow arrays.
-    pub fn scan_bool_filter_mmap(&self, col_name: &str, target_value: bool, limit: Option<usize>) -> io::Result<Option<Vec<usize>>> {
-        self.storage.scan_bool_filter_mmap(col_name, target_value, limit)
+    pub fn scan_bool_filter_mmap(
+        &self,
+        col_name: &str,
+        target_value: bool,
+        limit: Option<usize>,
+    ) -> io::Result<Option<Vec<usize>>> {
+        self.storage
+            .scan_bool_filter_mmap(col_name, target_value, limit)
     }
 
     /// Direct mmap top-K scan: finds top-k row indices without materializing the full Arrow column.
-    pub fn scan_top_k_indices_mmap(&self, col_name: &str, k: usize, descending: bool) -> io::Result<Option<Vec<(usize, f64)>>> {
-        self.storage.scan_top_k_indices_mmap(col_name, k, descending)
+    pub fn scan_top_k_indices_mmap(
+        &self,
+        col_name: &str,
+        k: usize,
+        descending: bool,
+    ) -> io::Result<Option<Vec<(usize, f64)>>> {
+        self.storage
+            .scan_top_k_indices_mmap(col_name, k, descending)
     }
 
     /// Get underlying storage for direct access
@@ -2613,8 +3151,8 @@ impl TableStorageBackend {
         limit: usize,
         offset: usize,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray};
-        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
         // V4 mmap-only: fall back to full batch read + Arrow filter
@@ -2624,10 +3162,19 @@ impl TableStorageBackend {
             return Ok(full_batch);
         }
 
-        let (col_data, matching_indices) = self.storage.read_columns_filtered_string_numeric_with_limit(
-            column_names, string_column, string_value, numeric_column, numeric_op, numeric_value, limit, offset
-        )?;
-        
+        let (col_data, matching_indices) = self
+            .storage
+            .read_columns_filtered_string_numeric_with_limit(
+                column_names,
+                string_column,
+                string_value,
+                numeric_column,
+                numeric_op,
+                numeric_value,
+                limit,
+                offset,
+            )?;
+
         if col_data.is_empty() || matching_indices.is_empty() {
             return self.read_columns_to_arrow(column_names, 0, Some(0));
         }
@@ -2636,7 +3183,9 @@ impl TableStorageBackend {
         let mut fields: Vec<Field> = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
 
-        let include_id = column_names.map(|cols| cols.contains(&"_id")).unwrap_or(true);
+        let include_id = column_names
+            .map(|cols| cols.contains(&"_id"))
+            .unwrap_or(true);
         if include_id {
             let filtered_ids = self.storage.read_ids_by_indices(&matching_indices)?;
             fields.push(Field::new("_id", ArrowDataType::Int64, false));
@@ -2644,7 +3193,11 @@ impl TableStorageBackend {
         }
 
         let col_order: Vec<String> = if let Some(names) = column_names {
-            names.iter().filter(|&s| *s != "_id").map(|s| s.to_string()).collect()
+            names
+                .iter()
+                .filter(|&s| *s != "_id")
+                .map(|s| s.to_string())
+                .collect()
         } else {
             schema.iter().map(|(n, _)| n.clone()).collect()
         };
@@ -2652,13 +3205,18 @@ impl TableStorageBackend {
         for col_name in &col_order {
             if let Some(data) = col_data.get(col_name) {
                 let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
-                    ColumnData::Int64(values) => {
-                        (ArrowDataType::Int64, Arc::new(Int64Array::from_iter_values(values.iter().copied())))
-                    }
-                    ColumnData::Float64(values) => {
-                        (ArrowDataType::Float64, Arc::new(Float64Array::from_iter_values(values.iter().copied())))
-                    }
-                    ColumnData::String { offsets, data: bytes } => {
+                    ColumnData::Int64(values) => (
+                        ArrowDataType::Int64,
+                        Arc::new(Int64Array::from_iter_values(values.iter().copied())),
+                    ),
+                    ColumnData::Float64(values) => (
+                        ArrowDataType::Float64,
+                        Arc::new(Float64Array::from_iter_values(values.iter().copied())),
+                    ),
+                    ColumnData::String {
+                        offsets,
+                        data: bytes,
+                    } => {
                         let count = offsets.len().saturating_sub(1);
                         let strings: Vec<Option<&str>> = (0..count)
                             .map(|i| {
@@ -2674,12 +3232,18 @@ impl TableStorageBackend {
                             .map(|i| {
                                 let byte_idx = i / 8;
                                 let bit_idx = i % 8;
-                                Some(byte_idx < packed.len() && (packed[byte_idx] >> bit_idx) & 1 == 1)
+                                Some(
+                                    byte_idx < packed.len()
+                                        && (packed[byte_idx] >> bit_idx) & 1 == 1,
+                                )
                             })
                             .collect();
                         (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
                     }
-                    ColumnData::Binary { offsets, data: bytes } => {
+                    ColumnData::Binary {
+                        offsets,
+                        data: bytes,
+                    } => {
                         use arrow::array::BinaryArray;
                         let count = offsets.len().saturating_sub(1);
                         let binary_data: Vec<Option<&[u8]>> = (0..count)
@@ -2689,13 +3253,20 @@ impl TableStorageBackend {
                                 Some(&bytes[start..end])
                             })
                             .collect();
-                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                        (
+                            ArrowDataType::Binary,
+                            Arc::new(BinaryArray::from(binary_data)),
+                        )
                     }
-                    ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                    ColumnData::StringDict {
+                        indices,
+                        dict_offsets,
+                        dict_data,
+                    } => {
                         // OPTIMIZED: Use Arrow DictionaryArray
                         use arrow::array::{DictionaryArray, UInt32Array};
                         use arrow::datatypes::UInt32Type;
-                        
+
                         let dict_count = dict_offsets.len().saturating_sub(1);
                         let dict_strings: Vec<Option<&str>> = (0..dict_count)
                             .map(|i| {
@@ -2705,17 +3276,26 @@ impl TableStorageBackend {
                             })
                             .collect();
                         let values = StringArray::from(dict_strings);
-                        
-                        let keys: Vec<Option<u32>> = indices.iter()
+
+                        let keys: Vec<Option<u32>> = indices
+                            .iter()
                             .map(|&idx| if idx == 0 { None } else { Some(idx - 1) })
                             .collect();
                         let keys_array = UInt32Array::from(keys);
-                        
-                        let dict_array = DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                        
-                        (ArrowDataType::Dictionary(Box::new(ArrowDataType::UInt32), Box::new(ArrowDataType::Utf8)), 
-                         Arc::new(dict_array) as ArrayRef)
+
+                        let dict_array =
+                            DictionaryArray::<UInt32Type>::try_new(keys_array, Arc::new(values))
+                                .map_err(|e| {
+                                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                                })?;
+
+                        (
+                            ArrowDataType::Dictionary(
+                                Box::new(ArrowDataType::UInt32),
+                                Box::new(ArrowDataType::Utf8),
+                            ),
+                            Arc::new(dict_array) as ArrayRef,
+                        )
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
@@ -2731,7 +3311,10 @@ impl TableStorageBackend {
     }
 
     /// Get or lazily build cached string dictionary for a column
-    pub fn get_or_build_dict_cache(&self, col_name: &str) -> io::Result<Option<(Vec<String>, Vec<u16>)>> {
+    pub fn get_or_build_dict_cache(
+        &self,
+        col_name: &str,
+    ) -> io::Result<Option<(Vec<String>, Vec<u16>)>> {
         // Check cache first
         {
             let cache = self.dict_cache.read();
@@ -2751,12 +3334,18 @@ impl TableStorageBackend {
     }
 
     /// Execute simple aggregation (no GROUP BY, no WHERE) directly on V4 columns
-    pub fn execute_simple_agg(&self, agg_cols: &[&str]) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+    pub fn execute_simple_agg(
+        &self,
+        agg_cols: &[&str],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
         self.storage.execute_simple_agg(agg_cols)
     }
 
     /// Build cached string dictionary indices for a column
-    pub fn build_string_dict_cache(&self, col_name: &str) -> io::Result<Option<(Vec<String>, Vec<u16>)>> {
+    pub fn build_string_dict_cache(
+        &self,
+        col_name: &str,
+    ) -> io::Result<Option<(Vec<String>, Vec<u16>)>> {
         self.storage.build_string_dict_cache(col_name)
     }
 
@@ -2771,25 +3360,39 @@ impl TableStorageBackend {
     }
 
     /// Fast COUNT(DISTINCT col) given a pre-built dict (from global cache). Null-aware via bitmaps.
-    pub fn count_distinct_with_dict(&self, col_name: &str, dict_strings: &[String], group_ids: &[u16]) -> io::Result<i64> {
-        self.storage.count_distinct_with_dict(col_name, dict_strings, group_ids)
+    pub fn count_distinct_with_dict(
+        &self,
+        col_name: &str,
+        dict_strings: &[String],
+        group_ids: &[u16],
+    ) -> io::Result<i64> {
+        self.storage
+            .count_distinct_with_dict(col_name, dict_strings, group_ids)
     }
 
     /// Fast top-k for ORDER BY (str_col, f64_col) without Arrow string conversion.
     /// Uses global dict cache for warm O(dict_size) rank lookup instead of rebuilding the dict.
     pub fn order_topk_str_float64(
         &self,
-        str_col: &str, str_asc: bool,
-        f64_col: &str, f64_asc: bool,
-        k: usize, offset: usize,
+        str_col: &str,
+        str_asc: bool,
+        f64_col: &str,
+        f64_asc: bool,
+        k: usize,
+        offset: usize,
     ) -> io::Result<Option<Vec<usize>>> {
         let dict = match get_global_dict_cache(self.path(), str_col, &self.storage)? {
             Some(d) => d,
             None => return Ok(None),
         };
         self.storage.order_topk_str_float64_with_dict(
-            dict.0.as_slice(), dict.1.as_slice(), str_asc,
-            f64_col, f64_asc, k, offset,
+            dict.0.as_slice(),
+            dict.1.as_slice(),
+            str_asc,
+            f64_col,
+            f64_asc,
+            k,
+            offset,
         )
     }
 
@@ -2797,27 +3400,52 @@ impl TableStorageBackend {
     /// Delegates directly to storage: uses in-memory path when data is loaded,
     /// otherwise uses mmap path reading only the needed agg columns via RCIX.
     pub fn execute_group_agg_cached(
-        &self, dict_strings: &[String], group_ids: &[u16], agg_cols: &[(&str, bool)],
+        &self,
+        dict_strings: &[String],
+        group_ids: &[u16],
+        agg_cols: &[(&str, bool)],
     ) -> io::Result<Option<Vec<(String, Vec<(f64, i64)>)>>> {
-        self.storage.execute_group_agg_cached(dict_strings, group_ids, agg_cols)
+        self.storage
+            .execute_group_agg_cached(dict_strings, group_ids, agg_cols)
     }
 
     /// Execute 2-column GROUP BY + aggregate using pre-built dict caches.
     pub fn execute_group_agg_2col_cached(
         &self,
-        dict1_strings: &[String], group_ids1: &[u16],
-        dict2_strings: &[String], group_ids2: &[u16],
+        dict1_strings: &[String],
+        group_ids1: &[u16],
+        dict2_strings: &[String],
+        group_ids2: &[u16],
         agg_cols: &[(&str, bool)],
     ) -> io::Result<Option<Vec<((String, String), Vec<(f64, i64)>)>>> {
-        self.storage.execute_group_agg_2col_cached(dict1_strings, group_ids1, dict2_strings, group_ids2, agg_cols)
+        self.storage.execute_group_agg_2col_cached(
+            dict1_strings,
+            group_ids1,
+            dict2_strings,
+            group_ids2,
+            agg_cols,
+        )
     }
 
     /// Execute BETWEEN + GROUP BY using pre-built dict cache.
     /// Delegates directly to storage: uses mmap path reading only the needed columns.
     pub fn execute_between_group_agg_cached(
-        &self, filter_col: &str, lo: f64, hi: f64, dict_strings: &[String], group_ids: &[u16], agg_col: Option<&str>,
+        &self,
+        filter_col: &str,
+        lo: f64,
+        hi: f64,
+        dict_strings: &[String],
+        group_ids: &[u16],
+        agg_col: Option<&str>,
     ) -> io::Result<Option<Vec<(String, f64, i64)>>> {
-        self.storage.execute_between_group_agg_cached(filter_col, lo, hi, dict_strings, group_ids, agg_col)
+        self.storage.execute_between_group_agg_cached(
+            filter_col,
+            lo,
+            hi,
+            dict_strings,
+            group_ids,
+            agg_col,
+        )
     }
 
     /// Execute BETWEEN + GROUP BY + aggregate directly on V4 columns
@@ -2829,7 +3457,8 @@ impl TableStorageBackend {
         group_col: &str,
         agg_col: Option<&str>,
     ) -> io::Result<Option<Vec<(String, f64, i64)>>> {
-        self.storage.execute_between_group_agg(filter_col, lo, hi, group_col, agg_col)
+        self.storage
+            .execute_between_group_agg(filter_col, lo, hi, group_col, agg_col)
     }
 
     /// Execute GROUP BY + aggregate directly on V4 columns (no WHERE)
@@ -2857,31 +3486,24 @@ impl TableStorageBackend {
         offset: usize,
     ) -> io::Result<Option<RecordBatch>> {
         use crate::query::AggregateFunc;
-        use arrow::array::{Int64Array, Float64Array, StringArray, DictionaryArray, UInt32Array};
+        use arrow::array::{DictionaryArray, Float64Array, Int64Array, StringArray, UInt32Array};
         use arrow::datatypes::UInt32Type;
-        use std::collections::BinaryHeap;
         use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
 
         // This optimization requires dictionary-encoded columns for maximum performance
         // Get filter column info
         let schema_guard = self.schema.read();
         let filter_idx = schema_guard.iter().position(|(name, _)| name == filter_col);
         let group_idx = schema_guard.iter().position(|(name, _)| name == group_col);
-        
+
         if filter_idx.is_none() || group_idx.is_none() {
             return Ok(None);
         }
 
         // For now, delegate to the OnDemandStorage implementation
         let result = self.storage.execute_filter_group_order(
-            filter_col,
-            filter_val,
-            group_col,
-            agg_col,
-            agg_func,
-            descending,
-            limit,
-            offset,
+            filter_col, filter_val, group_col, agg_col, agg_func, descending, limit, offset,
         )?;
 
         Ok(result)
@@ -2896,12 +3518,12 @@ use crate::storage::incremental::IncrementalStorage;
 use crate::storage::on_demand::ColumnValue as OnDemandColumnValue;
 
 /// High-performance storage backend with incremental writes
-/// 
+///
 /// Uses WAL (Write-Ahead Log) for fast append-only writes:
 /// - Writes append to WAL file - O(1) time
 /// - Reads merge main file + WAL transparently
 /// - Background compaction merges WAL into main file
-/// 
+///
 /// This provides significantly faster write performance compared to
 /// TableStorageBackend which rewrites the entire file on each save.
 pub struct IncrementalStorageBackend {
@@ -2926,12 +3548,13 @@ impl IncrementalStorageBackend {
     /// Open existing incremental storage
     pub fn open(path: &Path) -> io::Result<Self> {
         let storage = IncrementalStorage::open(path)?;
-        let schema: Vec<(String, DataType)> = storage.get_schema()
+        let schema: Vec<(String, DataType)> = storage
+            .get_schema()
             .into_iter()
             .map(|(name, ct)| (name, column_type_to_datatype(ct)))
             .collect();
         let known: HashSet<String> = schema.iter().map(|(n, _)| n.clone()).collect();
-        
+
         Ok(Self {
             storage,
             schema: RwLock::new(schema),
@@ -2979,7 +3602,9 @@ impl IncrementalStorageBackend {
                             Value::Bool(b) => OnDemandColumnValue::Bool(*b),
                             Value::Binary(b) => OnDemandColumnValue::Binary(b.clone()),
                             Value::Null => OnDemandColumnValue::Null,
-                            _ => OnDemandColumnValue::String(serde_json::to_string(v).unwrap_or_default()),
+                            _ => OnDemandColumnValue::String(
+                                serde_json::to_string(v).unwrap_or_default(),
+                            ),
                         };
                         (k.clone(), cv)
                     })
@@ -3062,12 +3687,13 @@ pub struct StorageManager {
 impl StorageManager {
     /// Create or open a storage manager
     pub fn open_or_create(base_path: &Path) -> io::Result<Self> {
-        let base_dir = base_path.parent()
+        let base_dir = base_path
+            .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
-        
+
         let mut tables = HashMap::new();
-        
+
         // Check if main file exists
         if base_path.exists() {
             // Load existing table
@@ -3075,7 +3701,7 @@ impl StorageManager {
             let name = backend.metadata().name;
             tables.insert(name.clone(), Arc::new(backend));
         }
-        
+
         Ok(Self {
             base_dir,
             tables: RwLock::new(tables),
@@ -3093,9 +3719,11 @@ impl StorageManager {
         // Create new table
         let path = self.base_dir.join(format!("{}.apex", name));
         let backend = Arc::new(TableStorageBackend::open_or_create(&path)?);
-        
-        self.tables.write().insert(name.to_string(), backend.clone());
-        
+
+        self.tables
+            .write()
+            .insert(name.to_string(), backend.clone());
+
         Ok(backend)
     }
 
@@ -3144,38 +3772,38 @@ mod tests {
         // Create and insert with NULL boolean - mimics Python client flow
         {
             let backend = TableStorageBackend::create(&path).unwrap();
-            
+
             let mut row1 = HashMap::new();
             row1.insert("id".to_string(), Value::Int64(1));
             row1.insert("flag".to_string(), Value::Bool(true));
-            
+
             let mut row2 = HashMap::new();
             row2.insert("id".to_string(), Value::Int64(2));
             row2.insert("flag".to_string(), Value::Bool(false));
-            
+
             let mut row3 = HashMap::new();
             row3.insert("id".to_string(), Value::Int64(3));
-            row3.insert("flag".to_string(), Value::Null);  // NULL boolean
-            
+            row3.insert("flag".to_string(), Value::Null); // NULL boolean
+
             let ids = backend.insert_rows(&[row1, row2, row3]).unwrap();
             assert_eq!(ids.len(), 3);
-            
+
             backend.save().unwrap();
         }
 
         // Reopen and check null mask
         {
             let backend = TableStorageBackend::open(&path).unwrap();
-            
+
             // Check null mask via storage
             let null_mask = backend.storage.get_null_mask("flag", 0, 3);
             println!("Null mask via backend: {:?}", null_mask);
             assert_eq!(null_mask, vec![false, false, true], "Row 2 should be NULL");
-            
+
             // Check via Arrow conversion
             let batch = backend.read_columns_to_arrow(None, 0, None).unwrap();
             println!("Arrow batch schema: {:?}", batch.schema());
-            
+
             // Find flag column and check nulls
             let flag_idx = batch.schema().index_of("flag").unwrap();
             let flag_col = batch.column(flag_idx);
@@ -3192,27 +3820,27 @@ mod tests {
         // Create and insert
         {
             let backend = TableStorageBackend::create(&path).unwrap();
-            
+
             let mut row = HashMap::new();
             row.insert("name".to_string(), Value::String("Alice".to_string()));
             row.insert("age".to_string(), Value::Int64(30));
-            
+
             let ids = backend.insert_rows(&[row]).unwrap();
             assert_eq!(ids.len(), 1);
-            
+
             backend.save().unwrap();
         }
 
         // Reopen and verify (lazy load)
         {
             let backend = TableStorageBackend::open(&path).unwrap();
-            
+
             // Metadata available without loading data
             assert_eq!(backend.row_count(), 1);
-            
+
             // Cache should be empty
             assert!(backend.get_cached_column("name").is_none());
-            
+
             // Load specific column
             backend.load_columns(&["name"]).unwrap();
             assert!(backend.get_cached_column("name").is_some());
@@ -3229,10 +3857,10 @@ mod tests {
         if let TypedColumn::Int64 { nulls, .. } = &mut col {
             nulls.extend_false(3);
         }
-        
+
         let cd = typed_column_to_column_data(&col);
         let back = column_data_to_typed_column(&cd, DataType::Int64);
-        
+
         if let TypedColumn::Int64 { data, .. } = back {
             assert_eq!(data, vec![1, 2, 3]);
         } else {
@@ -3243,55 +3871,60 @@ mod tests {
     #[test]
     fn test_insert_typed_and_reload() {
         use crate::storage::OnDemandStorage;
-        
+
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_typed.apex");
 
         // Save using insert_typed (like save_to_v3 does)
         {
             let storage = OnDemandStorage::create(&path).unwrap();
-            
+
             let mut int_cols: HashMap<String, Vec<i64>> = HashMap::new();
             let mut string_cols: HashMap<String, Vec<String>> = HashMap::new();
-            
+
             int_cols.insert("age".to_string(), vec![30, 25]);
-            string_cols.insert("name".to_string(), vec!["Alice".to_string(), "Bob".to_string()]);
-            
-            let ids = storage.insert_typed(
-                int_cols,
-                HashMap::new(), // float
-                string_cols,
-                HashMap::new(), // binary
-                HashMap::new(), // bool
-            ).unwrap();
-            
+            string_cols.insert(
+                "name".to_string(),
+                vec!["Alice".to_string(), "Bob".to_string()],
+            );
+
+            let ids = storage
+                .insert_typed(
+                    int_cols,
+                    HashMap::new(), // float
+                    string_cols,
+                    HashMap::new(), // binary
+                    HashMap::new(), // bool
+                )
+                .unwrap();
+
             assert_eq!(ids.len(), 2);
             assert_eq!(storage.row_count(), 2);
-            
+
             storage.save().unwrap();
         }
 
         // Reopen and verify with backend
         {
             let backend = TableStorageBackend::open(&path).unwrap();
-            
+
             // Check metadata
             let schema = backend.get_schema();
             println!("Schema after reopen: {:?}", schema);
             assert!(!schema.is_empty(), "Schema should not be empty");
-            
+
             let row_count = backend.row_count();
             println!("Row count after reopen: {}", row_count);
             assert_eq!(row_count, 2, "Should have 2 rows");
-            
+
             // Load all columns
             backend.load_all_columns().unwrap();
-            
+
             // Check cached columns
             let name_col = backend.get_cached_column("name");
             println!("Name column: {:?}", name_col.is_some());
             assert!(name_col.is_some(), "Name column should be loaded");
-            
+
             let age_col = backend.get_cached_column("age");
             println!("Age column: {:?}", age_col.is_some());
             assert!(age_col.is_some(), "Age column should be loaded");
@@ -3301,46 +3934,65 @@ mod tests {
     #[test]
     fn test_read_columns_to_arrow() {
         use crate::storage::OnDemandStorage;
-        
+
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_arrow.apex");
 
         // Create test data
         {
             let storage = OnDemandStorage::create(&path).unwrap();
-            
+
             let mut int_cols: HashMap<String, Vec<i64>> = HashMap::new();
             let mut float_cols: HashMap<String, Vec<f64>> = HashMap::new();
             let mut string_cols: HashMap<String, Vec<String>> = HashMap::new();
-            
+
             int_cols.insert("age".to_string(), vec![30, 25, 35]);
             float_cols.insert("score".to_string(), vec![85.5, 90.0, 78.5]);
-            string_cols.insert("name".to_string(), vec!["Alice".to_string(), "Bob".to_string(), "Charlie".to_string()]);
-            
-            storage.insert_typed(int_cols, float_cols, string_cols, HashMap::new(), HashMap::new()).unwrap();
+            string_cols.insert(
+                "name".to_string(),
+                vec![
+                    "Alice".to_string(),
+                    "Bob".to_string(),
+                    "Charlie".to_string(),
+                ],
+            );
+
+            storage
+                .insert_typed(
+                    int_cols,
+                    float_cols,
+                    string_cols,
+                    HashMap::new(),
+                    HashMap::new(),
+                )
+                .unwrap();
             storage.save().unwrap();
         }
 
         // Test read_columns_to_arrow
         {
             let backend = TableStorageBackend::open(&path).unwrap();
-            
+
             // Read all columns (age, score, name + auto-generated _id = 4)
             let batch = backend.read_columns_to_arrow(None, 0, None).unwrap();
             assert_eq!(batch.num_rows(), 3);
             assert_eq!(batch.num_columns(), 4);
-            
+
             // Read specific columns (column projection)
-            let batch2 = backend.read_columns_to_arrow(Some(&["name", "age"]), 0, None).unwrap();
+            let batch2 = backend
+                .read_columns_to_arrow(Some(&["name", "age"]), 0, None)
+                .unwrap();
             assert_eq!(batch2.num_rows(), 3);
             assert_eq!(batch2.num_columns(), 2);
-            
+
             // Read with row limit
             let batch3 = backend.read_columns_to_arrow(None, 0, Some(2)).unwrap();
             assert_eq!(batch3.num_rows(), 2);
-            
+
             // Read single column with limit
-            let batch4 = backend.read_columns_to_arrow(Some(&["name"]), 0, Some(1)).unwrap();
+            let batch4 = backend
+                .read_columns_to_arrow(Some(&["name"]), 0, Some(1))
+                .unwrap();
             assert_eq!(batch4.num_rows(), 1);
             assert_eq!(batch4.num_columns(), 1);
         }
@@ -3350,37 +4002,51 @@ mod tests {
     fn test_column_projection_correctness() {
         use crate::storage::OnDemandStorage;
         use arrow::array::{Int64Array, StringArray};
-        
+
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_proj.apex");
 
         // Create test data
         {
             let storage = OnDemandStorage::create(&path).unwrap();
-            
+
             let mut int_cols: HashMap<String, Vec<i64>> = HashMap::new();
             let mut string_cols: HashMap<String, Vec<String>> = HashMap::new();
-            
+
             int_cols.insert("id".to_string(), vec![1, 2, 3]);
             int_cols.insert("value".to_string(), vec![100, 200, 300]);
-            string_cols.insert("label".to_string(), vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-            
-            storage.insert_typed(int_cols, HashMap::new(), string_cols, HashMap::new(), HashMap::new()).unwrap();
+            string_cols.insert(
+                "label".to_string(),
+                vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            );
+
+            storage
+                .insert_typed(
+                    int_cols,
+                    HashMap::new(),
+                    string_cols,
+                    HashMap::new(),
+                    HashMap::new(),
+                )
+                .unwrap();
             storage.save().unwrap();
         }
 
         // Verify column projection returns correct data
         {
             let backend = TableStorageBackend::open(&path).unwrap();
-            
+
             // Read only 'id' and 'label' columns
-            let batch = backend.read_columns_to_arrow(Some(&["id", "label"]), 0, None).unwrap();
-            
+            let batch = backend
+                .read_columns_to_arrow(Some(&["id", "label"]), 0, None)
+                .unwrap();
+
             assert_eq!(batch.num_columns(), 2);
-            
+
             // Verify column names
             let schema = batch.schema();
-            let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            let field_names: Vec<&str> =
+                schema.fields().iter().map(|f| f.name().as_str()).collect();
             assert!(field_names.contains(&"id"));
             assert!(field_names.contains(&"label"));
             assert!(!field_names.contains(&"value")); // Should NOT include 'value'
@@ -3391,33 +4057,41 @@ mod tests {
     fn test_row_range_scan() {
         use crate::storage::OnDemandStorage;
         use arrow::array::Int64Array;
-        
+
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_range.apex");
 
         // Create test data with 10 rows
         {
             let storage = OnDemandStorage::create(&path).unwrap();
-            
+
             let mut int_cols: HashMap<String, Vec<i64>> = HashMap::new();
             int_cols.insert("index".to_string(), (0..10).collect());
-            
-            storage.insert_typed(int_cols, HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new()).unwrap();
+
+            storage
+                .insert_typed(
+                    int_cols,
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                )
+                .unwrap();
             storage.save().unwrap();
         }
 
         // Test row range scanning
         {
             let backend = TableStorageBackend::open(&path).unwrap();
-            
+
             // Read first 3 rows
             let batch1 = backend.read_columns_to_arrow(None, 0, Some(3)).unwrap();
             assert_eq!(batch1.num_rows(), 3);
-            
+
             // Read middle 4 rows (rows 3-6)
             let batch2 = backend.read_columns_to_arrow(None, 3, Some(4)).unwrap();
             assert_eq!(batch2.num_rows(), 4);
-            
+
             // Read last 2 rows
             let batch3 = backend.read_columns_to_arrow(None, 8, Some(10)).unwrap();
             assert_eq!(batch3.num_rows(), 2); // Only 2 rows left
@@ -3428,7 +4102,7 @@ mod tests {
     fn test_progressive_schema() {
         use crate::data::Value;
         use arrow::array::StringArray;
-        
+
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_progressive.apex");
 
@@ -3439,19 +4113,27 @@ mod tests {
             row.insert("a".to_string(), Value::Int64(1));
             backend.insert_rows(&[row]).unwrap();
             backend.save().unwrap();
-            
+
             println!("After first insert:");
             let batch = backend.read_columns_to_arrow(None, 0, None).unwrap();
             println!("  num_rows: {}", batch.num_rows());
-            println!("  schema: {:?}", batch.schema().fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+            println!(
+                "  schema: {:?}",
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .collect::<Vec<_>>()
+            );
         }
 
         // Step 2: Reopen and insert second row with columns 'a' and 'b'
         {
             let backend = TableStorageBackend::open_for_write(&path).unwrap();
-            
+
             println!("After reopen, before second insert:");
-            
+
             let mut row = HashMap::new();
             row.insert("a".to_string(), Value::Int64(2));
             row.insert("b".to_string(), Value::String("hello".to_string()));
@@ -3463,16 +4145,19 @@ mod tests {
         {
             let backend = TableStorageBackend::open(&path).unwrap();
             let batch = backend.read_columns_to_arrow(None, 0, None).unwrap();
-            
+
             println!("Final result:");
             println!("  num_rows: {}", batch.num_rows());
-            
+
             // Check each row
             let a_col = batch.column_by_name("a").unwrap();
-            let a_arr = a_col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
-            
+            let a_arr = a_col
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+
             let b_col = batch.column_by_name("b");
-            
+
             for i in 0..batch.num_rows() {
                 let a_val = a_arr.value(i);
                 let b_val = if let Some(col) = b_col {
@@ -3483,14 +4168,14 @@ mod tests {
                 };
                 println!("  Row {}: a={}, b={}", i, a_val, b_val);
             }
-            
+
             // Row 0 should be a=1, b=NULL/empty
             assert_eq!(a_arr.value(0), 1);
             if let Some(col) = b_col {
                 let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
                 assert!(arr.value(0).is_empty(), "Row 0 should have empty b");
             }
-            
+
             // Row 1 should be a=2, b='hello'
             assert_eq!(a_arr.value(1), 2);
             if let Some(col) = b_col {
@@ -3504,36 +4189,36 @@ mod tests {
     fn test_alter_then_insert() {
         use crate::data::{DataType, Value};
         use arrow::array::StringArray;
-        
+
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_alter_insert.apex");
 
         // Step 1: Create empty table and add columns via add_column_with_padding
         {
             let backend = TableStorageBackend::create(&path).unwrap();
-            
+
             // Add columns to empty table (simulates ALTER TABLE ADD COLUMN)
             backend.add_column("name", DataType::String).unwrap();
             backend.add_column("value", DataType::Int64).unwrap();
-            
+
             println!("After add_column:");
             println!("  Schema: {:?}", backend.list_columns());
-            
+
             backend.save().unwrap();
         }
 
         // Step 2: Reopen and insert data
         {
             let backend = TableStorageBackend::open_for_write(&path).unwrap();
-            
+
             println!("After reopen:");
             println!("  Schema: {:?}", backend.list_columns());
-            
+
             // Insert a row
             let mut row = HashMap::new();
             row.insert("name".to_string(), Value::String("Test".to_string()));
             row.insert("value".to_string(), Value::Int64(100));
-            
+
             backend.insert_rows(&[row]).unwrap();
             backend.save().unwrap();
         }
@@ -3542,11 +4227,11 @@ mod tests {
         {
             let backend = TableStorageBackend::open(&path).unwrap();
             let batch = backend.read_columns_to_arrow(None, 0, None).unwrap();
-            
+
             println!("Result batch:");
             println!("  num_rows: {}", batch.num_rows());
             println!("  schema: {:?}", batch.schema());
-            
+
             // Check name column
             if let Some(name_col) = batch.column_by_name("name") {
                 let arr = name_col.as_any().downcast_ref::<StringArray>().unwrap();
@@ -3555,10 +4240,13 @@ mod tests {
             } else {
                 panic!("Name column not found");
             }
-            
+
             // Check value column
             if let Some(value_col) = batch.column_by_name("value") {
-                let arr = value_col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+                let arr = value_col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
                 println!("  value[0]: {:?}", arr.value(0));
                 assert_eq!(arr.value(0), 100, "Value should be 100");
             }

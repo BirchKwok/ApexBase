@@ -200,7 +200,8 @@ impl NodeManager {
 
     /// Get all active nodes
     pub fn active_nodes(&self) -> Vec<NodeInfo> {
-        self.nodes.read()
+        self.nodes
+            .read()
             .values()
             .filter(|n| n.is_available())
             .cloned()
@@ -214,7 +215,8 @@ impl NodeManager {
 
     /// Number of active nodes
     pub fn active_count(&self) -> usize {
-        self.nodes.read()
+        self.nodes
+            .read()
             .values()
             .filter(|n| n.is_available())
             .count()
@@ -259,9 +261,7 @@ impl NodeManager {
             if *id == self.local_node_id {
                 continue; // Skip self
             }
-            if node.status == NodeStatus::Active
-                && (now - node.last_heartbeat) > timeout_secs
-            {
+            if node.status == NodeStatus::Active && (now - node.last_heartbeat) > timeout_secs {
                 node.status = NodeStatus::Suspect;
                 suspect_nodes.push(*id);
             }

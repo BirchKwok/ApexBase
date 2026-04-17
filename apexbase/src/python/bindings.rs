@@ -4,24 +4,24 @@
 //! enabling on-demand reading without loading entire tables into memory.
 
 use crate::data::Value;
-use crate::storage::{TableStorageBackend, StorageManager, DurabilityLevel, StorageEngine};
-use crate::storage::on_demand::ColumnValue;
-use crate::query::{ApexExecutor, ApexResult, SqlParser};
-use crate::fts::FtsManager;
 use crate::fts::FtsConfig;
+use crate::fts::FtsManager;
+use crate::query::{ApexExecutor, ApexResult, SqlParser};
+use crate::storage::on_demand::ColumnValue;
+use crate::storage::{DurabilityLevel, StorageEngine, StorageManager, TableStorageBackend};
+use arrow::record_batch::RecordBatch;
+use dashmap::DashMap;
 use fs2::FileExt;
+use parking_lot::RwLock;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use rayon::prelude::*;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::path::{Path, PathBuf};
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use parking_lot::RwLock;
-use dashmap::DashMap;
-use rayon::prelude::*;
-use arrow::record_batch::RecordBatch;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Convert Python dict to HashMap<String, Value>
 fn dict_to_values(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, Value>> {
@@ -42,7 +42,7 @@ fn dict_to_values(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, Value>> 
 /// Convert Python value to Value
 fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     use pyo3::types::PyBytes;
-    
+
     if obj.is_none() {
         return Ok(Value::Null);
     }
@@ -68,8 +68,14 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
 
     // numpy ndarray (1-D float32 or float64) → FixedList (raw LE f32 bytes)
     // Checked BEFORE list/sequence to catch np.ndarray first.
-    if obj.get_type().name().map(|n| n == "ndarray").unwrap_or(false) {
-        if let Ok(floats) = obj.call_method0("flatten")
+    if obj
+        .get_type()
+        .name()
+        .map(|n| n == "ndarray")
+        .unwrap_or(false)
+    {
+        if let Ok(floats) = obj
+            .call_method0("flatten")
             .and_then(|flat| flat.call_method1("astype", ("float32",)))
             .and_then(|f32arr| f32arr.call_method0("tobytes"))
             .and_then(|b| b.extract::<Vec<u8>>())
@@ -108,7 +114,7 @@ fn column_value_to_py(py: Python<'_>, val: &ColumnValue) -> PyResult<PyObject> {
 /// Convert Value to Python object
 fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
     use pyo3::types::PyBytes;
-    
+
     match val {
         Value::Null => Ok(py.None()),
         Value::Bool(b) => Ok(b.into_py(py)),
@@ -190,27 +196,32 @@ impl ApexStorageImpl {
     fn get_lock_path(table_path: &Path) -> PathBuf {
         table_path.with_extension("apex.lock")
     }
-    
+
     /// Acquire a lock on the table (shared for read, exclusive for write).
     /// Uses retry with exponential backoff (100µs → 200µs → ... → 50ms max total wait).
     /// This avoids spurious "Database is locked" errors under concurrent load.
     fn acquire_lock(table_path: &Path, exclusive: bool) -> io::Result<File> {
         let lock_path = Self::get_lock_path(table_path);
         let lock_file = OpenOptions::new()
-            .read(true).write(true).create(true).truncate(false)
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
             .open(&lock_path)?;
-        
+
         let max_wait = std::time::Duration::from_millis(50);
         let mut backoff = std::time::Duration::from_micros(100);
         let start = std::time::Instant::now();
-        
+
         loop {
             let result: io::Result<()> = if exclusive {
                 lock_file.try_lock_exclusive()
             } else {
-                lock_file.try_lock_shared().map_err(|e| io::Error::new(io::ErrorKind::WouldBlock, e.to_string()))
+                lock_file
+                    .try_lock_shared()
+                    .map_err(|e| io::Error::new(io::ErrorKind::WouldBlock, e.to_string()))
             };
-            
+
             match result {
                 Ok(()) => return Ok(lock_file),
                 Err(_) if start.elapsed() < max_wait => {
@@ -220,23 +231,27 @@ impl ApexStorageImpl {
                 Err(e) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
-                        format!("Database is locked (waited {}ms): {}", start.elapsed().as_millis(), e)
+                        format!(
+                            "Database is locked (waited {}ms): {}",
+                            start.elapsed().as_millis(),
+                            e
+                        ),
                     ));
                 }
             }
         }
     }
-    
+
     #[inline]
     fn acquire_read_lock(table_path: &Path) -> io::Result<File> {
         Self::acquire_lock(table_path, false)
     }
-    
+
     #[inline]
     fn acquire_write_lock(table_path: &Path) -> io::Result<File> {
         Self::acquire_lock(table_path, true)
     }
-    
+
     /// Release a lock (unlock and drop the file handle)
     #[inline]
     fn release_lock(lock_file: File) {
@@ -245,7 +260,9 @@ impl ApexStorageImpl {
     }
 
     /// Parse a Python dict {col_name: type_str} into Vec<(String, ColumnType)>
-    fn parse_schema_dict(dict: &Bound<'_, PyDict>) -> PyResult<Vec<(String, crate::storage::on_demand::ColumnType)>> {
+    fn parse_schema_dict(
+        dict: &Bound<'_, PyDict>,
+    ) -> PyResult<Vec<(String, crate::storage::on_demand::ColumnType)>> {
         use crate::storage::on_demand::ColumnType;
         let mut cols = Vec::with_capacity(dict.len());
         for (key, value) in dict.iter() {
@@ -277,14 +294,14 @@ impl ApexStorageImpl {
         }
         Ok(cols)
     }
-    
+
     /// Get the path for the current table
     #[inline]
     fn get_current_table_path(&self) -> PyResult<PathBuf> {
         let table_name = self.current_table.read().clone();
         if table_name.is_empty() {
             return Err(PyValueError::new_err(
-                "No table selected. Call create_table() or use_table() first."
+                "No table selected. Call create_table() or use_table() first.",
             ));
         }
         let paths = self.table_paths.read();
@@ -296,19 +313,24 @@ impl ApexStorageImpl {
         let base_dir = self.current_base_dir();
         let p = base_dir.join(format!("{}.apex", table_name));
         if p.exists() {
-            self.table_paths.write().insert(table_name.clone(), p.clone());
+            self.table_paths
+                .write()
+                .insert(table_name.clone(), p.clone());
             return Ok(p);
         }
-        Err(PyValueError::new_err(format!("Table not found: {}", table_name)))
+        Err(PyValueError::new_err(format!(
+            "Table not found: {}",
+            table_name
+        )))
     }
-    
+
     /// Get both table path and name in one lock acquisition (optimization)
     #[inline]
     fn get_current_table_info(&self) -> PyResult<(PathBuf, String)> {
         let table_name = self.current_table.read().clone();
         if table_name.is_empty() {
             return Err(PyValueError::new_err(
-                "No table selected. Call create_table() or use_table() first."
+                "No table selected. Call create_table() or use_table() first.",
             ));
         }
         let path = {
@@ -322,12 +344,93 @@ impl ApexStorageImpl {
         let base_dir = self.current_base_dir();
         let p = base_dir.join(format!("{}.apex", table_name));
         if p.exists() {
-            self.table_paths.write().insert(table_name.clone(), p.clone());
+            self.table_paths
+                .write()
+                .insert(table_name.clone(), p.clone());
             return Ok((p, table_name));
         }
-        Err(PyValueError::new_err(format!("Table not found: {}", table_name)))
+        Err(PyValueError::new_err(format!(
+            "Table not found: {}",
+            table_name
+        )))
     }
-    
+
+    /// Resolve the table path for a query-signature fast path.
+    #[inline]
+    fn resolve_signature_table(
+        &self,
+        explicit_table: Option<&str>,
+        default_table_name: &str,
+        default_table_path: &Path,
+        base_dir: &Path,
+    ) -> (String, PathBuf) {
+        let clean_name = match explicit_table {
+            Some(name) => name.trim_matches('"').trim_matches('`'),
+            None => default_table_name,
+        };
+
+        if clean_name.is_empty() {
+            return (
+                default_table_name.to_string(),
+                default_table_path.to_path_buf(),
+            );
+        }
+
+        if let Some(dot_pos) = clean_name.find('.') {
+            let db_name = clean_name[..dot_pos].trim();
+            let tbl_name = clean_name[dot_pos + 1..].trim();
+            let safe_tbl: String = tbl_name
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let safe_tbl = if safe_tbl.len() > 200 {
+                &safe_tbl[..200]
+            } else {
+                &safe_tbl
+            };
+
+            let db_dir = if db_name.is_empty() || db_name.eq_ignore_ascii_case("default") {
+                self.root_dir.clone()
+            } else {
+                self.root_dir.join(db_name)
+            };
+            return (
+                clean_name.to_string(),
+                db_dir.join(format!("{}.apex", safe_tbl)),
+            );
+        }
+
+        if clean_name.eq_ignore_ascii_case("default") || clean_name == default_table_name {
+            return (clean_name.to_string(), default_table_path.to_path_buf());
+        }
+
+        let safe_name: String = clean_name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let safe_name = if safe_name.len() > 200 {
+            &safe_name[..200]
+        } else {
+            &safe_name
+        };
+        (
+            clean_name.to_string(),
+            base_dir.join(format!("{}.apex", safe_name)),
+        )
+    }
+
     /// Get or create cached backend for current table
     /// Uses open_for_write to ensure existing data is loaded for write operations
     /// Get backend for INSERT operations - memory efficient!
@@ -351,13 +454,13 @@ impl ApexStorageImpl {
             TableStorageBackend::create_with_durability(&table_path, self.durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
         };
-        
+
         let backend = Arc::new(backend);
         self.cached_backends.insert(cache_key, backend.clone());
-        
+
         Ok(backend)
     }
-    
+
     /// Get backend for UPDATE/DELETE operations - loads all data into memory.
     /// This is required because save() rewrites the entire file.
     fn get_backend(&self) -> PyResult<Arc<TableStorageBackend>> {
@@ -379,17 +482,18 @@ impl ApexStorageImpl {
             TableStorageBackend::create_with_durability(&table_path, self.durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
         };
-        
+
         let backend = Arc::new(backend);
         self.cached_backends.insert(table_name, backend.clone());
-        
+
         Ok(backend)
     }
-    
+
     /// Invalidate cached backend for a table (used when table is dropped or modified externally)
     fn invalidate_backend(&self, table_name: &str) {
         self.cached_backends.remove(table_name);
-        self.cached_backends.remove(&format!("{}_insert", table_name));
+        self.cached_backends
+            .remove(&format!("{}_insert", table_name));
     }
 
     /// Return current base directory (root_dir for default db, root_dir/db for named db)
@@ -411,10 +515,12 @@ impl ApexStorageImpl {
     #[pyo3(signature = (path, drop_if_exists = false, durability = "fast"))]
     fn new(path: &str, drop_if_exists: bool, durability: &str) -> PyResult<Self> {
         // Parse durability level
-        let durability_level = DurabilityLevel::from_str(durability)
-            .ok_or_else(|| PyValueError::new_err(
-                format!("Invalid durability level '{}'. Must be 'fast', 'safe', or 'max'", durability)
-            ))?;
+        let durability_level = DurabilityLevel::from_str(durability).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "Invalid durability level '{}'. Must be 'fast', 'safe', or 'max'",
+                durability
+            ))
+        })?;
         // Convert to absolute path to avoid issues with relative paths
         let path_obj = PathBuf::from(path);
         let abs_path = if path_obj.is_absolute() {
@@ -424,7 +530,8 @@ impl ApexStorageImpl {
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(&path_obj)
         };
-        let root_dir = abs_path.parent()
+        let root_dir = abs_path
+            .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
 
@@ -439,7 +546,7 @@ impl ApexStorageImpl {
                     }
                 }
             }
-            
+
             // Also remove FTS indexes
             let fts_dir = root_dir.join("fts_indexes");
             if fts_dir.exists() {
@@ -476,31 +583,34 @@ impl ApexStorageImpl {
         let fields = dict_to_values(data)?;
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
-        
+
         // Skip file lock for 'fast' durability — StorageEngine handles thread safety
         // internally via parking_lot::RwLock. File locks only needed for cross-process safety.
         let lock_file = if durability != DurabilityLevel::Fast {
-            Some(Self::acquire_write_lock(&table_path)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?)
+            Some(
+                Self::acquire_write_lock(&table_path)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
+            )
         } else {
             None
         };
-        
+
         // Use StorageEngine for smart write routing
         let result = py.allow_threads(|| {
             let engine = crate::storage::engine::engine();
-            let ids = engine.write(&table_path, &[fields], durability)
+            let ids = engine
+                .write(&table_path, &[fields], durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
             Ok::<i64, PyErr>(ids.first().copied().unwrap_or(0) as i64)
         });
-        
+
         if let Some(lf) = lock_file {
             Self::release_lock(lf);
         }
-        
+
         // Invalidate local backend cache (StorageEngine handles its own cache)
         self.invalidate_backend(&table_name);
-        
+
         let id = result?;
 
         // Index in FTS if enabled
@@ -527,29 +637,32 @@ impl ApexStorageImpl {
 
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
-        
+
         // Skip file lock for 'fast' durability
         let lock_file = if durability != DurabilityLevel::Fast {
-            Some(Self::acquire_write_lock(&table_path)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?)
+            Some(
+                Self::acquire_write_lock(&table_path)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
+            )
         } else {
             None
         };
-        
+
         // Use StorageEngine for smart write routing
         let result = py.allow_threads(|| {
             let engine = crate::storage::engine::engine();
-            engine.write(&table_path, &rows, durability)
+            engine
+                .write(&table_path, &rows, durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         });
-        
+
         if let Some(lf) = lock_file {
             Self::release_lock(lf);
         }
-        
+
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
-        
+
         let ids = result?;
 
         // Index in FTS if enabled (batch operation - only if FTS manager exists)
@@ -559,7 +672,7 @@ impl ApexStorageImpl {
             if mgr.is_some() {
                 let table_name = self.current_table.read().clone();
                 let index_fields = self.fts_index_fields.read().get(&table_name).cloned();
-                
+
                 if let Some(m) = mgr.as_ref() {
                     if let Ok(engine) = m.get_engine(&table_name) {
                         // Determine which fields to index
@@ -572,7 +685,9 @@ impl ApexStorageImpl {
                                     if let Ok(dict) = first_item.downcast::<PyDict>() {
                                         for (key, value) in dict.iter() {
                                             if let Ok(key_str) = key.extract::<String>() {
-                                                if key_str != "_id" && value.extract::<String>().is_ok() {
+                                                if key_str != "_id"
+                                                    && value.extract::<String>().is_ok()
+                                                {
                                                     auto_fields.push(key_str);
                                                 }
                                             }
@@ -582,7 +697,7 @@ impl ApexStorageImpl {
                                 auto_fields
                             }
                         };
-                        
+
                         if !fields_to_index.is_empty() {
                             let num_docs = ids.len();
                             // Build columnar String data — direct per-field lookup, no per-doc HashMap
@@ -590,25 +705,35 @@ impl ApexStorageImpl {
                                 .iter()
                                 .map(|f| (f.clone(), Vec::with_capacity(num_docs)))
                                 .collect();
-                            
+
                             for (i, item) in data.iter().enumerate() {
-                                if i >= ids.len() { break; }
+                                if i >= ids.len() {
+                                    break;
+                                }
                                 if let Ok(dict) = item.downcast::<PyDict>() {
-                                    for (field_idx, field_name) in fields_to_index.iter().enumerate() {
-                                        let value = dict.get_item(field_name)
-                                            .ok().flatten()
+                                    for (field_idx, field_name) in
+                                        fields_to_index.iter().enumerate()
+                                    {
+                                        let value = dict
+                                            .get_item(field_name)
+                                            .ok()
+                                            .flatten()
                                             .and_then(|v| v.extract::<String>().ok())
                                             .unwrap_or_default();
                                         columns[field_idx].1.push(value);
                                     }
                                 }
                             }
-                            
+
                             // 🥈 add_documents_arrow_str: zero-copy &str slices, ~3.3M docs/s
                             if !columns.is_empty() && !columns[0].1.is_empty() {
-                                let doc_ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
-                                let columns_ref: Vec<(String, Vec<&str>)> = columns.iter()
-                                    .map(|(name, vals)| (name.clone(), vals.iter().map(|s| s.as_str()).collect()))
+                                let doc_ids_u32: Vec<u32> =
+                                    ids.iter().map(|&id| id as u32).collect();
+                                let columns_ref: Vec<(String, Vec<&str>)> = columns
+                                    .iter()
+                                    .map(|(name, vals)| {
+                                        (name.clone(), vals.iter().map(|s| s.as_str()).collect())
+                                    })
                                     .collect();
                                 let _ = py.allow_threads(|| {
                                     engine.add_documents_arrow_str(&doc_ids_u32, columns_ref)
@@ -625,7 +750,7 @@ impl ApexStorageImpl {
 
     /// Store columnar data directly - bypasses row-by-row conversion
     /// Much faster for bulk inserts with homogeneous data
-    /// 
+    ///
     /// Args:
     ///     columns: Dict[str, list] - column name to list of values
     ///     
@@ -640,28 +765,31 @@ impl ApexStorageImpl {
         let mut col_lengths: Vec<(String, usize)> = Vec::new();
         for (key, value) in columns.iter() {
             let col_name: String = key.extract()?;
-            if col_name == "_id" { continue; }
-            
-            let list = value.downcast::<PyList>()
-                .map_err(|_| PyValueError::new_err(format!("Column '{}' must be a list", col_name)))?;
+            if col_name == "_id" {
+                continue;
+            }
+
+            let list = value.downcast::<PyList>().map_err(|_| {
+                PyValueError::new_err(format!("Column '{}' must be a list", col_name))
+            })?;
             col_lengths.push((col_name, list.len()));
         }
-        
+
         if col_lengths.is_empty() {
             return Ok(Vec::new());
         }
-        
+
         // Check all columns have same length
         let first_len = col_lengths[0].1;
         for (name, len) in &col_lengths {
             if *len != first_len {
                 return Err(PyValueError::new_err(format!(
-                    "All columns must have the same length: '{}' has {} rows, expected {}", 
+                    "All columns must have the same length: '{}' has {} rows, expected {}",
                     name, len, first_len
                 )));
             }
         }
-        
+
         let num_rows = first_len;
         if num_rows == 0 {
             return Ok(Vec::new());
@@ -678,21 +806,28 @@ impl ApexStorageImpl {
 
         for (key, value) in columns.iter() {
             let col_name: String = key.extract()?;
-            if col_name == "_id" { continue; }
-            
-            let list = value.downcast::<PyList>()
-                .map_err(|_| PyValueError::new_err(format!("Column '{}' must be a list", col_name)))?;
-            
+            if col_name == "_id" {
+                continue;
+            }
+
+            let list = value.downcast::<PyList>().map_err(|_| {
+                PyValueError::new_err(format!("Column '{}' must be a list", col_name))
+            })?;
+
             let col_len = list.len();
-            if col_len == 0 { continue; }
-            
+            if col_len == 0 {
+                continue;
+            }
+
             // Detect type from first non-None element
             // NOTE: Check bool before int because in Python bool is a subclass of int
             // NOTE: Check bytes before string because PyBytes can also be extracted as str in some pyo3 versions
             let mut col_type: Option<&str> = None;
             for item in list.iter() {
                 if !item.is_none() {
-                    if item.extract::<bool>().is_ok() && item.get_type().name().map_or(false, |n| n == "bool") {
+                    if item.extract::<bool>().is_ok()
+                        && item.get_type().name().map_or(false, |n| n == "bool")
+                    {
                         col_type = Some("bool");
                     } else if item.downcast::<pyo3::types::PyBytes>().is_ok() {
                         col_type = Some("bytes");
@@ -715,7 +850,7 @@ impl ApexStorageImpl {
                     break;
                 }
             }
-            
+
             match col_type {
                 Some("int") => {
                     let mut vals = Vec::with_capacity(col_len);
@@ -723,7 +858,11 @@ impl ApexStorageImpl {
                     for item in list.iter() {
                         let is_null = item.is_none();
                         nulls.push(is_null);
-                        vals.push(if is_null { 0 } else { item.extract::<i64>().unwrap_or(0) });
+                        vals.push(if is_null {
+                            0
+                        } else {
+                            item.extract::<i64>().unwrap_or(0)
+                        });
                     }
                     int_columns.insert(col_name.clone(), vals);
                     null_positions.insert(col_name, nulls);
@@ -734,7 +873,11 @@ impl ApexStorageImpl {
                     for item in list.iter() {
                         let is_null = item.is_none();
                         nulls.push(is_null);
-                        vals.push(if is_null { 0.0 } else { item.extract::<f64>().unwrap_or(0.0) });
+                        vals.push(if is_null {
+                            0.0
+                        } else {
+                            item.extract::<f64>().unwrap_or(0.0)
+                        });
                     }
                     float_columns.insert(col_name.clone(), vals);
                     null_positions.insert(col_name, nulls);
@@ -745,7 +888,11 @@ impl ApexStorageImpl {
                     for item in list.iter() {
                         let is_null = item.is_none();
                         nulls.push(is_null);
-                        vals.push(if is_null { false } else { item.extract::<bool>().unwrap_or(false) });
+                        vals.push(if is_null {
+                            false
+                        } else {
+                            item.extract::<bool>().unwrap_or(false)
+                        });
                     }
                     bool_columns.insert(col_name.clone(), vals);
                     null_positions.insert(col_name, nulls);
@@ -805,7 +952,8 @@ impl ApexStorageImpl {
                             .and_then(|f32arr| f32arr.call_method0("tobytes"))
                             .and_then(|b| b.extract::<Vec<u8>>())
                         {
-                            let f16_bytes: Vec<u8> = f32_bytes.chunks_exact(4)
+                            let f16_bytes: Vec<u8> = f32_bytes
+                                .chunks_exact(4)
                                 .flat_map(|c| {
                                     let f = f32::from_le_bytes(c.try_into().unwrap());
                                     crate::storage::on_demand::f32_to_f16(f).to_le_bytes()
@@ -825,7 +973,11 @@ impl ApexStorageImpl {
                     for item in list.iter() {
                         let is_null = item.is_none();
                         nulls.push(is_null);
-                        vals.push(if is_null { String::new() } else { item.extract::<String>().unwrap_or_default() });
+                        vals.push(if is_null {
+                            String::new()
+                        } else {
+                            item.extract::<String>().unwrap_or_default()
+                        });
                     }
                     string_columns.insert(col_name.clone(), vals);
                     null_positions.insert(col_name, nulls);
@@ -840,36 +992,42 @@ impl ApexStorageImpl {
 
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
-        
+
         // Skip file lock for 'fast' durability
         let lock_file = if durability != DurabilityLevel::Fast {
-            Some(Self::acquire_write_lock(&table_path)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?)
+            Some(
+                Self::acquire_write_lock(&table_path)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
+            )
         } else {
             None
         };
-        
+
         // Save a copy of string_columns for FTS indexing (before insert_typed consumes it)
         let string_columns_for_fts = string_columns.clone();
 
         // Use StorageEngine for unified write
         let result = py.allow_threads(|| {
             let engine = crate::storage::engine::engine();
-            engine.write_typed(
-                &table_path,
-                int_columns, float_columns, string_columns,
-                binary_columns_map,
-                fixedlist_columns_map,
-                bool_columns,
-                null_positions,
-                durability,
-            ).map_err(|e| PyIOError::new_err(e.to_string()))
+            engine
+                .write_typed(
+                    &table_path,
+                    int_columns,
+                    float_columns,
+                    string_columns,
+                    binary_columns_map,
+                    fixedlist_columns_map,
+                    bool_columns,
+                    null_positions,
+                    durability,
+                )
+                .map_err(|e| PyIOError::new_err(e.to_string()))
         });
-        
+
         if let Some(lf) = lock_file {
             Self::release_lock(lf);
         }
-        
+
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
         // On Windows, engine.insert_cache holds a mmap'd backend after write_typed.
@@ -877,35 +1035,48 @@ impl ApexStorageImpl {
         // (ERROR_USER_MAPPED_FILE / os error 1224 is triggered when any mmap is open).
         #[cfg(target_os = "windows")]
         crate::storage::engine::engine().invalidate(&table_path);
-        
+
         let ids = result?;
-        
+
         // Index in FTS if enabled - OPTIMIZED: Use add_documents_arrow_str (🥈 zero-copy &str path)
         {
             let mgr = self.fts_manager.read();
             if mgr.is_some() {
                 let table_name = self.current_table.read().clone();
                 let index_fields = self.fts_index_fields.read().get(&table_name).cloned();
-                
+
                 if let Some(m) = mgr.as_ref() {
                     if let Ok(engine) = m.get_engine(&table_name) {
                         // Determine which string fields to index
                         let string_field_names: Vec<String> = match &index_fields {
-                            Some(fields) => fields.iter().cloned().filter(|f| string_columns_for_fts.contains_key(f)).collect(),
+                            Some(fields) => fields
+                                .iter()
+                                .cloned()
+                                .filter(|f| string_columns_for_fts.contains_key(f))
+                                .collect(),
                             None => string_columns_for_fts.keys().cloned().collect(),
                         };
-                        
+
                         if !string_field_names.is_empty() {
                             // Build owned String columns, then convert to &str for zero-copy call
-                            let fts_columns: Vec<(String, Vec<String>)> = string_field_names.iter()
-                                .filter_map(|f| string_columns_for_fts.get(f).map(|v| (f.clone(), v.clone())))
+                            let fts_columns: Vec<(String, Vec<String>)> = string_field_names
+                                .iter()
+                                .filter_map(|f| {
+                                    string_columns_for_fts
+                                        .get(f)
+                                        .map(|v| (f.clone(), v.clone()))
+                                })
                                 .collect();
-                            
+
                             // 🥈 add_documents_arrow_str: zero-copy &str slices, ~3.3M docs/s
                             if !fts_columns.is_empty() {
-                                let doc_ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
-                                let columns_ref: Vec<(String, Vec<&str>)> = fts_columns.iter()
-                                    .map(|(name, vals)| (name.clone(), vals.iter().map(|s| s.as_str()).collect()))
+                                let doc_ids_u32: Vec<u32> =
+                                    ids.iter().map(|&id| id as u32).collect();
+                                let columns_ref: Vec<(String, Vec<&str>)> = fts_columns
+                                    .iter()
+                                    .map(|(name, vals)| {
+                                        (name.clone(), vals.iter().map(|s| s.as_str()).collect())
+                                    })
                                     .collect();
                                 let _ = py.allow_threads(|| {
                                     engine.add_documents_arrow_str(&doc_ids_u32, columns_ref)
@@ -916,22 +1087,22 @@ impl ApexStorageImpl {
                 }
             }
         }
-        
+
         Ok(ids.into_iter().map(|id| id as i64).collect())
     }
-    
+
     /// Helper to index a document for FTS (single document - uses slower path)
     fn index_for_fts(&self, id: i64, data: &Bound<'_, PyDict>) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
-        
+
         if mgr.is_none() {
             return Ok(());
         }
-        
+
         // Get index fields config
         let index_fields = self.fts_index_fields.read().get(&table_name).cloned();
-        
+
         // Build fields map from dict
         let mut fields = HashMap::new();
         for (key, value) in data.iter() {
@@ -939,24 +1110,24 @@ impl ApexStorageImpl {
             if key_str == "_id" {
                 continue;
             }
-            
+
             // Check if this field should be indexed
             let should_index = match &index_fields {
                 Some(idx_fields) => idx_fields.contains(&key_str),
                 None => value.extract::<String>().is_ok(), // Index all string fields by default
             };
-            
+
             if should_index {
                 if let Ok(s) = value.extract::<String>() {
                     fields.insert(key_str, s);
                 }
             }
         }
-        
+
         if fields.is_empty() {
             return Ok(());
         }
-        
+
         // 🥇 Index the document via add_documents_arrow_texts (pre-joined text, zero-copy &str)
         if let Some(m) = mgr.as_ref() {
             if let Ok(engine) = m.get_engine(&table_name) {
@@ -966,7 +1137,7 @@ impl ApexStorageImpl {
                 let _ = engine.add_documents_arrow_texts(&[doc_id], &[joined.as_str()]);
             }
         }
-        
+
         Ok(())
     }
 
@@ -974,27 +1145,30 @@ impl ApexStorageImpl {
     fn delete(&self, id: i64) -> PyResult<bool> {
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
-        
+
         // Skip file lock for 'fast' durability
         let lock_file = if durability != DurabilityLevel::Fast {
-            Some(Self::acquire_write_lock(&table_path)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?)
+            Some(
+                Self::acquire_write_lock(&table_path)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
+            )
         } else {
             None
         };
-        
+
         // Use StorageEngine for unified delete
         let engine = crate::storage::engine::engine();
-        let result = engine.delete_one(&table_path, id as u64, durability)
+        let result = engine
+            .delete_one(&table_path, id as u64, durability)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+
         if let Some(lf) = lock_file {
             Self::release_lock(lf);
         }
-        
+
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
-        
+
         Ok(result)
     }
 
@@ -1004,83 +1178,84 @@ impl ApexStorageImpl {
         if ids.is_empty() {
             return Ok(true);
         }
-        
+
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
-        
+
         // Skip file lock for 'fast' durability
         let lock_file = if durability != DurabilityLevel::Fast {
-            Some(Self::acquire_write_lock(&table_path)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?)
+            Some(
+                Self::acquire_write_lock(&table_path)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
+            )
         } else {
             None
         };
-        
+
         // Use StorageEngine for unified delete
         let engine = crate::storage::engine::engine();
         let ids_u64: Vec<u64> = ids.into_iter().map(|id| id as u64).collect();
-        let deleted = engine.delete(&table_path, &ids_u64, durability)
+        let deleted = engine
+            .delete(&table_path, &ids_u64, durability)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+
         if let Some(lf) = lock_file {
             Self::release_lock(lf);
         }
-        
+
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
-        
+
         Ok(deleted > 0)
     }
-    
+
     /// Delete records matching a WHERE clause
     /// Returns the number of deleted rows
     fn delete_where(&self, where_clause: &str) -> PyResult<i64> {
         let (table_path, table_name) = self.get_current_table_info()?;
-        
+
         // Build DELETE SQL statement
         let sql = format!("DELETE FROM {} WHERE {}", table_name, where_clause);
-        
+
         // Execute using ApexExecutor
         let base_dir = self.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.root_dir);
         let exec_result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path);
         crate::query::executor::clear_query_root_dir();
-        let result = exec_result
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+        let result = exec_result.map_err(|e| PyIOError::new_err(e.to_string()))?;
+
         // Invalidate cached backend since data changed
         self.invalidate_backend(&table_name);
         // Invalidate StorageEngine cache so count_rows() sees updated state
         crate::storage::engine::engine().invalidate(&table_path);
-        
+
         // Extract scalar result (number of deleted rows)
         match result {
             ApexResult::Scalar(count) => Ok(count),
             _ => Ok(0),
         }
     }
-    
+
     /// Delete all records (no WHERE clause)
     /// Returns the number of deleted rows
     fn delete_all(&self) -> PyResult<i64> {
         let (table_path, table_name) = self.get_current_table_info()?;
-        
+
         // Build DELETE SQL statement without WHERE
         let sql = format!("DELETE FROM {}", table_name);
-        
+
         // Execute using ApexExecutor
         let base_dir = self.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.root_dir);
         let exec_result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path);
         crate::query::executor::clear_query_root_dir();
-        let result = exec_result
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+        let result = exec_result.map_err(|e| PyIOError::new_err(e.to_string()))?;
+
         // Invalidate cached backend since data changed
         self.invalidate_backend(&table_name);
         // Invalidate StorageEngine cache so count_rows() sees updated state
         crate::storage::engine::engine().invalidate(&table_path);
-        
+
         // Extract scalar result (number of deleted rows)
         match result {
             ApexResult::Scalar(count) => Ok(count),
@@ -1102,18 +1277,26 @@ impl ApexStorageImpl {
 
         // Single read of current_table — avoids 3x RwLock acquire + String clone
         let table_name = self.current_table.read().clone();
+        let base_dir = self.current_base_dir();
         let table_path = if table_name.is_empty() {
-            self.current_base_dir()
+            base_dir.clone()
         } else {
-            self.table_paths.read().get(&table_name)
+            self.table_paths
+                .read()
+                .get(&table_name)
                 .cloned()
-                .unwrap_or_else(|| self.current_base_dir().join(format!("{}.apex", table_name)))
+                .unwrap_or_else(|| base_dir.join(format!("{}.apex", table_name)))
         };
 
         // ── ULTRA-FAST PATH: _id point lookup via cached_backends (warm) ──
         // Uses per-instance DashMap — zero PathBuf hashing, bypasses STORAGE_CACHE.
-        if let QuerySignature::PointLookup { id, .. } = &sig {
-            let maybe_backend = self.cached_backends.get(&table_name).map(|v| Arc::clone(&v));
+        if let QuerySignature::PointLookup { id, ref table } = &sig {
+            let (target_table, target_path) =
+                self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
+            let maybe_backend = self
+                .cached_backends
+                .get(&target_table)
+                .map(|v| Arc::clone(&v));
             if let Some(backend) = maybe_backend {
                 let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
                 if let Ok(Some(vals)) = rcix_result {
@@ -1128,12 +1311,9 @@ impl ApexStorageImpl {
                     return Ok(out.into());
                 }
             }
-        }
-
-        // ── FAST PATH: Point lookup (cold — populates cached_backends for next ultra-fast call) ──
-        if let QuerySignature::PointLookup { id, .. } = &sig {
-            if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-                self.cached_backends.insert(table_name.clone(), Arc::clone(&backend));
+            if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
+                self.cached_backends
+                    .insert(target_table.clone(), Arc::clone(&backend));
                 let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
                 if let Ok(Some(vals)) = rcix_result {
                     let out = PyDict::new_bound(py);
@@ -1168,19 +1348,71 @@ impl ApexStorageImpl {
             }
         }
 
+        // ── FAST PATH: SELECT * ... WHERE _id IN (...) ──
+        if let QuerySignature::IdBatchLookup { ids, ref table } = &sig {
+            let (target_table, target_path) =
+                self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
+            let maybe_backend = self
+                .cached_backends
+                .get(&target_table)
+                .map(|v| Arc::clone(&v))
+                .or_else(|| {
+                    crate::query::get_cached_backend_pub(&target_path)
+                        .ok()
+                        .map(|b| {
+                            self.cached_backends
+                                .insert(target_table.clone(), Arc::clone(&b));
+                            b
+                        })
+                });
+
+            if let Some(backend) = maybe_backend {
+                let mut sorted_ids = ids.clone();
+                sorted_ids.sort_unstable();
+                sorted_ids.dedup();
+                let batch_result =
+                    py.allow_threads(|| backend.read_rows_by_ids_to_arrow(&sorted_ids));
+                if let Ok(batch) = batch_result {
+                    let batch = if batch.num_rows() > 0 {
+                        batch
+                    } else if let Ok(empty) = backend.read_columns_to_arrow(None, 0, Some(0)) {
+                        empty
+                    } else {
+                        batch
+                    };
+                    let out = PyDict::new_bound(py);
+                    let columns_dict = PyDict::new_bound(py);
+                    let schema = batch.schema();
+                    for col_idx in 0..batch.num_columns() {
+                        let col_name = schema.field(col_idx).name();
+                        let arr = batch.column(col_idx);
+                        let col_list = arrow_col_to_pylist(py, arr)?;
+                        columns_dict.set_item(col_name, col_list)?;
+                    }
+                    out.set_item("columns_dict", columns_dict)?;
+                    out.set_item("rows_affected", 0i64)?;
+                    return Ok(out.into());
+                }
+            }
+        }
+
         // ── FAST PATH: SELECT * LIMIT N — pread RCIX, returns columnar dict ──
-        if let QuerySignature::SimpleScanLimit { limit } = &sig {
-            if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+        if let QuerySignature::SimpleScanLimit { limit, ref table } = &sig {
+            let (_, target_path) =
+                self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
+            if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
                 let limit = *limit;
-                let batch_result = py.allow_threads(|| {
-                    match backend.storage.get_or_load_footer() {
+                let batch_result =
+                    py.allow_threads(|| match backend.storage.get_or_load_footer() {
                         Ok(Some(footer)) => {
-                            let col_indices: Vec<usize> = (0..footer.schema.column_count()).collect();
-                            backend.storage.to_arrow_batch_pread_rcix(&col_indices, true, limit)
+                            let col_indices: Vec<usize> =
+                                (0..footer.schema.column_count()).collect();
+                            backend
+                                .storage
+                                .to_arrow_batch_pread_rcix(&col_indices, true, limit)
                         }
                         _ => Ok(None),
-                    }
-                });
+                    });
                 if let Ok(Some(batch)) = batch_result {
                     if batch.num_rows() > 0 {
                         let out = PyDict::new_bound(py);
@@ -1202,31 +1434,51 @@ impl ApexStorageImpl {
 
         // ── Transaction handling (single uppercase pass) ──
         let is_txn = matches!(&sig, QuerySignature::Transaction);
-        let txn_upper = if is_txn { sql.trim().to_ascii_uppercase() } else { String::new() };
+        let txn_upper = if is_txn {
+            sql.trim().to_ascii_uppercase()
+        } else {
+            String::new()
+        };
         let is_begin = is_txn && txn_upper.starts_with("BEGIN");
         let is_commit = is_txn && (txn_upper == "COMMIT" || txn_upper == "COMMIT;");
-        let is_rollback = is_txn && (txn_upper == "ROLLBACK" || txn_upper == "ROLLBACK;") && !txn_upper.starts_with("ROLLBACK TO");
+        let is_rollback = is_txn
+            && (txn_upper == "ROLLBACK" || txn_upper == "ROLLBACK;")
+            && !txn_upper.starts_with("ROLLBACK TO");
         let is_savepoint = is_txn && txn_upper.starts_with("SAVEPOINT ");
         let is_rollback_to = is_txn && txn_upper.starts_with("ROLLBACK TO");
         let is_release = is_txn && txn_upper.starts_with("RELEASE");
 
         let current_txn = *self.current_txn_id.read();
         let is_txn_dml = current_txn.is_some() && matches!(&sig, QuerySignature::DmlWrite);
-        let is_txn_select = current_txn.is_some() && !is_write && !is_txn
-            && matches!(&sig, QuerySignature::Complex | QuerySignature::CountStar { .. }
-                | QuerySignature::PointLookup { .. } | QuerySignature::SimpleScanLimit { .. }
-                | QuerySignature::StringEqualityFilter { .. } | QuerySignature::LikeFilter { .. }
-                | QuerySignature::TableFunction);
+        let is_txn_select = current_txn.is_some()
+            && !is_write
+            && !is_txn
+            && matches!(
+                &sig,
+                QuerySignature::Complex
+                    | QuerySignature::CountStar { .. }
+                    | QuerySignature::PointLookup { .. }
+                    | QuerySignature::ProjectedPointLookup { .. }
+                    | QuerySignature::SimpleScanLimit { .. }
+                    | QuerySignature::ProjectedScanLimit { .. }
+                    | QuerySignature::IdBatchLookup { .. }
+                    | QuerySignature::ProjectedIdBatchLookup { .. }
+                    | QuerySignature::FullScan { .. }
+                    | QuerySignature::ProjectedFullScan { .. }
+                    | QuerySignature::StringEqualityFilter { .. }
+                    | QuerySignature::ProjectedStringEqualityFilter { .. }
+                    | QuerySignature::LikeFilter { .. }
+                    | QuerySignature::TableFunction
+            );
 
         let sql = sql.to_string();
-        let base_dir = self.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.root_dir);
 
         // Return enum to avoid per-cell arrow_value_at inside allow_threads
         enum ExecOut {
-            Scalar(String, i64),   // key, value — for txn commands
-            Batch(RecordBatch),    // data result — columnar conversion with GIL
-            Empty,                 // no result
+            Scalar(String, i64), // key, value — for txn commands
+            Batch(RecordBatch),  // data result — columnar conversion with GIL
+            Empty,               // no result
         }
 
         let exec_out = py.allow_threads(|| -> PyResult<ExecOut> {
@@ -1260,13 +1512,20 @@ impl ApexStorageImpl {
 
             if is_savepoint {
                 if let Some(txn_id) = current_txn {
-                    let name = sql.trim().strip_prefix("SAVEPOINT ").or_else(|| sql.trim().strip_prefix("savepoint "))
-                        .unwrap_or("").trim().trim_end_matches(';').to_string();
+                    let name = sql
+                        .trim()
+                        .strip_prefix("SAVEPOINT ")
+                        .or_else(|| sql.trim().strip_prefix("savepoint "))
+                        .unwrap_or("")
+                        .trim()
+                        .trim_end_matches(';')
+                        .to_string();
                     let mgr = crate::txn::txn_manager();
                     mgr.with_context(txn_id, |ctx| {
                         ctx.savepoint(&name);
                         Ok(())
-                    }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    })
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 }
                 return Ok(ExecOut::Empty);
             }
@@ -1274,13 +1533,19 @@ impl ApexStorageImpl {
             if is_rollback_to {
                 if let Some(txn_id) = current_txn {
                     let rest = txn_upper.strip_prefix("ROLLBACK TO").unwrap_or("").trim();
-                    let rest = rest.strip_prefix("SAVEPOINT").unwrap_or(rest).trim().trim_end_matches(';');
+                    let rest = rest
+                        .strip_prefix("SAVEPOINT")
+                        .unwrap_or(rest)
+                        .trim()
+                        .trim_end_matches(';');
                     let name_start = txn_upper.find(rest).unwrap_or(0);
-                    let name = sql.trim()[name_start..].trim().trim_end_matches(';').to_string();
+                    let name = sql.trim()[name_start..]
+                        .trim()
+                        .trim_end_matches(';')
+                        .to_string();
                     let mgr = crate::txn::txn_manager();
-                    mgr.with_context(txn_id, |ctx| {
-                        ctx.rollback_to_savepoint(&name)
-                    }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    mgr.with_context(txn_id, |ctx| ctx.rollback_to_savepoint(&name))
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 }
                 return Ok(ExecOut::Empty);
             }
@@ -1288,27 +1553,34 @@ impl ApexStorageImpl {
             if is_release {
                 if let Some(txn_id) = current_txn {
                     let rest = txn_upper.strip_prefix("RELEASE").unwrap_or("").trim();
-                    let rest = rest.strip_prefix("SAVEPOINT").unwrap_or(rest).trim().trim_end_matches(';');
+                    let rest = rest
+                        .strip_prefix("SAVEPOINT")
+                        .unwrap_or(rest)
+                        .trim()
+                        .trim_end_matches(';');
                     let name_start = txn_upper.find(rest).unwrap_or(0);
-                    let name = sql.trim()[name_start..].trim().trim_end_matches(';').to_string();
+                    let name = sql.trim()[name_start..]
+                        .trim()
+                        .trim_end_matches(';')
+                        .to_string();
                     let mgr = crate::txn::txn_manager();
-                    mgr.with_context(txn_id, |ctx| {
-                        ctx.release_savepoint(&name)
-                    }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    mgr.with_context(txn_id, |ctx| ctx.release_savepoint(&name))
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 }
                 return Ok(ExecOut::Empty);
             }
 
             if is_txn_dml || is_txn_select {
                 let txn_id = current_txn.unwrap();
-                let parsed = SqlParser::parse(&sql)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let parsed =
+                    SqlParser::parse(&sql).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 let result = ApexExecutor::execute_in_txn(txn_id, parsed, &base_dir, &table_path)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 if let ApexResult::Scalar(n) = &result {
                     return Ok(ExecOut::Scalar("rows_buffered".to_string(), *n));
                 }
-                let batch = result.to_record_batch()
+                let batch = result
+                    .to_record_batch()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 return Ok(ExecOut::Batch(batch));
             }
@@ -1319,7 +1591,8 @@ impl ApexStorageImpl {
             if let ApexResult::Scalar(n) = &result {
                 return Ok(ExecOut::Scalar("rows_affected".to_string(), *n));
             }
-            let batch = result.to_record_batch()
+            let batch = result
+                .to_record_batch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             Ok(ExecOut::Batch(batch))
         })?;
@@ -1370,7 +1643,10 @@ impl ApexStorageImpl {
         }
 
         // After CREATE TABLE, register the new table and set it as current
-        if let QuerySignature::Ddl { kind: crate::query::query_signature::DdlKind::CreateTable { ref name } } = &sig {
+        if let QuerySignature::Ddl {
+            kind: crate::query::query_signature::DdlKind::CreateTable { ref name },
+        } = &sig
+        {
             let tbl_path = self.current_base_dir().join(format!("{}.apex", name));
             self.table_paths.write().insert(name.clone(), tbl_path);
             *self.current_table.write() = name.clone();
@@ -1384,7 +1660,8 @@ impl ApexStorageImpl {
     fn execute_batch(&self, py: Python<'_>, queries: Vec<String>) -> PyResult<PyObject> {
         use arrow::ipc::writer::StreamWriter;
 
-        let table_path = self.get_current_table_path()
+        let table_path = self
+            .get_current_table_path()
             .unwrap_or_else(|_| self.current_base_dir());
         let base_dir = self.current_base_dir();
         let root_dir = self.root_dir.clone();
@@ -1417,9 +1694,11 @@ impl ApexStorageImpl {
                     {
                         let mut writer = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
                             .map_err(|e| format!("IPC writer error: {}", e))?;
-                        writer.write(&batch)
+                        writer
+                            .write(&batch)
                             .map_err(|e| format!("IPC write error: {}", e))?;
-                        writer.finish()
+                        writer
+                            .finish()
                             .map_err(|e| format!("IPC finish error: {}", e))?;
                     }
                     Ok(buf)
@@ -1446,70 +1725,93 @@ impl ApexStorageImpl {
     /// Execute SQL query and return Arrow FFI pointers for zero-copy transfer
     /// Returns (schema_ptr, array_ptr) that can be imported by PyArrow
     fn _execute_arrow_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(usize, usize)> {
+        use arrow::array::{Array, StructArray};
         use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-        use arrow::array::{StructArray, Array};
-        
+
         let sql = sql.to_string();
         let base_dir = self.current_base_dir();
         // Fall back to base_dir when no table selected (e.g. SELECT * FROM read_csv(...)).
         // Table-function queries don't use the default_table_path at all.
-        let table_path = self.get_current_table_path().unwrap_or_else(|_| base_dir.clone());
+        let table_path = self
+            .get_current_table_path()
+            .unwrap_or_else(|_| base_dir.clone());
         crate::query::executor::set_query_root_dir(&self.root_dir);
 
         // Execute query in Rust thread pool
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
             let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
-            result.to_record_batch()
+
+            result
+                .to_record_batch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
         crate::query::executor::clear_query_root_dir();
-        
+
         // Empty result
         if batch.num_rows() == 0 {
             return Ok((0, 0));
         }
-        
+
         // Convert RecordBatch to StructArray for FFI export
         let struct_array: StructArray = batch.into();
         let array_data = struct_array.to_data();
-        
+
         // Export to FFI
         let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&array_data)
             .map_err(|e| PyRuntimeError::new_err(format!("FFI export failed: {}", e)))?;
-        
+
         // Leak the FFI structs to get stable pointers (caller must free via _free_arrow_ffi)
         let schema_ptr = Box::into_raw(Box::new(ffi_schema)) as usize;
         let array_ptr = Box::into_raw(Box::new(ffi_array)) as usize;
-        
+
         Ok((schema_ptr, array_ptr))
     }
-    
+
     /// Single-pass LIKE scan+extract via scan_like_and_extract_mmap, returned as zero-copy
     /// Arrow FFI pointers.  Returns (0, 0) on any error or when the fast path is unavailable
     /// (compressed/non-RCIX files), letting Python fall back to the IPC path.
     ///
     /// Uses `QuerySignature::classify()` — no inline pattern matching.
     fn _execute_like_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(usize, usize)> {
-        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-        use arrow::array::{StructArray, Array};
         use crate::query::query_signature::{self, QuerySignature};
+        use arrow::array::{Array, StructArray};
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 
         let sig = query_signature::classify(sql);
-        let (col, pattern) = match sig {
-            QuerySignature::LikeFilter { column, pattern } => (column, pattern),
+        let (table, col, pattern) = match sig {
+            QuerySignature::LikeFilter {
+                table,
+                column,
+                pattern,
+            } => (table, column, pattern),
             _ => return Ok((0, 0)),
         };
 
-        let table_path = match self.get_current_table_path() {
-            Ok(p) => p,
-            Err(_) => return Ok((0, 0)),
+        let default_table_name = self.current_table.read().clone();
+        let base_dir = self.current_base_dir();
+        let default_table_path = if default_table_name.is_empty() {
+            base_dir.clone()
+        } else {
+            self.table_paths
+                .read()
+                .get(&default_table_name)
+                .cloned()
+                .unwrap_or_else(|| base_dir.join(format!("{}.apex", default_table_name)))
         };
+        let (_, table_path) = self.resolve_signature_table(
+            table.as_deref(),
+            &default_table_name,
+            &default_table_path,
+            &base_dir,
+        );
 
         let batch = py.allow_threads(|| -> Option<arrow::record_batch::RecordBatch> {
             let backend = crate::query::get_cached_backend_pub(&table_path).ok()?;
-            backend.scan_like_and_extract_mmap(&col, &pattern, None).ok().flatten()
+            backend
+                .scan_like_and_extract_mmap(&col, &pattern, None)
+                .ok()
+                .flatten()
         });
 
         let batch = match batch {
@@ -1523,14 +1825,14 @@ impl ApexStorageImpl {
         let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&array_data)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("FFI export: {}", e)))?;
         let schema_ptr = Box::into_raw(Box::new(ffi_schema)) as usize;
-        let array_ptr  = Box::into_raw(Box::new(ffi_array))  as usize;
+        let array_ptr = Box::into_raw(Box::new(ffi_array)) as usize;
         Ok((schema_ptr, array_ptr))
     }
 
     /// Free Arrow FFI pointers allocated by _execute_arrow_ffi or _query_arrow_ffi
     fn _free_arrow_ffi(&self, schema_ptr: usize, array_ptr: usize) -> PyResult<()> {
         use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-        
+
         if schema_ptr != 0 {
             unsafe {
                 let _ = Box::from_raw(schema_ptr as *mut FFI_ArrowSchema);
@@ -1543,15 +1845,15 @@ impl ApexStorageImpl {
         }
         Ok(())
     }
-    
+
     /// Execute SQL and return Arrow IPC bytes for efficient transfer.
     ///
     /// Uses `QuerySignature::classify()` — no inline pattern matching.
     /// Primarily used for multi-statement SQL and as a fallback for Arrow FFI failures.
     fn _execute_arrow_ipc(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+        use crate::query::query_signature::{self, QuerySignature};
         use arrow::ipc::writer::StreamWriter;
         use pyo3::types::PyBytes;
-        use crate::query::query_signature::{self, QuerySignature};
 
         let sig = query_signature::classify(sql);
         let is_write = matches!(&sig, QuerySignature::DmlWrite | QuerySignature::Ddl { .. });
@@ -1562,7 +1864,9 @@ impl ApexStorageImpl {
         let table_path = if table_name.is_empty() {
             self.current_base_dir()
         } else {
-            self.table_paths.read().get(&table_name)
+            self.table_paths
+                .read()
+                .get(&table_name)
                 .cloned()
                 .unwrap_or_else(|| self.current_base_dir().join(format!("{}.apex", table_name)))
         };
@@ -1570,18 +1874,27 @@ impl ApexStorageImpl {
         crate::query::executor::set_query_root_dir(&self.root_dir);
 
         // FAST PATH: SELECT * LIMIT N — build Arrow batch directly from V4
-        if let QuerySignature::SimpleScanLimit { limit } = &sig {
-            if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-                if let Ok(batch) = backend.storage.to_arrow_batch_with_limit(None, false, *limit) {
+        if let QuerySignature::SimpleScanLimit { limit, ref table } = &sig {
+            let (_, target_path) =
+                self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
+            if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
+                if let Ok(batch) = backend
+                    .storage
+                    .to_arrow_batch_with_limit(None, false, *limit)
+                {
                     if batch.num_rows() > 0 || batch.num_columns() > 0 {
                         let mut buf = Vec::with_capacity(batch.get_array_memory_size() + 256);
                         {
-                            let mut writer = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
-                                .map_err(|e| PyRuntimeError::new_err(format!("IPC writer error: {}", e)))?;
-                            writer.write(&batch)
-                                .map_err(|e| PyRuntimeError::new_err(format!("IPC write error: {}", e)))?;
-                            writer.finish()
-                                .map_err(|e| PyRuntimeError::new_err(format!("IPC finish error: {}", e)))?;
+                            let mut writer =
+                                StreamWriter::try_new(&mut buf, batch.schema().as_ref()).map_err(
+                                    |e| PyRuntimeError::new_err(format!("IPC writer error: {}", e)),
+                                )?;
+                            writer.write(&batch).map_err(|e| {
+                                PyRuntimeError::new_err(format!("IPC write error: {}", e))
+                            })?;
+                            writer.finish().map_err(|e| {
+                                PyRuntimeError::new_err(format!("IPC finish error: {}", e))
+                            })?;
                         }
                         return Ok(PyBytes::new_bound(py, &buf).into());
                     }
@@ -1596,9 +1909,15 @@ impl ApexStorageImpl {
             py.allow_threads(|| -> PyResult<(RecordBatch, Option<u64>)> {
                 let stmts = crate::query::sql_parser::SqlParser::parse_multi(&sql)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let (result, final_txn) = ApexExecutor::execute_multi_with_txn(stmts, &base_dir, &table_path, current_txn)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let batch = result.to_record_batch()
+                let (result, final_txn) = ApexExecutor::execute_multi_with_txn(
+                    stmts,
+                    &base_dir,
+                    &table_path,
+                    current_txn,
+                )
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let batch = result
+                    .to_record_batch()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 Ok((batch, final_txn))
             })?
@@ -1606,7 +1925,8 @@ impl ApexStorageImpl {
             let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
                 let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                result.to_record_batch()
+                result
+                    .to_record_batch()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })?;
             (batch, current_txn)
@@ -1622,9 +1942,11 @@ impl ApexStorageImpl {
         {
             let mut writer = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
                 .map_err(|e| PyRuntimeError::new_err(format!("IPC writer error: {}", e)))?;
-            writer.write(&batch)
+            writer
+                .write(&batch)
                 .map_err(|e| PyRuntimeError::new_err(format!("IPC write error: {}", e)))?;
-            writer.finish()
+            writer
+                .finish()
                 .map_err(|e| PyRuntimeError::new_err(format!("IPC finish error: {}", e)))?;
         }
 
@@ -1634,7 +1956,10 @@ impl ApexStorageImpl {
         }
 
         // After DROP TABLE, remove from table_paths (uses pre-extracted DdlKind — no re-uppercase)
-        if let QuerySignature::Ddl { kind: crate::query::query_signature::DdlKind::DropTable { ref name } } = &sig {
+        if let QuerySignature::Ddl {
+            kind: crate::query::query_signature::DdlKind::DropTable { ref name },
+        } = &sig
+        {
             self.table_paths.write().remove(name);
             self.invalidate_backend(name);
             if *self.current_table.read() == *name {
@@ -1643,7 +1968,10 @@ impl ApexStorageImpl {
         }
 
         // After CREATE TABLE, register the new table (uses pre-extracted DdlKind)
-        if let QuerySignature::Ddl { kind: crate::query::query_signature::DdlKind::CreateTable { ref name } } = &sig {
+        if let QuerySignature::Ddl {
+            kind: crate::query::query_signature::DdlKind::CreateTable { ref name },
+        } = &sig
+        {
             let tbl_path = self.current_base_dir().join(format!("{}.apex", name));
             self.table_paths.write().insert(name.clone(), tbl_path);
             *self.current_table.write() = name.clone();
@@ -1652,32 +1980,43 @@ impl ApexStorageImpl {
         crate::query::executor::clear_query_root_dir();
         Ok(PyBytes::new_bound(py, &buf).into())
     }
-    
+
     /// Query with Arrow FFI (zero-copy transfer)
-    fn _query_arrow_ffi(&self, py: Python<'_>, where_clause: &str, limit: Option<usize>) -> PyResult<(usize, usize)> {
+    fn _query_arrow_ffi(
+        &self,
+        py: Python<'_>,
+        where_clause: &str,
+        limit: Option<usize>,
+    ) -> PyResult<(usize, usize)> {
+        use arrow::array::{Array, StructArray};
         use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-        use arrow::array::{StructArray, Array};
-        
+
         // Single read of current_table — avoids double RwLock acquire
         let table_name = self.current_table.read().clone();
         if table_name.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "No table selected. Call create_table() or use_table() first."
+                "No table selected. Call create_table() or use_table() first.",
             ));
         }
-        let table_path = self.table_paths.read().get(&table_name)
+        let table_path = self
+            .table_paths
+            .read()
+            .get(&table_name)
             .cloned()
             .unwrap_or_else(|| self.current_base_dir().join(format!("{}.apex", table_name)));
         let base_dir = self.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.root_dir);
         let where_clause = where_clause.to_string();
-        
+
         // Build SQL from where clause using current table name
         let sql = if let Some(lim) = limit {
             if where_clause == "1=1" || where_clause.is_empty() {
                 format!("SELECT * FROM \"{}\" LIMIT {}", table_name, lim)
             } else {
-                format!("SELECT * FROM \"{}\" WHERE {} LIMIT {}", table_name, where_clause, lim)
+                format!(
+                    "SELECT * FROM \"{}\" WHERE {} LIMIT {}",
+                    table_name, where_clause, lim
+                )
             }
         } else {
             if where_clause == "1=1" || where_clause.is_empty() {
@@ -1686,31 +2025,32 @@ impl ApexStorageImpl {
                 format!("SELECT * FROM \"{}\" WHERE {}", table_name, where_clause)
             }
         };
-        
+
         // Execute query
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
             let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
-            result.to_record_batch()
+
+            result
+                .to_record_batch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
-        
+
         // Empty result
         if batch.num_rows() == 0 {
             return Ok((0, 0));
         }
-        
+
         // Convert to StructArray for FFI
         let struct_array: StructArray = batch.into();
         let array_data = struct_array.to_data();
-        
+
         let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&array_data)
             .map_err(|e| PyRuntimeError::new_err(format!("FFI export failed: {}", e)))?;
-        
+
         let schema_ptr = Box::into_raw(Box::new(ffi_schema)) as usize;
         let array_ptr = Box::into_raw(Box::new(ffi_array)) as usize;
-        
+
         Ok((schema_ptr, array_ptr))
     }
 
@@ -1727,16 +2067,18 @@ impl ApexStorageImpl {
                 return Ok(());
             }
         }
-        
+
         // Table not in cache - check if it exists on disk (lazy discovery)
         let table_path = self.current_base_dir().join(format!("{}.apex", name));
         if table_path.exists() {
             // Add to cache
-            self.table_paths.write().insert(name.to_string(), table_path);
+            self.table_paths
+                .write()
+                .insert(name.to_string(), table_path);
             *self.current_table.write() = name.to_string();
             return Ok(());
         }
-        
+
         Err(PyValueError::new_err(format!("Table not found: {}", name)))
     }
 
@@ -1754,7 +2096,10 @@ impl ApexStorageImpl {
             // Verify the file actually exists on disk (table_paths may be stale after SQL DROP TABLE)
             let existing_path = self.current_base_dir().join(format!("{}.apex", name));
             if existing_path.exists() {
-                return Err(PyValueError::new_err(format!("Table already exists: {}", name)));
+                return Err(PyValueError::new_err(format!(
+                    "Table already exists: {}",
+                    name
+                )));
             }
             // Stale entry — remove it and proceed with creation
             paths.remove(name);
@@ -1765,13 +2110,15 @@ impl ApexStorageImpl {
 
         if let Some(schema_dict) = schema {
             let schema_cols = Self::parse_schema_dict(schema_dict)?;
-            engine.create_table_with_schema(&table_path, self.durability, &schema_cols)
+            engine
+                .create_table_with_schema(&table_path, self.durability, &schema_cols)
                 .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))?;
         } else {
-            engine.create_table(&table_path, self.durability)
+            engine
+                .create_table(&table_path, self.durability)
                 .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))?;
         }
-        
+
         paths.insert(name.to_string(), table_path);
         drop(paths);
 
@@ -1783,7 +2130,7 @@ impl ApexStorageImpl {
     fn drop_table(&self, name: &str) -> PyResult<()> {
         // Invalidate cached backend first (releases file lock)
         self.invalidate_backend(name);
-        
+
         let mut paths = self.table_paths.write();
         if let Some(path) = paths.remove(name) {
             fs::remove_file(&path)
@@ -1807,7 +2154,11 @@ impl ApexStorageImpl {
         if let Ok(entries) = fs::read_dir(&base_dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()).map(|s| s == "apex").unwrap_or(false) {
+                if p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s == "apex")
+                    .unwrap_or(false)
+                {
                     if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
                         tables.push(stem.to_string());
                     }
@@ -1829,8 +2180,9 @@ impl ApexStorageImpl {
             self.root_dir.clone()
         } else {
             let db_dir = self.root_dir.join(db_name);
-            fs::create_dir_all(&db_dir)
-                .map_err(|e| PyIOError::new_err(format!("Cannot create database '{}': {}", db_name, e)))?;
+            fs::create_dir_all(&db_dir).map_err(|e| {
+                PyIOError::new_err(format!("Cannot create database '{}': {}", db_name, e))
+            })?;
             db_dir
         };
 
@@ -1883,20 +2235,21 @@ impl ApexStorageImpl {
         if !table_path.exists() {
             return Ok(0);
         }
-        
+
         // No file lock needed — active_count is atomic and always consistent
         let engine = crate::storage::engine::engine();
-        let count = engine.active_row_count(&table_path)
+        let count = engine
+            .active_row_count(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+
         Ok(count)
     }
-    
+
     /// Alias for row_count (compatibility)
     fn count_rows(&self) -> PyResult<u64> {
         self.row_count()
     }
-    
+
     /// Ultra-fast row count using cached backend (bypasses engine for maximum speed).
     /// This is 2-3x faster than row_count() for COUNT(*) queries.
     /// Uses base_row_count() - O(1) lock-free atomic read (no delta scan).
@@ -1905,16 +2258,17 @@ impl ApexStorageImpl {
         if !table_path.exists() {
             return Ok(0);
         }
-        
+
         // Direct backend access - bypass engine completely
         // Use base_row_count() for O(1) lock-free read (no delta file scan)
         if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
             return Ok(backend.base_row_count());
         }
-        
+
         // Fallback to engine path - also use fast base_row_count()
         let engine = crate::storage::engine::engine();
-        let count = engine.base_row_count(&table_path)
+        let count = engine
+            .base_row_count(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(count)
     }
@@ -1924,42 +2278,43 @@ impl ApexStorageImpl {
         // Storage auto-saves on each operation
         Ok(())
     }
-    
+
     /// Flush changes to disk with fsync
-    /// 
+    ///
     /// For 'safe' and 'max' durability levels, save() automatically calls fsync.
     /// For 'fast' durability, call this method explicitly when you need durability guarantees.
     fn flush(&self) -> PyResult<()> {
         let table_path = self.get_current_table_path()?;
-        
+
         // Acquire shared read lock (sync doesn't modify data, just ensures it's on disk)
-        let lock_file = Self::acquire_read_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+        let lock_file =
+            Self::acquire_read_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+
         let result = {
             let table_name = self.current_table.read().clone();
             if let Some(backend) = self.cached_backends.get(&table_name) {
-                backend.sync()
+                backend
+                    .sync()
                     .map_err(|e| PyIOError::new_err(format!("Failed to sync: {}", e)))
             } else {
                 Ok(()) // No backend means no data to sync
             }
         };
-        
+
         Self::release_lock(lock_file);
         result
     }
-    
+
     /// Get the current durability level
     fn get_durability(&self) -> String {
         self.durability.as_str().to_string()
     }
-    
+
     /// Set auto-flush thresholds
-    /// 
-    /// When either threshold is exceeded during writes, data is automatically 
+    ///
+    /// When either threshold is exceeded during writes, data is automatically
     /// written to file. Set to 0 to disable the respective threshold.
-    /// 
+    ///
     /// Parameters:
     /// - rows: Auto-flush when pending rows exceed this count (0 = disabled)
     /// - bytes: Auto-flush when estimated memory exceeds this size (0 = disabled)
@@ -1975,14 +2330,14 @@ impl ApexStorageImpl {
         }
         Ok(())
     }
-    
+
     /// Get current auto-flush configuration
-    /// 
+    ///
     /// Returns a tuple of (rows_threshold, bytes_threshold)
     fn get_auto_flush(&self) -> PyResult<(u64, u64)> {
         Ok((*self.auto_flush_rows.read(), *self.auto_flush_bytes.read()))
     }
-    
+
     /// Get estimated memory usage in bytes
     fn estimate_memory_bytes(&self) -> PyResult<u64> {
         let table_name = self.current_table.read().clone();
@@ -2012,17 +2367,21 @@ impl ApexStorageImpl {
     ///     True if applied, False if table is non-empty (no-op)
     fn set_compression(&self, compression: &str) -> PyResult<bool> {
         use crate::storage::on_demand::{CompressionType, OnDemandStorage};
-        let comp = CompressionType::from_str_opt(compression)
-            .ok_or_else(|| PyValueError::new_err(
-                format!("Invalid compression type '{}'. Use 'none', 'lz4', or 'zstd'.", compression)
-            ))?;
+        let comp = CompressionType::from_str_opt(compression).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "Invalid compression type '{}'. Use 'none', 'lz4', or 'zstd'.",
+                compression
+            ))
+        })?;
         let table_path = self.get_current_table_path()?;
         let storage = if table_path.exists() {
             OnDemandStorage::open_with_durability(&table_path, self.durability)
         } else {
             OnDemandStorage::create_with_durability(&table_path, self.durability)
-        }.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        storage.set_compression(comp)
+        }
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        storage
+            .set_compression(comp)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -2046,7 +2405,7 @@ impl ApexStorageImpl {
     fn close(&self) -> PyResult<()> {
         // Clear per-instance cached backends (releases per-instance references)
         self.cached_backends.clear();
-        
+
         // On Windows: release all mmaps so temp directories can be cleaned up.
         // On Unix: mmaps remain valid after atomic rename; keep STORAGE_CACHE alive
         // so the 50ms fast path in get_cached_backend skips stat() calls on next retrieve().
@@ -2054,29 +2413,32 @@ impl ApexStorageImpl {
         ApexExecutor::invalidate_cache_for_dir(&self.current_base_dir());
         Ok(())
     }
-    
+
     // ========== Retrieve Operations ==========
-    
+
     /// Retrieve a single record by ID
     fn retrieve(&self, py: Python<'_>, id: i64) -> PyResult<Option<PyObject>> {
         let table_path = self.get_current_table_path()?;
-        
+
         if id < 0 {
             return Ok(None);
         }
-        
+
         // ULTRA-FAST PATH: Direct V4 value read - no file lock, no Arrow, no GIL release
         // Skip allow_threads() for sub-0.1ms operations where GIL overhead dominates
         // Use per-instance cached_backends first: no stat() syscalls (~600µs saved vs get_cached_backend_pub).
         let table_name = self.current_table.read().clone();
         let maybe_cached = {
-            self.cached_backends.get(&table_name).map(|v| Arc::clone(&v))
+            self.cached_backends
+                .get(&table_name)
+                .map(|v| Arc::clone(&v))
         };
         let backend_opt: Option<Arc<TableStorageBackend>> = if let Some(b) = maybe_cached {
             Some(b)
         } else if let Ok(b) = crate::query::get_cached_backend_pub(&table_path) {
             // Populate per-instance cache so next call is zero-syscall
-            self.cached_backends.insert(table_name.clone(), Arc::clone(&b));
+            self.cached_backends
+                .insert(table_name.clone(), Arc::clone(&b));
             Some(b)
         } else {
             None
@@ -2116,27 +2478,28 @@ impl ApexStorageImpl {
                 }
             }
         }
-        
+
         // FALLBACK: File lock + Arrow path for edge cases
-        let lock_file = Self::acquire_read_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+        let lock_file =
+            Self::acquire_read_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+
         let base_dir = self.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.root_dir);
         let table_name = self.current_table.read().clone();
-        
+
         let result = py.allow_threads(|| -> PyResult<Option<HashMap<String, Value>>> {
             let sql = format!("SELECT * FROM \"{}\" WHERE _id = {}", table_name, id);
             let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
-            let batch = result.to_record_batch()
+
+            let batch = result
+                .to_record_batch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
+
             if batch.num_rows() == 0 {
                 return Ok(None);
             }
-            
+
             let mut row_data = HashMap::new();
             for (col_idx, field) in batch.schema().fields().iter().enumerate() {
                 let val = arrow_value_at(batch.column(col_idx), 0);
@@ -2144,11 +2507,11 @@ impl ApexStorageImpl {
             }
             Ok(Some(row_data))
         });
-        
+
         Self::release_lock(lock_file);
-        
+
         let result = result?;
-        
+
         match result {
             None => Ok(None),
             Some(row_data) => {
@@ -2176,11 +2539,15 @@ impl ApexStorageImpl {
         let (table_path, table_name) = self.get_current_table_info()?;
 
         // Try to get cached backend for direct storage access
-        let maybe_cached = self.cached_backends.get(&table_name).map(|v| Arc::clone(&v));
+        let maybe_cached = self
+            .cached_backends
+            .get(&table_name)
+            .map(|v| Arc::clone(&v));
         let backend_opt: Option<Arc<TableStorageBackend>> = if let Some(b) = maybe_cached {
             Some(b)
         } else if let Ok(b) = crate::query::get_cached_backend_pub(&table_path) {
-            self.cached_backends.insert(table_name.clone(), Arc::clone(&b));
+            self.cached_backends
+                .insert(table_name.clone(), Arc::clone(&b));
             Some(b)
         } else {
             None
@@ -2191,11 +2558,12 @@ impl ApexStorageImpl {
             let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
 
             // Fast path: retrieve_many_mmap — one footer lock + one mmap slice per RG
-            let batch_opt = if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
-                backend.storage.retrieve_many_mmap(&ids_u64).ok().flatten()
-            } else {
-                None
-            };
+            let batch_opt =
+                if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
+                    backend.storage.retrieve_many_mmap(&ids_u64).ok().flatten()
+                } else {
+                    None
+                };
 
             if let Some(batch) = batch_opt {
                 let num_rows = batch.num_rows();
@@ -2260,20 +2628,21 @@ impl ApexStorageImpl {
         out.set_item("rows_affected", 0i64)?;
         Ok(out.into())
     }
-    
+
     /// Retrieve all records
     fn retrieve_all(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
         let (table_path, table_name) = self.get_current_table_info()?;
-        
+
         let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
             let sql = format!("SELECT * FROM {}", table_name);
             let sql = sql.as_str();
             let result = ApexExecutor::execute(sql, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
-            let batch = result.to_record_batch()
+
+            let batch = result
+                .to_record_batch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
+
             let mut rows = Vec::with_capacity(batch.num_rows());
             for row_idx in 0..batch.num_rows() {
                 let mut row_data = HashMap::new();
@@ -2283,10 +2652,10 @@ impl ApexStorageImpl {
                 }
                 rows.push(row_data);
             }
-            
+
             Ok(rows)
         })?;
-        
+
         let mut result = Vec::with_capacity(rows.len());
         for row_data in rows {
             let dict = PyDict::new_bound(py);
@@ -2295,28 +2664,37 @@ impl ApexStorageImpl {
             }
             result.push(dict.into());
         }
-        
+
         Ok(result)
     }
-    
+
     /// Query with WHERE clause
     #[pyo3(signature = (where_clause, limit=None))]
-    fn query(&self, py: Python<'_>, where_clause: &str, limit: Option<usize>) -> PyResult<Vec<PyObject>> {
+    fn query(
+        &self,
+        py: Python<'_>,
+        where_clause: &str,
+        limit: Option<usize>,
+    ) -> PyResult<Vec<PyObject>> {
         let (table_path, table_name) = self.get_current_table_info()?;
-        
+
         let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
             let sql = if let Some(lim) = limit {
-                format!("SELECT * FROM {} WHERE {} LIMIT {}", table_name, where_clause, lim)
+                format!(
+                    "SELECT * FROM {} WHERE {} LIMIT {}",
+                    table_name, where_clause, lim
+                )
             } else {
                 format!("SELECT * FROM {} WHERE {}", table_name, where_clause)
             };
-            
+
             let result = ApexExecutor::execute(&sql, &table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
-            let batch = result.to_record_batch()
+
+            let batch = result
+                .to_record_batch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            
+
             let mut rows = Vec::with_capacity(batch.num_rows());
             for row_idx in 0..batch.num_rows() {
                 let mut row_data = HashMap::new();
@@ -2326,10 +2704,10 @@ impl ApexStorageImpl {
                 }
                 rows.push(row_data);
             }
-            
+
             Ok(rows)
         })?;
-        
+
         let mut result = Vec::with_capacity(rows.len());
         for row_data in rows {
             let dict = PyDict::new_bound(py);
@@ -2338,38 +2716,39 @@ impl ApexStorageImpl {
             }
             result.push(dict.into());
         }
-        
+
         Ok(result)
     }
-    
+
     /// Replace a record by ID using StorageEngine
     fn replace(&self, py: Python<'_>, id: i64, data: &Bound<'_, PyDict>) -> PyResult<bool> {
         let fields = dict_to_values(data)?;
         let table_path = self.get_current_table_path()?;
         let table_name = self.current_table.read().clone();
         let durability = self.durability;
-        
+
         // Acquire exclusive write lock
-        let lock_file = Self::acquire_write_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+        let lock_file =
+            Self::acquire_write_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+
         // Use StorageEngine for unified replace
         let result = py.allow_threads(|| {
             let engine = crate::storage::engine::engine();
-            engine.replace(&table_path, id as u64, &fields, durability)
+            engine
+                .replace(&table_path, id as u64, &fields, durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         });
-        
+
         Self::release_lock(lock_file);
-        
+
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
-        
+
         result
     }
-    
+
     // ========== Schema Operations ==========
-    
+
     /// Add a column to current table using StorageEngine
     fn add_column(&self, column_name: &str, column_type: &str) -> PyResult<()> {
         let dtype = match column_type.to_lowercase().as_str() {
@@ -2378,131 +2757,145 @@ impl ApexStorageImpl {
             "bool" | "boolean" => crate::data::DataType::Bool,
             "str" | "string" | "text" => crate::data::DataType::String,
             "bytes" | "binary" => crate::data::DataType::Binary,
-            "float16_vector" | "float16vector" | "f16_vector" => crate::data::DataType::Float16Vector,
+            "float16_vector" | "float16vector" | "f16_vector" => {
+                crate::data::DataType::Float16Vector
+            }
             "timestamp" | "datetime" => crate::data::DataType::Timestamp,
             "date" => crate::data::DataType::Date,
             _ => crate::data::DataType::String,
         };
-        
+
         let table_path = self.get_current_table_path()?;
         let table_name = self.current_table.read().clone();
         let durability = self.durability;
-        
+
         // Invalidate local backend cache before operation
         self.invalidate_backend(&table_name);
-        
+
         // Acquire exclusive write lock
-        let lock_file = Self::acquire_write_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+        let lock_file =
+            Self::acquire_write_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+
         // Use StorageEngine for unified add_column
         let engine = crate::storage::engine::engine();
-        let result = engine.add_column(&table_path, column_name, dtype, durability)
+        let result = engine
+            .add_column(&table_path, column_name, dtype, durability)
             .map_err(|e| PyIOError::new_err(e.to_string()));
-        
+
         Self::release_lock(lock_file);
-        
+
         // Invalidate local backend cache after operation
         self.invalidate_backend(&table_name);
-        
+
         result
     }
-    
+
     /// Drop a column from current table using StorageEngine
     fn drop_column(&self, column_name: &str) -> PyResult<()> {
         let table_path = self.get_current_table_path()?;
         let table_name = self.current_table.read().clone();
         let durability = self.durability;
-        
+
         // Invalidate local backend cache before operation
         self.invalidate_backend(&table_name);
-        
+
         // Acquire exclusive write lock
-        let lock_file = Self::acquire_write_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+        let lock_file =
+            Self::acquire_write_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+
         // Use StorageEngine for unified drop_column
         let engine = crate::storage::engine::engine();
-        let result = engine.drop_column(&table_path, column_name, durability)
+        let result = engine
+            .drop_column(&table_path, column_name, durability)
             .map_err(|e| PyIOError::new_err(e.to_string()));
-        
+
         Self::release_lock(lock_file);
-        
+
         // Invalidate local backend cache after operation
         self.invalidate_backend(&table_name);
-        
+
         result
     }
-    
+
     /// Rename a column using StorageEngine
     fn rename_column(&self, old_name: &str, new_name: &str) -> PyResult<()> {
         let table_path = self.get_current_table_path()?;
         let table_name = self.current_table.read().clone();
         let durability = self.durability;
-        
+
         // Acquire exclusive write lock
-        let lock_file = Self::acquire_write_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+        let lock_file =
+            Self::acquire_write_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+
         // Use StorageEngine for unified rename_column
         let engine = crate::storage::engine::engine();
-        let result = engine.rename_column(&table_path, old_name, new_name, durability)
+        let result = engine
+            .rename_column(&table_path, old_name, new_name, durability)
             .map_err(|e| PyIOError::new_err(e.to_string()));
-        
+
         Self::release_lock(lock_file);
-        
+
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
-        
+
         result
     }
-    
+
     /// List fields (columns) in current table using StorageEngine
     fn list_fields(&self) -> PyResult<Vec<String>> {
         let table_path = self.get_current_table_path()?;
-        
+
         // Acquire shared read lock
-        let lock_file = Self::acquire_read_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+        let lock_file =
+            Self::acquire_read_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+
         // Use StorageEngine for unified list_columns
         let engine = crate::storage::engine::engine();
-        let columns = engine.list_columns(&table_path)
+        let columns = engine
+            .list_columns(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+
         Self::release_lock(lock_file);
         Ok(columns)
     }
-    
+
     /// Get column data type using StorageEngine
     fn get_column_dtype(&self, column_name: &str) -> PyResult<Option<String>> {
         let table_path = self.get_current_table_path()?;
-        
+
         // Acquire shared read lock
-        let lock_file = Self::acquire_read_lock(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        
+        let lock_file =
+            Self::acquire_read_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+
         // Use StorageEngine for unified get_column_type
         let engine = crate::storage::engine::engine();
-        let dtype = engine.get_column_type(&table_path, column_name)
+        let dtype = engine
+            .get_column_type(&table_path, column_name)
             .map_err(|e| PyIOError::new_err(e.to_string()))?
             .map(|dt| format!("{:?}", dt));
-        
+
         Self::release_lock(lock_file);
         Ok(dtype)
     }
-    
+
     // ========== FTS Operations ==========
-    
+
     /// Initialize FTS for current table
     #[pyo3(name = "_init_fts")]
     #[pyo3(signature = (index_fields=None, lazy_load=false, cache_size=10000))]
-    fn init_fts(&self, index_fields: Option<Vec<String>>, lazy_load: bool, cache_size: usize) -> PyResult<()> {
+    fn init_fts(
+        &self,
+        index_fields: Option<Vec<String>>,
+        lazy_load: bool,
+        cache_size: usize,
+    ) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
 
         // Record index field configuration
         if let Some(fields) = index_fields.clone() {
-            self.fts_index_fields.write().insert(table_name.clone(), fields);
+            self.fts_index_fields
+                .write()
+                .insert(table_name.clone(), fields);
         }
 
         // Ensure manager exists
@@ -2533,32 +2926,39 @@ impl ApexStorageImpl {
 
         Ok(())
     }
-    
+
     /// Check if FTS is enabled
     #[pyo3(name = "_is_fts_enabled")]
     fn is_fts_enabled(&self) -> bool {
         self.fts_manager.read().is_some()
     }
-    
+
     /// Get FTS index fields for current table
     #[pyo3(name = "_get_fts_config")]
     fn get_fts_config(&self) -> Option<Vec<String>> {
         let table_name = self.current_table.read().clone();
         self.fts_index_fields.read().get(&table_name).cloned()
     }
-    
+
     /// FTS search
     #[pyo3(signature = (query, limit=None))]
-    fn search_text(&self, py: Python<'_>, query: &str, limit: Option<usize>) -> PyResult<Vec<(i64, f32)>> {
+    fn search_text(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        limit: Option<usize>,
+    ) -> PyResult<Vec<(i64, f32)>> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
-        
+
         if let Some(m) = mgr.as_ref() {
-            let engine = m.get_engine(&table_name)
+            let engine = m
+                .get_engine(&table_name)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             // Release GIL during search for better concurrency
             let results = py.allow_threads(|| {
-                engine.search_top_n(query, limit.unwrap_or(100))
+                engine
+                    .search_top_n(query, limit.unwrap_or(100))
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })?;
             // Return with score=1.0 for each result (nanofts doesn't return scores directly)
@@ -2588,22 +2988,34 @@ impl ApexStorageImpl {
 
         Ok(())
     }
-    
+
     /// FTS fuzzy search
     #[pyo3(signature = (query, limit=None, _max_distance=None))]
-    fn fuzzy_search_text(&self, py: Python<'_>, query: &str, limit: Option<usize>, _max_distance: Option<u8>) -> PyResult<Vec<(i64, f32)>> {
+    fn fuzzy_search_text(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        limit: Option<usize>,
+        _max_distance: Option<u8>,
+    ) -> PyResult<Vec<(i64, f32)>> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
-        
+
         if let Some(m) = mgr.as_ref() {
-            let engine = m.get_engine(&table_name)
+            let engine = m
+                .get_engine(&table_name)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             // Release GIL during fuzzy search for better concurrency
             let ids: Vec<u64> = py.allow_threads(|| -> PyResult<Vec<u64>> {
-                let result = engine.fuzzy_search(query, limit.unwrap_or(100))
+                let result = engine
+                    .fuzzy_search(query, limit.unwrap_or(100))
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 // Convert result handle to Vec<u64>
-                Ok(result.page(0, limit.unwrap_or(100)).into_iter().map(|id| id as u64).collect())
+                Ok(result
+                    .page(0, limit.unwrap_or(100))
+                    .into_iter()
+                    .map(|id| id as u64)
+                    .collect())
             })?;
             Ok(ids.into_iter().map(|id| (id as i64, 1.0f32)).collect())
         } else {
@@ -2613,71 +3025,82 @@ impl ApexStorageImpl {
 
     /// Search and retrieve records
     #[pyo3(signature = (query, limit=None))]
-    fn search_and_retrieve(&self, py: Python<'_>, query: &str, limit: Option<usize>) -> PyResult<PyObject> {
+    fn search_and_retrieve(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        limit: Option<usize>,
+    ) -> PyResult<PyObject> {
         let results = self.search_text(py, query, limit)?;
         let ids: Vec<i64> = results.into_iter().map(|(id, _)| id).collect();
         self.retrieve_many(py, ids)
     }
-    
+
     /// Index a document for FTS
     #[pyo3(name = "_fts_index")]
     fn fts_index(&self, py: Python<'_>, id: i64, text: &str) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
-        
+
         if let Some(m) = mgr.as_ref() {
-            let engine = m.get_engine(&table_name)
+            let engine = m
+                .get_engine(&table_name)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let mut fields = HashMap::new();
             fields.insert("content".to_string(), text.to_string());
             // Release GIL during indexing operation
             py.allow_threads(|| {
-                engine.add_document(id as u64, fields)
+                engine
+                    .add_document(id as u64, fields)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Remove a document from FTS index
     #[pyo3(name = "_fts_remove")]
     fn fts_remove(&self, py: Python<'_>, id: i64) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
-        
+
         if let Some(m) = mgr.as_ref() {
-            let engine = m.get_engine(&table_name)
+            let engine = m
+                .get_engine(&table_name)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             // Release GIL during remove operation
             py.allow_threads(|| {
-                engine.remove_document(id as u64)
+                engine
+                    .remove_document(id as u64)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Flush FTS index
     #[pyo3(name = "_fts_flush")]
     fn fts_flush(&self, py: Python<'_>) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
-        
+
         if let Some(m) = mgr.as_ref() {
-            let engine = m.get_engine(&table_name)
+            let engine = m
+                .get_engine(&table_name)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             // Release GIL during flush (I/O operation)
             py.allow_threads(|| {
-                engine.flush()
+                engine
+                    .flush()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Bulk index columnar string data into FTS (no storage write, GIL released)
     #[pyo3(name = "_fts_index_columns")]
     fn fts_index_columns(
@@ -2697,7 +3120,8 @@ impl ApexStorageImpl {
                 let doc_ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
                 // Build owned Vec<String> columns then borrow as &str — zero extra copy
                 let owned: Vec<(String, Vec<String>)> = columns.into_iter().collect();
-                let columns_ref: Vec<(String, Vec<&str>)> = owned.iter()
+                let columns_ref: Vec<(String, Vec<&str>)> = owned
+                    .iter()
                     .map(|(name, vals)| (name.clone(), vals.iter().map(|s| s.as_str()).collect()))
                     .collect();
                 py.allow_threads(|| {
@@ -2730,9 +3154,9 @@ impl ApexStorageImpl {
         k: usize,
         metric: &str,
     ) -> PyResult<(usize, usize)> {
-        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-        use arrow::array::{StructArray, Array};
         use crate::query::vector_ops::bytes_to_query_vec_f32;
+        use arrow::array::{Array, StructArray};
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 
         let query_f32 = bytes_to_query_vec_f32(query_bytes).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(
@@ -2740,112 +3164,144 @@ impl ApexStorageImpl {
             )
         })?;
 
-        let table_path = self.get_current_table_path()
+        let table_path = self
+            .get_current_table_path()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
         // Direct path — no SQL string formatting or parsing overhead.
-        let col_owned  = col.to_string();
+        let col_owned = col.to_string();
         let metric_str = metric.to_string();
         let names = vec!["_id".to_string(), "dist".to_string()];
 
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
-            use crate::query::vector_ops::{DistanceComputer, DistanceMetric, topk_heap_direct_parallel};
-            use arrow::array::{ArrayRef, BinaryArray, Float64Array, Int64Array};
-            use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
             use crate::query::executor::get_cached_backend_pub;
+            use crate::query::vector_ops::{
+                topk_heap_direct_parallel, DistanceComputer, DistanceMetric,
+            };
+            use arrow::array::{ArrayRef, BinaryArray, Float64Array, Int64Array};
+            use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 
             let metric_enum = DistanceMetric::from_str(&metric_str).ok_or_else(|| {
-                PyRuntimeError::new_err(format!("_topk_distance_ffi: unknown metric '{}'", metric_str))
+                PyRuntimeError::new_err(format!(
+                    "_topk_distance_ffi: unknown metric '{}'",
+                    metric_str
+                ))
             })?;
 
             let backend = get_cached_backend_pub(&table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            let id_field   = Field::new(&names[0], ArrowDataType::Int64,   false);
+            let id_field = Field::new(&names[0], ArrowDataType::Int64, false);
             let dist_field = Field::new(&names[1], ArrowDataType::Float64, false);
             let out_schema = std::sync::Arc::new(Schema::new(vec![id_field, dist_field]));
 
             let computer = DistanceComputer::new(metric_enum, query_f32.clone());
 
             // FAST PATH: zero-copy scan on OS mmap — no Arrow batch, no memcpy
-            let direct_topk = backend.topk_fixedlist_direct(&col_owned, &computer, k)
-                .ok().flatten()
-                .or_else(|| backend.topk_binary_direct(&col_owned, &computer, k).ok().flatten());
+            let direct_topk = backend
+                .topk_fixedlist_direct(&col_owned, &computer, k)
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    backend
+                        .topk_binary_direct(&col_owned, &computer, k)
+                        .ok()
+                        .flatten()
+                });
             if let Some(topk) = direct_topk {
                 if topk.is_empty() {
                     return RecordBatch::try_new(
                         out_schema,
                         vec![
-                            std::sync::Arc::new(Int64Array::from(Vec::<i64>::new()))   as ArrayRef,
+                            std::sync::Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
                             std::sync::Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
                         ],
-                    ).map_err(|e| PyRuntimeError::new_err(e.to_string()));
+                    )
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()));
                 }
                 // Read only the _id column (8MB) to map row indices → IDs
-                let id_batch = backend.read_columns_to_arrow(Some(&["_id"]), 0, None)
+                let id_batch = backend
+                    .read_columns_to_arrow(Some(&["_id"]), 0, None)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 let id_col = id_batch.column_by_name("_id");
-                let ids: Vec<i64> = topk.iter().map(|(row_idx, _)| {
-                    id_col.and_then(|a| a.as_any().downcast_ref::<Int64Array>())
-                          .map(|a| a.value(*row_idx))
-                          .unwrap_or(*row_idx as i64)
-                }).collect();
+                let ids: Vec<i64> = topk
+                    .iter()
+                    .map(|(row_idx, _)| {
+                        id_col
+                            .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+                            .map(|a| a.value(*row_idx))
+                            .unwrap_or(*row_idx as i64)
+                    })
+                    .collect();
                 let dists: Vec<f64> = topk.iter().map(|(_, d)| *d as f64).collect();
                 return RecordBatch::try_new(
                     out_schema,
                     vec![
-                        std::sync::Arc::new(Int64Array::from(ids))    as ArrayRef,
+                        std::sync::Arc::new(Int64Array::from(ids)) as ArrayRef,
                         std::sync::Arc::new(Float64Array::from(dists)) as ArrayRef,
                     ],
-                ).map_err(|e| PyRuntimeError::new_err(e.to_string()));
+                )
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
             }
 
             // FALLBACK: Arrow path for Binary columns / compressed RGs
             let needed: &[&str] = &[&col_owned, "_id"];
-            let full_batch = backend.read_columns_to_arrow(Some(needed), 0, None)
+            let full_batch = backend
+                .read_columns_to_arrow(Some(needed), 0, None)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             if full_batch.num_rows() == 0 {
                 return RecordBatch::try_new(
                     out_schema,
                     vec![
-                        std::sync::Arc::new(Int64Array::from(Vec::<i64>::new()))   as ArrayRef,
+                        std::sync::Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
                         std::sync::Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
                     ],
-                ).map_err(|e| PyRuntimeError::new_err(e.to_string()));
+                )
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
             }
 
             let bin_col = full_batch.column_by_name(&col_owned).ok_or_else(|| {
                 PyRuntimeError::new_err(format!("column '{}' not found", col_owned))
             })?;
 
-            let topk = if let Some(fixed_arr) = bin_col.as_any().downcast_ref::<arrow::array::FixedSizeListArray>() {
+            let topk = if let Some(fixed_arr) = bin_col
+                .as_any()
+                .downcast_ref::<arrow::array::FixedSizeListArray>()
+            {
                 use crate::query::vector_ops::topk_heap_direct_parallel_fixed;
                 topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
             } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
                 topk_heap_direct_parallel(bin_arr, &computer, k)
             } else {
-                return Err(PyRuntimeError::new_err(format!("column '{}' is not a vector column", col_owned)));
+                return Err(PyRuntimeError::new_err(format!(
+                    "column '{}' is not a vector column",
+                    col_owned
+                )));
             };
 
             let id_col = full_batch.column_by_name("_id");
-            let ids: Vec<i64> = topk.iter().map(|(row_idx, _)| {
-                if let Some(arr) = &id_col {
-                    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-                        return a.value(*row_idx);
+            let ids: Vec<i64> = topk
+                .iter()
+                .map(|(row_idx, _)| {
+                    if let Some(arr) = &id_col {
+                        if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                            return a.value(*row_idx);
+                        }
                     }
-                }
-                *row_idx as i64
-            }).collect();
+                    *row_idx as i64
+                })
+                .collect();
             let dists: Vec<f64> = topk.iter().map(|(_, d)| *d as f64).collect();
 
             RecordBatch::try_new(
                 out_schema,
                 vec![
-                    std::sync::Arc::new(Int64Array::from(ids))    as ArrayRef,
+                    std::sync::Arc::new(Int64Array::from(ids)) as ArrayRef,
                     std::sync::Arc::new(Float64Array::from(dists)) as ArrayRef,
                 ],
-            ).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
 
         if batch.num_rows() == 0 {
@@ -2858,7 +3314,7 @@ impl ApexStorageImpl {
             .map_err(|e| PyRuntimeError::new_err(format!("FFI export failed: {}", e)))?;
 
         let schema_ptr = Box::into_raw(Box::new(ffi_schema)) as usize;
-        let array_ptr  = Box::into_raw(Box::new(ffi_array))  as usize;
+        let array_ptr = Box::into_raw(Box::new(ffi_array)) as usize;
         Ok((schema_ptr, array_ptr))
     }
 
@@ -2894,10 +3350,10 @@ impl ApexStorageImpl {
         k: usize,
         metric: &str,
     ) -> PyResult<PyObject> {
-        use pyo3::types::PyBytes;
-        use crate::query::vector_ops::DistanceMetric;
         use crate::query::executor::get_cached_backend_pub;
+        use crate::query::vector_ops::DistanceMetric;
         use arrow::array::Int64Array;
+        use pyo3::types::PyBytes;
 
         if n_queries == 0 || k == 0 {
             let empty: Vec<u8> = vec![];
@@ -2922,85 +3378,112 @@ impl ApexStorageImpl {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        let table_path = self.get_current_table_path()
+        let table_path = self
+            .get_current_table_path()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-        let col_owned    = col.to_string();
-        let metric_str   = metric.to_string();
-        let n_q          = n_queries;
+        let col_owned = col.to_string();
+        let metric_str = metric.to_string();
+        let n_q = n_queries;
 
-        let (all_results, ids_map) = py.allow_threads(|| -> PyResult<(Vec<Vec<(usize, f32)>>, Vec<i64>)> {
-            let metric_enum = DistanceMetric::from_str(&metric_str).ok_or_else(|| {
-                PyRuntimeError::new_err(format!("_batch_topk_ffi: unknown metric '{}'", metric_str))
-            })?;
-
-            let backend = get_cached_backend_pub(&table_path)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // FAST PATH: mmap direct scan (FixedList → Binary fallback)
-            let batch_results = backend.batch_topk_fixedlist_direct(&col_owned, &queries_f32, n_q, k, metric_enum)
-                .ok().flatten()
-                .or_else(|| backend.batch_topk_binary_direct(&col_owned, &queries_f32, n_q, k, metric_enum).ok().flatten());
-
-            let all_results: Vec<Vec<(usize, f32)>> = if let Some(r) = batch_results {
-                r
-            } else {
-                // FALLBACK: load Arrow batch, run batch topk on FixedSizeListArray / BinaryArray
-                use arrow::array::{BinaryArray, FixedSizeListArray};
-                use crate::query::vector_ops::{topk_heap_direct_parallel, topk_heap_direct_parallel_fixed, DistanceComputer};
-
-                let needed: &[&str] = &[&col_owned, "_id"];
-                let full_batch = backend.read_columns_to_arrow(Some(needed), 0, None)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-                if full_batch.num_rows() == 0 {
-                    return Ok((vec![vec![]; n_q], vec![]));
-                }
-
-                let bin_col = full_batch.column_by_name(&col_owned).ok_or_else(|| {
-                    PyRuntimeError::new_err(format!("column '{}' not found", col_owned))
+        let (all_results, ids_map) =
+            py.allow_threads(|| -> PyResult<(Vec<Vec<(usize, f32)>>, Vec<i64>)> {
+                let metric_enum = DistanceMetric::from_str(&metric_str).ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "_batch_topk_ffi: unknown metric '{}'",
+                        metric_str
+                    ))
                 })?;
 
-                // Run N queries sequentially (Arrow fallback — uncommon path)
-                let mut results = Vec::with_capacity(n_q);
-                for qi in 0..n_q {
-                    let q = queries_f32[qi * dim..(qi + 1) * dim].to_vec();
-                    let computer = DistanceComputer::new(metric_enum, q);
-                    let topk = if let Some(fixed_arr) = bin_col.as_any().downcast_ref::<FixedSizeListArray>() {
-                        topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
-                    } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
-                        topk_heap_direct_parallel(bin_arr, &computer, k)
-                    } else {
-                        return Err(PyRuntimeError::new_err(format!(
-                            "column '{}' is not a vector column", col_owned
-                        )));
+                let backend = get_cached_backend_pub(&table_path)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+                // FAST PATH: mmap direct scan (FixedList → Binary fallback)
+                let batch_results = backend
+                    .batch_topk_fixedlist_direct(&col_owned, &queries_f32, n_q, k, metric_enum)
+                    .ok()
+                    .flatten()
+                    .or_else(|| {
+                        backend
+                            .batch_topk_binary_direct(&col_owned, &queries_f32, n_q, k, metric_enum)
+                            .ok()
+                            .flatten()
+                    });
+
+                let all_results: Vec<Vec<(usize, f32)>> = if let Some(r) = batch_results {
+                    r
+                } else {
+                    // FALLBACK: load Arrow batch, run batch topk on FixedSizeListArray / BinaryArray
+                    use crate::query::vector_ops::{
+                        topk_heap_direct_parallel, topk_heap_direct_parallel_fixed,
+                        DistanceComputer,
                     };
-                    results.push(topk);
-                }
+                    use arrow::array::{BinaryArray, FixedSizeListArray};
 
-                let id_col = full_batch.column_by_name("_id");
-                let n_rows = full_batch.num_rows();
-                let ids: Vec<i64> = (0..n_rows).map(|i| {
-                    id_col.and_then(|a| a.as_any().downcast_ref::<Int64Array>())
-                          .map(|a| a.value(i))
-                          .unwrap_or(i as i64)
-                }).collect();
-                return Ok((results, ids));
-            };
+                    let needed: &[&str] = &[&col_owned, "_id"];
+                    let full_batch = backend
+                        .read_columns_to_arrow(Some(needed), 0, None)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            // Read _id column once to map row_idx → _id
-            let id_batch = backend.read_columns_to_arrow(Some(&["_id"]), 0, None)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let n_rows = id_batch.num_rows();
-            let id_col = id_batch.column_by_name("_id");
-            let ids: Vec<i64> = (0..n_rows).map(|i| {
-                id_col.and_then(|a| a.as_any().downcast_ref::<Int64Array>())
-                      .map(|a| a.value(i))
-                      .unwrap_or(i as i64)
-            }).collect();
+                    if full_batch.num_rows() == 0 {
+                        return Ok((vec![vec![]; n_q], vec![]));
+                    }
 
-            Ok((all_results, ids))
-        })?;
+                    let bin_col = full_batch.column_by_name(&col_owned).ok_or_else(|| {
+                        PyRuntimeError::new_err(format!("column '{}' not found", col_owned))
+                    })?;
+
+                    // Run N queries sequentially (Arrow fallback — uncommon path)
+                    let mut results = Vec::with_capacity(n_q);
+                    for qi in 0..n_q {
+                        let q = queries_f32[qi * dim..(qi + 1) * dim].to_vec();
+                        let computer = DistanceComputer::new(metric_enum, q);
+                        let topk = if let Some(fixed_arr) =
+                            bin_col.as_any().downcast_ref::<FixedSizeListArray>()
+                        {
+                            topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
+                        } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>()
+                        {
+                            topk_heap_direct_parallel(bin_arr, &computer, k)
+                        } else {
+                            return Err(PyRuntimeError::new_err(format!(
+                                "column '{}' is not a vector column",
+                                col_owned
+                            )));
+                        };
+                        results.push(topk);
+                    }
+
+                    let id_col = full_batch.column_by_name("_id");
+                    let n_rows = full_batch.num_rows();
+                    let ids: Vec<i64> = (0..n_rows)
+                        .map(|i| {
+                            id_col
+                                .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+                                .map(|a| a.value(i))
+                                .unwrap_or(i as i64)
+                        })
+                        .collect();
+                    return Ok((results, ids));
+                };
+
+                // Read _id column once to map row_idx → _id
+                let id_batch = backend
+                    .read_columns_to_arrow(Some(&["_id"]), 0, None)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let n_rows = id_batch.num_rows();
+                let id_col = id_batch.column_by_name("_id");
+                let ids: Vec<i64> = (0..n_rows)
+                    .map(|i| {
+                        id_col
+                            .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+                            .map(|a| a.value(i))
+                            .unwrap_or(i as i64)
+                    })
+                    .collect();
+
+                Ok((all_results, ids))
+            })?;
 
         // Encode results as flat f64 bytes: (N × K × 2), row-major
         // [i, j, 0] = id (as f64), [i, j, 1] = dist (as f64)
@@ -3008,11 +3491,19 @@ impl ApexStorageImpl {
         let out_len = n_queries * k * 2;
         let mut out: Vec<u8> = Vec::with_capacity(out_len * 8);
         for qi in 0..n_queries {
-            let row = if qi < all_results.len() { &all_results[qi] } else { &[][..] };
+            let row = if qi < all_results.len() {
+                &all_results[qi]
+            } else {
+                &[][..]
+            };
             for j in 0..k {
                 let (id_f64, dist_f64) = if j < row.len() {
                     let (row_idx, dist) = row[j];
-                    let id = if row_idx < ids_map.len() { ids_map[row_idx] } else { row_idx as i64 };
+                    let id = if row_idx < ids_map.len() {
+                        ids_map[row_idx]
+                    } else {
+                        row_idx as i64
+                    };
                     (id as f64, dist as f64)
                 } else {
                     (-1.0f64, f64::INFINITY)
@@ -3029,7 +3520,7 @@ impl ApexStorageImpl {
     fn get_fts_stats(&self) -> PyResult<Option<(usize, usize)>> {
         let table_name = self.current_table.read().clone();
         let mgr = self.fts_manager.read();
-        
+
         if let Some(m) = mgr.as_ref() {
             if let Ok(engine) = m.get_engine(&table_name) {
                 let stats = engine.stats();
@@ -3061,7 +3552,11 @@ fn arrow_col_to_pylist(py: Python<'_>, arr: &arrow::array::ArrayRef) -> PyResult
             } else {
                 let list = PyList::empty_bound(py);
                 for i in 0..n {
-                    if a.is_null(i) { list.append(py.None())?; } else { list.append(a.value(i))?; }
+                    if a.is_null(i) {
+                        list.append(py.None())?;
+                    } else {
+                        list.append(a.value(i))?;
+                    }
                 }
                 Ok(list.into())
             }
@@ -3074,7 +3569,11 @@ fn arrow_col_to_pylist(py: Python<'_>, arr: &arrow::array::ArrayRef) -> PyResult
             } else {
                 let list = PyList::empty_bound(py);
                 for i in 0..n {
-                    if a.is_null(i) { list.append(py.None())?; } else { list.append(a.value(i))?; }
+                    if a.is_null(i) {
+                        list.append(py.None())?;
+                    } else {
+                        list.append(a.value(i))?;
+                    }
                 }
                 Ok(list.into())
             }
@@ -3091,7 +3590,9 @@ fn arrow_col_to_pylist(py: Python<'_>, arr: &arrow::array::ArrayRef) -> PyResult
                     std::collections::HashMap::with_capacity(32);
                 let list_obj = unsafe {
                     let list_ptr = ffi::PyList_New(n as ffi::Py_ssize_t);
-                    if list_ptr.is_null() { return Err(pyo3::PyErr::fetch(py)); }
+                    if list_ptr.is_null() {
+                        return Err(pyo3::PyErr::fetch(py));
+                    }
                     for i in 0..n {
                         let s = a.value(i);
                         let py_obj: pyo3::PyObject = match cache.get(s) {
@@ -3115,7 +3616,11 @@ fn arrow_col_to_pylist(py: Python<'_>, arr: &arrow::array::ArrayRef) -> PyResult
                         list.append(py.None())?;
                     } else {
                         let s = a.value(i);
-                        if s == "\x00__NULL__\x00" { list.append(py.None())?; } else { list.append(s)?; }
+                        if s == "\x00__NULL__\x00" {
+                            list.append(py.None())?;
+                        } else {
+                            list.append(s)?;
+                        }
                     }
                 }
                 Ok(list.into())
@@ -3125,7 +3630,11 @@ fn arrow_col_to_pylist(py: Python<'_>, arr: &arrow::array::ArrayRef) -> PyResult
             let a = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
             let list = PyList::empty_bound(py);
             for i in 0..n {
-                if a.is_null(i) { list.append(py.None())?; } else { list.append(a.value(i))?; }
+                if a.is_null(i) {
+                    list.append(py.None())?;
+                } else {
+                    list.append(a.value(i))?;
+                }
             }
             Ok(list.into())
         }

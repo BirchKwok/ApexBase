@@ -47,7 +47,10 @@ pub async fn start_flight_server(config: FlightConfig) -> Result<(), Box<dyn std
     println!("ApexBase Arrow Flight Server");
     println!("  Listening on: grpc://{}", addr);
     println!("  Data dir:     {}", config.data_dir.display());
-    println!("  Python:       pyarrow.flight.connect(\"grpc://{}\")", addr);
+    println!(
+        "  Python:       pyarrow.flight.connect(\"grpc://{}\")",
+        addr
+    );
 
     log::info!("ApexBase Flight server listening on {}", addr);
 

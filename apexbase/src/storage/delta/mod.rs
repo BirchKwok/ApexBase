@@ -15,8 +15,8 @@
 //! └──────────────────┴──────────────────────────┘
 //! ```
 
-pub mod update_log;
 pub mod merge;
+pub mod update_log;
 
-pub use update_log::{DeltaStore, DeltaRecord, DeleteBitmap};
 pub use merge::DeltaMerger;
+pub use update_log::{DeleteBitmap, DeltaRecord, DeltaStore};

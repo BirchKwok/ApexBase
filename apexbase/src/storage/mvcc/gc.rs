@@ -134,7 +134,11 @@ impl GarbageCollector {
         snapshot_manager: &SnapshotManager,
     ) -> Option<GcStats> {
         // Try to acquire the running flag (CAS to prevent concurrent GC)
-        if self.running.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
             return None; // Another GC is already running
         }
 
@@ -146,7 +150,8 @@ impl GarbageCollector {
         let removed = version_store.gc(oldest_active_ts);
 
         let duration = start.elapsed();
-        self.total_removed.fetch_add(removed as u64, Ordering::Relaxed);
+        self.total_removed
+            .fetch_add(removed as u64, Ordering::Relaxed);
 
         // Update last run time
         let now_millis = std::time::SystemTime::now()

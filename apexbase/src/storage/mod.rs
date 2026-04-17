@@ -6,15 +6,15 @@
 //!
 //! Incremental writes use WAL (Write-Ahead Log) for fast append-only writes.
 
-pub mod on_demand;
 pub mod backend;
-pub mod incremental;
 pub mod bloom;
-pub mod engine;
-pub mod index;
-pub mod delta;
-pub mod mvcc;
 pub mod concurrent;
+pub mod delta;
+pub mod engine;
+pub mod incremental;
+pub mod index;
+pub mod mvcc;
+pub mod on_demand;
 
 /// First user-visible row ID. ApexBase uses 1-based `_id` values.
 pub const FIRST_ROW_ID: u64 = 1;
@@ -24,7 +24,7 @@ pub const FIRST_ROW_ID: u64 = 1;
 // ============================================================================
 
 /// Durability level for write operations
-/// 
+///
 /// Controls how aggressively data is synced to disk:
 /// - `Fast`: No fsync - fastest but data may be lost on crash
 /// - `Safe`: fsync on flush() - balanced performance and durability  
@@ -36,12 +36,12 @@ pub enum DurabilityLevel {
     /// Risk: Data loss possible on system crash before OS flushes buffers.
     #[default]
     Fast,
-    
+
     /// Balanced mode. fsync called on explicit flush() calls.
     /// Suitable for most production environments.
     /// Risk: Data loss possible only for writes between last flush and crash.
     Safe,
-    
+
     /// Strongest ACID guarantee. fsync on every write operation.
     /// Suitable for financial, orders, and critical data scenarios.
     /// Performance: ~10-50x slower than Fast mode due to disk latency.
@@ -58,7 +58,7 @@ impl DurabilityLevel {
             _ => None,
         }
     }
-    
+
     /// Convert to string
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -71,66 +71,51 @@ impl DurabilityLevel {
 
 // Re-export all public types from on_demand
 pub use on_demand::{
-    // Storage engine
-    OnDemandStorage,
-    OnDemandHeader,
-    OnDemandSchema,
+    ColumnData,
+    ColumnDef,
     ColumnIndexEntry,
     // Data types
     ColumnType,
     ColumnValue,
-    ColumnData,
-    ColumnDef,
-    FileSchema,
     // Compression
     CompressionType,
+    FileSchema,
+    OnDemandHeader,
+    OnDemandSchema,
+    // Storage engine
+    OnDemandStorage,
 };
 
 // Re-export backend types
 pub use backend::{
+    column_data_to_typed_column, column_type_to_datatype, datatype_to_column_type,
+    typed_column_to_column_data, IncrementalStorageBackend, StorageManager, TableMetadata,
     TableStorageBackend,
-    TableMetadata,
-    StorageManager,
-    IncrementalStorageBackend,
-    typed_column_to_column_data,
-    column_data_to_typed_column,
-    datatype_to_column_type,
-    column_type_to_datatype,
 };
 
 // Re-export incremental storage types
-pub use incremental::{
-    IncrementalStorage,
-    WalRecord,
-    WalWriter,
-    WalReader,
-    ConcurrentWalWriter,
-};
+pub use incremental::{ConcurrentWalWriter, IncrementalStorage, WalReader, WalRecord, WalWriter};
 
 // Re-export bloom filter types
-pub use bloom::{
-    RowGroupBloomFilter,
-    ColumnBloomIndex,
-    BLOOM_ROW_GROUP_SIZE,
-    BLOOM_FP_RATE,
-};
+pub use bloom::{ColumnBloomIndex, RowGroupBloomFilter, BLOOM_FP_RATE, BLOOM_ROW_GROUP_SIZE};
 
 // Re-export storage engine
-pub use engine::{StorageEngine, engine};
+pub use engine::{engine, StorageEngine};
 
 // Re-export index types
-pub use index::{BTreeIndex, HashIndex, IndexManager, IndexType, IndexMeta};
+pub use index::{BTreeIndex, HashIndex, IndexManager, IndexMeta, IndexType};
 
 // Re-export delta store types
-pub use delta::{DeltaStore, DeltaRecord, DeleteBitmap, DeltaMerger};
+pub use delta::{DeleteBitmap, DeltaMerger, DeltaRecord, DeltaStore};
 
 // Re-export MVCC types
-pub use mvcc::{VersionStore, RowVersion, VersionChain, SnapshotManager, Snapshot, GarbageCollector};
+pub use mvcc::{
+    GarbageCollector, RowVersion, Snapshot, SnapshotManager, VersionChain, VersionStore,
+};
 
 // Re-export concurrent access types
 pub use concurrent::{
-    StorageStats, StorageSnapshot, BackendStats, global_stats,
-    ReadGuard, WriteGuard,
+    global_stats, BackendStats, ReadGuard, StorageSnapshot, StorageStats, WriteGuard,
 };
 
 // Type alias for backward compatibility

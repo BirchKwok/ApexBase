@@ -158,4 +158,3 @@ mod tests {
         assert_eq!(DataType::String.fixed_size(), None);
     }
 }
-

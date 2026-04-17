@@ -19,7 +19,10 @@ pub struct BitVec {
 
 impl BitVec {
     pub fn new() -> Self {
-        Self { data: Vec::new(), len: 0 }
+        Self {
+            data: Vec::new(),
+            len: 0,
+        }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
@@ -33,11 +36,11 @@ impl BitVec {
     pub fn push(&mut self, value: bool) {
         let word_idx = self.len / 64;
         let bit_idx = self.len % 64;
-        
+
         if word_idx >= self.data.len() {
             self.data.push(0);
         }
-        
+
         if value {
             self.data[word_idx] |= 1u64 << bit_idx;
         }
@@ -58,7 +61,7 @@ impl BitVec {
     pub fn set(&mut self, index: usize, value: bool) {
         let word_idx = index / 64;
         let bit_idx = index % 64;
-        
+
         // Extend if needed
         while word_idx >= self.data.len() {
             self.data.push(0);
@@ -66,7 +69,7 @@ impl BitVec {
         if index >= self.len {
             self.len = index + 1;
         }
-        
+
         if value {
             self.data[word_idx] |= 1u64 << bit_idx;
         } else {
@@ -105,7 +108,7 @@ impl BitVec {
         // Calculate new length
         let new_len = self.len + count;
         let required_words = (new_len + 63) / 64;
-        
+
         // Extend data vec if needed (new words are already 0)
         self.data.resize(required_words, 0);
         self.len = new_len;
@@ -133,10 +136,10 @@ impl BitVec {
         let start_idx = self.len;
         let new_len = self.len + count;
         let required_words = (new_len + 63) / 64;
-        
+
         // Ensure capacity
         self.data.resize(required_words, 0);
-        
+
         // Set bits from start_idx to new_len
         for i in start_idx..new_len {
             let word_idx = i / 64;
@@ -150,18 +153,20 @@ impl BitVec {
     #[inline]
     pub fn extend_from_bools(&mut self, values: &[bool]) {
         let count = values.len();
-        if count == 0 { return; }
-        
+        if count == 0 {
+            return;
+        }
+
         let new_len = self.len + count;
         let required_words = (new_len + 63) / 64;
-        
+
         // Ensure capacity
         self.data.resize(required_words, 0);
-        
+
         // Process in chunks of 64 for better performance
         let mut idx = 0;
         let base_bit = self.len;
-        
+
         // Fast path: process full words at once
         while idx + 64 <= count {
             let mut word = 0u64;
@@ -172,7 +177,7 @@ impl BitVec {
             }
             let word_idx = (base_bit + idx) / 64;
             let bit_offset = (base_bit + idx) % 64;
-            
+
             if bit_offset == 0 {
                 self.data[word_idx] = word;
             } else {
@@ -184,7 +189,7 @@ impl BitVec {
             }
             idx += 64;
         }
-        
+
         // Handle remaining bits
         while idx < count {
             let bit_idx = base_bit + idx;
@@ -195,13 +200,13 @@ impl BitVec {
             }
             idx += 1;
         }
-        
+
         self.len = new_len;
     }
 }
 
 /// Type-specific column storage for maximum performance
-/// 
+///
 /// String columns use Arrow-native contiguous buffer storage for 50-70% memory savings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TypedColumn {
@@ -231,20 +236,24 @@ impl TypedColumn {
     pub fn new(dtype: DataType) -> Self {
         match dtype {
             DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
-                TypedColumn::Int64 { data: Vec::new(), nulls: BitVec::new() }
+                TypedColumn::Int64 {
+                    data: Vec::new(),
+                    nulls: BitVec::new(),
+                }
             }
-            DataType::Float64 | DataType::Float32 => {
-                TypedColumn::Float64 { data: Vec::new(), nulls: BitVec::new() }
-            }
-            DataType::String => {
-                TypedColumn::String(ArrowStringColumn::new())
-            }
-            DataType::Bool => {
-                TypedColumn::Bool { data: BitVec::new(), nulls: BitVec::new() }
-            }
-            _ => {
-                TypedColumn::Mixed { data: Vec::new(), nulls: BitVec::new() }
-            }
+            DataType::Float64 | DataType::Float32 => TypedColumn::Float64 {
+                data: Vec::new(),
+                nulls: BitVec::new(),
+            },
+            DataType::String => TypedColumn::String(ArrowStringColumn::new()),
+            DataType::Bool => TypedColumn::Bool {
+                data: BitVec::new(),
+                nulls: BitVec::new(),
+            },
+            _ => TypedColumn::Mixed {
+                data: Vec::new(),
+                nulls: BitVec::new(),
+            },
         }
     }
 
@@ -256,27 +265,19 @@ impl TypedColumn {
                     nulls: BitVec::with_capacity(capacity),
                 }
             }
-            DataType::Float64 | DataType::Float32 => {
-                TypedColumn::Float64 {
-                    data: Vec::with_capacity(capacity),
-                    nulls: BitVec::with_capacity(capacity),
-                }
-            }
-            DataType::String => {
-                TypedColumn::String(ArrowStringColumn::with_capacity(capacity, 32))
-            }
-            DataType::Bool => {
-                TypedColumn::Bool {
-                    data: BitVec::with_capacity(capacity),
-                    nulls: BitVec::with_capacity(capacity),
-                }
-            }
-            _ => {
-                TypedColumn::Mixed {
-                    data: Vec::with_capacity(capacity),
-                    nulls: BitVec::with_capacity(capacity),
-                }
-            }
+            DataType::Float64 | DataType::Float32 => TypedColumn::Float64 {
+                data: Vec::with_capacity(capacity),
+                nulls: BitVec::with_capacity(capacity),
+            },
+            DataType::String => TypedColumn::String(ArrowStringColumn::with_capacity(capacity, 32)),
+            DataType::Bool => TypedColumn::Bool {
+                data: BitVec::with_capacity(capacity),
+                nulls: BitVec::with_capacity(capacity),
+            },
+            _ => TypedColumn::Mixed {
+                data: Vec::with_capacity(capacity),
+                nulls: BitVec::with_capacity(capacity),
+            },
         }
     }
 
@@ -440,9 +441,7 @@ impl TypedColumn {
                     Some(Value::Float64(data[index]))
                 }
             }
-            TypedColumn::String(col) => {
-                Some(col.get_value(index))
-            }
+            TypedColumn::String(col) => Some(col.get_value(index)),
             TypedColumn::Bool { data, nulls } => {
                 if index >= data.len() || nulls.get(index) {
                     None
@@ -577,22 +576,46 @@ impl TypedColumn {
     /// Append another TypedColumn to this one (for delta loading)
     pub fn append(&mut self, other: Self) {
         match (self, other) {
-            (TypedColumn::Int64 { data, nulls }, TypedColumn::Int64 { data: other_data, nulls: other_nulls }) => {
+            (
+                TypedColumn::Int64 { data, nulls },
+                TypedColumn::Int64 {
+                    data: other_data,
+                    nulls: other_nulls,
+                },
+            ) => {
                 data.extend(other_data);
                 nulls.extend(&other_nulls);
             }
-            (TypedColumn::Float64 { data, nulls }, TypedColumn::Float64 { data: other_data, nulls: other_nulls }) => {
+            (
+                TypedColumn::Float64 { data, nulls },
+                TypedColumn::Float64 {
+                    data: other_data,
+                    nulls: other_nulls,
+                },
+            ) => {
                 data.extend(other_data);
                 nulls.extend(&other_nulls);
             }
             (TypedColumn::String(col), TypedColumn::String(other_col)) => {
                 col.append(&other_col);
             }
-            (TypedColumn::Bool { data, nulls }, TypedColumn::Bool { data: other_data, nulls: other_nulls }) => {
+            (
+                TypedColumn::Bool { data, nulls },
+                TypedColumn::Bool {
+                    data: other_data,
+                    nulls: other_nulls,
+                },
+            ) => {
                 data.extend(&other_data);
                 nulls.extend(&other_nulls);
             }
-            (TypedColumn::Mixed { data, nulls }, TypedColumn::Mixed { data: other_data, nulls: other_nulls }) => {
+            (
+                TypedColumn::Mixed { data, nulls },
+                TypedColumn::Mixed {
+                    data: other_data,
+                    nulls: other_nulls,
+                },
+            ) => {
                 data.extend(other_data);
                 nulls.extend(&other_nulls);
             }

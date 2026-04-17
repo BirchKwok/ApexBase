@@ -1,5 +1,5 @@
 //! SQL:2023 Parser for ApexBase
-//! 
+//!
 //! Supports standard SQL SELECT statements with:
 //! - SELECT columns or SELECT *
 //! - FROM table
@@ -11,9 +11,9 @@
 //! - Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
 //! - GROUP BY / HAVING
 
-use crate::ApexError;
 use crate::data::DataType;
 use crate::data::Value;
+use crate::ApexError;
 
 /// Column-level constraint kinds
 #[derive(Debug, Clone, PartialEq)]
@@ -23,7 +23,10 @@ pub enum ColumnConstraintKind {
     Unique,
     Default(Value),
     Check(String),
-    ForeignKey { ref_table: String, ref_column: String },
+    ForeignKey {
+        ref_table: String,
+        ref_column: String,
+    },
     Autoincrement,
 }
 
@@ -48,51 +51,159 @@ pub enum AlterTableOp {
 pub enum SqlStatement {
     Select(SelectStatement),
     Union(UnionStatement),
-    CreateView { name: String, stmt: SelectStatement },
-    DropView { name: String },
+    CreateView {
+        name: String,
+        stmt: SelectStatement,
+    },
+    DropView {
+        name: String,
+    },
     // DDL Statements
-    CreateTable { table: String, columns: Vec<ColumnDef>, if_not_exists: bool },
-    DropTable { table: String, if_exists: bool },
-    AlterTable { table: String, operation: AlterTableOp },
-    TruncateTable { table: String },
+    CreateTable {
+        table: String,
+        columns: Vec<ColumnDef>,
+        if_not_exists: bool,
+    },
+    DropTable {
+        table: String,
+        if_exists: bool,
+    },
+    AlterTable {
+        table: String,
+        operation: AlterTableOp,
+    },
+    TruncateTable {
+        table: String,
+    },
     // Index Statements
-    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool, index_type: Option<String>, if_not_exists: bool },
-    DropIndex { name: String, table: String, if_exists: bool },
+    CreateIndex {
+        name: String,
+        table: String,
+        columns: Vec<String>,
+        unique: bool,
+        index_type: Option<String>,
+        if_not_exists: bool,
+    },
+    DropIndex {
+        name: String,
+        table: String,
+        if_exists: bool,
+    },
     // DML Statements
-    Insert { table: String, columns: Option<Vec<String>>, values: Vec<Vec<Value>> },
-    InsertOnConflict { table: String, columns: Option<Vec<String>>, values: Vec<Vec<Value>>, conflict_columns: Vec<String>, do_update: Option<Vec<(String, SqlExpr)>> },
-    InsertSelect { table: String, columns: Option<Vec<String>>, query: Box<SqlStatement> },
-    CreateTableAs { table: String, query: Box<SqlStatement>, if_not_exists: bool },
-    Explain { stmt: Box<SqlStatement>, analyze: bool },
-    Delete { table: String, where_clause: Option<SqlExpr> },
-    Update { table: String, assignments: Vec<(String, SqlExpr)>, where_clause: Option<SqlExpr> },
+    Insert {
+        table: String,
+        columns: Option<Vec<String>>,
+        values: Vec<Vec<Value>>,
+    },
+    InsertOnConflict {
+        table: String,
+        columns: Option<Vec<String>>,
+        values: Vec<Vec<Value>>,
+        conflict_columns: Vec<String>,
+        do_update: Option<Vec<(String, SqlExpr)>>,
+    },
+    InsertSelect {
+        table: String,
+        columns: Option<Vec<String>>,
+        query: Box<SqlStatement>,
+    },
+    CreateTableAs {
+        table: String,
+        query: Box<SqlStatement>,
+        if_not_exists: bool,
+    },
+    Explain {
+        stmt: Box<SqlStatement>,
+        analyze: bool,
+    },
+    Delete {
+        table: String,
+        where_clause: Option<SqlExpr>,
+    },
+    Update {
+        table: String,
+        assignments: Vec<(String, SqlExpr)>,
+        where_clause: Option<SqlExpr>,
+    },
     // CTE wrapper
-    Cte { name: String, column_aliases: Vec<String>, body: Box<SqlStatement>, main: Box<SqlStatement>, recursive: bool },
+    Cte {
+        name: String,
+        column_aliases: Vec<String>,
+        body: Box<SqlStatement>,
+        main: Box<SqlStatement>,
+        recursive: bool,
+    },
     // Transaction Statements
-    BeginTransaction { read_only: bool },
+    BeginTransaction {
+        read_only: bool,
+    },
     Commit,
     Rollback,
-    Savepoint { name: String },
-    ReleaseSavepoint { name: String },
-    RollbackToSavepoint { name: String },
-    AnalyzeTable { table: String },
-    CopyToParquet { table: String, file_path: String },
-    CopyFromParquet { table: String, file_path: String },
-    CopyImport { table: String, file_path: String, format: String, options: Vec<(String, String)> },
-    SetVariable { name: String, value: Value },
-    ResetVariable { name: String },
-    Reindex { table: String },
-    Pragma { name: String, arg: Option<String> },
+    Savepoint {
+        name: String,
+    },
+    ReleaseSavepoint {
+        name: String,
+    },
+    RollbackToSavepoint {
+        name: String,
+    },
+    AnalyzeTable {
+        table: String,
+    },
+    CopyToParquet {
+        table: String,
+        file_path: String,
+    },
+    CopyFromParquet {
+        table: String,
+        file_path: String,
+    },
+    CopyImport {
+        table: String,
+        file_path: String,
+        format: String,
+        options: Vec<(String, String)>,
+    },
+    SetVariable {
+        name: String,
+        value: Value,
+    },
+    ResetVariable {
+        name: String,
+    },
+    Reindex {
+        table: String,
+    },
+    Pragma {
+        name: String,
+        arg: Option<String>,
+    },
     // FTS DDL Statements
-    CreateFtsIndex { table: String, fields: Option<Vec<String>>, lazy_load: bool, cache_size: usize },
-    DropFtsIndex { table: String },
-    AlterFtsIndexDisable { table: String },
-    AlterFtsIndexEnable { table: String },
+    CreateFtsIndex {
+        table: String,
+        fields: Option<Vec<String>>,
+        lazy_load: bool,
+        cache_size: usize,
+    },
+    DropFtsIndex {
+        table: String,
+    },
+    AlterFtsIndexDisable {
+        table: String,
+    },
+    AlterFtsIndexEnable {
+        table: String,
+    },
     ShowFtsIndexes,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum SetOpType { Union, Intersect, Except }
+pub enum SetOpType {
+    Union,
+    Intersect,
+    Except,
+}
 
 #[derive(Debug, Clone)]
 pub struct UnionStatement {
@@ -173,14 +284,22 @@ pub enum SelectColumn {
     /// SELECT column_name AS alias
     ColumnAlias { column: String, alias: String },
     /// SELECT COUNT(*), SUM(col), etc.
-    Aggregate { func: AggregateFunc, column: Option<String>, distinct: bool, alias: Option<String> },
+    Aggregate {
+        func: AggregateFunc,
+        column: Option<String>,
+        distinct: bool,
+        alias: Option<String>,
+    },
     /// SELECT expression AS alias
-    Expression { expr: SqlExpr, alias: Option<String> },
+    Expression {
+        expr: SqlExpr,
+        alias: Option<String>,
+    },
     /// SELECT row_number() OVER (PARTITION BY ... ORDER BY ...) AS alias
     /// Also supports LAG(col, offset, default) and LEAD(col, offset, default)
     WindowFunction {
         name: String,
-        args: Vec<String>,  // Function arguments (column, offset, default)
+        args: Vec<String>, // Function arguments (column, offset, default)
         partition_by: Vec<String>,
         order_by: Vec<OrderByClause>,
         alias: Option<String>,
@@ -214,7 +333,7 @@ impl std::fmt::Display for AggregateFunc {
 pub struct OrderByClause {
     pub column: String,
     pub descending: bool,
-    pub nulls_first: Option<bool>,  // SQL:2023 NULLS FIRST/LAST
+    pub nulls_first: Option<bool>, // SQL:2023 NULLS FIRST/LAST
     /// Optional SQL expression (for ORDER BY func_call(...) syntax).
     /// When set, the executor will evaluate this expression if `column` is
     /// not found as a pre-existing column in the result batch.
@@ -229,17 +348,40 @@ pub enum SqlExpr {
     /// Literal value
     Literal(Value),
     /// Binary operation: expr op expr
-    BinaryOp { left: Box<SqlExpr>, op: BinaryOperator, right: Box<SqlExpr> },
+    BinaryOp {
+        left: Box<SqlExpr>,
+        op: BinaryOperator,
+        right: Box<SqlExpr>,
+    },
     /// Unary operation: NOT expr
-    UnaryOp { op: UnaryOperator, expr: Box<SqlExpr> },
+    UnaryOp {
+        op: UnaryOperator,
+        expr: Box<SqlExpr>,
+    },
     /// LIKE pattern matching
-    Like { column: String, pattern: String, negated: bool },
+    Like {
+        column: String,
+        pattern: String,
+        negated: bool,
+    },
     /// REGEXP pattern matching
-    Regexp { column: String, pattern: String, negated: bool },
+    Regexp {
+        column: String,
+        pattern: String,
+        negated: bool,
+    },
     /// IN list: column IN (v1, v2, ...)
-    In { column: String, values: Vec<Value>, negated: bool },
+    In {
+        column: String,
+        values: Vec<Value>,
+        negated: bool,
+    },
     /// IN subquery: column IN (SELECT ...)
-    InSubquery { column: String, stmt: Box<SelectStatement>, negated: bool },
+    InSubquery {
+        column: String,
+        stmt: Box<SelectStatement>,
+        negated: bool,
+    },
     /// EXISTS subquery: EXISTS (SELECT ...)
     ExistsSubquery { stmt: Box<SelectStatement> },
     /// Scalar subquery: (SELECT ...)
@@ -250,7 +392,12 @@ pub enum SqlExpr {
         else_expr: Option<Box<SqlExpr>>,
     },
     /// BETWEEN: column BETWEEN low AND high
-    Between { column: String, low: Box<SqlExpr>, high: Box<SqlExpr>, negated: bool },
+    Between {
+        column: String,
+        low: Box<SqlExpr>,
+        high: Box<SqlExpr>,
+        negated: bool,
+    },
     /// IS NULL / IS NOT NULL
     IsNull { column: String, negated: bool },
     /// FTS: MATCH('query') or FUZZY_MATCH('query') in WHERE clause
@@ -260,29 +407,43 @@ pub enum SqlExpr {
     /// Session variable reference: $varname
     Variable(String),
     /// CAST(expr AS TYPE)
-    Cast { expr: Box<SqlExpr>, data_type: DataType },
+    Cast {
+        expr: Box<SqlExpr>,
+        data_type: DataType,
+    },
     /// Parenthesized expression
     Paren(Box<SqlExpr>),
     /// Array index: expr[index]
-    ArrayIndex { array: Box<SqlExpr>, index: Box<SqlExpr> },
+    ArrayIndex {
+        array: Box<SqlExpr>,
+        index: Box<SqlExpr>,
+    },
     /// Array literal: [1.0, 2.0, 3.0]  (used for vector distance queries)
     ArrayLiteral(Vec<f64>),
     /// topk_distance(col, [q], k, 'metric') — whole-column TopK used inside explode_rename
-    TopkDistance { col: String, query: Vec<f64>, k: usize, metric: String },
+    TopkDistance {
+        col: String,
+        query: Vec<f64>,
+        k: usize,
+        metric: String,
+    },
     /// explode_rename(topk_distance_expr, "name1", "name2") — expands TopK pairs into k rows
-    ExplodeRename { inner: Box<SqlExpr>, names: Vec<String> },
+    ExplodeRename {
+        inner: Box<SqlExpr>,
+        names: Vec<String>,
+    },
 }
 
 /// Binary operators
 #[derive(Debug, Clone, PartialEq)]
 pub enum BinaryOperator {
     // Comparison
-    Eq,         // =
-    NotEq,      // != or <>
-    Lt,         // <
-    Le,         // <=
-    Gt,         // >
-    Ge,         // >=
+    Eq,    // =
+    NotEq, // != or <>
+    Lt,    // <
+    Le,    // <=
+    Gt,    // >
+    Ge,    // >=
     // Logical
     And,
     Or,
@@ -317,19 +478,21 @@ impl SelectStatement {
         columns.dedup();
         columns
     }
-    
+
     /// Check if this query uses SELECT * (needs all columns)
     pub fn is_select_star(&self) -> bool {
-        self.columns.iter().any(|col| matches!(col, SelectColumn::All))
+        self.columns
+            .iter()
+            .any(|col| matches!(col, SelectColumn::All))
     }
-    
+
     /// Extract all column names required by this SELECT statement
     /// Returns None if SELECT * is used (meaning all columns needed)
     pub fn required_columns(&self) -> Option<Vec<String>> {
         let mut columns = Vec::new();
         let mut has_star = false;
         let mut has_explicit_id = false;
-        
+
         // Extract from SELECT clause
         for col in &self.columns {
             match col {
@@ -360,7 +523,13 @@ impl SelectStatement {
                     if let Some(col) = column {
                         if col == "_id" {
                             has_explicit_id = true;
-                        } else if col != "*" && !col.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                        } else if col != "*"
+                            && !col
+                                .chars()
+                                .next()
+                                .map(|c| c.is_ascii_digit())
+                                .unwrap_or(false)
+                        {
                             // Skip constants like "1", "2" and "*" - only add real column names
                             columns.push(col.clone());
                         }
@@ -369,7 +538,12 @@ impl SelectStatement {
                 SelectColumn::Expression { expr, .. } => {
                     Self::extract_columns_from_expr(expr, &mut columns);
                 }
-                SelectColumn::WindowFunction { args, partition_by, order_by, .. } => {
+                SelectColumn::WindowFunction {
+                    args,
+                    partition_by,
+                    order_by,
+                    ..
+                } => {
                     // Add columns from args (for LAG/LEAD)
                     for arg in args {
                         if !arg.starts_with("Int") && !arg.starts_with("Float") && arg != "_id" {
@@ -389,12 +563,12 @@ impl SelectStatement {
                 }
             }
         }
-        
+
         // Extract from WHERE clause
         if let Some(ref expr) = self.where_clause {
             Self::extract_columns_from_expr(expr, &mut columns);
         }
-        
+
         // Extract from ORDER BY
         for ob in &self.order_by {
             if let Some(ref expr) = ob.expr {
@@ -405,7 +579,7 @@ impl SelectStatement {
                 columns.push(ob.column.clone());
             }
         }
-        
+
         // Extract from GROUP BY (including expression column refs)
         for (i, col) in self.group_by.iter().enumerate() {
             if let Some(Some(expr)) = self.group_by_exprs.get(i) {
@@ -414,14 +588,14 @@ impl SelectStatement {
                 columns.push(col.clone());
             }
         }
-        
+
         // Extract from HAVING
         if let Some(ref expr) = self.having {
             Self::extract_columns_from_expr(expr, &mut columns);
         }
-        
+
         if has_star {
-            None  // SELECT * means all columns
+            None // SELECT * means all columns
         } else {
             // Include _id if explicitly requested
             if has_explicit_id {
@@ -439,7 +613,7 @@ impl SelectStatement {
             }
         }
     }
-    
+
     fn extract_columns_from_expr(expr: &SqlExpr, columns: &mut Vec<String>) {
         match expr {
             SqlExpr::Column(name) => {
@@ -461,12 +635,12 @@ impl SelectStatement {
                 Self::extract_columns_from_expr(expr, columns);
             }
             SqlExpr::FtsMatch { .. } => {} // FTS — no column to extract
-            SqlExpr::Like { column, .. } | 
-            SqlExpr::Regexp { column, .. } |
-            SqlExpr::In { column, .. } |
-            SqlExpr::Between { column, .. } |
-            SqlExpr::IsNull { column, .. } |
-            SqlExpr::InSubquery { column, .. } => {
+            SqlExpr::Like { column, .. }
+            | SqlExpr::Regexp { column, .. }
+            | SqlExpr::In { column, .. }
+            | SqlExpr::Between { column, .. }
+            | SqlExpr::IsNull { column, .. }
+            | SqlExpr::InSubquery { column, .. } => {
                 // Strip table prefix if present
                 let actual_name = if let Some(dot_pos) = column.rfind('.') {
                     &column[dot_pos + 1..]
@@ -477,7 +651,10 @@ impl SelectStatement {
                     columns.push(actual_name.to_string());
                 }
             }
-            SqlExpr::Case { when_then, else_expr } => {
+            SqlExpr::Case {
+                when_then,
+                else_expr,
+            } => {
                 for (cond, then_expr) in when_then {
                     Self::extract_columns_from_expr(cond, columns);
                     Self::extract_columns_from_expr(then_expr, columns);
@@ -521,7 +698,7 @@ impl SelectStatement {
             _ => {}
         }
     }
-    
+
     /// Extract outer column references from subquery expressions
     /// These are qualified column names like "u.col" or "table.col" that reference outer tables
     fn extract_outer_refs_from_subquery(expr: &SqlExpr, columns: &mut Vec<String>) {
@@ -567,52 +744,113 @@ struct SpannedToken {
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
     // Keywords
-    Select, From, Where, And, Or, Not, As, Distinct,
-    Order, By, Asc, Desc, Limit, Offset, Nulls, First, Last,
-    Like, In, Between, Is, Null,
-    Group, Having,
-    Count, Sum, Avg, Min, Max,
-    True, False,
+    Select,
+    From,
+    Where,
+    And,
+    Or,
+    Not,
+    As,
+    Distinct,
+    Order,
+    By,
+    Asc,
+    Desc,
+    Limit,
+    Offset,
+    Nulls,
+    First,
+    Last,
+    Like,
+    In,
+    Between,
+    Is,
+    Null,
+    Group,
+    Having,
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    True,
+    False,
     Regexp,
     Over,
     Partition,
-    Join, Left, Right, Full, Inner, Outer, Cross, On,
-    Union, Intersect, Except, All,
+    Join,
+    Left,
+    Right,
+    Full,
+    Inner,
+    Outer,
+    Cross,
+    On,
+    Union,
+    Intersect,
+    Except,
+    All,
     Exists,
     Cast,
-    Case, When, Then, Else, End,
-    Create, Drop, View,
+    Case,
+    When,
+    Then,
+    Else,
+    End,
+    Create,
+    Drop,
+    View,
     // DDL keywords
-    Table, Alter, Add, Column, Rename, To, If, Truncate,
+    Table,
+    Alter,
+    Add,
+    Column,
+    Rename,
+    To,
+    If,
+    Truncate,
     // Index keywords
-    Index, Unique, Using,
+    Index,
+    Unique,
+    Using,
     // DML keywords
-    Insert, Into, Values, Delete, Update, Set,
+    Insert,
+    Into,
+    Values,
+    Delete,
+    Update,
+    Set,
     // Variable keywords (token for $name)
     Variable(String),
     // Transaction keywords
-    Begin, Commit, Rollback, Transaction, Read,
+    Begin,
+    Commit,
+    Rollback,
+    Transaction,
+    Read,
     // CTE / EXPLAIN keywords
-    With, Explain, Recursive,
+    With,
+    Explain,
+    Recursive,
     // Symbols
-    Star,           // *
-    Comma,          // ,
-    Dot,            // .
-    LParen,         // (
-    RParen,         // )
-    Semicolon,      // ;
-    Eq,             // =
-    NotEq,          // != or <>
-    Lt,             // <
-    Le,             // <=
-    Gt,             // >
-    Ge,             // >=
-    Plus,           // +
-    Minus,          // -
-    Slash,          // /
-    Percent,        // %
-    LBracket,       // [
-    RBracket,       // ]
+    Star,      // *
+    Comma,     // ,
+    Dot,       // .
+    LParen,    // (
+    RParen,    // )
+    Semicolon, // ;
+    Eq,        // =
+    NotEq,     // != or <>
+    Lt,        // <
+    Le,        // <=
+    Gt,        // >
+    Ge,        // >=
+    Plus,      // +
+    Minus,     // -
+    Slash,     // /
+    Percent,   // %
+    LBracket,  // [
+    RBracket,  // ]
     // Literals
     Identifier(String),
     StringLit(String),
@@ -678,7 +916,10 @@ impl SqlParser {
             let (start, _) = parser.current_span();
             return Err(parser.syntax_error(
                 start,
-                format!("Unexpected token {:?} after end of expression", parser.current()),
+                format!(
+                    "Unexpected token {:?} after end of expression",
+                    parser.current()
+                ),
             ));
         }
 
@@ -745,24 +986,124 @@ impl SqlParser {
 
             // Single character tokens
             match c {
-                b'*' => { tokens.push(SpannedToken { token: Token::Star, start: i, end: i + 1 }); i += 1; continue; }
-                b',' => { tokens.push(SpannedToken { token: Token::Comma, start: i, end: i + 1 }); i += 1; continue; }
-                b'.' => { tokens.push(SpannedToken { token: Token::Dot, start: i, end: i + 1 }); i += 1; continue; }
-                b'(' => { tokens.push(SpannedToken { token: Token::LParen, start: i, end: i + 1 }); i += 1; continue; }
-                b')' => { tokens.push(SpannedToken { token: Token::RParen, start: i, end: i + 1 }); i += 1; continue; }
-                b';' => { tokens.push(SpannedToken { token: Token::Semicolon, start: i, end: i + 1 }); i += 1; continue; }
-                b'+' => { tokens.push(SpannedToken { token: Token::Plus, start: i, end: i + 1 }); i += 1; continue; }
-                b'-' => { tokens.push(SpannedToken { token: Token::Minus, start: i, end: i + 1 }); i += 1; continue; }
-                b'/' => { tokens.push(SpannedToken { token: Token::Slash, start: i, end: i + 1 }); i += 1; continue; }
-                b'%' => { tokens.push(SpannedToken { token: Token::Percent, start: i, end: i + 1 }); i += 1; continue; }
-                b'[' => { tokens.push(SpannedToken { token: Token::LBracket, start: i, end: i + 1 }); i += 1; continue; }
-                b']' => { tokens.push(SpannedToken { token: Token::RBracket, start: i, end: i + 1 }); i += 1; continue; }
+                b'*' => {
+                    tokens.push(SpannedToken {
+                        token: Token::Star,
+                        start: i,
+                        end: i + 1,
+                    });
+                    i += 1;
+                    continue;
+                }
+                b',' => {
+                    tokens.push(SpannedToken {
+                        token: Token::Comma,
+                        start: i,
+                        end: i + 1,
+                    });
+                    i += 1;
+                    continue;
+                }
+                b'.' => {
+                    tokens.push(SpannedToken {
+                        token: Token::Dot,
+                        start: i,
+                        end: i + 1,
+                    });
+                    i += 1;
+                    continue;
+                }
+                b'(' => {
+                    tokens.push(SpannedToken {
+                        token: Token::LParen,
+                        start: i,
+                        end: i + 1,
+                    });
+                    i += 1;
+                    continue;
+                }
+                b')' => {
+                    tokens.push(SpannedToken {
+                        token: Token::RParen,
+                        start: i,
+                        end: i + 1,
+                    });
+                    i += 1;
+                    continue;
+                }
+                b';' => {
+                    tokens.push(SpannedToken {
+                        token: Token::Semicolon,
+                        start: i,
+                        end: i + 1,
+                    });
+                    i += 1;
+                    continue;
+                }
+                b'+' => {
+                    tokens.push(SpannedToken {
+                        token: Token::Plus,
+                        start: i,
+                        end: i + 1,
+                    });
+                    i += 1;
+                    continue;
+                }
+                b'-' => {
+                    tokens.push(SpannedToken {
+                        token: Token::Minus,
+                        start: i,
+                        end: i + 1,
+                    });
+                    i += 1;
+                    continue;
+                }
+                b'/' => {
+                    tokens.push(SpannedToken {
+                        token: Token::Slash,
+                        start: i,
+                        end: i + 1,
+                    });
+                    i += 1;
+                    continue;
+                }
+                b'%' => {
+                    tokens.push(SpannedToken {
+                        token: Token::Percent,
+                        start: i,
+                        end: i + 1,
+                    });
+                    i += 1;
+                    continue;
+                }
+                b'[' => {
+                    tokens.push(SpannedToken {
+                        token: Token::LBracket,
+                        start: i,
+                        end: i + 1,
+                    });
+                    i += 1;
+                    continue;
+                }
+                b']' => {
+                    tokens.push(SpannedToken {
+                        token: Token::RBracket,
+                        start: i,
+                        end: i + 1,
+                    });
+                    i += 1;
+                    continue;
+                }
                 _ => {}
             }
 
             // Multi-character operators
             if c == b'=' {
-                tokens.push(SpannedToken { token: Token::Eq, start: i, end: i + 1 });
+                tokens.push(SpannedToken {
+                    token: Token::Eq,
+                    start: i,
+                    end: i + 1,
+                });
                 i += 1;
                 continue;
             }
@@ -783,7 +1124,11 @@ impl SqlParser {
                 }
                 let ident = sql[start..i].to_string();
                 i += 1;
-                tokens.push(SpannedToken { token: Token::Identifier(ident), start: start0, end: i });
+                tokens.push(SpannedToken {
+                    token: Token::Identifier(ident),
+                    start: start0,
+                    end: i,
+                });
                 continue;
             }
             // Backtick-quoted identifier: `identifier` (Hive/MySQL style)
@@ -802,7 +1147,11 @@ impl SqlParser {
                 }
                 let ident = sql[start..i].to_string();
                 i += 1;
-                tokens.push(SpannedToken { token: Token::Identifier(ident), start: start0, end: i });
+                tokens.push(SpannedToken {
+                    token: Token::Identifier(ident),
+                    start: start0,
+                    end: i,
+                });
                 continue;
             }
             if c == b'\'' {
@@ -820,33 +1169,61 @@ impl SqlParser {
                 }
                 let s = sql[start..i].to_string();
                 i += 1;
-                tokens.push(SpannedToken { token: Token::StringLit(s), start: start0, end: i });
+                tokens.push(SpannedToken {
+                    token: Token::StringLit(s),
+                    start: start0,
+                    end: i,
+                });
                 continue;
             }
             if c == b'!' && i + 1 < len && bytes[i + 1] == b'=' {
-                tokens.push(SpannedToken { token: Token::NotEq, start: i, end: i + 2 });
+                tokens.push(SpannedToken {
+                    token: Token::NotEq,
+                    start: i,
+                    end: i + 2,
+                });
                 i += 2;
                 continue;
             }
             if c == b'<' {
                 if i + 1 < len && bytes[i + 1] == b'=' {
-                    tokens.push(SpannedToken { token: Token::Le, start: i, end: i + 2 });
+                    tokens.push(SpannedToken {
+                        token: Token::Le,
+                        start: i,
+                        end: i + 2,
+                    });
                     i += 2;
                 } else if i + 1 < len && bytes[i + 1] == b'>' {
-                    tokens.push(SpannedToken { token: Token::NotEq, start: i, end: i + 2 });
+                    tokens.push(SpannedToken {
+                        token: Token::NotEq,
+                        start: i,
+                        end: i + 2,
+                    });
                     i += 2;
                 } else {
-                    tokens.push(SpannedToken { token: Token::Lt, start: i, end: i + 1 });
+                    tokens.push(SpannedToken {
+                        token: Token::Lt,
+                        start: i,
+                        end: i + 1,
+                    });
                     i += 1;
                 }
                 continue;
             }
             if c == b'>' {
                 if i + 1 < len && bytes[i + 1] == b'=' {
-                    tokens.push(SpannedToken { token: Token::Ge, start: i, end: i + 2 });
+                    tokens.push(SpannedToken {
+                        token: Token::Ge,
+                        start: i,
+                        end: i + 2,
+                    });
                     i += 2;
                 } else {
-                    tokens.push(SpannedToken { token: Token::Gt, start: i, end: i + 1 });
+                    tokens.push(SpannedToken {
+                        token: Token::Gt,
+                        start: i,
+                        end: i + 1,
+                    });
                     i += 1;
                 }
                 continue;
@@ -858,18 +1235,36 @@ impl SqlParser {
                 let mut has_dot = c == b'.';
                 i += 1;
                 while i < len && (bytes[i].is_ascii_digit() || (!has_dot && bytes[i] == b'.')) {
-                    if bytes[i] == b'.' { has_dot = true; }
+                    if bytes[i] == b'.' {
+                        has_dot = true;
+                    }
                     i += 1;
                 }
                 let num_str = &sql[start..i];
                 if has_dot {
-                    let f: f64 = num_str.parse().map_err(|_|
-                        ApexError::QueryParseError(format!("Syntax error at byte {}: Invalid number: {}", start, num_str)))?;
-                    tokens.push(SpannedToken { token: Token::FloatLit(f), start, end: i });
+                    let f: f64 = num_str.parse().map_err(|_| {
+                        ApexError::QueryParseError(format!(
+                            "Syntax error at byte {}: Invalid number: {}",
+                            start, num_str
+                        ))
+                    })?;
+                    tokens.push(SpannedToken {
+                        token: Token::FloatLit(f),
+                        start,
+                        end: i,
+                    });
                 } else {
-                    let n: i64 = num_str.parse().map_err(|_|
-                        ApexError::QueryParseError(format!("Syntax error at byte {}: Invalid number: {}", start, num_str)))?;
-                    tokens.push(SpannedToken { token: Token::IntLit(n), start, end: i });
+                    let n: i64 = num_str.parse().map_err(|_| {
+                        ApexError::QueryParseError(format!(
+                            "Syntax error at byte {}: Invalid number: {}",
+                            start, num_str
+                        ))
+                    })?;
+                    tokens.push(SpannedToken {
+                        token: Token::IntLit(n),
+                        start,
+                        end: i,
+                    });
                 }
                 continue;
             }
@@ -978,12 +1373,19 @@ impl SqlParser {
                     b"RECURSIVE" => Token::Recursive,
                     _ => Token::Identifier(word.to_string()),
                 };
-                tokens.push(SpannedToken { token, start, end: i });
+                tokens.push(SpannedToken {
+                    token,
+                    start,
+                    end: i,
+                });
                 continue;
             }
 
             // $variable_name — session variable reference
-            if c == b'$' && i + 1 < len && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_') {
+            if c == b'$'
+                && i + 1 < len
+                && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+            {
                 let start = i;
                 i += 1; // skip '$'
                 let var_start = i;
@@ -991,7 +1393,11 @@ impl SqlParser {
                     i += 1;
                 }
                 let name = sql[var_start..i].to_string();
-                tokens.push(SpannedToken { token: Token::Variable(name), start, end: i });
+                tokens.push(SpannedToken {
+                    token: Token::Variable(name),
+                    start,
+                    end: i,
+                });
                 continue;
             }
 
@@ -1001,7 +1407,11 @@ impl SqlParser {
             )));
         }
 
-        tokens.push(SpannedToken { token: Token::Eof, start: len, end: len });
+        tokens.push(SpannedToken {
+            token: Token::Eof,
+            start: len,
+            end: len,
+        });
         Ok(tokens)
     }
 
@@ -1189,9 +1599,8 @@ impl SqlParser {
     fn is_likely_misspelled_keyword(&self, ident: &str) -> bool {
         let u = ident.to_uppercase();
         const KWS: [&str; 15] = [
-            "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER",
-            "ORDER", "GROUP", "HAVING", "LIMIT", "OFFSET", "UNION",
-            "INSERT", "DELETE",
+            "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "ORDER", "GROUP",
+            "HAVING", "LIMIT", "OFFSET", "UNION", "INSERT", "DELETE",
         ];
         for kw in KWS {
             // Length must be similar (differ by at most 1)
@@ -1262,14 +1671,18 @@ impl SqlParser {
         match self.current() {
             Token::Explain => {
                 self.advance();
-                let analyze = if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "ANALYZE") {
+                let analyze = if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "ANALYZE")
+                {
                     self.advance();
                     true
                 } else {
                     false
                 };
                 let inner = self.parse_statement()?;
-                Ok(SqlStatement::Explain { stmt: Box::new(inner), analyze })
+                Ok(SqlStatement::Explain {
+                    stmt: Box::new(inner),
+                    analyze,
+                })
             }
             Token::With => {
                 // CTE: WITH name AS (SELECT ...) [, name2 AS (SELECT ...)] SELECT ...
@@ -1333,7 +1746,10 @@ impl SqlParser {
                 let mut stmt = SqlStatement::Select(self.parse_select_part()?);
 
                 // UNION / INTERSECT / EXCEPT chain
-                while matches!(self.current(), Token::Union | Token::Intersect | Token::Except) {
+                while matches!(
+                    self.current(),
+                    Token::Union | Token::Intersect | Token::Except
+                ) {
                     let set_op = match self.current() {
                         Token::Union => SetOpType::Union,
                         Token::Intersect => SetOpType::Intersect,
@@ -1350,7 +1766,10 @@ impl SqlParser {
 
                     if !matches!(self.current(), Token::Select) {
                         let (start, _) = self.current_span();
-                        return Err(self.syntax_error(start, "Expected SELECT after set operation".to_string()));
+                        return Err(self.syntax_error(
+                            start,
+                            "Expected SELECT after set operation".to_string(),
+                        ));
                     }
                     let right = SqlStatement::Select(self.parse_select_part()?);
 
@@ -1380,7 +1799,9 @@ impl SqlParser {
                         self.advance();
                         Some(n as usize)
                     } else {
-                        return Err(ApexError::QueryParseError("Expected number after LIMIT".to_string()));
+                        return Err(ApexError::QueryParseError(
+                            "Expected number after LIMIT".to_string(),
+                        ));
                     }
                 } else {
                     None
@@ -1392,7 +1813,9 @@ impl SqlParser {
                         self.advance();
                         Some(n as usize)
                     } else {
-                        return Err(ApexError::QueryParseError("Expected number after OFFSET".to_string()));
+                        return Err(ApexError::QueryParseError(
+                            "Expected number after OFFSET".to_string(),
+                        ));
                     }
                 } else {
                     None
@@ -1434,7 +1857,9 @@ impl SqlParser {
                         self.expect(Token::As)?;
                         if !matches!(self.current(), Token::Select) {
                             let (start, _) = self.current_span();
-                            return Err(self.syntax_error(start, "Expected SELECT after AS".to_string()));
+                            return Err(
+                                self.syntax_error(start, "Expected SELECT after AS".to_string())
+                            );
                         }
                         let stmt = self.parse_select_internal(true)?;
                         Ok(SqlStatement::CreateView { name, stmt })
@@ -1448,7 +1873,11 @@ impl SqlParser {
                         if matches!(self.current(), Token::As) {
                             self.advance();
                             let query = self.parse_statement()?;
-                            return Ok(SqlStatement::CreateTableAs { table, query: Box::new(query), if_not_exists });
+                            return Ok(SqlStatement::CreateTableAs {
+                                table,
+                                query: Box::new(query),
+                                if_not_exists,
+                            });
                         }
                         // Column definitions are optional: CREATE TABLE t OR CREATE TABLE t (col INT)
                         let columns = if matches!(self.current(), Token::LParen) {
@@ -1459,18 +1888,29 @@ impl SqlParser {
                         } else {
                             Vec::new()
                         };
-                        Ok(SqlStatement::CreateTable { table, columns, if_not_exists })
+                        Ok(SqlStatement::CreateTable {
+                            table,
+                            columns,
+                            if_not_exists,
+                        })
                     }
                     Token::Identifier(ref fts_kw) if fts_kw.to_uppercase() == "FTS" && !unique => {
                         // CREATE FTS INDEX ON table [(col1, col2)] [WITH (opt=val, ...)]
                         self.advance(); // consume FTS
-                        // Expect INDEX keyword (as identifier or Token::Index)
+                                        // Expect INDEX keyword (as identifier or Token::Index)
                         match self.current().clone() {
-                            Token::Index => { self.advance(); }
-                            Token::Identifier(ref s) if s.to_uppercase() == "INDEX" => { self.advance(); }
-                            other => return Err(ApexError::QueryParseError(
-                                format!("Expected INDEX after CREATE FTS, got {:?}", other)
-                            )),
+                            Token::Index => {
+                                self.advance();
+                            }
+                            Token::Identifier(ref s) if s.to_uppercase() == "INDEX" => {
+                                self.advance();
+                            }
+                            other => {
+                                return Err(ApexError::QueryParseError(format!(
+                                    "Expected INDEX after CREATE FTS, got {:?}",
+                                    other
+                                )))
+                            }
                         }
                         self.expect(Token::On)?;
                         let table = self.parse_identifier()?;
@@ -1480,34 +1920,64 @@ impl SqlParser {
                             let cols = self.parse_identifier_list()?;
                             self.expect(Token::RParen)?;
                             Some(cols)
-                        } else { None };
+                        } else {
+                            None
+                        };
                         // Optional WITH (key=value, ...)
                         let mut lazy_load = false;
                         let mut cache_size: usize = 10000;
-                        if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "WITH") {
+                        if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "WITH")
+                        {
                             self.advance();
                             self.expect(Token::LParen)?;
                             loop {
                                 let key = self.parse_identifier()?.to_lowercase();
                                 self.expect(Token::Eq)?;
                                 let val = match self.current().clone() {
-                                    Token::Identifier(v) => { self.advance(); v }
-                                    Token::IntLit(n) => { self.advance(); n.to_string() }
-                                    Token::True => { self.advance(); "true".to_string() }
-                                    Token::False => { self.advance(); "false".to_string() }
-                                    other => return Err(ApexError::QueryParseError(format!("Expected value in WITH options, got {:?}", other))),
+                                    Token::Identifier(v) => {
+                                        self.advance();
+                                        v
+                                    }
+                                    Token::IntLit(n) => {
+                                        self.advance();
+                                        n.to_string()
+                                    }
+                                    Token::True => {
+                                        self.advance();
+                                        "true".to_string()
+                                    }
+                                    Token::False => {
+                                        self.advance();
+                                        "false".to_string()
+                                    }
+                                    other => {
+                                        return Err(ApexError::QueryParseError(format!(
+                                            "Expected value in WITH options, got {:?}",
+                                            other
+                                        )))
+                                    }
                                 };
                                 match key.as_str() {
-                                    "lazy_load" => lazy_load = matches!(val.to_lowercase().as_str(), "true" | "1"),
+                                    "lazy_load" => {
+                                        lazy_load =
+                                            matches!(val.to_lowercase().as_str(), "true" | "1")
+                                    }
                                     "cache_size" => cache_size = val.parse().unwrap_or(10000),
                                     _ => {}
                                 }
-                                if !matches!(self.current(), Token::Comma) { break; }
+                                if !matches!(self.current(), Token::Comma) {
+                                    break;
+                                }
                                 self.advance();
                             }
                             self.expect(Token::RParen)?;
                         }
-                        return Ok(SqlStatement::CreateFtsIndex { table, fields, lazy_load, cache_size });
+                        return Ok(SqlStatement::CreateFtsIndex {
+                            table,
+                            fields,
+                            lazy_load,
+                            cache_size,
+                        });
                     }
                     Token::Index => {
                         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col1[, col2, ...]) [USING HASH|BTREE]
@@ -1526,14 +1996,27 @@ impl SqlParser {
                         } else {
                             None
                         };
-                        Ok(SqlStatement::CreateIndex { name, table, columns, unique, index_type, if_not_exists })
+                        Ok(SqlStatement::CreateIndex {
+                            name,
+                            table,
+                            columns,
+                            unique,
+                            index_type,
+                            if_not_exists,
+                        })
                     }
                     _ => {
                         let (start, _) = self.current_span();
                         if unique {
-                            Err(self.syntax_error(start, "Expected INDEX after CREATE UNIQUE".to_string()))
+                            Err(self.syntax_error(
+                                start,
+                                "Expected INDEX after CREATE UNIQUE".to_string(),
+                            ))
                         } else {
-                            Err(self.syntax_error(start, "Expected TABLE, VIEW, or INDEX after CREATE".to_string()))
+                            Err(self.syntax_error(
+                                start,
+                                "Expected TABLE, VIEW, or INDEX after CREATE".to_string(),
+                            ))
                         }
                     }
                 }
@@ -1557,11 +2040,18 @@ impl SqlParser {
                         // DROP FTS INDEX ON table
                         self.advance(); // consume FTS
                         match self.current().clone() {
-                            Token::Index => { self.advance(); }
-                            Token::Identifier(ref s) if s.to_uppercase() == "INDEX" => { self.advance(); }
-                            other => return Err(ApexError::QueryParseError(
-                                format!("Expected INDEX after DROP FTS, got {:?}", other)
-                            )),
+                            Token::Index => {
+                                self.advance();
+                            }
+                            Token::Identifier(ref s) if s.to_uppercase() == "INDEX" => {
+                                self.advance();
+                            }
+                            other => {
+                                return Err(ApexError::QueryParseError(format!(
+                                    "Expected INDEX after DROP FTS, got {:?}",
+                                    other
+                                )))
+                            }
                         }
                         self.expect(Token::On)?;
                         let table = self.parse_identifier()?;
@@ -1574,11 +2064,18 @@ impl SqlParser {
                         let name = self.parse_identifier()?;
                         self.expect(Token::On)?;
                         let table = self.parse_identifier()?;
-                        Ok(SqlStatement::DropIndex { name, table, if_exists })
+                        Ok(SqlStatement::DropIndex {
+                            name,
+                            table,
+                            if_exists,
+                        })
                     }
                     _ => {
                         let (start, _) = self.current_span();
-                        Err(self.syntax_error(start, "Expected TABLE, VIEW, or INDEX after DROP".to_string()))
+                        Err(self.syntax_error(
+                            start,
+                            "Expected TABLE, VIEW, or INDEX after DROP".to_string(),
+                        ))
                     }
                 }
             }
@@ -1588,11 +2085,18 @@ impl SqlParser {
                 if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "FTS") {
                     self.advance(); // consume FTS
                     match self.current().clone() {
-                        Token::Index => { self.advance(); }
-                        Token::Identifier(ref s) if s.to_uppercase() == "INDEX" => { self.advance(); }
-                        other => return Err(ApexError::QueryParseError(
-                            format!("Expected INDEX after ALTER FTS, got {:?}", other)
-                        )),
+                        Token::Index => {
+                            self.advance();
+                        }
+                        Token::Identifier(ref s) if s.to_uppercase() == "INDEX" => {
+                            self.advance();
+                        }
+                        other => {
+                            return Err(ApexError::QueryParseError(format!(
+                                "Expected INDEX after ALTER FTS, got {:?}",
+                                other
+                            )))
+                        }
                     }
                     self.expect(Token::On)?;
                     let table = self.parse_identifier()?;
@@ -1606,9 +2110,12 @@ impl SqlParser {
                             self.advance();
                             return Ok(SqlStatement::AlterFtsIndexEnable { table });
                         }
-                        other => return Err(ApexError::QueryParseError(
-                            format!("Expected ENABLE or DISABLE after ALTER FTS INDEX ON table, got {:?}", other)
-                        )),
+                        other => {
+                            return Err(ApexError::QueryParseError(format!(
+                            "Expected ENABLE or DISABLE after ALTER FTS INDEX ON table, got {:?}",
+                            other
+                        )))
+                        }
                     }
                 }
                 self.expect(Token::Table)?;
@@ -1638,9 +2145,14 @@ impl SqlParser {
                     None
                 };
                 // INSERT ... SELECT or INSERT ... VALUES
-                if matches!(self.current(), Token::Select) || matches!(self.current(), Token::With) {
+                if matches!(self.current(), Token::Select) || matches!(self.current(), Token::With)
+                {
                     let query = self.parse_statement()?;
-                    Ok(SqlStatement::InsertSelect { table, columns, query: Box::new(query) })
+                    Ok(SqlStatement::InsertSelect {
+                        table,
+                        columns,
+                        query: Box::new(query),
+                    })
                 } else {
                     self.expect(Token::Values)?;
                     let values = self.parse_values_list()?;
@@ -1651,7 +2163,9 @@ impl SqlParser {
                         let kw = self.parse_identifier()?;
                         if kw.to_uppercase() != "CONFLICT" {
                             let (start, _) = self.current_span();
-                            return Err(self.syntax_error(start, "Expected CONFLICT after ON".to_string()));
+                            return Err(
+                                self.syntax_error(start, "Expected CONFLICT after ON".to_string())
+                            );
                         }
                         // Parse conflict target: (col1, col2, ...)
                         self.expect(Token::LParen)?;
@@ -1661,7 +2175,10 @@ impl SqlParser {
                         let do_kw = self.parse_identifier()?;
                         if do_kw.to_uppercase() != "DO" {
                             let (start, _) = self.current_span();
-                            return Err(self.syntax_error(start, "Expected DO after conflict target".to_string()));
+                            return Err(self.syntax_error(
+                                start,
+                                "Expected DO after conflict target".to_string(),
+                            ));
                         }
                         // DO UPDATE SET ... or DO NOTHING
                         let do_update = if matches!(self.current(), Token::Update) {
@@ -1675,13 +2192,26 @@ impl SqlParser {
                                 "NOTHING" => None,
                                 _ => {
                                     let (start, _) = self.current_span();
-                                    return Err(self.syntax_error(start, "Expected UPDATE or NOTHING after DO".to_string()));
+                                    return Err(self.syntax_error(
+                                        start,
+                                        "Expected UPDATE or NOTHING after DO".to_string(),
+                                    ));
                                 }
                             }
                         };
-                        Ok(SqlStatement::InsertOnConflict { table, columns, values, conflict_columns, do_update })
+                        Ok(SqlStatement::InsertOnConflict {
+                            table,
+                            columns,
+                            values,
+                            conflict_columns,
+                            do_update,
+                        })
                     } else {
-                        Ok(SqlStatement::Insert { table, columns, values })
+                        Ok(SqlStatement::Insert {
+                            table,
+                            columns,
+                            values,
+                        })
                     }
                 }
             }
@@ -1695,7 +2225,10 @@ impl SqlParser {
                 } else {
                     None
                 };
-                Ok(SqlStatement::Delete { table, where_clause })
+                Ok(SqlStatement::Delete {
+                    table,
+                    where_clause,
+                })
             }
             Token::Update => {
                 self.advance();
@@ -1708,7 +2241,11 @@ impl SqlParser {
                 } else {
                     None
                 };
-                Ok(SqlStatement::Update { table, assignments, where_clause })
+                Ok(SqlStatement::Update {
+                    table,
+                    assignments,
+                    where_clause,
+                })
             }
             Token::Set => {
                 // SET VARIABLE name = value
@@ -1735,7 +2272,9 @@ impl SqlParser {
                     let word = self.parse_identifier()?;
                     if word.to_uppercase() != "ONLY" {
                         let (start, _) = self.current_span();
-                        return Err(self.syntax_error(start, "Expected ONLY after READ".to_string()));
+                        return Err(
+                            self.syntax_error(start, "Expected ONLY after READ".to_string())
+                        );
                     }
                     true
                 } else {
@@ -1753,7 +2292,8 @@ impl SqlParser {
                 if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "TO") {
                     self.advance();
                     // Optional SAVEPOINT keyword
-                    if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "SAVEPOINT") {
+                    if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "SAVEPOINT")
+                    {
                         self.advance();
                     }
                     let name = self.parse_identifier()?;
@@ -1786,25 +2326,41 @@ impl SqlParser {
                             let table = self.parse_identifier()?;
                             // Expect TO or FROM (may be keywords or identifiers)
                             let direction = match self.current().clone() {
-                                Token::From => { self.advance(); "FROM".to_string() }
-                                Token::To => { self.advance(); "TO".to_string() }
+                                Token::From => {
+                                    self.advance();
+                                    "FROM".to_string()
+                                }
+                                Token::To => {
+                                    self.advance();
+                                    "TO".to_string()
+                                }
                                 Token::Identifier(ref kw) => {
                                     let u = kw.to_uppercase();
                                     self.advance();
                                     u
                                 }
-                                _ => return Err(ApexError::QueryParseError("Expected TO or FROM after COPY table".to_string())),
+                                _ => {
+                                    return Err(ApexError::QueryParseError(
+                                        "Expected TO or FROM after COPY table".to_string(),
+                                    ))
+                                }
                             };
                             // file path as string literal
-                            let file_path = if let Token::StringLit(ref s) = self.current().clone() {
+                            let file_path = if let Token::StringLit(ref s) = self.current().clone()
+                            {
                                 let p = s.clone();
                                 self.advance();
                                 p
                             } else {
-                                return Err(ApexError::QueryParseError("Expected file path string after COPY table TO/FROM".to_string()));
+                                return Err(ApexError::QueryParseError(
+                                    "Expected file path string after COPY table TO/FROM"
+                                        .to_string(),
+                                ));
                             };
                             match direction.as_str() {
-                                "TO" => return Ok(SqlStatement::CopyToParquet { table, file_path }),
+                                "TO" => {
+                                    return Ok(SqlStatement::CopyToParquet { table, file_path })
+                                }
                                 "FROM" => {
                                     // Parse optional (FORMAT CSV, HEADER true, DELIMITER ',', ...) options
                                     let mut format: Option<String> = None;
@@ -1814,20 +2370,38 @@ impl SqlParser {
                                         loop {
                                             let key = self.parse_identifier()?.to_uppercase();
                                             if key == "FORMAT" {
-                                                let fmt_val = self.parse_identifier()?.to_uppercase();
+                                                let fmt_val =
+                                                    self.parse_identifier()?.to_uppercase();
                                                 format = Some(fmt_val);
                                             } else {
                                                 let val = match self.current().clone() {
-                                                    Token::StringLit(s) => { self.advance(); s }
-                                                    Token::Identifier(s) => { self.advance(); s }
-                                                    Token::True => { self.advance(); "true".to_string() }
-                                                    Token::False => { self.advance(); "false".to_string() }
-                                                    Token::IntLit(n) => { self.advance(); n.to_string() }
+                                                    Token::StringLit(s) => {
+                                                        self.advance();
+                                                        s
+                                                    }
+                                                    Token::Identifier(s) => {
+                                                        self.advance();
+                                                        s
+                                                    }
+                                                    Token::True => {
+                                                        self.advance();
+                                                        "true".to_string()
+                                                    }
+                                                    Token::False => {
+                                                        self.advance();
+                                                        "false".to_string()
+                                                    }
+                                                    Token::IntLit(n) => {
+                                                        self.advance();
+                                                        n.to_string()
+                                                    }
                                                     _ => "true".to_string(),
                                                 };
                                                 options.push((key.to_lowercase(), val));
                                             }
-                                            if !matches!(self.current(), Token::Comma) { break; }
+                                            if !matches!(self.current(), Token::Comma) {
+                                                break;
+                                            }
                                             self.advance();
                                         }
                                         self.expect(Token::RParen)?;
@@ -1837,7 +2411,10 @@ impl SqlParser {
                                         let lower = file_path.to_lowercase();
                                         if lower.ends_with(".csv") || lower.ends_with(".tsv") {
                                             format = Some("CSV".to_string());
-                                        } else if lower.ends_with(".json") || lower.ends_with(".ndjson") || lower.ends_with(".jsonl") {
+                                        } else if lower.ends_with(".json")
+                                            || lower.ends_with(".ndjson")
+                                            || lower.ends_with(".jsonl")
+                                        {
                                             format = Some("JSON".to_string());
                                         } else {
                                             format = Some("PARQUET".to_string());
@@ -1845,17 +2422,30 @@ impl SqlParser {
                                     }
                                     let fmt = format.unwrap();
                                     if fmt == "PARQUET" && options.is_empty() {
-                                        return Ok(SqlStatement::CopyFromParquet { table, file_path });
+                                        return Ok(SqlStatement::CopyFromParquet {
+                                            table,
+                                            file_path,
+                                        });
                                     }
-                                    return Ok(SqlStatement::CopyImport { table, file_path, format: fmt, options });
+                                    return Ok(SqlStatement::CopyImport {
+                                        table,
+                                        file_path,
+                                        format: fmt,
+                                        options,
+                                    });
                                 }
-                                _ => return Err(ApexError::QueryParseError("Expected TO or FROM in COPY statement".to_string())),
+                                _ => {
+                                    return Err(ApexError::QueryParseError(
+                                        "Expected TO or FROM in COPY statement".to_string(),
+                                    ))
+                                }
                             }
                         }
                         "RELEASE" => {
                             self.advance();
                             // Optional SAVEPOINT keyword
-                            if matches!(self.current(), Token::Identifier(ref s2) if s2.to_uppercase() == "SAVEPOINT") {
+                            if matches!(self.current(), Token::Identifier(ref s2) if s2.to_uppercase() == "SAVEPOINT")
+                            {
                                 self.advance();
                             }
                             let name = self.parse_identifier()?;
@@ -1866,7 +2456,10 @@ impl SqlParser {
                             let kw = self.parse_identifier()?;
                             if kw.to_uppercase() != "VARIABLE" {
                                 let (start, _) = self.current_span();
-                                return Err(self.syntax_error(start, "Expected VARIABLE after RESET".to_string()));
+                                return Err(self.syntax_error(
+                                    start,
+                                    "Expected VARIABLE after RESET".to_string(),
+                                ));
                             }
                             let name = self.parse_identifier()?;
                             return Ok(SqlStatement::ResetVariable { name });
@@ -1885,9 +2478,12 @@ impl SqlParser {
                                     }
                                     return Ok(SqlStatement::ShowFtsIndexes);
                                 }
-                                other => return Err(ApexError::QueryParseError(
-                                    format!("Expected FTS after SHOW, got {:?}", other)
-                                )),
+                                other => {
+                                    return Err(ApexError::QueryParseError(format!(
+                                        "Expected FTS after SHOW, got {:?}",
+                                        other
+                                    )))
+                                }
                             }
                         }
                         "REINDEX" => {
@@ -1996,37 +2592,67 @@ impl SqlParser {
                         };
                         self.expect(Token::Comma)?;
                         let k = match self.current().clone() {
-                            Token::IntLit(n) => { self.advance(); n as usize }
-                            other => return Err(ApexError::QueryParseError(
-                                format!("topk_distance: third argument must be integer k, got {:?}", other),
-                            )),
+                            Token::IntLit(n) => {
+                                self.advance();
+                                n as usize
+                            }
+                            other => {
+                                return Err(ApexError::QueryParseError(format!(
+                                    "topk_distance: third argument must be integer k, got {:?}",
+                                    other
+                                )))
+                            }
                         };
                         self.expect(Token::Comma)?;
                         let metric = match self.current().clone() {
-                            Token::StringLit(s) => { self.advance(); s }
-                            other => return Err(ApexError::QueryParseError(
-                                format!("topk_distance: fourth argument must be a metric string, got {:?}", other),
-                            )),
+                            Token::StringLit(s) => {
+                                self.advance();
+                                s
+                            }
+                            other => {
+                                return Err(ApexError::QueryParseError(format!(
+                                "topk_distance: fourth argument must be a metric string, got {:?}",
+                                other
+                            )))
+                            }
                         };
                         self.expect(Token::RParen)?;
                         let alias = if matches!(self.current(), Token::As) {
                             self.advance();
                             Some(self.parse_identifier()?)
                         } else if let Token::Identifier(a) = self.current().clone() {
-                            if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) { None }
-                            else { self.advance(); Some(a) }
-                        } else { None };
-                        Some(FromItem::TopkDistance { col, query, k, metric, alias })
+                            if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) {
+                                None
+                            } else {
+                                self.advance();
+                                Some(a)
+                            }
+                        } else {
+                            None
+                        };
+                        Some(FromItem::TopkDistance {
+                            col,
+                            query,
+                            k,
+                            metric,
+                            alias,
+                        })
                     // Check for table function: read_csv(...), read_parquet(...), read_json(...)
                     } else if matches!(upper.as_str(), "READ_CSV" | "READ_PARQUET" | "READ_JSON")
                         && matches!(self.current(), Token::LParen)
                     {
                         self.advance(); // consume '('
                         let file = match self.current().clone() {
-                            Token::StringLit(s) => { self.advance(); s }
-                            other => return Err(ApexError::QueryParseError(format!(
-                                "Expected file path string in {}(), got {:?}", table, other
-                            ))),
+                            Token::StringLit(s) => {
+                                self.advance();
+                                s
+                            }
+                            other => {
+                                return Err(ApexError::QueryParseError(format!(
+                                    "Expected file path string in {}(), got {:?}",
+                                    table, other
+                                )))
+                            }
                         };
                         let mut options: Vec<(String, String)> = Vec::new();
                         while matches!(self.current(), Token::Comma) {
@@ -2034,15 +2660,36 @@ impl SqlParser {
                             let key = self.parse_identifier()?.to_lowercase();
                             self.expect(Token::Eq)?;
                             let val = match self.current().clone() {
-                                Token::StringLit(s) => { self.advance(); s }
-                                Token::Identifier(s) => { self.advance(); s }
-                                Token::IntLit(n) => { self.advance(); n.to_string() }
-                                Token::FloatLit(f) => { self.advance(); f.to_string() }
-                                Token::True => { self.advance(); "true".to_string() }
-                                Token::False => { self.advance(); "false".to_string() }
-                                other => return Err(ApexError::QueryParseError(format!(
-                                    "Expected option value, got {:?}", other
-                                ))),
+                                Token::StringLit(s) => {
+                                    self.advance();
+                                    s
+                                }
+                                Token::Identifier(s) => {
+                                    self.advance();
+                                    s
+                                }
+                                Token::IntLit(n) => {
+                                    self.advance();
+                                    n.to_string()
+                                }
+                                Token::FloatLit(f) => {
+                                    self.advance();
+                                    f.to_string()
+                                }
+                                Token::True => {
+                                    self.advance();
+                                    "true".to_string()
+                                }
+                                Token::False => {
+                                    self.advance();
+                                    "false".to_string()
+                                }
+                                other => {
+                                    return Err(ApexError::QueryParseError(format!(
+                                        "Expected option value, got {:?}",
+                                        other
+                                    )))
+                                }
                             };
                             options.push((key, val));
                         }
@@ -2060,7 +2707,12 @@ impl SqlParser {
                         } else {
                             None
                         };
-                        Some(FromItem::TableFunction { func: upper, file, options, alias })
+                        Some(FromItem::TableFunction {
+                            func: upper,
+                            file,
+                            options,
+                            alias,
+                        })
                     } else {
                         // Check for qualified db.table syntax
                         let table = if matches!(self.current(), Token::Dot) {
@@ -2095,12 +2747,17 @@ impl SqlParser {
                     // Derived table: FROM (SELECT ... [UNION/INTERSECT/EXCEPT SELECT ...]) alias
                     if !matches!(self.current(), Token::Select) {
                         let (start, _) = self.current_span();
-                        return Err(self.syntax_error(start, "Expected SELECT after FROM (".to_string()));
+                        return Err(
+                            self.syntax_error(start, "Expected SELECT after FROM (".to_string())
+                        );
                     }
                     let sub = self.parse_select_part()?;
                     let mut sub_sql = SqlStatement::Select(sub);
                     // Allow set-operation chains inside the derived table
-                    while matches!(self.current(), Token::Union | Token::Intersect | Token::Except) {
+                    while matches!(
+                        self.current(),
+                        Token::Union | Token::Intersect | Token::Except
+                    ) {
                         let set_op = match self.current() {
                             Token::Union => SetOpType::Union,
                             Token::Intersect => SetOpType::Intersect,
@@ -2108,15 +2765,28 @@ impl SqlParser {
                             _ => unreachable!(),
                         };
                         self.advance();
-                        let all = if matches!(self.current(), Token::All) { self.advance(); true } else { false };
+                        let all = if matches!(self.current(), Token::All) {
+                            self.advance();
+                            true
+                        } else {
+                            false
+                        };
                         if !matches!(self.current(), Token::Select) {
                             let (start, _) = self.current_span();
-                            return Err(self.syntax_error(start, "Expected SELECT after set operation".to_string()));
+                            return Err(self.syntax_error(
+                                start,
+                                "Expected SELECT after set operation".to_string(),
+                            ));
                         }
                         let right = SqlStatement::Select(self.parse_select_part()?);
                         sub_sql = SqlStatement::Union(UnionStatement {
-                            left: Box::new(sub_sql), right: Box::new(right), all, set_op,
-                            order_by: Vec::new(), limit: None, offset: None,
+                            left: Box::new(sub_sql),
+                            right: Box::new(right),
+                            all,
+                            set_op,
+                            order_by: Vec::new(),
+                            limit: None,
+                            offset: None,
                         });
                     }
                     self.expect(Token::RParen)?;
@@ -2139,7 +2809,9 @@ impl SqlParser {
                     })
                 }
                 _ => {
-                    return Err(ApexError::QueryParseError("Expected table name after FROM".to_string()));
+                    return Err(ApexError::QueryParseError(
+                        "Expected table name after FROM".to_string(),
+                    ));
                 }
             }
         } else {
@@ -2210,7 +2882,10 @@ impl SqlParser {
                             "JOIN subquery requires an alias".to_string(),
                         ));
                     };
-                    FromItem::Subquery { stmt: Box::new(crate::query::SqlStatement::Select(sub)), alias }
+                    FromItem::Subquery {
+                        stmt: Box::new(crate::query::SqlStatement::Select(sub)),
+                        alias,
+                    }
                 }
                 Token::Identifier(table) => {
                     self.advance();
@@ -2221,10 +2896,16 @@ impl SqlParser {
                     {
                         self.advance(); // consume '('
                         let file = match self.current().clone() {
-                            Token::StringLit(s) => { self.advance(); s }
-                            other => return Err(ApexError::QueryParseError(format!(
-                                "Expected file path string in {}(), got {:?}", table, other
-                            ))),
+                            Token::StringLit(s) => {
+                                self.advance();
+                                s
+                            }
+                            other => {
+                                return Err(ApexError::QueryParseError(format!(
+                                    "Expected file path string in {}(), got {:?}",
+                                    table, other
+                                )))
+                            }
                         };
                         let mut options: Vec<(String, String)> = Vec::new();
                         while matches!(self.current(), Token::Comma) {
@@ -2232,15 +2913,36 @@ impl SqlParser {
                             let key = self.parse_identifier()?.to_lowercase();
                             self.expect(Token::Eq)?;
                             let val = match self.current().clone() {
-                                Token::StringLit(s) => { self.advance(); s }
-                                Token::Identifier(s) => { self.advance(); s }
-                                Token::IntLit(n) => { self.advance(); n.to_string() }
-                                Token::FloatLit(f) => { self.advance(); f.to_string() }
-                                Token::True => { self.advance(); "true".to_string() }
-                                Token::False => { self.advance(); "false".to_string() }
-                                other => return Err(ApexError::QueryParseError(format!(
-                                    "Expected option value, got {:?}", other
-                                ))),
+                                Token::StringLit(s) => {
+                                    self.advance();
+                                    s
+                                }
+                                Token::Identifier(s) => {
+                                    self.advance();
+                                    s
+                                }
+                                Token::IntLit(n) => {
+                                    self.advance();
+                                    n.to_string()
+                                }
+                                Token::FloatLit(f) => {
+                                    self.advance();
+                                    f.to_string()
+                                }
+                                Token::True => {
+                                    self.advance();
+                                    "true".to_string()
+                                }
+                                Token::False => {
+                                    self.advance();
+                                    "false".to_string()
+                                }
+                                other => {
+                                    return Err(ApexError::QueryParseError(format!(
+                                        "Expected option value, got {:?}",
+                                        other
+                                    )))
+                                }
                             };
                             options.push((key, val));
                         }
@@ -2249,10 +2951,21 @@ impl SqlParser {
                             self.advance();
                             Some(self.parse_identifier()?)
                         } else if let Token::Identifier(a) = self.current().clone() {
-                            if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) { None }
-                            else { self.advance(); Some(a) }
-                        } else { None };
-                        FromItem::TableFunction { func: upper, file, options, alias }
+                            if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) {
+                                None
+                            } else {
+                                self.advance();
+                                Some(a)
+                            }
+                        } else {
+                            None
+                        };
+                        FromItem::TableFunction {
+                            func: upper,
+                            file,
+                            options,
+                            alias,
+                        }
                     } else {
                         // Regular table — check for qualified db.table syntax
                         let table = if matches!(self.current(), Token::Dot) {
@@ -2260,17 +2973,25 @@ impl SqlParser {
                             if let Token::Identifier(tbl) = self.current().clone() {
                                 self.advance();
                                 format!("{}.{}", table, tbl)
-                            } else { table }
-                        } else { table };
+                            } else {
+                                table
+                            }
+                        } else {
+                            table
+                        };
                         let alias = if let Token::Identifier(a) = self.current().clone() {
                             self.advance();
                             Some(a)
-                        } else { None };
+                        } else {
+                            None
+                        };
                         FromItem::Table { table, alias }
                     }
                 }
                 _ => {
-                    return Err(ApexError::QueryParseError("Expected table name after JOIN".to_string()));
+                    return Err(ApexError::QueryParseError(
+                        "Expected table name after JOIN".to_string(),
+                    ));
                 }
             };
 
@@ -2281,7 +3002,11 @@ impl SqlParser {
                 self.expect(Token::On)?;
                 self.parse_expr()?
             };
-            joins.push(JoinClause { join_type, right, on });
+            joins.push(JoinClause {
+                join_type,
+                right,
+                on,
+            });
         }
 
         // WHERE
@@ -2324,7 +3049,9 @@ impl SqlParser {
                 self.advance();
                 Some(n as usize)
             } else {
-                return Err(ApexError::QueryParseError("Expected number after LIMIT".to_string()));
+                return Err(ApexError::QueryParseError(
+                    "Expected number after LIMIT".to_string(),
+                ));
             }
         } else {
             None
@@ -2336,7 +3063,9 @@ impl SqlParser {
                 self.advance();
                 Some(n as usize)
             } else {
-                return Err(ApexError::QueryParseError("Expected number after OFFSET".to_string()));
+                return Err(ApexError::QueryParseError(
+                    "Expected number after OFFSET".to_string(),
+                ));
             }
         } else {
             None
@@ -2359,25 +3088,80 @@ impl SqlParser {
 
     fn parse_alias_identifier(&mut self) -> Option<String> {
         let alias = match self.current() {
-            Token::Identifier(name) => { let n = name.clone(); self.advance(); Some(n) }
+            Token::Identifier(name) => {
+                let n = name.clone();
+                self.advance();
+                Some(n)
+            }
             // Allow keyword aliases, e.g. COUNT(1) count, FIRST_VALUE(...) first
-            Token::Count => { self.advance(); Some("count".to_string()) }
-            Token::Sum => { self.advance(); Some("sum".to_string()) }
-            Token::Avg => { self.advance(); Some("avg".to_string()) }
-            Token::Min => { self.advance(); Some("min".to_string()) }
-            Token::Max => { self.advance(); Some("max".to_string()) }
-            Token::First => { self.advance(); Some("first".to_string()) }
-            Token::Last => { self.advance(); Some("last".to_string()) }
-            Token::Order => { self.advance(); Some("order".to_string()) }
-            Token::Group => { self.advance(); Some("group".to_string()) }
-            Token::By => { self.advance(); Some("by".to_string()) }
-            Token::Asc => { self.advance(); Some("asc".to_string()) }
-            Token::Desc => { self.advance(); Some("desc".to_string()) }
-            Token::Nulls => { self.advance(); Some("nulls".to_string()) }
-            Token::Is => { self.advance(); Some("is".to_string()) }
-            Token::In => { self.advance(); Some("in".to_string()) }
-            Token::Not => { self.advance(); Some("not".to_string()) }
-            Token::Null => { self.advance(); Some("null".to_string()) }
+            Token::Count => {
+                self.advance();
+                Some("count".to_string())
+            }
+            Token::Sum => {
+                self.advance();
+                Some("sum".to_string())
+            }
+            Token::Avg => {
+                self.advance();
+                Some("avg".to_string())
+            }
+            Token::Min => {
+                self.advance();
+                Some("min".to_string())
+            }
+            Token::Max => {
+                self.advance();
+                Some("max".to_string())
+            }
+            Token::First => {
+                self.advance();
+                Some("first".to_string())
+            }
+            Token::Last => {
+                self.advance();
+                Some("last".to_string())
+            }
+            Token::Order => {
+                self.advance();
+                Some("order".to_string())
+            }
+            Token::Group => {
+                self.advance();
+                Some("group".to_string())
+            }
+            Token::By => {
+                self.advance();
+                Some("by".to_string())
+            }
+            Token::Asc => {
+                self.advance();
+                Some("asc".to_string())
+            }
+            Token::Desc => {
+                self.advance();
+                Some("desc".to_string())
+            }
+            Token::Nulls => {
+                self.advance();
+                Some("nulls".to_string())
+            }
+            Token::Is => {
+                self.advance();
+                Some("is".to_string())
+            }
+            Token::In => {
+                self.advance();
+                Some("in".to_string())
+            }
+            Token::Not => {
+                self.advance();
+                Some("not".to_string())
+            }
+            Token::Null => {
+                self.advance();
+                Some("null".to_string())
+            }
             _ => None,
         };
         alias
@@ -2392,7 +3176,9 @@ impl SqlParser {
             self.advance();
             n
         } else {
-            return Err(ApexError::QueryParseError("Expected column identifier".to_string()));
+            return Err(ApexError::QueryParseError(
+                "Expected column identifier".to_string(),
+            ));
         };
 
         while matches!(self.current(), Token::Dot) {
@@ -2402,7 +3188,9 @@ impl SqlParser {
                 full.push('.');
                 full.push_str(&n);
             } else {
-                return Err(ApexError::QueryParseError("Expected identifier after '.'".to_string()));
+                return Err(ApexError::QueryParseError(
+                    "Expected identifier after '.'".to_string(),
+                ));
             }
         }
 
@@ -2419,7 +3207,10 @@ impl SqlParser {
                 columns.push(SelectColumn::All);
             }
             // Aggregate functions
-            else if matches!(self.current(), Token::Count | Token::Sum | Token::Avg | Token::Min | Token::Max) {
+            else if matches!(
+                self.current(),
+                Token::Count | Token::Sum | Token::Avg | Token::Min | Token::Max
+            ) {
                 let func = match self.current() {
                     Token::Count => AggregateFunc::Count,
                     Token::Sum => AggregateFunc::Sum,
@@ -2441,14 +3232,20 @@ impl SqlParser {
                 let column = if matches!(self.current(), Token::Star) {
                     if distinct {
                         let (start, _) = self.current_span();
-                        return Err(self.syntax_error(start, "COUNT(DISTINCT *) is not supported".to_string()));
+                        return Err(self.syntax_error(
+                            start,
+                            "COUNT(DISTINCT *) is not supported".to_string(),
+                        ));
                     }
                     self.advance();
                     None
                 } else if matches!(self.current(), Token::Identifier(_)) {
                     if distinct && func != AggregateFunc::Count {
                         let (start, _) = self.current_span();
-                        return Err(self.syntax_error(start, "DISTINCT is only supported for COUNT".to_string()));
+                        return Err(self.syntax_error(
+                            start,
+                            "DISTINCT is only supported for COUNT".to_string(),
+                        ));
                     }
                     Some(self.parse_column_ref()?)
                 } else if func == AggregateFunc::Count
@@ -2486,17 +3283,17 @@ impl SqlParser {
                     // Convert aggregate to window function
                     let func_name = format!("{}", func);
                     let args: Vec<String> = column.clone().into_iter().collect();
-                    
+
                     self.advance(); // consume OVER
                     self.expect(Token::LParen)?;
-                    
+
                     let mut partition_by = Vec::new();
                     if matches!(self.current(), Token::Partition) {
                         self.advance();
                         self.expect(Token::By)?;
                         partition_by = self.parse_column_list()?;
                     }
-                    
+
                     let order_by = if matches!(self.current(), Token::Order) {
                         self.advance();
                         self.expect(Token::By)?;
@@ -2504,16 +3301,16 @@ impl SqlParser {
                     } else {
                         Vec::new()
                     };
-                    
+
                     self.expect(Token::RParen)?;
-                    
+
                     let alias = if matches!(self.current(), Token::As) {
                         self.advance();
                         self.parse_alias_identifier()
                     } else {
                         self.parse_alias_identifier()
                     };
-                    
+
                     columns.push(SelectColumn::WindowFunction {
                         name: func_name,
                         args,
@@ -2531,7 +3328,12 @@ impl SqlParser {
                         self.parse_alias_identifier()
                     };
 
-                    columns.push(SelectColumn::Aggregate { func, column, distinct, alias });
+                    columns.push(SelectColumn::Aggregate {
+                        func,
+                        column,
+                        distinct,
+                        alias,
+                    });
                 }
             }
             // Column or window function name
@@ -2548,16 +3350,26 @@ impl SqlParser {
                     if matches!(self.current(), Token::Over) {
                         // Window function: func(args...) OVER (PARTITION BY ... ORDER BY ...)
                         // Extract args from the function expression
-                        let args = if let SqlExpr::Function { args: func_args, .. } = &func_expr {
-                            func_args.iter().filter_map(|a| {
-                                if let SqlExpr::Column(c) = a { Some(c.clone()) }
-                                else if let SqlExpr::Literal(v) = a { Some(format!("{:?}", v)) }
-                                else { None }
-                            }).collect()
+                        let args = if let SqlExpr::Function {
+                            args: func_args, ..
+                        } = &func_expr
+                        {
+                            func_args
+                                .iter()
+                                .filter_map(|a| {
+                                    if let SqlExpr::Column(c) = a {
+                                        Some(c.clone())
+                                    } else if let SqlExpr::Literal(v) = a {
+                                        Some(format!("{:?}", v))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
                         } else {
                             Vec::new()
                         };
-                        
+
                         self.advance();
                         self.expect(Token::LParen)?;
 
@@ -2600,9 +3412,15 @@ impl SqlParser {
                             self.parse_alias_identifier()
                         };
 
-                        columns.push(SelectColumn::Expression { expr: func_expr, alias });
+                        columns.push(SelectColumn::Expression {
+                            expr: func_expr,
+                            alias,
+                        });
                     }
-                } else if matches!(self.current(), Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent) {
+                } else if matches!(
+                    self.current(),
+                    Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent
+                ) {
                     // Column reference followed by arithmetic operator → parse as expression
                     // Build left side as SqlExpr::Column, then continue with binary op parsing
                     let mut left = SqlExpr::Column(name);
@@ -2640,14 +3458,22 @@ impl SqlParser {
                     if matches!(self.current(), Token::As) {
                         self.advance();
                         if let Some(alias) = self.parse_alias_identifier() {
-                            columns.push(SelectColumn::ColumnAlias { column: name, alias });
+                            columns.push(SelectColumn::ColumnAlias {
+                                column: name,
+                                alias,
+                            });
                         } else {
-                            return Err(ApexError::QueryParseError("Expected alias after AS".to_string()));
+                            return Err(ApexError::QueryParseError(
+                                "Expected alias after AS".to_string(),
+                            ));
                         }
                     } else {
                         // Allow implicit aliases: col alias
                         if let Some(alias) = self.parse_alias_identifier() {
-                            columns.push(SelectColumn::ColumnAlias { column: name, alias });
+                            columns.push(SelectColumn::ColumnAlias {
+                                column: name,
+                                alias,
+                            });
                         } else {
                             columns.push(SelectColumn::Column(name));
                         }
@@ -2655,14 +3481,18 @@ impl SqlParser {
                 }
             }
             // Handle keywords that can also be function names: LEFT, RIGHT, IF, TRUNCATE
-            else if matches!(self.current(), Token::Left | Token::Right | Token::If | Token::Truncate) {
+            else if matches!(
+                self.current(),
+                Token::Left | Token::Right | Token::If | Token::Truncate
+            ) {
                 let name = match self.current() {
                     Token::Left => "LEFT",
                     Token::Right => "RIGHT",
                     Token::If => "IF",
                     Token::Truncate => "TRUNCATE",
                     _ => unreachable!(),
-                }.to_string();
+                }
+                .to_string();
                 self.advance();
                 if matches!(self.current(), Token::LParen) {
                     let func_expr = self.parse_function_call_from_name(name)?;
@@ -2672,10 +3502,15 @@ impl SqlParser {
                     } else {
                         self.parse_alias_identifier()
                     };
-                    columns.push(SelectColumn::Expression { expr: func_expr, alias });
+                    columns.push(SelectColumn::Expression {
+                        expr: func_expr,
+                        alias,
+                    });
                 } else {
                     let (start, _) = self.current_span();
-                    return Err(self.syntax_error(start, format!("Expected '(' after function name")));
+                    return Err(
+                        self.syntax_error(start, format!("Expected '(' after function name"))
+                    );
                 }
             } else {
                 // Fallback: allow expression/literal select items like `SELECT 1`.
@@ -2715,237 +3550,321 @@ impl SqlParser {
             }
         }
 
-    if columns.is_empty() {
-        let (start, _) = self.current_span();
-        return Err(self.syntax_error(start, "Expected column list after SELECT".to_string()));
+        if columns.is_empty() {
+            let (start, _) = self.current_span();
+            return Err(self.syntax_error(start, "Expected column list after SELECT".to_string()));
+        }
+
+        Ok(columns)
     }
 
-    Ok(columns)
-}
+    /// Parse GROUP BY list: supports both simple columns and expressions like YEAR(date)
+    fn parse_group_by_list(&mut self) -> Result<(Vec<String>, Vec<Option<SqlExpr>>), ApexError> {
+        let mut names = Vec::new();
+        let mut exprs = Vec::new();
 
-/// Parse GROUP BY list: supports both simple columns and expressions like YEAR(date)
-fn parse_group_by_list(&mut self) -> Result<(Vec<String>, Vec<Option<SqlExpr>>), ApexError> {
-    let mut names = Vec::new();
-    let mut exprs = Vec::new();
-    
-    loop {
-        // Check if this is a function call: IDENT '(' ...
-        let is_func = matches!(self.current(), Token::Identifier(_)) && {
-            let next_pos = self.pos + 1;
-            next_pos < self.tokens.len() && matches!(self.tokens[next_pos].token, Token::LParen)
-        };
-        
-        if is_func {
-            // Parse as expression (function call like YEAR(date))
-            let expr = self.parse_expr()?;
-            let display = Self::expr_to_display_string(&expr);
-            names.push(display);
-            exprs.push(Some(expr));
-        } else if matches!(self.current(), Token::Identifier(_)) {
-            let name = self.parse_column_ref()?;
-            names.push(name);
-            exprs.push(None);
-        } else {
-            return Err(ApexError::QueryParseError("Expected column name or expression in GROUP BY".to_string()));
-        }
-        
-        if matches!(self.current(), Token::Comma) {
-            self.advance();
-        } else {
-            break;
-        }
-    }
-    
-    Ok((names, exprs))
-}
-
-/// Convert a SqlExpr to a display string for use as column name
-fn expr_to_display_string(expr: &SqlExpr) -> String {
-    match expr {
-        SqlExpr::Column(name) => name.clone(),
-        SqlExpr::Function { name, args } => {
-            let arg_strs: Vec<String> = args.iter().map(Self::expr_to_display_string).collect();
-            format!("{}({})", name.to_uppercase(), arg_strs.join(", "))
-        }
-        SqlExpr::BinaryOp { left, op, right } => {
-            let op_str = match op {
-                crate::query::sql_parser::BinaryOperator::Add => "+",
-                crate::query::sql_parser::BinaryOperator::Sub => "-",
-                crate::query::sql_parser::BinaryOperator::Mul => "*",
-                crate::query::sql_parser::BinaryOperator::Div => "/",
-                crate::query::sql_parser::BinaryOperator::Mod => "%",
-                _ => "?",
+        loop {
+            // Check if this is a function call: IDENT '(' ...
+            let is_func = matches!(self.current(), Token::Identifier(_)) && {
+                let next_pos = self.pos + 1;
+                next_pos < self.tokens.len() && matches!(self.tokens[next_pos].token, Token::LParen)
             };
-            format!("{} {} {}", Self::expr_to_display_string(left), op_str, Self::expr_to_display_string(right))
-        }
-        SqlExpr::Cast { expr, data_type } => {
-            format!("CAST({} AS {:?})", Self::expr_to_display_string(expr), data_type)
-        }
-        SqlExpr::Literal(val) => format!("{:?}", val),
-        SqlExpr::Paren(inner) => format!("({})", Self::expr_to_display_string(inner)),
-        _ => format!("{:?}", expr),
-    }
-}
 
-fn parse_column_list(&mut self) -> Result<Vec<String>, ApexError> {
-    let mut columns = Vec::new();
-    
-    loop {
-        if matches!(self.current(), Token::Identifier(_)) {
-            let name = self.parse_column_ref()?;
-            columns.push(name);
-        } else {
-            return Err(ApexError::QueryParseError("Expected column name".to_string()));
-        }
-        
-        if matches!(self.current(), Token::Comma) {
-            self.advance();
-        } else {
-            break;
-        }
-    }
-    
-    Ok(columns)
-}
+            if is_func {
+                // Parse as expression (function call like YEAR(date))
+                let expr = self.parse_expr()?;
+                let display = Self::expr_to_display_string(&expr);
+                names.push(display);
+                exprs.push(Some(expr));
+            } else if matches!(self.current(), Token::Identifier(_)) {
+                let name = self.parse_column_ref()?;
+                names.push(name);
+                exprs.push(None);
+            } else {
+                return Err(ApexError::QueryParseError(
+                    "Expected column name or expression in GROUP BY".to_string(),
+                ));
+            }
 
-fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
-    let mut clauses = Vec::new();
-
-    loop {
-        // Accept: identifier, or aggregate function token (SUM/COUNT/AVG/MIN/MAX) followed by (...)
-        let is_agg_func = matches!(self.current(),
-            Token::Sum | Token::Count | Token::Avg | Token::Min | Token::Max);
-        let is_ident = matches!(self.current(), Token::Identifier(_));
-        let is_int_lit = matches!(self.current(), Token::IntLit(_));
-        let is_expr_start = matches!(self.current(),
-            Token::LBracket | Token::LParen | Token::Minus | Token::FloatLit(_));
-
-        if !is_ident && !is_agg_func && !is_int_lit && !is_expr_start {
-            break;
-        }
-
-        let column = if is_agg_func {
-            // Parse SUM(col) / COUNT(*) / etc. as a string for the ORDER BY clause
-            let func_name = match self.current() {
-                Token::Sum => "SUM",
-                Token::Count => "COUNT",
-                Token::Avg => "AVG",
-                Token::Min => "MIN",
-                Token::Max => "MAX",
-                _ => unreachable!(),
-            }.to_string();
-            self.advance();
-            // Consume parenthesised argument(s) as opaque text
-            let mut depth = 0usize;
-            let mut arg = String::new();
-            if matches!(self.current(), Token::LParen) {
+            if matches!(self.current(), Token::Comma) {
                 self.advance();
-                depth = 1;
-                while depth > 0 {
-                    match self.current() {
-                        Token::LParen => { depth += 1; arg.push('('); self.advance(); }
-                        Token::RParen => {
-                            depth -= 1;
-                            if depth > 0 { arg.push(')'); }
-                            self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok((names, exprs))
+    }
+
+    /// Convert a SqlExpr to a display string for use as column name
+    fn expr_to_display_string(expr: &SqlExpr) -> String {
+        match expr {
+            SqlExpr::Column(name) => name.clone(),
+            SqlExpr::Function { name, args } => {
+                let arg_strs: Vec<String> = args.iter().map(Self::expr_to_display_string).collect();
+                format!("{}({})", name.to_uppercase(), arg_strs.join(", "))
+            }
+            SqlExpr::BinaryOp { left, op, right } => {
+                let op_str = match op {
+                    crate::query::sql_parser::BinaryOperator::Add => "+",
+                    crate::query::sql_parser::BinaryOperator::Sub => "-",
+                    crate::query::sql_parser::BinaryOperator::Mul => "*",
+                    crate::query::sql_parser::BinaryOperator::Div => "/",
+                    crate::query::sql_parser::BinaryOperator::Mod => "%",
+                    _ => "?",
+                };
+                format!(
+                    "{} {} {}",
+                    Self::expr_to_display_string(left),
+                    op_str,
+                    Self::expr_to_display_string(right)
+                )
+            }
+            SqlExpr::Cast { expr, data_type } => {
+                format!(
+                    "CAST({} AS {:?})",
+                    Self::expr_to_display_string(expr),
+                    data_type
+                )
+            }
+            SqlExpr::Literal(val) => format!("{:?}", val),
+            SqlExpr::Paren(inner) => format!("({})", Self::expr_to_display_string(inner)),
+            _ => format!("{:?}", expr),
+        }
+    }
+
+    fn parse_column_list(&mut self) -> Result<Vec<String>, ApexError> {
+        let mut columns = Vec::new();
+
+        loop {
+            if matches!(self.current(), Token::Identifier(_)) {
+                let name = self.parse_column_ref()?;
+                columns.push(name);
+            } else {
+                return Err(ApexError::QueryParseError(
+                    "Expected column name".to_string(),
+                ));
+            }
+
+            if matches!(self.current(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(columns)
+    }
+
+    fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
+        let mut clauses = Vec::new();
+
+        loop {
+            // Accept: identifier, or aggregate function token (SUM/COUNT/AVG/MIN/MAX) followed by (...)
+            let is_agg_func = matches!(
+                self.current(),
+                Token::Sum | Token::Count | Token::Avg | Token::Min | Token::Max
+            );
+            let is_ident = matches!(self.current(), Token::Identifier(_));
+            let is_int_lit = matches!(self.current(), Token::IntLit(_));
+            let is_expr_start = matches!(
+                self.current(),
+                Token::LBracket | Token::LParen | Token::Minus | Token::FloatLit(_)
+            );
+
+            if !is_ident && !is_agg_func && !is_int_lit && !is_expr_start {
+                break;
+            }
+
+            let column = if is_agg_func {
+                // Parse SUM(col) / COUNT(*) / etc. as a string for the ORDER BY clause
+                let func_name = match self.current() {
+                    Token::Sum => "SUM",
+                    Token::Count => "COUNT",
+                    Token::Avg => "AVG",
+                    Token::Min => "MIN",
+                    Token::Max => "MAX",
+                    _ => unreachable!(),
+                }
+                .to_string();
+                self.advance();
+                // Consume parenthesised argument(s) as opaque text
+                let mut depth = 0usize;
+                let mut arg = String::new();
+                if matches!(self.current(), Token::LParen) {
+                    self.advance();
+                    depth = 1;
+                    while depth > 0 {
+                        match self.current() {
+                            Token::LParen => {
+                                depth += 1;
+                                arg.push('(');
+                                self.advance();
+                            }
+                            Token::RParen => {
+                                depth -= 1;
+                                if depth > 0 {
+                                    arg.push(')');
+                                }
+                                self.advance();
+                            }
+                            Token::Star => {
+                                arg.push('*');
+                                self.advance();
+                            }
+                            Token::Identifier(s) => {
+                                arg.push_str(s);
+                                self.advance();
+                            }
+                            Token::Comma => {
+                                arg.push(',');
+                                self.advance();
+                            }
+                            _ => {
+                                self.advance();
+                            }
                         }
-                        Token::Star => { arg.push('*'); self.advance(); }
-                        Token::Identifier(s) => { arg.push_str(s); self.advance(); }
-                        Token::Comma => { arg.push(','); self.advance(); }
-                        _ => { self.advance(); }
                     }
                 }
-            }
-            format!("{}({})", func_name, arg.trim())
-        } else if is_int_lit {
-            // Positional ORDER BY like ORDER BY 1
-            if let Token::IntLit(n) = self.current() {
-                let s = n.to_string();
-                self.advance();
-                s
-            } else { break; }
-        } else if is_expr_start {
-            // Expression that starts with '[', '(', '-', or a float literal
-            let expr = self.parse_expr()?;
-            let display = Self::expr_to_display_string(&expr);
-            let descending = if matches!(self.current(), Token::Desc) {
-                self.advance(); true
-            } else if matches!(self.current(), Token::Asc) {
-                self.advance(); false
-            } else { false };
-            let nulls_first = if matches!(self.current(), Token::Nulls) {
-                self.advance();
-                if matches!(self.current(), Token::First) { self.advance(); Some(true) }
-                else if matches!(self.current(), Token::Last) { self.advance(); Some(false) }
-                else { None }
-            } else { None };
-            clauses.push(OrderByClause { column: display.clone(), descending, nulls_first, expr: Some(expr) });
-            if matches!(self.current(), Token::Comma) { self.advance(); } else { break; }
-            continue;
-        } else {
-            // Identifier — check if it's followed by '(' (function call expression)
-            let saved_pos = self.pos;
-            let col = self.parse_column_ref()?;
-            if matches!(self.current(), Token::LParen) {
-                // Restore and re-parse as full expression
-                self.pos = saved_pos;
+                format!("{}({})", func_name, arg.trim())
+            } else if is_int_lit {
+                // Positional ORDER BY like ORDER BY 1
+                if let Token::IntLit(n) = self.current() {
+                    let s = n.to_string();
+                    self.advance();
+                    s
+                } else {
+                    break;
+                }
+            } else if is_expr_start {
+                // Expression that starts with '[', '(', '-', or a float literal
                 let expr = self.parse_expr()?;
                 let display = Self::expr_to_display_string(&expr);
                 let descending = if matches!(self.current(), Token::Desc) {
-                    self.advance(); true
+                    self.advance();
+                    true
                 } else if matches!(self.current(), Token::Asc) {
-                    self.advance(); false
-                } else { false };
+                    self.advance();
+                    false
+                } else {
+                    false
+                };
                 let nulls_first = if matches!(self.current(), Token::Nulls) {
                     self.advance();
-                    if matches!(self.current(), Token::First) { self.advance(); Some(true) }
-                    else if matches!(self.current(), Token::Last) { self.advance(); Some(false) }
-                    else { None }
-                } else { None };
-                clauses.push(OrderByClause { column: display.clone(), descending, nulls_first, expr: Some(expr) });
-                if matches!(self.current(), Token::Comma) { self.advance(); } else { break; }
+                    if matches!(self.current(), Token::First) {
+                        self.advance();
+                        Some(true)
+                    } else if matches!(self.current(), Token::Last) {
+                        self.advance();
+                        Some(false)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                clauses.push(OrderByClause {
+                    column: display.clone(),
+                    descending,
+                    nulls_first,
+                    expr: Some(expr),
+                });
+                if matches!(self.current(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
                 continue;
-            }
-            col
-        };
+            } else {
+                // Identifier — check if it's followed by '(' (function call expression)
+                let saved_pos = self.pos;
+                let col = self.parse_column_ref()?;
+                if matches!(self.current(), Token::LParen) {
+                    // Restore and re-parse as full expression
+                    self.pos = saved_pos;
+                    let expr = self.parse_expr()?;
+                    let display = Self::expr_to_display_string(&expr);
+                    let descending = if matches!(self.current(), Token::Desc) {
+                        self.advance();
+                        true
+                    } else if matches!(self.current(), Token::Asc) {
+                        self.advance();
+                        false
+                    } else {
+                        false
+                    };
+                    let nulls_first = if matches!(self.current(), Token::Nulls) {
+                        self.advance();
+                        if matches!(self.current(), Token::First) {
+                            self.advance();
+                            Some(true)
+                        } else if matches!(self.current(), Token::Last) {
+                            self.advance();
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    clauses.push(OrderByClause {
+                        column: display.clone(),
+                        descending,
+                        nulls_first,
+                        expr: Some(expr),
+                    });
+                    if matches!(self.current(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                    continue;
+                }
+                col
+            };
 
-        let descending = if matches!(self.current(), Token::Desc) {
-            self.advance();
-            true
-        } else if matches!(self.current(), Token::Asc) {
-            self.advance();
-            false
-        } else {
-            false
-        };
+            let descending = if matches!(self.current(), Token::Desc) {
+                self.advance();
+                true
+            } else if matches!(self.current(), Token::Asc) {
+                self.advance();
+                false
+            } else {
+                false
+            };
 
-        // SQL:2023 NULLS FIRST/LAST
-        let nulls_first = if matches!(self.current(), Token::Nulls) {
-            self.advance();
-            if matches!(self.current(), Token::First) {
+            // SQL:2023 NULLS FIRST/LAST
+            let nulls_first = if matches!(self.current(), Token::Nulls) {
                 self.advance();
-                Some(true)
-            } else if matches!(self.current(), Token::Last) {
-                self.advance();
-                Some(false)
+                if matches!(self.current(), Token::First) {
+                    self.advance();
+                    Some(true)
+                } else if matches!(self.current(), Token::Last) {
+                    self.advance();
+                    Some(false)
+                } else {
+                    None
+                }
             } else {
                 None
+            };
+
+            clauses.push(OrderByClause {
+                column,
+                descending,
+                nulls_first,
+                expr: None,
+            });
+
+            if matches!(self.current(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
             }
-        } else {
-            None
-        };
-
-        clauses.push(OrderByClause { column, descending, nulls_first, expr: None });
-
-        if matches!(self.current(), Token::Comma) {
-            self.advance();
-        } else {
-            break;
         }
-    }
 
-    Ok(clauses)
-}
+        Ok(clauses)
+    }
 
     fn parse_expr(&mut self) -> Result<SqlExpr, ApexError> {
         self.parse_or()
@@ -3037,19 +3956,28 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                         1.0f32
                     };
                     let v = match self.current().clone() {
-                        Token::FloatLit(f) => { self.advance(); f as f32 }
-                        Token::IntLit(n)   => { self.advance(); n as f32 }
-                        other => return Err(ApexError::QueryParseError(format!(
-                            "Expected number in array literal, got {:?}", other
-                        ))),
+                        Token::FloatLit(f) => {
+                            self.advance();
+                            f as f32
+                        }
+                        Token::IntLit(n) => {
+                            self.advance();
+                            n as f32
+                        }
+                        other => {
+                            return Err(ApexError::QueryParseError(format!(
+                                "Expected number in array literal, got {:?}",
+                                other
+                            )))
+                        }
                     };
                     floats.push(sign * v);
-                    if matches!(self.current(), Token::Comma) { self.advance(); }
+                    if matches!(self.current(), Token::Comma) {
+                        self.advance();
+                    }
                 }
                 self.expect(Token::RBracket)?;
-                let bytes: Vec<u8> = floats.iter()
-                    .flat_map(|f| f.to_le_bytes())
-                    .collect();
+                let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
                 Ok(Value::Binary(bytes))
             }
             other => Err(ApexError::QueryParseError(format!(
@@ -3069,26 +3997,46 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
             self.expect(Token::Comma)?;
             let query = match self.parse_expr()? {
                 SqlExpr::ArrayLiteral(v) => v,
-                _ => return Err(ApexError::QueryParseError(
-                    "topk_distance: second argument must be an array literal [f1, f2, ...]".to_string(),
-                )),
+                _ => {
+                    return Err(ApexError::QueryParseError(
+                        "topk_distance: second argument must be an array literal [f1, f2, ...]"
+                            .to_string(),
+                    ))
+                }
             };
             self.expect(Token::Comma)?;
             let k = match self.current().clone() {
-                Token::IntLit(n) => { self.advance(); n as usize }
-                other => return Err(ApexError::QueryParseError(
-                    format!("topk_distance: third argument must be integer k, got {:?}", other),
-                )),
+                Token::IntLit(n) => {
+                    self.advance();
+                    n as usize
+                }
+                other => {
+                    return Err(ApexError::QueryParseError(format!(
+                        "topk_distance: third argument must be integer k, got {:?}",
+                        other
+                    )))
+                }
             };
             self.expect(Token::Comma)?;
             let metric = match self.current().clone() {
-                Token::StringLit(s) => { self.advance(); s }
-                other => return Err(ApexError::QueryParseError(
-                    format!("topk_distance: fourth argument must be a metric string, got {:?}", other),
-                )),
+                Token::StringLit(s) => {
+                    self.advance();
+                    s
+                }
+                other => {
+                    return Err(ApexError::QueryParseError(format!(
+                        "topk_distance: fourth argument must be a metric string, got {:?}",
+                        other
+                    )))
+                }
             };
             self.expect(Token::RParen)?;
-            return Ok(SqlExpr::TopkDistance { col, query, k, metric });
+            return Ok(SqlExpr::TopkDistance {
+                col,
+                query,
+                k,
+                metric,
+            });
         }
 
         // explode_rename(topk_expr, "name1", "name2", ...)
@@ -3098,10 +4046,16 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
             while matches!(self.current(), Token::Comma) {
                 self.advance();
                 match self.current().clone() {
-                    Token::StringLit(s) => { self.advance(); names.push(s); }
-                    other => return Err(ApexError::QueryParseError(
-                        format!("explode_rename: column names must be string literals, got {:?}", other),
-                    )),
+                    Token::StringLit(s) => {
+                        self.advance();
+                        names.push(s);
+                    }
+                    other => {
+                        return Err(ApexError::QueryParseError(format!(
+                            "explode_rename: column names must be string literals, got {:?}",
+                            other
+                        )))
+                    }
                 }
             }
             if names.len() < 2 {
@@ -3110,7 +4064,10 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                 ));
             }
             self.expect(Token::RParen)?;
-            return Ok(SqlExpr::ExplodeRename { inner: Box::new(inner), names });
+            return Ok(SqlExpr::ExplodeRename {
+                inner: Box::new(inner),
+                names,
+            });
         }
 
         let mut args = Vec::new();
@@ -3135,12 +4092,12 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
         }
         self.expect(Token::RParen)?;
         let mut result = SqlExpr::Function { name, args };
-        
+
         // Check for array indexing: func(...)[index]
         result = self.parse_array_index(result)?;
         Ok(result)
     }
-    
+
     /// Parse array index suffix: expr[index]
     fn parse_array_index(&mut self, mut expr: SqlExpr) -> Result<SqlExpr, ApexError> {
         while matches!(self.current(), Token::LBracket) {
@@ -3201,7 +4158,9 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
         }
 
         if matches!(self.current(), Token::Like) {
-            let column = left_col.ok_or_else(|| ApexError::QueryParseError("LIKE requires column on left side".to_string()))?;
+            let column = left_col.ok_or_else(|| {
+                ApexError::QueryParseError("LIKE requires column on left side".to_string())
+            })?;
             self.advance();
             let pattern = match self.current().clone() {
                 Token::StringLit(s) => {
@@ -3213,13 +4172,23 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                     self.advance();
                     s
                 }
-                _ => return Err(ApexError::QueryParseError("LIKE pattern must be a string literal".to_string())),
+                _ => {
+                    return Err(ApexError::QueryParseError(
+                        "LIKE pattern must be a string literal".to_string(),
+                    ))
+                }
             };
-            return Ok(SqlExpr::Like { column, pattern, negated });
+            return Ok(SqlExpr::Like {
+                column,
+                pattern,
+                negated,
+            });
         }
 
         if matches!(self.current(), Token::Regexp) {
-            let column = left_col.ok_or_else(|| ApexError::QueryParseError("REGEXP requires column on left side".to_string()))?;
+            let column = left_col.ok_or_else(|| {
+                ApexError::QueryParseError("REGEXP requires column on left side".to_string())
+            })?;
             self.advance();
             let pattern = match self.current().clone() {
                 Token::StringLit(s) => {
@@ -3231,13 +4200,23 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                     self.advance();
                     s
                 }
-                _ => return Err(ApexError::QueryParseError("REGEXP pattern must be a string literal".to_string())),
+                _ => {
+                    return Err(ApexError::QueryParseError(
+                        "REGEXP pattern must be a string literal".to_string(),
+                    ))
+                }
             };
-            return Ok(SqlExpr::Regexp { column, pattern, negated });
+            return Ok(SqlExpr::Regexp {
+                column,
+                pattern,
+                negated,
+            });
         }
 
         if matches!(self.current(), Token::In) {
-            let column = left_col.ok_or_else(|| ApexError::QueryParseError("IN requires column on left side".to_string()))?;
+            let column = left_col.ok_or_else(|| {
+                ApexError::QueryParseError("IN requires column on left side".to_string())
+            })?;
             self.advance();
             self.expect(Token::LParen)?;
             if matches!(self.current(), Token::Select) {
@@ -3252,7 +4231,12 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
             let mut values = Vec::new();
             loop {
                 match self.current() {
-                    Token::StringLit(_) | Token::IntLit(_) | Token::FloatLit(_) | Token::True | Token::False | Token::Null => {
+                    Token::StringLit(_)
+                    | Token::IntLit(_)
+                    | Token::FloatLit(_)
+                    | Token::True
+                    | Token::False
+                    | Token::Null => {
                         values.push(self.parse_literal_value()?);
                     }
                     _ => break,
@@ -3264,20 +4248,33 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                 }
             }
             self.expect(Token::RParen)?;
-            return Ok(SqlExpr::In { column, values, negated });
+            return Ok(SqlExpr::In {
+                column,
+                values,
+                negated,
+            });
         }
 
         if matches!(self.current(), Token::Between) {
-            let column = left_col.ok_or_else(|| ApexError::QueryParseError("BETWEEN requires column on left side".to_string()))?;
+            let column = left_col.ok_or_else(|| {
+                ApexError::QueryParseError("BETWEEN requires column on left side".to_string())
+            })?;
             self.advance();
             let low = Box::new(self.parse_add_sub()?);
             self.expect(Token::And)?;
             let high = Box::new(self.parse_add_sub()?);
-            return Ok(SqlExpr::Between { column, low, high, negated });
+            return Ok(SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated,
+            });
         }
 
         if matches!(self.current(), Token::Is) {
-            let column = left_col.ok_or_else(|| ApexError::QueryParseError("IS NULL requires column on left side".to_string()))?;
+            let column = left_col.ok_or_else(|| {
+                ApexError::QueryParseError("IS NULL requires column on left side".to_string())
+            })?;
             self.advance();
             let negated = if matches!(self.current(), Token::Not) {
                 self.advance();
@@ -3373,7 +4370,9 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                 if matches!(self.current(), Token::Select) {
                     let sub = self.parse_select_internal(true)?;
                     self.expect(Token::RParen)?;
-                    Ok(SqlExpr::ScalarSubquery { stmt: Box::new(sub) })
+                    Ok(SqlExpr::ScalarSubquery {
+                        stmt: Box::new(sub),
+                    })
                 } else {
                     let expr = self.parse_expr()?;
                     self.expect(Token::RParen)?;
@@ -3452,7 +4451,10 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
 
                 self.expect(Token::End)?;
 
-                Ok(SqlExpr::Case { when_then, else_expr })
+                Ok(SqlExpr::Case {
+                    when_then,
+                    else_expr,
+                })
             }
             Token::StringLit(s) => {
                 self.advance();
@@ -3490,11 +4492,20 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                         false
                     };
                     let v = match self.current().clone() {
-                        Token::FloatLit(f) => { self.advance(); f }
-                        Token::IntLit(n) => { self.advance(); n as f64 }
-                        other => return Err(ApexError::QueryParseError(
-                            format!("Array literal must contain numbers, got {:?}", other)
-                        )),
+                        Token::FloatLit(f) => {
+                            self.advance();
+                            f
+                        }
+                        Token::IntLit(n) => {
+                            self.advance();
+                            n as f64
+                        }
+                        other => {
+                            return Err(ApexError::QueryParseError(format!(
+                                "Array literal must contain numbers, got {:?}",
+                                other
+                            )))
+                        }
                     };
                     values.push(if neg { -v } else { v });
                     if matches!(self.current(), Token::Comma) {
@@ -3514,10 +4525,16 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                         let fuzzy = upper == "FUZZY_MATCH";
                         self.advance(); // consume '('
                         let query = match self.current().clone() {
-                            Token::StringLit(s) => { self.advance(); s }
-                            other => return Err(ApexError::QueryParseError(
-                                format!("MATCH() requires a string literal, got {:?}", other)
-                            )),
+                            Token::StringLit(s) => {
+                                self.advance();
+                                s
+                            }
+                            other => {
+                                return Err(ApexError::QueryParseError(format!(
+                                    "MATCH() requires a string literal, got {:?}",
+                                    other
+                                )))
+                            }
                         };
                         self.expect(Token::RParen)?;
                         return Ok(SqlExpr::FtsMatch { query, fuzzy });
@@ -3533,7 +4550,9 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                         full.push('.');
                         full.push_str(&n);
                     } else {
-                        return Err(ApexError::QueryParseError("Expected identifier after '.'".to_string()));
+                        return Err(ApexError::QueryParseError(
+                            "Expected identifier after '.'".to_string(),
+                        ));
                     }
                 }
 
@@ -3564,9 +4583,10 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                 self.advance();
                 self.parse_function_call_from_name("max".to_string())
             }
-            _ => Err(ApexError::QueryParseError(
-                format!("Unexpected token in expression: {:?}", self.current())
-            )),
+            _ => Err(ApexError::QueryParseError(format!(
+                "Unexpected token in expression: {:?}",
+                self.current()
+            ))),
         }
     }
 
@@ -3625,20 +4645,24 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
     /// Supports: name TYPE [NOT NULL] [PRIMARY KEY] [UNIQUE] [DEFAULT value]
     fn parse_column_defs(&mut self) -> Result<Vec<ColumnDef>, ApexError> {
         let mut columns = Vec::new();
-        
+
         loop {
             let name = self.parse_identifier()?;
             let data_type = self.parse_data_type()?;
             let constraints = self.parse_column_constraints()?;
-            columns.push(ColumnDef { name, data_type, constraints });
-            
+            columns.push(ColumnDef {
+                name,
+                data_type,
+                constraints,
+            });
+
             if matches!(self.current(), Token::Comma) {
                 self.advance();
             } else {
                 break;
             }
         }
-        
+
         Ok(columns)
     }
 
@@ -3663,7 +4687,8 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                 Token::Identifier(s) if s.to_uppercase() == "PRIMARY" => {
                     self.advance();
                     // PRIMARY KEY
-                    if matches!(self.current(), Token::Identifier(ref k) if k.to_uppercase() == "KEY") {
+                    if matches!(self.current(), Token::Identifier(ref k) if k.to_uppercase() == "KEY")
+                    {
                         self.advance();
                         constraints.push(ColumnConstraintKind::PrimaryKey);
                         // PK implies NOT NULL
@@ -3672,7 +4697,9 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                         }
                     } else {
                         let (start, _) = self.current_span();
-                        return Err(self.syntax_error(start, "Expected KEY after PRIMARY".to_string()));
+                        return Err(
+                            self.syntax_error(start, "Expected KEY after PRIMARY".to_string())
+                        );
                     }
                 }
                 Token::Unique => {
@@ -3684,7 +4711,9 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                     // CHECK ( expression ) — capture raw SQL text between parens
                     if !matches!(self.current(), Token::LParen) {
                         let (start, _) = self.current_span();
-                        return Err(self.syntax_error(start, "Expected '(' after CHECK".to_string()));
+                        return Err(
+                            self.syntax_error(start, "Expected '(' after CHECK".to_string())
+                        );
                     }
                     let (paren_start, _) = self.current_span();
                     self.advance(); // consume '('
@@ -3693,21 +4722,35 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                     let mut depth = 1u32;
                     while depth > 0 {
                         match self.current() {
-                            Token::LParen => { depth += 1; self.advance(); }
+                            Token::LParen => {
+                                depth += 1;
+                                self.advance();
+                            }
                             Token::RParen => {
                                 depth -= 1;
-                                if depth > 0 { self.advance(); }
+                                if depth > 0 {
+                                    self.advance();
+                                }
                             }
                             Token::Eof => {
-                                return Err(self.syntax_error(paren_start, "Unclosed CHECK expression".to_string()));
+                                return Err(self.syntax_error(
+                                    paren_start,
+                                    "Unclosed CHECK expression".to_string(),
+                                ));
                             }
-                            _ => { self.advance(); }
+                            _ => {
+                                self.advance();
+                            }
                         }
                     }
                     let (expr_end, _) = self.current_span();
                     // Extract the SQL text between '(' and ')' from sql_chars
                     self.ensure_chars();
-                    let check_sql: String = self.sql_chars.as_ref().unwrap()[expr_start..expr_end].iter().collect::<String>().trim().to_string();
+                    let check_sql: String = self.sql_chars.as_ref().unwrap()[expr_start..expr_end]
+                        .iter()
+                        .collect::<String>()
+                        .trim()
+                        .to_string();
                     self.advance(); // consume final ')'
                     constraints.push(ColumnConstraintKind::Check(check_sql));
                 }
@@ -3717,35 +4760,68 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                     let ref_table = self.parse_identifier()?;
                     if !matches!(self.current(), Token::LParen) {
                         let (start, _) = self.current_span();
-                        return Err(self.syntax_error(start, "Expected '(' after REFERENCES table".to_string()));
+                        return Err(self.syntax_error(
+                            start,
+                            "Expected '(' after REFERENCES table".to_string(),
+                        ));
                     }
                     self.advance(); // consume '('
                     let ref_column = self.parse_identifier()?;
                     if !matches!(self.current(), Token::RParen) {
                         let (start, _) = self.current_span();
-                        return Err(self.syntax_error(start, "Expected ')' after REFERENCES column".to_string()));
+                        return Err(self.syntax_error(
+                            start,
+                            "Expected ')' after REFERENCES column".to_string(),
+                        ));
                     }
                     self.advance(); // consume ')'
-                    constraints.push(ColumnConstraintKind::ForeignKey { ref_table, ref_column });
+                    constraints.push(ColumnConstraintKind::ForeignKey {
+                        ref_table,
+                        ref_column,
+                    });
                 }
                 Token::Identifier(s) if s.to_uppercase() == "DEFAULT" => {
                     self.advance();
                     // Parse default value (literal)
                     let val = match self.current().clone() {
-                        Token::IntLit(n) => { self.advance(); Value::Int64(n) }
-                        Token::FloatLit(f) => { self.advance(); Value::Float64(f) }
-                        Token::StringLit(s) => { self.advance(); Value::String(s) }
-                        Token::True => { self.advance(); Value::Bool(true) }
-                        Token::False => { self.advance(); Value::Bool(false) }
-                        Token::Null => { self.advance(); Value::Null }
+                        Token::IntLit(n) => {
+                            self.advance();
+                            Value::Int64(n)
+                        }
+                        Token::FloatLit(f) => {
+                            self.advance();
+                            Value::Float64(f)
+                        }
+                        Token::StringLit(s) => {
+                            self.advance();
+                            Value::String(s)
+                        }
+                        Token::True => {
+                            self.advance();
+                            Value::Bool(true)
+                        }
+                        Token::False => {
+                            self.advance();
+                            Value::Bool(false)
+                        }
+                        Token::Null => {
+                            self.advance();
+                            Value::Null
+                        }
                         _ => {
                             let (start, _) = self.current_span();
-                            return Err(self.syntax_error(start, "Expected literal value after DEFAULT".to_string()));
+                            return Err(self.syntax_error(
+                                start,
+                                "Expected literal value after DEFAULT".to_string(),
+                            ));
                         }
                     };
                     constraints.push(ColumnConstraintKind::Default(val));
                 }
-                Token::Identifier(s) if s.to_uppercase() == "AUTOINCREMENT" || s.to_uppercase() == "AUTO_INCREMENT" => {
+                Token::Identifier(s)
+                    if s.to_uppercase() == "AUTOINCREMENT"
+                        || s.to_uppercase() == "AUTO_INCREMENT" =>
+                {
                     self.advance();
                     constraints.push(ColumnConstraintKind::Autoincrement);
                 }
@@ -3771,12 +4847,16 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                         // Skip optional (precision, scale) parameters
                         if matches!(self.current(), Token::LParen) {
                             self.advance(); // skip '('
-                            // precision
-                            if matches!(self.current(), Token::IntLit(_)) { self.advance(); }
+                                            // precision
+                            if matches!(self.current(), Token::IntLit(_)) {
+                                self.advance();
+                            }
                             // optional comma + scale
                             if matches!(self.current(), Token::Comma) {
                                 self.advance();
-                                if matches!(self.current(), Token::IntLit(_)) { self.advance(); }
+                                if matches!(self.current(), Token::IntLit(_)) {
+                                    self.advance();
+                                }
                             }
                             self.expect(Token::RParen)?;
                         }
@@ -3784,7 +4864,9 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
                     }
                     "TIMESTAMP" | "DATETIME" => Ok(DataType::Timestamp),
                     "DATE" => Ok(DataType::Date),
-                    "FLOAT16_VECTOR" | "FLOAT16VECTOR" | "F16_VECTOR" => Ok(DataType::Float16Vector),
+                    "FLOAT16_VECTOR" | "FLOAT16VECTOR" | "F16_VECTOR" => {
+                        Ok(DataType::Float16Vector)
+                    }
                     "FLOAT_VECTOR" | "FLOATVECTOR" | "VECTOR" => Ok(DataType::Binary),
                     _ => {
                         let (start, _) = self.current_span();
@@ -3842,72 +4924,71 @@ fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ApexError> {
     /// Parse comma-separated list of identifiers
     fn parse_identifier_list(&mut self) -> Result<Vec<String>, ApexError> {
         let mut list = Vec::new();
-        
+
         loop {
             list.push(self.parse_identifier()?);
-            
+
             if matches!(self.current(), Token::Comma) {
                 self.advance();
             } else {
                 break;
             }
         }
-        
+
         Ok(list)
     }
 
     /// Parse VALUES clause for INSERT
     fn parse_values_list(&mut self) -> Result<Vec<Vec<Value>>, ApexError> {
         let mut rows = Vec::new();
-        
+
         loop {
             self.expect(Token::LParen)?;
             let mut row = Vec::new();
-            
+
             loop {
                 let value = self.parse_literal_value()?;
                 row.push(value);
-                
+
                 if matches!(self.current(), Token::Comma) {
                     self.advance();
                 } else {
                     break;
                 }
             }
-            
+
             self.expect(Token::RParen)?;
             rows.push(row);
-            
+
             if matches!(self.current(), Token::Comma) {
                 self.advance();
             } else {
                 break;
             }
         }
-        
+
         Ok(rows)
     }
 
     /// Parse SET clause for UPDATE (column = value pairs)
     fn parse_assignments(&mut self) -> Result<Vec<(String, SqlExpr)>, ApexError> {
         let mut assignments = Vec::new();
-        
+
         loop {
             let column = self.parse_identifier()?;
             self.expect(Token::Eq)?;
             let value = self.parse_expr()?;
             assignments.push((column, value));
-            
+
             if matches!(self.current(), Token::Comma) {
                 self.advance();
             } else {
                 break;
             }
         }
-        
+
         Ok(assignments)
     }
-
 }
 
 #[cfg(test)]
@@ -4023,7 +5104,12 @@ mod tests {
         let err = SqlParser::parse(sql).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Syntax error"));
-        assert!(msg.contains("did you mean FROM") || msg.contains("did you mean WHERE") || msg.contains("did you mean LIKE") || msg.contains("did you mean LIMIT"));
+        assert!(
+            msg.contains("did you mean FROM")
+                || msg.contains("did you mean WHERE")
+                || msg.contains("did you mean LIKE")
+                || msg.contains("did you mean LIMIT")
+        );
     }
 
     #[test]
@@ -4059,7 +5145,13 @@ mod tests {
     fn test_cte_without_column_aliases() {
         let sql = "WITH cte AS (SELECT 1) SELECT * FROM cte";
         let stmt = SqlParser::parse(sql).unwrap();
-        if let SqlStatement::Cte { name, column_aliases, recursive, .. } = stmt {
+        if let SqlStatement::Cte {
+            name,
+            column_aliases,
+            recursive,
+            ..
+        } = stmt
+        {
             assert_eq!(name, "cte");
             assert!(column_aliases.is_empty());
             assert!(!recursive);
@@ -4072,7 +5164,12 @@ mod tests {
     fn test_cte_with_single_column_alias() {
         let sql = "WITH cte(x) AS (SELECT 1) SELECT x FROM cte";
         let stmt = SqlParser::parse(sql).unwrap();
-        if let SqlStatement::Cte { name, column_aliases, .. } = stmt {
+        if let SqlStatement::Cte {
+            name,
+            column_aliases,
+            ..
+        } = stmt
+        {
             assert_eq!(name, "cte");
             assert_eq!(column_aliases, vec!["x"]);
         } else {
@@ -4084,7 +5181,13 @@ mod tests {
     fn test_cte_with_multiple_column_aliases() {
         let sql = "WITH RECURSIVE fact(n, val) AS (SELECT 1, 1 UNION ALL SELECT n+1, val*(n+1) FROM fact WHERE n < 5) SELECT n, val FROM fact";
         let stmt = SqlParser::parse(sql).unwrap();
-        if let SqlStatement::Cte { name, column_aliases, recursive, .. } = stmt {
+        if let SqlStatement::Cte {
+            name,
+            column_aliases,
+            recursive,
+            ..
+        } = stmt
+        {
             assert_eq!(name, "fact");
             assert_eq!(column_aliases, vec!["n", "val"]);
             assert!(recursive);
@@ -4097,7 +5200,12 @@ mod tests {
     fn test_cte_recursive_three_columns() {
         let sql = "WITH RECURSIVE fib(n, a, b) AS (SELECT 1, 0, 1 UNION ALL SELECT n+1, b, a+b FROM fib WHERE n < 10) SELECT n, b FROM fib";
         let stmt = SqlParser::parse(sql).unwrap();
-        if let SqlStatement::Cte { column_aliases, recursive, .. } = stmt {
+        if let SqlStatement::Cte {
+            column_aliases,
+            recursive,
+            ..
+        } = stmt
+        {
             assert_eq!(column_aliases, vec!["n", "a", "b"]);
             assert!(recursive);
         } else {
@@ -4113,7 +5221,10 @@ mod tests {
         let stmt = SqlParser::parse(sql).unwrap();
         if let SqlStatement::CreateTable { columns, .. } = stmt {
             assert_eq!(columns.len(), 1);
-            let has_check = columns[0].constraints.iter().any(|c| matches!(c, ColumnConstraintKind::Check(_)));
+            let has_check = columns[0]
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraintKind::Check(_)));
             assert!(has_check, "CHECK constraint not parsed");
         } else {
             panic!("Expected CreateTable");
@@ -4126,7 +5237,11 @@ mod tests {
         let stmt = SqlParser::parse(sql).unwrap();
         if let SqlStatement::CreateTable { columns, .. } = stmt {
             let check = columns[0].constraints.iter().find_map(|c| {
-                if let ColumnConstraintKind::Check(s) = c { Some(s.clone()) } else { None }
+                if let ColumnConstraintKind::Check(s) = c {
+                    Some(s.clone())
+                } else {
+                    None
+                }
             });
             assert!(check.is_some());
             let expr = check.unwrap();
@@ -4145,9 +5260,15 @@ mod tests {
         if let SqlStatement::CreateTable { columns, .. } = stmt {
             assert_eq!(columns.len(), 2);
             let fk = columns[1].constraints.iter().find_map(|c| {
-                if let ColumnConstraintKind::ForeignKey { ref_table, ref_column } = c {
+                if let ColumnConstraintKind::ForeignKey {
+                    ref_table,
+                    ref_column,
+                } = c
+                {
                     Some((ref_table.clone(), ref_column.clone()))
-                } else { None }
+                } else {
+                    None
+                }
             });
             assert_eq!(fk, Some(("parent".to_string(), "id".to_string())));
         } else {
@@ -4161,10 +5282,19 @@ mod tests {
         let stmt = SqlParser::parse(sql).unwrap();
         if let SqlStatement::CreateTable { columns, .. } = stmt {
             assert_eq!(columns.len(), 2);
-            let has_pk = columns[0].constraints.iter().any(|c| matches!(c, ColumnConstraintKind::PrimaryKey));
+            let has_pk = columns[0]
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraintKind::PrimaryKey));
             assert!(has_pk);
-            let has_check = columns[1].constraints.iter().any(|c| matches!(c, ColumnConstraintKind::Check(_)));
-            let has_fk = columns[1].constraints.iter().any(|c| matches!(c, ColumnConstraintKind::ForeignKey { .. }));
+            let has_check = columns[1]
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraintKind::Check(_)));
+            let has_fk = columns[1]
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraintKind::ForeignKey { .. }));
             assert!(has_check);
             assert!(has_fk);
         } else {

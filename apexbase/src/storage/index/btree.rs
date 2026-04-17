@@ -73,10 +73,18 @@ impl Ord for IndexKey {
             (IndexKey::Int(a), IndexKey::Int(b)) => a.cmp(b),
             (IndexKey::UInt(a), IndexKey::UInt(b)) => a.cmp(b),
             (IndexKey::Int(a), IndexKey::UInt(b)) => {
-                if *a < 0 { Ordering::Less } else { (*a as u64).cmp(b) }
+                if *a < 0 {
+                    Ordering::Less
+                } else {
+                    (*a as u64).cmp(b)
+                }
             }
             (IndexKey::UInt(a), IndexKey::Int(b)) => {
-                if *b < 0 { Ordering::Greater } else { a.cmp(&(*b as u64)) }
+                if *b < 0 {
+                    Ordering::Greater
+                } else {
+                    a.cmp(&(*b as u64))
+                }
             }
             (IndexKey::Float(a), IndexKey::Float(b)) => {
                 let fa = f64::from_bits(*a);

@@ -11,14 +11,11 @@
 
 use crate::data::{DataType, Value};
 use crate::table::column_table::BitVec;
-use arrow::array::{
-    ArrayRef, BooleanBuilder, Float64Builder,
-    GenericByteBuilder, Int64Builder,
-};
+use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, GenericByteBuilder, Int64Builder};
 use arrow::array::{DictionaryArray, Int32Array, StringArray};
+use arrow::buffer::{Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::GenericStringType;
 use arrow::datatypes::Int32Type;
-use arrow::buffer::{Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -149,7 +146,7 @@ impl CowBytes {
 }
 
 /// Arrow-native string column using contiguous buffer storage
-/// 
+///
 /// Memory layout:
 /// - offsets: Vec<i32> - 4 bytes per row (start offset into data buffer)
 /// - data: Vec<u8> - contiguous string bytes
@@ -302,7 +299,9 @@ impl ArrowStringColumn {
                 let id_usize = id as usize;
                 let start = self.dict_offsets[id_usize] as usize;
                 let end = self.dict_offsets[id_usize + 1] as usize;
-                let existing = unsafe { std::str::from_utf8_unchecked(&self.dict_data.as_slice()[start..end]) };
+                let existing = unsafe {
+                    std::str::from_utf8_unchecked(&self.dict_data.as_slice()[start..end])
+                };
                 if existing == value {
                     return id;
                 }
@@ -396,7 +395,9 @@ impl ArrowStringColumn {
             }
             let start = self.dict_offsets[key] as usize;
             let end = self.dict_offsets[key + 1] as usize;
-            return Some(unsafe { std::str::from_utf8_unchecked(&self.dict_data.as_slice()[start..end]) });
+            return Some(unsafe {
+                std::str::from_utf8_unchecked(&self.dict_data.as_slice()[start..end])
+            });
         }
         let start = self.offsets[index] as usize;
         let end = self.offsets[index + 1] as usize;
@@ -455,29 +456,31 @@ impl ArrowStringColumn {
             self.nulls.set(index, false);
             return;
         }
-        
+
         let old_start = self.offsets[index] as usize;
         let old_end = self.offsets[index + 1] as usize;
         let old_len = old_end - old_start;
         let new_len = value.len();
-        
+
         if new_len == old_len {
             // Same length - in-place update
             // For simplicity and safety across Mutable/Frozen, rebuild this small range
-            self.data.replace_range(old_start, old_end, value.as_bytes());
+            self.data
+                .replace_range(old_start, old_end, value.as_bytes());
         } else {
             // Different length - need to rebuild (expensive but rare)
             let len_diff = new_len as i32 - old_len as i32;
-            
+
             // Update data buffer
-            self.data.replace_range(old_start, old_end, value.as_bytes());
-            
+            self.data
+                .replace_range(old_start, old_end, value.as_bytes());
+
             // Update all subsequent offsets
             for i in (index + 1)..=self.len {
                 self.offsets[i] = (self.offsets[i] as i32 + len_diff) as i32;
             }
         }
-        
+
         self.nulls.set(index, false);
     }
 
@@ -506,20 +509,22 @@ impl ArrowStringColumn {
             out.rebuild_dict_index();
             return out;
         }
-        
+
         let data_start = self.offsets[start] as usize;
         let data_end = self.offsets[end] as usize;
-        
+
         let mut new_offsets = Vec::with_capacity(end - start + 1);
         new_offsets.push(0);
         for i in start..end {
             let len = self.offsets[i + 1] - self.offsets[i];
             new_offsets.push(new_offsets.last().unwrap() + len);
         }
-        
+
         Self {
             offsets: new_offsets,
-            data: CowBytes::Frozen(Buffer::from(self.data.as_slice()[data_start..data_end].to_vec())),
+            data: CowBytes::Frozen(Buffer::from(
+                self.data.as_slice()[data_start..data_end].to_vec(),
+            )),
             dict_keys: Vec::new(),
             dict_offsets: vec![0],
             dict_data: CowBytes::new_mutable(),
@@ -550,18 +555,18 @@ impl ArrowStringColumn {
             return;
         }
         let base_offset = *self.offsets.last().unwrap_or(&0);
-        
+
         // Append offsets (skip first which is 0)
         for i in 1..=other.len {
             self.offsets.push(base_offset + other.offsets[i]);
         }
-        
+
         // Append data
         self.data.push_bytes(other.data.as_slice());
-        
+
         // Append nulls
         self.nulls.extend(&other.nulls);
-        
+
         self.len += other.len;
     }
 
@@ -575,7 +580,10 @@ impl ArrowStringColumn {
             }
 
             // Fallback: build Utf8 array (should be rare)
-            let mut builder = GenericByteBuilder::<GenericStringType<i32>>::with_capacity(self.len, self.len * 32);
+            let mut builder = GenericByteBuilder::<GenericStringType<i32>>::with_capacity(
+                self.len,
+                self.len * 32,
+            );
             for i in 0..self.len {
                 if self.nulls.get(i) {
                     builder.append_null();
@@ -594,7 +602,11 @@ impl ArrowStringColumn {
         let valid = if self.nulls.all_false() {
             None
         } else {
-            Some((0..self.len).map(|i| !self.nulls.get(i)).collect::<Vec<bool>>())
+            Some(
+                (0..self.len)
+                    .map(|i| !self.nulls.get(i))
+                    .collect::<Vec<bool>>(),
+            )
         };
 
         Self::build_utf8_array_from_buffers(offsets, value_buf, valid)
@@ -617,13 +629,17 @@ impl ArrowStringColumn {
                 }
             }
 
-            let key_array = Int32Array::new(ScalarBuffer::from(keys), Some(NullBuffer::from(valid)));
+            let key_array =
+                Int32Array::new(ScalarBuffer::from(keys), Some(NullBuffer::from(valid)));
             if let Ok(dict) = DictionaryArray::<Int32Type>::try_new(key_array, values) {
                 return Arc::new(dict);
             }
 
             // Fallback: build Utf8 array (should be rare)
-            let mut builder = GenericByteBuilder::<GenericStringType<i32>>::with_capacity(indices.len(), indices.len() * 32);
+            let mut builder = GenericByteBuilder::<GenericStringType<i32>>::with_capacity(
+                indices.len(),
+                indices.len() * 32,
+            );
             for &idx in indices {
                 if idx >= self.len || self.nulls.get(idx) {
                     builder.append_null();
@@ -682,7 +698,11 @@ impl ArrowStringColumn {
     }
 
     #[inline]
-    fn build_utf8_array_from_buffers(offsets: Vec<i32>, values: Buffer, valid: Option<Vec<bool>>) -> ArrayRef {
+    fn build_utf8_array_from_buffers(
+        offsets: Vec<i32>,
+        values: Buffer,
+        valid: Option<Vec<bool>>,
+    ) -> ArrayRef {
         let offset_buffer = OffsetBuffer::new(offsets.into());
         let null_buf = valid.map(NullBuffer::from);
         Arc::new(unsafe { StringArray::new_unchecked(offset_buffer, values, null_buf) })
@@ -702,7 +722,12 @@ impl ArrowStringColumn {
     /// Compare memory usage with equivalent Vec<String>
     pub fn memory_savings_vs_vec_string(&self) -> (usize, usize) {
         let arrow_mem = self.memory_usage();
-        let vec_string_mem = self.len * 24 + if self.dict_enabled { self.dict_data.len() } else { self.data.len() };
+        let vec_string_mem = self.len * 24
+            + if self.dict_enabled {
+                self.dict_data.len()
+            } else {
+                self.data.len()
+            };
         (arrow_mem, vec_string_mem)
     }
 
@@ -715,9 +740,13 @@ impl ArrowStringColumn {
         for id in 0..unique {
             let start = self.dict_offsets[id] as usize;
             let end = self.dict_offsets[id + 1] as usize;
-            let s = unsafe { std::str::from_utf8_unchecked(&self.dict_data.as_slice()[start..end]) };
+            let s =
+                unsafe { std::str::from_utf8_unchecked(&self.dict_data.as_slice()[start..end]) };
             let h = Self::hash_str(s);
-            self.dict_index.entry(h).or_insert_with(Vec::new).push(id as u32);
+            self.dict_index
+                .entry(h)
+                .or_insert_with(Vec::new)
+                .push(id as u32);
         }
     }
 
@@ -795,7 +824,7 @@ impl<'de> Deserialize<'de> for ArrowStringColumn {
             #[serde(default)]
             sample_len: usize,
         }
-        
+
         let data = ArrowStringColumnData::deserialize(deserializer)?;
         let mut out = Self {
             offsets: data.offsets,
@@ -803,7 +832,11 @@ impl<'de> Deserialize<'de> for ArrowStringColumn {
             nulls: data.nulls,
             len: data.len,
             dict_keys: data.dict_keys,
-            dict_offsets: if data.dict_offsets.is_empty() { vec![0] } else { data.dict_offsets },
+            dict_offsets: if data.dict_offsets.is_empty() {
+                vec![0]
+            } else {
+                data.dict_offsets
+            },
             dict_data: CowBytes::Frozen(Buffer::from(data.dict_data)),
             dict_index: HashMap::new(),
             dict_enabled: data.dict_enabled,
@@ -844,20 +877,24 @@ impl ArrowTypedColumn {
     pub fn new(dtype: DataType) -> Self {
         match dtype {
             DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
-                ArrowTypedColumn::Int64 { data: Vec::new(), nulls: BitVec::new() }
+                ArrowTypedColumn::Int64 {
+                    data: Vec::new(),
+                    nulls: BitVec::new(),
+                }
             }
-            DataType::Float64 | DataType::Float32 => {
-                ArrowTypedColumn::Float64 { data: Vec::new(), nulls: BitVec::new() }
-            }
-            DataType::String => {
-                ArrowTypedColumn::String(ArrowStringColumn::new())
-            }
-            DataType::Bool => {
-                ArrowTypedColumn::Bool { data: BitVec::new(), nulls: BitVec::new() }
-            }
-            _ => {
-                ArrowTypedColumn::Mixed { data: Vec::new(), nulls: BitVec::new() }
-            }
+            DataType::Float64 | DataType::Float32 => ArrowTypedColumn::Float64 {
+                data: Vec::new(),
+                nulls: BitVec::new(),
+            },
+            DataType::String => ArrowTypedColumn::String(ArrowStringColumn::new()),
+            DataType::Bool => ArrowTypedColumn::Bool {
+                data: BitVec::new(),
+                nulls: BitVec::new(),
+            },
+            _ => ArrowTypedColumn::Mixed {
+                data: Vec::new(),
+                nulls: BitVec::new(),
+            },
         }
     }
 
@@ -869,27 +906,21 @@ impl ArrowTypedColumn {
                     nulls: BitVec::with_capacity(capacity),
                 }
             }
-            DataType::Float64 | DataType::Float32 => {
-                ArrowTypedColumn::Float64 {
-                    data: Vec::with_capacity(capacity),
-                    nulls: BitVec::with_capacity(capacity),
-                }
-            }
+            DataType::Float64 | DataType::Float32 => ArrowTypedColumn::Float64 {
+                data: Vec::with_capacity(capacity),
+                nulls: BitVec::with_capacity(capacity),
+            },
             DataType::String => {
                 ArrowTypedColumn::String(ArrowStringColumn::with_capacity(capacity, 32))
             }
-            DataType::Bool => {
-                ArrowTypedColumn::Bool {
-                    data: BitVec::with_capacity(capacity),
-                    nulls: BitVec::with_capacity(capacity),
-                }
-            }
-            _ => {
-                ArrowTypedColumn::Mixed {
-                    data: Vec::with_capacity(capacity),
-                    nulls: BitVec::with_capacity(capacity),
-                }
-            }
+            DataType::Bool => ArrowTypedColumn::Bool {
+                data: BitVec::with_capacity(capacity),
+                nulls: BitVec::with_capacity(capacity),
+            },
+            _ => ArrowTypedColumn::Mixed {
+                data: Vec::with_capacity(capacity),
+                nulls: BitVec::with_capacity(capacity),
+            },
         }
     }
 
@@ -993,9 +1024,7 @@ impl ArrowTypedColumn {
                     Some(Value::Float64(data[index]))
                 }
             }
-            ArrowTypedColumn::String(col) => {
-                Some(col.get_value(index))
-            }
+            ArrowTypedColumn::String(col) => Some(col.get_value(index)),
             ArrowTypedColumn::Bool { data, nulls } => {
                 if index >= data.len() || nulls.get(index) {
                     Some(Value::Null)
@@ -1133,9 +1162,7 @@ impl ArrowTypedColumn {
                 data: data[start..end].to_vec(),
                 nulls: nulls.slice(start, end),
             },
-            ArrowTypedColumn::String(col) => {
-                ArrowTypedColumn::String(col.slice(start, end))
-            }
+            ArrowTypedColumn::String(col) => ArrowTypedColumn::String(col.slice(start, end)),
             ArrowTypedColumn::Bool { data, nulls } => ArrowTypedColumn::Bool {
                 data: data.slice(start, end),
                 nulls: nulls.slice(start, end),
@@ -1150,22 +1177,46 @@ impl ArrowTypedColumn {
     /// Append another column
     pub fn append(&mut self, other: Self) {
         match (self, other) {
-            (ArrowTypedColumn::Int64 { data, nulls }, ArrowTypedColumn::Int64 { data: od, nulls: on }) => {
+            (
+                ArrowTypedColumn::Int64 { data, nulls },
+                ArrowTypedColumn::Int64 {
+                    data: od,
+                    nulls: on,
+                },
+            ) => {
                 data.extend(od);
                 nulls.extend(&on);
             }
-            (ArrowTypedColumn::Float64 { data, nulls }, ArrowTypedColumn::Float64 { data: od, nulls: on }) => {
+            (
+                ArrowTypedColumn::Float64 { data, nulls },
+                ArrowTypedColumn::Float64 {
+                    data: od,
+                    nulls: on,
+                },
+            ) => {
                 data.extend(od);
                 nulls.extend(&on);
             }
             (ArrowTypedColumn::String(col), ArrowTypedColumn::String(other_col)) => {
                 col.append(&other_col);
             }
-            (ArrowTypedColumn::Bool { data, nulls }, ArrowTypedColumn::Bool { data: od, nulls: on }) => {
+            (
+                ArrowTypedColumn::Bool { data, nulls },
+                ArrowTypedColumn::Bool {
+                    data: od,
+                    nulls: on,
+                },
+            ) => {
                 data.extend(&od);
                 nulls.extend(&on);
             }
-            (ArrowTypedColumn::Mixed { data, nulls }, ArrowTypedColumn::Mixed { data: od, nulls: on }) => {
+            (
+                ArrowTypedColumn::Mixed { data, nulls },
+                ArrowTypedColumn::Mixed {
+                    data: od,
+                    nulls: on,
+                },
+            ) => {
                 data.extend(od);
                 nulls.extend(&on);
             }
@@ -1198,9 +1249,7 @@ impl ArrowTypedColumn {
                 }
                 Arc::new(builder.finish())
             }
-            ArrowTypedColumn::String(col) => {
-                col.to_arrow_array()
-            }
+            ArrowTypedColumn::String(col) => col.to_arrow_array(),
             ArrowTypedColumn::Bool { data, nulls } => {
                 let mut builder = BooleanBuilder::with_capacity(data.len());
                 for i in 0..data.len() {
@@ -1214,7 +1263,10 @@ impl ArrowTypedColumn {
             }
             ArrowTypedColumn::Mixed { data, nulls } => {
                 // Convert to string array
-                let mut builder = GenericByteBuilder::<GenericStringType<i32>>::with_capacity(data.len(), data.len() * 32);
+                let mut builder = GenericByteBuilder::<GenericStringType<i32>>::with_capacity(
+                    data.len(),
+                    data.len() * 32,
+                );
                 for (i, v) in data.iter().enumerate() {
                     if nulls.get(i) {
                         builder.append_null();
@@ -1230,16 +1282,12 @@ impl ArrowTypedColumn {
     /// Estimate memory usage in bytes
     pub fn memory_usage(&self) -> usize {
         match self {
-            ArrowTypedColumn::Int64 { data, nulls } => {
-                data.capacity() * 8 + (nulls.len() + 7) / 8
-            }
+            ArrowTypedColumn::Int64 { data, nulls } => data.capacity() * 8 + (nulls.len() + 7) / 8,
             ArrowTypedColumn::Float64 { data, nulls } => {
                 data.capacity() * 8 + (nulls.len() + 7) / 8
             }
             ArrowTypedColumn::String(col) => col.memory_usage(),
-            ArrowTypedColumn::Bool { data, nulls } => {
-                (data.len() + 7) / 8 + (nulls.len() + 7) / 8
-            }
+            ArrowTypedColumn::Bool { data, nulls } => (data.len() + 7) / 8 + (nulls.len() + 7) / 8,
             ArrowTypedColumn::Mixed { data, nulls } => {
                 // Rough estimate: 64 bytes per Value on average
                 data.capacity() * 64 + (nulls.len() + 7) / 8
@@ -1274,10 +1322,14 @@ mod tests {
         for i in 0..10000 {
             col.push(&format!("test string number {}", i));
         }
-        
+
         let (arrow_mem, vec_mem) = col.memory_savings_vs_vec_string();
         assert!(arrow_mem < vec_mem, "Arrow should use less memory");
-        println!("Arrow: {} bytes, Vec<String>: {} bytes, Savings: {:.1}%", 
-            arrow_mem, vec_mem, (1.0 - arrow_mem as f64 / vec_mem as f64) * 100.0);
+        println!(
+            "Arrow: {} bytes, Vec<String>: {} bytes, Savings: {:.1}%",
+            arrow_mem,
+            vec_mem,
+            (1.0 - arrow_mem as f64 / vec_mem as f64) * 100.0
+        );
     }
 }

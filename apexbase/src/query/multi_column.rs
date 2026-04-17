@@ -3,16 +3,18 @@
 //! This module extends the vectorized execution to support multi-column GROUP BY
 //! with efficient hash aggregation and parallel processing.
 
-use arrow::array::{Array, ArrayRef, Int64Array, Float64Array, StringArray, BooleanArray, DictionaryArray};
+use ahash::{AHashMap, AHashSet, AHasher};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int64Array, StringArray,
+};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, UInt32Type};
 use arrow::record_batch::RecordBatch;
-use ahash::{AHashMap, AHasher, AHashSet};
+use rayon::prelude::*;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::sync::Arc;
-use rayon::prelude::*;
 
-use crate::query::vectorized::{GroupHash, AggregateState, VECTOR_SIZE};
+use crate::query::vectorized::{AggregateState, GroupHash, VECTOR_SIZE};
 
 /// Typed column reference for multi-column grouping
 #[derive(Clone, Copy)]
@@ -132,21 +134,27 @@ impl MultiColumnHashAgg {
     #[inline(always)]
     pub fn update_int(&mut self, group_id: u32, val: i64) {
         unsafe {
-            self.states.get_unchecked_mut(group_id as usize).update_int(val);
+            self.states
+                .get_unchecked_mut(group_id as usize)
+                .update_int(val);
         }
     }
 
     #[inline(always)]
     pub fn update_float(&mut self, group_id: u32, val: f64) {
         unsafe {
-            self.states.get_unchecked_mut(group_id as usize).update_float(val);
+            self.states
+                .get_unchecked_mut(group_id as usize)
+                .update_float(val);
         }
     }
 
     #[inline(always)]
     pub fn update_count(&mut self, group_id: u32) {
         unsafe {
-            self.states.get_unchecked_mut(group_id as usize).update_count();
+            self.states
+                .get_unchecked_mut(group_id as usize)
+                .update_count();
         }
     }
 
@@ -210,8 +218,12 @@ pub fn execute_multi_column_group_by(
     // Extract and type group columns
     let mut typed_group_cols: Vec<TypedColumnRef<'_>> = Vec::with_capacity(group_col_names.len());
     for col_name in group_col_names {
-        let col = batch.column_by_name(col_name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("Group column '{}' not found", col_name)))?;
+        let col = batch.column_by_name(col_name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Group column '{}' not found", col_name),
+            )
+        })?;
 
         let typed_col = if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
             TypedColumnRef::Int64(arr)
@@ -226,20 +238,30 @@ pub fn execute_multi_column_group_by(
             if let Some(str_arr) = values.as_any().downcast_ref::<StringArray>() {
                 TypedColumnRef::DictString(dict_arr, str_arr)
             } else {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsupported dictionary value type"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Unsupported dictionary value type",
+                ));
             }
         } else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Unsupported group column type for column '{}'", col_name)));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Unsupported group column type for column '{}'", col_name),
+            ));
         };
         typed_group_cols.push(typed_col);
     }
 
     // Get aggregate column
     let agg_col_int: Option<&Int64Array> = agg_col_name.and_then(|name| {
-        batch.column_by_name(name).and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
     });
     let agg_col_float: Option<&Float64Array> = agg_col_name.and_then(|name| {
-        batch.column_by_name(name).and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
     });
     let count_only = agg_col_int.is_none() && agg_col_float.is_none();
 
@@ -286,7 +308,9 @@ pub fn execute_multi_column_group_by(
                     let new_group_id = final_agg.states.len() as u32;
                     final_agg.hash_table.insert(key, new_group_id);
                     final_agg.states.push(local_state.clone());
-                    final_agg.first_row_indices.push(local_agg.first_row_indices[local_group_id as usize]);
+                    final_agg
+                        .first_row_indices
+                        .push(local_agg.first_row_indices[local_group_id as usize]);
                 }
             }
         }
@@ -334,7 +358,7 @@ pub fn build_multi_column_result(
     for col_name in group_col_names {
         if let Some(src_col) = batch.column_by_name(col_name) {
             let indices_arr = arrow::array::UInt32Array::from(
-                first_indices.iter().map(|&i| i as u32).collect::<Vec<_>>()
+                first_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
             );
             let taken = arrow::compute::take(src_col.as_ref(), &indices_arr, None)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -353,7 +377,9 @@ pub fn build_multi_column_result(
             AggregateFunc::Max => "MAX",
         };
 
-        let output_name = agg_col_name.map(|c| format!("{}({})", func_name, c)).unwrap_or_else(|| format!("{}(*)", func_name));
+        let output_name = agg_col_name
+            .map(|c| format!("{}({})", func_name, c))
+            .unwrap_or_else(|| format!("{}(*)", func_name));
 
         match func {
             AggregateFunc::Count => {
@@ -363,11 +389,13 @@ pub fn build_multi_column_result(
             }
             AggregateFunc::Sum => {
                 // Determine if we should use int or float sum based on aggregate column type
-                let is_int_agg = agg_col_name.and_then(|name| {
-                    batch.column_by_name(name).map(|c| {
-                        c.as_any().downcast_ref::<Int64Array>().is_some()
+                let is_int_agg = agg_col_name
+                    .and_then(|name| {
+                        batch
+                            .column_by_name(name)
+                            .map(|c| c.as_any().downcast_ref::<Int64Array>().is_some())
                     })
-                }).unwrap_or(false);
+                    .unwrap_or(false);
 
                 if is_int_agg {
                     let sums: Vec<i64> = states.iter().map(|s| s.sum_int).collect();
@@ -380,22 +408,27 @@ pub fn build_multi_column_result(
                 }
             }
             AggregateFunc::Avg => {
-                let avgs: Vec<Option<f64>> = states.iter().map(|s| {
-                    if s.count > 0 {
-                        Some(s.sum_float / s.count as f64)
-                    } else {
-                        None
-                    }
-                }).collect();
+                let avgs: Vec<Option<f64>> = states
+                    .iter()
+                    .map(|s| {
+                        if s.count > 0 {
+                            Some(s.sum_float / s.count as f64)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 result_fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
                 result_arrays.push(Arc::new(Float64Array::from(avgs)));
             }
             AggregateFunc::Min => {
-                let is_int_agg = agg_col_name.and_then(|name| {
-                    batch.column_by_name(name).map(|c| {
-                        c.as_any().downcast_ref::<Int64Array>().is_some()
+                let is_int_agg = agg_col_name
+                    .and_then(|name| {
+                        batch
+                            .column_by_name(name)
+                            .map(|c| c.as_any().downcast_ref::<Int64Array>().is_some())
                     })
-                }).unwrap_or(false);
+                    .unwrap_or(false);
 
                 if is_int_agg {
                     let mins: Vec<Option<i64>> = states.iter().map(|s| s.min_int).collect();
@@ -408,11 +441,13 @@ pub fn build_multi_column_result(
                 }
             }
             AggregateFunc::Max => {
-                let is_int_agg = agg_col_name.and_then(|name| {
-                    batch.column_by_name(name).map(|c| {
-                        c.as_any().downcast_ref::<Int64Array>().is_some()
+                let is_int_agg = agg_col_name
+                    .and_then(|name| {
+                        batch
+                            .column_by_name(name)
+                            .map(|c| c.as_any().downcast_ref::<Int64Array>().is_some())
                     })
-                }).unwrap_or(false);
+                    .unwrap_or(false);
 
                 if is_int_agg {
                     let maxs: Vec<Option<i64>> = states.iter().map(|s| s.max_int).collect();

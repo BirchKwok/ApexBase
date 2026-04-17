@@ -93,9 +93,9 @@ impl Schema {
             return Err(ApexError::ColumnExists(name.to_string()));
         }
 
-        let col = ColumnDef::new(self.next_column_id, name, data_type)
-            .position(self.next_column_id);
-        
+        let col =
+            ColumnDef::new(self.next_column_id, name, data_type).position(self.next_column_id);
+
         self.columns.insert(name.to_string(), col);
         self.column_order.push(name.to_string());
         self.next_column_id += 1;
@@ -173,7 +173,9 @@ impl Schema {
 
     /// Iterate over columns
     pub fn columns(&self) -> impl Iterator<Item = &ColumnDef> {
-        self.column_order.iter().filter_map(|name| self.columns.get(name))
+        self.column_order
+            .iter()
+            .filter_map(|name| self.columns.get(name))
     }
 
     /// Update schema from data (add missing columns)
@@ -235,4 +237,3 @@ mod tests {
         assert!(schema.rename_column("_id", "id").is_err());
     }
 }
-

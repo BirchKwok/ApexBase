@@ -25,20 +25,20 @@ use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::Type;
 use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeResponse, DescribeStatementResponse,
     FieldFormat, FieldInfo, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
+use pgwire::api::Type;
 use pgwire::api::{ClientInfo, ClientPortalStore};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
-use crate::query::{ApexExecutor, ApexResult};
 use super::pg_catalog;
 use super::types::{schema_to_field_info, schema_to_field_info_binary};
+use crate::query::{ApexExecutor, ApexResult};
 
 /// Client metadata key for tracking current database per connection
 const METADATA_KEY_DB: &str = "apex_current_db";
@@ -93,7 +93,10 @@ impl ApexBaseHandler {
         crate::query::executor::set_query_root_dir(&self.base_dir);
         let exec_result = ApexExecutor::execute_with_base_dir(sql, &base_dir, &default_table_path);
         crate::query::executor::clear_query_root_dir();
-        exec_result.map_err(|e| e.to_string())?.to_record_batch().map_err(|e| e.to_string())
+        exec_result
+            .map_err(|e| e.to_string())?
+            .to_record_batch()
+            .map_err(|e| e.to_string())
     }
 
     /// Try to parse a USE / \c database-switching command.
@@ -101,8 +104,16 @@ impl ApexBaseHandler {
     fn try_parse_use_cmd(sql: &str) -> Option<String> {
         let trimmed = sql.trim();
         let db_name = if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("USE ") {
-            trimmed[4..].trim().trim_matches('"').trim_matches('\'').trim_matches('`')
-        } else if trimmed.starts_with("\\c ") || trimmed.starts_with("\\C ") || trimmed.starts_with("\\c\t") || trimmed.starts_with("\\C\t") {
+            trimmed[4..]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim_matches('`')
+        } else if trimmed.starts_with("\\c ")
+            || trimmed.starts_with("\\C ")
+            || trimmed.starts_with("\\c\t")
+            || trimmed.starts_with("\\C\t")
+        {
             trimmed[3..].trim()
         } else {
             return None;
@@ -110,8 +121,15 @@ impl ApexBaseHandler {
         let safe_db: String = if db_name.is_empty() || db_name.eq_ignore_ascii_case("default") {
             "default".to_string()
         } else {
-            db_name.chars()
-                .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            db_name
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
                 .collect()
         };
         Some(safe_db)
@@ -119,7 +137,8 @@ impl ApexBaseHandler {
 
     /// Read the current database from client metadata (defaults to "default").
     fn current_db_from_metadata<C: ClientInfo>(client: &mut C) -> String {
-        client.metadata()
+        client
+            .metadata()
             .get(METADATA_KEY_DB)
             .cloned()
             .unwrap_or_else(|| "default".to_string())
@@ -127,7 +146,10 @@ impl ApexBaseHandler {
 
     /// Encode a RecordBatch into a Vec of encoded DataRows.
     /// Columns are extracted once outside the row loop to avoid repeated Arc deref.
-    fn encode_batch_rows(batch: &RecordBatch, field_infos: &Arc<Vec<FieldInfo>>) -> PgWireResult<Vec<PgWireResult<pgwire::messages::data::DataRow>>> {
+    fn encode_batch_rows(
+        batch: &RecordBatch,
+        field_infos: &Arc<Vec<FieldInfo>>,
+    ) -> PgWireResult<Vec<PgWireResult<pgwire::messages::data::DataRow>>> {
         let num_rows = batch.num_rows();
         let num_cols = batch.num_columns();
         let mut rows = Vec::with_capacity(num_rows);
@@ -172,17 +194,28 @@ impl ApexBaseHandler {
     /// Check if SQL is a write/command operation (not a SELECT query)
     fn is_write_op(sql: &str) -> bool {
         let s = Self::strip_sql_comments(sql);
-        if s.is_empty() { return false; }
+        if s.is_empty() {
+            return false;
+        }
         // First-byte guard + eq_ignore_ascii_case — zero allocation
         match s.as_bytes()[0] | 0x20 {
             b'i' => s.len() >= 6 && s[..6].eq_ignore_ascii_case("INSERT"),
             b'u' => s.len() >= 6 && s[..6].eq_ignore_ascii_case("UPDATE"),
-            b'd' => (s.len() >= 6 && s[..6].eq_ignore_ascii_case("DELETE")) || (s.len() >= 4 && s[..4].eq_ignore_ascii_case("DROP")),
-            b'c' => (s.len() >= 6 && s[..6].eq_ignore_ascii_case("CREATE")) || (s.len() >= 6 && s[..6].eq_ignore_ascii_case("COMMIT")),
+            b'd' => {
+                (s.len() >= 6 && s[..6].eq_ignore_ascii_case("DELETE"))
+                    || (s.len() >= 4 && s[..4].eq_ignore_ascii_case("DROP"))
+            }
+            b'c' => {
+                (s.len() >= 6 && s[..6].eq_ignore_ascii_case("CREATE"))
+                    || (s.len() >= 6 && s[..6].eq_ignore_ascii_case("COMMIT"))
+            }
             b'a' => s.len() >= 5 && s[..5].eq_ignore_ascii_case("ALTER"),
             b't' => s.len() >= 8 && s[..8].eq_ignore_ascii_case("TRUNCATE"),
             b'b' => s.len() >= 5 && s[..5].eq_ignore_ascii_case("BEGIN"),
-            b'r' => (s.len() >= 8 && s[..8].eq_ignore_ascii_case("ROLLBACK")) || (s.len() >= 7 && s[..7].eq_ignore_ascii_case("RELEASE")),
+            b'r' => {
+                (s.len() >= 8 && s[..8].eq_ignore_ascii_case("ROLLBACK"))
+                    || (s.len() >= 7 && s[..7].eq_ignore_ascii_case("RELEASE"))
+            }
             b's' => s.len() >= 9 && s[..9].eq_ignore_ascii_case("SAVEPOINT"),
             _ => false,
         }
@@ -238,10 +271,7 @@ impl NoopStartupHandler for ApexBaseHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        log::info!(
-            "Client connected from {}",
-            client.socket_addr(),
-        );
+        log::info!("Client connected from {}", client.socket_addr(),);
         Ok(())
     }
 }
@@ -272,7 +302,9 @@ impl SimpleQueryHandler for ApexBaseHandler {
         for sql in statements {
             // Handle USE <database> / \c <database> per-connection switching
             if let Some(db_name) = Self::try_parse_use_cmd(sql) {
-                client.metadata_mut().insert(METADATA_KEY_DB.to_string(), db_name.clone());
+                client
+                    .metadata_mut()
+                    .insert(METADATA_KEY_DB.to_string(), db_name.clone());
                 log::info!("Connection switched to database: {}", db_name);
                 responses.push(Response::Execution(Tag::new("USE")));
                 continue;
@@ -285,7 +317,8 @@ impl SimpleQueryHandler for ApexBaseHandler {
                         responses.push(Response::Execution(tag));
                     } else {
                         let schema = batch.schema();
-                        let field_infos: Arc<Vec<FieldInfo>> = Arc::new(schema_to_field_info(&schema));
+                        let field_infos: Arc<Vec<FieldInfo>> =
+                            Arc::new(schema_to_field_info(&schema));
                         self.cache_schema(sql, field_infos.clone());
 
                         let rows = Self::encode_batch_rows(&batch, &field_infos)?;
@@ -360,7 +393,10 @@ impl ExtendedQueryHandler for ApexBaseHandler {
 
         // Check schema cache first — avoids executing the query a second time just for schema
         if let Some(cached) = self.cached_schema(sql) {
-            return Ok(DescribeStatementResponse::new(param_types, (*cached).clone()));
+            return Ok(DescribeStatementResponse::new(
+                param_types,
+                (*cached).clone(),
+            ));
         }
 
         // Substitute dummy NULLs for parameters to discover result schema
@@ -484,15 +520,10 @@ impl ExtendedQueryHandler for ApexBaseHandler {
                 }
             }
             Err(msg) => Err(PgWireError::UserError(Box::new(
-                pgwire::error::ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "42000".to_string(),
-                    msg,
-                ),
+                pgwire::error::ErrorInfo::new("ERROR".to_string(), "42000".to_string(), msg),
             ))),
         }
     }
-
 }
 
 // ============================================================================
@@ -575,7 +606,11 @@ fn binary_param_to_sql_literal(bytes: &Bytes, pg_type: &Type) -> PgWireResult<St
         return Ok(v.to_string());
     }
     if *pg_type == Type::BOOL && b.len() == 1 {
-        return Ok(if b[0] != 0 { "true".to_owned() } else { "false".to_owned() });
+        return Ok(if b[0] != 0 {
+            "true".to_owned()
+        } else {
+            "false".to_owned()
+        });
     }
     // Fallback: try as UTF-8 string
     match std::str::from_utf8(b) {
@@ -737,11 +772,19 @@ fn encode_arrow_value(
         }
         ArrowDataType::Dictionary(_, _) => {
             if let Some(dict) = array.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
-                let values: &StringArray = dict.values().as_any().downcast_ref::<StringArray>().unwrap();
+                let values: &StringArray = dict
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
                 let key = dict.keys().value(row) as usize;
                 encoder.encode_field(&values.value(key))?;
             } else if let Some(dict) = array.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
-                let values: &StringArray = dict.values().as_any().downcast_ref::<StringArray>().unwrap();
+                let values: &StringArray = dict
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
                 let key = dict.keys().value(row) as usize;
                 encoder.encode_field(&values.value(key))?;
             } else {

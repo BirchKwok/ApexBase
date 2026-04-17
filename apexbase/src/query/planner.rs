@@ -33,10 +33,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 
-use crate::query::{SqlStatement, SelectStatement, SqlExpr, SelectColumn, AggregateFunc};
-use crate::query::sql_parser::BinaryOperator;
-use crate::storage::index::IndexManager;
 use crate::data::Value;
+use crate::query::sql_parser::BinaryOperator;
+use crate::query::{AggregateFunc, SelectColumn, SelectStatement, SqlExpr, SqlStatement};
+use crate::storage::index::IndexManager;
 
 // ============================================================================
 // Table Statistics Cache (for CBO)
@@ -67,7 +67,8 @@ pub struct TableStats {
 }
 
 /// Global stats cache: table_path → TableStats
-static STATS_CACHE: Lazy<RwLock<HashMap<String, TableStats>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+static STATS_CACHE: Lazy<RwLock<HashMap<String, TableStats>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// Store ANALYZE results into the stats cache
 pub fn store_table_stats(table_key: &str, stats: TableStats) {
@@ -107,7 +108,10 @@ pub struct PlanCost {
 
 impl PlanCost {
     fn seq_scan(row_count: f64) -> Self {
-        Self { total: row_count * COST_SEQ_SCAN_PER_ROW, output_rows: row_count }
+        Self {
+            total: row_count * COST_SEQ_SCAN_PER_ROW,
+            output_rows: row_count,
+        }
     }
 
     fn index_scan(row_count: f64, selectivity: f64) -> Self {
@@ -148,8 +152,10 @@ impl QueryPlanner {
                         }
                         0.01 // default for equality
                     }
-                    BinaryOperator::Gt | BinaryOperator::Ge
-                    | BinaryOperator::Lt | BinaryOperator::Le => {
+                    BinaryOperator::Gt
+                    | BinaryOperator::Ge
+                    | BinaryOperator::Lt
+                    | BinaryOperator::Le => {
                         // Range: assume uniform distribution → 1/3
                         0.33
                     }
@@ -190,21 +196,22 @@ impl QueryPlanner {
             }
             SqlExpr::Like { .. } => 0.1,
             SqlExpr::IsNull { negated, .. } => {
-                if *negated { 0.95 } else { 0.05 }
+                if *negated {
+                    0.95
+                } else {
+                    0.05
+                }
             }
-            SqlExpr::UnaryOp { op: crate::query::sql_parser::UnaryOperator::Not, expr } => {
-                1.0 - Self::estimate_selectivity(expr, stats)
-            }
+            SqlExpr::UnaryOp {
+                op: crate::query::sql_parser::UnaryOperator::Not,
+                expr,
+            } => 1.0 - Self::estimate_selectivity(expr, stats),
             _ => 0.5,
         }
     }
 
     /// Determine whether to use an index or full scan based on cost
-    pub fn should_use_index(
-        col: &str,
-        selectivity: f64,
-        row_count: u64,
-    ) -> bool {
+    pub fn should_use_index(col: &str, selectivity: f64, row_count: u64) -> bool {
         let scan_cost = PlanCost::seq_scan(row_count as f64);
         let index_cost = PlanCost::index_scan(row_count as f64, selectivity);
         index_cost.total < scan_cost.total
@@ -324,9 +331,7 @@ impl QueryPlanner {
     /// Analyze a parsed SQL statement and determine the best execution strategy
     pub fn plan(stmt: &SqlStatement, index_manager: Option<&IndexManager>) -> ExecutionStrategy {
         match stmt {
-            SqlStatement::Select(select) => {
-                Self::plan_select(select, index_manager)
-            }
+            SqlStatement::Select(select) => Self::plan_select(select, index_manager),
             SqlStatement::Insert { .. } => ExecutionStrategy::DirectWrite,
             SqlStatement::Update { .. } => ExecutionStrategy::DirectWrite,
             SqlStatement::Delete { .. } => ExecutionStrategy::DirectWrite,
@@ -432,10 +437,18 @@ impl QueryPlanner {
     ) -> ExecutionStrategy {
         let chars = Self::analyze_select(select);
 
-        if chars.is_write { return ExecutionStrategy::DirectWrite; }
-        if chars.is_ddl { return ExecutionStrategy::Ddl; }
-        if chars.has_aggregation || chars.has_group_by { return ExecutionStrategy::OlapAggregation; }
-        if chars.has_join || chars.has_subquery { return ExecutionStrategy::OlapFullScan; }
+        if chars.is_write {
+            return ExecutionStrategy::DirectWrite;
+        }
+        if chars.is_ddl {
+            return ExecutionStrategy::Ddl;
+        }
+        if chars.has_aggregation || chars.has_group_by {
+            return ExecutionStrategy::OlapAggregation;
+        }
+        if chars.has_join || chars.has_subquery {
+            return ExecutionStrategy::OlapFullScan;
+        }
 
         // Primary key lookup
         if chars.filters_on_pk {
@@ -456,11 +469,19 @@ impl QueryPlanner {
             };
 
             // Check each indexed column — use cost model to decide
-            for col in chars.equality_filter_columns.iter().chain(chars.range_filter_columns.iter()) {
+            for col in chars
+                .equality_filter_columns
+                .iter()
+                .chain(chars.range_filter_columns.iter())
+            {
                 if idx_mgr.has_index_on(col) {
                     let col_selectivity = if let Some(s) = stats {
                         if let Some(cs) = s.columns.get(col) {
-                            if cs.ndv > 0 { 1.0 / cs.ndv as f64 } else { selectivity }
+                            if cs.ndv > 0 {
+                                1.0 / cs.ndv as f64
+                            } else {
+                                selectivity
+                            }
                         } else {
                             selectivity
                         }
@@ -546,8 +567,10 @@ impl QueryPlanner {
                             chars.estimated_selectivity *= 0.01; // Very selective
                         }
                     }
-                    BinaryOperator::Gt | BinaryOperator::Ge
-                    | BinaryOperator::Lt | BinaryOperator::Le => {
+                    BinaryOperator::Gt
+                    | BinaryOperator::Ge
+                    | BinaryOperator::Lt
+                    | BinaryOperator::Le => {
                         if let SqlExpr::Column(col) = left.as_ref() {
                             chars.range_filter_columns.push(col.clone());
                             chars.estimated_selectivity *= 0.3; // Moderately selective
@@ -565,7 +588,9 @@ impl QueryPlanner {
                     _ => {}
                 }
             }
-            SqlExpr::Between { column, low, high, .. } => {
+            SqlExpr::Between {
+                column, low, high, ..
+            } => {
                 chars.range_filter_columns.push(column.clone());
                 chars.estimated_selectivity *= 0.2;
             }
@@ -579,7 +604,12 @@ impl QueryPlanner {
 
     /// Extract primary key value from WHERE _id = X
     fn extract_pk_value(where_clause: &Option<SqlExpr>) -> Option<i64> {
-        if let Some(SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right }) = where_clause {
+        if let Some(SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        }) = where_clause
+        {
             if let SqlExpr::Column(col) = left.as_ref() {
                 if col == "_id" {
                     if let SqlExpr::Literal(val) = right.as_ref() {

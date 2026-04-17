@@ -84,6 +84,29 @@ class TestBasicSQLExecute:
             
             client.close()
 
+    def test_execute_between_without_limit_returns_all_matches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            client.store(
+                {
+                    "age": list(range(200)),
+                    "name": [f"user_{i}" for i in range(200)],
+                }
+            )
+            client.flush()
+
+            result = client.execute(
+                "SELECT age FROM default WHERE age BETWEEN 25 AND 150"
+            ).to_dict()
+
+            assert len(result) == 126
+            assert result[0]["age"] == 25
+            assert result[-1]["age"] == 150
+
+            client.close()
+
     def test_execute_cast_expression(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
@@ -658,6 +681,77 @@ class TestBasicSQLExecute:
 
             client.close()
 
+    def test_execute_projected_point_lookup_respects_projection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            client.store([
+                {"name": "Alice", "age": 25, "city": "NYC"},
+                {"name": "Bob", "age": 30, "city": "LA"},
+            ])
+
+            result = client.execute("SELECT name FROM default WHERE _id = 1")
+            assert result.columns == ["name"]
+            rows = result.to_dict()
+            assert rows == [{"name": "Alice"}]
+
+            client.close()
+
+    def test_execute_projected_id_in_lookup_respects_projection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            client.store([
+                {"name": "Alice", "age": 25, "city": "NYC"},
+                {"name": "Bob", "age": 30, "city": "LA"},
+                {"name": "Charlie", "age": 35, "city": "Chicago"},
+            ])
+
+            result = client.execute("SELECT name FROM default WHERE _id IN (3, 1, 3, 2)")
+            assert result.columns == ["name"]
+            rows = result.to_dict()
+            assert rows == [{"name": "Alice"}, {"name": "Bob"}, {"name": "Charlie"}]
+
+            client.close()
+
+    def test_execute_id_in_lookup_deduplicates_sql_results(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            client.store([
+                {"name": "Alice", "age": 25},
+                {"name": "Bob", "age": 30},
+                {"name": "Charlie", "age": 35},
+            ])
+
+            result = client.execute("SELECT * FROM default WHERE _id IN (3, 1, 3, 2)")
+            ids = result.get_ids(return_list=True)
+            assert len(result) == 3
+            assert ids == [1, 2, 3]
+            assert [row["name"] for row in result.to_dict()] == ["Alice", "Bob", "Charlie"]
+
+            client.close()
+
+    def test_execute_projected_string_equality_filter_respects_projection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            client.store([
+                {"name": "Alice", "age": 25, "city": "NYC"},
+                {"name": "Bob", "age": 30, "city": "LA"},
+                {"name": "Charlie", "age": 35, "city": "NYC"},
+            ])
+
+            result = client.execute("SELECT name FROM default WHERE city = 'NYC'")
+            assert result.columns == ["name"]
+            assert result.to_dict() == [{"name": "Alice"}, {"name": "Charlie"}]
+
+            client.close()
+
     def test_execute_arrow_dictionary_string_schema_match(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             if not (ARROW_AVAILABLE and PYARROW_AVAILABLE and PANDAS_AVAILABLE):
@@ -825,6 +919,26 @@ class TestBasicSQLExecute:
             ids = [row["id"] for row in rows]
             assert ids == [9, 8, 7]  # Last 3 IDs in descending order
             
+            client.close()
+
+    def test_execute_projected_select_with_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            client.store([
+                {"name": "Alice", "age": 25, "city": "NYC"},
+                {"name": "Bob", "age": 30, "city": "LA"},
+                {"name": "Charlie", "age": 35, "city": "Chicago"},
+            ])
+
+            result = client.execute("SELECT name, city FROM default LIMIT 2")
+            assert result.columns == ["name", "city"]
+            assert result.to_dict() == [
+                {"name": "Alice", "city": "NYC"},
+                {"name": "Bob", "city": "LA"},
+            ]
+
             client.close()
     
     def test_execute_select_with_limit_offset(self):

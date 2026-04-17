@@ -174,4 +174,3 @@ mod tests {
         assert_eq!(row, restored);
     }
 }
-

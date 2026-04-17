@@ -22,10 +22,10 @@
 //! └──────────────────────────────────────────────────┘
 //! ```
 
-pub mod manager;
-pub mod context;
 pub mod conflict;
+pub mod context;
+pub mod manager;
 
-pub use manager::{TxnManager, TxnId, TxnStatus, txn_manager};
-pub use context::TxnContext;
 pub use conflict::{ConflictDetector, ConflictResult};
+pub use context::TxnContext;
+pub use manager::{txn_manager, TxnId, TxnManager, TxnStatus};

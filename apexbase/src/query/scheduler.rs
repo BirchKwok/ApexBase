@@ -3,13 +3,13 @@
 //! This module provides a thread-pool based query scheduler that allows
 //! multiple queries to execute concurrently in Rust, bypassing Python's GIL.
 
+use parking_lot::{Condvar, Mutex};
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::collections::VecDeque;
-use parking_lot::{Mutex, Condvar};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Sender, Receiver};
-use std::path::PathBuf;
 
 use crate::query::executor::{ApexExecutor, ApexResult};
 use crate::query::sql_parser::SqlParser;
@@ -94,8 +94,8 @@ impl ThreadPoolExecutor {
     fn execute_query(task: QueryTask) {
         let result = (|| -> Result<QueryResult, String> {
             // Use the execute function that takes storage_path
-            let exec_result = ApexExecutor::execute(&task.sql, &task.table_path)
-                .map_err(|e| e.to_string())?;
+            let exec_result =
+                ApexExecutor::execute(&task.sql, &task.table_path).map_err(|e| e.to_string())?;
 
             match exec_result {
                 ApexResult::Data(batch) => Ok(QueryResult::Data(batch)),
@@ -106,9 +106,14 @@ impl ThreadPoolExecutor {
                 }
                 ApexResult::Scalar(val) => {
                     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                        arrow::datatypes::Field::new("result", arrow::datatypes::DataType::Int64, false),
+                        arrow::datatypes::Field::new(
+                            "result",
+                            arrow::datatypes::DataType::Int64,
+                            false,
+                        ),
                     ]));
-                    let array: arrow::array::ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![val]));
+                    let array: arrow::array::ArrayRef =
+                        Arc::new(arrow::array::Int64Array::from(vec![val]));
                     let batch = arrow::record_batch::RecordBatch::try_new(schema, vec![array])
                         .map_err(|e| e.to_string())?;
                     Ok(QueryResult::Data(batch))
@@ -190,10 +195,11 @@ pub fn init_scheduler_default() {
 
 /// Execute query through scheduler - returns receiver to get result
 /// Returns None if scheduler not initialized
-pub fn execute_through_scheduler(sql: String, table_path: PathBuf) -> Option<Receiver<QueryResult>> {
-    SCHEDULER.with(|s| {
-        s.borrow().as_ref().map(|s| s.submit(sql, table_path))
-    })
+pub fn execute_through_scheduler(
+    sql: String,
+    table_path: PathBuf,
+) -> Option<Receiver<QueryResult>> {
+    SCHEDULER.with(|s| s.borrow().as_ref().map(|s| s.submit(sql, table_path)))
 }
 
 /// Check if scheduler is initialized

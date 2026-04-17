@@ -3,8 +3,8 @@
 //! Exposes `start_flight_server` as a Python function so `pip install apexbase`
 //! users can launch the Flight server without a separate Rust binary.
 
-use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
 use std::path::PathBuf;
 
 use crate::flight::{self, FlightConfig};
@@ -19,7 +19,12 @@ use crate::flight::{self, FlightConfig};
 ///     port (int): Port to listen on. Default 50051.
 #[pyfunction]
 #[pyo3(signature = (data_dir, host = "127.0.0.1".to_string(), port = 50051))]
-pub fn start_flight_server(py: Python<'_>, data_dir: String, host: String, port: u16) -> PyResult<()> {
+pub fn start_flight_server(
+    py: Python<'_>,
+    data_dir: String,
+    host: String,
+    port: u16,
+) -> PyResult<()> {
     let config = FlightConfig {
         data_dir: PathBuf::from(data_dir),
         host,
@@ -27,11 +32,13 @@ pub fn start_flight_server(py: Python<'_>, data_dir: String, host: String, port:
     };
 
     py.allow_threads(|| {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create tokio runtime: {}", e)))?;
+        let rt = tokio::runtime::Runtime::new().map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to create tokio runtime: {}", e))
+        })?;
 
         rt.block_on(async {
-            flight::start_flight_server(config).await
+            flight::start_flight_server(config)
+                .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Flight server error: {}", e)))
         })
     })

@@ -139,7 +139,7 @@ impl Value {
                 } else {
                     format!("<binary_data_{}bytes>", b.len())
                 }
-            },
+            }
             Value::FixedList(b) => format!("<vector_{}dims>", b.len() / 4),
             Value::Json(j) => j.to_string(),
             Value::Timestamp(t) => t.to_string(),
@@ -321,4 +321,3 @@ mod tests {
         assert_eq!(restored, Some(val));
     }
 }
-

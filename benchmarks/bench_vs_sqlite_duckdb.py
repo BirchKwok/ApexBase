@@ -79,6 +79,30 @@ def generate_data(n: int):
     }
 
 
+def build_shared_inputs(n: int):
+    """Build deterministic shared benchmark inputs used by all engines."""
+    if n <= 0:
+        return {"point_lookup_id": 0, "retrieve_many_ids": []}
+
+    rng = random.Random(20260416)
+    point_lookup_id = min(5000, n)
+    sample_size = min(100, n)
+    retrieve_many_ids = rng.sample(range(1, n + 1), sample_size)
+    return {
+        "point_lookup_id": point_lookup_id,
+        "retrieve_many_ids": retrieve_many_ids,
+    }
+
+
+def rows_to_dicts(columns, rows):
+    """Materialize rows into a consistent Python representation."""
+    if not rows:
+        return []
+    if not columns:
+        return list(rows)
+    return [dict(zip(columns, row)) for row in rows]
+
+
 @contextmanager
 def timer():
     """Context manager that yields a dict; sets 'elapsed_ms' on exit."""
@@ -187,13 +211,34 @@ class SQLiteBench:
         self.data = data
         self.n = len(data["name"])
         self.conn = None
+        self.shared_inputs = build_shared_inputs(self.n)
 
-    def setup(self):
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
+    def _connect(self):
         self.conn = sqlite3.connect(self.db_path)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=OFF")
+
+    def _query_all(self, sql, params=()):
+        cur = self.conn.execute(sql, params)
+        return rows_to_dicts([d[0] for d in (cur.description or [])], cur.fetchall())
+
+    def _scalar(self, sql, params=()):
+        return self.conn.execute(sql, params).fetchone()[0]
+
+    def _query_pandas(self, sql):
+        if HAS_PANDAS:
+            return pd.read_sql(sql, self.conn)
+        return self._query_all(sql)
+
+    def execute_materialized_query(self, sql):
+        return self._query_all(sql)
+
+    def setup(self):
+        if self.conn:
+            self.conn.close()
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        self._connect()
         self.conn.execute("""
             CREATE TABLE bench (
                 _id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -204,6 +249,11 @@ class SQLiteBench:
                 category TEXT
             )
         """)
+
+    def cold_start_setup(self):
+        if self.conn:
+            self.conn.close()
+        self._connect()
 
     def bench_insert(self):
         rows = list(zip(
@@ -217,61 +267,63 @@ class SQLiteBench:
         self.conn.commit()
 
     def bench_count(self):
-        return self.conn.execute("SELECT COUNT(*) FROM bench").fetchone()[0]
+        return self._scalar("SELECT COUNT(*) FROM bench")
 
     def bench_select_limit(self, limit=100):
-        return self.conn.execute(f"SELECT * FROM bench LIMIT {limit}").fetchall()
+        return self._query_all(f"SELECT * FROM bench LIMIT {limit}")
 
     def bench_select_limit_10k(self):
-        return self.conn.execute("SELECT * FROM bench LIMIT 10000").fetchall()
+        return self._query_all("SELECT * FROM bench LIMIT 10000")
 
     def bench_filter_string(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE name = 'user_5000'"
-        ).fetchall()
+        )
 
     def bench_filter_range(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE age BETWEEN 25 AND 35"
-        ).fetchall()
+        )
 
     def bench_group_by(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT city, COUNT(*), AVG(score) FROM bench GROUP BY city"
-        ).fetchall()
+        )
 
     def bench_group_by_having(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT city, COUNT(*) as cnt, AVG(score) FROM bench GROUP BY city HAVING cnt > 1000"
-        ).fetchall()
+        )
 
     def bench_order_limit(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench ORDER BY score DESC LIMIT 100"
-        ).fetchall()
+        )
 
     def bench_aggregation(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT COUNT(*), AVG(age), SUM(score), MIN(age), MAX(age) FROM bench"
-        ).fetchone()
+        )
 
     def bench_complex(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT city, AVG(score) as avg_s FROM bench WHERE age BETWEEN 25 AND 50 GROUP BY city ORDER BY avg_s DESC LIMIT 5"
-        ).fetchall()
+        )
 
     def bench_point_lookup(self):
-        return self.conn.execute(
-            "SELECT * FROM bench WHERE _id = 5000"
-        ).fetchone()
+        point_lookup_id = self.shared_inputs["point_lookup_id"]
+        return self._query_all(
+            "SELECT * FROM bench WHERE _id = ?",
+            (point_lookup_id,),
+        )
 
     def bench_retrieve_many(self):
-        # Retrieve 100 random IDs
-        ids = random.sample(range(1, self.n + 1), 100)
-        placeholders = ",".join(["?"] * 100)
-        return self.conn.execute(
-            f"SELECT * FROM bench WHERE _id IN ({placeholders})", ids
-        ).fetchall()
+        ids = self.shared_inputs["retrieve_many_ids"]
+        placeholders = ",".join(["?"] * len(ids))
+        return self._query_all(
+            f"SELECT * FROM bench WHERE _id IN ({placeholders})",
+            ids,
+        )
 
     def bench_insert_1k(self):
         rows = [(f"new_{i}", 25, 50.0, "Beijing", "Books") for i in range(1000)]
@@ -282,54 +334,52 @@ class SQLiteBench:
         self.conn.commit()
 
     def bench_full_scan_pandas(self):
-        if HAS_PANDAS:
-            return pd.read_sql("SELECT * FROM bench", self.conn)
-        return self.conn.execute("SELECT * FROM bench").fetchall()
+        return self._query_pandas("SELECT * FROM bench")
 
     def bench_group_by_2cols(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT city, category, COUNT(*), AVG(score) FROM bench GROUP BY city, category"
-        ).fetchall()
+        )
 
     def bench_filter_like(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE name LIKE 'user_1%'"
-        ).fetchall()
+        )
 
     def bench_filter_multi_cond(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE age > 30 AND score > 50.0"
-        ).fetchall()
+        )
 
     def bench_order_by_multi(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench ORDER BY city ASC, score DESC LIMIT 100"
-        ).fetchall()
+        )
 
     def bench_count_distinct(self):
-        return self.conn.execute(
+        return self._scalar(
             "SELECT COUNT(DISTINCT city) FROM bench"
-        ).fetchone()[0]
+        )
 
     def bench_filter_in(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"
-        ).fetchall()
+        )
 
     def bench_filter_numeric_in(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE age IN (20, 25, 30, 35, 40, 45, 50, 55, 60)"
-        ).fetchall()
+        )
 
     def bench_filter_or_cross_col(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE age = 25 OR city = 'Beijing'"
-        ).fetchall()
+        )
 
     def bench_filter_numeric_or(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE age = 20 OR age = 30 OR age = 40 OR age = 50"
-        ).fetchall()
+        )
 
     def bench_update_1k(self):
         self.conn.execute("UPDATE bench SET score = 50.0 WHERE age = 25")
@@ -358,11 +408,11 @@ class SQLiteBench:
         self.conn.commit()
 
     def bench_window_row_number(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT name, city, score, "
             "ROW_NUMBER() OVER (PARTITION BY city ORDER BY score DESC) as rn "
             "FROM bench LIMIT 1000"
-        ).fetchall()
+        )
 
     def bench_fts_build(self):
         try:
@@ -380,9 +430,11 @@ class SQLiteBench:
     def bench_fts_search(self):
         if not getattr(self, '_fts_ready', False):
             return None
-        return self.conn.execute(
+        return [
+            row[0] for row in self.conn.execute(
             "SELECT rowid FROM bench_fts WHERE bench_fts MATCH 'Electronics'"
         ).fetchall()
+        ]
 
     def close(self):
         if self.conn:
@@ -399,11 +451,32 @@ class DuckDBBench:
         self.data = data
         self.n = len(data["name"])
         self.conn = None
+        self.shared_inputs = build_shared_inputs(self.n)
+
+    def _connect(self):
+        self.conn = duckdb.connect(self.db_path)
+
+    def _query_all(self, sql, params=()):
+        cur = self.conn.execute(sql, params)
+        return rows_to_dicts([d[0] for d in (cur.description or [])], cur.fetchall())
+
+    def _scalar(self, sql, params=()):
+        return self.conn.execute(sql, params).fetchone()[0]
+
+    def _query_pandas(self, sql):
+        if HAS_PANDAS:
+            return self.conn.execute(sql).df()
+        return self._query_all(sql)
+
+    def execute_materialized_query(self, sql):
+        return self._query_all(sql)
 
     def setup(self):
+        if self.conn:
+            self.conn.close()
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
-        self.conn = duckdb.connect(self.db_path)
+        self._connect()
         self.conn.execute("""
             CREATE TABLE bench (
                 name VARCHAR,
@@ -413,6 +486,11 @@ class DuckDBBench:
                 category VARCHAR
             )
         """)
+
+    def cold_start_setup(self):
+        if self.conn:
+            self.conn.close()
+        self._connect()
 
     def bench_insert(self):
         # Use executemany for reliable cross-version compatibility
@@ -425,61 +503,64 @@ class DuckDBBench:
         )
 
     def bench_count(self):
-        return self.conn.execute("SELECT COUNT(*) FROM bench").fetchone()[0]
+        return self._scalar("SELECT COUNT(*) FROM bench")
 
     def bench_select_limit(self, limit=100):
-        return self.conn.execute(f"SELECT * FROM bench LIMIT {limit}").fetchall()
+        return self._query_all(f"SELECT * FROM bench LIMIT {limit}")
 
     def bench_select_limit_10k(self):
-        return self.conn.execute("SELECT * FROM bench LIMIT 10000").fetchall()
+        return self._query_all("SELECT * FROM bench LIMIT 10000")
 
     def bench_filter_string(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE name = 'user_5000'"
-        ).fetchall()
+        )
 
     def bench_filter_range(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE age BETWEEN 25 AND 35"
-        ).fetchall()
+        )
 
     def bench_group_by(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT city, COUNT(*), AVG(score) FROM bench GROUP BY city"
-        ).fetchall()
+        )
 
     def bench_group_by_having(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT city, COUNT(*) as cnt, AVG(score) FROM bench GROUP BY city HAVING cnt > 1000"
-        ).fetchall()
+        )
 
     def bench_order_limit(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench ORDER BY score DESC LIMIT 100"
-        ).fetchall()
+        )
 
     def bench_aggregation(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT COUNT(*), AVG(age), SUM(score), MIN(age), MAX(age) FROM bench"
-        ).fetchone()
+        )
 
     def bench_complex(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT city, AVG(score) as avg_s FROM bench WHERE age BETWEEN 25 AND 50 GROUP BY city ORDER BY avg_s DESC LIMIT 5"
-        ).fetchall()
+        )
 
     def bench_point_lookup(self):
-        return self.conn.execute(
-            "SELECT * FROM bench WHERE rowid = 5000"
-        ).fetchall()
+        rowid = self.shared_inputs["point_lookup_id"] - 1
+        return self._query_all(
+            "SELECT rowid + 1 AS _id, * FROM bench WHERE rowid = ?",
+            (rowid,),
+        )
 
     def bench_retrieve_many(self):
-        # Retrieve 100 random IDs using rowid
-        ids = random.sample(range(1, self.n + 1), 100)
-        placeholders = ",".join(["?"] * 100)
-        return self.conn.execute(
-            f"SELECT * FROM bench WHERE rowid IN ({placeholders})", ids
-        ).fetchall()
+        ids = self.shared_inputs["retrieve_many_ids"]
+        rowids = [id_ - 1 for id_ in ids]
+        placeholders = ",".join(["?"] * len(rowids))
+        return self._query_all(
+            f"SELECT rowid + 1 AS _id, * FROM bench WHERE rowid IN ({placeholders})",
+            rowids,
+        )
 
     def bench_insert_1k(self):
         # Use executemany for reliable cross-version compatibility
@@ -487,62 +568,59 @@ class DuckDBBench:
         self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
 
     def bench_full_scan_pandas(self):
-        if HAS_PANDAS:
-            return self.conn.execute("SELECT * FROM bench").df()
-        return self.conn.execute("SELECT * FROM bench").fetchall()
+        return self._query_pandas("SELECT rowid + 1 AS _id, * FROM bench")
 
     def bench_group_by_2cols(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT city, category, COUNT(*), AVG(score) FROM bench GROUP BY city, category"
-        ).fetchall()
+        )
 
     def bench_filter_like(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE name LIKE 'user_1%'"
-        ).fetchall()
+        )
 
     def bench_filter_multi_cond(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE age > 30 AND score > 50.0"
-        ).fetchall()
+        )
 
     def bench_order_by_multi(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench ORDER BY city ASC, score DESC LIMIT 100"
-        ).fetchall()
+        )
 
     def bench_count_distinct(self):
-        return self.conn.execute(
+        return self._scalar(
             "SELECT COUNT(DISTINCT city) FROM bench"
-        ).fetchone()[0]
+        )
 
     def bench_filter_in(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"
-        ).fetchall()
+        )
 
     def bench_filter_numeric_in(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE age IN (20, 25, 30, 35, 40, 45, 50, 55, 60)"
-        ).fetchall()
+        )
 
     def bench_filter_or_cross_col(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE age = 25 OR city = 'Beijing'"
-        ).fetchall()
+        )
 
     def bench_filter_numeric_or(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT * FROM bench WHERE age = 20 OR age = 30 OR age = 40 OR age = 50"
-        ).fetchall()
+        )
 
     def bench_update_1k(self):
         self.conn.execute("UPDATE bench SET score = 50.0 WHERE age = 25")
 
     def bench_delete_1k(self):
-        if HAS_PANDAS:
-            rows = [(f"del_{i}", 99, 99.0, "Beijing", "Books") for i in range(1000)]
-            self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
+        rows = [(f"del_{i}", 99, 99.0, "Beijing", "Books") for i in range(1000)]
+        self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
         self.conn.execute("DELETE FROM bench WHERE age = 99")
 
     def bench_delete_1k_setup(self):
@@ -553,11 +631,11 @@ class DuckDBBench:
         self.conn.execute("DELETE FROM bench WHERE age = 99")
 
     def bench_window_row_number(self):
-        return self.conn.execute(
+        return self._query_all(
             "SELECT name, city, score, "
             "ROW_NUMBER() OVER (PARTITION BY city ORDER BY score DESC) as rn "
             "FROM bench LIMIT 1000"
-        ).fetchall()
+        )
 
     def bench_fts_build(self):
         try:
@@ -574,10 +652,12 @@ class DuckDBBench:
         if not getattr(self, '_fts_ready', False):
             return None
         try:
-            return self.conn.execute(
-                "SELECT * FROM bench "
+            return [
+                row["_id"] for row in self._query_all(
+                "SELECT rowid + 1 AS _id FROM bench "
                 "WHERE fts_main_bench.match_bm25(rowid, 'Electronics') IS NOT NULL"
-            ).fetchall()
+            )
+            ]
         except Exception:
             return None
 
@@ -597,6 +677,22 @@ class ApexBaseBench:
         self.n = len(data["name"])
         self.client = None
         self.low_memory = low_memory
+        self.shared_inputs = build_shared_inputs(self.n)
+
+    def _query_all(self, sql):
+        return self.client.execute(sql, show_internal_id=True).to_dict()
+
+    def _scalar(self, sql):
+        return self.client.execute(sql).scalar()
+
+    def _query_pandas(self, sql):
+        result = self.client.execute(sql, show_internal_id=True)
+        if HAS_PANDAS:
+            return result.to_pandas()
+        return result.to_dict()
+
+    def execute_materialized_query(self, sql):
+        return self.client.execute(sql, show_internal_id=True).to_dict()
 
     def setup(self):
         if os.path.exists(self.db_dir):
@@ -615,57 +711,61 @@ class ApexBaseBench:
         self.client.store(self.data)
 
     def bench_count(self):
-        return self.client.execute("SELECT COUNT(*) FROM default").scalar()
+        return self._scalar("SELECT COUNT(*) FROM default")
 
     def bench_select_limit(self, limit=100):
-        return self.client.execute(f"SELECT * FROM default LIMIT {limit}")
+        return self._query_all(f"SELECT * FROM default LIMIT {limit}")
 
     def bench_select_limit_10k(self):
-        return self.client.execute("SELECT * FROM default LIMIT 10000")
+        return self._query_all("SELECT * FROM default LIMIT 10000")
 
     def bench_filter_string(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT * FROM default WHERE name = 'user_5000'"
         )
 
     def bench_filter_range(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT * FROM default WHERE age BETWEEN 25 AND 35"
         )
 
     def bench_group_by(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT city, COUNT(*), AVG(score) FROM default GROUP BY city"
         )
 
     def bench_group_by_having(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT city, COUNT(*) as cnt, AVG(score) FROM default GROUP BY city HAVING cnt > 1000"
         )
 
     def bench_order_limit(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT * FROM default ORDER BY score DESC LIMIT 100"
         )
 
     def bench_aggregation(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT COUNT(*), AVG(age), SUM(score), MIN(age), MAX(age) FROM default"
         )
 
     def bench_complex(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT city, AVG(score) as avg_s FROM default WHERE age BETWEEN 25 AND 50 GROUP BY city ORDER BY avg_s DESC LIMIT 5"
         )
 
     def bench_point_lookup(self):
-        # Use optimized retrieve API for point lookup by ID
-        return self.client.retrieve(5000)
+        point_lookup_id = self.shared_inputs["point_lookup_id"]
+        return self._query_all(
+            f"SELECT * FROM default WHERE _id = {point_lookup_id}"
+        )
 
     def bench_retrieve_many(self):
-        # Retrieve 100 random IDs using retrieve_many
-        ids = random.sample(range(1, self.n + 1), 100)
-        return self.client.retrieve_many(ids)
+        ids = self.shared_inputs["retrieve_many_ids"]
+        id_list = ",".join(str(id_) for id_ in ids)
+        return self._query_all(
+            f"SELECT * FROM default WHERE _id IN ({id_list})"
+        )
 
     def bench_insert_1k(self):
         data_1k = {
@@ -678,53 +778,50 @@ class ApexBaseBench:
         self.client.store(data_1k)
 
     def bench_full_scan_pandas(self):
-        result = self.client.execute("SELECT * FROM default")
-        if HAS_PANDAS:
-            return result.to_pandas()
-        return result
+        return self._query_pandas("SELECT * FROM default")
 
     def bench_group_by_2cols(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT city, category, COUNT(*), AVG(score) FROM default GROUP BY city, category"
         )
 
     def bench_filter_like(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT * FROM default WHERE name LIKE 'user_1%'"
         )
 
     def bench_filter_multi_cond(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT * FROM default WHERE age > 30 AND score > 50.0"
         )
 
     def bench_order_by_multi(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT * FROM default ORDER BY city ASC, score DESC LIMIT 100"
         )
 
     def bench_count_distinct(self):
-        return self.client.execute(
+        return self._scalar(
             "SELECT COUNT(DISTINCT city) FROM default"
         )
 
     def bench_filter_in(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT * FROM default WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"
         )
 
     def bench_filter_numeric_in(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT * FROM default WHERE age IN (20, 25, 30, 35, 40, 45, 50, 55, 60)"
         )
 
     def bench_filter_or_cross_col(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT * FROM default WHERE age = 25 OR city = 'Beijing'"
         )
 
     def bench_filter_numeric_or(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT * FROM default WHERE age = 20 OR age = 30 OR age = 40 OR age = 50"
         )
 
@@ -758,7 +855,7 @@ class ApexBaseBench:
         self.client.execute("DELETE FROM default WHERE age = 99")
 
     def bench_window_row_number(self):
-        return self.client.execute(
+        return self._query_all(
             "SELECT name, city, score, "
             "ROW_NUMBER() OVER (PARTITION BY city ORDER BY score DESC) as rn "
             "FROM default LIMIT 1000"
@@ -786,7 +883,7 @@ class ApexBaseBench:
     def bench_fts_search(self):
         if not getattr(self, '_fts_ready', False):
             return None
-        return self.client.search_text('Electronics')
+        return self.client.search_text('Electronics').tolist()
 
     def close(self):
         if self.client:
@@ -798,7 +895,7 @@ class ApexBaseBench:
 # ---------------------------------------------------------------------------
 
 # (display_name, method_name, is_write, is_cold, is_warm_nogc, setup_method)
-# is_cold=True      -> cold_start_setup() per iter (DB reopen), no gc
+# is_cold=True      -> cold_start_setup() per iter (reopen connection/client), no gc
 # is_warm_nogc=True -> warm cached backend, no gc
 # setup_method      -> if not None, call bench.{setup_method}() before each timed iter
 BENCHMARKS = [
@@ -815,8 +912,8 @@ BENCHMARKS = [
     ("ORDER BY score LIMIT 100",         "bench_order_limit",      False, False, False, None),
     ("Aggregation (5 funcs)",            "bench_aggregation",      False, False, False, None),
     ("Complex (Filter+Group+Order)",     "bench_complex",          False, False, False, None),
-    ("Point Lookup (by ID)",             "bench_point_lookup",     False, False, False, None),
-    ("Retrieve Many (100 IDs)",          "bench_retrieve_many",    False, False, False, None),
+    ("Point Lookup (SQL by ID)",         "bench_point_lookup",     False, False, False, None),
+    ("Retrieve Many (SQL, 100 IDs)",     "bench_retrieve_many",    False, False, False, None),
     ("Insert 1K rows",                   "bench_insert_1k",        False, False, False, None),
     # --- New cases ---
     ("SELECT * -> pandas (full scan)",   "bench_full_scan_pandas", False, False, False, None),
@@ -837,6 +934,142 @@ BENCHMARKS = [
     ("FTS Index Build (name,city,category)", "bench_fts_build",         True,  False, False, None),
     ("FTS Search ('Electronics')",           "bench_fts_search",        False, False, False, None),
 ]
+
+
+def result_shape(value):
+    """Return a compact shape string for materialized benchmark results."""
+    if value is None:
+        return "0x0"
+    if hasattr(value, "num_rows") and hasattr(value, "num_columns"):
+        return f"{value.num_rows}x{value.num_columns}"
+    if hasattr(value, "shape"):
+        shape = tuple(value.shape)
+        if len(shape) >= 2:
+            return f"{shape[0]}x{shape[1]}"
+        if len(shape) == 1:
+            return f"{shape[0]}x1"
+    if isinstance(value, list):
+        return f"{len(value)}x{len(value[0]) if value else 0}"
+    return type(value).__name__
+
+
+def run_bench_with_result(fn, warmup=2, iterations=5):
+    """Run fn() and return (average_ms, last_result)."""
+    last = None
+    for _ in range(warmup):
+        last = fn()
+    times = []
+    for _ in range(iterations):
+        with timer() as t:
+            last = fn()
+        times.append(t["elapsed_ms"])
+    return sum(times) / len(times), last
+
+
+def materialization_speedup_label(dict_ms, arrow_ms):
+    if dict_ms is None or arrow_ms is None or arrow_ms <= 0:
+        return "N/A"
+    ratio = dict_ms / arrow_ms
+    if ratio >= 1:
+        return f"{ratio:.1f}x faster"
+    return f"{1 / ratio:.1f}x slower"
+
+
+def apex_materialization_queries(shared_inputs):
+    point_id = shared_inputs.get("point_lookup_id", 1)
+    return [
+        ("Point Lookup", f"SELECT * FROM default WHERE _id = {point_id}"),
+        ("SELECT * LIMIT 10K", "SELECT * FROM default LIMIT 10000"),
+        ("IN filter (city IN 3)", "SELECT * FROM default WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"),
+        ("Multi-cond filter", "SELECT * FROM default WHERE age > 30 AND score > 50.0"),
+        ("GROUP BY city", "SELECT city, COUNT(*), AVG(score) FROM default GROUP BY city"),
+        ("Full scan", "SELECT * FROM default"),
+    ]
+
+
+def run_apex_materialization_benchmarks(tmpdir, data, shared_inputs, warmup, iterations, low_memory=False):
+    """Compare ApexBase result APIs without mixing them into cross-engine rankings."""
+    if not HAS_APEXBASE:
+        return []
+
+    methods = [
+        ("to_dict", lambda rv: rv.to_dict()),
+        ("to_arrow", lambda rv: rv.to_arrow() if HAS_PYARROW else None),
+        ("to_pandas", lambda rv: rv.to_pandas() if HAS_PANDAS else None),
+    ]
+    rows = []
+    mat_tmpdir = tempfile.mkdtemp(prefix="apexbase_materialize_", dir=tmpdir)
+    apex_bench = ApexBaseBench(mat_tmpdir, data, low_memory=low_memory)
+
+    print("\n--- ApexBase Result Materialization APIs (not part of cross-engine ranking) ---")
+    try:
+        apex_bench.setup()
+        apex_bench.shared_inputs = shared_inputs
+        apex_bench.bench_insert()
+
+        print("  Uses a fresh ApexBase copy of the same generated data; previous DML benchmarks do not affect row counts.")
+        print("  This isolates Python result conversion cost and is not compared against SQLite/DuckDB rows.")
+        header = (
+            f"  {'Query':<24} | {'to_dict':>12} | {'to_arrow':>12} | "
+            f"{'to_pandas':>12} | {'Arrow vs dict':>14} | {'Shape':>12}"
+        )
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+
+        for label, sql in apex_materialization_queries(shared_inputs):
+            method_ms = {}
+            method_shapes = {}
+            for method_name, materialize in methods:
+                if method_name == "to_arrow" and not HAS_PYARROW:
+                    method_ms[method_name] = None
+                    continue
+                if method_name == "to_pandas" and not HAS_PANDAS:
+                    method_ms[method_name] = None
+                    continue
+
+                def fn(sql=sql, materialize=materialize):
+                    rv = apex_bench.client.execute(sql, show_internal_id=True)
+                    return materialize(rv)
+
+                ms, last = run_bench_with_result(fn, warmup=warmup, iterations=iterations)
+                method_ms[method_name] = ms
+                method_shapes[method_name] = result_shape(last)
+
+            shape = (
+                method_shapes.get("to_arrow")
+                or method_shapes.get("to_pandas")
+                or method_shapes.get("to_dict")
+                or "N/A"
+            )
+            speedup = materialization_speedup_label(method_ms.get("to_dict"), method_ms.get("to_arrow"))
+            row = (
+                f"  {label:<24} | "
+                f"{fmt_ms(method_ms['to_dict']) if method_ms.get('to_dict') is not None else 'N/A':>12} | "
+                f"{fmt_ms(method_ms['to_arrow']) if method_ms.get('to_arrow') is not None else 'N/A':>12} | "
+                f"{fmt_ms(method_ms['to_pandas']) if method_ms.get('to_pandas') is not None else 'N/A':>12} | "
+                f"{speedup:>14} | {shape:>12}"
+            )
+            print(row)
+            rows.append({
+                "query": label,
+                "sql": sql,
+                "shape": shape,
+                "to_dict_ms": round(method_ms["to_dict"], 3) if method_ms.get("to_dict") is not None else None,
+                "to_arrow_ms": round(method_ms["to_arrow"], 3) if method_ms.get("to_arrow") is not None else None,
+                "to_pandas_ms": round(method_ms["to_pandas"], 3) if method_ms.get("to_pandas") is not None else None,
+                "arrow_vs_dict": speedup,
+            })
+    finally:
+        try:
+            apex_bench.close()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(mat_tmpdir)
+        except Exception:
+            pass
+
+    return rows
 
 
 def get_system_info():
@@ -901,8 +1134,10 @@ def main():
         print(f"PyArrow: v{sys_info['pyarrow']}")
     print(f"\nDataset: {N:,} rows × 5 columns (name, age, score, city, category)")
     print(f"Warmup: {WARMUP} iterations, Timed: {ITERS} iterations (average)")
+    print("Fairness mode: read benchmarks materialize full results; ID lookups use shared deterministic inputs")
+    print("Q/s workload: COUNT + two full-table GROUP BY scans + filtered LIMIT 100, materialized to Python rows")
     if args.low_memory:
-        print("Mode: LOW-MEMORY (ApexBase arrow_batch_cache disabled)")
+        print("Mode: LOW-MEMORY (ApexBase-only cache stress mode; not a cross-engine apples-to-apples setting)")
     print()
 
     # Generate data
@@ -912,6 +1147,7 @@ def main():
 
     tmpdir = tempfile.mkdtemp(prefix="apexbase_bench_")
     results = {}
+    shared_inputs = build_shared_inputs(N)
 
     engines = []
     if HAS_APEXBASE:
@@ -926,6 +1162,7 @@ def main():
 
     # Setup all engines
     for name, bench in engines:
+        bench.shared_inputs = shared_inputs
         bench.setup()
 
     mem_results = {}  # bench_name -> {eng_name: rss_delta_mb}
@@ -1085,6 +1322,15 @@ def main():
         losses = total - wins - ties
         print(f"Summary: ApexBase wins {wins}/{total}, ties {ties}/{total}, slower {losses}/{total}")
 
+    materialization_results = run_apex_materialization_benchmarks(
+        tmpdir,
+        data,
+        shared_inputs,
+        warmup=WARMUP,
+        iterations=ITERS,
+        low_memory=args.low_memory,
+    )
+
     # ========================================================================
     # Q/s Throughput Tests (Single & Concurrent)
     # ========================================================================
@@ -1099,11 +1345,18 @@ def main():
         "SELECT * FROM default WHERE age > 30 LIMIT 100",
     ]
     
-    QPS_QUERIES_OTHER = [
+    QPS_QUERIES_SQLITE = [
         "SELECT COUNT(*) FROM bench",
         "SELECT city, COUNT(*) FROM bench GROUP BY city",
         "SELECT category, AVG(score) FROM bench GROUP BY category",
         "SELECT * FROM bench WHERE age > 30 LIMIT 100",
+    ]
+    
+    QPS_QUERIES_DUCKDB = [
+        "SELECT COUNT(*) FROM bench",
+        "SELECT city, COUNT(*) FROM bench GROUP BY city",
+        "SELECT category, AVG(score) FROM bench GROUP BY category",
+        "SELECT rowid + 1 AS _id, * FROM bench WHERE age > 30 LIMIT 100",
     ]
 
     def run_qps_benchmark(tmpdir, data, n_threads=4, min_duration=1.0, min_iterations=50,
@@ -1123,16 +1376,16 @@ def main():
             if HAS_APEXBASE and "ApexBase" in existing_engines:
                 qps_engines.append(("ApexBase", existing_engines["ApexBase"], QPS_QUERIES_APEX))
             if "SQLite" in existing_engines:
-                qps_engines.append(("SQLite", existing_engines["SQLite"], QPS_QUERIES_OTHER))
+                qps_engines.append(("SQLite", existing_engines["SQLite"], QPS_QUERIES_SQLITE))
             if HAS_DUCKDB and "DuckDB" in existing_engines:
-                qps_engines.append(("DuckDB", existing_engines["DuckDB"], QPS_QUERIES_OTHER))
+                qps_engines.append(("DuckDB", existing_engines["DuckDB"], QPS_QUERIES_DUCKDB))
         else:
             # Fallback: create fresh engines (slow path)
             if HAS_APEXBASE:
                 qps_engines.append(("ApexBase", ApexBaseBench(tmpdir, data), QPS_QUERIES_APEX))
-            qps_engines.append(("SQLite", SQLiteBench(tmpdir, data), QPS_QUERIES_OTHER))
+            qps_engines.append(("SQLite", SQLiteBench(tmpdir, data), QPS_QUERIES_SQLITE))
             if HAS_DUCKDB:
-                qps_engines.append(("DuckDB", DuckDBBench(tmpdir, data), QPS_QUERIES_OTHER))
+                qps_engines.append(("DuckDB", DuckDBBench(tmpdir, data), QPS_QUERIES_DUCKDB))
             for name, bench, _ in qps_engines:
                 bench.setup()
                 if hasattr(bench, 'bench_insert'):
@@ -1141,37 +1394,18 @@ def main():
         # Pre-warm all engines - run each query once to ensure caching is comparable
         for name, bench, queries in qps_engines:
             try:
-                if hasattr(bench, 'client'):
-                    for q in queries:
-                        _ = bench.client.execute(q).to_pandas()
-                elif hasattr(bench, 'conn'):
-                    for q in queries:
-                        _ = bench.conn.execute(q).fetchall()
+                for q in queries:
+                    _ = bench.execute_materialized_query(q)
             except Exception:
                 pass
 
         # 1. Single-threaded Q/s
         print("\n--- Single-threaded Q/s ---")
         iterations = min_iterations  # fallback default
+        single_iterations = {}
         for name, bench, queries in qps_engines:
             try:
-                # Determine execute method - make it consistent across engines
-                # All engines will use Arrow for fair comparison (ApexBase uses Arrow internally)
-                is_duckdb = hasattr(bench, 'conn') and 'duckdb' in str(type(bench.conn)).lower()
-
-                if hasattr(bench, 'client'):
-                    # ApexBase: use execute() for single queries (more efficient than scheduler for n=1)
-                    # The scheduler is optimized for batch workloads with multiple queries
-                    exec_fn = lambda q, b=bench: list(bench.client.execute(q))
-                elif hasattr(bench, 'conn'):
-                    if is_duckdb:
-                        # DuckDB: use Arrow for fair comparison with ApexBase
-                        exec_fn = lambda q, b=bench: b.conn.execute(q).arrow().to_pydict()
-                    else:
-                        # SQLite: use fetchall() as baseline
-                        exec_fn = lambda q, b=bench: b.conn.execute(q).fetchall()
-                else:
-                    continue
+                exec_fn = lambda q, b=bench: b.execute_materialized_query(q)
 
                 # Run sequential queries with proper timing
                 gc.collect()
@@ -1191,6 +1425,7 @@ def main():
                 # At least min_iterations batches, but also enough to run for min_duration
                 time_per_batch = trial_time / trial_iterations
                 iterations = max(min_iterations, int(min_duration / time_per_batch))
+                single_iterations[name] = iterations
                 
                 # Run the actual benchmark
                 t0 = time.perf_counter()
@@ -1215,12 +1450,12 @@ def main():
                 # ApexBase handles concurrency internally
                 if hasattr(bench, 'client'):
                     # ApexBase: shared client
-                    # Compute per-engine iterations independently for concurrent test
-                    conc_iterations = max(min_iterations, iterations)
+                    # Reuse the per-engine calibration from the single-threaded test.
+                    conc_iterations = max(min_iterations, single_iterations.get(name, min_iterations))
                     def concurrent_worker_apex(its=conc_iterations):
                         for _ in range(its):
                             for q in queries:
-                                list(bench.client.execute(q))
+                                bench.execute_materialized_query(q)
                     
                     gc.collect()
                     t0 = time.perf_counter()
@@ -1235,7 +1470,7 @@ def main():
                     db_path = bench.db_path
                     is_duckdb = 'duckdb' in str(type(bench.conn)).lower()
 
-                    conc_iterations = max(min_iterations, iterations)
+                    conc_iterations = max(min_iterations, single_iterations.get(name, min_iterations))
                     def concurrent_worker_sql(db_path, is_duckdb, queries, its=conc_iterations):
                         # Each thread creates its own connection
                         try:
@@ -1247,16 +1482,8 @@ def main():
                                 conn = sqlite3.connect(db_path, timeout=30)
                             for _ in range(its):
                                 for q in queries:
-                                    # Use Arrow for DuckDB (fair comparison with ApexBase)
-                                    # For SQLite, use fetchall() as baseline
-                                    if is_duckdb:
-                                        result = conn.execute(q)
-                                        # Use Arrow for DuckDB - most efficient path
-                                        arrow_result = result.arrow()
-                                        # Materialize to match ApexBase behavior
-                                        _ = arrow_result.to_pydict()
-                                    else:
-                                        conn.execute(q).fetchall()
+                                    cur = conn.execute(q)
+                                    _ = rows_to_dicts([d[0] for d in (cur.description or [])], cur.fetchall())
                             conn.close()
                         except Exception:
                             pass
@@ -1316,6 +1543,7 @@ def main():
             "system": sys_info,
             "config": {"rows": N, "warmup": WARMUP, "iterations": ITERS},
             "results": json_results,
+            "apexbase_materialization": materialization_results,
         }
         with open(args.output, "w") as f:
             json.dump(output, f, indent=2)

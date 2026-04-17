@@ -146,4 +146,3 @@ mod tests {
         assert!(!catalog.contains("users"));
     }
 }
-

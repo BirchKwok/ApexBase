@@ -22,10 +22,10 @@
 //! └──────────────────────────────────────────────────┘
 //! ```
 
-pub mod version_store;
-pub mod snapshot;
 pub mod gc;
+pub mod snapshot;
+pub mod version_store;
 
-pub use version_store::{VersionStore, RowVersion, VersionChain};
-pub use snapshot::{SnapshotManager, Snapshot, SnapshotId};
 pub use gc::GarbageCollector;
+pub use snapshot::{Snapshot, SnapshotId, SnapshotManager};
+pub use version_store::{RowVersion, VersionChain, VersionStore};

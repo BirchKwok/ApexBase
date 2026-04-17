@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use super::node::NodeId;
-use super::partition::{PartitionStrategy, PartitionKey};
+use super::partition::{PartitionKey, PartitionStrategy};
 
 // ============================================================================
 // Shard ID
@@ -194,7 +194,8 @@ impl ShardManager {
 
         let shard_id = meta.id;
         self.shards.write().insert(shard_id, meta.clone());
-        self.table_shards.write()
+        self.table_shards
+            .write()
             .entry(table_name.to_string())
             .or_insert_with(Vec::new)
             .push(shard_id);
@@ -234,7 +235,10 @@ impl ShardManager {
     pub fn set_shard_status(&self, shard_id: ShardId, status: ShardStatus) -> io::Result<()> {
         let mut shards = self.shards.write();
         let shard = shards.get_mut(&shard_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Shard {} not found", shard_id))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Shard {} not found", shard_id),
+            )
         })?;
         shard.status = status;
         shard.modified_at = chrono::Utc::now().timestamp();
@@ -254,8 +258,12 @@ impl ShardManager {
 
     /// Remove a shard
     pub fn remove_shard(&self, shard_id: ShardId) -> io::Result<ShardMeta> {
-        let meta = self.shards.write().remove(&shard_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Shard {} not found", shard_id)))?;
+        let meta = self.shards.write().remove(&shard_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Shard {} not found", shard_id),
+            )
+        })?;
 
         if let Some(ids) = self.table_shards.write().get_mut(&meta.table_name) {
             ids.retain(|&id| id != shard_id);
@@ -275,7 +283,10 @@ impl ShardManager {
     pub fn plan_split(&self, shard_id: ShardId) -> io::Result<SplitPlan> {
         let shards = self.shards.read();
         let shard = shards.get(&shard_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Shard {} not found", shard_id))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Shard {} not found", shard_id),
+            )
         })?;
 
         Ok(SplitPlan {
@@ -289,10 +300,16 @@ impl ShardManager {
     pub fn plan_merge(&self, shard_a: ShardId, shard_b: ShardId) -> io::Result<MergePlan> {
         let shards = self.shards.read();
         let a = shards.get(&shard_a).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Shard {} not found", shard_a))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Shard {} not found", shard_a),
+            )
         })?;
         let b = shards.get(&shard_b).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Shard {} not found", shard_b))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Shard {} not found", shard_b),
+            )
         })?;
 
         if a.table_name != b.table_name {
@@ -322,12 +339,15 @@ impl ShardManager {
 
         let avg_rows = shards.iter().map(|s| s.row_count).sum::<u64>() / shards.len() as u64;
         // Rebalance if any shard has >2x the average
-        shards.iter().any(|s| s.row_count > avg_rows * 2 || (avg_rows > 100 && s.row_count < avg_rows / 3))
+        shards
+            .iter()
+            .any(|s| s.row_count > avg_rows * 2 || (avg_rows > 100 && s.row_count < avg_rows / 3))
     }
 
     /// Get shard count for a table
     pub fn shard_count(&self, table_name: &str) -> usize {
-        self.table_shards.read()
+        self.table_shards
+            .read()
             .get(table_name)
             .map(|v| v.len())
             .unwrap_or(0)
@@ -420,7 +440,8 @@ mod tests {
         let mgr = ShardManager::new(dir.path(), 1);
         let shard = mgr.create_shard("users").unwrap();
 
-        mgr.set_shard_status(shard.id, ShardStatus::ReadOnly).unwrap();
+        mgr.set_shard_status(shard.id, ShardStatus::ReadOnly)
+            .unwrap();
         let updated = mgr.get_shard(shard.id).unwrap();
         assert_eq!(updated.status, ShardStatus::ReadOnly);
         assert!(updated.is_readable());

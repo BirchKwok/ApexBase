@@ -1,5 +1,52 @@
 // SELECT execution: fast paths, index scans, late materialization
 
+type CachedSingleGroupAgg = Vec<(String, Vec<(f64, i64)>)>;
+type CachedDoubleGroupAgg = Vec<((String, String), Vec<(f64, i64)>)>;
+type CachedOrderTopK = Vec<usize>;
+type CachedBetweenGroupAgg = Vec<(String, f64, i64)>;
+
+/// Warm-query cache for single-column GROUP BY aggregate states on immutable mmap tables.
+/// Keyed by (table path, group column, aggregate-column signature) and invalidated by mtime.
+static GLOBAL_SINGLE_GROUP_AGG_CACHE: once_cell::sync::Lazy<
+    parking_lot::RwLock<
+        std::collections::HashMap<
+            (std::path::PathBuf, String, String),
+            (std::time::SystemTime, Arc<CachedSingleGroupAgg>),
+        >,
+    >,
+> = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+
+/// Warm-query cache for two-column GROUP BY aggregate states on immutable mmap tables.
+/// Keyed by (table path, group columns, aggregate-column signature) and invalidated by mtime.
+static GLOBAL_DOUBLE_GROUP_AGG_CACHE: once_cell::sync::Lazy<
+    parking_lot::RwLock<
+        std::collections::HashMap<
+            (std::path::PathBuf, String, String, String),
+            (std::time::SystemTime, Arc<CachedDoubleGroupAgg>),
+        >,
+    >,
+> = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+
+/// Warm-query cache for ORDER BY ... LIMIT top-k row indices on immutable tables.
+static GLOBAL_ORDER_TOPK_CACHE: once_cell::sync::Lazy<
+    parking_lot::RwLock<
+        std::collections::HashMap<
+            (std::path::PathBuf, String, usize, usize),
+            (std::time::SystemTime, Arc<CachedOrderTopK>),
+        >,
+    >,
+> = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+
+/// Warm-query cache for BETWEEN + GROUP BY aggregate states on immutable tables.
+static GLOBAL_BETWEEN_GROUP_AGG_CACHE: once_cell::sync::Lazy<
+    parking_lot::RwLock<
+        std::collections::HashMap<
+            (std::path::PathBuf, String, u64, u64, String, String),
+            (std::time::SystemTime, Arc<CachedBetweenGroupAgg>),
+        >,
+    >,
+> = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+
 /// Represents a single scannable leaf predicate from an OR decomposition.
 enum OrLeafPredicate {
     StringEq(String, String),           // (col, value)
@@ -9,6 +56,200 @@ enum OrLeafPredicate {
 }
 
 impl ApexExecutor {
+    fn table_mtime(path: &Path) -> std::time::SystemTime {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    }
+
+    fn single_group_agg_signature(agg_cols: &[(&str, bool)]) -> String {
+        agg_cols.iter()
+            .map(|(col, is_count)| format!("{}:{}", col, if *is_count { "count" } else { "value" }))
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn order_by_signature(order_by: &[crate::query::OrderByClause]) -> String {
+        format!("{order_by:?}")
+    }
+
+    fn get_cached_single_group_agg(
+        backend: &TableStorageBackend,
+        group_col: &str,
+        agg_cols: &[(&str, bool)],
+        dict_strings: &[String],
+        group_ids: &[u16],
+    ) -> io::Result<Option<Arc<CachedSingleGroupAgg>>> {
+        let mtime = Self::table_mtime(backend.path());
+        let key = (
+            backend.path().to_path_buf(),
+            group_col.to_string(),
+            Self::single_group_agg_signature(agg_cols),
+        );
+
+        {
+            let cache = GLOBAL_SINGLE_GROUP_AGG_CACHE.read();
+            if let Some((cached_mtime, data)) = cache.get(&key) {
+                if *cached_mtime >= mtime {
+                    return Ok(Some(Arc::clone(data)));
+                }
+            }
+        }
+
+        let raw = match backend.execute_group_agg_cached(dict_strings, group_ids, agg_cols)? {
+            Some(r) if !r.is_empty() => r,
+            _ => return Ok(None),
+        };
+        let raw = Arc::new(raw);
+        let mut cache = GLOBAL_SINGLE_GROUP_AGG_CACHE.write();
+        cache.insert(key, (mtime, Arc::clone(&raw)));
+        Ok(Some(raw))
+    }
+
+    fn get_cached_double_group_agg(
+        backend: &TableStorageBackend,
+        group_col1: &str,
+        group_col2: &str,
+        agg_cols: &[(&str, bool)],
+        dict1_strings: &[String],
+        group_ids1: &[u16],
+        dict2_strings: &[String],
+        group_ids2: &[u16],
+    ) -> io::Result<Option<Arc<CachedDoubleGroupAgg>>> {
+        let mtime = Self::table_mtime(backend.path());
+        let key = (
+            backend.path().to_path_buf(),
+            group_col1.to_string(),
+            group_col2.to_string(),
+            Self::single_group_agg_signature(agg_cols),
+        );
+
+        {
+            let cache = GLOBAL_DOUBLE_GROUP_AGG_CACHE.read();
+            if let Some((cached_mtime, data)) = cache.get(&key) {
+                if *cached_mtime >= mtime {
+                    return Ok(Some(Arc::clone(data)));
+                }
+            }
+        }
+
+        let raw = match backend.execute_group_agg_2col_cached(
+            dict1_strings,
+            group_ids1,
+            dict2_strings,
+            group_ids2,
+            agg_cols,
+        )? {
+            Some(r) if !r.is_empty() => r,
+            _ => return Ok(None),
+        };
+        let raw = Arc::new(raw);
+        let mut cache = GLOBAL_DOUBLE_GROUP_AGG_CACHE.write();
+        cache.insert(key, (mtime, Arc::clone(&raw)));
+        Ok(Some(raw))
+    }
+
+    fn get_cached_order_topk_indices(
+        backend: &TableStorageBackend,
+        order_by: &[crate::query::OrderByClause],
+        limit: usize,
+        offset: usize,
+    ) -> Option<Arc<CachedOrderTopK>> {
+        let key = (
+            backend.path().to_path_buf(),
+            Self::order_by_signature(order_by),
+            limit,
+            offset,
+        );
+        let mtime = Self::table_mtime(backend.path());
+        let cache = GLOBAL_ORDER_TOPK_CACHE.read();
+        cache.get(&key).and_then(|(cached_mtime, data)| {
+            if *cached_mtime >= mtime {
+                Some(Arc::clone(data))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn store_cached_order_topk_indices(
+        backend: &TableStorageBackend,
+        order_by: &[crate::query::OrderByClause],
+        limit: usize,
+        offset: usize,
+        indices: &[usize],
+    ) {
+        let key = (
+            backend.path().to_path_buf(),
+            Self::order_by_signature(order_by),
+            limit,
+            offset,
+        );
+        let mtime = Self::table_mtime(backend.path());
+        let mut cache = GLOBAL_ORDER_TOPK_CACHE.write();
+        cache.insert(key, (mtime, Arc::new(indices.to_vec())));
+    }
+
+    fn get_cached_between_group_agg(
+        backend: &TableStorageBackend,
+        filter_col: &str,
+        lo: f64,
+        hi: f64,
+        group_col: &str,
+        agg_col: Option<&str>,
+    ) -> io::Result<Option<Arc<CachedBetweenGroupAgg>>> {
+        let key = (
+            backend.path().to_path_buf(),
+            filter_col.to_string(),
+            lo.to_bits(),
+            hi.to_bits(),
+            group_col.to_string(),
+            agg_col.unwrap_or("*").to_string(),
+        );
+        let mtime = Self::table_mtime(backend.path());
+
+        {
+            let cache = GLOBAL_BETWEEN_GROUP_AGG_CACHE.read();
+            if let Some((cached_mtime, data)) = cache.get(&key) {
+                if *cached_mtime >= mtime {
+                    return Ok(Some(Arc::clone(data)));
+                }
+            }
+        }
+
+        let raw = if let Some(dict_arc) = crate::storage::backend::get_global_dict_cache(
+            backend.path(),
+            group_col,
+            &backend.storage,
+        )? {
+            backend.execute_between_group_agg_cached(
+                filter_col,
+                lo,
+                hi,
+                &dict_arc.0,
+                &dict_arc.1,
+                agg_col,
+            )?
+        } else {
+            backend.storage.execute_between_group_agg(
+                filter_col,
+                lo,
+                hi,
+                group_col,
+                agg_col,
+            )?
+        };
+
+        let raw = match raw {
+            Some(r) if !r.is_empty() => r,
+            _ => return Ok(None),
+        };
+        let raw = Arc::new(raw);
+        let mut cache = GLOBAL_BETWEEN_GROUP_AGG_CACHE.write();
+        cache.insert(key, (mtime, Arc::clone(&raw)));
+        Ok(Some(raw))
+    }
+
     /// Execute SELECT statement with base_dir for proper subquery table resolution
     fn execute_select_with_base_dir(mut stmt: SelectStatement, storage_path: &Path, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
         // Resolve MATCH()/FUZZY_MATCH() predicates to _id IN (...) before anything else
@@ -251,50 +492,42 @@ impl ApexExecutor {
                                     // MMAP FAST PATH: byte-level scan + point lookups
                                     if let Some(where_clause) = &stmt.where_clause {
                                         let _limit_with_off = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
-                                        let matching_indices = if let Some((col, val)) = Self::extract_string_equality(where_clause) {
-                                            backend.scan_string_filter_mmap(&col, &val, _limit_with_off)?
+                                        let (matching_indices, prefer_index_materialization) =
+                                            if let Some((col, val)) = Self::extract_string_equality(where_clause) {
+                                            (backend.scan_string_filter_mmap(&col, &val, _limit_with_off)?, false)
                                         } else if let Some((col, low, high)) = Self::extract_between_range(where_clause) {
-                                            backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?
+                                            (backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?, false)
                                         } else if let Some((col, low, high)) = Self::extract_two_sided_same_col_range(where_clause) {
                                             // col >= N AND col <= M — logically equivalent to BETWEEN
-                                            backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?
+                                            (backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?, false)
                                         } else if let Some((col, low, high)) = Self::extract_single_comparison_as_range(where_clause) {
-                                            backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?
+                                            (backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?, false)
                                         } else if let Some((col, values)) = Self::extract_in_string_filter(where_clause) {
-                                            // IN filter: scan each value, union indices
-                                            let mut all_idx: Vec<usize> = Vec::new();
-                                            for val in &values {
-                                                if let Some(mut idxs) = backend.scan_string_filter_mmap(&col, val, None)? {
-                                                    all_idx.append(&mut idxs);
-                                                }
-                                            }
-                                            all_idx.sort_unstable();
-                                            all_idx.dedup();
-                                            if let Some(lim) = _limit_with_off { all_idx.truncate(lim); }
-                                            if all_idx.is_empty() { None } else { Some(all_idx) }
+                                            (backend.scan_string_in_mmap(&col, &values, _limit_with_off)?, true)
                                         } else if let Some((col, nums)) = Self::extract_in_numeric_filter(where_clause)
                                             .or_else(|| Self::extract_or_numeric_equalities(where_clause))
                                         {
                                             // Numeric IN or OR-of-equalities: single-pass mmap scan
-                                            backend.scan_numeric_in_mmap(&col, &nums, _limit_with_off)?
+                                            (backend.scan_numeric_in_mmap(&col, &nums, _limit_with_off)?, true)
                                         } else if let Some(leaves) = Self::extract_or_leaf_predicates(where_clause) {
                                             // General OR decomposition: scan each leaf, union indices
                                             match Self::scan_or_leaves_mmap(&backend, &leaves, _limit_with_off)? {
-                                                Some(v) if !v.is_empty() => Some(v),
-                                                Some(_) => None, // empty result
-                                                None => None,
+                                                Some(v) if !v.is_empty() => (Some(v), true),
+                                                Some(_) => (None, true), // empty result
+                                                None => (None, true),
                                             }
                                         } else {
-                                            None
+                                            (None, false)
                                         };
                                         if let Some(indices) = matching_indices {
                                             if indices.is_empty() {
                                                 return Ok(ApexResult::Empty(Arc::new(Schema::empty())));
                                             }
-                                            // Use index-based extraction for all result sizes (avoids full table scan)
-                                            let col_refs = Self::get_col_refs(&stmt);
-                                            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
-                                            let batch = backend.read_columns_by_indices_to_arrow(&indices, col_refs_vec.as_deref())?;
+                                            let batch = if prefer_index_materialization {
+                                                Self::read_matching_rows_by_indices(&backend, &stmt, &indices)?
+                                            } else {
+                                                Self::read_matching_rows_adaptive(&backend, &stmt, &indices)?
+                                            };
                                             
                                             // Apply ORDER BY with LIMIT if needed
                                             if !stmt.order_by.is_empty() {
@@ -874,7 +1107,12 @@ impl ApexExecutor {
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
         // Skip if there are pending deltas (use slower but accurate path)
-        if backend.has_pending_deltas() {
+        if backend.has_pending_deltas() || backend.is_mmap_only() {
+            return Ok(None);
+        }
+
+        // Must have LIMIT for early termination benefit
+        if stmt.limit.is_none() {
             return Ok(None);
         }
 
@@ -912,22 +1150,16 @@ impl ApexExecutor {
             None => return Ok(None),
         };
 
-        let projected_cols: Option<Vec<String>> = if stmt.is_select_star() {
-            None
-        } else {
-            Some(stmt.required_columns().unwrap_or_default())
-        };
-        let col_refs: Option<Vec<&str>> = projected_cols.as_ref()
-            .map(|cols| cols.iter().map(|s| s.as_str()).collect());
-
         if indices.is_empty() {
-            return Ok(Some(backend.read_columns_to_arrow(col_refs.as_deref(), 0, Some(0))?));
+            let empty = Self::read_matching_rows_adaptive(backend, stmt, &indices)?;
+            return Ok(Some(empty));
         }
 
         let offset = stmt.offset.unwrap_or(0);
         if offset > 0 {
             if offset >= indices.len() {
-                return Ok(Some(backend.read_columns_to_arrow(col_refs.as_deref(), 0, Some(0))?));
+                let empty = Self::read_matching_rows_adaptive(backend, stmt, &[])?;
+                return Ok(Some(empty));
             }
             indices = indices[offset..].to_vec();
          }
@@ -935,7 +1167,7 @@ impl ApexExecutor {
             indices.truncate(lim);
         }
 
-        Ok(Some(backend.read_columns_by_indices_to_arrow(&indices, col_refs.as_deref())?))
+        Ok(Some(Self::read_matching_rows_adaptive(backend, stmt, &indices)?))
     }
     
     /// Unified implementation for string equality filter fast path
@@ -1000,19 +1232,38 @@ impl ApexExecutor {
     ) -> io::Result<Option<RecordBatch>> {
         use crate::query::sql_parser::BinaryOperator;
         
-        if backend.has_pending_deltas() || backend.is_mmap_only() {
+        if backend.has_pending_deltas() {
             return Ok(None);
         }
 
-        // Must have LIMIT for early termination benefit
-        if stmt.limit.is_none() {
-            return Ok(None);
-        }
-        
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
         };
+
+        if backend.is_mmap_only() {
+            if stmt.limit.is_none() { return Ok(None); }
+            let (col, lo, hi) = match Self::extract_any_numeric_range(where_clause) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            let limit_with_off = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            let indices = match backend.scan_numeric_range_mmap(&col, lo, hi, limit_with_off)? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            if indices.is_empty() {
+                let schema = backend.read_columns_to_arrow(None, 0, Some(0))?;
+                return Ok(Some(schema));
+            }
+            let batch = Self::read_matching_rows_adaptive(backend, stmt, &indices)?;
+            return Ok(Some(batch));
+        }
+
+        // The storage-level range reader is a LIMIT-oriented fast path.
+        if stmt.limit.is_none() {
+            return Ok(None);
+        }
         
         // Extract BETWEEN pattern: col BETWEEN low AND high
         let (col_name, low, high) = match where_clause {
@@ -1052,12 +1303,20 @@ impl ApexExecutor {
             _ => return Ok(None),
         };
         
+        let projected_cols: Option<Vec<String>> = if stmt.is_select_star() {
+            None
+        } else {
+            Some(stmt.required_columns().unwrap_or_default())
+        };
+        let col_refs: Option<Vec<&str>> = projected_cols.as_ref()
+            .map(|cols| cols.iter().map(|s| s.as_str()).collect());
+
         let limit = stmt.limit.unwrap_or(100);
         let offset = stmt.offset.unwrap_or(0);
-        
+
         // Use storage-level numeric range filter with early termination
         let result = backend.read_columns_filtered_range_with_limit_to_arrow(
-            None, // All columns (SELECT *)
+            col_refs.as_deref(),
             &col_name,
             low,
             high,
@@ -1296,33 +1555,27 @@ impl ApexExecutor {
                 }
             }
             FilterType::Between(filter_col, lo, hi) => {
-                // OPTIMIZED: Use global cached dict for O(1) group lookup
-                let raw_results = if let Some(dict_arc) = crate::storage::backend::get_global_dict_cache(
-                    backend.path(), group_col, &backend.storage,
+                let raw = match Self::get_cached_between_group_agg(
+                    backend,
+                    filter_col,
+                    *lo,
+                    *hi,
+                    group_col,
+                    agg_col,
                 )? {
-                    backend.execute_between_group_agg_cached(
-                        filter_col, *lo, *hi, &dict_arc.0, &dict_arc.1, agg_col,
-                    )?
-                } else {
-                    backend.storage.execute_between_group_agg(
-                        filter_col, *lo, *hi, group_col, agg_col,
-                    )?
-                };
-                
-                let raw = match raw_results {
-                    Some(r) if !r.is_empty() => r,
+                    Some(r) => r,
                     _ => return Ok(None),
                 };
                 
                 // Compute final aggregated values
-                let mut results: Vec<(String, f64)> = raw.into_iter().map(|(k, sum, count)| {
+                let mut results: Vec<(String, f64)> = raw.iter().map(|(k, sum, count)| {
                     let val = match agg_func {
-                        AggregateFunc::Sum => sum,
-                        AggregateFunc::Count => count as f64,
-                        AggregateFunc::Avg => if count > 0 { sum / count as f64 } else { 0.0 },
-                        _ => sum,
+                        AggregateFunc::Sum => *sum,
+                        AggregateFunc::Count => *count as f64,
+                        AggregateFunc::Avg => if *count > 0 { *sum / *count as f64 } else { 0.0 },
+                        _ => *sum,
                     };
-                    (k, val)
+                    (k.clone(), val)
                 }).collect();
                 
                 // Sort
@@ -1652,8 +1905,14 @@ impl ApexExecutor {
             .map(|(col, is_count, _, _)| (*col, *is_count))
             .collect();
         
-        let raw = match backend.execute_group_agg_cached(dict_strings, group_ids, &agg_cols)? {
-            Some(r) if !r.is_empty() => r,
+        let raw = match Self::get_cached_single_group_agg(
+            backend,
+            group_col,
+            &agg_cols,
+            dict_strings,
+            group_ids,
+        )? {
+            Some(r) => r,
             _ => return Ok(None),
         };
         
@@ -1760,10 +2019,17 @@ impl ApexExecutor {
             .map(|(col, is_count, _, _)| (*col, *is_count))
             .collect();
 
-        let raw = match backend.execute_group_agg_2col_cached(
-            dict1_strings, group_ids1, dict2_strings, group_ids2, &agg_cols,
+        let raw = match Self::get_cached_double_group_agg(
+            backend,
+            group_col1,
+            group_col2,
+            &agg_cols,
+            dict1_strings,
+            group_ids1,
+            dict2_strings,
+            group_ids2,
         )? {
-            Some(r) if !r.is_empty() => r,
+            Some(r) => r,
             _ => return Ok(None),
         };
 
@@ -2023,9 +2289,7 @@ impl ApexExecutor {
                 if intersected.is_empty() {
                     return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
                 }
-                let col_refs = Self::get_col_refs(stmt);
-                let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
-                let batch = backend.read_columns_by_indices_to_arrow(&intersected, col_refs_vec.as_deref())?;
+                let batch = Self::read_matching_rows_adaptive(backend, stmt, &intersected)?;
                 if !stmt.is_select_star() {
                     let projected = Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
                     return Ok(Some(ApexResult::Data(projected)));
@@ -2075,9 +2339,7 @@ impl ApexExecutor {
             return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
         }
 
-        let col_refs = Self::get_col_refs(stmt);
-        let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
-        let batch = backend.read_columns_by_indices_to_arrow(&intersected, col_refs_vec.as_deref())?;
+        let batch = Self::read_matching_rows_adaptive(backend, stmt, &intersected)?;
         if !stmt.is_select_star() {
             let projected = Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
             return Ok(Some(ApexResult::Data(projected)));
@@ -2243,13 +2505,7 @@ impl ApexExecutor {
                     backend.scan_numeric_in_mmap(col, nums, None)?
                 }
                 OrLeafPredicate::StringIn(col, strs) => {
-                    let mut idx: Vec<usize> = Vec::new();
-                    for val in strs {
-                        if let Some(mut idxs) = backend.scan_string_filter_mmap(col, val, None)? {
-                            idx.append(&mut idxs);
-                        }
-                    }
-                    if idx.is_empty() { None } else { idx.sort_unstable(); idx.dedup(); Some(idx) }
+                    backend.scan_string_in_mmap(col, strs, None)?
                 }
             };
             if let Some(mut idxs) = indices {
@@ -2265,6 +2521,67 @@ impl ApexExecutor {
             all_indices.truncate(lim);
         }
         Ok(Some(all_indices))
+    }
+
+    #[inline]
+    fn should_use_scatter_read(total_rows: usize, matched_rows: usize) -> bool {
+        matched_rows < 200_000 && matched_rows.saturating_mul(4) < total_rows
+    }
+
+    fn take_rows_from_full_batch(
+        full_batch: &RecordBatch,
+        row_indices: &[usize],
+    ) -> io::Result<RecordBatch> {
+        use arrow::array::{ArrayRef, UInt32Array};
+
+        let indices_arr = UInt32Array::from(
+            row_indices.iter().map(|&i| i as u32).collect::<Vec<_>>()
+        );
+        let taken_columns: Vec<ArrayRef> = full_batch.columns().iter()
+            .map(|col| arrow::compute::take(col.as_ref(), &indices_arr, None)
+                .map_err(|e| err_data(e.to_string())))
+            .collect::<io::Result<Vec<_>>>()?;
+        RecordBatch::try_new(full_batch.schema(), taken_columns)
+            .map_err(|e| err_data(e.to_string()))
+    }
+
+    fn read_matching_rows_adaptive(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+        row_indices: &[usize],
+    ) -> io::Result<RecordBatch> {
+        let col_refs = Self::get_col_refs(stmt);
+        let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
+
+        if row_indices.is_empty() {
+            return backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, Some(0));
+        }
+
+        let total_rows = backend.row_count() as usize;
+        if backend.is_mmap_only() && !Self::should_use_scatter_read(total_rows, row_indices.len()) {
+            let full_batch = backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, None)?;
+            return Self::take_rows_from_full_batch(&full_batch, row_indices);
+        }
+
+        backend.read_columns_by_indices_to_arrow(row_indices, col_refs_vec.as_deref())
+    }
+
+    fn read_matching_rows_by_indices(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+        row_indices: &[usize],
+    ) -> io::Result<RecordBatch> {
+        let col_refs = Self::get_col_refs(stmt);
+        let col_refs_vec: Option<Vec<&str>> = col_refs
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
+
+        if row_indices.is_empty() {
+            return backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, Some(0));
+        }
+
+        backend.read_columns_by_indices_to_arrow(row_indices, col_refs_vec.as_deref())
     }
 
     /// MMAP fast path for IN filter on string column.
@@ -2285,16 +2602,10 @@ impl ApexExecutor {
             None => return Ok(None),
         };
 
-        // Scan each value and collect indices
-        let mut all_indices: Vec<usize> = Vec::new();
-        for val in &values {
-            if let Some(mut idxs) = backend.scan_string_filter_mmap(&col, val, None)? {
-                all_indices.append(&mut idxs);
-            }
-        }
-        // Sort and deduplicate (union of sorted sets)
-        all_indices.sort_unstable();
-        all_indices.dedup();
+        let mut all_indices = match backend.scan_string_in_mmap(&col, &values, None)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
 
         // Apply offset + limit
         let offset = stmt.offset.unwrap_or(0);
@@ -2312,9 +2623,7 @@ impl ApexExecutor {
             return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
         }
 
-        let col_refs = Self::get_col_refs(stmt);
-        let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
-        let batch = backend.read_columns_by_indices_to_arrow(&all_indices, col_refs_vec.as_deref())?;
+        let batch = Self::read_matching_rows_by_indices(backend, stmt, &all_indices)?;
         if !stmt.is_select_star() {
             let projected = Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
             return Ok(Some(ApexResult::Data(projected)));
@@ -2413,9 +2722,7 @@ impl ApexExecutor {
                 let schema = backend.read_columns_to_arrow(None, 0, Some(0))?;
                 return Ok(Some(schema));
             }
-            let col_refs = Self::get_col_refs(stmt);
-            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
-            let batch = backend.read_columns_by_indices_to_arrow(&indices, col_refs_vec.as_deref())?;
+            let batch = Self::read_matching_rows_adaptive(backend, stmt, &indices)?;
             return Ok(Some(batch));
         }
 
@@ -2452,46 +2759,9 @@ impl ApexExecutor {
         let need_count = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
 
         // FAST PATH: no LIMIT.
-        // For large tables with selective WHERE clauses, use column-pruning late materialization:
-        //   1. Read only the filter column(s) — a small fraction of total data
-        //   2. Apply predicate → collect matching row indices
-        //   3. If < 40% rows match: read only matching rows via scatter (read_columns_by_indices)
-        //   4. Otherwise: fall back to full sequential read + vectorized Arrow filter
-        // This avoids reading N×unmatched_rows×col_width of data for typical filters like
-        // BETWEEN, LIKE prefix, IN on low-cardinality columns.
+        // Fall back to full sequential read + vectorized Arrow filter.
+        // Highly selective shapes are handled by dedicated mmap fast paths above.
         if need_count.is_none() {
-            let total_rows = backend.row_count() as usize;
-            // Only bother for tables > 50K rows (below that, full scan is cheap)
-            if total_rows > 50_000 && !backend.has_pending_deltas() {
-                let filter_cols = stmt.where_columns();
-                // Proceed if WHERE references ≤ 2 columns (covers BETWEEN, LIKE, IN, single-range)
-                if !filter_cols.is_empty() && filter_cols.len() <= 2 {
-                    let mut cols_to_read: Vec<&str> = Vec::with_capacity(filter_cols.len() + 1);
-                    cols_to_read.push("_id");
-                    for c in &filter_cols {
-                        cols_to_read.push(c.as_str());
-                    }
-                    let filter_batch = backend.read_columns_to_arrow(Some(&cols_to_read), 0, None)?;
-                    if filter_batch.num_rows() > 0 {
-                        let mask = Self::evaluate_predicate_with_storage(&filter_batch, where_clause, storage_path)?;
-                        let true_count = mask.true_count();
-                        // Late materialization threshold: < 40% of rows matched
-                        if true_count < total_rows * 2 / 5 {
-                            if true_count == 0 {
-                                return Ok(filter_batch); // empty result with partial schema
-                            }
-                            let indices: Vec<usize> = mask.iter().enumerate()
-                                .filter(|(_, v)| *v == Some(true))
-                                .map(|(i, _)| i)
-                                .collect();
-                            let col_refs = Self::get_col_refs(stmt);
-                            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
-                            return backend.read_columns_by_indices_to_arrow(&indices, col_refs_vec.as_deref());
-                        }
-                        // ≥ 40% matched: full sequential + filter is cheaper
-                    }
-                }
-            }
             // Fallback: full sequential read + vectorized Arrow filter
             // Need both SELECT columns and WHERE columns (WHERE is applied on this batch)
             // For SELECT *, required_columns() returns None → read all columns
@@ -2640,9 +2910,25 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<RecordBatch> {
-        let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0)).unwrap_or(0);
+        let limit = stmt.limit.unwrap_or(0);
+        let offset = stmt.offset.unwrap_or(0);
+        let k = limit + offset;
         if k == 0 {
             return backend.read_columns_to_arrow(None, 0, Some(0));
+        }
+
+        if !backend.has_pending_deltas() {
+            if let Some(indices) = Self::get_cached_order_topk_indices(
+                backend,
+                &stmt.order_by,
+                limit,
+                offset,
+            ) {
+                if indices.is_empty() {
+                    return backend.read_columns_to_arrow(None, 0, Some(0));
+                }
+                return backend.read_columns_by_indices_to_arrow(indices.as_ref(), None);
+            }
         }
 
         // IN-MEMORY FAST PATH: 2-col ORDER BY (string, float64) — skip Arrow string conversion.
@@ -2653,8 +2939,9 @@ impl ApexExecutor {
             let c0 = { let c = o0.column.trim_matches('"'); if let Some(p) = c.rfind('.') { &c[p+1..] } else { c } };
             let c1 = { let c = o1.column.trim_matches('"'); if let Some(p) = c.rfind('.') { &c[p+1..] } else { c } };
             if let Some(indices) = backend.order_topk_str_float64(
-                c0, !o0.descending, c1, !o1.descending, k, stmt.offset.unwrap_or(0),
+                c0, !o0.descending, c1, !o1.descending, k, offset,
             )? {
+                Self::store_cached_order_topk_indices(backend, &stmt.order_by, limit, offset, &indices);
                 if !indices.is_empty() {
                     return backend.read_columns_by_indices_to_arrow(&indices, None);
                 }
@@ -2668,11 +2955,12 @@ impl ApexExecutor {
             let col_name = clause.column.trim_matches('"');
             let actual_col = if let Some(p) = col_name.rfind('.') { &col_name[p+1..] } else { col_name };
             if let Some(heap) = backend.scan_top_k_indices_mmap(actual_col, k, clause.descending)? {
-                let offset = stmt.offset.unwrap_or(0);
                 let final_indices: Vec<usize> = heap.into_iter().skip(offset).map(|(idx, _)| idx).collect();
+                Self::store_cached_order_topk_indices(backend, &stmt.order_by, limit, offset, &final_indices);
                 if !final_indices.is_empty() {
                     return backend.read_columns_by_indices_to_arrow(&final_indices, None);
                 }
+                return backend.read_columns_to_arrow(None, 0, Some(0));
             }
         }
 
@@ -2745,7 +3033,6 @@ impl ApexExecutor {
                         }
                     }
                     
-                    let offset = stmt.offset.unwrap_or(0);
                     top_k.into_iter().skip(offset).map(|(_, idx)| idx).collect()
                 } else if let Some(int_arr) = col.as_any().downcast_ref::<Int64Array>() {
                     let descending = clause.descending;
@@ -2779,7 +3066,6 @@ impl ApexExecutor {
                         }
                     }
                     
-                    let offset = stmt.offset.unwrap_or(0);
                     top_k.into_iter().skip(offset).map(|(_, idx)| idx).collect()
                 } else {
                     Self::compute_topk_indices_generic(&sort_batch, &stmt.order_by, k_actual, stmt.offset)
@@ -2792,7 +3078,14 @@ impl ApexExecutor {
         };
 
         if final_indices.is_empty() {
+            if !backend.has_pending_deltas() {
+                Self::store_cached_order_topk_indices(backend, &stmt.order_by, limit, offset, &final_indices);
+            }
             return backend.read_columns_to_arrow(None, 0, Some(0));
+        }
+
+        if !backend.has_pending_deltas() {
+            Self::store_cached_order_topk_indices(backend, &stmt.order_by, limit, offset, &final_indices);
         }
 
         // Step 3: Read ALL columns but only for top-k row indices

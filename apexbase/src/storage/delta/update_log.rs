@@ -202,7 +202,8 @@ impl DeltaStore {
 
         // Rebuild updates map from log
         for record in &persisted.log {
-            store.updates
+            store
+                .updates
                 .entry(record.row_id)
                 .or_insert_with(HashMap::new)
                 .insert(record.column_name.clone(), record.clone());
@@ -351,7 +352,9 @@ impl DeltaStore {
 
         // Persist only the COLLAPSED updates (one record per unique (row, col) pair).
         // This prevents unbounded log growth across repeated UPDATE calls on the same rows.
-        let collapsed_log: Vec<DeltaRecord> = self.updates.values()
+        let collapsed_log: Vec<DeltaRecord> = self
+            .updates
+            .values()
             .flat_map(|col_map| col_map.values().cloned())
             .collect();
 
@@ -448,10 +451,7 @@ mod tests {
             store.get_updated_value(0, "name"),
             Some(&Value::String("alice_updated".into()))
         );
-        assert_eq!(
-            store.get_updated_value(0, "age"),
-            Some(&Value::Int64(30))
-        );
+        assert_eq!(store.get_updated_value(0, "age"), Some(&Value::Int64(30)));
         assert_eq!(store.get_updated_value(1, "name"), None);
     }
 

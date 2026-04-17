@@ -119,6 +119,15 @@ _RE_QUALIFIED_REF = re.compile(r"\b\w+\.\w+\b")
 _RE_SELECT_FROM = re.compile(r"\bselect\b(.*?)\bfrom\b", re.IGNORECASE | re.DOTALL)
 _RE_AGGREGATE_FUNC = re.compile(r"\b(count|sum|avg|min|max)\s*\(", re.IGNORECASE)
 _RE_EXPLICIT_ID = re.compile(r"(^|[^\w])(_id|\"_id\")([^\w]|$)|\._id([^\w]|$)", re.IGNORECASE)
+_RE_POINT_LOOKUP_ID = re.compile(r"\bwhere\s+_id\s*=\s*(\d+)\b", re.IGNORECASE)
+_RE_SIMPLE_COUNT_STAR = re.compile(
+    r"^\s*select\s+count\s*\(\s*\*\s*\)(?:\s+(?:as\s+)?([A-Za-z_][\w]*))?\s+from\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)\s*;?\s*$",
+    re.IGNORECASE,
+)
+_RE_SIMPLE_POINT_LOOKUP = re.compile(
+    r"^\s*select\s+\*\s+from\s+([A-Za-z_][\w]*)\s+where\s+_id\s*=\s*(\d+)\s*;?\s*$",
+    re.IGNORECASE,
+)
 
 
 
@@ -839,27 +848,84 @@ class ApexClient:
         # Lock-free execution: Rust layer handles concurrent reads via RwLock.
         # Python-level _storage_lock was causing serialization of all queries.
         return self._execute_impl(sql, show_internal_id)
+
+    @staticmethod
+    def _should_use_columnar_materialization(sql_upper: str, sig: str) -> bool:
+        """Prefer Rust-side columnar Python conversion for large filtered row sets."""
+        if sig not in ('like', 'complex'):
+            return False
+        if not sql_upper.startswith('SELECT *'):
+            return False
+        if 'WHERE' not in sql_upper:
+            return False
+        if any(token in sql_upper for token in (
+            'GROUP', 'HAVING', 'ORDER', 'JOIN', 'DISTINCT', 'UNION',
+            'INTERSECT', 'EXCEPT', 'WITH ', ' WINDOW ', ' OVER ',
+        )):
+            return False
+        return True
+
+    @staticmethod
+    def _extract_point_lookup_id(sql: str) -> Optional[int]:
+        match = _RE_POINT_LOOKUP_ID.search(sql)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
     
     def _execute_impl(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
+        if not getattr(self, '_in_txn', False):
+            point_match = _RE_SIMPLE_POINT_LOOKUP.match(sql)
+            if point_match:
+                table_name = point_match.group(1)
+                try:
+                    point_id = int(point_match.group(2))
+                    self._ensure_table_selected()
+                    if self._current_table and table_name.lower() == self._current_table.lower():
+                        if show_internal_id is None:
+                            show_internal_id = False
+                        row = self._storage.retrieve(point_id)
+                        if row is None:
+                            rv = ResultView(data=None)
+                            rv._show_internal_id = show_internal_id
+                            return rv
+                        if not show_internal_id and '_id' in row:
+                            row = {k: v for k, v in row.items() if k != '_id'}
+                        rv = ResultView(data=[row])
+                        rv._show_internal_id = show_internal_id
+                        return rv
+                except Exception:
+                    pass  # fall through to the general SQL executor
+
         # ── Single-point classification (mirrors Rust QuerySignature) ──
         sql_upper = sql.strip().upper()
         _trimmed = sql.strip().rstrip(';').strip()
         is_multi_stmt = ';' in _trimmed
 
         # Classify query type ONCE — no duplicate pattern matching
+        _count_star_match = None
         if is_multi_stmt:
             _sig = 'multi'
-        elif (sql_upper.startswith("SELECT COUNT(*) FROM ")
-                and "WHERE" not in sql_upper and "GROUP" not in sql_upper
-                and "HAVING" not in sql_upper and "JOIN" not in sql_upper
-                and "DISTINCT" not in sql_upper):
+        elif (_count_star_match := _RE_SIMPLE_COUNT_STAR.match(sql)):
             _sig = 'count_star'
-        elif (sql_upper.startswith('SELECT')
+        elif (sql_upper.startswith('SELECT *')
                 and ('WHERE _ID =' in sql_upper or 'WHERE _ID=' in sql_upper)
                 and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
                 and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+                and ' NOT ' not in sql_upper and ' IN ' not in sql_upper
                 and ';' not in sql_upper):
             _sig = 'point_lookup'
+        elif (sql_upper.startswith('SELECT *')
+                and 'WHERE _ID IN' in sql_upper
+                and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+                and ' NOT ' not in sql_upper
+                and ';' not in sql_upper):
+            _sig = 'batch_lookup'
         elif (sql_upper.startswith('SELECT *') and 'LIMIT' in sql_upper
                 and 'WHERE' not in sql_upper and 'ORDER' not in sql_upper
                 and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper):
@@ -908,7 +974,7 @@ class ApexClient:
                 pass
         elif _has_qualified_ref or sql_upper.startswith('WITH '):
             pass  # CTE or cross-db qualified refs don't need a selected table
-        elif _sig in ('count_star', 'point_lookup', 'scan_limit', 'like', 'complex'):
+        elif _sig in ('count_star', 'point_lookup', 'batch_lookup', 'scan_limit', 'like', 'complex'):
             self._ensure_table_selected()
 
         # ── Determine locking ──
@@ -921,8 +987,14 @@ class ApexClient:
             # ── COUNT(*): ultra-fast atomic read ──
             if _sig == 'count_star':
                 try:
+                    count_alias = _count_star_match.group(1) if _count_star_match else None
+                    count_table = _count_star_match.group(2) if _count_star_match else None
+                    if count_table and '.' in count_table:
+                        raise ValueError("qualified COUNT(*) uses the SQL executor")
+                    if count_table and self._current_table and count_table.lower() != self._current_table.lower():
+                        raise ValueError("non-current COUNT(*) table uses the SQL executor")
                     count = self._storage.fast_row_count()
-                    rv = ResultView(lazy_pydict={'COUNT(*)': [count]})
+                    rv = ResultView(lazy_pydict={count_alias or 'COUNT(*)': [count]})
                     rv._show_internal_id = False
                     return rv
                 except Exception:
@@ -930,6 +1002,23 @@ class ApexClient:
 
             # ── Point lookup: retrieve_rcix via execute() ──
             if _sig == 'point_lookup':
+                point_id = self._extract_point_lookup_id(sql)
+                if point_id is not None:
+                    try:
+                        row = self.retrieve(point_id)
+                        if row is None:
+                            rv = ResultView(data=None)
+                            rv._show_internal_id = show_internal_id
+                            return rv
+                        if not show_internal_id and '_id' in row:
+                            row = {k: v for k, v in row.items() if k != '_id'}
+                        rv = ResultView(data=[row])
+                        rv._show_internal_id = show_internal_id
+                        return rv
+                    except Exception:
+                        pass  # fall through to Rust execute()
+
+            if _sig in ('point_lookup', 'batch_lookup'):
                 try:
                     result = self._storage.execute(sql)
                     if result is not None:
@@ -955,7 +1044,7 @@ class ApexClient:
                     limit_val = int(sql_upper.rsplit('LIMIT', 1)[1].strip().rstrip(';'))
                 except (ValueError, IndexError):
                     limit_val = 999999
-                if limit_val <= 500:
+                if limit_val <= 10000:
                     try:
                         result = self._storage.execute(sql)
                         if result is not None:
@@ -1024,6 +1113,24 @@ class ApexClient:
                 rv = ResultView(arrow_table=table, data=None)
                 rv._show_internal_id = show_internal_id
                 return rv
+
+            if (not getattr(self, '_in_txn', False)
+                    and self._should_use_columnar_materialization(sql_upper, _sig)):
+                try:
+                    result = self._storage.execute(sql)
+                    if isinstance(result, dict):
+                        columns_dict = result.get('columns_dict')
+                        if columns_dict is not None:
+                            row_count = len(next(iter(columns_dict.values()), []))
+                            if row_count == 0:
+                                rv = ResultView(data=None)
+                                rv._show_internal_id = show_internal_id
+                                return rv
+                            rv = ResultView(lazy_pydict=columns_dict)
+                            rv._show_internal_id = show_internal_id
+                            return rv
+                except Exception:
+                    pass  # fall through to Arrow FFI
 
             # ── LIKE: zero-copy FFI scan ──
             if _sig == 'like' and not getattr(self, '_in_txn', False):

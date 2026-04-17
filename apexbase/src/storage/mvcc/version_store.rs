@@ -171,9 +171,8 @@ impl VersionChain {
         let original_len = self.versions.len();
         // Keep versions that might still be visible to any active snapshot
         // A version is removable if end_ts < oldest_active_ts
-        self.versions.retain(|v| {
-            v.is_latest() || v.end_ts > oldest_active_ts
-        });
+        self.versions
+            .retain(|v| v.is_latest() || v.end_ts > oldest_active_ts);
         // Always keep at least the latest version
         if self.versions.is_empty() {
             // This shouldn't happen due to is_latest() check, but be safe
@@ -227,7 +226,12 @@ impl VersionStore {
     }
 
     /// Update a row (adds new version to chain)
-    pub fn update(&self, row_id: u64, begin_ts: u64, data: HashMap<String, Value>) -> io::Result<()> {
+    pub fn update(
+        &self,
+        row_id: u64,
+        begin_ts: u64,
+        data: HashMap<String, Value>,
+    ) -> io::Result<()> {
         let mut chains = self.chains.write();
         let chain = chains.get_mut(&row_id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("Row {} not found", row_id))
@@ -253,7 +257,8 @@ impl VersionStore {
     /// Read a row at a specific snapshot timestamp
     pub fn read(&self, row_id: u64, snapshot_ts: u64) -> Option<HashMap<String, Value>> {
         let chains = self.chains.read();
-        chains.get(&row_id)
+        chains
+            .get(&row_id)
             .and_then(|chain| chain.get_visible(snapshot_ts))
             .map(|v| v.data.clone())
     }
@@ -261,7 +266,8 @@ impl VersionStore {
     /// Check if a row exists at a specific snapshot
     pub fn exists(&self, row_id: u64, snapshot_ts: u64) -> bool {
         let chains = self.chains.read();
-        chains.get(&row_id)
+        chains
+            .get(&row_id)
             .map(|chain| !chain.is_deleted_at(snapshot_ts))
             .unwrap_or(false)
     }
@@ -269,7 +275,8 @@ impl VersionStore {
     /// Get the latest version data for a row (for write operations)
     pub fn read_latest(&self, row_id: u64) -> Option<HashMap<String, Value>> {
         let chains = self.chains.read();
-        chains.get(&row_id)
+        chains
+            .get(&row_id)
             .and_then(|chain| chain.latest())
             .filter(|v| !v.is_delete)
             .map(|v| v.data.clone())
@@ -290,7 +297,8 @@ impl VersionStore {
                 false
             }
         });
-        self.total_versions.fetch_sub(removed as u64, Ordering::Relaxed);
+        self.total_versions
+            .fetch_sub(removed as u64, Ordering::Relaxed);
         removed
     }
 
@@ -406,9 +414,45 @@ mod tests {
         chain.add_version(RowVersion::new_update(20, make_row("v2", 2)));
         chain.add_version(RowVersion::new_update(30, make_row("v3", 3)));
 
-        assert_eq!(chain.get_visible(10).unwrap().data.get("name").unwrap().as_str(), Some("v1"));
-        assert_eq!(chain.get_visible(15).unwrap().data.get("name").unwrap().as_str(), Some("v1"));
-        assert_eq!(chain.get_visible(20).unwrap().data.get("name").unwrap().as_str(), Some("v2"));
-        assert_eq!(chain.get_visible(30).unwrap().data.get("name").unwrap().as_str(), Some("v3"));
+        assert_eq!(
+            chain
+                .get_visible(10)
+                .unwrap()
+                .data
+                .get("name")
+                .unwrap()
+                .as_str(),
+            Some("v1")
+        );
+        assert_eq!(
+            chain
+                .get_visible(15)
+                .unwrap()
+                .data
+                .get("name")
+                .unwrap()
+                .as_str(),
+            Some("v1")
+        );
+        assert_eq!(
+            chain
+                .get_visible(20)
+                .unwrap()
+                .data
+                .get("name")
+                .unwrap()
+                .as_str(),
+            Some("v2")
+        );
+        assert_eq!(
+            chain
+                .get_visible(30)
+                .unwrap()
+                .data
+                .get("name")
+                .unwrap()
+                .as_str(),
+            Some("v3")
+        );
     }
 }

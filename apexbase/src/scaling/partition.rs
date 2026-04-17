@@ -203,7 +203,9 @@ impl RangePartitioner {
     /// Create with evenly spaced integer boundaries
     pub fn for_int_range(min: i64, max: i64, shard_count: u32) -> Self {
         if shard_count <= 1 {
-            return Self { boundaries: Vec::new() };
+            return Self {
+                boundaries: Vec::new(),
+            };
         }
         let range = max - min;
         let step = range / shard_count as i64;
@@ -282,7 +284,11 @@ mod tests {
         }
         // Each shard should have roughly 2500 ± tolerance
         for &c in &counts {
-            assert!(c > 1500 && c < 3500, "Unbalanced distribution: {:?}", counts);
+            assert!(
+                c > 1500 && c < 3500,
+                "Unbalanced distribution: {:?}",
+                counts
+            );
         }
     }
 
@@ -315,7 +321,13 @@ mod tests {
 
     #[test]
     fn test_partition_key_from_value() {
-        assert_eq!(PartitionKey::from_value(&Value::Int64(42)), PartitionKey::Int(42));
-        assert_eq!(PartitionKey::from_value(&Value::String("hello".into())), PartitionKey::Str("hello".into()));
+        assert_eq!(
+            PartitionKey::from_value(&Value::Int64(42)),
+            PartitionKey::Int(42)
+        );
+        assert_eq!(
+            PartitionKey::from_value(&Value::String("hello".into())),
+            PartitionKey::Str("hello".into())
+        );
     }
 }

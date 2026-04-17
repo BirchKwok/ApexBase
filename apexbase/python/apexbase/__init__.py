@@ -256,8 +256,30 @@ class ResultView:
                 show_id = bool(getattr(self, "_show_internal_id", False))
                 d = self._lazy_pydict
                 keys = [k for k in d if show_id or k != '_id']
+                cols = [d[k] for k in keys]
                 n = len(next(iter(d.values()), []))
-                self._data = [{k: d[k][i] for k in keys} for i in range(n)]
+                # Common SQL result widths benefit from avoiding a per-row inner
+                # comprehension over column names during Python row materialization.
+                if len(keys) == 6:
+                    k0, k1, k2, k3, k4, k5 = keys
+                    c0, c1, c2, c3, c4, c5 = cols
+                    self._data = [
+                        {k0: c0[i], k1: c1[i], k2: c2[i], k3: c3[i], k4: c4[i], k5: c5[i]}
+                        for i in range(n)
+                    ]
+                elif len(keys) == 5:
+                    k0, k1, k2, k3, k4 = keys
+                    c0, c1, c2, c3, c4 = cols
+                    self._data = [
+                        {k0: c0[i], k1: c1[i], k2: c2[i], k3: c3[i], k4: c4[i]}
+                        for i in range(n)
+                    ]
+                elif len(keys) == 3:
+                    k0, k1, k2 = keys
+                    c0, c1, c2 = cols
+                    self._data = [{k0: c0[i], k1: c1[i], k2: c2[i]} for i in range(n)]
+                else:
+                    self._data = [{k: d[k][i] for k in keys} for i in range(n)]
                 return self._data
             self._ensure_arrow()
             if self._arrow_table is not None:
@@ -342,7 +364,8 @@ class ResultView:
         
         # Fallback
         df = pd.DataFrame(self._ensure_data())
-        if '_id' in df.columns:
+        show_id = bool(getattr(self, "_show_internal_id", False))
+        if not show_id and '_id' in df.columns:
             df.set_index('_id', inplace=True)
             df.index.name = None
         return df
@@ -395,12 +418,21 @@ class ResultView:
         self._ensure_arrow()
         if self._arrow_table is not None:
             return (self._arrow_table.num_rows, self._arrow_table.num_columns)
+        if self._data:
+            show_id = bool(getattr(self, "_show_internal_id", False))
+            cols = list(self._data[0].keys())
+            if not show_id and '_id' in cols:
+                cols.remove('_id')
+            return (len(self._data), len(cols))
         # When arrow_table is None (empty result), return (0, 0)
         return (0, 0)
     
     @property
     def columns(self):
         if self._lazy_pydict is not None:
+            show_id = bool(getattr(self, "_show_internal_id", False))
+            if show_id:
+                return list(self._lazy_pydict)
             return [c for c in self._lazy_pydict if c != '_id']
         if self._arrow_table is not None:
             cols = self._arrow_table.column_names
@@ -412,7 +444,8 @@ class ResultView:
         if not data:
             return []
         cols = list(data[0].keys())
-        if '_id' in cols:
+        show_id = bool(getattr(self, "_show_internal_id", False))
+        if not show_id and '_id' in cols:
             cols.remove('_id')
         return cols
     
@@ -504,4 +537,3 @@ from .client import ApexClient
 
 # Exports
 __all__ = ['ApexClient', 'ApexStorage', 'ResultView', 'DurabilityLevel', '__version__', 'FTS_AVAILABLE', 'ARROW_AVAILABLE', 'POLARS_AVAILABLE']
-

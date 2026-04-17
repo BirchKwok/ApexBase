@@ -8,13 +8,13 @@ use std::io;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array,
-    BooleanBuilder, Float64Builder, Int64Builder, StringBuilder, UInt64Builder,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder, Int64Array,
+    Int64Builder, StringArray, StringBuilder, UInt64Array, UInt64Builder,
 };
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use super::update_log::{DeltaStore, DeleteBitmap};
+use super::update_log::{DeleteBitmap, DeltaStore};
 use crate::data::Value;
 
 // ============================================================================
@@ -77,7 +77,7 @@ impl DeltaMerger {
         // Step 3: For each column, apply deletes and overlay updates
         let schema = base.schema();
         let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-        
+
         for (col_idx, field) in schema.fields().iter().enumerate() {
             let col_name = field.name();
             let base_col = base.column(col_idx);
@@ -141,15 +141,25 @@ impl DeltaMerger {
         delta: &DeltaStore,
     ) -> io::Result<ArrayRef> {
         match data_type {
-            ArrowDataType::Int64 => Self::merge_int64(base_col, col_name, kept_positions, base_row_ids, delta),
-            ArrowDataType::UInt64 => Self::merge_uint64(base_col, col_name, kept_positions, base_row_ids, delta),
-            ArrowDataType::Float64 => Self::merge_float64(base_col, col_name, kept_positions, base_row_ids, delta),
-            ArrowDataType::Utf8 => Self::merge_string(base_col, col_name, kept_positions, base_row_ids, delta),
-            ArrowDataType::Boolean => Self::merge_bool(base_col, col_name, kept_positions, base_row_ids, delta),
+            ArrowDataType::Int64 => {
+                Self::merge_int64(base_col, col_name, kept_positions, base_row_ids, delta)
+            }
+            ArrowDataType::UInt64 => {
+                Self::merge_uint64(base_col, col_name, kept_positions, base_row_ids, delta)
+            }
+            ArrowDataType::Float64 => {
+                Self::merge_float64(base_col, col_name, kept_positions, base_row_ids, delta)
+            }
+            ArrowDataType::Utf8 => {
+                Self::merge_string(base_col, col_name, kept_positions, base_row_ids, delta)
+            }
+            ArrowDataType::Boolean => {
+                Self::merge_bool(base_col, col_name, kept_positions, base_row_ids, delta)
+            }
             _ => {
                 // For unsupported types, just take the kept rows without updates
                 let indices = arrow::array::UInt32Array::from(
-                    kept_positions.iter().map(|&p| p as u32).collect::<Vec<_>>()
+                    kept_positions.iter().map(|&p| p as u32).collect::<Vec<_>>(),
                 );
                 arrow::compute::take(base_col, &indices, None)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
@@ -241,7 +251,8 @@ impl DeltaMerger {
         delta: &DeltaStore,
     ) -> io::Result<ArrayRef> {
         let arr = base_col.as_any().downcast_ref::<StringArray>().unwrap();
-        let mut builder = StringBuilder::with_capacity(kept_positions.len(), kept_positions.len() * 32);
+        let mut builder =
+            StringBuilder::with_capacity(kept_positions.len(), kept_positions.len() * 32);
         for &pos in kept_positions {
             let row_id = base_row_ids[pos];
             if let Some(updated) = delta.get_updated_value(row_id, col_name) {
@@ -301,7 +312,9 @@ mod tests {
         ]));
 
         let ids = Arc::new(UInt64Array::from(vec![0, 1, 2, 3, 4]));
-        let names = Arc::new(StringArray::from(vec!["alice", "bob", "carol", "dave", "eve"]));
+        let names = Arc::new(StringArray::from(vec![
+            "alice", "bob", "carol", "dave", "eve",
+        ]));
         let ages = Arc::new(Int64Array::from(vec![25, 30, 35, 40, 45]));
 
         let batch = RecordBatch::try_new(schema, vec![ids, names, ages]).unwrap();
@@ -321,7 +334,11 @@ mod tests {
         let merged = DeltaMerger::merge(&batch, &delta, &row_ids).unwrap();
         assert_eq!(merged.num_rows(), 3);
 
-        let names = merged.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let names = merged
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(names.value(0), "alice");
         assert_eq!(names.value(1), "carol");
         assert_eq!(names.value(2), "eve");
@@ -339,11 +356,19 @@ mod tests {
         let merged = DeltaMerger::merge(&batch, &delta, &row_ids).unwrap();
         assert_eq!(merged.num_rows(), 5);
 
-        let names = merged.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let names = merged
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(names.value(0), "alice_updated");
         assert_eq!(names.value(1), "bob");
 
-        let ages = merged.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ages = merged
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(ages.value(2), 99);
     }
 
@@ -359,7 +384,11 @@ mod tests {
         let merged = DeltaMerger::merge(&batch, &delta, &row_ids).unwrap();
         assert_eq!(merged.num_rows(), 4); // bob removed
 
-        let ages = merged.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ages = merged
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         // eve is at position 3 (after bob removed: alice, carol, dave, eve)
         assert_eq!(ages.value(3), 100);
     }

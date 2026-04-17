@@ -115,11 +115,7 @@ impl SnapshotManager {
         let mut active = self.active.write();
         active.remove(&snapshot_id);
         // Recalculate oldest active timestamp
-        let oldest = active
-            .values()
-            .map(|s| s.read_ts)
-            .min()
-            .unwrap_or(u64::MAX);
+        let oldest = active.values().map(|s| s.read_ts).min().unwrap_or(u64::MAX);
         self.oldest_active_ts.store(oldest, Ordering::SeqCst);
     }
 

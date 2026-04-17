@@ -295,7 +295,13 @@ impl IndexManager {
         unique: bool,
         data_type: DataType,
     ) -> io::Result<()> {
-        self.create_index_multi(name, &[column_name.to_string()], index_type, unique, data_type)
+        self.create_index_multi(
+            name,
+            &[column_name.to_string()],
+            index_type,
+            unique,
+            data_type,
+        )
     }
 
     /// Create a new index (supports single or multi-column)
@@ -361,8 +367,12 @@ impl IndexManager {
 
     /// Drop an index
     pub fn drop_index(&mut self, name: &str) -> io::Result<()> {
-        let meta = self.catalog.remove(name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Index '{}' not found", name)))?;
+        let meta = self.catalog.remove(name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Index '{}' not found", name),
+            )
+        })?;
 
         // Remove from column mapping
         if let Some(names) = self.column_index_map.get_mut(&meta.column_name) {
@@ -388,7 +398,11 @@ impl IndexManager {
     // ========================================================================
 
     /// Notify that a row was inserted
-    pub fn on_insert(&mut self, row_id: u64, column_values: &HashMap<String, Value>) -> io::Result<()> {
+    pub fn on_insert(
+        &mut self,
+        row_id: u64,
+        column_values: &HashMap<String, Value>,
+    ) -> io::Result<()> {
         // Collect unique index names that need updating
         let mut seen_indexes: std::collections::HashSet<String> = std::collections::HashSet::new();
         for col_name in column_values.keys() {
@@ -399,8 +413,15 @@ impl IndexManager {
             }
         }
         for idx_name in &seen_indexes {
-            let cols = self.catalog.get(idx_name)
-                .map(|m| m.effective_columns().iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            let cols = self
+                .catalog
+                .get(idx_name)
+                .map(|m| {
+                    m.effective_columns()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
             if let Some(key) = composite_key(&cols, column_values) {
                 let instance = self.ensure_loaded(idx_name)?;
@@ -421,8 +442,15 @@ impl IndexManager {
             }
         }
         for idx_name in &seen_indexes {
-            let cols = self.catalog.get(idx_name)
-                .map(|m| m.effective_columns().iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            let cols = self
+                .catalog
+                .get(idx_name)
+                .map(|m| {
+                    m.effective_columns()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
             if let Some(key) = composite_key(&cols, column_values) {
                 if let Some(instance) = self.instances.get_mut(idx_name.as_str()) {
@@ -487,7 +515,10 @@ impl IndexManager {
         let row_ids = match predicate {
             PredicateHint::Eq(val) => {
                 let key = IndexKey::from_value(val);
-                instance.get(&key).map(|ids| ids.to_vec()).unwrap_or_default()
+                instance
+                    .get(&key)
+                    .map(|ids| ids.to_vec())
+                    .unwrap_or_default()
             }
             PredicateHint::Range { low, high } => {
                 match instance {
@@ -499,42 +530,34 @@ impl IndexManager {
                     IndexInstance::Hash(_) => return Ok(None), // Hash can't do range
                 }
             }
-            PredicateHint::Gt(val) => {
-                match instance {
-                    IndexInstance::BTree(bt) => {
-                        let key = IndexKey::from_value(val);
-                        bt.greater_than(&key)
-                    }
-                    IndexInstance::Hash(_) => return Ok(None),
+            PredicateHint::Gt(val) => match instance {
+                IndexInstance::BTree(bt) => {
+                    let key = IndexKey::from_value(val);
+                    bt.greater_than(&key)
                 }
-            }
-            PredicateHint::Gte(val) => {
-                match instance {
-                    IndexInstance::BTree(bt) => {
-                        let key = IndexKey::from_value(val);
-                        bt.greater_than_or_equal(&key)
-                    }
-                    IndexInstance::Hash(_) => return Ok(None),
+                IndexInstance::Hash(_) => return Ok(None),
+            },
+            PredicateHint::Gte(val) => match instance {
+                IndexInstance::BTree(bt) => {
+                    let key = IndexKey::from_value(val);
+                    bt.greater_than_or_equal(&key)
                 }
-            }
-            PredicateHint::Lt(val) => {
-                match instance {
-                    IndexInstance::BTree(bt) => {
-                        let key = IndexKey::from_value(val);
-                        bt.less_than(&key)
-                    }
-                    IndexInstance::Hash(_) => return Ok(None),
+                IndexInstance::Hash(_) => return Ok(None),
+            },
+            PredicateHint::Lt(val) => match instance {
+                IndexInstance::BTree(bt) => {
+                    let key = IndexKey::from_value(val);
+                    bt.less_than(&key)
                 }
-            }
-            PredicateHint::Lte(val) => {
-                match instance {
-                    IndexInstance::BTree(bt) => {
-                        let key = IndexKey::from_value(val);
-                        bt.less_than_or_equal(&key)
-                    }
-                    IndexInstance::Hash(_) => return Ok(None),
+                IndexInstance::Hash(_) => return Ok(None),
+            },
+            PredicateHint::Lte(val) => match instance {
+                IndexInstance::BTree(bt) => {
+                    let key = IndexKey::from_value(val);
+                    bt.less_than_or_equal(&key)
                 }
-            }
+                IndexInstance::Hash(_) => return Ok(None),
+            },
             PredicateHint::In(vals) => {
                 let mut result = Vec::new();
                 for val in vals {
@@ -592,14 +615,22 @@ impl IndexManager {
             IndexType::BTree => "btidx",
             IndexType::Hash => "hashidx",
         };
-        self.base_dir.join(format!("{}_{}.{}", self.table_name, name, ext))
+        self.base_dir
+            .join(format!("{}_{}.{}", self.table_name, name, ext))
     }
 
     /// Ensure an index instance is loaded into memory
     fn ensure_loaded(&mut self, name: &str) -> io::Result<&mut IndexInstance> {
         if !self.instances.contains_key(name) {
-            let meta = self.catalog.get(name)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("Index '{}' not found", name)))?
+            let meta = self
+                .catalog
+                .get(name)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("Index '{}' not found", name),
+                    )
+                })?
                 .clone();
             let path = self.index_file_path(name, meta.index_type);
             let instance = if path.exists() {
@@ -609,12 +640,16 @@ impl IndexManager {
                 }
             } else {
                 match meta.index_type {
-                    IndexType::BTree => {
-                        IndexInstance::BTree(BTreeIndex::with_path(&meta.column_name, meta.unique, path))
-                    }
-                    IndexType::Hash => {
-                        IndexInstance::Hash(HashIndex::with_path(&meta.column_name, meta.unique, path))
-                    }
+                    IndexType::BTree => IndexInstance::BTree(BTreeIndex::with_path(
+                        &meta.column_name,
+                        meta.unique,
+                        path,
+                    )),
+                    IndexType::Hash => IndexInstance::Hash(HashIndex::with_path(
+                        &meta.column_name,
+                        meta.unique,
+                        path,
+                    )),
                 }
             };
             self.instances.insert(name.to_string(), instance);
@@ -623,7 +658,11 @@ impl IndexManager {
     }
 
     /// Select the best index for a predicate
-    fn select_best_index(&self, index_names: &[String], predicate: &PredicateHint) -> Option<String> {
+    fn select_best_index(
+        &self,
+        index_names: &[String],
+        predicate: &PredicateHint,
+    ) -> Option<String> {
         match predicate {
             PredicateHint::Eq(_) | PredicateHint::In(_) => {
                 // Prefer hash index for equality, fall back to btree
@@ -670,7 +709,8 @@ mod tests {
         let mut mgr = IndexManager::new("test_table", dir.path());
 
         // Create a hash index on _id
-        mgr.create_index("idx_id", "_id", IndexType::Hash, true, DataType::UInt64).unwrap();
+        mgr.create_index("idx_id", "_id", IndexType::Hash, true, DataType::UInt64)
+            .unwrap();
 
         // Insert some data
         let mut row = HashMap::new();
@@ -681,7 +721,9 @@ mod tests {
         mgr.on_insert(1, &row).unwrap();
 
         // Lookup
-        let result = mgr.lookup("_id", &PredicateHint::Eq(Value::UInt64(1))).unwrap();
+        let result = mgr
+            .lookup("_id", &PredicateHint::Eq(Value::UInt64(1)))
+            .unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().row_ids, vec![0]);
     }
@@ -691,7 +733,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = IndexManager::new("test_table", dir.path());
 
-        mgr.create_index("idx_age", "age", IndexType::BTree, false, DataType::Int64).unwrap();
+        mgr.create_index("idx_age", "age", IndexType::BTree, false, DataType::Int64)
+            .unwrap();
 
         for i in 0..100 {
             let mut row = HashMap::new();
@@ -699,10 +742,15 @@ mod tests {
             mgr.on_insert(i as u64, &row).unwrap();
         }
 
-        let result = mgr.lookup("age", &PredicateHint::Range {
-            low: Value::Int64(10),
-            high: Value::Int64(20),
-        }).unwrap();
+        let result = mgr
+            .lookup(
+                "age",
+                &PredicateHint::Range {
+                    low: Value::Int64(10),
+                    high: Value::Int64(20),
+                },
+            )
+            .unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().row_ids.len(), 11);
     }
@@ -713,7 +761,14 @@ mod tests {
 
         {
             let mut mgr = IndexManager::new("test_table", dir.path());
-            mgr.create_index("idx_name", "name", IndexType::BTree, false, DataType::String).unwrap();
+            mgr.create_index(
+                "idx_name",
+                "name",
+                IndexType::BTree,
+                false,
+                DataType::String,
+            )
+            .unwrap();
 
             let mut row = HashMap::new();
             row.insert("name".to_string(), Value::String("alice".into()));
@@ -726,7 +781,9 @@ mod tests {
         let mut mgr = IndexManager::load("test_table", dir.path()).unwrap();
         assert!(mgr.has_index_on("name"));
 
-        let result = mgr.lookup("name", &PredicateHint::Eq(Value::String("alice".into()))).unwrap();
+        let result = mgr
+            .lookup("name", &PredicateHint::Eq(Value::String("alice".into())))
+            .unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().row_ids, vec![0]);
     }
@@ -735,7 +792,8 @@ mod tests {
     fn test_index_manager_drop() {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = IndexManager::new("test_table", dir.path());
-        mgr.create_index("idx_x", "x", IndexType::Hash, false, DataType::Int64).unwrap();
+        mgr.create_index("idx_x", "x", IndexType::Hash, false, DataType::Int64)
+            .unwrap();
         assert!(mgr.has_index_on("x"));
 
         mgr.drop_index("idx_x").unwrap();

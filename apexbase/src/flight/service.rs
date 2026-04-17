@@ -10,10 +10,9 @@
 use std::path::PathBuf;
 
 use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint,
-    FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
-    encode::FlightDataEncoderBuilder,
-    flight_service_server::FlightService,
+    encode::FlightDataEncoderBuilder, flight_service_server::FlightService, Action, ActionType,
+    Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
+    HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
@@ -32,15 +31,15 @@ fn invalid(msg: impl Into<String>) -> Status {
 }
 
 /// Execute SQL via ApexExecutor, return RecordBatch. Runs synchronously (for spawn_blocking).
-fn execute_sql(
-    sql: &str,
-    base_dir: &PathBuf,
-) -> Result<arrow::record_batch::RecordBatch, Status> {
+fn execute_sql(sql: &str, base_dir: &PathBuf) -> Result<arrow::record_batch::RecordBatch, Status> {
     let default_table_path = base_dir.join("apexbase.apex");
     crate::query::executor::set_query_root_dir(base_dir);
     let result = ApexExecutor::execute_with_base_dir(sql, base_dir, &default_table_path);
     crate::query::executor::clear_query_root_dir();
-    result.map_err(apex_err)?.to_record_batch().map_err(apex_err)
+    result
+        .map_err(apex_err)?
+        .to_record_batch()
+        .map_err(apex_err)
 }
 
 /// Encode a RecordBatch as a stream of Arrow IPC FlightData messages.
@@ -55,14 +54,12 @@ fn batch_to_flight_data(
 }
 
 /// Encode an Arrow Schema as IPC bytes (for FlightInfo / SchemaResult).
-fn schema_ipc_bytes(
-    schema: &arrow::datatypes::Schema,
-) -> Result<bytes::Bytes, Status> {
+fn schema_ipc_bytes(schema: &arrow::datatypes::Schema) -> Result<bytes::Bytes, Status> {
     let ipc_opts = arrow::ipc::writer::IpcWriteOptions::default();
     let data_gen = arrow::ipc::writer::IpcDataGenerator::default();
     let mut dict_tracker = arrow::ipc::writer::DictionaryTracker::new(false);
-    let encoded = data_gen
-        .schema_to_bytes_with_dictionary_tracker(schema, &mut dict_tracker, &ipc_opts);
+    let encoded =
+        data_gen.schema_to_bytes_with_dictionary_tracker(schema, &mut dict_tracker, &ipc_opts);
     Ok(encoded.ipc_message.into())
 }
 
@@ -80,13 +77,13 @@ impl ApexFlightService {
 
 #[tonic::async_trait]
 impl FlightService for ApexFlightService {
-    type HandshakeStream    = BoxStream<'static, Result<HandshakeResponse, Status>>;
-    type ListFlightsStream  = BoxStream<'static, Result<FlightInfo, Status>>;
-    type DoGetStream        = BoxStream<'static, Result<FlightData, Status>>;
-    type DoPutStream        = BoxStream<'static, Result<PutResult, Status>>;
-    type DoExchangeStream   = BoxStream<'static, Result<FlightData, Status>>;
-    type DoActionStream     = BoxStream<'static, Result<arrow_flight::Result, Status>>;
-    type ListActionsStream  = BoxStream<'static, Result<ActionType, Status>>;
+    type HandshakeStream = BoxStream<'static, Result<HandshakeResponse, Status>>;
+    type ListFlightsStream = BoxStream<'static, Result<FlightInfo, Status>>;
+    type DoGetStream = BoxStream<'static, Result<FlightData, Status>>;
+    type DoPutStream = BoxStream<'static, Result<PutResult, Status>>;
+    type DoExchangeStream = BoxStream<'static, Result<FlightData, Status>>;
+    type DoActionStream = BoxStream<'static, Result<arrow_flight::Result, Status>>;
+    type ListActionsStream = BoxStream<'static, Result<ActionType, Status>>;
 
     // ── handshake (no-auth passthrough) ──────────────────────────────────────
     async fn handshake(
@@ -124,7 +121,9 @@ impl FlightService for ApexFlightService {
             .map_err(apex_err)??;
 
         let schema_bytes = schema_ipc_bytes(batch.schema_ref())?;
-        let ticket = Ticket { ticket: descriptor.cmd.clone().into() };
+        let ticket = Ticket {
+            ticket: descriptor.cmd.clone().into(),
+        };
         let endpoint = FlightEndpoint {
             ticket: Some(ticket),
             location: vec![],
@@ -173,14 +172,13 @@ impl FlightService for ApexFlightService {
             .map_err(apex_err)??;
 
         let schema_bytes = schema_ipc_bytes(batch.schema_ref())?;
-        Ok(Response::new(SchemaResult { schema: schema_bytes }))
+        Ok(Response::new(SchemaResult {
+            schema: schema_bytes,
+        }))
     }
 
     // ── do_get: execute SQL, stream results as Arrow IPC ─────────────────────
-    async fn do_get(
-        &self,
-        req: Request<Ticket>,
-    ) -> Result<Response<Self::DoGetStream>, Status> {
+    async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = req.into_inner();
         let sql = std::str::from_utf8(&ticket.ticket)
             .map_err(|_| invalid("Ticket must be valid UTF-8 SQL"))?
@@ -245,12 +243,11 @@ impl FlightService for ApexFlightService {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        let actions = vec![
-            ActionType {
-                r#type: "sql".to_string(),
-                description: "Execute DML/DDL. Body = UTF-8 SQL. Returns {affected_rows:N}.".to_string(),
-            },
-        ];
+        let actions = vec![ActionType {
+            r#type: "sql".to_string(),
+            description: "Execute DML/DDL. Body = UTF-8 SQL. Returns {affected_rows:N}."
+                .to_string(),
+        }];
         let stream = futures::stream::iter(actions.into_iter().map(Ok)).boxed();
         Ok(Response::new(stream))
     }

@@ -16,7 +16,7 @@ use super::conflict::{ConflictDetector, ConflictResult};
 use super::context::TxnContext;
 use crate::storage::mvcc::gc::GarbageCollector;
 use crate::storage::mvcc::snapshot::{Snapshot, SnapshotManager};
-use crate::storage::mvcc::version_store::{VersionStore, next_timestamp};
+use crate::storage::mvcc::version_store::{next_timestamp, VersionStore};
 
 // ============================================================================
 // Global TxnManager Singleton
@@ -139,7 +139,8 @@ impl TxnManager {
             }
         }
         let mut stores = self.version_stores.write();
-        stores.entry(table.to_string())
+        stores
+            .entry(table.to_string())
             .or_insert_with(|| Arc::new(VersionStore::new()))
             .clone()
     }
@@ -165,13 +166,16 @@ impl TxnManager {
         let context = TxnContext::new(txn_id, snapshot.read_ts, false);
 
         let now = Instant::now();
-        self.active_txns.write().insert(txn_id, ActiveTxn {
-            context,
-            snapshot: snapshot.clone(),
-            status: TxnStatus::Active,
-            started_at: now,
-            last_activity: now,
-        });
+        self.active_txns.write().insert(
+            txn_id,
+            ActiveTxn {
+                context,
+                snapshot: snapshot.clone(),
+                status: TxnStatus::Active,
+                started_at: now,
+                last_activity: now,
+            },
+        );
 
         // Opportunistically abort timed-out transactions
         self.abort_timed_out_txns();
@@ -186,13 +190,16 @@ impl TxnManager {
         let context = TxnContext::new(txn_id, snapshot.read_ts, true);
 
         let now = Instant::now();
-        self.active_txns.write().insert(txn_id, ActiveTxn {
-            context,
-            snapshot: snapshot.clone(),
-            status: TxnStatus::Active,
-            started_at: now,
-            last_activity: now,
-        });
+        self.active_txns.write().insert(
+            txn_id,
+            ActiveTxn {
+                context,
+                snapshot: snapshot.clone(),
+                status: TxnStatus::Active,
+                started_at: now,
+                last_activity: now,
+            },
+        );
 
         txn_id
     }
@@ -208,13 +215,19 @@ impl TxnManager {
     pub fn commit(&self, txn_id: TxnId) -> io::Result<()> {
         let mut txns = self.active_txns.write();
         let txn = txns.get_mut(&txn_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Transaction {} not found", txn_id))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Transaction {} not found", txn_id),
+            )
         })?;
 
         if txn.status != TxnStatus::Active {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Transaction {} is not active (status: {:?})", txn_id, txn.status),
+                format!(
+                    "Transaction {} is not active (status: {:?})",
+                    txn_id, txn.status
+                ),
             ));
         }
 
@@ -249,7 +262,8 @@ impl TxnManager {
 
         // Commit successful
         let commit_ts = next_timestamp();
-        self.conflict_detector.record_commit(&txn.context, commit_ts);
+        self.conflict_detector
+            .record_commit(&txn.context, commit_ts);
 
         // Extract write set for VersionStore recording before removing context
         let writes = txn.context.write_set().to_vec();
@@ -264,11 +278,21 @@ impl TxnManager {
         for write in &writes {
             use crate::txn::context::TxnWrite;
             match write {
-                TxnWrite::Insert { table, row_id, data, .. } => {
+                TxnWrite::Insert {
+                    table,
+                    row_id,
+                    data,
+                    ..
+                } => {
                     let store = self.get_version_store(table);
                     store.insert(*row_id, commit_ts, data.clone());
                 }
-                TxnWrite::Delete { table, row_id, old_data, .. } => {
+                TxnWrite::Delete {
+                    table,
+                    row_id,
+                    old_data,
+                    ..
+                } => {
                     let store = self.get_version_store(table);
                     // Ensure base version exists so older snapshots can see the row
                     if store.read_latest(*row_id).is_none() && !old_data.is_empty() {
@@ -276,7 +300,13 @@ impl TxnManager {
                     }
                     let _ = store.delete(*row_id, commit_ts);
                 }
-                TxnWrite::Update { table, row_id, old_data, new_data, .. } => {
+                TxnWrite::Update {
+                    table,
+                    row_id,
+                    old_data,
+                    new_data,
+                    ..
+                } => {
                     let store = self.get_version_store(table);
                     // Ensure base version exists so older snapshots can see old data
                     if store.read_latest(*row_id).is_none() && !old_data.is_empty() {
@@ -308,7 +338,10 @@ impl TxnManager {
     pub fn rollback(&self, txn_id: TxnId) -> io::Result<()> {
         let mut txns = self.active_txns.write();
         let txn = txns.get_mut(&txn_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Transaction {} not found", txn_id))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Transaction {} not found", txn_id),
+            )
         })?;
 
         txn.status = TxnStatus::Aborted;
@@ -332,7 +365,10 @@ impl TxnManager {
     pub fn get_snapshot_ts(&self, txn_id: TxnId) -> io::Result<u64> {
         let txns = self.active_txns.read();
         let txn = txns.get(&txn_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Transaction {} not found", txn_id))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Transaction {} not found", txn_id),
+            )
         })?;
         Ok(txn.snapshot.read_ts)
     }
@@ -345,7 +381,12 @@ impl TxnManager {
     }
 
     /// Read a row's visible version for a transaction
-    pub fn read_versioned(&self, txn_id: TxnId, table: &str, row_id: u64) -> io::Result<Option<HashMap<String, crate::data::Value>>> {
+    pub fn read_versioned(
+        &self,
+        txn_id: TxnId,
+        table: &str,
+        row_id: u64,
+    ) -> io::Result<Option<HashMap<String, crate::data::Value>>> {
         let snapshot_ts = self.get_snapshot_ts(txn_id)?;
         let store = self.get_version_store(table);
         Ok(store.read(row_id, snapshot_ts))
@@ -359,7 +400,10 @@ impl TxnManager {
     {
         let mut txns = self.active_txns.write();
         let txn = txns.get_mut(&txn_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("Transaction {} not found", txn_id))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Transaction {} not found", txn_id),
+            )
         })?;
         if txn.status != TxnStatus::Active {
             return Err(io::Error::new(
@@ -379,7 +423,10 @@ impl TxnManager {
             self.total_aborted.fetch_add(1, Ordering::Relaxed);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("Transaction {} timed out (idle > {:?})", txn_id, self.txn_timeout),
+                format!(
+                    "Transaction {} timed out (idle > {:?})",
+                    txn_id, self.txn_timeout
+                ),
             ));
         }
         // Refresh last activity timestamp
@@ -408,7 +455,8 @@ impl TxnManager {
 
     /// Check if a transaction is active
     pub fn is_active(&self, txn_id: TxnId) -> bool {
-        self.active_txns.read()
+        self.active_txns
+            .read()
             .get(&txn_id)
             .map(|t| t.status == TxnStatus::Active)
             .unwrap_or(false)
@@ -416,7 +464,8 @@ impl TxnManager {
 
     /// Check if a specific transaction has timed out
     pub fn is_timed_out(&self, txn_id: TxnId) -> bool {
-        self.active_txns.read()
+        self.active_txns
+            .read()
             .get(&txn_id)
             .map(|t| t.last_activity.elapsed() > self.txn_timeout)
             .unwrap_or(false)
@@ -426,8 +475,11 @@ impl TxnManager {
     /// Called opportunistically from begin() to prevent leaked snapshots.
     fn abort_timed_out_txns(&self) {
         let mut txns = self.active_txns.write();
-        let timed_out: Vec<TxnId> = txns.iter()
-            .filter(|(_, t)| t.status == TxnStatus::Active && t.last_activity.elapsed() > self.txn_timeout)
+        let timed_out: Vec<TxnId> = txns
+            .iter()
+            .filter(|(_, t)| {
+                t.status == TxnStatus::Active && t.last_activity.elapsed() > self.txn_timeout
+            })
             .map(|(id, _)| *id)
             .collect();
         for txn_id in timed_out {
@@ -488,7 +540,8 @@ mod tests {
 
         mgr.with_context(txn_id, |ctx| {
             ctx.buffer_insert("users", 0, make_row("alice"))
-        }).unwrap();
+        })
+        .unwrap();
 
         mgr.rollback(txn_id).unwrap();
         assert_eq!(mgr.total_aborted(), 1);
@@ -502,7 +555,8 @@ mod tests {
         mgr.with_context(txn_id, |ctx| {
             ctx.record_read("users", 0, 50);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         mgr.commit(txn_id).unwrap();
         assert_eq!(mgr.total_committed(), 1);
@@ -517,14 +571,14 @@ mod tests {
         let txn2 = mgr.begin();
 
         // Txn 1: write row 0
-        mgr.with_context(txn1, |ctx| {
-            ctx.buffer_insert("users", 0, make_row("alice"))
-        }).unwrap();
+        mgr.with_context(txn1, |ctx| ctx.buffer_insert("users", 0, make_row("alice")))
+            .unwrap();
 
         // Txn 2: also write row 0
         mgr.with_context(txn2, |ctx| {
             ctx.buffer_update("users", 0, make_row("alice"), make_row("alice2"))
-        }).unwrap();
+        })
+        .unwrap();
 
         // Txn 1 commits first (succeeds)
         mgr.commit(txn1).unwrap();
@@ -543,13 +597,11 @@ mod tests {
         let txn2 = mgr.begin();
 
         // Write to different rows
-        mgr.with_context(txn1, |ctx| {
-            ctx.buffer_insert("users", 0, make_row("alice"))
-        }).unwrap();
+        mgr.with_context(txn1, |ctx| ctx.buffer_insert("users", 0, make_row("alice")))
+            .unwrap();
 
-        mgr.with_context(txn2, |ctx| {
-            ctx.buffer_insert("users", 1, make_row("bob"))
-        }).unwrap();
+        mgr.with_context(txn2, |ctx| ctx.buffer_insert("users", 1, make_row("bob")))
+            .unwrap();
 
         mgr.commit(txn1).unwrap();
         mgr.commit(txn2).unwrap();

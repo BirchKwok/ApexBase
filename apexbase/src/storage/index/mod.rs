@@ -24,4 +24,4 @@ pub mod index_manager;
 
 pub use btree::BTreeIndex;
 pub use hash_index::HashIndex;
-pub use index_manager::{IndexManager, IndexType, IndexMeta};
+pub use index_manager::{IndexManager, IndexMeta, IndexType};
