@@ -173,6 +173,8 @@ pub struct ApexStorageImpl {
     /// Backends are opened once and reused for all operations
     /// Uses DashMap for lock-free concurrent reads
     cached_backends: DashMap<String, Arc<TableStorageBackend>>,
+    /// Verified `(table, column) -> ColumnType` entries for numeric `_id` update fast paths.
+    update_by_id_numeric_cache: DashMap<String, crate::storage::on_demand::ColumnType>,
     /// Current table name
     current_table: RwLock<String>,
     /// FTS Manager (optional) — Arc so it can be shared with the global SQL executor registry
@@ -191,6 +193,16 @@ pub struct ApexStorageImpl {
 
 /// Internal Rust-only methods (not exposed to Python)
 impl ApexStorageImpl {
+    #[inline]
+    fn backend_cache_key(table_path: &std::path::Path, table_name: &str) -> String {
+        format!("{}\0{}", table_path.to_string_lossy(), table_name)
+    }
+
+    #[inline]
+    fn insert_backend_cache_key(table_path: &std::path::Path, table_name: &str) -> String {
+        format!("{}\0{}\0insert", table_path.to_string_lossy(), table_name)
+    }
+
     /// Get the lock file path for a table
     #[inline]
     fn get_lock_path(table_path: &Path) -> PathBuf {
@@ -439,7 +451,7 @@ impl ApexStorageImpl {
     fn get_backend_for_insert(&self) -> PyResult<Arc<TableStorageBackend>> {
         let table_name = self.current_table.read().clone();
         let table_path = self.get_current_table_path()?;
-        let cache_key = format!("{}_insert", table_name);
+        let cache_key = Self::insert_backend_cache_key(&table_path, &table_name);
 
         // Check if backend is already cached (lock-free read)
         if let Some(entry) = self.cached_backends.get(&cache_key) {
@@ -466,9 +478,10 @@ impl ApexStorageImpl {
     fn get_backend(&self) -> PyResult<Arc<TableStorageBackend>> {
         let table_name = self.current_table.read().clone();
         let table_path = self.get_current_table_path()?;
+        let cache_key = Self::backend_cache_key(&table_path, &table_name);
 
         // Check if backend is already cached (lock-free read)
-        if let Some(entry) = self.cached_backends.get(&table_name) {
+        if let Some(entry) = self.cached_backends.get(&cache_key) {
             return Ok(entry.clone());
         }
 
@@ -484,7 +497,7 @@ impl ApexStorageImpl {
         };
 
         let backend = Arc::new(backend);
-        self.cached_backends.insert(table_name, backend.clone());
+        self.cached_backends.insert(cache_key, backend.clone());
 
         Ok(backend)
     }
@@ -494,6 +507,15 @@ impl ApexStorageImpl {
         self.cached_backends.remove(table_name);
         self.cached_backends
             .remove(&format!("{}_insert", table_name));
+        let table_suffix = format!("\0{table_name}");
+        let insert_suffix = format!("\0{table_name}\0insert");
+        self.cached_backends
+            .retain(|key, _| !(key.ends_with(&table_suffix) || key.ends_with(&insert_suffix)));
+        let update_cache_marker = format!("\0{table_name}\0");
+        let legacy_prefix = format!("{table_name}\0");
+        self.update_by_id_numeric_cache.retain(|key, _| {
+            !(key.starts_with(&legacy_prefix) || key.contains(&update_cache_marker))
+        });
     }
 
     /// Return current base directory (root_dir for default db, root_dir/db for named db)
@@ -567,6 +589,7 @@ impl ApexStorageImpl {
             table_paths: RwLock::new(HashMap::new()),
             tables_scanned: RwLock::new(false),
             cached_backends: DashMap::new(),
+            update_by_id_numeric_cache: DashMap::new(),
             current_table: RwLock::new(String::new()),
             fts_manager: RwLock::new(None::<Arc<FtsManager>>),
             fts_index_fields: RwLock::new(HashMap::new()),
@@ -756,6 +779,309 @@ impl ApexStorageImpl {
     ///     
     /// Returns:
     ///     List[int] - list of generated IDs
+    fn store_one(&self, py: Python<'_>, row: &Bound<'_, PyDict>) -> PyResult<Vec<i64>> {
+        if row.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
+        let mut binary_columns_map: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut fixedlist_columns_map: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
+        let mut null_positions: HashMap<String, Vec<bool>> = HashMap::new();
+
+        for (key, value) in row.iter() {
+            let col_name: String = key.extract()?;
+            if col_name == "_id" {
+                continue;
+            }
+
+            if value.is_none() {
+                string_columns.insert(col_name.clone(), vec![String::new()]);
+                null_positions.insert(col_name, vec![true]);
+            } else if let Ok(v) = value.extract::<bool>() {
+                bool_columns.insert(col_name.clone(), vec![v]);
+                null_positions.insert(col_name, vec![false]);
+            } else if let Ok(v) = value.extract::<i64>() {
+                int_columns.insert(col_name.clone(), vec![v]);
+                null_positions.insert(col_name, vec![false]);
+            } else if let Ok(v) = value.extract::<f64>() {
+                float_columns.insert(col_name.clone(), vec![v]);
+                null_positions.insert(col_name, vec![false]);
+            } else if let Ok(bytes) = value.extract::<Vec<u8>>() {
+                binary_columns_map.insert(col_name.clone(), vec![bytes]);
+                null_positions.insert(col_name, vec![false]);
+            } else if value
+                .get_type()
+                .name()
+                .map(|n| n == "ndarray")
+                .unwrap_or(false)
+            {
+                if let Ok(bytes) = value
+                    .call_method0("flatten")
+                    .and_then(|flat| flat.call_method1("astype", ("float32",)))
+                    .and_then(|f32arr| f32arr.call_method0("tobytes"))
+                    .and_then(|b| b.extract::<Vec<u8>>())
+                {
+                    fixedlist_columns_map.insert(col_name.clone(), vec![bytes]);
+                    null_positions.insert(col_name, vec![false]);
+                } else {
+                    string_columns.insert(
+                        col_name.clone(),
+                        vec![value.extract::<String>().unwrap_or_default()],
+                    );
+                    null_positions.insert(col_name, vec![false]);
+                }
+            } else {
+                string_columns.insert(
+                    col_name.clone(),
+                    vec![value.extract::<String>().unwrap_or_default()],
+                );
+                null_positions.insert(col_name, vec![false]);
+            }
+        }
+
+        if int_columns.is_empty()
+            && float_columns.is_empty()
+            && string_columns.is_empty()
+            && binary_columns_map.is_empty()
+            && fixedlist_columns_map.is_empty()
+            && bool_columns.is_empty()
+        {
+            return Ok(Vec::new());
+        }
+
+        let (table_path, table_name) = self.get_current_table_info()?;
+        let durability = self.durability;
+        let result = py.allow_threads(|| {
+            crate::storage::engine::engine()
+                .write_typed(
+                    &table_path,
+                    int_columns,
+                    float_columns,
+                    string_columns,
+                    binary_columns_map,
+                    fixedlist_columns_map,
+                    bool_columns,
+                    null_positions,
+                    durability,
+                )
+                .map_err(|e| PyIOError::new_err(e.to_string()))
+        })?;
+
+        self.invalidate_backend(&table_name);
+        #[cfg(target_os = "windows")]
+        crate::storage::engine::engine().invalidate(&table_path);
+
+        Ok(result.into_iter().map(|id| id as i64).collect())
+    }
+
+    /// Experimental storage-level memtable append for one schema-stable row.
+    ///
+    /// The row is immediately visible through this storage instance and is
+    /// persisted by flush()/close(). It is intentionally narrow and opt-in from
+    /// Python until cross-client visibility semantics are fully settled.
+    fn store_one_memtable(
+        &self,
+        py: Python<'_>,
+        row: &Bound<'_, PyDict>,
+    ) -> PyResult<Option<Vec<i64>>> {
+        if row.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let (table_path, table_name) = self.get_current_table_info()?;
+        let base_dir = table_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+
+        if let Ok(index_mgr) = crate::storage::index::IndexManager::load(&table_name, &base_dir) {
+            if !index_mgr.catalog_is_empty() {
+                return Ok(None);
+            }
+        }
+
+        let backend = self.get_backend_for_insert()?;
+        if !backend.storage.is_v4_format() || backend.storage.has_constraints() {
+            return Ok(None);
+        }
+
+        let schema = backend.storage.get_schema();
+        if schema.is_empty() {
+            return Ok(None);
+        }
+        let schema_cols: std::collections::HashSet<&str> =
+            schema.iter().map(|(name, _)| name.as_str()).collect();
+
+        let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
+        let mut binary_columns_map: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let fixedlist_columns_map: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
+        let mut null_positions: HashMap<String, Vec<bool>> = HashMap::new();
+        let mut field_count = 0usize;
+
+        for (key, value) in row.iter() {
+            let col_name: String = key.extract()?;
+            if col_name == "_id" {
+                continue;
+            }
+            if !schema_cols.contains(col_name.as_str()) {
+                return Ok(None);
+            }
+            field_count += 1;
+
+            if value.is_none() {
+                string_columns.insert(col_name.clone(), vec![String::new()]);
+                null_positions.insert(col_name, vec![true]);
+            } else if let Ok(v) = value.extract::<bool>() {
+                bool_columns.insert(col_name.clone(), vec![v]);
+                null_positions.insert(col_name, vec![false]);
+            } else if let Ok(v) = value.extract::<i64>() {
+                int_columns.insert(col_name.clone(), vec![v]);
+                null_positions.insert(col_name, vec![false]);
+            } else if let Ok(v) = value.extract::<f64>() {
+                float_columns.insert(col_name.clone(), vec![v]);
+                null_positions.insert(col_name, vec![false]);
+            } else if let Ok(bytes) = value.extract::<Vec<u8>>() {
+                binary_columns_map.insert(col_name.clone(), vec![bytes]);
+                null_positions.insert(col_name, vec![false]);
+            } else {
+                string_columns.insert(
+                    col_name.clone(),
+                    vec![value.extract::<String>().unwrap_or_default()],
+                );
+                null_positions.insert(col_name, vec![false]);
+            }
+        }
+
+        if field_count != schema_cols.len() {
+            return Ok(None);
+        }
+
+        let result = py.allow_threads(|| {
+            backend
+                .insert_typed_with_nulls_full(
+                    int_columns,
+                    float_columns,
+                    string_columns,
+                    binary_columns_map,
+                    fixedlist_columns_map,
+                    bool_columns,
+                    null_positions,
+                )
+                .map_err(|e| PyIOError::new_err(e.to_string()))
+        })?;
+
+        let cache_key = Self::backend_cache_key(&table_path, &table_name);
+        self.cached_backends.insert(cache_key, Arc::clone(&backend));
+        crate::query::executor::invalidate_storage_cache(&table_path);
+        crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
+
+        Ok(Some(result.into_iter().map(|id| id as i64).collect()))
+    }
+
+    /// Fast OLTP append for one schema-stable row.
+    ///
+    /// This intentionally handles only the low-risk case: an existing V4 table,
+    /// exact schema match, no constraints, and no secondary indexes. Other
+    /// cases fall back to store_one(), which preserves schema evolution,
+    /// constraint checks, and index maintenance through the existing path.
+    fn store_one_delta(
+        &self,
+        py: Python<'_>,
+        row: &Bound<'_, PyDict>,
+    ) -> PyResult<Option<Vec<i64>>> {
+        if row.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let fields = dict_to_values(row)?;
+        if fields.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if fields.values().any(|value| {
+            matches!(
+                value,
+                Value::Null
+                    | Value::Binary(_)
+                    | Value::FixedList(_)
+                    | Value::Json(_)
+                    | Value::Array(_)
+            )
+        }) {
+            return Ok(None);
+        }
+
+        let (table_path, table_name) = self.get_current_table_info()?;
+        let base_dir = table_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+
+        // Keep indexed tables on the existing path until index maintenance for
+        // delta-only rows is fully covered.
+        if let Ok(index_mgr) = crate::storage::index::IndexManager::load(&table_name, &base_dir) {
+            if !index_mgr.catalog_is_empty() {
+                return Ok(None);
+            }
+        }
+
+        let backend = self.get_backend_for_insert()?;
+
+        if !backend.storage.is_v4_format() || backend.storage.has_constraints() {
+            return Ok(None);
+        }
+
+        let schema = backend.storage.get_schema();
+        if schema.is_empty() {
+            return Ok(None);
+        }
+        let schema_cols: std::collections::HashSet<&str> =
+            schema.iter().map(|(name, _)| name.as_str()).collect();
+        if schema_cols.len() != fields.len()
+            || fields
+                .keys()
+                .any(|name| !schema_cols.contains(name.as_str()))
+        {
+            return Ok(None);
+        }
+
+        let durability = self.durability;
+        let lock_file = if durability != DurabilityLevel::Fast {
+            Some(
+                Self::acquire_write_lock(&table_path)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        let result = py.allow_threads(|| {
+            backend
+                .insert_rows_to_delta(&[fields])
+                .map_err(|e| PyIOError::new_err(e.to_string()))
+        });
+
+        if let Some(lf) = lock_file {
+            Self::release_lock(lf);
+        }
+
+        let ids = result?;
+        // Keep the insert backend warm so repeated OLTP appends don't reopen
+        // and rescan the delta file. Read/query caches must still be invalidated.
+        self.cached_backends
+            .remove(&Self::backend_cache_key(&table_path, &table_name));
+        crate::query::executor::invalidate_storage_cache(&table_path);
+        crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
+
+        Ok(Some(ids.into_iter().map(|id| id as i64).collect()))
+    }
+
     fn store_columnar(&self, py: Python<'_>, columns: &Bound<'_, PyDict>) -> PyResult<Vec<i64>> {
         if columns.is_empty() {
             return Ok(Vec::new());
@@ -1298,33 +1624,41 @@ impl ApexStorageImpl {
                 .get(&target_table)
                 .map(|v| Arc::clone(&v));
             if let Some(backend) = maybe_backend {
-                let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
-                if let Ok(Some(vals)) = rcix_result {
-                    let out = PyDict::new_bound(py);
-                    let columns_dict = PyDict::new_bound(py);
-                    for (col_name, val) in &vals {
-                        let pyval = value_to_py(py, val)?;
-                        columns_dict.set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
+                if backend.has_pending_deltas() {
+                    // Fall back to the Arrow executor path below so DeltaMerger overlays updates.
+                } else {
+                    let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
+                    if let Ok(Some(vals)) = rcix_result {
+                        let out = PyDict::new_bound(py);
+                        let columns_dict = PyDict::new_bound(py);
+                        for (col_name, val) in &vals {
+                            let pyval = value_to_py(py, val)?;
+                            columns_dict
+                                .set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
+                        }
+                        out.set_item("columns_dict", columns_dict)?;
+                        out.set_item("rows_affected", 0i64)?;
+                        return Ok(out.into());
                     }
-                    out.set_item("columns_dict", columns_dict)?;
-                    out.set_item("rows_affected", 0i64)?;
-                    return Ok(out.into());
                 }
             }
             if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
                 self.cached_backends
                     .insert(target_table.clone(), Arc::clone(&backend));
-                let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
-                if let Ok(Some(vals)) = rcix_result {
-                    let out = PyDict::new_bound(py);
-                    let columns_dict = PyDict::new_bound(py);
-                    for (col_name, val) in &vals {
-                        let pyval = value_to_py(py, val)?;
-                        columns_dict.set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
+                if !backend.has_pending_deltas() {
+                    let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
+                    if let Ok(Some(vals)) = rcix_result {
+                        let out = PyDict::new_bound(py);
+                        let columns_dict = PyDict::new_bound(py);
+                        for (col_name, val) in &vals {
+                            let pyval = value_to_py(py, val)?;
+                            columns_dict
+                                .set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
+                        }
+                        out.set_item("columns_dict", columns_dict)?;
+                        out.set_item("rows_affected", 0i64)?;
+                        return Ok(out.into());
                     }
-                    out.set_item("columns_dict", columns_dict)?;
-                    out.set_item("rows_affected", 0i64)?;
-                    return Ok(out.into());
                 }
                 // Fallback: Arrow batch path
                 if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(*id) {
@@ -1343,6 +1677,69 @@ impl ApexStorageImpl {
                         out.set_item("columns_dict", columns_dict)?;
                         out.set_item("rows_affected", 0i64)?;
                         return Ok(out.into());
+                    }
+                }
+            }
+        }
+
+        // ── ULTRA-FAST PATH: projected _id point lookup ──
+        // Keep OLTP-style `SELECT col1, col2 ... WHERE _id = N` on the same
+        // direct rcix path as SELECT *, avoiding an intermediate Arrow batch.
+        if let QuerySignature::ProjectedPointLookup {
+            id,
+            ref table,
+            columns,
+        } = &sig
+        {
+            let (target_table, target_path) =
+                self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
+            let maybe_backend = self
+                .cached_backends
+                .get(&target_table)
+                .map(|v| Arc::clone(&v))
+                .or_else(|| {
+                    crate::query::get_cached_backend_pub(&target_path)
+                        .ok()
+                        .map(|b| {
+                            self.cached_backends
+                                .insert(target_table.clone(), Arc::clone(&b));
+                            b
+                        })
+                });
+
+            if let Some(backend) = maybe_backend {
+                if !backend.has_pending_deltas() {
+                    let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
+                    let vals_result = match rcix_result {
+                        Ok(Some(vals)) => Some(vals),
+                        _ => py
+                            .allow_threads(|| backend.storage.read_row_by_id_values(*id))
+                            .ok()
+                            .flatten(),
+                    };
+                    if let Some(vals) = vals_result {
+                        let out = PyDict::new_bound(py);
+                        let columns_dict = PyDict::new_bound(py);
+                        let mut all_found = true;
+                        for requested_col in columns {
+                            if let Some((_, val)) =
+                                vals.iter().find(|(col_name, _)| col_name == requested_col)
+                            {
+                                let pyval = value_to_py(py, val)?;
+                                columns_dict.set_item(
+                                    requested_col.as_str(),
+                                    PyList::new_bound(py, [pyval]),
+                                )?;
+                            } else {
+                                all_found = false;
+                                break;
+                            }
+                        }
+                        if all_found {
+                            out.set_item("columns_dict", columns_dict)?;
+                            out.set_item("rows_affected", 0i64)?;
+                            return Ok(out.into());
+                        }
                     }
                 }
             }
@@ -1725,10 +2122,14 @@ impl ApexStorageImpl {
     /// Execute SQL query and return Arrow FFI pointers for zero-copy transfer
     /// Returns (schema_ptr, array_ptr) that can be imported by PyArrow
     fn _execute_arrow_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(usize, usize)> {
+        use crate::query::query_signature::{self, QuerySignature};
         use arrow::array::{Array, StructArray};
         use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 
         let sql = sql.to_string();
+        let sig = query_signature::classify(&sql);
+        let is_write = matches!(&sig, QuerySignature::DmlWrite | QuerySignature::Ddl { .. });
+        let table_name = self.current_table.read().clone();
         let base_dir = self.current_base_dir();
         // Fall back to base_dir when no table selected (e.g. SELECT * FROM read_csv(...)).
         // Table-function queries don't use the default_table_path at all.
@@ -1747,6 +2148,10 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
         crate::query::executor::clear_query_root_dir();
+
+        if is_write && !table_name.is_empty() {
+            self.invalidate_backend(&table_name);
+        }
 
         // Empty result
         if batch.num_rows() == 0 {
@@ -2191,6 +2596,7 @@ impl ApexStorageImpl {
 
         // Clear all per-database caches
         self.cached_backends.clear();
+        self.update_by_id_numeric_cache.clear();
         self.table_paths.write().clear();
         *self.tables_scanned.write() = false;
         *self.current_table.write() = String::new();
@@ -2250,6 +2656,21 @@ impl ApexStorageImpl {
         self.row_count()
     }
 
+    /// Whether the current table has V4 rows buffered in memory but not yet
+    /// saved as an on-disk row group.
+    fn has_pending_memtable_rows(&self) -> PyResult<bool> {
+        let table_name = self.current_table.read().clone();
+        if table_name.is_empty() {
+            return Ok(false);
+        }
+        let table_path = self.get_current_table_path()?;
+        let cache_key = Self::backend_cache_key(&table_path, &table_name);
+        if let Some(backend) = self.cached_backends.get(&cache_key) {
+            return Ok(backend.pending_v4_in_memory_rows() > 0);
+        }
+        Ok(false)
+    }
+
     /// Ultra-fast row count using cached backend (bypasses engine for maximum speed).
     /// This is 2-3x faster than row_count() for COUNT(*) queries.
     /// Uses base_row_count() - O(1) lock-free atomic read (no delta scan).
@@ -2292,17 +2713,28 @@ impl ApexStorageImpl {
 
         let result = {
             let table_name = self.current_table.read().clone();
-            if let Some(backend) = self.cached_backends.get(&table_name) {
+            let cache_key = Self::backend_cache_key(&table_path, &table_name);
+            if let Some(backend) = self.cached_backends.get(&cache_key) {
                 backend
-                    .sync()
-                    .map_err(|e| PyIOError::new_err(format!("Failed to sync: {}", e)))
+                    .save()
+                    .and_then(|_| backend.sync())
+                    .map_err(|e| PyIOError::new_err(format!("Failed to flush: {}", e)))
             } else {
                 Ok(()) // No backend means no data to sync
             }
         };
 
         Self::release_lock(lock_file);
-        result
+        result?;
+
+        let table_name = self.current_table.read().clone();
+        if !table_name.is_empty() {
+            self.invalidate_backend(&table_name);
+        }
+        crate::storage::engine::engine().invalidate(&table_path);
+        crate::query::executor::invalidate_storage_cache(&table_path);
+        crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
+        Ok(())
     }
 
     /// Get the current durability level
@@ -2325,7 +2757,9 @@ impl ApexStorageImpl {
         *self.auto_flush_bytes.write() = bytes;
         // Also apply to cached backend if present
         let table_name = self.current_table.read().clone();
-        if let Some(backend) = self.cached_backends.get(&table_name) {
+        let table_path = self.get_current_table_path()?;
+        let cache_key = Self::backend_cache_key(&table_path, &table_name);
+        if let Some(backend) = self.cached_backends.get(&cache_key) {
             backend.set_auto_flush(rows, bytes);
         }
         Ok(())
@@ -2341,17 +2775,17 @@ impl ApexStorageImpl {
     /// Get estimated memory usage in bytes
     fn estimate_memory_bytes(&self) -> PyResult<u64> {
         let table_name = self.current_table.read().clone();
-        if let Some(backend) = self.cached_backends.get(&table_name) {
+        let table_path = self.get_current_table_path()?;
+        let cache_key = Self::backend_cache_key(&table_path, &table_name);
+        if let Some(backend) = self.cached_backends.get(&cache_key) {
             let mem = backend.estimate_memory_bytes();
             if mem > 0 {
                 return Ok(mem);
             }
         }
         // No in-memory data (flushed to disk): estimate from file size
-        if let Ok(table_path) = self.get_current_table_path() {
-            if let Ok(meta) = std::fs::metadata(&table_path) {
-                return Ok(meta.len());
-            }
+        if let Ok(meta) = std::fs::metadata(&table_path) {
+            return Ok(meta.len());
         }
         Ok(0)
     }
@@ -2405,6 +2839,7 @@ impl ApexStorageImpl {
     fn close(&self) -> PyResult<()> {
         // Clear per-instance cached backends (releases per-instance references)
         self.cached_backends.clear();
+        self.update_by_id_numeric_cache.clear();
 
         // On Windows: release all mmaps so temp directories can be cleaned up.
         // On Unix: mmaps remain valid after atomic rename; keep STORAGE_CACHE alive
@@ -2428,53 +2863,54 @@ impl ApexStorageImpl {
         // Skip allow_threads() for sub-0.1ms operations where GIL overhead dominates
         // Use per-instance cached_backends first: no stat() syscalls (~600µs saved vs get_cached_backend_pub).
         let table_name = self.current_table.read().clone();
-        let maybe_cached = {
-            self.cached_backends
-                .get(&table_name)
-                .map(|v| Arc::clone(&v))
-        };
+        let cache_key = Self::backend_cache_key(&table_path, &table_name);
+        let maybe_cached = { self.cached_backends.get(&cache_key).map(|v| Arc::clone(&v)) };
         let backend_opt: Option<Arc<TableStorageBackend>> = if let Some(b) = maybe_cached {
             Some(b)
         } else if let Ok(b) = crate::query::get_cached_backend_pub(&table_path) {
             // Populate per-instance cache so next call is zero-syscall
-            self.cached_backends
-                .insert(table_name.clone(), Arc::clone(&b));
+            self.cached_backends.insert(cache_key, Arc::clone(&b));
             Some(b)
         } else {
             None
         };
         if let Some(backend) = backend_opt {
-            // Release GIL for all Rust computation; re-acquire only for PyDict construction.
-            // retrieve_rcix: page-cached RCIX read, handles PLAIN/BITPACK/RLE/StringDict.
-            let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(id as u64));
-            if let Ok(Some(vals)) = rcix_result {
-                let dict = PyDict::new_bound(py);
-                for (k, v) in vals {
-                    dict.set_item(k, value_to_py(py, &v)?)?;
-                }
-                return Ok(Some(dict.into()));
-            }
-            // Fallback: may need to (re)create mmap after save_v4 invalidation
-            let vals_result = py.allow_threads(|| backend.storage.read_row_by_id_values(id as u64));
-            if let Ok(Some(vals)) = vals_result {
-                let dict = PyDict::new_bound(py);
-                for (k, v) in vals {
-                    dict.set_item(k, value_to_py(py, &v)?)?;
-                }
-                return Ok(Some(dict.into()));
-            }
-            // Arrow batch cache path: O(1) index lookup + batch.slice(idx, 1)
-            let batch_result = py.allow_threads(|| backend.read_row_by_id_to_arrow(id as u64));
-            if let Ok(Some(batch)) = batch_result {
-                if batch.num_rows() > 0 {
+            if backend.has_pending_deltas() {
+                // Pending UPDATE overlays are applied by the Arrow executor fallback below.
+            } else {
+                // Release GIL for all Rust computation; re-acquire only for PyDict construction.
+                // retrieve_rcix: page-cached RCIX read, handles PLAIN/BITPACK/RLE/StringDict.
+                let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(id as u64));
+                if let Ok(Some(vals)) = rcix_result {
                     let dict = PyDict::new_bound(py);
-                    let schema = batch.schema();
-                    for col_idx in 0..batch.num_columns() {
-                        let col_name = schema.field(col_idx).name();
-                        let val = arrow_value_at(batch.column(col_idx), 0);
-                        dict.set_item(col_name.as_str(), value_to_py(py, &val)?)?;
+                    for (k, v) in vals {
+                        dict.set_item(k, value_to_py(py, &v)?)?;
                     }
                     return Ok(Some(dict.into()));
+                }
+                // Fallback: may need to (re)create mmap after save_v4 invalidation
+                let vals_result =
+                    py.allow_threads(|| backend.storage.read_row_by_id_values(id as u64));
+                if let Ok(Some(vals)) = vals_result {
+                    let dict = PyDict::new_bound(py);
+                    for (k, v) in vals {
+                        dict.set_item(k, value_to_py(py, &v)?)?;
+                    }
+                    return Ok(Some(dict.into()));
+                }
+                // Arrow batch cache path: O(1) index lookup + batch.slice(idx, 1)
+                let batch_result = py.allow_threads(|| backend.read_row_by_id_to_arrow(id as u64));
+                if let Ok(Some(batch)) = batch_result {
+                    if batch.num_rows() > 0 {
+                        let dict = PyDict::new_bound(py);
+                        let schema = batch.schema();
+                        for col_idx in 0..batch.num_columns() {
+                            let col_name = schema.field(col_idx).name();
+                            let val = arrow_value_at(batch.column(col_idx), 0);
+                            dict.set_item(col_name.as_str(), value_to_py(py, &val)?)?;
+                        }
+                        return Ok(Some(dict.into()));
+                    }
                 }
             }
         }
@@ -2522,6 +2958,373 @@ impl ApexStorageImpl {
                 Ok(Some(dict.into()))
             }
         }
+    }
+
+    /// Retrieve selected columns for one ID without SQL parsing/classification.
+    fn retrieve_projected(
+        &self,
+        py: Python<'_>,
+        id: i64,
+        columns: Vec<String>,
+    ) -> PyResult<Option<PyObject>> {
+        if id < 0 || columns.is_empty() {
+            return Ok(None);
+        }
+        let (table_path, table_name) = self.get_current_table_info()?;
+        let cache_key = Self::backend_cache_key(&table_path, &table_name);
+        let backend_opt: Option<Arc<TableStorageBackend>> = self
+            .cached_backends
+            .get(&cache_key)
+            .map(|v| Arc::clone(&v))
+            .or_else(|| {
+                crate::query::get_cached_backend_pub(&table_path)
+                    .ok()
+                    .map(|b| {
+                        self.cached_backends
+                            .insert(cache_key.clone(), Arc::clone(&b));
+                        b
+                    })
+            });
+
+        let Some(backend) = backend_opt else {
+            return Ok(None);
+        };
+        if backend.has_pending_deltas() {
+            return Ok(None);
+        }
+
+        let vals_result = backend
+            .storage
+            .retrieve_rcix(id as u64)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                backend
+                    .storage
+                    .read_row_by_id_values(id as u64)
+                    .ok()
+                    .flatten()
+            });
+        let Some(vals) = vals_result else {
+            return Ok(None);
+        };
+
+        let out = PyDict::new_bound(py);
+        let columns_dict = PyDict::new_bound(py);
+        for requested_col in &columns {
+            let Some((_, val)) = vals.iter().find(|(col_name, _)| col_name == requested_col) else {
+                return Ok(None);
+            };
+            let pyval = value_to_py(py, val)?;
+            columns_dict.set_item(requested_col.as_str(), PyList::new_bound(py, [pyval]))?;
+        }
+        out.set_item("columns_dict", columns_dict)?;
+        out.set_item("rows_affected", 0i64)?;
+        Ok(Some(out.into()))
+    }
+
+    /// Retrieve selected columns for one ID as a row dict; optimized for SQL
+    /// point lookups immediately consumed via ResultView.to_dict().
+    fn retrieve_projected_row(
+        &self,
+        py: Python<'_>,
+        id: i64,
+        columns: Vec<String>,
+    ) -> PyResult<Option<PyObject>> {
+        if id < 0 || columns.is_empty() {
+            return Ok(None);
+        }
+        let (table_path, table_name) = self.get_current_table_info()?;
+        let cache_key = Self::backend_cache_key(&table_path, &table_name);
+        let backend_opt: Option<Arc<TableStorageBackend>> = self
+            .cached_backends
+            .get(&cache_key)
+            .map(|v| Arc::clone(&v))
+            .or_else(|| {
+                crate::query::get_cached_backend_pub(&table_path)
+                    .ok()
+                    .map(|b| {
+                        self.cached_backends
+                            .insert(cache_key.clone(), Arc::clone(&b));
+                        b
+                    })
+            });
+
+        let Some(backend) = backend_opt else {
+            return Ok(None);
+        };
+        if backend.has_pending_deltas() {
+            return Ok(None);
+        }
+
+        let vals_result = backend
+            .storage
+            .retrieve_rcix(id as u64)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                backend
+                    .storage
+                    .read_row_by_id_values(id as u64)
+                    .ok()
+                    .flatten()
+            });
+        let Some(vals) = vals_result else {
+            return Ok(None);
+        };
+
+        let row = PyDict::new_bound(py);
+        for requested_col in &columns {
+            let Some((_, val)) = vals.iter().find(|(col_name, _)| col_name == requested_col) else {
+                return Ok(None);
+            };
+            row.set_item(requested_col.as_str(), value_to_py(py, val)?)?;
+        }
+        Ok(Some(row.into()))
+    }
+
+    /// Narrow fast path for `UPDATE table SET numeric_col = literal WHERE _id = N`.
+    /// Returns None whenever indexes, constraints, deltas, unsupported column types,
+    /// or storage layout require the general SQL executor for correctness.
+    fn update_numeric_by_id_inplace(
+        &self,
+        id: i64,
+        column: String,
+        value: f64,
+    ) -> PyResult<Option<i64>> {
+        if id < 0 || column == "_id" {
+            return Ok(None);
+        }
+
+        let (table_path, table_name) = self.get_current_table_info()?;
+        let backend_cache_key = Self::backend_cache_key(&table_path, &table_name);
+        let cache_key = format!("{}\0{}", backend_cache_key, column);
+
+        let backend_opt: Option<Arc<TableStorageBackend>> = self
+            .cached_backends
+            .get(&backend_cache_key)
+            .map(|v| Arc::clone(&v))
+            .or_else(|| {
+                crate::query::get_cached_backend_pub(&table_path)
+                    .ok()
+                    .map(|b| {
+                        self.cached_backends
+                            .insert(backend_cache_key.clone(), Arc::clone(&b));
+                        b
+                    })
+            })
+            .or_else(|| TableStorageBackend::open(&table_path).ok().map(Arc::new));
+
+        let Some(backend) = backend_opt else {
+            return Ok(None);
+        };
+        if backend.has_pending_deltas() {
+            return Ok(None);
+        }
+
+        let col_type = if let Some(entry) = self.update_by_id_numeric_cache.get(&cache_key) {
+            *entry.value()
+        } else {
+            let base_dir = table_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf();
+            if let Ok(index_mgr) = crate::storage::index::IndexManager::load(&table_name, &base_dir)
+            {
+                if index_mgr
+                    .list_indexes()
+                    .iter()
+                    .any(|meta| meta.effective_columns().iter().any(|c| *c == column))
+                {
+                    return Ok(None);
+                }
+            }
+
+            if backend.storage.has_constraints() {
+                return Ok(None);
+            }
+
+            let Some((_, col_type)) = backend
+                .storage
+                .get_schema()
+                .into_iter()
+                .find(|(name, _)| name == &column)
+            else {
+                return Ok(None);
+            };
+
+            let is_numeric = matches!(
+                col_type,
+                crate::storage::on_demand::ColumnType::Float64
+                    | crate::storage::on_demand::ColumnType::Float32
+                    | crate::storage::on_demand::ColumnType::Int64
+                    | crate::storage::on_demand::ColumnType::Int32
+                    | crate::storage::on_demand::ColumnType::Int16
+                    | crate::storage::on_demand::ColumnType::Int8
+                    | crate::storage::on_demand::ColumnType::UInt8
+                    | crate::storage::on_demand::ColumnType::UInt16
+                    | crate::storage::on_demand::ColumnType::UInt32
+                    | crate::storage::on_demand::ColumnType::UInt64
+                    | crate::storage::on_demand::ColumnType::Timestamp
+                    | crate::storage::on_demand::ColumnType::Date
+            );
+            if !is_numeric {
+                return Ok(None);
+            }
+            self.update_by_id_numeric_cache.insert(cache_key, col_type);
+            col_type
+        };
+
+        let bytes = match col_type {
+            crate::storage::on_demand::ColumnType::Float64
+            | crate::storage::on_demand::ColumnType::Float32 => value.to_le_bytes(),
+            crate::storage::on_demand::ColumnType::Int64
+            | crate::storage::on_demand::ColumnType::Int32
+            | crate::storage::on_demand::ColumnType::Int16
+            | crate::storage::on_demand::ColumnType::Int8
+            | crate::storage::on_demand::ColumnType::UInt8
+            | crate::storage::on_demand::ColumnType::UInt16
+            | crate::storage::on_demand::ColumnType::UInt32
+            | crate::storage::on_demand::ColumnType::UInt64
+            | crate::storage::on_demand::ColumnType::Timestamp
+            | crate::storage::on_demand::ColumnType::Date => (value as i64).to_le_bytes(),
+            _ => return Ok(None),
+        };
+
+        match backend.update_by_id_inplace(id as u64, &column, &bytes) {
+            Ok(Some((n, physically_written))) => {
+                if physically_written {
+                    crate::storage::engine::engine().invalidate(&table_path);
+                    crate::query::executor::invalidate_storage_cache(&table_path);
+                    crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
+                }
+                Ok(Some(n))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(PyIOError::new_err(e.to_string())),
+        }
+    }
+
+    /// Retrieve selected columns for multiple IDs in table order.
+    ///
+    /// SQL results for `_id IN (...)` are expected to be de-duplicated and
+    /// returned in storage order when no ORDER BY is present; for Apex row IDs
+    /// that means ascending `_id`.
+    fn retrieve_many_projected(
+        &self,
+        py: Python<'_>,
+        ids: Vec<i64>,
+        columns: Vec<String>,
+    ) -> PyResult<Option<PyObject>> {
+        if ids.is_empty() || columns.is_empty() {
+            return Ok(None);
+        }
+        let (table_path, table_name) = self.get_current_table_info()?;
+        let backend_opt: Option<Arc<TableStorageBackend>> = self
+            .cached_backends
+            .get(&table_name)
+            .map(|v| Arc::clone(&v))
+            .or_else(|| {
+                crate::query::get_cached_backend_pub(&table_path)
+                    .ok()
+                    .map(|b| {
+                        self.cached_backends
+                            .insert(table_name.clone(), Arc::clone(&b));
+                        b
+                    })
+            });
+
+        let Some(backend) = backend_opt else {
+            return Ok(None);
+        };
+        if backend.has_pending_deltas() {
+            return Ok(None);
+        }
+
+        let mut sorted_ids: Vec<u64> = ids
+            .into_iter()
+            .filter(|id| *id >= 0)
+            .map(|id| id as u64)
+            .collect();
+        if sorted_ids.is_empty() {
+            return Ok(None);
+        }
+        sorted_ids.sort_unstable();
+        sorted_ids.dedup();
+
+        if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
+            if let Ok(Some(batch)) = backend.storage.retrieve_many_mmap(&sorted_ids) {
+                let num_rows = batch.num_rows();
+                if num_rows == 0 {
+                    let out = PyDict::new_bound(py);
+                    out.set_item("columns_dict", PyDict::new_bound(py))?;
+                    out.set_item("rows_affected", 0i64)?;
+                    return Ok(Some(out.into()));
+                }
+
+                let columns_dict = PyDict::new_bound(py);
+                for requested_col in &columns {
+                    let Some(col_idx) = batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .position(|field| field.name() == requested_col)
+                    else {
+                        return Ok(None);
+                    };
+                    let py_list = arrow_col_to_pylist(py, batch.column(col_idx))?;
+                    columns_dict.set_item(requested_col.as_str(), py_list)?;
+                }
+
+                let out = PyDict::new_bound(py);
+                out.set_item("columns_dict", columns_dict)?;
+                out.set_item("rows_affected", num_rows as i64)?;
+                return Ok(Some(out.into()));
+            }
+        }
+
+        let mut col_values: Vec<Vec<PyObject>> = (0..columns.len())
+            .map(|_| Vec::with_capacity(sorted_ids.len()))
+            .collect();
+        let mut matched_rows = 0usize;
+
+        for id in sorted_ids {
+            let vals_result = backend
+                .storage
+                .retrieve_rcix(id)
+                .ok()
+                .flatten()
+                .or_else(|| backend.storage.read_row_by_id_values(id).ok().flatten());
+            let Some(vals) = vals_result else {
+                continue;
+            };
+
+            let mut row_values: Vec<PyObject> = Vec::with_capacity(columns.len());
+            for requested_col in &columns {
+                let Some((_, val)) = vals.iter().find(|(col_name, _)| col_name == requested_col)
+                else {
+                    return Ok(None);
+                };
+                row_values.push(value_to_py(py, val)?);
+            }
+            for (idx, value) in row_values.into_iter().enumerate() {
+                col_values[idx].push(value);
+            }
+            matched_rows += 1;
+        }
+
+        let columns_dict = PyDict::new_bound(py);
+        for (idx, requested_col) in columns.iter().enumerate() {
+            columns_dict.set_item(
+                requested_col.as_str(),
+                PyList::new_bound(py, &col_values[idx]),
+            )?;
+        }
+
+        let out = PyDict::new_bound(py);
+        out.set_item("columns_dict", columns_dict)?;
+        out.set_item("rows_affected", matched_rows as i64)?;
+        Ok(Some(out.into()))
     }
 
     /// Retrieve multiple records by IDs

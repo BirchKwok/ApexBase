@@ -896,42 +896,51 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
-                        if let Ok(Some(vals)) = backend.storage.retrieve_rcix(*id) {
-                            use crate::data::Value as V;
-                            let mut fields = Vec::with_capacity(vals.len());
-                            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(vals.len());
-                            for (col_name, val) in &vals {
-                                let nullable = matches!(val, V::Null);
-                                let (dt, arr): (ArrowDataType, ArrayRef) = match val {
-                                    V::Int64(v) => {
-                                        (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![*v])))
-                                    }
-                                    V::Float64(v) => (
-                                        ArrowDataType::Float64,
-                                        Arc::new(arrow::array::Float64Array::from(vec![*v])),
-                                    ),
-                                    V::String(s) => (
-                                        ArrowDataType::Utf8,
-                                        Arc::new(arrow::array::StringArray::from(vec![s.as_str()])),
-                                    ),
-                                    V::Bool(b) => (
-                                        ArrowDataType::Boolean,
-                                        Arc::new(arrow::array::BooleanArray::from(vec![*b])),
-                                    ),
-                                    _ => (
-                                        ArrowDataType::Utf8,
-                                        Arc::new(arrow::array::StringArray::from(vec![
-                                            None as Option<&str>,
-                                        ])),
-                                    ),
-                                };
-                                fields.push(Field::new(col_name, dt, nullable));
-                                arrays.push(arr);
-                            }
-                            let schema = Arc::new(Schema::new(fields));
-                            if let Ok(batch) = RecordBatch::try_new(schema, arrays) {
-                                return Ok(ApexResult::Data(batch));
+                    if backend.has_pending_deltas() {
+                        // Fall through so the general executor applies DeltaMerger overlays.
+                    } else {
+                        if backend.storage.is_v4_format()
+                            && !backend.storage.has_v4_in_memory_data()
+                        {
+                            if let Ok(Some(vals)) = backend.storage.retrieve_rcix(*id) {
+                                use crate::data::Value as V;
+                                let mut fields = Vec::with_capacity(vals.len());
+                                let mut arrays: Vec<ArrayRef> = Vec::with_capacity(vals.len());
+                                for (col_name, val) in &vals {
+                                    let nullable = matches!(val, V::Null);
+                                    let (dt, arr): (ArrowDataType, ArrayRef) = match val {
+                                        V::Int64(v) => (
+                                            ArrowDataType::Int64,
+                                            Arc::new(Int64Array::from(vec![*v])),
+                                        ),
+                                        V::Float64(v) => (
+                                            ArrowDataType::Float64,
+                                            Arc::new(arrow::array::Float64Array::from(vec![*v])),
+                                        ),
+                                        V::String(s) => (
+                                            ArrowDataType::Utf8,
+                                            Arc::new(arrow::array::StringArray::from(vec![
+                                                s.as_str()
+                                            ])),
+                                        ),
+                                        V::Bool(b) => (
+                                            ArrowDataType::Boolean,
+                                            Arc::new(arrow::array::BooleanArray::from(vec![*b])),
+                                        ),
+                                        _ => (
+                                            ArrowDataType::Utf8,
+                                            Arc::new(arrow::array::StringArray::from(vec![
+                                                None as Option<&str>,
+                                            ])),
+                                        ),
+                                    };
+                                    fields.push(Field::new(col_name, dt, nullable));
+                                    arrays.push(arr);
+                                }
+                                let schema = Arc::new(Schema::new(fields));
+                                if let Ok(batch) = RecordBatch::try_new(schema, arrays) {
+                                    return Ok(ApexResult::Data(batch));
+                                }
                             }
                         }
                     }
@@ -948,16 +957,21 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(*id) {
-                        if let Some(projected) = Self::project_batch_by_names(&batch, columns)? {
-                            return Ok(ApexResult::Data(projected));
+                    if backend.has_pending_deltas() {
+                        // Fall through so the general executor applies DeltaMerger overlays.
+                    } else {
+                        if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(*id) {
+                            if let Some(projected) = Self::project_batch_by_names(&batch, columns)?
+                            {
+                                return Ok(ApexResult::Data(projected));
+                            }
                         }
-                    }
-                    let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-                    if let Ok(empty) =
-                        backend.read_columns_to_arrow(Some(col_refs.as_slice()), 0, Some(0))
-                    {
-                        return Ok(ApexResult::Data(empty));
+                        let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                        if let Ok(empty) =
+                            backend.read_columns_to_arrow(Some(col_refs.as_slice()), 0, Some(0))
+                        {
+                            return Ok(ApexResult::Data(empty));
+                        }
                     }
                 }
                 // Fall through to full parse if fast path unavailable

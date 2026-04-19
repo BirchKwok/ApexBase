@@ -1074,6 +1074,24 @@ impl TableStorageBackend {
             .scan_and_update_inplace(where_col, low, high, set_col, new_value_bytes)
     }
 
+    /// O(1) in-place overwrite for `UPDATE ... SET numeric_col = literal WHERE _id = N`.
+    /// Returns Some((count, physically_written)) when the fast path handled the
+    /// statement, or None to fall back.
+    pub fn update_by_id_inplace(
+        &self,
+        id: u64,
+        set_col: &str,
+        new_value_bytes: &[u8; 8],
+    ) -> io::Result<Option<(i64, bool)>> {
+        self.storage
+            .update_by_id_inplace(id, set_col, new_value_bytes)
+    }
+
+    /// O(1) existence check for a V4 `_id` using row-group id/deletion sections.
+    pub fn row_id_active_rcix(&self, id: u64) -> io::Result<Option<bool>> {
+        self.storage.row_id_active_rcix(id)
+    }
+
     /// Save the delta store to disk.
     pub fn save_delta_store(&self) -> io::Result<()> {
         self.storage.save_delta_store()
@@ -1204,6 +1222,11 @@ impl TableStorageBackend {
     /// Use this for COUNT(*) without WHERE clause - O(1) lock-free read
     pub fn base_row_count(&self) -> u64 {
         self.storage.base_row_count()
+    }
+
+    /// Rows buffered in the V4 in-memory append area and not yet persisted.
+    pub fn pending_v4_in_memory_rows(&self) -> usize {
+        self.storage.pending_v4_in_memory_rows()
     }
 
     /// Replace a row (delete + insert new)

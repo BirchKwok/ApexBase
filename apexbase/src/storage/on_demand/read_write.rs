@@ -52,14 +52,28 @@ pub fn apply_pending_deletes(path: &std::path::Path) -> io::Result<()> {
     pos += 4;
     if pos + footer_len > buf.len() { return Ok(()); }
     let footer_bytes = &buf[pos..pos+footer_len];
-    // Write deletion vectors and footer to disk
-    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    // Write deletion vectors, footer, and active row count to disk.
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
     for (rg_i, offset, del_bytes) in &rg_writes {
         file.seek(SeekFrom::Start(*offset))?;
         file.write_all(del_bytes)?;
     }
     file.seek(SeekFrom::Start(footer_offset))?;
     file.write_all(footer_bytes)?;
+    if let Ok(footer) = V4Footer::from_bytes(footer_bytes) {
+        let active_rows: u64 = footer
+            .row_groups
+            .iter()
+            .map(|rg| rg.row_count.saturating_sub(rg.deletion_count) as u64)
+            .sum();
+        let mut header_bytes = [0u8; HEADER_SIZE];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut header_bytes)?;
+        let mut header = OnDemandHeader::from_bytes(&header_bytes)?;
+        header.row_count = active_rows;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header.to_bytes())?;
+    }
     file.flush()?;
     // Remove from global map after checkpoint
     global_pending_deletes().write().unwrap().as_mut().map(|m| m.remove(path));
@@ -1463,11 +1477,136 @@ impl OnDemandStorage {
 
     /// Ultra-fast point lookup: returns Vec<(col_name, Value)> directly from V4 columns
     /// Bypasses Arrow conversion and HashMap overhead
+    fn read_in_memory_row_by_id_values(
+        &self,
+        id: u64,
+    ) -> io::Result<Option<Vec<(String, crate::data::Value)>>> {
+        use crate::data::Value;
+
+        let ids_guard = self.ids.read();
+        let row_idx = match ids_guard.binary_search(&id) {
+            Ok(i) => i,
+            Err(_) => return Ok(None),
+        };
+        if self.is_deleted(row_idx) {
+            return Ok(None);
+        }
+        drop(ids_guard);
+
+        let schema = self.schema.read();
+        let columns = self.columns.read();
+        let nulls = self.nulls.read();
+
+        let mut result = Vec::with_capacity(schema.column_count() + 1);
+        result.push(("_id".to_string(), Value::Int64(id as i64)));
+
+        for (col_idx, (col_name, _)) in schema.columns.iter().enumerate() {
+            // Check null
+            if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                let b = row_idx / 8;
+                let bit = row_idx % 8;
+                if b < nulls[col_idx].len() && (nulls[col_idx][b] >> bit) & 1 == 1 {
+                    result.push((col_name.clone(), Value::Null));
+                    continue;
+                }
+            }
+
+            if col_idx >= columns.len() {
+                result.push((col_name.clone(), Value::Null));
+                continue;
+            }
+
+            let val = match &columns[col_idx] {
+                ColumnData::Int64(v) => {
+                    if row_idx < v.len() {
+                        Value::Int64(v[row_idx])
+                    } else {
+                        Value::Null
+                    }
+                }
+                ColumnData::Float64(v) => {
+                    if row_idx < v.len() {
+                        Value::Float64(v[row_idx])
+                    } else {
+                        Value::Null
+                    }
+                }
+                ColumnData::String { offsets, data } => {
+                    let count = offsets.len().saturating_sub(1);
+                    if row_idx < count {
+                        let s = offsets[row_idx] as usize;
+                        let e = offsets[row_idx + 1] as usize;
+                        Value::String(std::str::from_utf8(&data[s..e]).unwrap_or("").to_string())
+                    } else {
+                        Value::Null
+                    }
+                }
+                ColumnData::Bool { data, len } => {
+                    if row_idx < *len {
+                        let b = row_idx / 8;
+                        let bit = row_idx % 8;
+                        if b < data.len() {
+                            Value::Bool((data[b] >> bit) & 1 == 1)
+                        } else {
+                            Value::Null
+                        }
+                    } else {
+                        Value::Null
+                    }
+                }
+                ColumnData::Binary { offsets, data } => {
+                    let count = offsets.len().saturating_sub(1);
+                    if row_idx < count {
+                        let s = offsets[row_idx] as usize;
+                        let e = offsets[row_idx + 1] as usize;
+                        Value::Binary(data[s..e].to_vec())
+                    } else {
+                        Value::Null
+                    }
+                }
+                ColumnData::StringDict {
+                    indices,
+                    dict_offsets,
+                    dict_data,
+                } => {
+                    if row_idx < indices.len() {
+                        let idx = indices[row_idx];
+                        if idx == 0 {
+                            Value::Null
+                        } else {
+                            let di = (idx - 1) as usize;
+                            if di + 1 < dict_offsets.len() {
+                                let s = dict_offsets[di] as usize;
+                                let e = dict_offsets[di + 1] as usize;
+                                Value::String(
+                                    std::str::from_utf8(&dict_data[s..e])
+                                        .unwrap_or("")
+                                        .to_string(),
+                                )
+                            } else {
+                                Value::Null
+                            }
+                        }
+                    } else {
+                        Value::Null
+                    }
+                }
+                _ => Value::Null,
+            };
+            result.push((col_name.clone(), val));
+        }
+
+        Ok(Some(result))
+    }
+
     pub fn read_row_by_id_values(&self, id: u64) -> io::Result<Option<Vec<(String, crate::data::Value)>>> {
         use crate::data::Value;
-        
+
         let is_v4 = self.is_v4_format();
         if !is_v4 { return Ok(None); }
+        if let Some(row) = self.read_in_memory_row_by_id_values(id)? {
+            return Ok(Some(row));
+        }
         {
             // RCIX MMAP PATH: always try first, even if data is also in memory.
             // Avoids building the 1M-entry id_to_idx HashMap (~0.76ms).
@@ -1784,88 +1923,6 @@ impl OnDemandStorage {
             drop(file_guard);
             return Ok(Some(result));
         }
-        
-        // In-memory fallback: binary search on sorted ids Vec (no HashMap needed).
-        let ids_guard = self.ids.read();
-        let row_idx = match ids_guard.binary_search(&id) {
-            Ok(i) => i,
-            Err(_) => return Ok(None),
-        };
-        if self.is_deleted(row_idx) { return Ok(None); }
-        drop(ids_guard);
-        
-        let schema = self.schema.read();
-        let columns = self.columns.read();
-        let nulls = self.nulls.read();
-        
-        let mut result = Vec::with_capacity(schema.column_count() + 1);
-        result.push(("_id".to_string(), Value::Int64(id as i64)));
-        
-        for (col_idx, (col_name, _)) in schema.columns.iter().enumerate() {
-            // Check null
-            if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
-                let b = row_idx / 8; let bit = row_idx % 8;
-                if b < nulls[col_idx].len() && (nulls[col_idx][b] >> bit) & 1 == 1 {
-                    result.push((col_name.clone(), Value::Null));
-                    continue;
-                }
-            }
-            
-            if col_idx >= columns.len() {
-                result.push((col_name.clone(), Value::Null));
-                continue;
-            }
-            
-            let val = match &columns[col_idx] {
-                ColumnData::Int64(v) => {
-                    if row_idx < v.len() { Value::Int64(v[row_idx]) } else { Value::Null }
-                }
-                ColumnData::Float64(v) => {
-                    if row_idx < v.len() { Value::Float64(v[row_idx]) } else { Value::Null }
-                }
-                ColumnData::String { offsets, data } => {
-                    let count = offsets.len().saturating_sub(1);
-                    if row_idx < count {
-                        let s = offsets[row_idx] as usize;
-                        let e = offsets[row_idx + 1] as usize;
-                        Value::String(std::str::from_utf8(&data[s..e]).unwrap_or("").to_string())
-                    } else { Value::Null }
-                }
-                ColumnData::Bool { data, len } => {
-                    if row_idx < *len {
-                        let b = row_idx / 8; let bit = row_idx % 8;
-                        if b < data.len() {
-                            Value::Bool((data[b] >> bit) & 1 == 1)
-                        } else { Value::Null }
-                    } else { Value::Null }
-                }
-                ColumnData::Binary { offsets, data } => {
-                    let count = offsets.len().saturating_sub(1);
-                    if row_idx < count {
-                        let s = offsets[row_idx] as usize;
-                        let e = offsets[row_idx + 1] as usize;
-                        Value::Binary(data[s..e].to_vec())
-                    } else { Value::Null }
-                }
-                ColumnData::StringDict { indices, dict_offsets, dict_data } => {
-                    if row_idx < indices.len() {
-                        let idx = indices[row_idx];
-                        if idx == 0 { Value::Null } else {
-                            let di = (idx - 1) as usize;
-                            if di + 1 < dict_offsets.len() {
-                                let s = dict_offsets[di] as usize;
-                                let e = dict_offsets[di + 1] as usize;
-                                Value::String(std::str::from_utf8(&dict_data[s..e]).unwrap_or("").to_string())
-                            } else { Value::Null }
-                        }
-                    } else { Value::Null }
-                }
-                _ => Value::Null,
-            };
-            result.push((col_name.clone(), val));
-        }
-        
-        Ok(Some(result))
     }
 
     /// Fast SELECT * LIMIT N: read first N non-deleted rows directly from V4 columns
@@ -2478,7 +2535,11 @@ impl OnDemandStorage {
             let has_unloaded_base = on_disk_rows > 0 && in_memory_ids > 0 && !base_loaded;
             drop(ids);
 
-            // If base data isn't loaded but we have new rows, append incrementally
+            // If base data isn't loaded but we have new rows, append the
+            // already-buffered rows incrementally. Do not call append_row_group()
+            // here: that API is for rows that are not yet in memory and will
+            // extend ids/active_count after writing. These rows are the memtable
+            // buffer itself, so extending again duplicates them on every flush.
             if has_unloaded_base {
                 let ids = self.ids.read();
                 let new_ids: Vec<u64> = ids.clone();
@@ -2490,7 +2551,17 @@ impl OnDemandStorage {
                 let new_nulls: Vec<Vec<u8>> = nulls.clone();
                 drop(nulls);
                 self.pending_rows.store(0, Ordering::SeqCst);
-                return self.append_row_group(&new_ids, &new_cols, &new_nulls);
+                self.write_row_group_to_disk(&new_ids, &new_cols, &new_nulls)?;
+
+                // Keep a warm insert backend as metadata-only after persistence.
+                // Future single-row appends can reuse the schema/next_id/footer
+                // without treating the already-persisted rows as pending again.
+                self.ids.write().clear();
+                self.columns.write().clear();
+                self.nulls.write().clear();
+                self.deleted.write().clear();
+                *self.id_to_idx.write() = None;
+                return Ok(());
             }
 
             if !has_new_rows && !base_loaded && on_disk_rows > 0 {
@@ -3609,8 +3680,10 @@ impl OnDemandStorage {
                         can_fast_delete = false;
                         break 'rg_loop;
                     }
-                    // Decode RLE to flat array
-                    let mut decoded = Vec::with_capacity(count * 8);
+                    // Decode RLE to the same payload shape as PLAIN: [count:u64][values...].
+                    // The delete scanner below expects the first 8 bytes to be the value count.
+                    let mut decoded = Vec::with_capacity(8 + count * 8);
+                    decoded.extend_from_slice(&(count as u64).to_le_bytes());
                     let mut pos = 16;
                     for _ in 0..num_runs {
                         let val = i64::from_le_bytes(rle_data[pos..pos+8].try_into().unwrap());
@@ -4111,6 +4184,12 @@ impl OnDemandStorage {
         
         // Update persisted count (disk now has more rows)
         self.persisted_row_count.store(new_persisted, Ordering::SeqCst);
+
+        // Keep this storage instance coherent when it stays warm in the insert cache.
+        // Without this, a cached V4 footer from before the append can point at the
+        // overwritten old-footer bytes, and later readers/deleters may interpret row data
+        // as row-group metadata.
+        *self.v4_footer.write() = Some(footer);
         
         Ok(())
     }

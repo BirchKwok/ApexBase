@@ -128,7 +128,73 @@ _RE_SIMPLE_POINT_LOOKUP = re.compile(
     r"^\s*select\s+\*\s+from\s+([A-Za-z_][\w]*)\s+where\s+_id\s*=\s*(\d+)\s*;?\s*$",
     re.IGNORECASE,
 )
+_RE_SIMPLE_PROJECTED_POINT_LOOKUP = re.compile(
+    r"^\s*select\s+(.+?)\s+from\s+([A-Za-z_][\w]*)\s+where\s+_id\s*=\s*(\d+)\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_RE_SIMPLE_SELECT_FROM = re.compile(r"^\s*select\s+(.*?)\s+from\s+", re.IGNORECASE | re.DOTALL)
+_RE_SIMPLE_FROM_TABLE = re.compile(r"\bfrom\s+([A-Za-z_][\w]*)\b", re.IGNORECASE)
+_RE_SIMPLE_ID_IN = re.compile(r"\bwhere\s+_id\s+in\s*\(([^)]*)\)\s*;?\s*$", re.IGNORECASE)
+_RE_SIMPLE_STRING_EQ = re.compile(
+    r"\bwhere\s+([A-Za-z_][\w]*)\s*=\s*'([^']*)'\s*;?\s*$",
+    re.IGNORECASE,
+)
+_RE_SIMPLE_POINT_PARSE = re.compile(
+    r"^\s*select\s+\*\s+from\s+([A-Za-z_][\w]*)\s+where\s+_id\s*=\s*(\d+)\s*;?\s*$",
+    re.IGNORECASE,
+)
+_RE_SIMPLE_NUMERIC_UPDATE_BY_ID = re.compile(
+    r"^\s*update\s+([A-Za-z_][\w]*)\s+set\s+([A-Za-z_][\w]*)\s*=\s*(-?\d+(?:\.\d+)?)\s+where\s+_id\s*=\s*(\d+)\s*;?\s*$",
+    re.IGNORECASE,
+)
 
+
+def _projection_columns_from_text(projection: str) -> Optional[List[str]]:
+    if not projection or projection == "*":
+        return None
+
+    columns = []
+    seen = set()
+    for raw in projection.split(','):
+        part = raw.strip()
+        part_upper = part.upper()
+        if (not part or part == "*" or part.endswith(".*")
+                or any(ch in part for ch in ("(", ")", "+", "-", "/", "'"))
+                or " AS " in part_upper
+                or any(ch.isspace() for ch in part)):
+            return None
+        name = part.rsplit('.', 1)[-1].strip('"`')
+        if not name or name == "*" or name in seen:
+            return None
+        seen.add(name)
+        columns.append(name)
+    return columns or None
+
+
+def _simple_projection_columns(sql: str) -> Optional[List[str]]:
+    """Return plain SELECT columns for simple projected fast paths."""
+    m = _RE_SIMPLE_SELECT_FROM.match(sql)
+    if not m:
+        return None
+    return _projection_columns_from_text(m.group(1).strip())
+
+
+def _simple_from_table(sql: str) -> Optional[str]:
+    m = _RE_SIMPLE_FROM_TABLE.search(sql)
+    return m.group(1) if m else None
+
+
+def _simple_id_list(sql: str) -> Optional[List[int]]:
+    m = _RE_SIMPLE_ID_IN.search(sql)
+    if not m:
+        return None
+    ids = []
+    for part in m.group(1).split(','):
+        part = part.strip()
+        if not part or not part.isdigit():
+            return None
+        ids.append(int(part))
+    return ids
 
 
 class ApexClient:
@@ -216,6 +282,15 @@ class ApexClient:
         self._prefer_arrow_format = prefer_arrow_format and ARROW_AVAILABLE
         self._registry = _registry
         self._has_writes = False  # True after any write; disables _storage.execute() fast paths
+        self._simple_sql_cache = {}
+        self._buffered_writes_enabled = False
+        self._buffered_write_rows = []
+        self._buffered_write_table = None
+        self._buffered_write_flush_rows = 0
+        self._memtable_single_writes_enabled = (
+            durability == 'fast'
+            and os.environ.get("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE") != "1"
+        )
         
         # Get the storage lock for thread-safe concurrent access
         self._storage_lock = None
@@ -297,6 +372,8 @@ class ApexClient:
         """
         self._check_connection()
         with self._lock:
+            self._flush_pending_memtable_rows_for_read()
+            self.flush_buffered_writes()
             self._storage.use_database_(database)
             self._current_database = database if database else 'default'
             self._current_table = None
@@ -347,6 +424,8 @@ class ApexClient:
     def use_table(self, table_name: str):
         self._check_connection()
         with self._lock:
+            self._flush_pending_memtable_rows_for_read()
+            self.flush_buffered_writes()
             self._storage.use_table(table_name)
         self._current_table = table_name
 
@@ -369,6 +448,8 @@ class ApexClient:
         """
         self._check_connection()
         with self._lock:
+            self._flush_pending_memtable_rows_for_read()
+            self.flush_buffered_writes()
             try:
                 self._storage.create_table(table_name, schema)
             except OSError as e:
@@ -378,6 +459,7 @@ class ApexClient:
     def drop_table(self, table_name: str):
         self._check_connection()
         with self._lock:
+            self.flush_buffered_writes()
             try:
                 self._storage.drop_table(table_name)
             except (ValueError, RuntimeError):
@@ -754,6 +836,50 @@ class ApexClient:
         
             # 5. Single record dict
             if isinstance(data, dict):
+                if data and all(not isinstance(v, (list, tuple)) and not hasattr(v, 'dtype') for v in data.values()):
+                    if self._buffered_writes_enabled and not self._is_fts_enabled(self._current_table):
+                        encoded = self._encode_vectors_in_record(data)
+                        if self._buffered_write_table is None:
+                            self._buffered_write_table = self._current_table
+                        if self._buffered_write_table != self._current_table:
+                            self.flush_buffered_writes()
+                            self._buffered_write_table = self._current_table
+                        self._buffered_write_rows.append(encoded)
+                        self._has_writes = True
+                        if (self._buffered_write_flush_rows
+                                and len(self._buffered_write_rows) >= self._buffered_write_flush_rows):
+                            self.flush_buffered_writes()
+                        return
+                    store_one = getattr(self._storage, "store_one", None)
+                    if store_one is not None and not self._is_fts_enabled(self._current_table):
+                        encoded = self._encode_vectors_in_record(data)
+                        store_one_memtable = (
+                            getattr(self._storage, "store_one_memtable", None)
+                            if (
+                                self._memtable_single_writes_enabled
+                                or os.environ.get("APEXBASE_EXPERIMENTAL_MEMTABLE_SINGLE_WRITE") == "1"
+                            )
+                            else None
+                        )
+                        if store_one_memtable is not None:
+                            memtable_ids = store_one_memtable(encoded)
+                            if memtable_ids is not None:
+                                self._has_writes = True
+                                return
+                        store_one_delta = (
+                            getattr(self._storage, "store_one_delta", None)
+                            if os.environ.get("APEXBASE_EXPERIMENTAL_DELTA_SINGLE_WRITE") == "1"
+                            else None
+                        )
+                        if store_one_delta is not None:
+                            delta_ids = store_one_delta(encoded)
+                            if delta_ids is not None:
+                                self._has_writes = True
+                                return
+                        store_one(encoded)
+                    else:
+                        self._store_columnar({k: [v] for k, v in data.items()})
+                    return
                 self._storage.store(self._encode_vectors_in_record(data))
                 return
             
@@ -849,21 +975,48 @@ class ApexClient:
         # Python-level _storage_lock was causing serialization of all queries.
         return self._execute_impl(sql, show_internal_id)
 
+    def _flush_pending_memtable_rows_for_read(self) -> None:
+        """Persist storage-level single-row write buffers before broad reads."""
+        has_pending = getattr(self._storage, "has_pending_memtable_rows", None)
+        if has_pending is None:
+            return
+        try:
+            if has_pending():
+                self._storage.flush()
+        except Exception:
+            # Reads should still fall through to their normal error handling.
+            pass
+
     @staticmethod
     def _should_use_columnar_materialization(sql_upper: str, sig: str) -> bool:
-        """Prefer Rust-side columnar Python conversion for large filtered row sets."""
+        """Prefer Rust-side columnar Python conversion for to_dict-friendly result sets."""
         if sig not in ('like', 'complex'):
             return False
-        if not sql_upper.startswith('SELECT *'):
-            return False
-        if 'WHERE' not in sql_upper:
+        if not sql_upper.startswith('SELECT'):
             return False
         if any(token in sql_upper for token in (
-            'GROUP', 'HAVING', 'ORDER', 'JOIN', 'DISTINCT', 'UNION',
-            'INTERSECT', 'EXCEPT', 'WITH ', ' WINDOW ', ' OVER ',
+            'JOIN', 'UNION', 'INTERSECT', 'EXCEPT', 'WITH ',
         )):
             return False
-        return True
+
+        # Large filtered row sets avoid PyArrow Table.to_pylist() overhead.
+        if (sql_upper.startswith('SELECT *')
+                and 'WHERE' in sql_upper
+                and not any(token in sql_upper for token in ('GROUP', 'HAVING', 'ORDER', 'DISTINCT'))):
+            return True
+
+        # Small/medium OLAP outputs are usually consumed as Python rows in execute().to_dict().
+        # Let Rust's executor fast paths (cached GROUP BY, aggregation, top-k ORDER BY, etc.)
+        # return columnar Python lists directly instead of importing Arrow then converting rows.
+        if ('GROUP' in sql_upper or 'HAVING' in sql_upper or 'DISTINCT' in sql_upper
+                or 'COUNT(' in sql_upper or 'SUM(' in sql_upper or 'AVG(' in sql_upper
+                or 'MIN(' in sql_upper or 'MAX(' in sql_upper):
+            return True
+        if 'ORDER' in sql_upper and 'LIMIT' in sql_upper:
+            return True
+        if ' OVER ' in sql_upper and 'LIMIT' in sql_upper:
+            return True
+        return False
 
     @staticmethod
     def _extract_point_lookup_id(sql: str) -> Optional[int]:
@@ -877,6 +1030,116 @@ class ApexClient:
     
     def _execute_impl(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
         if not getattr(self, '_in_txn', False):
+            cached_update = self._simple_sql_cache.get(sql)
+            if cached_update is None:
+                update_match = _RE_SIMPLE_NUMERIC_UPDATE_BY_ID.match(sql)
+                if update_match:
+                    try:
+                        value_text = update_match.group(3)
+                        value = float(value_text) if "." in value_text else int(value_text)
+                        cached_update = (
+                            'update_numeric_by_id',
+                            update_match.group(1),
+                            update_match.group(2),
+                            value,
+                            int(update_match.group(4)),
+                        )
+                        if len(self._simple_sql_cache) >= 256:
+                            self._simple_sql_cache.clear()
+                        self._simple_sql_cache[sql] = cached_update
+                    except (TypeError, ValueError):
+                        cached_update = False
+
+            if cached_update and cached_update[0] == 'update_numeric_by_id':
+                try:
+                    _, table_name, col_name, value, row_id = cached_update
+                    self._ensure_table_selected()
+                    if (self._current_table and table_name.lower() == self._current_table.lower()
+                            and col_name != "_id"):
+                        updated = self._storage.update_numeric_by_id_inplace(row_id, col_name, value)
+                        if updated is not None:
+                            self._has_writes = True
+                            rv = ResultView(lazy_pydict={"rows_affected": [updated]})
+                            rv._show_internal_id = False
+                            return rv
+                except Exception:
+                    pass  # fall through to the general SQL executor
+
+            cached_simple = self._simple_sql_cache.get(sql)
+            if cached_simple is None:
+                cached_simple = False
+                point_match = _RE_SIMPLE_POINT_PARSE.match(sql)
+                if point_match:
+                    cached_simple = ('point', point_match.group(1), int(point_match.group(2)), None)
+                else:
+                    projected_point = _RE_SIMPLE_PROJECTED_POINT_LOOKUP.match(sql)
+                    if projected_point:
+                        columns = _projection_columns_from_text(projected_point.group(1).strip())
+                        if columns:
+                            cached_simple = (
+                                'projected_point',
+                                projected_point.group(2),
+                                int(projected_point.group(3)),
+                                tuple(columns),
+                            )
+                    else:
+                        columns = _simple_projection_columns(sql)
+                        ids = _simple_id_list(sql) if columns else None
+                        table_name = _simple_from_table(sql) if ids else None
+                        if columns and ids and table_name:
+                            cached_simple = ('projected_batch', table_name, tuple(ids), tuple(columns))
+                if len(self._simple_sql_cache) >= 256:
+                    self._simple_sql_cache.clear()
+                self._simple_sql_cache[sql] = cached_simple
+
+            if cached_simple and cached_simple[0] == 'point':
+                _, table_name, point_id, _ = cached_simple
+                try:
+                    self._ensure_table_selected()
+                    if self._current_table and table_name.lower() == self._current_table.lower():
+                        if show_internal_id is None:
+                            show_internal_id = False
+                        row = self._storage.retrieve(point_id)
+                        if row is None:
+                            rv = ResultView(data=None)
+                            rv._show_internal_id = show_internal_id
+                            return rv
+                        if not show_internal_id and '_id' in row:
+                            row = {k: v for k, v in row.items() if k != '_id'}
+                        rv = ResultView(data=[row])
+                        rv._show_internal_id = show_internal_id
+                        return rv
+                except Exception:
+                    pass  # fall through to the general SQL executor
+
+            if cached_simple and cached_simple[0] == 'projected_point':
+                _, table_name, point_id, columns = cached_simple
+                try:
+                    self._ensure_table_selected()
+                    if self._current_table and table_name.lower() == self._current_table.lower():
+                        row = self._storage.retrieve_projected_row(point_id, list(columns))
+                        if row is not None:
+                            rv = ResultView(data=[row])
+                            rv._show_internal_id = show_internal_id if show_internal_id is not None else False
+                            return rv
+                except Exception:
+                    pass  # fall through to the general SQL executor
+
+            if cached_simple and cached_simple[0] == 'projected_batch':
+                _, table_name, ids, columns = cached_simple
+                try:
+                    self._ensure_table_selected()
+                    if self._current_table and table_name.lower() == self._current_table.lower():
+                        result = self._storage.retrieve_many_projected(list(ids), list(columns))
+                        if result is not None:
+                            columns_dict = result.get('columns_dict')
+                            if columns_dict is not None:
+                                rv = ResultView(lazy_pydict=columns_dict)
+                                rv._show_internal_id = show_internal_id if show_internal_id is not None else False
+                                return rv
+                except Exception:
+                    pass  # fall through to the general SQL executor
+
             point_match = _RE_SIMPLE_POINT_LOOKUP.match(sql)
             if point_match:
                 table_name = point_match.group(1)
@@ -899,6 +1162,23 @@ class ApexClient:
                 except Exception:
                     pass  # fall through to the general SQL executor
 
+            projected_point = _RE_SIMPLE_PROJECTED_POINT_LOOKUP.match(sql)
+            if projected_point:
+                try:
+                    columns = _projection_columns_from_text(projected_point.group(1).strip())
+                    table_name = projected_point.group(2)
+                    point_id = int(projected_point.group(3))
+                    self._ensure_table_selected()
+                    if (columns and self._current_table
+                            and table_name.lower() == self._current_table.lower()):
+                        row = self._storage.retrieve_projected_row(point_id, columns)
+                        if row is not None:
+                            rv = ResultView(data=[row])
+                            rv._show_internal_id = show_internal_id if show_internal_id is not None else False
+                            return rv
+                except Exception:
+                    pass  # fall through to the general SQL executor
+
         # ── Single-point classification (mirrors Rust QuerySignature) ──
         sql_upper = sql.strip().upper()
         _trimmed = sql.strip().rstrip(';').strip()
@@ -906,10 +1186,46 @@ class ApexClient:
 
         # Classify query type ONCE — no duplicate pattern matching
         _count_star_match = None
+        _simple_projection = _simple_projection_columns(sql)
         if is_multi_stmt:
             _sig = 'multi'
         elif (_count_star_match := _RE_SIMPLE_COUNT_STAR.match(sql)):
             _sig = 'count_star'
+        elif (_simple_projection
+                and sql_upper.startswith('SELECT')
+                and ('WHERE _ID =' in sql_upper or 'WHERE _ID=' in sql_upper)
+                and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+                and ' NOT ' not in sql_upper and ' IN ' not in sql_upper
+                and ';' not in sql_upper):
+            _sig = 'projected_point_lookup'
+        elif (_simple_projection
+                and sql_upper.startswith('SELECT')
+                and _RE_SIMPLE_ID_IN.search(sql)
+                and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+                and ' NOT ' not in sql_upper
+                and ';' not in sql_upper):
+            _sig = 'projected_batch_lookup'
+        elif (_simple_projection
+                and sql_upper.startswith('SELECT')
+                and 'LIMIT' in sql_upper
+                and 'WHERE' not in sql_upper and 'ORDER' not in sql_upper
+                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper):
+            _sig = 'projected_scan_limit'
+        elif (_simple_projection
+                and sql_upper.startswith('SELECT')
+                and 'WHERE' in sql_upper
+                and _RE_SIMPLE_STRING_EQ.search(sql)
+                and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
+                and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+                and 'BETWEEN' not in sql_upper and ' IN ' not in sql_upper
+                and ' LIKE ' not in sql_upper
+                and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+                and '>' not in sql_upper and '<' not in sql_upper):
+            _sig = 'projected_string_filter'
         elif (sql_upper.startswith('SELECT *')
                 and ('WHERE _ID =' in sql_upper or 'WHERE _ID=' in sql_upper)
                 and 'LIMIT' not in sql_upper and 'ORDER' not in sql_upper
@@ -974,8 +1290,15 @@ class ApexClient:
                 pass
         elif _has_qualified_ref or sql_upper.startswith('WITH '):
             pass  # CTE or cross-db qualified refs don't need a selected table
-        elif _sig in ('count_star', 'point_lookup', 'batch_lookup', 'scan_limit', 'like', 'complex'):
+        elif _sig in ('count_star', 'point_lookup', 'projected_point_lookup',
+                      'batch_lookup', 'projected_batch_lookup', 'scan_limit',
+                      'projected_scan_limit', 'projected_string_filter',
+                      'like', 'complex'):
             self._ensure_table_selected()
+
+        if _sig in ('count_star', 'scan_limit', 'projected_scan_limit',
+                    'projected_string_filter', 'like', 'complex', 'multi'):
+            self._flush_pending_memtable_rows_for_read()
 
         # ── Determine locking ──
         _needs_lock = _sig in ('multi', 'write', 'transaction', 'session') or getattr(self, '_in_txn', False)
@@ -1018,7 +1341,30 @@ class ApexClient:
                     except Exception:
                         pass  # fall through to Rust execute()
 
-            if _sig in ('point_lookup', 'batch_lookup'):
+            if _sig in (
+                'point_lookup',
+                'projected_point_lookup',
+                'batch_lookup',
+                'projected_batch_lookup',
+                'projected_scan_limit',
+                'projected_string_filter',
+            ):
+                if _sig == 'projected_point_lookup':
+                    try:
+                        point_id = self._extract_point_lookup_id(sql)
+                        table_name = _simple_from_table(sql)
+                        if (point_id is not None and _simple_projection
+                                and table_name and self._current_table
+                                and table_name.lower() == self._current_table.lower()):
+                            result = self._storage.retrieve_projected(point_id, _simple_projection)
+                            if result is not None:
+                                columns_dict = result.get('columns_dict')
+                                if columns_dict is not None:
+                                    rv = ResultView(lazy_pydict=columns_dict)
+                                    rv._show_internal_id = show_internal_id
+                                    return rv
+                    except Exception:
+                        pass  # fall through to Rust execute()
                 try:
                     result = self._storage.execute(sql)
                     if result is not None:
@@ -1477,6 +1823,7 @@ class ApexClient:
         self._check_connection()
         self._ensure_table_selected()
         with self._lock:
+            self._flush_pending_memtable_rows_for_read()
             results = self._storage.retrieve_all()
         if not results:
             return _empty_result_view()
@@ -1608,17 +1955,83 @@ class ApexClient:
             if table_name and table_name != self._current_table:
                 original = self._current_table
                 self.use_table(table_name)
+                self._flush_pending_memtable_rows_for_read()
                 count = self._storage.row_count()
                 if original is not None:
                     self.use_table(original)
                 return count
             self._ensure_table_selected()
+            self._flush_pending_memtable_rows_for_read()
             return self._storage.row_count()
 
     def flush(self) -> None:
         self._check_connection()
         with self._lock:
+            self.flush_buffered_writes()
             self._storage.flush()
+
+    def begin_buffered_writes(self, flush_rows: int = 0) -> None:
+        """Enable explicit client-local buffered single-row writes.
+
+        Rows are visible after :meth:`flush_buffered_writes`, :meth:`flush`, or
+        :meth:`close`. This mode trades immediate visibility/durability for much
+        lower per-row Python overhead in OLTP-style append bursts.
+        """
+        self._check_connection()
+        with self._lock:
+            self._ensure_table_selected()
+            self._buffered_writes_enabled = True
+            self._buffered_write_table = self._current_table
+            self._buffered_write_flush_rows = max(0, int(flush_rows or 0))
+
+    def end_buffered_writes(self, flush: bool = True) -> None:
+        """Disable buffered writes, optionally flushing pending rows first."""
+        self._check_connection()
+        with self._lock:
+            if flush:
+                self.flush_buffered_writes()
+            else:
+                self._buffered_write_rows.clear()
+                self._buffered_write_table = None
+            self._buffered_writes_enabled = False
+            self._buffered_write_flush_rows = 0
+
+    def flush_buffered_writes(self) -> int:
+        """Flush pending buffered single-row writes and return the row count."""
+        self._check_connection()
+        with self._lock:
+            return self._flush_buffered_writes_unlocked()
+
+    def _flush_buffered_writes_unlocked(self) -> int:
+        if not self._buffered_write_rows:
+            return 0
+        table = self._buffered_write_table or self._current_table
+        rows = self._buffered_write_rows
+
+        old_enabled = self._buffered_writes_enabled
+        self._buffered_writes_enabled = False
+        original_table = self._current_table
+        try:
+            if table and table != self._current_table:
+                self._storage.use_table(table)
+                self._current_table = table
+            if len(rows) == 1:
+                self._storage.store(rows[0])
+            else:
+                self._store_batch_optimized(rows)
+            self._buffered_write_rows = []
+            self._buffered_write_table = None
+            self._has_writes = True
+            return len(rows)
+        finally:
+            if original_table and original_table != self._current_table:
+                self._storage.use_table(original_table)
+                self._current_table = original_table
+            self._buffered_writes_enabled = old_enabled
+
+    def buffered_write_count(self) -> int:
+        """Return the number of pending client-local buffered rows."""
+        return len(getattr(self, "_buffered_write_rows", []))
     
     def flush_cache(self):
         self.flush()
@@ -1790,6 +2203,10 @@ class ApexClient:
         
         try:
             if hasattr(self, '_storage') and self._storage is not None:
+                try:
+                    self.flush_buffered_writes()
+                except Exception:
+                    pass
                 # Best-effort: ensure FTS index is persisted across reopen
                 try:
                     if any((isinstance(v, dict) and v.get('enabled', False)) for v in self._fts_tables.values()):

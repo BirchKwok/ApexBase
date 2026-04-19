@@ -2727,6 +2727,41 @@ impl OnDemandStorage {
         !cols.is_empty() && cols.iter().any(|c| c.len() > 0)
     }
 
+    /// Number of rows currently buffered in memory for a V4 table.
+    ///
+    /// Insert backends for mmap-only V4 files keep newly appended rows in
+    /// `ids/columns` until save()/flush() persists them as a row group. If the
+    /// full base table has been loaded into memory, only rows beyond the on-disk
+    /// footer count are considered pending.
+    #[inline]
+    pub fn pending_v4_in_memory_rows(&self) -> usize {
+        if !self.is_v4_format() {
+            return 0;
+        }
+        let ids = self.ids.read();
+        let ids_len = ids.len();
+        if ids_len == 0 || !self.has_v4_in_memory_data() {
+            return 0;
+        }
+        let on_disk_rows = self
+            .v4_footer
+            .read()
+            .as_ref()
+            .map(|footer| footer.row_groups.iter().map(|rg| rg.row_count as usize).sum())
+            .unwrap_or(0);
+        if on_disk_rows == 0 {
+            ids_len
+        } else if ids.first().copied().unwrap_or(0) != 1 {
+            // Insert backends for mmap-only V4 files hold only newly appended
+            // IDs, e.g. base has rows 1..N while memory starts at N+1.
+            ids_len
+        } else if ids_len < on_disk_rows {
+            ids_len
+        } else {
+            ids_len.saturating_sub(on_disk_rows)
+        }
+    }
+
     /// Check if in-memory columns contain the FULL base dataset (not just write buffer).
     /// Used by save() to decide between append vs full rewrite.
     #[inline]

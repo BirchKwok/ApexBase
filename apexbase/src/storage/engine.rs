@@ -177,6 +177,18 @@ impl StorageEngine {
         ApexExecutor::invalidate_cache_for_path(table_path);
     }
 
+    /// Invalidate read/query caches after an append while keeping the insert backend warm.
+    ///
+    /// The insert backend owns the just-updated footer/next-id state, so dropping it after
+    /// every small append defeats the write fast path. Read caches still need to be cleared
+    /// so subsequent queries see the newly appended row group.
+    #[inline]
+    fn invalidate_after_append(&self, table_path: &Path) {
+        self.cache.write().remove(table_path);
+        self.schema_cache.write().remove(table_path);
+        ApexExecutor::invalidate_cache_for_path(table_path);
+    }
+
     /// Invalidate all caches under a directory
     pub fn invalidate_dir(&self, dir: &Path) {
         // Use path directly without canonicalize for speed
@@ -844,7 +856,7 @@ impl StorageEngine {
         null_positions: HashMap<String, Vec<bool>>,
         durability: DurabilityLevel,
     ) -> io::Result<Vec<u64>> {
-        use crate::storage::on_demand::{ColumnData, ColumnType, OnDemandStorage};
+        use crate::storage::on_demand::{ColumnData, ColumnType};
 
         // Determine row count from first non-empty column
         let row_count = int_columns
@@ -863,8 +875,10 @@ impl StorageEngine {
         if row_count > 0 && table_path.exists() {
             if let Ok(meta) = std::fs::metadata(table_path) {
                 if meta.len() >= 256 {
-                    // Try to open read-only and check schema compatibility
-                    if let Ok(storage) = OnDemandStorage::open(table_path) {
+                    // Reuse the insert backend so repeated small appends avoid reopening
+                    // and reparsing the V4 footer on every call.
+                    if let Ok(backend) = self.get_insert_backend(table_path, durability) {
+                        let storage = &backend.storage;
                         let schema = storage.get_schema();
                         let header = storage.header_info();
                         let is_v4 = header.0 > 0; // footer_offset > 0 means V4
@@ -1071,7 +1085,7 @@ impl StorageEngine {
                                 // Append row group and return
                                 match storage.append_row_group(&ids, &new_columns, &new_nulls) {
                                     Ok(()) => {
-                                        self.invalidate(table_path);
+                                        self.invalidate_after_append(table_path);
                                         ApexExecutor::notify_indexes_after_write(table_path, &ids);
                                         return Ok(ids);
                                     }

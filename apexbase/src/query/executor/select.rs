@@ -387,7 +387,11 @@ impl ApexExecutor {
                             && !has_aggregation_check;
                         
                         // EARLY FAST PATH: _id = X point lookup — skip CBO entirely
-                        if !has_scalar_subquery && stmt.group_by.is_empty() && !has_aggregation_check {
+                        if !has_scalar_subquery
+                            && stmt.group_by.is_empty()
+                            && !has_aggregation_check
+                            && !backend.has_pending_deltas()
+                        {
                             if let Some(ref where_clause) = stmt.where_clause {
                                 if let Some(id) = Self::extract_id_equality_filter(where_clause) {
                                     if let Some(row_batch) = backend.read_row_by_id_to_arrow(id)? {
@@ -439,15 +443,29 @@ impl ApexExecutor {
                     // FAST PATH 0: Check for _id = X pattern (O(1) lookup)
                         if let Some(where_clause) = &stmt.where_clause {
                             if let Some(id) = Self::extract_id_equality_filter(where_clause) {
-                                if let Some(batch) = backend.read_row_by_id_to_arrow(id)? {
-                                    batch
+                                if !backend.has_pending_deltas() {
+                                    if let Some(batch) = backend.read_row_by_id_to_arrow(id)? {
+                                        batch
+                                    } else {
+                                        // Not in memory — fall through to general mmap → Arrow → WHERE filter path
+                                        let batch = backend.read_columns_to_arrow(None, 0, None)?;
+                                        if batch.num_rows() == 0 {
+                                            backend.read_columns_to_arrow(None, 0, Some(0))?
+                                        } else {
+                                            // Apply WHERE filter on the mmap-read batch
+                                            let filtered = Self::apply_filter_with_storage(&batch, where_clause, storage_path)?;
+                                            if filtered.num_rows() == 0 {
+                                                return Ok(ApexResult::Empty(filtered.schema()));
+                                            }
+                                            return Ok(ApexResult::Data(Self::apply_projection_with_storage(&filtered, &stmt.columns, Some(storage_path))?));
+                                        }
+                                    }
                                 } else {
-                                    // Not in memory — fall through to general mmap → Arrow → WHERE filter path
+                                    // Pending DeltaStore updates must be merged through the full scan path.
                                     let batch = backend.read_columns_to_arrow(None, 0, None)?;
                                     if batch.num_rows() == 0 {
                                         backend.read_columns_to_arrow(None, 0, Some(0))?
                                     } else {
-                                        // Apply WHERE filter on the mmap-read batch
                                         let filtered = Self::apply_filter_with_storage(&batch, where_clause, storage_path)?;
                                         if filtered.num_rows() == 0 {
                                             return Ok(ApexResult::Empty(filtered.schema()));

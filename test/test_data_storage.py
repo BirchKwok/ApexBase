@@ -73,6 +73,122 @@ class TestSingleRecordStorage:
             assert result["city"] == "NYC"
             
             client.close()
+
+    def test_buffered_single_dict_flush_visibility(self):
+        """Buffered writes are explicit and become visible after flush."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            client.store({"name": "seed", "age": 1})
+            client.begin_buffered_writes()
+            client.store({"name": "buffered", "age": 2})
+
+            assert client.buffered_write_count() == 1
+            assert client.count_rows() == 1
+
+            assert client.flush_buffered_writes() == 1
+            assert client.buffered_write_count() == 0
+            assert client.count_rows() == 2
+            assert client.retrieve(2)["name"] == "buffered"
+
+            client.end_buffered_writes(flush=False)
+            client.close()
+
+    def test_buffered_single_dict_close_flushes(self):
+        """Closing a client flushes pending buffered rows."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.begin_buffered_writes()
+            client.store({"name": "close_flush", "age": 3})
+            assert client.buffered_write_count() == 1
+            client.close()
+
+            reopened = ApexClient(dirpath=temp_dir)
+            reopened.use_table("default")
+            assert reopened.count_rows() == 1
+            assert reopened.retrieve(1)["name"] == "close_flush"
+            reopened.close()
+
+    def test_experimental_delta_single_dict_read_after_write(self, monkeypatch):
+        """Experimental delta writes preserve same-client read-after-write semantics."""
+        monkeypatch.setenv("APEXBASE_EXPERIMENTAL_DELTA_SINGLE_WRITE", "1")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.store({"name": ["seed"], "age": [1], "score": [1.0], "city": ["BJ"]})
+
+            client.store({"name": "delta", "age": 2, "score": 2.0, "city": "SH"})
+
+            assert client.count_rows() == 2
+            assert client.retrieve(2)["name"] == "delta"
+            result = client.execute(
+                "SELECT name, age, score FROM default WHERE _id = 2"
+            ).to_dict()
+            assert result == [{"name": "delta", "age": 2, "score": 2.0}]
+
+            client.store({"name": "after_read", "age": 3, "score": 3.0, "city": "GZ"})
+            assert client.count_rows() == 3
+            assert client.retrieve(3)["name"] == "after_read"
+            client.close()
+
+    def test_experimental_memtable_single_dict_flush_reopen(self, monkeypatch):
+        """Experimental memtable writes are readable immediately and persist on flush."""
+        monkeypatch.setenv("APEXBASE_EXPERIMENTAL_MEMTABLE_SINGLE_WRITE", "1")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.store({"name": ["seed"], "age": [1], "score": [1.0], "city": ["BJ"]})
+
+            client.store({"name": "memtable", "age": 2, "score": 2.0, "city": "SH"})
+
+            assert client.retrieve(2)["name"] == "memtable"
+            result = client.execute(
+                "SELECT name, age, score FROM default WHERE _id = 2"
+            ).to_dict()
+            assert result == [{"name": "memtable", "age": 2, "score": 2.0}]
+
+            client.flush()
+            client.close()
+
+            reopened = ApexClient(dirpath=temp_dir)
+            reopened.use_table("default")
+            assert reopened.count_rows() == 2
+            assert reopened.retrieve(2)["name"] == "memtable"
+            reopened.close()
+
+    def test_fast_single_dict_memtable_flushes_before_broad_reads(self, monkeypatch):
+        """Default fast single-row writes stay correct for count/filter/full reads."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir, durability="fast")
+            client.create_table("default")
+            client.store({"name": ["seed"], "age": [1], "score": [1.0], "city": ["BJ"]})
+
+            client.store({"name": "m2", "age": 2, "score": 2.0, "city": "SH"})
+
+            assert client.retrieve(2)["name"] == "m2"
+            assert client.count_rows() == 2
+            result = client.execute(
+                "SELECT * FROM default WHERE name = 'm2'",
+                show_internal_id=True,
+            ).to_dict()
+            assert result == [{
+                "_id": 2,
+                "age": 2,
+                "score": 2.0,
+                "city": "SH",
+                "name": "m2",
+            }]
+
+            client.close()
+
+            reopened = ApexClient(dirpath=temp_dir)
+            reopened.use_table("default")
+            assert reopened.count_rows() == 2
+            assert reopened.retrieve(2)["name"] == "m2"
+            reopened.close()
     
     def test_store_single_dict_all_types(self):
         """Test storing dict with all supported data types"""

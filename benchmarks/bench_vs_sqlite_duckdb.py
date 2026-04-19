@@ -317,6 +317,13 @@ class SQLiteBench:
             (point_lookup_id,),
         )
 
+    def bench_oltp_projected_point_lookup(self):
+        point_lookup_id = self.shared_inputs["point_lookup_id"]
+        return self._query_all(
+            "SELECT name, age, score FROM bench WHERE _id = ?",
+            (point_lookup_id,),
+        )
+
     def bench_retrieve_many(self):
         ids = self.shared_inputs["retrieve_many_ids"]
         placeholders = ",".join(["?"] * len(ids))
@@ -324,6 +331,32 @@ class SQLiteBench:
             f"SELECT * FROM bench WHERE _id IN ({placeholders})",
             ids,
         )
+
+    def bench_oltp_projected_retrieve_10(self):
+        ids = self.shared_inputs["retrieve_many_ids"][:10]
+        placeholders = ",".join(["?"] * len(ids))
+        return self._query_all(
+            f"SELECT name, age, score FROM bench WHERE _id IN ({placeholders})",
+            ids,
+        )
+
+    def bench_oltp_projected_limit_100(self):
+        return self._query_all("SELECT name, age, city FROM bench LIMIT 100")
+
+    def bench_oltp_projected_string_eq(self):
+        return self._query_all("SELECT age, score, city FROM bench WHERE name = 'user_5000'")
+
+    def bench_oltp_insert_one(self):
+        self.conn.execute(
+            "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+            ("oltp_one", 31, 77.0, "Beijing", "Books"),
+        )
+        self.conn.commit()
+
+    def bench_oltp_update_by_id(self):
+        point_lookup_id = self.shared_inputs["point_lookup_id"]
+        self.conn.execute("UPDATE bench SET score = 77.0 WHERE _id = ?", (point_lookup_id,))
+        self.conn.commit()
 
     def bench_insert_1k(self):
         rows = [(f"new_{i}", 25, 50.0, "Beijing", "Books") for i in range(1000)]
@@ -553,6 +586,13 @@ class DuckDBBench:
             (rowid,),
         )
 
+    def bench_oltp_projected_point_lookup(self):
+        rowid = self.shared_inputs["point_lookup_id"] - 1
+        return self._query_all(
+            "SELECT name, age, score FROM bench WHERE rowid = ?",
+            (rowid,),
+        )
+
     def bench_retrieve_many(self):
         ids = self.shared_inputs["retrieve_many_ids"]
         rowids = [id_ - 1 for id_ in ids]
@@ -561,6 +601,31 @@ class DuckDBBench:
             f"SELECT rowid + 1 AS _id, * FROM bench WHERE rowid IN ({placeholders})",
             rowids,
         )
+
+    def bench_oltp_projected_retrieve_10(self):
+        ids = self.shared_inputs["retrieve_many_ids"][:10]
+        rowids = [id_ - 1 for id_ in ids]
+        placeholders = ",".join(["?"] * len(rowids))
+        return self._query_all(
+            f"SELECT name, age, score FROM bench WHERE rowid IN ({placeholders})",
+            rowids,
+        )
+
+    def bench_oltp_projected_limit_100(self):
+        return self._query_all("SELECT name, age, city FROM bench LIMIT 100")
+
+    def bench_oltp_projected_string_eq(self):
+        return self._query_all("SELECT age, score, city FROM bench WHERE name = 'user_5000'")
+
+    def bench_oltp_insert_one(self):
+        self.conn.execute(
+            "INSERT INTO bench VALUES (?,?,?,?,?)",
+            ("oltp_one", 31, 77.0, "Beijing", "Books"),
+        )
+
+    def bench_oltp_update_by_id(self):
+        rowid = self.shared_inputs["point_lookup_id"] - 1
+        self.conn.execute("UPDATE bench SET score = 77.0 WHERE rowid = ?", (rowid,))
 
     def bench_insert_1k(self):
         # Use executemany for reliable cross-version compatibility
@@ -760,11 +825,45 @@ class ApexBaseBench:
             f"SELECT * FROM default WHERE _id = {point_lookup_id}"
         )
 
+    def bench_oltp_projected_point_lookup(self):
+        point_lookup_id = self.shared_inputs["point_lookup_id"]
+        return self.client.execute(
+            f"SELECT name, age, score FROM default WHERE _id = {point_lookup_id}"
+        ).to_dict()
+
     def bench_retrieve_many(self):
         ids = self.shared_inputs["retrieve_many_ids"]
         id_list = ",".join(str(id_) for id_ in ids)
         return self._query_all(
             f"SELECT * FROM default WHERE _id IN ({id_list})"
+        )
+
+    def bench_oltp_projected_retrieve_10(self):
+        ids = self.shared_inputs["retrieve_many_ids"][:10]
+        id_list = ",".join(str(id_) for id_ in ids)
+        return self.client.execute(
+            f"SELECT name, age, score FROM default WHERE _id IN ({id_list})"
+        ).to_dict()
+
+    def bench_oltp_projected_limit_100(self):
+        return self.client.execute("SELECT name, age, city FROM default LIMIT 100").to_dict()
+
+    def bench_oltp_projected_string_eq(self):
+        return self.client.execute("SELECT age, score, city FROM default WHERE name = 'user_5000'").to_dict()
+
+    def bench_oltp_insert_one(self):
+        self.client.store({
+            "name": "oltp_one",
+            "age": 31,
+            "score": 77.0,
+            "city": "Beijing",
+            "category": "Books",
+        })
+
+    def bench_oltp_update_by_id(self):
+        point_lookup_id = self.shared_inputs["point_lookup_id"]
+        return self.client.execute(
+            f"UPDATE default SET score = 77.0 WHERE _id = {point_lookup_id}"
         )
 
     def bench_insert_1k(self):
@@ -936,6 +1035,16 @@ BENCHMARKS = [
 ]
 
 
+OLTP_BENCHMARKS = [
+    ("OLTP Point Lookup projected", "bench_oltp_projected_point_lookup"),
+    ("OLTP Retrieve 10 projected", "bench_oltp_projected_retrieve_10"),
+    ("OLTP SELECT 3 cols LIMIT 100", "bench_oltp_projected_limit_100"),
+    ("OLTP String equality projected", "bench_oltp_projected_string_eq"),
+    ("OLTP Insert 1 row", "bench_oltp_insert_one"),
+    ("OLTP UPDATE by ID", "bench_oltp_update_by_id"),
+]
+
+
 def result_shape(value):
     """Return a compact shape string for materialized benchmark results."""
     if value is None:
@@ -1066,6 +1175,265 @@ def run_apex_materialization_benchmarks(tmpdir, data, shared_inputs, warmup, ite
             pass
         try:
             shutil.rmtree(mat_tmpdir)
+        except Exception:
+            pass
+
+    return rows
+
+
+def run_oltp_benchmarks(engines, warmup, iterations):
+    """Run short OLTP-style microbenchmarks on the already-loaded engines."""
+    if not engines:
+        return []
+
+    print("\n--- OLTP Microbenchmarks (short queries / point mutations) ---")
+    print("  Uses the already-loaded benchmark tables; read cases materialize Python rows.")
+    print("  Insert/update cases use each engine's native client API and may mutate the table between iterations.")
+    print("  FTS maintenance is disabled before OLTP writes so engines are compared on base-table OLTP only.")
+
+    for _, bench in engines:
+        if isinstance(bench, ApexBaseBench) and getattr(bench, "_fts_ready", False):
+            try:
+                bench.client.disable_fts("default")
+            except Exception:
+                pass
+
+    eng_names = [name for name, _ in engines]
+    col_width = 16
+    header = f"  {'Operation':<34}"
+    for name in eng_names:
+        header += f" | {name:>{col_width}}"
+    if len(eng_names) >= 2:
+        header += f" | {'Ratio (Apex/Best)':>{col_width}}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    rows = []
+    for bench_name, method_name in OLTP_BENCHMARKS:
+        values = {}
+        row = f"  {bench_name:<34}"
+        for eng_name, bench in engines:
+            fn = getattr(bench, method_name, None)
+            if fn is None:
+                row += f" | {'N/A':>{col_width}}"
+                continue
+            try:
+                ms = run_bench_nogc(fn, warmup=warmup, iterations=iterations)
+                values[eng_name] = ms
+                row += f" | {fmt_ms(ms):>{col_width}}"
+            except Exception:
+                row += f" | {'N/A':>{col_width}}"
+
+        if len(eng_names) >= 2 and "ApexBase" in values:
+            others = {k: v for k, v in values.items() if k != "ApexBase"}
+            if others:
+                best_other = min(others.values())
+                ratio = values["ApexBase"] / best_other if best_other > 0 else float("inf")
+                if ratio < 1:
+                    label = f"{ratio:.2f}x (faster)"
+                elif ratio < 1.05:
+                    label = "~1.0x (tied)"
+                else:
+                    label = f"{ratio:.1f}x (slower)"
+                row += f" | {label:>{col_width}}"
+        print(row)
+        rows.append({
+            "operation": bench_name,
+            **{k: round(v, 3) for k, v in values.items()},
+        })
+    return rows
+
+
+def run_apex_buffered_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
+    """Show ApexBase's explicit client-local buffered write mode.
+
+    This is intentionally separate from the default cross-engine OLTP table:
+    buffered rows are accumulated in the ApexClient process and become visible
+    after flush/end/close, so the durability/visibility contract is different
+    from per-call SQLite INSERT+commit.
+    """
+    if not HAS_APEXBASE or not hasattr(ApexClient, "begin_buffered_writes"):
+        return []
+
+    baselines = {}
+    for row in oltp_results or []:
+        if row.get("operation") == "OLTP Insert 1 row":
+            baselines = row
+            break
+
+    print("\n--- ApexBase Explicit Buffered OLTP (separate mode) ---")
+    print("  Opt-in client-local write buffer; rows are flushed before visibility/durability.")
+    print("  This is not mixed into the default fair OLTP ranking.")
+
+    col_width = 16
+    header = f"  {'Operation':<42} | {'ApexBase Buffered':>{col_width}}"
+    for name in ("SQLite", "DuckDB"):
+        if name in baselines:
+            header += f" | {name:>{col_width}}"
+    if baselines:
+        header += f" | {'Ratio (Apex/Best)':>{col_width}}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    rows = []
+    buf_tmpdir = tempfile.mkdtemp(prefix="apexbase_buffered_oltp_", dir=tmpdir)
+    client = ApexClient(buf_tmpdir, drop_if_exists=True)
+    try:
+        client.create_table("default")
+        client.store({
+            "name": ["seed"],
+            "age": [1],
+            "score": [1.0],
+            "city": ["Beijing"],
+            "category": ["Books"],
+        })
+        client.begin_buffered_writes()
+
+        def buffered_insert_one():
+            client.store({
+                "name": "oltp_buffered_one",
+                "age": 31,
+                "score": 77.0,
+                "city": "Beijing",
+                "category": "Books",
+            })
+
+        ms = run_bench_nogc(buffered_insert_one, warmup=warmup, iterations=iterations)
+        flushed = client.flush_buffered_writes()
+
+        row_text = f"  {'Buffered Insert 1 row':<42} | {fmt_ms(ms):>{col_width}}"
+        others = []
+        for name in ("SQLite", "DuckDB"):
+            other_ms = baselines.get(name)
+            if other_ms is not None:
+                row_text += f" | {fmt_ms(other_ms):>{col_width}}"
+                others.append(other_ms)
+        if others:
+            best_other = min(others)
+            ratio = ms / best_other if best_other > 0 else float("inf")
+            if ratio < 1:
+                label = f"{ratio:.2f}x (faster)"
+            elif ratio < 1.05:
+                label = "~1.0x (tied)"
+            else:
+                label = f"{ratio:.1f}x (slower)"
+            row_text += f" | {label:>{col_width}}"
+        print(row_text)
+
+        rows.append({
+            "operation": "Buffered Insert 1 row",
+            "ApexBase Buffered": round(ms, 6),
+            "flushed_rows_after_timing": flushed,
+        })
+    finally:
+        try:
+            client.end_buffered_writes(flush=True)
+        except Exception:
+            pass
+        try:
+            client.close()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(buf_tmpdir)
+        except Exception:
+            pass
+
+    return rows
+
+
+def run_apex_memtable_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
+    """Show ApexBase's experimental storage-level memtable write path.
+
+    This path keeps writes inside the storage engine and makes them immediately
+    readable by the same storage instance, then persists them on flush/close.
+    It is separate from the default fair OLTP table until cross-client/process
+    visibility semantics are finalized.
+    """
+    if not HAS_APEXBASE:
+        return []
+
+    baselines = {}
+    for row in oltp_results or []:
+        if row.get("operation") == "OLTP Insert 1 row":
+            baselines = row
+            break
+
+    print("\n--- ApexBase Experimental Storage Memtable OLTP (separate mode) ---")
+    print("  Opt-in storage-level write buffer; same-storage reads see rows immediately.")
+    print("  Rows are persisted on flush/close; not mixed into the default fair OLTP ranking.")
+
+    col_width = 16
+    header = f"  {'Operation':<42} | {'ApexBase Memtable':>{col_width}}"
+    for name in ("SQLite", "DuckDB"):
+        if name in baselines:
+            header += f" | {name:>{col_width}}"
+    if baselines:
+        header += f" | {'Ratio (Apex/Best)':>{col_width}}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    rows = []
+    mem_tmpdir = tempfile.mkdtemp(prefix="apexbase_memtable_oltp_", dir=tmpdir)
+    old_env = os.environ.get("APEXBASE_EXPERIMENTAL_MEMTABLE_SINGLE_WRITE")
+    os.environ["APEXBASE_EXPERIMENTAL_MEMTABLE_SINGLE_WRITE"] = "1"
+    client = ApexClient(mem_tmpdir, drop_if_exists=True)
+    try:
+        client.create_table("default")
+        client.store({
+            "name": ["seed"],
+            "age": [1],
+            "score": [1.0],
+            "city": ["Beijing"],
+            "category": ["Books"],
+        })
+
+        def memtable_insert_one():
+            client.store({
+                "name": "oltp_memtable_one",
+                "age": 31,
+                "score": 77.0,
+                "city": "Beijing",
+                "category": "Books",
+            })
+
+        ms = run_bench_nogc(memtable_insert_one, warmup=warmup, iterations=iterations)
+        client.flush()
+
+        row_text = f"  {'Memtable Insert 1 row':<42} | {fmt_ms(ms):>{col_width}}"
+        others = []
+        for name in ("SQLite", "DuckDB"):
+            other_ms = baselines.get(name)
+            if other_ms is not None:
+                row_text += f" | {fmt_ms(other_ms):>{col_width}}"
+                others.append(other_ms)
+        if others:
+            best_other = min(others)
+            ratio = ms / best_other if best_other > 0 else float("inf")
+            if ratio < 1:
+                label = f"{ratio:.2f}x (faster)"
+            elif ratio < 1.05:
+                label = "~1.0x (tied)"
+            else:
+                label = f"{ratio:.1f}x (slower)"
+            row_text += f" | {label:>{col_width}}"
+        print(row_text)
+
+        rows.append({
+            "operation": "Memtable Insert 1 row",
+            "ApexBase Memtable": round(ms, 6),
+        })
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+        if old_env is None:
+            os.environ.pop("APEXBASE_EXPERIMENTAL_MEMTABLE_SINGLE_WRITE", None)
+        else:
+            os.environ["APEXBASE_EXPERIMENTAL_MEMTABLE_SINGLE_WRITE"] = old_env
+        try:
+            shutil.rmtree(mem_tmpdir)
         except Exception:
             pass
 
@@ -1533,6 +1901,24 @@ def main():
     qps_results = run_qps_benchmark(tmpdir, data, n_threads=4, min_duration=2.0, min_iterations=50,
                                     existing_engines=existing_engines)
 
+    oltp_results = run_oltp_benchmarks(
+        engines,
+        warmup=WARMUP,
+        iterations=ITERS,
+    )
+    buffered_oltp_results = run_apex_buffered_oltp_benchmarks(
+        tmpdir,
+        oltp_results,
+        warmup=WARMUP,
+        iterations=ITERS,
+    )
+    memtable_oltp_results = run_apex_memtable_oltp_benchmarks(
+        tmpdir,
+        oltp_results,
+        warmup=WARMUP,
+        iterations=ITERS,
+    )
+
     # Cleanup (after Q/s tests, engines are still open)
     for name, bench in engines:
         bench.close()
@@ -1544,6 +1930,10 @@ def main():
             "config": {"rows": N, "warmup": WARMUP, "iterations": ITERS},
             "results": json_results,
             "apexbase_materialization": materialization_results,
+            "qps": qps_results,
+            "oltp_microbenchmarks": oltp_results,
+            "apexbase_buffered_oltp": buffered_oltp_results,
+            "apexbase_memtable_oltp": memtable_oltp_results,
         }
         with open(args.output, "w") as f:
             json.dump(output, f, indent=2)

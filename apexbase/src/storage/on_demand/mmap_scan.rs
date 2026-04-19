@@ -4281,6 +4281,202 @@ impl OnDemandStorage {
         Ok(Some(total_updated))
     }
 
+    /// Overwrite one numeric cell by `_id` using the V4 row-group id section.
+    /// Returns None unless the target row exists, is active, and the SET column is
+    /// PLAIN numeric in an uncompressed RCIX row group.
+    pub fn update_by_id_inplace(
+        &self,
+        id: u64,
+        set_col: &str,
+        new_value_bytes: &[u8; 8],
+    ) -> io::Result<Option<(i64, bool)>> {
+        if set_col == "_id" {
+            return Ok(None);
+        }
+
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let set_idx = match schema.get_index(set_col) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let set_type = schema.columns[set_idx].1;
+        let is_numeric = matches!(
+            set_type,
+            ColumnType::Int64
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Timestamp
+                | ColumnType::Date
+                | ColumnType::Float64
+                | ColumnType::Float32
+        );
+        if !is_numeric {
+            return Ok(None);
+        }
+
+        let (rg_i, rg_meta) = match footer
+            .row_groups
+            .iter()
+            .enumerate()
+            .find(|(_, rg)| rg.min_id <= id && id <= rg.max_id && rg.row_count > 0)
+        {
+            Some(v) => v,
+            None => return Ok(Some((0, false))),
+        };
+        if rg_i >= footer.col_offsets.len() || set_idx >= footer.col_offsets[rg_i].len() {
+            return Ok(None);
+        }
+
+        let rg_rows = rg_meta.row_count as usize;
+        let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        if rg_end > mmap_ref.len() {
+            return Ok(None);
+        }
+
+        let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+        let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { 1 };
+        let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+        if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
+            return Ok(None);
+        }
+
+        let body = &rg_bytes[32..];
+        let guess = id.saturating_sub(rg_meta.min_id) as usize;
+        if guess >= rg_rows {
+            return Ok(Some((0, false)));
+        }
+        let id_start = guess * 8;
+        if id_start + 8 > body.len() {
+            return Ok(None);
+        }
+        let actual_id = u64::from_le_bytes(body[id_start..id_start + 8].try_into().unwrap());
+        if actual_id != id {
+            return Ok(None);
+        }
+
+        let bitmap_len = (rg_rows + 7) / 8;
+        let del_off = rg_rows * 8 + guess / 8;
+        if del_off >= body.len() {
+            return Ok(None);
+        }
+        if ((body[del_off] >> (guess % 8)) & 1) == 1 {
+            return Ok(Some((0, false)));
+        }
+
+        let set_col_off = footer.col_offsets[rg_i][set_idx] as usize;
+        if set_col_off + bitmap_len + 1 + 8 > body.len() {
+            return Ok(None);
+        }
+        let set_data = &body[set_col_off + bitmap_len..];
+        if set_data.is_empty() || set_data[0] != COL_ENCODING_PLAIN {
+            return Ok(None);
+        }
+
+        let value_file_offset =
+            rg_meta.offset + 32 + (set_col_off + bitmap_len + 1 + 8 + guess * 8) as u64;
+        let null_byte_file_offset = rg_meta.offset + 32 + (set_col_off + guess / 8) as u64;
+        let value_body_offset = set_col_off + bitmap_len + 1 + 8 + guess * 8;
+        let null_byte = body[set_col_off + guess / 8];
+        if ((null_byte >> (guess % 8)) & 1) == 0
+            && value_body_offset + 8 <= body.len()
+            && &body[value_body_offset..value_body_offset + 8] == new_value_bytes
+        {
+            return Ok(Some((1, false)));
+        }
+
+        use std::io::{Seek, SeekFrom, Write};
+        let mut write_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
+        let mut null_byte = null_byte;
+        null_byte &= !(1u8 << (guess % 8));
+        write_file.seek(SeekFrom::Start(null_byte_file_offset))?;
+        write_file.write_all(&[null_byte])?;
+        write_file.seek(SeekFrom::Start(value_file_offset))?;
+        write_file.write_all(new_value_bytes)?;
+
+        drop(mmap_guard);
+        drop(file_guard);
+        Ok(Some((1, true)))
+    }
+
+    /// Check whether `_id` is present and not deleted by reading only the row-group
+    /// id/deletion sections. Returns None when the V4 layout is not directly readable.
+    pub fn row_id_active_rcix(&self, id: u64) -> io::Result<Option<bool>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let rg_meta = match footer
+            .row_groups
+            .iter()
+            .find(|rg| rg.min_id <= id && id <= rg.max_id && rg.row_count > 0)
+        {
+            Some(rg) => rg,
+            None => return Ok(Some(false)),
+        };
+        let rg_rows = rg_meta.row_count as usize;
+        let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        if rg_end > mmap_ref.len() {
+            return Ok(None);
+        }
+        let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+        if rg_bytes.len() < 32 || rg_bytes[28] != RG_COMPRESS_NONE {
+            return Ok(None);
+        }
+
+        let body = &rg_bytes[32..];
+        if body.len() < rg_rows * 8 {
+            return Ok(None);
+        }
+        let guess = id.saturating_sub(rg_meta.min_id) as usize;
+        let local_idx = if guess < rg_rows {
+            let start = guess * 8;
+            let actual = u64::from_le_bytes(body[start..start + 8].try_into().unwrap());
+            if actual == id {
+                guess
+            } else {
+                let ids_cow = bytes_as_u64_slice(&body[..rg_rows * 8], rg_rows);
+                match ids_cow.binary_search(&id) {
+                    Ok(i) => i,
+                    Err(_) => return Ok(Some(false)),
+                }
+            }
+        } else {
+            return Ok(Some(false));
+        };
+
+        let del_off = rg_rows * 8 + local_idx / 8;
+        if del_off >= body.len() {
+            return Ok(None);
+        }
+        let deleted = ((body[del_off] >> (local_idx % 8)) & 1) == 1;
+        Ok(Some(!deleted))
+    }
+
     /// Scan a numeric column for rows in [low, high] and return their row IDs directly.
     /// Unlike scan_numeric_range_mmap which returns global row indices, this reads IDs
     /// from the row group body in the same pass — avoids a separate _id column read.

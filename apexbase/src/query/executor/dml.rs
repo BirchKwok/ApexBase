@@ -2204,6 +2204,7 @@ impl ApexExecutor {
             Self::notify_index_delete(storage_path, &deleted_entries);
             Self::notify_fts_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
+            crate::storage::engine::engine().invalidate(storage_path);
             invalidate_table_stats(&storage_path.to_string_lossy());
             return Ok(ApexResult::Scalar(count));
         }
@@ -2219,6 +2220,7 @@ impl ApexExecutor {
                 if let Some(deleted) = storage.delete_where_numeric_range_inplace(&col, low, high)? {
                     if deleted > 0 {
                         invalidate_storage_cache(storage_path);
+                        crate::storage::engine::engine().invalidate(storage_path);
                         invalidate_table_stats(&storage_path.to_string_lossy());
                     }
                     return Ok(ApexResult::Scalar(deleted));
@@ -2234,6 +2236,7 @@ impl ApexExecutor {
                             storage.save_delete_only()?;
                         }
                         invalidate_storage_cache(storage_path);
+                        crate::storage::engine::engine().invalidate(storage_path);
                         invalidate_table_stats(&storage_path.to_string_lossy());
                     }
                     return Ok(ApexResult::Scalar(deleted));
@@ -2248,6 +2251,7 @@ impl ApexExecutor {
                             storage.save_delete_only()?;
                         }
                         invalidate_storage_cache(storage_path);
+                        crate::storage::engine::engine().invalidate(storage_path);
                         invalidate_table_stats(&storage_path.to_string_lossy());
                     }
                     return Ok(ApexResult::Scalar(deleted));
@@ -2355,6 +2359,7 @@ impl ApexExecutor {
             Self::notify_index_delete(storage_path, &deleted_entries);
             Self::notify_fts_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
+            crate::storage::engine::engine().invalidate(storage_path);
             invalidate_table_stats(&storage_path.to_string_lossy());
         }
         
@@ -2414,6 +2419,58 @@ impl ApexExecutor {
                         !ds.all_updates().values().any(|m| m.contains_key(&where_col))
                     };
                     if where_col_clean {
+                        if where_col == "_id" && low.is_finite() && high.is_finite() && (low - high).abs() < f64::EPSILON && low >= 0.0 {
+                            let row_id = low as u64;
+                            if assignments.len() == 1 {
+                                let (col_name, expr) = &assignments[0];
+                                if col_name != "_id" {
+                                    if let SqlExpr::Literal(v) = expr {
+                                        let bytes_opt = match v {
+                                            Value::Float64(f) => Some(f.to_le_bytes()),
+                                            Value::Int64(i) => Some(i.to_le_bytes()),
+                                            _ => None,
+                                        };
+                                        if let Some(bytes) = bytes_opt {
+                                            if let Some((n, physically_written)) = storage.update_by_id_inplace(row_id, col_name, &bytes)? {
+                                                if physically_written {
+                                                    invalidate_storage_cache(storage_path);
+                                                    invalidate_table_stats(&storage_path.to_string_lossy());
+                                                }
+                                                return Ok(ApexResult::Scalar(n));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            let mut delta_values: Vec<(u64, &str, Value)> = Vec::with_capacity(assignments.len());
+                            let mut can_delta_by_id = true;
+                            for (col_name, expr) in assignments {
+                                if col_name == "_id" {
+                                    can_delta_by_id = false;
+                                    break;
+                                }
+                                if let SqlExpr::Literal(v) = expr {
+                                    delta_values.push((row_id, col_name.as_str(), v.clone()));
+                                } else {
+                                    can_delta_by_id = false;
+                                    break;
+                                }
+                            }
+                            if can_delta_by_id {
+                                if let Some(row_exists) = storage.row_id_active_rcix(row_id)? {
+                                    let updated = if row_exists { 1 } else { 0 };
+                                    if updated > 0 {
+                                        storage.delta_batch_update_rows(&delta_values);
+                                        storage.save_delta_store()?;
+                                    }
+                                    invalidate_storage_cache(storage_path);
+                                    invalidate_table_stats(&storage_path.to_string_lossy());
+                                    return Ok(ApexResult::Scalar(updated));
+                                }
+                            }
+                        }
+
                         // Try in-place write for each SET column
                         let mut all_inplace = true;
                         let mut inplace_count: i64 = 0;
