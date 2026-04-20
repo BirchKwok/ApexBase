@@ -915,6 +915,20 @@ impl ApexStorageImpl {
         }
         let schema_cols: std::collections::HashSet<&str> =
             schema.iter().map(|(name, _)| name.as_str()).collect();
+        let schema_types: HashMap<String, crate::storage::on_demand::ColumnType> = schema
+            .iter()
+            .map(|(name, ty)| (name.clone(), *ty))
+            .collect();
+        if schema_types.values().any(|ty| {
+            matches!(
+                ty,
+                crate::storage::on_demand::ColumnType::FixedList
+                    | crate::storage::on_demand::ColumnType::Float16List
+                    | crate::storage::on_demand::ColumnType::Null
+            )
+        }) {
+            return Ok(None);
+        }
 
         let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
         let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
@@ -934,28 +948,82 @@ impl ApexStorageImpl {
                 return Ok(None);
             }
             field_count += 1;
+            let Some(col_type) = schema_types.get(&col_name).copied() else {
+                return Ok(None);
+            };
 
-            if value.is_none() {
-                string_columns.insert(col_name.clone(), vec![String::new()]);
-                null_positions.insert(col_name, vec![true]);
-            } else if let Ok(v) = value.extract::<bool>() {
-                bool_columns.insert(col_name.clone(), vec![v]);
-                null_positions.insert(col_name, vec![false]);
-            } else if let Ok(v) = value.extract::<i64>() {
-                int_columns.insert(col_name.clone(), vec![v]);
-                null_positions.insert(col_name, vec![false]);
-            } else if let Ok(v) = value.extract::<f64>() {
-                float_columns.insert(col_name.clone(), vec![v]);
-                null_positions.insert(col_name, vec![false]);
-            } else if let Ok(bytes) = value.extract::<Vec<u8>>() {
-                binary_columns_map.insert(col_name.clone(), vec![bytes]);
-                null_positions.insert(col_name, vec![false]);
-            } else {
-                string_columns.insert(
-                    col_name.clone(),
-                    vec![value.extract::<String>().unwrap_or_default()],
-                );
-                null_positions.insert(col_name, vec![false]);
+            use crate::storage::on_demand::ColumnType;
+            match col_type {
+                ColumnType::Bool => {
+                    let v = if value.is_none() {
+                        false
+                    } else if let Ok(v) = value.extract::<bool>() {
+                        v
+                    } else {
+                        return Ok(None);
+                    };
+                    bool_columns.insert(col_name.clone(), vec![v]);
+                    null_positions.insert(col_name, vec![value.is_none()]);
+                }
+                ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::Int64
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Timestamp
+                | ColumnType::Date => {
+                    let v = if value.is_none() {
+                        0
+                    } else if let Ok(v) = value.extract::<i64>() {
+                        v
+                    } else {
+                        return Ok(None);
+                    };
+                    int_columns.insert(col_name.clone(), vec![v]);
+                    null_positions.insert(col_name, vec![value.is_none()]);
+                }
+                ColumnType::Float32 | ColumnType::Float64 => {
+                    let v = if value.is_none() {
+                        0.0
+                    } else if let Ok(v) = value.extract::<f64>() {
+                        v
+                    } else {
+                        match value.extract::<i64>() {
+                            Ok(v) => v as f64,
+                            Err(_) => return Ok(None),
+                        }
+                    };
+                    float_columns.insert(col_name.clone(), vec![v]);
+                    null_positions.insert(col_name, vec![value.is_none()]);
+                }
+                ColumnType::String | ColumnType::StringDict => {
+                    let v = if value.is_none() {
+                        String::new()
+                    } else if let Ok(v) = value.extract::<String>() {
+                        v
+                    } else {
+                        return Ok(None);
+                    };
+                    string_columns.insert(col_name.clone(), vec![v]);
+                    null_positions.insert(col_name, vec![value.is_none()]);
+                }
+                ColumnType::Binary => {
+                    let v = if value.is_none() {
+                        Vec::new()
+                    } else if let Ok(v) = value.extract::<Vec<u8>>() {
+                        v
+                    } else {
+                        return Ok(None);
+                    };
+                    binary_columns_map.insert(col_name.clone(), vec![v]);
+                    null_positions.insert(col_name, vec![value.is_none()]);
+                }
+                ColumnType::FixedList | ColumnType::Float16List | ColumnType::Null => {
+                    return Ok(None);
+                }
             }
         }
 
@@ -979,7 +1047,7 @@ impl ApexStorageImpl {
 
         let cache_key = Self::backend_cache_key(&table_path, &table_name);
         self.cached_backends.insert(cache_key, Arc::clone(&backend));
-        crate::query::executor::invalidate_storage_cache(&table_path);
+        crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
         crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
 
         Ok(Some(result.into_iter().map(|id| id as i64).collect()))
@@ -1798,32 +1866,34 @@ impl ApexStorageImpl {
             let (_, target_path) =
                 self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
             if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
-                let limit = *limit;
-                let batch_result =
-                    py.allow_threads(|| match backend.storage.get_or_load_footer() {
-                        Ok(Some(footer)) => {
-                            let col_indices: Vec<usize> =
-                                (0..footer.schema.column_count()).collect();
-                            backend
-                                .storage
-                                .to_arrow_batch_pread_rcix(&col_indices, true, limit)
+                if backend.pending_v4_in_memory_rows() == 0 {
+                    let limit = *limit;
+                    let batch_result =
+                        py.allow_threads(|| match backend.storage.get_or_load_footer() {
+                            Ok(Some(footer)) => {
+                                let col_indices: Vec<usize> =
+                                    (0..footer.schema.column_count()).collect();
+                                backend
+                                    .storage
+                                    .to_arrow_batch_pread_rcix(&col_indices, true, limit)
+                            }
+                            _ => Ok(None),
+                        });
+                    if let Ok(Some(batch)) = batch_result {
+                        if batch.num_rows() > 0 {
+                            let out = PyDict::new_bound(py);
+                            let columns_dict = PyDict::new_bound(py);
+                            let schema = batch.schema();
+                            for col_idx in 0..batch.num_columns() {
+                                let col_name = schema.field(col_idx).name();
+                                let arr = batch.column(col_idx);
+                                let col_list = arrow_col_to_pylist(py, arr)?;
+                                columns_dict.set_item(col_name, col_list)?;
+                            }
+                            out.set_item("columns_dict", columns_dict)?;
+                            out.set_item("rows_affected", 0i64)?;
+                            return Ok(out.into());
                         }
-                        _ => Ok(None),
-                    });
-                if let Ok(Some(batch)) = batch_result {
-                    if batch.num_rows() > 0 {
-                        let out = PyDict::new_bound(py);
-                        let columns_dict = PyDict::new_bound(py);
-                        let schema = batch.schema();
-                        for col_idx in 0..batch.num_columns() {
-                            let col_name = schema.field(col_idx).name();
-                            let arr = batch.column(col_idx);
-                            let col_list = arrow_col_to_pylist(py, arr)?;
-                            columns_dict.set_item(col_name, col_list)?;
-                        }
-                        out.set_item("columns_dict", columns_dict)?;
-                        out.set_item("rows_affected", 0i64)?;
-                        return Ok(out.into());
                     }
                 }
             }
@@ -2213,6 +2283,9 @@ impl ApexStorageImpl {
 
         let batch = py.allow_threads(|| -> Option<arrow::record_batch::RecordBatch> {
             let backend = crate::query::get_cached_backend_pub(&table_path).ok()?;
+            if backend.pending_v4_in_memory_rows() > 0 {
+                return None;
+            }
             backend
                 .scan_like_and_extract_mmap(&col, &pattern, None)
                 .ok()
@@ -2283,25 +2356,31 @@ impl ApexStorageImpl {
             let (_, target_path) =
                 self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
             if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
-                if let Ok(batch) = backend
-                    .storage
-                    .to_arrow_batch_with_limit(None, false, *limit)
-                {
-                    if batch.num_rows() > 0 || batch.num_columns() > 0 {
-                        let mut buf = Vec::with_capacity(batch.get_array_memory_size() + 256);
-                        {
-                            let mut writer =
-                                StreamWriter::try_new(&mut buf, batch.schema().as_ref()).map_err(
-                                    |e| PyRuntimeError::new_err(format!("IPC writer error: {}", e)),
-                                )?;
-                            writer.write(&batch).map_err(|e| {
-                                PyRuntimeError::new_err(format!("IPC write error: {}", e))
-                            })?;
-                            writer.finish().map_err(|e| {
-                                PyRuntimeError::new_err(format!("IPC finish error: {}", e))
-                            })?;
+                if backend.pending_v4_in_memory_rows() == 0 {
+                    if let Ok(batch) = backend
+                        .storage
+                        .to_arrow_batch_with_limit(None, false, *limit)
+                    {
+                        if batch.num_rows() > 0 || batch.num_columns() > 0 {
+                            let mut buf = Vec::with_capacity(batch.get_array_memory_size() + 256);
+                            {
+                                let mut writer =
+                                    StreamWriter::try_new(&mut buf, batch.schema().as_ref())
+                                        .map_err(|e| {
+                                            PyRuntimeError::new_err(format!(
+                                                "IPC writer error: {}",
+                                                e
+                                            ))
+                                        })?;
+                                writer.write(&batch).map_err(|e| {
+                                    PyRuntimeError::new_err(format!("IPC write error: {}", e))
+                                })?;
+                                writer.finish().map_err(|e| {
+                                    PyRuntimeError::new_err(format!("IPC finish error: {}", e))
+                                })?;
+                            }
+                            return Ok(PyBytes::new_bound(py, &buf).into());
                         }
-                        return Ok(PyBytes::new_bound(py, &buf).into());
                     }
                 }
             }
@@ -2642,6 +2721,12 @@ impl ApexStorageImpl {
             return Ok(0);
         }
 
+        let table_name = self.current_table.read().clone();
+        let cache_key = Self::backend_cache_key(&table_path, &table_name);
+        if let Some(backend) = self.cached_backends.get(&cache_key) {
+            return Ok(backend.active_row_count());
+        }
+
         // No file lock needed — active_count is atomic and always consistent
         let engine = crate::storage::engine::engine();
         let count = engine
@@ -2673,23 +2758,23 @@ impl ApexStorageImpl {
 
     /// Ultra-fast row count using cached backend (bypasses engine for maximum speed).
     /// This is 2-3x faster than row_count() for COUNT(*) queries.
-    /// Uses base_row_count() - O(1) lock-free atomic read (no delta scan).
+    /// Uses active_row_count() so pending memtable rows are visible to COUNT(*).
     fn fast_row_count(&self) -> PyResult<u64> {
         let table_path = self.get_current_table_path()?;
         if !table_path.exists() {
             return Ok(0);
         }
 
-        // Direct backend access - bypass engine completely
-        // Use base_row_count() for O(1) lock-free read (no delta file scan)
+        // Direct backend access - bypass engine completely. Use active count so
+        // storage-level memtable rows are visible before they are flushed.
         if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-            return Ok(backend.base_row_count());
+            return Ok(backend.active_row_count());
         }
 
-        // Fallback to engine path - also use fast base_row_count()
+        // Fallback to engine path.
         let engine = crate::storage::engine::engine();
         let count = engine
-            .base_row_count(&table_path)
+            .active_row_count(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(count)
     }

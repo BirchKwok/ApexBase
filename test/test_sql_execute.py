@@ -2223,6 +2223,14 @@ def _store_rows_in_chunks(client: ApexClient, rows_iter, chunk_size: int = 50_00
         client.store(buf)
 
 
+# Keep pytest fast while preserving the large-query shape. Set these env vars to
+# 200000/1000000/1000000 to run the original 1M-row stress profile locally.
+_PERF_JOIN_USER_ROWS = int(os.environ.get("APEXBASE_TEST_JOIN_USER_ROWS", "50000"))
+_PERF_JOIN_ORDER_ROWS = int(os.environ.get("APEXBASE_TEST_JOIN_ORDER_ROWS", "250000"))
+_PERF_SUBQUERY_ROWS = int(os.environ.get("APEXBASE_TEST_SUBQUERY_ROWS", "250000"))
+_PERF_QUERY_RUNS = int(os.environ.get("APEXBASE_TEST_QUERY_RUNS", "3"))
+
+
 class TestSQLPerformance1M:
     @pytest.mark.perf
     @pytest.mark.slow
@@ -2234,7 +2242,10 @@ class TestSQLPerformance1M:
             t_store0 = time.perf_counter()
             _store_rows_in_chunks(
                 client,
-                ({"user_id": i, "tier": "pro" if (i % 10 == 0) else "free"} for i in range(200_000)),
+                (
+                    {"user_id": i, "tier": "pro" if (i % 10 == 0) else "free"}
+                    for i in range(_PERF_JOIN_USER_ROWS)
+                ),
                 chunk_size=50_000,
             )
             t_store1 = time.perf_counter()
@@ -2247,10 +2258,10 @@ class TestSQLPerformance1M:
                 (
                     {
                         "order_id": i,
-                        "user_id": i % 200_000,
+                        "user_id": i % _PERF_JOIN_USER_ROWS,
                         "amount": (i % 97) * 1.0,
                     }
-                    for i in range(1_000_000)
+                    for i in range(_PERF_JOIN_ORDER_ROWS)
                 ),
                 chunk_size=50_000,
             )
@@ -2271,7 +2282,7 @@ class TestSQLPerformance1M:
             # Warmup + repeated runs to measure executor-only improvements
             _execute_or_xfail(client, sql).to_dict()
             times = []
-            for _ in range(5):
+            for _ in range(_PERF_QUERY_RUNS):
                 t0 = time.perf_counter()
                 result = _execute_or_xfail(client, sql)
                 rows = result.to_dict()
@@ -2284,6 +2295,7 @@ class TestSQLPerformance1M:
             avg = sum(times) / len(times)
             print(
                 f"perf_1m_join_filter_order_limit: query_avg={avg:.3f}s query_runs={[round(x, 3) for x in times]} "
+                f"users={_PERF_JOIN_USER_ROWS} orders={_PERF_JOIN_ORDER_ROWS} "
                 f"store_users={t_store1 - t_store0:.3f}s flush_users={t_flush1 - t_store1:.3f}s "
                 f"store_orders={t_store2 - t_flush1:.3f}s flush_orders={t_flush2 - t_store2:.3f}s"
             )
@@ -2307,7 +2319,7 @@ class TestSQLPerformance1M:
                         "channel": f"c{i % 20}",
                         "amount": float(i % 101),
                     }
-                    for i in range(1_000_000)
+                    for i in range(_PERF_SUBQUERY_ROWS)
                 ),
                 chunk_size=50_000,
             )
@@ -2328,7 +2340,7 @@ class TestSQLPerformance1M:
 
             _execute_or_xfail(client, sql).scalar()
             times = []
-            for _ in range(5):
+            for _ in range(_PERF_QUERY_RUNS):
                 t0 = time.perf_counter()
                 result = _execute_or_xfail(client, sql)
                 v = result.scalar()
@@ -2339,6 +2351,7 @@ class TestSQLPerformance1M:
             avg = sum(times) / len(times)
             print(
                 f"perf_1m_nested_subquery_two_stage: query_avg={avg:.3f}s query_runs={[round(x, 3) for x in times]} "
+                f"rows={_PERF_SUBQUERY_ROWS} "
                 f"store={t_store1 - t_store0:.3f}s flush={t_flush1 - t_store1:.3f}s"
             )
 

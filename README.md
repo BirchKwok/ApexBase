@@ -574,6 +574,15 @@ Read benchmarks materialize full results for fairness; ID lookups use shared det
 
 Q/s uses a scan-heavy mixed workload: COUNT + two full-table GROUP BY scans + filtered LIMIT 100, materialized to Python rows.
 
+### OLTP Write Visibility
+
+ApexBase has two fast paths for frequent single-row appends:
+
+- **Memtable OLTP** is the default fast single-row path for schema-stable `store({...})` calls with `durability="fast"`. The writing client can read the row immediately, managed clients in the same Python process share the storage instance, and `flush()` / `close()` persists pending rows. A separate process sees those rows only after the writer flushes, closes, or reaches the auto-flush threshold.
+- **Buffered OLTP** is explicit: call `begin_buffered_writes()`, issue many single-row `store({...})` calls, then call `flush_buffered_writes()` or `end_buffered_writes(flush=True)`. Buffered rows are not visible until flushed.
+
+For benchmark reporting, Memtable OLTP is valid as ApexBase's default fast-profile same-client OLTP path, but it should not be treated as a cross-process committed-write comparison unless each timed write also calls `flush()`. The benchmark script therefore keeps default fast OLTP, durable-per-operation OLTP, and opt-in peak modes as separate sections.
+
 ### ApexBase Result Materialization APIs
 
 The cross-engine table above keeps result materialization comparable across engines. The table below uses a fresh ApexBase copy of the same 1M-row generated data and isolates ApexBase's Python result conversion APIs. It is not part of the SQLite/DuckDB ranking.

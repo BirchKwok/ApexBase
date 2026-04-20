@@ -341,7 +341,14 @@ impl ApexExecutor {
                         }
                     });
                     
-                    if has_scalar_subquery {
+                    if backend.pending_v4_in_memory_rows() > 0 {
+                        let col_refs = if has_scalar_subquery {
+                            None
+                        } else {
+                            Self::get_col_refs(&stmt)
+                        };
+                        backend.read_columns_to_arrow(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref(), 0, None)?
+                    } else if has_scalar_subquery {
                         let col_refs = Self::get_col_refs(&stmt);
                         backend.read_columns_to_arrow(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref(), 0, None)?
                     } else {

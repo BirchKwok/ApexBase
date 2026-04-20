@@ -424,8 +424,13 @@ class ApexClient:
     def use_table(self, table_name: str):
         self._check_connection()
         with self._lock:
-            self._flush_pending_memtable_rows_for_read()
-            self.flush_buffered_writes()
+            switching_tables = (
+                self._current_table is not None
+                and self._current_table != table_name
+            )
+            if switching_tables:
+                self._flush_pending_memtable_rows_for_read()
+                self.flush_buffered_writes()
             self._storage.use_table(table_name)
         self._current_table = table_name
 
@@ -1296,10 +1301,6 @@ class ApexClient:
                       'like', 'complex'):
             self._ensure_table_selected()
 
-        if _sig in ('count_star', 'scan_limit', 'projected_scan_limit',
-                    'projected_string_filter', 'like', 'complex', 'multi'):
-            self._flush_pending_memtable_rows_for_read()
-
         # ── Determine locking ──
         _needs_lock = _sig in ('multi', 'write', 'transaction', 'session') or getattr(self, '_in_txn', False)
 
@@ -1823,7 +1824,6 @@ class ApexClient:
         self._check_connection()
         self._ensure_table_selected()
         with self._lock:
-            self._flush_pending_memtable_rows_for_read()
             results = self._storage.retrieve_all()
         if not results:
             return _empty_result_view()
@@ -1955,13 +1955,11 @@ class ApexClient:
             if table_name and table_name != self._current_table:
                 original = self._current_table
                 self.use_table(table_name)
-                self._flush_pending_memtable_rows_for_read()
                 count = self._storage.row_count()
                 if original is not None:
                     self.use_table(original)
                 return count
             self._ensure_table_selected()
-            self._flush_pending_memtable_rows_for_read()
             return self._storage.row_count()
 
     def flush(self) -> None:
@@ -2205,6 +2203,10 @@ class ApexClient:
             if hasattr(self, '_storage') and self._storage is not None:
                 try:
                     self.flush_buffered_writes()
+                except Exception:
+                    pass
+                try:
+                    self._flush_pending_memtable_rows_for_read()
                 except Exception:
                     pass
                 # Best-effort: ensure FTS index is persisted across reopen

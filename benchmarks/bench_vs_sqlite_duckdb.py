@@ -1,8 +1,10 @@
 """
 ApexBase Performance Benchmark: ApexBase vs SQLite vs DuckDB
 
-Measures key HTAP operations across all three engines on the same dataset.
-Results are printed as a formatted table and optionally saved to JSON.
+Measures OLAP, OLTP, and HTAP operations across all three engines on the
+same dataset. Default fair rankings use normal engine APIs and comparable
+materialization semantics; tuned/opt-in ApexBase paths are shown separately.
+Results are printed as formatted tables and optionally saved to JSON.
 
 Usage:
     python benchmarks/bench_vs_sqlite_duckdb.py [--rows N] [--warmup N] [--iterations N] [--output FILE]
@@ -1034,14 +1036,71 @@ BENCHMARKS = [
     ("FTS Search ('Electronics')",           "bench_fts_search",        False, False, False, None),
 ]
 
+OLAP_BENCHMARK_NAMES = [
+    "COUNT(*)",
+    "SELECT * LIMIT 100 [cold]",
+    "SELECT * LIMIT 100 [warm]",
+    "SELECT * LIMIT 10K [cold]",
+    "SELECT * LIMIT 10K [warm]",
+    "Filter (name = 'user_5000')",
+    "Filter (age BETWEEN 25 AND 35)",
+    "GROUP BY city (10 groups)",
+    "GROUP BY + HAVING",
+    "ORDER BY score LIMIT 100",
+    "Aggregation (5 funcs)",
+    "Complex (Filter+Group+Order)",
+    "SELECT * -> pandas (full scan)",
+    "GROUP BY city,category (100 grp)",
+    "LIKE filter (name LIKE user_1%)",
+    "Multi-cond (age>30 AND score>50)",
+    "ORDER BY city,score DESC LIMIT100",
+    "COUNT(DISTINCT city)",
+    "IN filter (city IN 3 cities)",
+    "Numeric IN (age IN 9 values)",
+    "OR cross-col (age=25 OR city=BJ)",
+    "Numeric OR (age=20|30|40|50)",
+    "Window ROW_NUMBER PARTITION BY city",
+]
 
-OLTP_BENCHMARKS = [
+HTAP_BENCHMARK_NAMES = [
+    "Bulk Insert (N rows)",
+    "Point Lookup (SQL by ID)",
+    "Retrieve Many (SQL, 100 IDs)",
+    "Insert 1K rows",
+    "UPDATE rows (age=25, idempotent)",
+    "Store+DELETE 1K (combined)",
+    "DELETE 1K [pure delete only]",
+    "FTS Index Build (name,city,category)",
+    "FTS Search ('Electronics')",
+]
+
+_BENCHMARK_BY_NAME = {spec[0]: spec for spec in BENCHMARKS}
+MAIN_BENCHMARK_SECTIONS = [
+    (
+        "OLAP Fair Benchmarks",
+        "Analytical scans, filters, grouping, ordering, windows, and full-result materialization.",
+        [_BENCHMARK_BY_NAME[name] for name in OLAP_BENCHMARK_NAMES],
+    ),
+    (
+        "HTAP Fair Benchmarks",
+        "Load, search/indexing, point SQL, and DML on the same loaded analytical table.",
+        [_BENCHMARK_BY_NAME[name] for name in HTAP_BENCHMARK_NAMES],
+    ),
+]
+
+
+OLTP_DEFAULT_BENCHMARKS = [
     ("OLTP Point Lookup projected", "bench_oltp_projected_point_lookup"),
     ("OLTP Retrieve 10 projected", "bench_oltp_projected_retrieve_10"),
     ("OLTP SELECT 3 cols LIMIT 100", "bench_oltp_projected_limit_100"),
     ("OLTP String equality projected", "bench_oltp_projected_string_eq"),
     ("OLTP Insert 1 row", "bench_oltp_insert_one"),
     ("OLTP UPDATE by ID", "bench_oltp_update_by_id"),
+]
+
+OLTP_DURABLE_WRITE_BENCHMARKS = [
+    ("Durable Insert 1 row", "bench_oltp_insert_one"),
+    ("Durable UPDATE by ID", "bench_oltp_update_by_id"),
 ]
 
 
@@ -1082,6 +1141,91 @@ def materialization_speedup_label(dict_ms, arrow_ms):
     if ratio >= 1:
         return f"{ratio:.1f}x faster"
     return f"{1 / ratio:.1f}x slower"
+
+
+def apex_ratio_label(apex_ms, others):
+    if apex_ms is None or not others:
+        return None
+    best_other = min(others)
+    ratio = apex_ms / best_other if best_other > 0 else float("inf")
+    if ratio < 1:
+        return f"{ratio:.2f}x (faster)"
+    if ratio < 1.05:
+        return "~1.0x (tied)"
+    return f"{ratio:.1f}x (slower)"
+
+
+def summarize_apex_section(benchmark_specs, results):
+    wins = 0
+    ties = 0
+    total = 0
+    for bench_name, _, _, _, _, _ in benchmark_specs:
+        vals = results.get(bench_name, {})
+        apex_ms = vals.get("ApexBase")
+        if apex_ms is None:
+            continue
+        others = [v for k, v in vals.items() if k != "ApexBase" and v is not None]
+        if not others:
+            continue
+        total += 1
+        best_other = min(others)
+        ratio = apex_ms / best_other if best_other > 0 else float("inf")
+        if ratio < 0.95:
+            wins += 1
+        elif ratio <= 1.05:
+            ties += 1
+    return {
+        "wins": wins,
+        "ties": ties,
+        "slower": total - wins - ties,
+        "total": total,
+    }
+
+
+def print_benchmark_section(title, description, benchmark_specs, results, eng_names, col_width):
+    print(f"\n--- {title} ---")
+    print(f"  {description}")
+    header = f"{'Query':<42}"
+    for name in eng_names:
+        header += f" | {name:>{col_width}}"
+    if len(eng_names) >= 2:
+        header += f" | {'Ratio (Apex/Best)':>{col_width}}"
+    print(header)
+    print("-" * len(header))
+
+    json_rows = []
+    for bench_name, method_name, is_insert, is_cold, is_warm_nogc, setup_method in benchmark_specs:
+        row = f"{bench_name:<42}"
+        values = {}
+        for eng_name in eng_names:
+            ms = results.get(bench_name, {}).get(eng_name)
+            if ms is not None:
+                row += f" | {fmt_ms(ms):>{col_width}}"
+                values[eng_name] = ms
+            else:
+                row += f" | {'N/A':>{col_width}}"
+
+        if len(eng_names) >= 2 and "ApexBase" in values:
+            others = [v for k, v in values.items() if k != "ApexBase"]
+            label = apex_ratio_label(values["ApexBase"], others)
+            if label:
+                row += f" | {label:>{col_width}}"
+
+        print(row)
+        json_rows.append({
+            "category": title,
+            "query": bench_name,
+            **{k: round(v, 3) for k, v in values.items()},
+        })
+
+    if "ApexBase" in eng_names:
+        stats = summarize_apex_section(benchmark_specs, results)
+        print(
+            f"Section Summary: ApexBase wins {stats['wins']}/{stats['total']}, "
+            f"ties {stats['ties']}/{stats['total']}, slower {stats['slower']}/{stats['total']}"
+        )
+
+    return json_rows
 
 
 def apex_materialization_queries(shared_inputs):
@@ -1186,9 +1330,11 @@ def run_oltp_benchmarks(engines, warmup, iterations):
     if not engines:
         return []
 
-    print("\n--- OLTP Microbenchmarks (short queries / point mutations) ---")
+    print("\n--- OLTP Microbenchmarks (Default Fair) ---")
     print("  Uses the already-loaded benchmark tables; read cases materialize Python rows.")
     print("  Insert/update cases use each engine's native client API and may mutate the table between iterations.")
+    print("  This table measures default user paths under each engine's configured profile.")
+    print("  ApexBase fast inserts may use memtable: same-client visible, cross-process visible after flush/close/auto-flush.")
     print("  FTS maintenance is disabled before OLTP writes so engines are compared on base-table OLTP only.")
 
     for _, bench in engines:
@@ -1209,7 +1355,7 @@ def run_oltp_benchmarks(engines, warmup, iterations):
     print("  " + "-" * (len(header) - 2))
 
     rows = []
-    for bench_name, method_name in OLTP_BENCHMARKS:
+    for bench_name, method_name in OLTP_DEFAULT_BENCHMARKS:
         values = {}
         row = f"  {bench_name:<34}"
         for eng_name, bench in engines:
@@ -1241,6 +1387,97 @@ def run_oltp_benchmarks(engines, warmup, iterations):
             "operation": bench_name,
             **{k: round(v, 3) for k, v in values.items()},
         })
+    return rows
+
+
+def run_oltp_durable_benchmarks(engines, warmup, iterations):
+    """Run OLTP write microbenchmarks with explicit durable persistence per operation."""
+    if not engines:
+        return []
+
+    print("\n--- OLTP Microbenchmarks (Durable Fair) ---")
+    print("  Explicitly forces persistence on every timed write for durability-oriented comparison.")
+    print("  ApexBase uses flush(); SQLite uses FULL sync + WAL checkpoint; DuckDB uses CHECKPOINT.")
+
+    # Keep SQLite in durable mode only for this section.
+    for eng_name, bench in engines:
+        if eng_name == "SQLite":
+            try:
+                bench.conn.execute("PRAGMA synchronous=FULL")
+            except Exception:
+                pass
+
+    eng_names = [name for name, _ in engines]
+    col_width = 16
+    header = f"  {'Operation':<34}"
+    for name in eng_names:
+        header += f" | {name:>{col_width}}"
+    if len(eng_names) >= 2:
+        header += f" | {'Ratio (Apex/Best)':>{col_width}}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    rows = []
+    try:
+        for bench_name, method_name in OLTP_DURABLE_WRITE_BENCHMARKS:
+            values = {}
+            row = f"  {bench_name:<34}"
+            for eng_name, bench in engines:
+                fn = getattr(bench, method_name, None)
+                if fn is None:
+                    row += f" | {'N/A':>{col_width}}"
+                    continue
+
+                try:
+                    if eng_name == "ApexBase":
+                        def durable_fn(fn=fn, bench=bench):
+                            result = fn()
+                            bench.client.flush()
+                            return result
+                    elif eng_name == "SQLite":
+                        def durable_fn(fn=fn, bench=bench):
+                            result = fn()
+                            bench.conn.execute("PRAGMA wal_checkpoint(FULL)")
+                            return result
+                    elif eng_name == "DuckDB":
+                        def durable_fn(fn=fn, bench=bench):
+                            result = fn()
+                            bench.conn.execute("CHECKPOINT")
+                            return result
+                    else:
+                        durable_fn = fn
+
+                    ms = run_bench_nogc(durable_fn, warmup=warmup, iterations=iterations)
+                    values[eng_name] = ms
+                    row += f" | {fmt_ms(ms):>{col_width}}"
+                except Exception:
+                    row += f" | {'N/A':>{col_width}}"
+
+            if len(eng_names) >= 2 and "ApexBase" in values:
+                others = {k: v for k, v in values.items() if k != "ApexBase"}
+                if others:
+                    best_other = min(others.values())
+                    ratio = values["ApexBase"] / best_other if best_other > 0 else float("inf")
+                    if ratio < 1:
+                        label = f"{ratio:.2f}x (faster)"
+                    elif ratio < 1.05:
+                        label = "~1.0x (tied)"
+                    else:
+                        label = f"{ratio:.1f}x (slower)"
+                    row += f" | {label:>{col_width}}"
+            print(row)
+            rows.append({
+                "operation": bench_name,
+                **{k: round(v, 3) for k, v in values.items()},
+            })
+    finally:
+        for eng_name, bench in engines:
+            if eng_name == "SQLite":
+                try:
+                    bench.conn.execute("PRAGMA synchronous=OFF")
+                except Exception:
+                    pass
+
     return rows
 
 
@@ -1346,9 +1583,10 @@ def run_apex_memtable_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
     """Show ApexBase's experimental storage-level memtable write path.
 
     This path keeps writes inside the storage engine and makes them immediately
-    readable by the same storage instance, then persists them on flush/close.
-    It is separate from the default fair OLTP table until cross-client/process
-    visibility semantics are finalized.
+    readable by the same storage instance, then persists them on flush/close or
+    auto-flush. Separate processes see the rows only after persistence, so this
+    stays outside committed-write OLTP rankings unless the benchmark flushes
+    each timed write.
     """
     if not HAS_APEXBASE:
         return []
@@ -1361,7 +1599,7 @@ def run_apex_memtable_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
 
     print("\n--- ApexBase Experimental Storage Memtable OLTP (separate mode) ---")
     print("  Opt-in storage-level write buffer; same-storage reads see rows immediately.")
-    print("  Rows are persisted on flush/close; not mixed into the default fair OLTP ranking.")
+    print("  Separate processes see rows after flush/close/auto-flush; not mixed into committed-write OLTP.")
 
     col_width = 16
     header = f"  {'Operation':<42} | {'ApexBase Memtable':>{col_width}}"
@@ -1502,8 +1740,9 @@ def main():
         print(f"PyArrow: v{sys_info['pyarrow']}")
     print(f"\nDataset: {N:,} rows × 5 columns (name, age, score, city, category)")
     print(f"Warmup: {WARMUP} iterations, Timed: {ITERS} iterations (average)")
-    print("Fairness mode: read benchmarks materialize full results; ID lookups use shared deterministic inputs")
-    print("Q/s workload: COUNT + two full-table GROUP BY scans + filtered LIMIT 100, materialized to Python rows")
+    print("Fairness mode: default rankings use normal engine APIs and comparable result materialization.")
+    print("Layout: OLAP fair ranking, HTAP fair ranking, OLTP default/durable microbenchmarks, and ApexBase opt-in peak modes.")
+    print("HTAP Q/s workload: COUNT + two full-table GROUP BY scans + filtered LIMIT 100, materialized to Python rows.")
     if args.low_memory:
         print("Mode: LOW-MEMORY (ApexBase-only cache stress mode; not a cross-engine apples-to-apples setting)")
     print()
@@ -1602,93 +1841,61 @@ def main():
                 if rss_before and rss_after:
                     mem_results[bench_name][eng_name] = rss_after - rss_before
 
-    # Print results table
+    # Print results tables grouped by workload class.
     eng_names = [name for name, _ in engines]
     col_width = 16
 
-    print()
-    header = f"{'Query':<42}"
-    for name in eng_names:
-        header += f" | {name:>{col_width}}"
-    if len(eng_names) >= 2:
-        header += f" | {'Ratio (Apex/Best)':>{col_width}}"
-    print(header)
-    print("-" * len(header))
-
     json_results = []
-    for bench_name, method_name, is_insert, is_cold, is_warm_nogc, setup_method in BENCHMARKS:
-        row = f"{bench_name:<42}"
-        values = {}
-        for eng_name in eng_names:
-            ms = results.get(bench_name, {}).get(eng_name)
-            if ms is not None:
-                row += f" | {fmt_ms(ms):>{col_width}}"
-                values[eng_name] = ms
-            else:
-                row += f" | {'N/A':>{col_width}}"
+    benchmark_sections = list(MAIN_BENCHMARK_SECTIONS)
+    grouped_names = {spec[0] for _, _, specs in benchmark_sections for spec in specs}
+    ungrouped_specs = [spec for spec in BENCHMARKS if spec[0] not in grouped_names]
+    if ungrouped_specs:
+        benchmark_sections.append((
+            "Other Fair Benchmarks",
+            "Benchmarks not yet classified as OLAP or HTAP.",
+            ungrouped_specs,
+        ))
 
-        if len(eng_names) >= 2 and "ApexBase" in values:
-            others = {k: v for k, v in values.items() if k != "ApexBase"}
-            if others:
-                best_other = min(others.values())
-                ratio = values["ApexBase"] / best_other if best_other > 0 else float("inf")
-                if ratio < 1:
-                    label = f"{ratio:.2f}x (faster)"
-                elif ratio < 1.05:
-                    label = f"~1.0x (tied)"
-                else:
-                    label = f"{ratio:.1f}x (slower)"
-                row += f" | {label:>{col_width}}"
-
-        print(row)
-        json_results.append({
-            "query": bench_name,
-            **{k: round(v, 3) for k, v in values.items()},
-        })
+    for section_title, section_description, benchmark_specs in benchmark_sections:
+        json_results.extend(print_benchmark_section(
+            section_title,
+            section_description,
+            benchmark_specs,
+            results,
+            eng_names,
+            col_width,
+        ))
 
     print()
 
     # Memory summary (if tracking enabled)
     if args.memory:
         print()
-        print("Memory delta per query (RSS change, MB):")
-        mem_header = f"  {'Query':<42}"
+        print("Memory delta per query by workload class (RSS change, MB):")
+        mem_header = f"    {'Query':<42}"
         for name in eng_names:
             mem_header += f" | {name:>{col_width}}"
         print(mem_header)
-        print("  " + "-" * (len(mem_header) - 2))
-        for bench_name, _, _, _, _, _ in BENCHMARKS:
-            row = f"  {bench_name:<42}"
-            for eng_name in eng_names:
-                delta = mem_results.get(bench_name, {}).get(eng_name)
-                if delta is not None:
-                    row += f" | {delta:>+{col_width}.1f}"
-                else:
-                    row += f" | {'N/A':>{col_width}}"
-            print(row)
+        print("    " + "-" * (len(mem_header) - 4))
+        for section_title, _, benchmark_specs in benchmark_sections:
+            print(f"  {section_title}:")
+            for bench_name, _, _, _, _, _ in benchmark_specs:
+                row = f"    {bench_name:<42}"
+                for eng_name in eng_names:
+                    delta = mem_results.get(bench_name, {}).get(eng_name)
+                    if delta is not None:
+                        row += f" | {delta:>+{col_width}.1f}"
+                    else:
+                        row += f" | {'N/A':>{col_width}}"
+                print(row)
 
     # Summary
     if "ApexBase" in [n for n, _ in engines]:
-        wins = 0
-        ties = 0
-        total = 0
-        for bench_name, _, _, _, _, _ in BENCHMARKS:
-            vals = results.get(bench_name, {})
-            apex_ms = vals.get("ApexBase")
-            if apex_ms is None:
-                continue
-            others = {k: v for k, v in vals.items() if k != "ApexBase" and v is not None}
-            if not others:
-                continue
-            total += 1
-            best_other = min(others.values())
-            ratio = apex_ms / best_other if best_other > 0 else float("inf")
-            if ratio < 0.95:
-                wins += 1
-            elif ratio <= 1.05:
-                ties += 1
-        losses = total - wins - ties
-        print(f"Summary: ApexBase wins {wins}/{total}, ties {ties}/{total}, slower {losses}/{total}")
+        stats = summarize_apex_section(BENCHMARKS, results)
+        print(
+            f"\nDefault Fair Summary: ApexBase wins {stats['wins']}/{stats['total']}, "
+            f"ties {stats['ties']}/{stats['total']}, slower {stats['slower']}/{stats['total']}"
+        )
 
     materialization_results = run_apex_materialization_benchmarks(
         tmpdir,
@@ -1700,12 +1907,12 @@ def main():
     )
 
     # ========================================================================
-    # Q/s Throughput Tests (Single & Concurrent)
+    # HTAP Throughput Tests (Single & Concurrent)
     # ========================================================================
     from concurrent.futures import ThreadPoolExecutor
     import threading
 
-    # Q/s test queries - mix of simple and complex
+    # Q/s test queries - mixed short + analytical reads on the same loaded table
     QPS_QUERIES_APEX = [
         "SELECT COUNT(*) FROM default",
         "SELECT city, COUNT(*) FROM default GROUP BY city",
@@ -1729,7 +1936,7 @@ def main():
 
     def run_qps_benchmark(tmpdir, data, n_threads=4, min_duration=1.0, min_iterations=50,
                            existing_engines=None):
-        """Measure Q/s (queries per second) for single-threaded and concurrent scenarios.
+        """Measure HTAP Q/s for single-threaded and concurrent scenarios.
         
         Args:
             min_duration: Minimum test duration in seconds for accurate timing
@@ -1737,6 +1944,9 @@ def main():
             existing_engines: dict of {name: bench} to reuse, avoids re-inserting data
         """
         results = {}
+        print("\n--- HTAP Throughput (mixed short + analytical reads) ---")
+        print("  Workload: COUNT + two full-table GROUP BY scans + filtered LIMIT 100.")
+        print("  All queries materialize Python rows; existing loaded tables are reused.")
 
         # Reuse existing engines (data already inserted) to avoid re-inserting 1M rows
         qps_engines = []
@@ -1768,7 +1978,7 @@ def main():
                 pass
 
         # 1. Single-threaded Q/s
-        print("\n--- Single-threaded Q/s ---")
+        print("\n--- Single-threaded HTAP Q/s ---")
         iterations = min_iterations  # fallback default
         single_iterations = {}
         for name, bench, queries in qps_engines:
@@ -1810,7 +2020,7 @@ def main():
                 print(f"  {name}: Error - {e}")
 
         # 2. Concurrent Q/s (multiple threads) — reuse qps_engines, no re-insert
-        print(f"\n--- Concurrent Q/s ({n_threads} threads) ---")
+        print(f"\n--- Concurrent HTAP Q/s ({n_threads} threads) ---")
 
         for name, bench, queries in qps_engines:
             try:
@@ -1880,7 +2090,7 @@ def main():
                 print(f"  {name}: Error - {e}")
 
         # Print Q/s Summary
-        print("\n--- Q/s Summary ---")
+        print("\n--- HTAP Q/s Summary ---")
         apex_single = results.get("ApexBase_single", 0)
         sqlite_single = results.get("SQLite_single", 0)
         duckdb_single = results.get("DuckDB_single", 0)
@@ -1902,6 +2112,11 @@ def main():
                                     existing_engines=existing_engines)
 
     oltp_results = run_oltp_benchmarks(
+        engines,
+        warmup=WARMUP,
+        iterations=ITERS,
+    )
+    durable_oltp_results = run_oltp_durable_benchmarks(
         engines,
         warmup=WARMUP,
         iterations=ITERS,
@@ -1932,6 +2147,7 @@ def main():
             "apexbase_materialization": materialization_results,
             "qps": qps_results,
             "oltp_microbenchmarks": oltp_results,
+            "oltp_durable_microbenchmarks": durable_oltp_results,
             "apexbase_buffered_oltp": buffered_oltp_results,
             "apexbase_memtable_oltp": memtable_oltp_results,
         }

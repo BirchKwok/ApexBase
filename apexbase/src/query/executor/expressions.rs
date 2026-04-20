@@ -1167,7 +1167,12 @@ impl ApexExecutor {
         storage_path: &Path,
     ) -> io::Result<BooleanArray> {
         use crate::query::sql_parser::BinaryOperator;
-        
+
+        if !Self::expr_contains_scalar_subquery(left) && !Self::expr_contains_scalar_subquery(right)
+        {
+            return Self::evaluate_comparison(batch, left, op, right);
+        }
+
         let left_array = Self::evaluate_expr_to_array_with_storage(batch, left, storage_path)?;
         let right_array = Self::evaluate_expr_to_array_with_storage(batch, right, storage_path)?;
 

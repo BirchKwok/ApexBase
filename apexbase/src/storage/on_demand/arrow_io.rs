@@ -48,7 +48,39 @@ impl OnDemandStorage {
                 let has_in_memory_data = !cols.is_empty() && cols.iter().any(|c| c.len() > 0);
                 drop(cols);
 
-                if !has_in_memory_data {
+                let on_disk_rows = self.persisted_row_count.load(Ordering::SeqCst) as usize;
+                let base_loaded = self.v4_base_loaded.load(Ordering::SeqCst);
+                let pending_rows = if has_in_memory_data {
+                    self.pending_v4_in_memory_rows()
+                } else {
+                    0
+                };
+
+                if has_in_memory_data && pending_rows > 0 && on_disk_rows > 0 && !base_loaded {
+                    let base_batch = self.to_arrow_batch_mmap(
+                        column_names, include_id, None, false,
+                    )?;
+                    let pending_batch = self.pending_v4_to_arrow_batch(column_names, include_id)?;
+
+                    return match base_batch {
+                        Some(base) if base.num_rows() > 0 && pending_batch.num_rows() > 0 => {
+                            let schema = base.schema();
+                            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(base.num_columns());
+                            for idx in 0..base.num_columns() {
+                                let pieces = [
+                                    base.column(idx).as_ref(),
+                                    pending_batch.column(idx).as_ref(),
+                                ];
+                                arrays.push(arrow::compute::concat(&pieces)
+                                    .map_err(|e| err_data(e.to_string()))?);
+                            }
+                            RecordBatch::try_new(schema, arrays)
+                                .map_err(|e| err_data(e.to_string()))
+                        }
+                        Some(base) if base.num_rows() > 0 => Ok(base),
+                        _ => Ok(pending_batch),
+                    };
+                } else if !has_in_memory_data {
                     // Pure mmap path — read directly from disk every time
                     if let Some(batch) = self.to_arrow_batch_mmap(
                         column_names, include_id, None, dict_encode_strings,
@@ -504,6 +536,289 @@ impl OnDemandStorage {
                 fields.push(f);
                 arrays.push(a);
             }
+        }
+
+        let arrow_schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(arrow_schema, arrays)
+            .map_err(|e| err_data(e.to_string()))
+    }
+
+    /// Build an Arrow batch from only the V4 in-memory append area.
+    ///
+    /// Insert backends for mmap-only tables keep just pending rows in
+    /// ids/columns/nulls. The normal in-memory path assumes those buffers are a
+    /// complete table, so SQL overlay reads need a pending-only batch that can be
+    /// concatenated after the mmap base batch.
+    fn pending_v4_to_arrow_batch(
+        &self,
+        column_names: Option<&[&str]>,
+        include_id: bool,
+    ) -> io::Result<RecordBatch> {
+        use arrow::array::{
+            ArrayRef, BinaryArray, BooleanArray, FixedSizeListArray, Float32Array, Int64Array,
+            PrimitiveArray, StringArray,
+        };
+        use arrow::buffer::{Buffer, BooleanBuffer, NullBuffer, ScalarBuffer};
+        use arrow::datatypes::{
+            DataType as ArrowDataType, Date32Type, Field, Float64Type, Int64Type, Schema,
+            TimeUnit, TimestampMicrosecondType,
+        };
+        use std::sync::Arc;
+
+        let schema = self.schema.read();
+        let ids = self.ids.read();
+        let columns = self.columns.read();
+        let nulls = self.nulls.read();
+        let row_count = ids.len();
+
+        let col_indices: Vec<usize> = if let Some(names) = column_names {
+            names.iter()
+                .filter(|&&n| n != "_id")
+                .filter_map(|&name| schema.get_index(name))
+                .collect()
+        } else {
+            (0..schema.column_count()).collect()
+        };
+
+        let mut fields: Vec<Field> = Vec::with_capacity(col_indices.len() + 1);
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_indices.len() + 1);
+
+        if include_id {
+            fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            arrays.push(Arc::new(Int64Array::from(
+                ids.iter().map(|&id| id as i64).collect::<Vec<_>>(),
+            )));
+        }
+
+        let is_null = |col_idx: usize, row_idx: usize| -> bool {
+            if col_idx >= nulls.len() {
+                return false;
+            }
+            let null_bitmap = &nulls[col_idx];
+            let byte_idx = row_idx / 8;
+            let bit_idx = row_idx % 8;
+            byte_idx < null_bitmap.len() && (null_bitmap[byte_idx] >> bit_idx) & 1 == 1
+        };
+
+        let make_null_buf = |col_idx: usize| -> Option<NullBuffer> {
+            if col_idx >= nulls.len() || row_count == 0 {
+                return None;
+            }
+            let null_bitmap = &nulls[col_idx];
+            if null_bitmap.is_empty() || !null_bitmap.iter().any(|&b| b != 0) {
+                return None;
+            }
+            let mut validity_bytes = vec![0xFFu8; (row_count + 7) / 8];
+            for row_idx in 0..row_count {
+                if is_null(col_idx, row_idx) {
+                    validity_bytes[row_idx / 8] &= !(1u8 << (row_idx % 8));
+                }
+            }
+            let tail = row_count % 8;
+            if tail > 0 {
+                let last = validity_bytes.len() - 1;
+                validity_bytes[last] &= (1u8 << tail) - 1;
+            }
+            Some(NullBuffer::new(BooleanBuffer::new(
+                Buffer::from(validity_bytes),
+                0,
+                row_count,
+            )))
+        };
+
+        for &col_idx in &col_indices {
+            let (col_name, schema_col_type) = &schema.columns[col_idx];
+            let schema_col_type = *schema_col_type;
+            let col_data = columns.get(col_idx);
+            let null_buf = make_null_buf(col_idx);
+
+            let (arrow_dt, array): (ArrowDataType, ArrayRef) = match col_data {
+                Some(ColumnData::Int64(values)) => {
+                    let data_vec: Vec<i64> = (0..row_count)
+                        .map(|i| values.get(i).copied().unwrap_or(0))
+                        .collect();
+                    match schema_col_type {
+                        ColumnType::Timestamp => {
+                            let arr = PrimitiveArray::<TimestampMicrosecondType>::new(
+                                ScalarBuffer::from(data_vec),
+                                null_buf,
+                            );
+                            (
+                                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                                Arc::new(arr) as ArrayRef,
+                            )
+                        }
+                        ColumnType::Date => {
+                            let data_i32: Vec<i32> = data_vec.iter().map(|&v| v as i32).collect();
+                            let arr = PrimitiveArray::<Date32Type>::new(
+                                ScalarBuffer::from(data_i32),
+                                null_buf,
+                            );
+                            (ArrowDataType::Date32, Arc::new(arr) as ArrayRef)
+                        }
+                        _ => {
+                            let arr = PrimitiveArray::<Int64Type>::new(
+                                ScalarBuffer::from(data_vec),
+                                null_buf,
+                            );
+                            (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                        }
+                    }
+                }
+                Some(ColumnData::Float64(values)) => {
+                    let data_vec: Vec<f64> = (0..row_count)
+                        .map(|i| values.get(i).copied().unwrap_or(0.0))
+                        .collect();
+                    let arr = PrimitiveArray::<Float64Type>::new(
+                        ScalarBuffer::from(data_vec),
+                        null_buf,
+                    );
+                    (ArrowDataType::Float64, Arc::new(arr) as ArrayRef)
+                }
+                Some(ColumnData::String { offsets, data }) => {
+                    let count = offsets.len().saturating_sub(1);
+                    let strings: Vec<Option<&str>> = (0..row_count)
+                        .map(|i| {
+                            if is_null(col_idx, i) || i >= count {
+                                return None;
+                            }
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            std::str::from_utf8(&data[start..end]).ok()
+                        })
+                        .collect();
+                    (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                }
+                Some(ColumnData::Bool { data, len }) => {
+                    let bools: Vec<Option<bool>> = (0..row_count)
+                        .map(|i| {
+                            if is_null(col_idx, i) || i >= *len {
+                                return None;
+                            }
+                            let byte_idx = i / 8;
+                            let bit_idx = i % 8;
+                            Some(byte_idx < data.len() && (data[byte_idx] >> bit_idx) & 1 == 1)
+                        })
+                        .collect();
+                    (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
+                }
+                Some(ColumnData::Binary { offsets, data }) => {
+                    let count = offsets.len().saturating_sub(1);
+                    let binary_data: Vec<Option<&[u8]>> = (0..row_count)
+                        .map(|i| {
+                            if is_null(col_idx, i) || i >= count {
+                                return None;
+                            }
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            Some(&data[start..end])
+                        })
+                        .collect();
+                    (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                }
+                Some(ColumnData::StringDict { indices, dict_offsets, dict_data }) => {
+                    let strings: Vec<Option<&str>> = (0..row_count)
+                        .map(|i| {
+                            if is_null(col_idx, i) {
+                                return None;
+                            }
+                            let dict_idx = indices.get(i).copied().unwrap_or(0) as usize;
+                            if dict_idx + 1 >= dict_offsets.len() {
+                                return None;
+                            }
+                            let start = dict_offsets[dict_idx] as usize;
+                            let end = dict_offsets[dict_idx + 1] as usize;
+                            std::str::from_utf8(&dict_data[start..end]).ok()
+                        })
+                        .collect();
+                    (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                }
+                Some(ColumnData::FixedList { data, dim }) => {
+                    let dim_usize = *dim as usize;
+                    if dim_usize == 0 {
+                        let arr = arrow::array::new_null_array(&ArrowDataType::Utf8, row_count);
+                        (ArrowDataType::Utf8, arr)
+                    } else {
+                        let byte_len = row_count * dim_usize * 4;
+                        let mut selected_data = Vec::with_capacity(byte_len);
+                        selected_data.extend_from_slice(&data[..data.len().min(byte_len)]);
+                        selected_data.resize(byte_len, 0);
+                        let float_buf = Buffer::from_vec(selected_data);
+                        let float_arr = unsafe {
+                            Float32Array::from(arrow::array::ArrayData::new_unchecked(
+                                ArrowDataType::Float32,
+                                row_count * dim_usize,
+                                Some(0),
+                                None,
+                                0,
+                                vec![float_buf],
+                                vec![],
+                            ))
+                        };
+                        let item = Arc::new(Field::new("item", ArrowDataType::Float32, false));
+                        let list_dt = ArrowDataType::FixedSizeList(item.clone(), dim_usize as i32);
+                        let arr = FixedSizeListArray::new(
+                            item,
+                            dim_usize as i32,
+                            Arc::new(float_arr),
+                            null_buf,
+                        );
+                        (list_dt, Arc::new(arr) as ArrayRef)
+                    }
+                }
+                Some(ColumnData::Float16List { data, dim }) => {
+                    let dim_usize = *dim as usize;
+                    if dim_usize == 0 {
+                        let arr = arrow::array::new_null_array(&ArrowDataType::Utf8, row_count);
+                        (ArrowDataType::Utf8, arr)
+                    } else {
+                        let mut f32_bytes = Vec::with_capacity(row_count * dim_usize * 4);
+                        let available_rows = data.len() / (dim_usize * 2);
+                        for row_idx in 0..row_count {
+                            if row_idx < available_rows {
+                                let start = row_idx * dim_usize * 2;
+                                let end = start + dim_usize * 2;
+                                for chunk in data[start..end].chunks_exact(2) {
+                                    let bits = u16::from_le_bytes(chunk.try_into().unwrap());
+                                    f32_bytes.extend_from_slice(
+                                        &crate::storage::on_demand::f16_to_f32(bits).to_le_bytes(),
+                                    );
+                                }
+                            } else {
+                                f32_bytes.extend(std::iter::repeat(0u8).take(dim_usize * 4));
+                            }
+                        }
+                        let float_buf = Buffer::from_vec(f32_bytes);
+                        let float_arr = unsafe {
+                            Float32Array::from(arrow::array::ArrayData::new_unchecked(
+                                ArrowDataType::Float32,
+                                row_count * dim_usize,
+                                Some(0),
+                                None,
+                                0,
+                                vec![float_buf],
+                                vec![],
+                            ))
+                        };
+                        let item = Arc::new(Field::new("item", ArrowDataType::Float32, false));
+                        let list_dt = ArrowDataType::FixedSizeList(item.clone(), dim_usize as i32);
+                        let arr = FixedSizeListArray::new(
+                            item,
+                            dim_usize as i32,
+                            Arc::new(float_arr),
+                            null_buf,
+                        );
+                        (list_dt, Arc::new(arr) as ArrayRef)
+                    }
+                }
+                None => {
+                    let arr = arrow::array::new_null_array(&ArrowDataType::Utf8, row_count);
+                    (ArrowDataType::Utf8, arr)
+                }
+            };
+
+            fields.push(Field::new(col_name, arrow_dt, true));
+            arrays.push(array);
         }
 
         let arrow_schema = Arc::new(Schema::new(fields));

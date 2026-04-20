@@ -635,6 +635,26 @@ pub fn invalidate_storage_cache(path: &Path) {
     STORAGE_CACHE.remove(path);
 }
 
+/// Register an already-open backend in the SQL executor cache.
+///
+/// Used by storage-level memtable appends: SQL reads should see the same warm
+/// backend instead of reopening the mmap-only file and missing pending rows.
+#[inline]
+pub fn cache_backend_pub(path: &Path, backend: Arc<TableStorageBackend>) {
+    if STORAGE_CACHE.len() >= MAX_CACHE_ENTRIES {
+        evict_lru_cache_entries();
+    }
+
+    let modified = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    STORAGE_CACHE.insert(
+        path.to_path_buf(),
+        (backend, modified, Arc::new(AtomicU64::new(now_nanos()))),
+    );
+}
+
 /// Invalidate all storage cache entries under a directory
 /// CRITICAL: Must be called when closing a client to release all mmaps on Windows
 #[inline]
@@ -1059,8 +1079,10 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if let Ok(batch) = backend.read_columns_to_arrow(None, 0, Some(*limit)) {
-                        return Ok(ApexResult::Data(batch));
+                    if backend.pending_v4_in_memory_rows() == 0 {
+                        if let Ok(batch) = backend.read_columns_to_arrow(None, 0, Some(*limit)) {
+                            return Ok(ApexResult::Data(batch));
+                        }
                     }
                 }
                 // Fall through to full parse if fast path unavailable
@@ -1075,11 +1097,15 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-                    if let Ok(batch) =
-                        backend.read_columns_to_arrow(Some(col_refs.as_slice()), 0, Some(*limit))
-                    {
-                        return Ok(ApexResult::Data(batch));
+                    if backend.pending_v4_in_memory_rows() == 0 {
+                        let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                        if let Ok(batch) = backend.read_columns_to_arrow(
+                            Some(col_refs.as_slice()),
+                            0,
+                            Some(*limit),
+                        ) {
+                            return Ok(ApexResult::Data(batch));
+                        }
                     }
                 }
                 // Fall through to full parse if fast path unavailable
@@ -1094,10 +1120,12 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if let Ok(batch) =
-                        backend.read_columns_filtered_string_to_arrow(None, column, value, true)
-                    {
-                        return Ok(ApexResult::Data(batch));
+                    if backend.pending_v4_in_memory_rows() == 0 {
+                        if let Ok(batch) =
+                            backend.read_columns_filtered_string_to_arrow(None, column, value, true)
+                        {
+                            return Ok(ApexResult::Data(batch));
+                        }
                     }
                 }
                 // Fall through to full parse if fast path unavailable
@@ -1113,14 +1141,16 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-                    if let Ok(batch) = backend.read_columns_filtered_string_to_arrow(
-                        Some(col_refs.as_slice()),
-                        column,
-                        value,
-                        true,
-                    ) {
-                        return Ok(ApexResult::Data(batch));
+                    if backend.pending_v4_in_memory_rows() == 0 {
+                        let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                        if let Ok(batch) = backend.read_columns_filtered_string_to_arrow(
+                            Some(col_refs.as_slice()),
+                            column,
+                            value,
+                            true,
+                        ) {
+                            return Ok(ApexResult::Data(batch));
+                        }
                     }
                 }
                 // Fall through to full parse if fast path unavailable
@@ -1135,10 +1165,12 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if let Ok(Some(batch)) =
-                        backend.scan_like_and_extract_mmap(column, pattern, None)
-                    {
-                        return Ok(ApexResult::Data(batch));
+                    if backend.pending_v4_in_memory_rows() == 0 {
+                        if let Ok(Some(batch)) =
+                            backend.scan_like_and_extract_mmap(column, pattern, None)
+                        {
+                            return Ok(ApexResult::Data(batch));
+                        }
                     }
                 }
                 // Fall through to full parse if fast path unavailable
@@ -1156,7 +1188,7 @@ impl ApexExecutor {
                         if let Some(where_pos) = after_df_u.find(" WHERE ") {
                             let table_raw = after_df[..where_pos].trim();
                             let after_where = after_df[where_pos + 7..].trim();
-                            let after_where_u = after_df_u[where_pos + 7..].to_ascii_uppercase();
+                            let after_where_u = after_where.to_ascii_uppercase();
                             if !after_where_u.contains(" AND ")
                                 && !after_where_u.contains(" OR ")
                                 && !after_where_u.contains("NOT ")

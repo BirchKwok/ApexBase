@@ -19,6 +19,9 @@ import shutil
 from pathlib import Path
 import sys
 import os
+import subprocess
+import threading
+import time
 import numpy as np
 from datetime import datetime, date
 from decimal import Decimal
@@ -158,8 +161,110 @@ class TestSingleRecordStorage:
             assert reopened.retrieve(2)["name"] == "memtable"
             reopened.close()
 
-    def test_fast_single_dict_memtable_flushes_before_broad_reads(self, monkeypatch):
-        """Default fast single-row writes stay correct for count/filter/full reads."""
+    def test_memtable_single_dict_close_persists_without_prior_read(self, monkeypatch):
+        """Closing a client flushes pending memtable rows even without a broad read."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir, durability="fast")
+            client.create_table("default")
+            client.store({"name": ["seed"], "age": [1], "score": [1.0], "city": ["BJ"]})
+
+            client.store({"name": "close_memtable", "age": 2, "score": 2.0, "city": "SH"})
+            client.close()
+
+            reopened = ApexClient(dirpath=temp_dir)
+            reopened.use_table("default")
+            assert reopened.count_rows() == 2
+            assert reopened.retrieve(2)["name"] == "close_memtable"
+            reopened.close()
+
+    def test_memtable_visibility_same_process_shared_client(self, monkeypatch):
+        """Default managed clients in one process share the storage instance."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writer = ApexClient(dirpath=temp_dir, durability="fast")
+            writer.create_table("default")
+            writer.store({"name": ["seed"], "age": [1], "score": [1.0], "city": ["BJ"]})
+
+            writer.store({"name": "shared_memtable", "age": 2, "score": 2.0, "city": "SH"})
+
+            reader = ApexClient(dirpath=temp_dir, durability="fast")
+            reader.use_table("default")
+            assert reader.retrieve(2)["name"] == "shared_memtable"
+            assert reader.count_rows() == 2
+
+            reader.close()
+            writer.close()
+
+    def test_memtable_visibility_cross_process_requires_flush(self, monkeypatch):
+        """A separate process cannot see pending memtable rows until the writer flushes."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writer = ApexClient(dirpath=temp_dir, durability="fast")
+            writer.create_table("default")
+            writer.store({"name": ["seed"], "age": [1], "score": [1.0], "city": ["BJ"]})
+
+            writer.store({"name": "pending_memtable", "age": 2, "score": 2.0, "city": "SH"})
+
+            env = os.environ.copy()
+            python_path = os.path.join(os.path.dirname(__file__), '..', 'apexbase', 'python')
+            env["PYTHONPATH"] = python_path + os.pathsep + env.get("PYTHONPATH", "")
+            go_path = str(Path(temp_dir) / ".reader_go")
+            reader_script = Path(temp_dir) / "_memtable_reader.py"
+            reader_script.write_text("\n".join([
+                "import os, pathlib, sys, time",
+                "from apexbase import ApexClient",
+                "db_dir, go_path, mode = sys.argv[1:4]",
+                "def snapshot():",
+                "    client = ApexClient(db_dir)",
+                "    client.use_table('default')",
+                "    count = client.count_rows()",
+                "    row = client.retrieve(2)",
+                "    client.close()",
+                "    return count, row",
+                "if mode == 'before':",
+                "    count, row = snapshot()",
+                "    print(count, flush=True)",
+                "    print(row, flush=True)",
+                "    go = pathlib.Path(go_path)",
+                "    while not go.exists():",
+                "        time.sleep(0.005)",
+                "    os.execv(sys.executable, [sys.executable, __file__, db_dir, go_path, 'after'])",
+                "count, row = snapshot()",
+                "print(count, flush=True)",
+                "print(row, flush=True)",
+            ]), encoding="utf-8")
+
+            reader = subprocess.Popen(
+                [sys.executable, str(reader_script), temp_dir, go_path, "before"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            try:
+                before_flush = [
+                    reader.stdout.readline().strip(),
+                    reader.stdout.readline().strip(),
+                ]
+                assert before_flush == ["1", "None"]
+
+                writer.flush()
+                Path(go_path).write_text("go")
+
+                after_flush, stderr = reader.communicate(timeout=5)
+            finally:
+                if reader.poll() is None:
+                    reader.kill()
+                    reader.communicate()
+            assert reader.returncode == 0, stderr
+            assert after_flush.splitlines()[0] == "2"
+            assert "pending_memtable" in after_flush
+
+            writer.close()
+
+    def test_fast_single_dict_memtable_overlays_broad_reads(self, monkeypatch):
+        """Default fast single-row writes stay visible without broad-read flushes."""
         monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, durability="fast")
@@ -169,7 +274,9 @@ class TestSingleRecordStorage:
             client.store({"name": "m2", "age": 2, "score": 2.0, "city": "SH"})
 
             assert client.retrieve(2)["name"] == "m2"
+            assert client._storage.has_pending_memtable_rows() is True
             assert client.count_rows() == 2
+            assert client._storage.has_pending_memtable_rows() is True
             result = client.execute(
                 "SELECT * FROM default WHERE name = 'm2'",
                 show_internal_id=True,
@@ -181,6 +288,7 @@ class TestSingleRecordStorage:
                 "city": "SH",
                 "name": "m2",
             }]
+            assert client._storage.has_pending_memtable_rows() is True
 
             client.close()
 
@@ -189,6 +297,237 @@ class TestSingleRecordStorage:
             assert reopened.count_rows() == 2
             assert reopened.retrieve(2)["name"] == "m2"
             reopened.close()
+
+    def test_memtable_continuous_write_read_interleaving(self, monkeypatch):
+        """A tight write/read loop sees pending rows without flushing them."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir, durability="fast")
+            client.create_table("default")
+            client.store({
+                "name": ["seed_0", "seed_1"],
+                "seq": [0, 1],
+                "bucket": ["base", "base"],
+                "score": [0.0, 1.0],
+            })
+
+            for seq in range(2, 22):
+                bucket = "even" if seq % 2 == 0 else "odd"
+                client.store({
+                    "name": f"live_{seq}",
+                    "seq": seq,
+                    "bucket": bucket,
+                    "score": float(seq),
+                })
+
+                assert client._storage.has_pending_memtable_rows() is True
+                assert client.count_rows() == seq + 1
+                assert client.execute("SELECT COUNT(*) AS cnt FROM default").to_dict()[0]["cnt"] == seq + 1
+
+                point = client.execute(
+                    f"SELECT name, seq, bucket FROM default WHERE seq = {seq}"
+                ).to_dict()
+                assert point == [{"name": f"live_{seq}", "seq": seq, "bucket": bucket}]
+
+                latest = client.retrieve(seq + 1)
+                assert latest["name"] == f"live_{seq}"
+                assert latest["seq"] == seq
+
+            grouped = client.execute(
+                "SELECT bucket, COUNT(*) AS cnt FROM default GROUP BY bucket ORDER BY bucket"
+            ).to_dict()
+            assert {row["bucket"]: row["cnt"] for row in grouped} == {
+                "base": 2,
+                "even": 10,
+                "odd": 10,
+            }
+
+            top = client.execute(
+                "SELECT name, seq FROM default ORDER BY seq DESC LIMIT 3"
+            ).to_dict()
+            assert [row["seq"] for row in top] == [21, 20, 19]
+            assert client._storage.has_pending_memtable_rows() is True
+
+            client.close()
+
+    def test_memtable_intermittent_reads_during_write_burst(self, monkeypatch):
+        """Intermittent analytical reads during a write burst include memtable rows."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir, durability="fast")
+            client.create_table("default")
+            client.store({
+                "name": ["base_0", "base_1", "base_2"],
+                "seq": [0, 1, 2],
+                "bucket": ["cold", "hot", "cold"],
+                "score": [0.0, 1.0, 2.0],
+            })
+
+            written = [
+                {"name": "base_0", "seq": 0, "bucket": "cold", "score": 0.0},
+                {"name": "base_1", "seq": 1, "bucket": "hot", "score": 1.0},
+                {"name": "base_2", "seq": 2, "bucket": "cold", "score": 2.0},
+            ]
+            checkpoints = {3, 4, 10, 20, 32}
+
+            for seq in range(3, 33):
+                row = {
+                    "name": f"live_{seq}",
+                    "seq": seq,
+                    "bucket": "hot" if seq % 3 == 0 else "cold",
+                    "score": float(seq),
+                }
+                client.store(row)
+                written.append(row)
+
+                if seq in checkpoints:
+                    assert client.count_rows() == len(written)
+                    hot_expected = sum(1 for item in written if item["bucket"] == "hot")
+                    hot_count = client.execute(
+                        "SELECT COUNT(*) AS cnt FROM default WHERE bucket = 'hot'"
+                    ).to_dict()[0]["cnt"]
+                    assert hot_count == hot_expected
+
+                    ranged = client.execute(
+                        "SELECT seq FROM default WHERE seq BETWEEN 8 AND 12 ORDER BY seq"
+                    ).to_dict()
+                    expected_range = [
+                        item["seq"] for item in written if 8 <= item["seq"] <= 12
+                    ]
+                    assert [item["seq"] for item in ranged] == expected_range
+                    assert client._storage.has_pending_memtable_rows() is True
+
+            like_rows = client.execute(
+                "SELECT seq FROM default WHERE name LIKE 'live_1%' ORDER BY seq"
+            ).to_dict()
+            assert [row["seq"] for row in like_rows] == list(range(10, 20))
+            assert client._storage.has_pending_memtable_rows() is True
+
+            client.close()
+
+    def test_memtable_later_same_process_sql_reader_before_flush(self, monkeypatch):
+        """A later same-process reader sees unflushed rows through SQL overlay."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writer = ApexClient(dirpath=temp_dir, durability="fast")
+            writer.create_table("default")
+            writer.store({
+                "name": ["base_0", "base_1"],
+                "seq": [0, 1],
+                "bucket": ["base", "base"],
+                "score": [0.0, 1.0],
+            })
+
+            for seq in range(2, 7):
+                writer.store({
+                    "name": f"pending_{seq}",
+                    "seq": seq,
+                    "bucket": "pending",
+                    "score": float(seq),
+                })
+
+            assert writer._storage.has_pending_memtable_rows() is True
+
+            reader = ApexClient(dirpath=temp_dir, durability="fast")
+            reader.use_table("default")
+
+            assert reader.count_rows() == 7
+            assert reader.execute(
+                "SELECT COUNT(*) AS cnt FROM default WHERE bucket = 'pending'"
+            ).to_dict()[0]["cnt"] == 5
+            assert reader.execute(
+                "SELECT name FROM default WHERE seq = 6"
+            ).to_dict() == [{"name": "pending_6"}]
+            assert reader.execute(
+                "SELECT seq FROM default ORDER BY seq DESC LIMIT 2"
+            ).to_dict() == [{"seq": 6}, {"seq": 5}]
+            assert writer._storage.has_pending_memtable_rows() is True
+
+            reader.close()
+            writer.close()
+
+    def test_memtable_concurrent_write_stream_and_reader_loop(self, monkeypatch):
+        """Concurrent readers observe a monotonic in-process view of pending writes."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir, durability="fast")
+            client.create_table("default")
+            client.store({
+                "name": ["seed"],
+                "seq": [0],
+                "bucket": ["base"],
+                "score": [0.0],
+            })
+
+            total_writes = 40
+            first_write = threading.Event()
+            done = threading.Event()
+            errors = []
+            observed_counts = []
+
+            def writer():
+                try:
+                    for seq in range(1, total_writes + 1):
+                        client.store({
+                            "name": f"live_{seq}",
+                            "seq": seq,
+                            "bucket": f"b{seq % 4}",
+                            "score": float(seq),
+                        })
+                        first_write.set()
+                        if seq % 5 == 0:
+                            time.sleep(0.001)
+                except Exception as exc:
+                    errors.append(f"writer: {exc!r}")
+                finally:
+                    done.set()
+
+            def reader():
+                if not first_write.wait(timeout=2):
+                    errors.append("reader: writer did not start")
+                    return
+
+                last_count = 0
+                try:
+                    while not done.is_set():
+                        count = client.execute(
+                            "SELECT COUNT(*) AS cnt FROM default"
+                        ).to_dict()[0]["cnt"]
+                        if count < last_count:
+                            errors.append(f"reader: count moved backward {last_count}->{count}")
+                            return
+                        last_count = count
+                        observed_counts.append(count)
+                        time.sleep(0.0005)
+                except Exception as exc:
+                    errors.append(f"reader: {exc!r}")
+
+            reader_thread = threading.Thread(target=reader)
+            writer_thread = threading.Thread(target=writer)
+            reader_thread.start()
+            writer_thread.start()
+            writer_thread.join(timeout=5)
+            reader_thread.join(timeout=5)
+
+            assert not writer_thread.is_alive()
+            assert not reader_thread.is_alive()
+            assert errors == []
+            assert observed_counts
+
+            final_count = client.execute(
+                "SELECT COUNT(*) AS cnt FROM default"
+            ).to_dict()[0]["cnt"]
+            assert final_count == total_writes + 1
+            grouped = client.execute(
+                "SELECT bucket, COUNT(*) AS cnt FROM default GROUP BY bucket"
+            ).to_dict()
+            assert sum(row["cnt"] for row in grouped) == final_count
+            assert client.execute(
+                f"SELECT name FROM default WHERE seq = {total_writes}"
+            ).to_dict() == [{"name": f"live_{total_writes}"}]
+            assert client._storage.has_pending_memtable_rows() is True
+
+            client.close()
     
     def test_store_single_dict_all_types(self):
         """Test storing dict with all supported data types"""
