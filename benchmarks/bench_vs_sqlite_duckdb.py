@@ -1580,7 +1580,7 @@ def run_apex_buffered_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
 
 
 def run_apex_memtable_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
-    """Show ApexBase's experimental storage-level memtable write path.
+    """Show ApexBase's default fast storage-level memtable write path in isolation.
 
     This path keeps writes inside the storage engine and makes them immediately
     readable by the same storage instance, then persists them on flush/close or
@@ -1597,8 +1597,8 @@ def run_apex_memtable_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
             baselines = row
             break
 
-    print("\n--- ApexBase Experimental Storage Memtable OLTP (separate mode) ---")
-    print("  Opt-in storage-level write buffer; same-storage reads see rows immediately.")
+    print("\n--- ApexBase Storage Memtable OLTP (isolated default-fast mode) ---")
+    print("  Default fast single-row path; same-storage reads see rows immediately.")
     print("  Separate processes see rows after flush/close/auto-flush; not mixed into committed-write OLTP.")
 
     col_width = 16
@@ -1613,8 +1613,8 @@ def run_apex_memtable_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
 
     rows = []
     mem_tmpdir = tempfile.mkdtemp(prefix="apexbase_memtable_oltp_", dir=tmpdir)
-    old_env = os.environ.get("APEXBASE_EXPERIMENTAL_MEMTABLE_SINGLE_WRITE")
-    os.environ["APEXBASE_EXPERIMENTAL_MEMTABLE_SINGLE_WRITE"] = "1"
+    old_disable_env = os.environ.get("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE")
+    os.environ.pop("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", None)
     client = ApexClient(mem_tmpdir, drop_if_exists=True)
     try:
         client.create_table("default")
@@ -1666,10 +1666,10 @@ def run_apex_memtable_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
             client.close()
         except Exception:
             pass
-        if old_env is None:
-            os.environ.pop("APEXBASE_EXPERIMENTAL_MEMTABLE_SINGLE_WRITE", None)
+        if old_disable_env is None:
+            os.environ.pop("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", None)
         else:
-            os.environ["APEXBASE_EXPERIMENTAL_MEMTABLE_SINGLE_WRITE"] = old_env
+            os.environ["APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE"] = old_disable_env
         try:
             shutil.rmtree(mem_tmpdir)
         except Exception:
@@ -1741,7 +1741,7 @@ def main():
     print(f"\nDataset: {N:,} rows × 5 columns (name, age, score, city, category)")
     print(f"Warmup: {WARMUP} iterations, Timed: {ITERS} iterations (average)")
     print("Fairness mode: default rankings use normal engine APIs and comparable result materialization.")
-    print("Layout: OLAP fair ranking, HTAP fair ranking, OLTP default/durable microbenchmarks, and ApexBase opt-in peak modes.")
+    print("Layout: OLAP fair ranking, HTAP fair ranking, OLTP default/durable microbenchmarks, and ApexBase isolated fast-path modes.")
     print("HTAP Q/s workload: COUNT + two full-table GROUP BY scans + filtered LIMIT 100, materialized to Python rows.")
     if args.low_memory:
         print("Mode: LOW-MEMORY (ApexBase-only cache stress mode; not a cross-engine apples-to-apples setting)")

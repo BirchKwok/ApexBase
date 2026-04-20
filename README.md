@@ -535,40 +535,40 @@ Read benchmarks materialize full results for fairness; ID lookups use shared det
 
 | Query | ApexBase | SQLite | DuckDB | vs Best Other |
 |-------|----------|--------|--------|---------------|
-| Bulk Insert (1M rows) | 293.68ms | 1.02s | 195.62s | **3.5x faster** |
-| COUNT(\*) | 0.077ms | 8.26ms | 0.545ms | **7.1x faster** |
-| SELECT \* LIMIT 100 [cold] | 0.046ms | 0.132ms | 0.644ms | **2.9x faster** |
-| SELECT \* LIMIT 100 [warm] | 0.045ms | 0.112ms | 0.222ms | **2.5x faster** |
-| SELECT \* LIMIT 10K [cold] | 4.47ms | 12.01ms | 7.90ms | **1.8x faster** |
-| SELECT \* LIMIT 10K [warm] | 4.30ms | 12.09ms | 7.95ms | **1.8x faster** |
-| Filter (name = 'user\_5000') | 0.152ms | 41.03ms | 1.72ms | **11.3x faster** |
-| Filter (age BETWEEN 25 AND 35) | 91.94ms | 273.85ms | 159.88ms | **1.7x faster** |
-| GROUP BY city (10 groups) | 0.238ms | 355.98ms | 3.73ms | **15.7x faster** |
-| GROUP BY + HAVING | 0.239ms | 363.91ms | 4.33ms | **18.1x faster** |
-| ORDER BY score LIMIT 100 | 0.535ms | 52.14ms | 5.46ms | **10.2x faster** |
-| Aggregation (5 funcs) | 0.287ms | 85.76ms | 1.72ms | **6.0x faster** |
-| Complex (Filter+Group+Order) | 0.216ms | 173.72ms | 5.25ms | **24.3x faster** |
-| Point Lookup (SQL by ID) | 0.047ms | 0.061ms | 2.95ms | **1.3x faster** |
-| Retrieve Many (SQL, 100 IDs) | 0.244ms | 0.334ms | 4.94ms | **1.4x faster** |
-| Insert 1K rows | 0.704ms | 1.65ms | 217.65ms | **2.3x faster** |
-| SELECT \* -> pandas (full scan) | 23.78ms | 1.40s | 222.45ms | **9.4x faster** |
-| GROUP BY city,category (100 grp) | 0.378ms | 713.27ms | 9.16ms | **24.2x faster** |
-| LIKE filter (name LIKE user\_1%) | 61.14ms | 191.31ms | 97.38ms | **1.6x faster** |
-| Multi-cond (age>30 AND score>50) | 213.82ms | 561.74ms | 350.96ms | **1.6x faster** |
-| ORDER BY city,score DESC LIMIT100 | 0.508ms | 71.53ms | 8.38ms | **16.5x faster** |
-| COUNT(DISTINCT city) | 0.187ms | 91.07ms | 4.49ms | **24.0x faster** |
-| IN filter (city IN 3 cities) | 153.70ms | 484.42ms | 268.56ms | **1.7x faster** |
-| Numeric IN (age IN 9 values) | 85.26ms | 260.28ms | 133.30ms | **1.6x faster** |
-| OR cross-col (age=25 OR city=BJ) | 45.98ms | 214.88ms | 104.00ms | **2.3x faster** |
-| Numeric OR (age=20\|30\|40\|50) | 42.45ms | 135.50ms | 56.95ms | **1.3x faster** |
-| UPDATE rows (age=25, idempotent) | 7.87ms | 38.69ms | 15.85ms | **2.0x faster** |
-| Store+DELETE 1K (combined) | 0.949ms | 35.51ms | 186.08ms | **37.4x faster** |
-| DELETE 1K [pure delete only] | 0.186ms | 33.61ms | 0.400ms | **2.2x faster** |
-| Window ROW\_NUMBER PARTITION BY city | 1.80ms | 514.42ms | 62.08ms | **34.5x faster** |
-| FTS Index Build (name,city,category) | 777.31ms | 1.62s | 1.21s | **1.6x faster** |
-| FTS Search ('Electronics') | 0.165ms | 28.83ms | 25.46ms | **154x faster** |
-| Single-threaded Q/s | 9027.5 Q/s | 6.2 Q/s | 503.6 Q/s | **17.9x faster** |
-| Concurrent Q/s (4 threads) | 12140.7 Q/s | 22.5 Q/s | 889.5 Q/s | **13.6x faster** |
+| Bulk Insert (1M rows) | 271.99ms | 971.89ms | 168.06s | **3.6x faster** |
+| COUNT(\*) | 0.099ms | 7.41ms | 0.531ms | **5.4x faster** |
+| SELECT \* LIMIT 100 [cold] | 0.053ms | 0.118ms | 0.519ms | **2.2x faster** |
+| SELECT \* LIMIT 100 [warm] | 0.045ms | 0.109ms | 0.251ms | **2.4x faster** |
+| SELECT \* LIMIT 10K [cold] | 4.30ms | 11.46ms | 7.75ms | **1.8x faster** |
+| SELECT \* LIMIT 10K [warm] | 4.19ms | 11.24ms | 7.51ms | **1.8x faster** |
+| Filter (name = 'user\_5000') | 0.145ms | 38.31ms | 1.62ms | **11.2x faster** |
+| Filter (age BETWEEN 25 AND 35) | 92.08ms | 251.54ms | 152.96ms | **1.7x faster** |
+| GROUP BY city (10 groups) | 0.143ms | 340.39ms | 3.05ms | **21.3x faster** |
+| GROUP BY + HAVING | 0.153ms | 344.71ms | 3.26ms | **21.3x faster** |
+| ORDER BY score LIMIT 100 | 0.259ms | 49.41ms | 4.67ms | **18.0x faster** |
+| Aggregation (5 funcs) | 0.221ms | 80.42ms | 1.19ms | **5.4x faster** |
+| Complex (Filter+Group+Order) | 0.155ms | 159.86ms | 2.43ms | **15.7x faster** |
+| Point Lookup (SQL by ID) | 0.035ms | 0.060ms | 2.86ms | **1.7x faster** |
+| Retrieve Many (SQL, 100 IDs) | 0.252ms | 0.296ms | 4.39ms | **1.2x faster** |
+| Insert 1K rows | 0.606ms | 1.57ms | 161.47ms | **2.6x faster** |
+| SELECT \* -> pandas (full scan) | 21.89ms | 1.32s | 204.00ms | **9.3x faster** |
+| GROUP BY city,category (100 grp) | 0.172ms | 656.99ms | 4.77ms | **27.7x faster** |
+| LIKE filter (name LIKE user\_1%) | 64.79ms | 182.67ms | 90.72ms | **1.4x faster** |
+| Multi-cond (age>30 AND score>50) | 216.25ms | 541.55ms | 331.96ms | **1.5x faster** |
+| ORDER BY city,score DESC LIMIT100 | 0.259ms | 67.60ms | 7.16ms | **27.6x faster** |
+| COUNT(DISTINCT city) | 0.136ms | 86.96ms | 4.49ms | **33.0x faster** |
+| IN filter (city IN 3 cities) | 140.89ms | 460.42ms | 257.56ms | **1.8x faster** |
+| Numeric IN (age IN 9 values) | 81.46ms | 253.54ms | 136.99ms | **1.7x faster** |
+| OR cross-col (age=25 OR city=BJ) | 44.23ms | 205.04ms | 105.69ms | **2.4x faster** |
+| Numeric OR (age=20\|30\|40\|50) | 42.00ms | 130.97ms | 60.34ms | **1.4x faster** |
+| UPDATE rows (age=25, idempotent) | 7.66ms | 36.61ms | 14.30ms | **1.9x faster** |
+| Store+DELETE 1K (combined) | 0.940ms | 33.72ms | 169.30ms | **35.9x faster** |
+| DELETE 1K [pure delete only] | 0.129ms | 31.85ms | 0.413ms | **3.2x faster** |
+| Window ROW\_NUMBER PARTITION BY city | 0.645ms | 492.43ms | 52.19ms | **80.9x faster** |
+| FTS Index Build (name,city,category) | 642.49ms | 1.46s | 1.08s | **1.7x faster** |
+| FTS Search ('Electronics') | 0.151ms | 28.59ms | 23.96ms | **159x faster** |
+| Single-threaded Q/s | 10205.4 Q/s | 6.5 Q/s | 610.5 Q/s | **16.7x faster** |
+| Concurrent Q/s (4 threads) | 12776.4 Q/s | 23.4 Q/s | 1134.3 Q/s | **11.3x faster** |
 
 **Summary**: ApexBase wins 32/32 benchmarks. "Cold" = fresh DB open per iteration; "warm" = cached backend.
 
@@ -581,7 +581,7 @@ ApexBase has two fast paths for frequent single-row appends:
 - **Memtable OLTP** is the default fast single-row path for schema-stable `store({...})` calls with `durability="fast"`. The writing client can read the row immediately, managed clients in the same Python process share the storage instance, and `flush()` / `close()` persists pending rows. A separate process sees those rows only after the writer flushes, closes, or reaches the auto-flush threshold.
 - **Buffered OLTP** is explicit: call `begin_buffered_writes()`, issue many single-row `store({...})` calls, then call `flush_buffered_writes()` or `end_buffered_writes(flush=True)`. Buffered rows are not visible until flushed.
 
-For benchmark reporting, Memtable OLTP is valid as ApexBase's default fast-profile same-client OLTP path, but it should not be treated as a cross-process committed-write comparison unless each timed write also calls `flush()`. The benchmark script therefore keeps default fast OLTP, durable-per-operation OLTP, and opt-in peak modes as separate sections.
+For benchmark reporting, Memtable OLTP is valid as ApexBase's default fast-profile same-client OLTP path, but it should not be treated as a cross-process committed-write comparison unless each timed write also calls `flush()`. The benchmark script therefore keeps default fast OLTP, durable-per-operation OLTP, explicit buffered OLTP, and isolated storage-memtable fast-path reporting as separate sections.
 
 ### ApexBase Result Materialization APIs
 
@@ -589,12 +589,12 @@ The cross-engine table above keeps result materialization comparable across engi
 
 | Query | to_dict | to_arrow | to_pandas | Arrow vs dict | Shape |
 |-------|---------|----------|-----------|---------------|-------|
-| Point Lookup | 0.045ms | 0.167ms | 0.395ms | 3.7x slower | 1x6 |
-| SELECT \* LIMIT 10K | 4.53ms | 3.71ms | 7.20ms | 1.2x faster | 10000x6 |
-| IN filter (city IN 3) | 145.07ms | 104.82ms | 195.27ms | 1.4x faster | 300321x6 |
-| Multi-cond filter | 211.38ms | 161.91ms | 274.44ms | 1.3x faster | 396569x6 |
-| GROUP BY city | 0.225ms | 0.171ms | 0.596ms | 1.3x faster | 10x3 |
-| Full scan | 2.37s | 25.30ms | 40.01ms | 93.5x faster | 1000000x6 |
+| Point Lookup | 0.037ms | 0.163ms | 0.388ms | 4.4x slower | 1x6 |
+| SELECT \* LIMIT 10K | 4.44ms | 3.53ms | 6.41ms | 1.3x faster | 10000x6 |
+| IN filter (city IN 3) | 136.65ms | 98.92ms | 182.17ms | 1.4x faster | 300321x6 |
+| Multi-cond filter | 209.93ms | 157.21ms | 268.80ms | 1.3x faster | 396569x6 |
+| GROUP BY city | 0.147ms | 0.219ms | 0.391ms | 1.5x slower | 10x3 |
+| Full scan | 2.19s | 22.06ms | 23.95ms | 99.3x faster | 1000000x6 |
 
 For tiny one-row results, `to_dict()` can be faster because Python object creation is minimal. For large scans and filters, `to_arrow()` avoids row-dict materialization and exposes ApexBase's Arrow-native path.
 
