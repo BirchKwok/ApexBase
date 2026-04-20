@@ -326,6 +326,17 @@ class SQLiteBench:
             (point_lookup_id,),
         )
 
+    def bench_oltp_count_rows(self):
+        return self._scalar("SELECT COUNT(*) FROM bench")
+
+    def bench_oltp_direct_point_lookup(self):
+        point_lookup_id = self.shared_inputs["point_lookup_id"]
+        return self._query_all("SELECT * FROM bench WHERE _id = ?", (point_lookup_id,))
+
+    def bench_oltp_missing_point_lookup(self):
+        missing_id = self.n + 100_000_000
+        return self._query_all("SELECT * FROM bench WHERE _id = ?", (missing_id,))
+
     def bench_retrieve_many(self):
         ids = self.shared_inputs["retrieve_many_ids"]
         placeholders = ",".join(["?"] * len(ids))
@@ -336,6 +347,14 @@ class SQLiteBench:
 
     def bench_oltp_projected_retrieve_10(self):
         ids = self.shared_inputs["retrieve_many_ids"][:10]
+        placeholders = ",".join(["?"] * len(ids))
+        return self._query_all(
+            f"SELECT name, age, score FROM bench WHERE _id IN ({placeholders})",
+            ids,
+        )
+
+    def bench_oltp_projected_retrieve_100(self):
+        ids = self.shared_inputs["retrieve_many_ids"]
         placeholders = ",".join(["?"] * len(ids))
         return self._query_all(
             f"SELECT name, age, score FROM bench WHERE _id IN ({placeholders})",
@@ -355,9 +374,42 @@ class SQLiteBench:
         )
         self.conn.commit()
 
+    def bench_oltp_insert_read_own_row(self):
+        cur = self.conn.execute(
+            "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+            ("oltp_insert_read", 32, 78.0, "Shanghai", "Books"),
+        )
+        self.conn.commit()
+        return self._query_all("SELECT * FROM bench WHERE _id = ?", (cur.lastrowid,))
+
+    def bench_oltp_insert_count_visible(self):
+        self.conn.execute(
+            "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+            ("oltp_insert_count", 33, 79.0, "Guangzhou", "Books"),
+        )
+        self.conn.commit()
+        return self._scalar("SELECT COUNT(*) FROM bench")
+
     def bench_oltp_update_by_id(self):
         point_lookup_id = self.shared_inputs["point_lookup_id"]
         self.conn.execute("UPDATE bench SET score = 77.0 WHERE _id = ?", (point_lookup_id,))
+        self.conn.commit()
+
+    def bench_oltp_replace_by_id(self):
+        point_lookup_id = self.shared_inputs["point_lookup_id"]
+        self.conn.execute(
+            "UPDATE bench SET name = ?, age = ?, score = ?, city = ?, category = ? WHERE _id = ?",
+            ("user_5000", 31, 77.0, "Beijing", "Books", point_lookup_id),
+        )
+        self.conn.commit()
+
+    def bench_oltp_insert_delete_by_id(self):
+        cur = self.conn.execute(
+            "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+            ("oltp_insert_delete", 34, 80.0, "Shenzhen", "Books"),
+        )
+        self.conn.commit()
+        self.conn.execute("DELETE FROM bench WHERE _id = ?", (cur.lastrowid,))
         self.conn.commit()
 
     def bench_insert_1k(self):
@@ -487,6 +539,7 @@ class DuckDBBench:
         self.n = len(data["name"])
         self.conn = None
         self.shared_inputs = build_shared_inputs(self.n)
+        self._next_rowid = 0
 
     def _connect(self):
         self.conn = duckdb.connect(self.db_path)
@@ -536,6 +589,7 @@ class DuckDBBench:
         self.conn.executemany(
             "INSERT INTO bench VALUES (?,?,?,?,?)", rows
         )
+        self._next_rowid = self.n
 
     def bench_count(self):
         return self._scalar("SELECT COUNT(*) FROM bench")
@@ -595,6 +649,23 @@ class DuckDBBench:
             (rowid,),
         )
 
+    def bench_oltp_count_rows(self):
+        return self._scalar("SELECT COUNT(*) FROM bench")
+
+    def bench_oltp_direct_point_lookup(self):
+        rowid = self.shared_inputs["point_lookup_id"] - 1
+        return self._query_all(
+            "SELECT rowid + 1 AS _id, * FROM bench WHERE rowid = ?",
+            (rowid,),
+        )
+
+    def bench_oltp_missing_point_lookup(self):
+        missing_rowid = self.n + 100_000_000
+        return self._query_all(
+            "SELECT rowid + 1 AS _id, * FROM bench WHERE rowid = ?",
+            (missing_rowid,),
+        )
+
     def bench_retrieve_many(self):
         ids = self.shared_inputs["retrieve_many_ids"]
         rowids = [id_ - 1 for id_ in ids]
@@ -613,6 +684,15 @@ class DuckDBBench:
             rowids,
         )
 
+    def bench_oltp_projected_retrieve_100(self):
+        ids = self.shared_inputs["retrieve_many_ids"]
+        rowids = [id_ - 1 for id_ in ids]
+        placeholders = ",".join(["?"] * len(rowids))
+        return self._query_all(
+            f"SELECT name, age, score FROM bench WHERE rowid IN ({placeholders})",
+            rowids,
+        )
+
     def bench_oltp_projected_limit_100(self):
         return self._query_all("SELECT name, age, city FROM bench LIMIT 100")
 
@@ -624,15 +704,53 @@ class DuckDBBench:
             "INSERT INTO bench VALUES (?,?,?,?,?)",
             ("oltp_one", 31, 77.0, "Beijing", "Books"),
         )
+        self._next_rowid += 1
+
+    def bench_oltp_insert_read_own_row(self):
+        rowid = self._next_rowid
+        self.conn.execute(
+            "INSERT INTO bench VALUES (?,?,?,?,?)",
+            ("oltp_insert_read", 32, 78.0, "Shanghai", "Books"),
+        )
+        self._next_rowid += 1
+        return self._query_all(
+            "SELECT rowid + 1 AS _id, * FROM bench WHERE rowid = ?",
+            (rowid,),
+        )
+
+    def bench_oltp_insert_count_visible(self):
+        self.conn.execute(
+            "INSERT INTO bench VALUES (?,?,?,?,?)",
+            ("oltp_insert_count", 33, 79.0, "Guangzhou", "Books"),
+        )
+        self._next_rowid += 1
+        return self._scalar("SELECT COUNT(*) FROM bench")
 
     def bench_oltp_update_by_id(self):
         rowid = self.shared_inputs["point_lookup_id"] - 1
         self.conn.execute("UPDATE bench SET score = 77.0 WHERE rowid = ?", (rowid,))
 
+    def bench_oltp_replace_by_id(self):
+        rowid = self.shared_inputs["point_lookup_id"] - 1
+        self.conn.execute(
+            "UPDATE bench SET name = ?, age = ?, score = ?, city = ?, category = ? WHERE rowid = ?",
+            ("user_5000", 31, 77.0, "Beijing", "Books", rowid),
+        )
+
+    def bench_oltp_insert_delete_by_id(self):
+        rowid = self._next_rowid
+        self.conn.execute(
+            "INSERT INTO bench VALUES (?,?,?,?,?)",
+            ("oltp_insert_delete", 34, 80.0, "Shenzhen", "Books"),
+        )
+        self._next_rowid += 1
+        self.conn.execute("DELETE FROM bench WHERE rowid = ?", (rowid,))
+
     def bench_insert_1k(self):
         # Use executemany for reliable cross-version compatibility
         rows = [(f"new_{i}", 25, 50.0, "Beijing", "Books") for i in range(1000)]
         self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
+        self._next_rowid += 1000
 
     def bench_full_scan_pandas(self):
         return self._query_pandas("SELECT rowid + 1 AS _id, * FROM bench")
@@ -688,11 +806,13 @@ class DuckDBBench:
     def bench_delete_1k(self):
         rows = [(f"del_{i}", 99, 99.0, "Beijing", "Books") for i in range(1000)]
         self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
+        self._next_rowid += 1000
         self.conn.execute("DELETE FROM bench WHERE age = 99")
 
     def bench_delete_1k_setup(self):
         rows = [(f"del_{i}", 99, 99.0, "Beijing", "Books") for i in range(1000)]
         self.conn.executemany("INSERT INTO bench VALUES (?,?,?,?,?)", rows)
+        self._next_rowid += 1000
 
     def bench_delete_1k_only(self):
         self.conn.execute("DELETE FROM bench WHERE age = 99")
@@ -745,6 +865,7 @@ class ApexBaseBench:
         self.client = None
         self.low_memory = low_memory
         self.shared_inputs = build_shared_inputs(self.n)
+        self._next_id = 1
 
     def _query_all(self, sql):
         return self.client.execute(sql, show_internal_id=True).to_dict()
@@ -766,6 +887,7 @@ class ApexBaseBench:
             shutil.rmtree(self.db_dir)
         self.client = ApexClient(self.db_dir, drop_if_exists=True)
         self.client.create_table('default')
+        self._next_id = 1
 
     def cold_start_setup(self):
         """Close and reopen client — clears all Python/Rust-side caches (arrow_batch_cache etc.)."""
@@ -776,6 +898,7 @@ class ApexBaseBench:
 
     def bench_insert(self):
         self.client.store(self.data)
+        self._next_id = self.n + 1
 
     def bench_count(self):
         return self._scalar("SELECT COUNT(*) FROM default")
@@ -833,6 +956,17 @@ class ApexBaseBench:
             f"SELECT name, age, score FROM default WHERE _id = {point_lookup_id}"
         ).to_dict()
 
+    def bench_oltp_count_rows(self):
+        return self.client.count_rows()
+
+    def bench_oltp_direct_point_lookup(self):
+        point_lookup_id = self.shared_inputs["point_lookup_id"]
+        return self.client.retrieve(point_lookup_id)
+
+    def bench_oltp_missing_point_lookup(self):
+        missing_id = self.n + 100_000_000
+        return self.client.retrieve(missing_id)
+
     def bench_retrieve_many(self):
         ids = self.shared_inputs["retrieve_many_ids"]
         id_list = ",".join(str(id_) for id_ in ids)
@@ -842,6 +976,13 @@ class ApexBaseBench:
 
     def bench_oltp_projected_retrieve_10(self):
         ids = self.shared_inputs["retrieve_many_ids"][:10]
+        id_list = ",".join(str(id_) for id_ in ids)
+        return self.client.execute(
+            f"SELECT name, age, score FROM default WHERE _id IN ({id_list})"
+        ).to_dict()
+
+    def bench_oltp_projected_retrieve_100(self):
+        ids = self.shared_inputs["retrieve_many_ids"]
         id_list = ",".join(str(id_) for id_ in ids)
         return self.client.execute(
             f"SELECT name, age, score FROM default WHERE _id IN ({id_list})"
@@ -861,12 +1002,58 @@ class ApexBaseBench:
             "city": "Beijing",
             "category": "Books",
         })
+        self._next_id += 1
+
+    def bench_oltp_insert_read_own_row(self):
+        row_id = self._next_id
+        self.client.store({
+            "name": "oltp_insert_read",
+            "age": 32,
+            "score": 78.0,
+            "city": "Shanghai",
+            "category": "Books",
+        })
+        self._next_id += 1
+        return self.client.retrieve(row_id)
+
+    def bench_oltp_insert_count_visible(self):
+        self.client.store({
+            "name": "oltp_insert_count",
+            "age": 33,
+            "score": 79.0,
+            "city": "Guangzhou",
+            "category": "Books",
+        })
+        self._next_id += 1
+        return self.client.count_rows()
 
     def bench_oltp_update_by_id(self):
         point_lookup_id = self.shared_inputs["point_lookup_id"]
         return self.client.execute(
             f"UPDATE default SET score = 77.0 WHERE _id = {point_lookup_id}"
         )
+
+    def bench_oltp_replace_by_id(self):
+        point_lookup_id = self.shared_inputs["point_lookup_id"]
+        return self.client.replace(point_lookup_id, {
+            "name": "user_5000",
+            "age": 31,
+            "score": 77.0,
+            "city": "Beijing",
+            "category": "Books",
+        })
+
+    def bench_oltp_insert_delete_by_id(self):
+        row_id = self._next_id
+        self.client.store({
+            "name": "oltp_insert_delete",
+            "age": 34,
+            "score": 80.0,
+            "city": "Shenzhen",
+            "category": "Books",
+        })
+        self._next_id += 1
+        return self.client.delete(id=row_id)
 
     def bench_insert_1k(self):
         data_1k = {
@@ -877,6 +1064,7 @@ class ApexBaseBench:
             "category": ["Books"] * 1000,
         }
         self.client.store(data_1k)
+        self._next_id += 1000
 
     def bench_full_scan_pandas(self):
         return self._query_pandas("SELECT * FROM default")
@@ -940,6 +1128,7 @@ class ApexBaseBench:
             "category": ["Books"] * 1000,
         }
         self.client.store(data)
+        self._next_id += 1000
         self.client.execute("DELETE FROM default WHERE age = 99")
 
     def bench_delete_1k_setup(self):
@@ -951,6 +1140,7 @@ class ApexBaseBench:
             "category": ["Books"] * 1000,
         }
         self.client.store(data)
+        self._next_id += 1000
 
     def bench_delete_1k_only(self):
         self.client.execute("DELETE FROM default WHERE age = 99")
@@ -1090,12 +1280,20 @@ MAIN_BENCHMARK_SECTIONS = [
 
 
 OLTP_DEFAULT_BENCHMARKS = [
+    ("OLTP COUNT(*) direct", "bench_oltp_count_rows"),
     ("OLTP Point Lookup projected", "bench_oltp_projected_point_lookup"),
+    ("OLTP Direct Lookup full", "bench_oltp_direct_point_lookup"),
+    ("OLTP Missing ID lookup", "bench_oltp_missing_point_lookup"),
     ("OLTP Retrieve 10 projected", "bench_oltp_projected_retrieve_10"),
+    ("OLTP Retrieve 100 projected", "bench_oltp_projected_retrieve_100"),
     ("OLTP SELECT 3 cols LIMIT 100", "bench_oltp_projected_limit_100"),
     ("OLTP String equality projected", "bench_oltp_projected_string_eq"),
     ("OLTP Insert 1 row", "bench_oltp_insert_one"),
+    ("OLTP Insert+Read own row", "bench_oltp_insert_read_own_row"),
+    ("OLTP Insert+COUNT visible", "bench_oltp_insert_count_visible"),
     ("OLTP UPDATE by ID", "bench_oltp_update_by_id"),
+    ("OLTP Replace row by ID", "bench_oltp_replace_by_id"),
+    ("OLTP Insert+DELETE by ID", "bench_oltp_insert_delete_by_id"),
 ]
 
 OLTP_DURABLE_WRITE_BENCHMARKS = [

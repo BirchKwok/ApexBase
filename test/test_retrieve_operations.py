@@ -765,6 +765,24 @@ class TestRetrieveEdgeCases:
             assert result is None
             
             client.close()
+
+    def test_retrieve_large_missing_id_keeps_pending_memtable(self, monkeypatch):
+        """Large missing-ID lookups short-circuit without flushing pending rows."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir, durability="fast")
+            client.create_table("default")
+            client.store({"name": ["seed"], "age": [1]})
+
+            client.store({"name": "pending", "age": 2})
+            assert client.retrieve(2)["name"] == "pending"
+            assert client._storage.has_pending_memtable_rows() is True
+
+            assert client.retrieve(10**12) is None
+            assert client._storage.has_pending_memtable_rows() is True
+            assert client.retrieve(2)["name"] == "pending"
+
+            client.close()
     
     def test_retrieve_from_different_tables(self):
         """Test retrieving from different tables"""

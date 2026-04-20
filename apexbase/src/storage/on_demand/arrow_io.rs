@@ -570,6 +570,7 @@ impl OnDemandStorage {
         let columns = self.columns.read();
         let nulls = self.nulls.read();
         let row_count = ids.len();
+        let row_ids: Vec<u64> = ids.iter().copied().collect();
 
         let col_indices: Vec<usize> = if let Some(names) = column_names {
             names.iter()
@@ -822,8 +823,14 @@ impl OnDemandStorage {
         }
 
         let arrow_schema = Arc::new(Schema::new(fields));
-        RecordBatch::try_new(arrow_schema, arrays)
-            .map_err(|e| err_data(e.to_string()))
+        let batch =
+            RecordBatch::try_new(arrow_schema, arrays).map_err(|e| err_data(e.to_string()))?;
+        let delta = self.delta_store.read();
+        if delta.is_empty() {
+            Ok(batch)
+        } else {
+            crate::storage::DeltaMerger::merge(&batch, &delta, &row_ids)
+        }
     }
 
     /// Build Arrow RecordBatch with a row LIMIT from in-memory V4 columns.

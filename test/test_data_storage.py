@@ -298,6 +298,112 @@ class TestSingleRecordStorage:
             assert reopened.retrieve(2)["name"] == "m2"
             reopened.close()
 
+    def test_fast_delete_pending_memtable_row_overlay(self, monkeypatch):
+        """Fast delete hides an unflushed memtable row without forcing a table save."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir, durability="fast")
+            client.create_table("default")
+            client.store({"name": ["seed"], "age": [1], "score": [1.0], "city": ["BJ"]})
+
+            client.store({"name": "pending_delete", "age": 2, "score": 2.0, "city": "SH"})
+            assert client._storage.has_pending_memtable_rows() is True
+            assert client.retrieve(2)["name"] == "pending_delete"
+
+            assert client.delete(2) is True
+            assert client.count_rows() == 1
+            assert client.retrieve(2) is None
+            assert client.execute("SELECT name FROM default WHERE _id = 2").to_dict() == []
+            assert client._storage.has_pending_memtable_rows() is True
+
+            client.flush()
+            client.close()
+
+            reopened = ApexClient(dirpath=temp_dir)
+            reopened.use_table("default")
+            assert reopened.count_rows() == 1
+            assert reopened.retrieve(1)["name"] == "seed"
+            assert reopened.retrieve(2) is None
+            reopened.close()
+
+    def test_fast_replace_exact_schema_uses_delta_overlay(self, monkeypatch):
+        """Fast replace overlays an exact-schema row and persists on flush."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir, durability="fast")
+            client.create_table("default")
+            client.store({
+                "name": ["alice", "bob"],
+                "age": [25, 30],
+                "score": [10.0, 20.0],
+                "city": ["BJ", "SH"],
+            })
+
+            assert client.replace(1, {
+                "name": "alice2",
+                "age": 26,
+                "score": 11.5,
+                "city": "GZ",
+            }) is True
+            assert client.count_rows() == 2
+            assert client.retrieve(1)["name"] == "alice2"
+            rows = client.execute(
+                "SELECT name, age, score, city FROM default WHERE _id = 1"
+            ).to_dict()
+            assert rows == [{"name": "alice2", "age": 26, "score": 11.5, "city": "GZ"}]
+
+            client.flush()
+            client.close()
+
+            reopened = ApexClient(dirpath=temp_dir)
+            reopened.use_table("default")
+            assert reopened.count_rows() == 2
+            assert reopened.retrieve(1)["name"] == "alice2"
+            assert reopened.retrieve(2)["name"] == "bob"
+            reopened.close()
+
+    def test_fast_overlay_survives_memtable_append(self, monkeypatch):
+        """Pending delete/replace overlays remain visible after a memtable append."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir, durability="fast")
+            client.create_table("default")
+            client.store({
+                "name": ["alice", "bob", "charlie"],
+                "age": [25, 30, 35],
+                "score": [10.0, 20.0, 30.0],
+                "city": ["BJ", "SH", "GZ"],
+            })
+
+            assert client.delete(2) is True
+            assert client.replace(1, {
+                "name": "alice2",
+                "age": 26,
+                "score": 11.5,
+                "city": "SZ",
+            }) is True
+
+            client.store({"name": "diana", "age": 28, "score": 40.0, "city": "HZ"})
+
+            assert client._storage.has_pending_memtable_rows() is True
+            assert client.count_rows() == 3
+            assert client.retrieve(1)["name"] == "alice2"
+            assert client.retrieve(2) is None
+            assert client.retrieve(4)["name"] == "diana"
+            rows = client.retrieve_all()
+            assert {row["name"] for row in rows} == {"alice2", "charlie", "diana"}
+
+            client.flush()
+            client.close()
+
+            reopened = ApexClient(dirpath=temp_dir)
+            reopened.use_table("default")
+            assert reopened.count_rows() == 3
+            assert reopened.retrieve(1)["name"] == "alice2"
+            assert reopened.retrieve(2) is None
+            assert reopened.retrieve(4)["name"] == "diana"
+            reopened.close()
+
     def test_memtable_continuous_write_read_interleaving(self, monkeypatch):
         """A tight write/read loop sees pending rows without flushing them."""
         monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)

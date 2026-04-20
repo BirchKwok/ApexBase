@@ -473,6 +473,69 @@ impl ApexStorageImpl {
         Ok(backend)
     }
 
+    /// Get a mmap/read backend suitable for fast overlay writes.
+    fn get_backend_for_overlay(
+        &self,
+        table_path: &Path,
+        table_name: &str,
+    ) -> PyResult<Arc<TableStorageBackend>> {
+        let cache_key = Self::backend_cache_key(table_path, table_name);
+        if let Some(entry) = self.cached_backends.get(&cache_key) {
+            return Ok(entry.clone());
+        }
+
+        if let Ok(backend) = crate::query::get_cached_backend_pub(table_path) {
+            self.cached_backends.insert(cache_key, Arc::clone(&backend));
+            return Ok(backend);
+        }
+
+        let backend = Arc::new(
+            TableStorageBackend::open_with_durability(table_path, self.durability)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?,
+        );
+        self.cached_backends.insert(cache_key, Arc::clone(&backend));
+        crate::query::executor::cache_backend_pub(table_path, Arc::clone(&backend));
+        Ok(backend)
+    }
+
+    fn table_has_secondary_indexes(&self, table_path: &Path, table_name: &str) -> bool {
+        let base_dir = table_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        crate::storage::index::IndexManager::load(table_name, &base_dir)
+            .map(|mgr| !mgr.catalog_is_empty())
+            .unwrap_or(false)
+    }
+
+    fn persist_pending_overlay_for_table(
+        &self,
+        table_path: &Path,
+        table_name: &str,
+    ) -> PyResult<()> {
+        let mut backends: Vec<Arc<TableStorageBackend>> = Vec::new();
+        let cache_key = Self::backend_cache_key(table_path, table_name);
+
+        if let Some(entry) = self.cached_backends.get(&cache_key) {
+            backends.push(Arc::clone(entry.value()));
+        }
+        if let Some(entry) = self.cached_backends.get(table_name) {
+            let backend = Arc::clone(entry.value());
+            if !backends.iter().any(|b| Arc::ptr_eq(b, &backend)) {
+                backends.push(backend);
+            }
+        }
+        for backend in backends {
+            if backend.has_pending_deltas() {
+                backend
+                    .save_delta_store()
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get backend for UPDATE/DELETE operations - loads all data into memory.
     /// This is required because save() rewrites the entire file.
     fn get_backend(&self) -> PyResult<Arc<TableStorageBackend>> {
@@ -606,6 +669,7 @@ impl ApexStorageImpl {
         let fields = dict_to_values(data)?;
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
+        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
 
         // Skip file lock for 'fast' durability — StorageEngine handles thread safety
         // internally via parking_lot::RwLock. File locks only needed for cross-process safety.
@@ -660,6 +724,7 @@ impl ApexStorageImpl {
 
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
+        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
 
         // Skip file lock for 'fast' durability
         let lock_file = if durability != DurabilityLevel::Fast {
@@ -855,6 +920,7 @@ impl ApexStorageImpl {
 
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
+        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
         let result = py.allow_threads(|| {
             crate::storage::engine::engine()
                 .write_typed(
@@ -904,6 +970,7 @@ impl ApexStorageImpl {
             }
         }
 
+        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
         let backend = self.get_backend_for_insert()?;
         if !backend.storage.is_v4_format() || backend.storage.has_constraints() {
             return Ok(None);
@@ -1099,6 +1166,7 @@ impl ApexStorageImpl {
             }
         }
 
+        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
         let backend = self.get_backend_for_insert()?;
 
         if !backend.storage.is_v4_format() || backend.storage.has_constraints() {
@@ -1386,6 +1454,7 @@ impl ApexStorageImpl {
 
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
+        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
 
         // Skip file lock for 'fast' durability
         let lock_file = if durability != DurabilityLevel::Fast {
@@ -1540,6 +1609,32 @@ impl ApexStorageImpl {
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
 
+        if id < 0 {
+            return Ok(false);
+        }
+
+        if durability == DurabilityLevel::Fast
+            && !self.table_has_secondary_indexes(&table_path, &table_name)
+        {
+            let backend = self.get_backend_for_overlay(&table_path, &table_name)?;
+            if !backend.storage.has_constraints() {
+                if backend.delete_pending_v4_in_memory_row(id as u64) {
+                    crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
+                    crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
+                    return Ok(true);
+                }
+
+                let result = backend
+                    .delta_delete_row(id as u64)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                if result {
+                    crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
+                    crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
+                }
+                return Ok(result);
+            }
+        }
+
         // Skip file lock for 'fast' durability
         let lock_file = if durability != DurabilityLevel::Fast {
             Some(
@@ -1575,6 +1670,35 @@ impl ApexStorageImpl {
 
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
+
+        if durability == DurabilityLevel::Fast
+            && !self.table_has_secondary_indexes(&table_path, &table_name)
+        {
+            let backend = self.get_backend_for_overlay(&table_path, &table_name)?;
+            if !backend.storage.has_constraints() {
+                let mut deleted = 0usize;
+                for id in &ids {
+                    if *id < 0 {
+                        continue;
+                    }
+                    if backend.delete_pending_v4_in_memory_row(*id as u64) {
+                        deleted += 1;
+                        continue;
+                    }
+                    if backend
+                        .delta_delete_row(*id as u64)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?
+                    {
+                        deleted += 1;
+                    }
+                }
+                if deleted > 0 {
+                    crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
+                    crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
+                }
+                return Ok(deleted > 0);
+            }
+        }
 
         // Skip file lock for 'fast' durability
         let lock_file = if durability != DurabilityLevel::Fast {
@@ -2922,6 +3046,13 @@ impl ApexStorageImpl {
 
     /// Close storage
     fn close(&self) -> PyResult<()> {
+        for entry in self.cached_backends.iter() {
+            let backend = entry.value();
+            if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+                let _ = backend.save();
+            }
+        }
+
         // Clear per-instance cached backends (releases per-instance references)
         self.cached_backends.clear();
         self.update_by_id_numeric_cache.clear();
@@ -2960,12 +3091,31 @@ impl ApexStorageImpl {
             None
         };
         if let Some(backend) = backend_opt {
+            let id_u64 = id as u64;
+            if id_u64 >= backend.next_id_value() {
+                return Ok(None);
+            }
             if backend.has_pending_deltas() {
                 // Pending UPDATE overlays are applied by the Arrow executor fallback below.
             } else {
+                if backend.pending_v4_in_memory_rows() > 0 {
+                    let vals_result =
+                        py.allow_threads(|| backend.storage.read_row_by_id_values(id_u64));
+                    return match vals_result {
+                        Ok(Some(vals)) => {
+                            let dict = PyDict::new_bound(py);
+                            for (k, v) in vals {
+                                dict.set_item(k, value_to_py(py, &v)?)?;
+                            }
+                            Ok(Some(dict.into()))
+                        }
+                        Ok(None) => Ok(None),
+                        Err(_) => Ok(None),
+                    };
+                }
                 // Release GIL for all Rust computation; re-acquire only for PyDict construction.
                 // retrieve_rcix: page-cached RCIX read, handles PLAIN/BITPACK/RLE/StringDict.
-                let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(id as u64));
+                let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(id_u64));
                 if let Ok(Some(vals)) = rcix_result {
                     let dict = PyDict::new_bound(py);
                     for (k, v) in vals {
@@ -2975,7 +3125,7 @@ impl ApexStorageImpl {
                 }
                 // Fallback: may need to (re)create mmap after save_v4 invalidation
                 let vals_result =
-                    py.allow_threads(|| backend.storage.read_row_by_id_values(id as u64));
+                    py.allow_threads(|| backend.storage.read_row_by_id_values(id_u64));
                 if let Ok(Some(vals)) = vals_result {
                     let dict = PyDict::new_bound(py);
                     for (k, v) in vals {
@@ -2984,7 +3134,7 @@ impl ApexStorageImpl {
                     return Ok(Some(dict.into()));
                 }
                 // Arrow batch cache path: O(1) index lookup + batch.slice(idx, 1)
-                let batch_result = py.allow_threads(|| backend.read_row_by_id_to_arrow(id as u64));
+                let batch_result = py.allow_threads(|| backend.read_row_by_id_to_arrow(id_u64));
                 if let Ok(Some(batch)) = batch_result {
                     if batch.num_rows() > 0 {
                         let dict = PyDict::new_bound(py);
@@ -3074,7 +3224,7 @@ impl ApexStorageImpl {
         let Some(backend) = backend_opt else {
             return Ok(None);
         };
-        if backend.has_pending_deltas() {
+        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
             return Ok(None);
         }
 
@@ -3138,7 +3288,7 @@ impl ApexStorageImpl {
         let Some(backend) = backend_opt else {
             return Ok(None);
         };
-        if backend.has_pending_deltas() {
+        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
             return Ok(None);
         }
 
@@ -3203,7 +3353,7 @@ impl ApexStorageImpl {
         let Some(backend) = backend_opt else {
             return Ok(None);
         };
-        if backend.has_pending_deltas() {
+        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
             return Ok(None);
         }
 
@@ -3614,6 +3764,54 @@ impl ApexStorageImpl {
         let table_path = self.get_current_table_path()?;
         let table_name = self.current_table.read().clone();
         let durability = self.durability;
+
+        if id < 0 {
+            return Ok(false);
+        }
+
+        if durability == DurabilityLevel::Fast
+            && !fields.is_empty()
+            && !self.table_has_secondary_indexes(&table_path, &table_name)
+        {
+            let backend = self.get_backend_for_overlay(&table_path, &table_name)?;
+            if !backend.storage.has_constraints() {
+                let schema = backend.storage.get_schema();
+                let schema_cols: std::collections::HashSet<&str> =
+                    schema.iter().map(|(name, _)| name.as_str()).collect();
+                let schema_supported = schema.iter().all(|(_, ty)| {
+                    use crate::storage::on_demand::ColumnType;
+                    !matches!(
+                        *ty,
+                        ColumnType::Binary
+                            | ColumnType::FixedList
+                            | ColumnType::Float16List
+                            | ColumnType::Null
+                    )
+                });
+                let exact_schema = fields.len() == schema_cols.len()
+                    && fields
+                        .keys()
+                        .all(|name| schema_cols.contains(name.as_str()));
+
+                if schema_supported && exact_schema {
+                    let result = py.allow_threads(|| {
+                        backend
+                            .delta_update_existing_row(id as u64, &fields)
+                            .map_err(|e| PyIOError::new_err(e.to_string()))
+                    })?;
+                    if result {
+                        crate::query::executor::cache_backend_pub(
+                            &table_path,
+                            Arc::clone(&backend),
+                        );
+                        crate::query::planner::invalidate_table_stats(
+                            &table_path.to_string_lossy(),
+                        );
+                    }
+                    return Ok(result);
+                }
+            }
+        }
 
         // Acquire exclusive write lock
         let lock_file =

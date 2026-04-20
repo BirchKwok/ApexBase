@@ -812,6 +812,50 @@ impl OnDemandStorage {
         }
     }
 
+    /// Delete an unflushed V4 memtable row in-place.
+    ///
+    /// This keeps the common OLTP pattern `insert -> delete same row` entirely
+    /// inside the warm insert backend instead of creating a DeltaStore delete
+    /// that the next append must persist before it can continue.
+    pub fn delete_pending_v4_in_memory_row(&self, id: u64) -> bool {
+        let pending = self.pending_v4_in_memory_rows();
+        if pending == 0 {
+            return false;
+        }
+
+        let ids = self.ids.read();
+        let ids_len = ids.len();
+        if ids_len == 0 {
+            return false;
+        }
+
+        let start = ids_len.saturating_sub(pending);
+        let Some(row_idx) = ids[start..]
+            .iter()
+            .position(|&row_id| row_id == id)
+            .map(|idx| start + idx)
+        else {
+            return false;
+        };
+        drop(ids);
+
+        let mut deleted = self.deleted.write();
+        let byte_idx = row_idx / 8;
+        let bit_idx = row_idx % 8;
+        if byte_idx >= deleted.len() {
+            deleted.resize(byte_idx + 1, 0);
+        }
+
+        let was_deleted = (deleted[byte_idx] >> bit_idx) & 1 == 1;
+        if was_deleted {
+            return false;
+        }
+
+        deleted[byte_idx] |= 1 << bit_idx;
+        self.active_count.fetch_sub(1, Ordering::Relaxed);
+        true
+    }
+
     /// Delete multiple rows by IDs (soft delete)
     /// Returns true if all rows were found and deleted
     pub fn delete_batch(&self, ids: &[u64]) -> bool {
@@ -2134,7 +2178,8 @@ impl OnDemandStorage {
     pub fn active_row_count(&self) -> u64 {
         let base_active = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
         let delta_rows = self.delta_row_count() as u64;
-        base_active + delta_rows
+        let pending_delta_deletes = self.delta_store.read().delete_count() as u64;
+        base_active.saturating_sub(pending_delta_deletes) + delta_rows
     }
 
     /// Drop a column from schema (logical delete - data stays but column is removed from schema)
@@ -2561,6 +2606,9 @@ impl OnDemandStorage {
                 self.nulls.write().clear();
                 self.deleted.write().clear();
                 *self.id_to_idx.write() = None;
+                if self.has_pending_deltas() {
+                    self.save_delta_store()?;
+                }
                 return Ok(());
             }
 
@@ -2569,6 +2617,9 @@ impl OnDemandStorage {
                 // Base data is NOT in memory — must NOT call save_v4() which would
                 // rewrite with empty data and lose everything.
                 // Instead, update just the footer schema on disk.
+                if self.has_pending_deltas() {
+                    self.save_delta_store()?;
+                }
                 return self.update_v4_footer_schema();
             }
 
@@ -4068,21 +4119,36 @@ impl OnDemandStorage {
         let rg_offset = footer_offset;
         let min_id = new_ids.iter().copied().min().unwrap_or(0);
         let max_id = new_ids.iter().copied().max().unwrap_or(0);
-        
+
         // Serialize RG body to buffer (IDs + deletion vector + columns)
         let null_bitmap_len = (rg_rows + 7) / 8;
+        let (delete_bitmap, deletion_count) = {
+            let deleted = self.deleted.read();
+            let mut bitmap = vec![0u8; null_bitmap_len];
+            let copy_len = deleted.len().min(null_bitmap_len);
+            if copy_len > 0 {
+                bitmap[..copy_len].copy_from_slice(&deleted[..copy_len]);
+            }
+            let count = (0..rg_rows)
+                .filter(|row_idx| {
+                    let byte_idx = row_idx / 8;
+                    let bit_idx = row_idx % 8;
+                    byte_idx < bitmap.len() && (bitmap[byte_idx] >> bit_idx) & 1 == 1
+                })
+                .count() as u32;
+            (bitmap, count)
+        };
         let mut body_buf: Vec<u8> = Vec::with_capacity(rg_rows * 8 + rg_rows * col_count);
         {
             let mut body_writer = std::io::Cursor::new(&mut body_buf);
-            
+
             // IDs
             for &id in new_ids {
                 body_writer.write_all(&id.to_le_bytes())?;
             }
-            
-            // Deletion vector (all zeros)
-            let del_vec_len = (rg_rows + 7) / 8;
-            body_writer.write_all(&vec![0u8; del_vec_len])?;
+
+            // Deletion vector for rows that were inserted and deleted before flush.
+            body_writer.write_all(&delete_bitmap)?;
             
             // Columns
             let mut new_rg_col_offsets: Vec<u32> = Vec::with_capacity(col_count);
@@ -4149,9 +4215,14 @@ impl OnDemandStorage {
             row_count: rg_rows as u32,
             min_id,
             max_id,
-            deletion_count: 0,
+            deletion_count,
         });
-        
+        let active_rows_after: u64 = footer
+            .row_groups
+            .iter()
+            .map(|rg| (rg.row_count as u64).saturating_sub(rg.deletion_count as u64))
+            .sum();
+
         // Write updated footer + trailer (footer_size + magic)
         let new_footer_offset = rg_end;
         let footer_bytes = footer.to_bytes();
@@ -4165,7 +4236,7 @@ impl OnDemandStorage {
         let writer_inner = writer.get_mut();
         {
             let mut header = self.header.write();
-            header.row_count = new_persisted;
+            header.row_count = active_rows_after;
             header.footer_offset = new_footer_offset;
             header.row_group_count = footer.row_groups.len() as u32;
         }

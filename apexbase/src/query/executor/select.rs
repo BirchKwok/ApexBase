@@ -342,7 +342,10 @@ impl ApexExecutor {
                     });
                     
                     if backend.pending_v4_in_memory_rows() > 0 {
-                        let col_refs = if has_scalar_subquery {
+                        let col_refs = if has_scalar_subquery
+                            || stmt.where_clause.is_some()
+                            || backend.has_pending_deltas()
+                        {
                             None
                         } else {
                             Self::get_col_refs(&stmt)

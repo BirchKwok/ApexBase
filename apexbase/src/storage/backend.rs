@@ -1044,6 +1044,37 @@ impl TableStorageBackend {
         self.storage.delta_update_row(row_id, values);
     }
 
+    /// Record a row deletion in DeltaStore without rewriting the base file.
+    pub fn delta_delete_row(&self, row_id: u64) -> io::Result<bool> {
+        let result = self.storage.delta_delete_row(row_id)?;
+        if result {
+            *self.dirty.write() = true;
+        }
+        Ok(result)
+    }
+
+    /// Mark an unflushed V4 memtable row deleted without creating DeltaStore work.
+    pub fn delete_pending_v4_in_memory_row(&self, row_id: u64) -> bool {
+        let result = self.storage.delete_pending_v4_in_memory_row(row_id);
+        if result {
+            *self.dirty.write() = true;
+        }
+        result
+    }
+
+    /// Record a full-row replacement in DeltaStore for an existing row.
+    pub fn delta_update_existing_row(
+        &self,
+        row_id: u64,
+        values: &std::collections::HashMap<String, crate::data::Value>,
+    ) -> io::Result<bool> {
+        let result = self.storage.delta_update_existing_row(row_id, values)?;
+        if result {
+            *self.dirty.write() = true;
+        }
+        Ok(result)
+    }
+
     /// Batch update multiple rows in a single lock acquisition.
     pub fn delta_batch_update_rows(&self, batch: &[(u64, &str, crate::data::Value)]) {
         self.storage.delta_batch_update_rows(batch);

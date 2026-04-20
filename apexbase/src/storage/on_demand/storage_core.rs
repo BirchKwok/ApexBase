@@ -748,6 +748,49 @@ impl OnDemandStorage {
         self.delta_store.write().update_row(row_id, values);
     }
 
+    fn row_active_for_delta_overlay(&self, row_id: u64) -> io::Result<bool> {
+        if row_id >= self.next_id.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(false);
+        }
+        if self.delta_store.read().is_deleted(row_id) {
+            return Ok(false);
+        }
+
+        match self.row_id_active_rcix(row_id)? {
+            Some(true) => Ok(true),
+            Some(false) => {
+                if self.pending_v4_in_memory_rows() == 0 {
+                    Ok(false)
+                } else {
+                    Ok(self.exists(row_id))
+                }
+            }
+            None => Ok(self.exists(row_id)),
+        }
+    }
+
+    /// Record a row deletion in the delta store without rewriting the base file.
+    pub fn delta_delete_row(&self, row_id: u64) -> io::Result<bool> {
+        if !self.row_active_for_delta_overlay(row_id)? {
+            return Ok(false);
+        }
+        self.delta_store.write().delete_row(row_id);
+        Ok(true)
+    }
+
+    /// Record a full-row replacement in the delta store for an existing row.
+    pub fn delta_update_existing_row(
+        &self,
+        row_id: u64,
+        values: &HashMap<String, crate::data::Value>,
+    ) -> io::Result<bool> {
+        if !self.row_active_for_delta_overlay(row_id)? {
+            return Ok(false);
+        }
+        self.delta_store.write().update_row(row_id, values);
+        Ok(true)
+    }
+
     /// Batch update multiple rows in a single lock acquisition.
     /// `batch` is a slice of (row_id, col_name, new_value) triples.
     pub fn delta_batch_update_rows(&self, batch: &[(u64, &str, crate::data::Value)]) {

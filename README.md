@@ -535,44 +535,67 @@ Read benchmarks materialize full results for fairness; ID lookups use shared det
 
 | Query | ApexBase | SQLite | DuckDB | vs Best Other |
 |-------|----------|--------|--------|---------------|
-| Bulk Insert (1M rows) | 271.99ms | 971.89ms | 168.06s | **3.6x faster** |
-| COUNT(\*) | 0.099ms | 7.41ms | 0.531ms | **5.4x faster** |
-| SELECT \* LIMIT 100 [cold] | 0.053ms | 0.118ms | 0.519ms | **2.2x faster** |
-| SELECT \* LIMIT 100 [warm] | 0.045ms | 0.109ms | 0.251ms | **2.4x faster** |
-| SELECT \* LIMIT 10K [cold] | 4.30ms | 11.46ms | 7.75ms | **1.8x faster** |
-| SELECT \* LIMIT 10K [warm] | 4.19ms | 11.24ms | 7.51ms | **1.8x faster** |
-| Filter (name = 'user\_5000') | 0.145ms | 38.31ms | 1.62ms | **11.2x faster** |
-| Filter (age BETWEEN 25 AND 35) | 92.08ms | 251.54ms | 152.96ms | **1.7x faster** |
-| GROUP BY city (10 groups) | 0.143ms | 340.39ms | 3.05ms | **21.3x faster** |
-| GROUP BY + HAVING | 0.153ms | 344.71ms | 3.26ms | **21.3x faster** |
-| ORDER BY score LIMIT 100 | 0.259ms | 49.41ms | 4.67ms | **18.0x faster** |
-| Aggregation (5 funcs) | 0.221ms | 80.42ms | 1.19ms | **5.4x faster** |
-| Complex (Filter+Group+Order) | 0.155ms | 159.86ms | 2.43ms | **15.7x faster** |
-| Point Lookup (SQL by ID) | 0.035ms | 0.060ms | 2.86ms | **1.7x faster** |
-| Retrieve Many (SQL, 100 IDs) | 0.252ms | 0.296ms | 4.39ms | **1.2x faster** |
-| Insert 1K rows | 0.606ms | 1.57ms | 161.47ms | **2.6x faster** |
-| SELECT \* -> pandas (full scan) | 21.89ms | 1.32s | 204.00ms | **9.3x faster** |
-| GROUP BY city,category (100 grp) | 0.172ms | 656.99ms | 4.77ms | **27.7x faster** |
-| LIKE filter (name LIKE user\_1%) | 64.79ms | 182.67ms | 90.72ms | **1.4x faster** |
-| Multi-cond (age>30 AND score>50) | 216.25ms | 541.55ms | 331.96ms | **1.5x faster** |
-| ORDER BY city,score DESC LIMIT100 | 0.259ms | 67.60ms | 7.16ms | **27.6x faster** |
-| COUNT(DISTINCT city) | 0.136ms | 86.96ms | 4.49ms | **33.0x faster** |
-| IN filter (city IN 3 cities) | 140.89ms | 460.42ms | 257.56ms | **1.8x faster** |
-| Numeric IN (age IN 9 values) | 81.46ms | 253.54ms | 136.99ms | **1.7x faster** |
-| OR cross-col (age=25 OR city=BJ) | 44.23ms | 205.04ms | 105.69ms | **2.4x faster** |
-| Numeric OR (age=20\|30\|40\|50) | 42.00ms | 130.97ms | 60.34ms | **1.4x faster** |
-| UPDATE rows (age=25, idempotent) | 7.66ms | 36.61ms | 14.30ms | **1.9x faster** |
-| Store+DELETE 1K (combined) | 0.940ms | 33.72ms | 169.30ms | **35.9x faster** |
-| DELETE 1K [pure delete only] | 0.129ms | 31.85ms | 0.413ms | **3.2x faster** |
-| Window ROW\_NUMBER PARTITION BY city | 0.645ms | 492.43ms | 52.19ms | **80.9x faster** |
-| FTS Index Build (name,city,category) | 642.49ms | 1.46s | 1.08s | **1.7x faster** |
-| FTS Search ('Electronics') | 0.151ms | 28.59ms | 23.96ms | **159x faster** |
-| Single-threaded Q/s | 10205.4 Q/s | 6.5 Q/s | 610.5 Q/s | **16.7x faster** |
-| Concurrent Q/s (4 threads) | 12776.4 Q/s | 23.4 Q/s | 1134.3 Q/s | **11.3x faster** |
+| Bulk Insert (1M rows) | 284.47ms | 1.02s | 173.26s | **3.6x faster** |
+| COUNT(\*) | 0.100ms | 7.69ms | 0.525ms | **5.3x faster** |
+| SELECT \* LIMIT 100 [cold] | 0.051ms | 0.131ms | 0.560ms | **2.6x faster** |
+| SELECT \* LIMIT 100 [warm] | 0.049ms | 0.114ms | 0.253ms | **2.3x faster** |
+| SELECT \* LIMIT 10K [cold] | 4.34ms | 11.72ms | 7.63ms | **1.8x faster** |
+| SELECT \* LIMIT 10K [warm] | 4.18ms | 14.53ms | 7.46ms | **1.8x faster** |
+| Filter (name = 'user\_5000') | 0.167ms | 40.25ms | 1.68ms | **10.1x faster** |
+| Filter (age BETWEEN 25 AND 35) | 87.05ms | 266.51ms | 153.01ms | **1.8x faster** |
+| GROUP BY city (10 groups) | 0.147ms | 346.19ms | 2.94ms | **20.0x faster** |
+| GROUP BY + HAVING | 0.161ms | 348.49ms | 3.07ms | **19.1x faster** |
+| ORDER BY score LIMIT 100 | 0.255ms | 49.36ms | 4.72ms | **18.5x faster** |
+| Aggregation (5 funcs) | 0.224ms | 82.64ms | 1.20ms | **5.4x faster** |
+| Complex (Filter+Group+Order) | 0.147ms | 167.85ms | 2.55ms | **17.3x faster** |
+| Point Lookup (SQL by ID) | 0.036ms | 0.056ms | 3.31ms | **1.6x faster** |
+| Retrieve Many (SQL, 100 IDs) | 0.235ms | 0.297ms | 4.19ms | **1.3x faster** |
+| Insert 1K rows | 0.739ms | 1.59ms | 166.71ms | **2.2x faster** |
+| SELECT \* -> pandas (full scan) | 22.13ms | 1.32s | 206.87ms | **9.3x faster** |
+| GROUP BY city,category (100 grp) | 0.174ms | 667.02ms | 4.58ms | **26.3x faster** |
+| LIKE filter (name LIKE user\_1%) | 62.29ms | 183.95ms | 88.35ms | **1.4x faster** |
+| Multi-cond (age>30 AND score>50) | 216.02ms | 548.51ms | 331.58ms | **1.5x faster** |
+| ORDER BY city,score DESC LIMIT100 | 0.248ms | 67.93ms | 6.69ms | **27.0x faster** |
+| COUNT(DISTINCT city) | 0.161ms | 87.08ms | 3.75ms | **23.3x faster** |
+| IN filter (city IN 3 cities) | 145.13ms | 466.45ms | 257.02ms | **1.8x faster** |
+| Numeric IN (age IN 9 values) | 79.85ms | 255.46ms | 134.37ms | **1.7x faster** |
+| OR cross-col (age=25 OR city=BJ) | 43.70ms | 207.97ms | 104.82ms | **2.4x faster** |
+| Numeric OR (age=20\|30\|40\|50) | 42.79ms | 132.25ms | 61.17ms | **1.4x faster** |
+| UPDATE rows (age=25, idempotent) | 7.67ms | 36.93ms | 14.49ms | **1.9x faster** |
+| Store+DELETE 1K (combined) | 1.05ms | 33.75ms | 189.45ms | **32.1x faster** |
+| DELETE 1K [pure delete only] | 0.133ms | 33.48ms | 0.393ms | **3.0x faster** |
+| Window ROW\_NUMBER PARTITION BY city | 0.641ms | 510.78ms | 41.04ms | **64.0x faster** |
+| FTS Index Build (name,city,category) | 663.57ms | 1.53s | 1.07s | **1.6x faster** |
+| FTS Search ('Electronics') | 0.161ms | 28.27ms | 24.10ms | **150x faster** |
+| Single-threaded Q/s | 10092.1 Q/s | 6.5 Q/s | 601.8 Q/s | **16.8x faster** |
+| Concurrent Q/s (4 threads) | 12948.3 Q/s | 23.7 Q/s | 1095.3 Q/s | **11.8x faster** |
 
 **Summary**: ApexBase wins 32/32 benchmarks. "Cold" = fresh DB open per iteration; "warm" = cached backend.
 
 Q/s uses a scan-heavy mixed workload: COUNT + two full-table GROUP BY scans + filtered LIMIT 100, materialized to Python rows.
+
+### OLTP Microbenchmarks
+
+The default OLTP table uses already-loaded 1M-row tables and measures short operations on each engine's normal fast-profile client path. Read cases materialize Python rows; write cases may mutate the table between iterations. These microbenchmarks are diagnostic and are not included in the 32/32 OLAP+HTAP fair summary above.
+
+| Operation | ApexBase | SQLite | DuckDB | vs Best Other |
+|-----------|----------|--------|--------|---------------|
+| COUNT(\*) direct | 7.93us | 7.77ms | 0.337ms | **42.5x faster** |
+| Point lookup projected | 2.69us | 3.72us | 2.25ms | **1.4x faster** |
+| Direct lookup full row | 1.72us | 4.13us | 3.17ms | **2.4x faster** |
+| Missing ID lookup | 0.59us | 2.74us | 2.45ms | **4.6x faster** |
+| Retrieve 10 projected | 0.011ms | 0.014ms | 3.40ms | **1.3x faster** |
+| Retrieve 100 projected | 0.047ms | 0.106ms | 3.58ms | **2.3x faster** |
+| SELECT 3 cols LIMIT 100 | 0.037ms | 0.080ms | 0.230ms | **2.2x faster** |
+| String equality projected | 0.096ms | 39.82ms | 1.38ms | **14.4x faster** |
+| Insert 1 row | 0.012ms | 0.016ms | 0.358ms | **1.3x faster** |
+| Insert+Read own row | 0.014ms | 0.022ms | 3.86ms | **1.6x faster** |
+| Insert+COUNT visible | 0.016ms | 7.64ms | 0.813ms | **50.8x faster** |
+| UPDATE by ID | 4.20us | 4.84us | 0.719ms | **1.2x faster** |
+| Replace row by ID | 0.011ms | 5.50us | 0.795ms | **2.0x slower** |
+| Insert+DELETE by ID | 0.014ms | 0.024ms | 1.08ms | **1.7x faster** |
+
+Current OLTP profile: reads, same-client fast inserts, insert-read visibility, count-visible appends, and single-row delete are strong. The previous large-table `replace/delete_one` cliff has been removed for `durability="fast"` by routing exact-schema replace and single-row delete through a DeltaStore overlay that SQL reads honor immediately and `flush()` / `close()` persist. The remaining short-operation gap is exact-schema row replacement, which is now microsecond-level but still about 2x slower than SQLite's in-place UPDATE path because it pays overlay bookkeeping and Python/Rust API overhead. Durable-per-operation writes remain a separate profile because they intentionally force persistence each timed operation.
 
 ### OLTP Write Visibility
 
@@ -589,12 +612,12 @@ The cross-engine table above keeps result materialization comparable across engi
 
 | Query | to_dict | to_arrow | to_pandas | Arrow vs dict | Shape |
 |-------|---------|----------|-----------|---------------|-------|
-| Point Lookup | 0.037ms | 0.163ms | 0.388ms | 4.4x slower | 1x6 |
-| SELECT \* LIMIT 10K | 4.44ms | 3.53ms | 6.41ms | 1.3x faster | 10000x6 |
-| IN filter (city IN 3) | 136.65ms | 98.92ms | 182.17ms | 1.4x faster | 300321x6 |
-| Multi-cond filter | 209.93ms | 157.21ms | 268.80ms | 1.3x faster | 396569x6 |
-| GROUP BY city | 0.147ms | 0.219ms | 0.391ms | 1.5x slower | 10x3 |
-| Full scan | 2.19s | 22.06ms | 23.95ms | 99.3x faster | 1000000x6 |
+| Point Lookup | 0.035ms | 0.146ms | 0.362ms | 4.1x slower | 1x6 |
+| SELECT \* LIMIT 10K | 4.40ms | 3.65ms | 6.74ms | 1.2x faster | 10000x6 |
+| IN filter (city IN 3) | 137.65ms | 98.13ms | 183.51ms | 1.4x faster | 300321x6 |
+| Multi-cond filter | 214.53ms | 161.92ms | 268.41ms | 1.3x faster | 396569x6 |
+| GROUP BY city | 0.150ms | 0.234ms | 0.703ms | 1.6x slower | 10x3 |
+| Full scan | 2.17s | 21.14ms | 23.11ms | 102.9x faster | 1000000x6 |
 
 For tiny one-row results, `to_dict()` can be faster because Python object creation is minimal. For large scans and filters, `to_arrow()` avoids row-dict materialization and exposes ApexBase's Arrow-native path.
 
