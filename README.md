@@ -595,8 +595,6 @@ The default OLTP table uses already-loaded 1M-row tables and measures short oper
 | Replace row by ID | 0.011ms | 5.50us | 0.795ms | **2.0x slower** |
 | Insert+DELETE by ID | 0.014ms | 0.024ms | 1.08ms | **1.7x faster** |
 
-Current OLTP profile: reads, same-client fast inserts, insert-read visibility, count-visible appends, and single-row delete are strong. The previous large-table `replace/delete_one` cliff has been removed for `durability="fast"` by routing exact-schema replace and single-row delete through a DeltaStore overlay that SQL reads honor immediately and `flush()` / `close()` persist. The remaining short-operation gap is exact-schema row replacement, which is now microsecond-level but still about 2x slower than SQLite's in-place UPDATE path because it pays overlay bookkeeping and Python/Rust API overhead. Durable-per-operation writes remain a separate profile because they intentionally force persistence each timed operation.
-
 ### OLTP Write Visibility
 
 ApexBase has two fast paths for frequent single-row appends:
