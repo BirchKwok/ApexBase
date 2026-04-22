@@ -2803,6 +2803,8 @@ impl OnDemandStorage {
         
         // Close file handle
         *self.file.write() = None;
+        *self.write_file.write() = None;
+        *self.delta_file.write() = None;
         
         Ok(())
     }
@@ -2851,4 +2853,3 @@ impl Drop for OnDemandStorage {
         }));
     }
 }
-

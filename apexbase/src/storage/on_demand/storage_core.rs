@@ -4,8 +4,12 @@
 // On-Demand Storage Engine
 // ============================================================================
 
+const SYNC_PENDING_MAIN: u8 = 0b001;
+const SYNC_PENDING_DELTA: u8 = 0b010;
+const SYNC_PENDING_DELTASTORE: u8 = 0b100;
+
 /// High-performance on-demand columnar storage
-/// 
+///
 /// Key features:
 /// - Read only required columns (column projection)
 /// - Read only required row ranges  
@@ -15,6 +19,8 @@
 pub struct OnDemandStorage {
     path: PathBuf,
     file: RwLock<Option<File>>,
+    write_file: RwLock<Option<File>>,
+    delta_file: RwLock<Option<File>>,
     /// Memory-mapped file cache for fast repeated reads
     mmap_cache: RwLock<MmapCache>,
     header: RwLock<OnDemandHeader>,
@@ -65,6 +71,8 @@ pub struct OnDemandStorage {
     /// Tracks pending UPDATE changes without rewriting the base file.
     /// On read, DeltaMerger overlays these changes on top of base data.
     delta_store: RwLock<DeltaStore>,
+    /// Bitmask of files that were written directly to disk and still need fsync.
+    sync_pending: AtomicU8,
     /// Row Group body compression algorithm. Default: None (no compression).
     /// Persisted in header flags bits 0-1. Can only be set on empty tables.
     compression: std::sync::atomic::AtomicU8,
@@ -97,15 +105,17 @@ pub struct OnDemandStorage {
     pub(crate) global_lock: parking_lot::RwLock<()>,
 }
 
-
 impl OnDemandStorage {
     /// Create a new storage file with default durability (Fast)
     pub fn create(path: &Path) -> io::Result<Self> {
         Self::create_with_durability(path, super::DurabilityLevel::Fast)
     }
-    
+
     /// Create a new storage file with specified durability level
-    pub fn create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+    pub fn create_with_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+    ) -> io::Result<Self> {
         Self::create_with_schema_and_durability(path, durability, &[])
     }
 
@@ -133,7 +143,10 @@ impl OnDemandStorage {
         // Initialize WAL for safe/max durability modes
         let wal_writer = if durability != super::DurabilityLevel::Fast {
             let wal_path = Self::wal_path(path);
-            Some(super::incremental::WalWriter::create(&wal_path, crate::storage::FIRST_ROW_ID)?)
+            Some(super::incremental::WalWriter::create(
+                &wal_path,
+                crate::storage::FIRST_ROW_ID,
+            )?)
         } else {
             None
         };
@@ -141,6 +154,8 @@ impl OnDemandStorage {
         let storage = Self {
             path: path.to_path_buf(),
             file: RwLock::new(None),
+            write_file: RwLock::new(None),
+            delta_file: RwLock::new(None),
             mmap_cache: RwLock::new(MmapCache::new()),
             header: RwLock::new(header),
             schema: RwLock::new(schema),
@@ -163,6 +178,7 @@ impl OnDemandStorage {
             cached_footer_offset: AtomicU64::new(0),
             v4_footer: RwLock::new(None),
             delta_store: RwLock::new(DeltaStore::new(path)),
+            sync_pending: AtomicU8::new(0),
             compression: std::sync::atomic::AtomicU8::new(CompressionType::None as u8),
             page_cache: RwLock::new(HashMap::new()),
             scan_buf: std::sync::Mutex::new(Vec::new()),
@@ -179,11 +195,12 @@ impl OnDemandStorage {
 
         Ok(storage)
     }
-    
+
     /// Get WAL file path for a given data file path
     fn wal_path(main_path: &Path) -> PathBuf {
         let mut wal_path = main_path.to_path_buf();
-        let ext = wal_path.extension()
+        let ext = wal_path
+            .extension()
             .map(|e| format!("{}.wal", e.to_string_lossy()))
             .unwrap_or_else(|| "wal".to_string());
         wal_path.set_extension(ext);
@@ -194,10 +211,13 @@ impl OnDemandStorage {
     pub fn open(path: &Path) -> io::Result<Self> {
         Self::open_with_durability(path, super::DurabilityLevel::Fast)
     }
-    
+
     /// Open existing storage with specified durability level
     /// Uses mmap for fast zero-copy reads with OS page cache
-    pub fn open_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+    pub fn open_with_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+    ) -> io::Result<Self> {
         // Clean up stale .tmp files from crashed atomic writes
         let tmp_path = path.with_extension("apex.tmp");
         if tmp_path.exists() {
@@ -206,7 +226,11 @@ impl OnDemandStorage {
         // Clean up stale .deltastore.tmp from crashed DeltaStore save
         let ds_tmp = {
             let mut p = path.to_path_buf();
-            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             p.set_file_name(format!("{}.deltastore.tmp", name));
             p
         };
@@ -215,23 +239,26 @@ impl OnDemandStorage {
         }
         // Apply any deferred delete state before reading the file
         let _ = apply_pending_deletes(path);
-        
+
         let file = open_for_sequential_read(path)?;
-        
+
         // Create mmap cache and use it for initial reads
         let mut mmap_cache = MmapCache::new();
-        
+
         // Read header using mmap (zero-copy)
         let mut header_bytes = [0u8; HEADER_SIZE];
         mmap_cache.read_at(&file, &mut header_bytes, 0)?;
         let header = OnDemandHeader::from_bytes(&header_bytes)?;
-        
+
         if header.footer_offset == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Unsupported legacy file format (V3). Please re-create the table."));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unsupported legacy file format (V3). Please re-create the table.",
+            ));
         }
-        
+
         let id_count = header.row_count as usize;
-        
+
         // V4 Row Group format: read schema from footer
         let file_len = file.metadata()?.len();
         let footer_byte_count = (file_len - header.footer_offset) as usize;
@@ -241,7 +268,9 @@ impl OnDemandStorage {
         let schema = footer.schema.clone();
         let column_index: Vec<ColumnIndexEntry> = Vec::new();
         // Use max_id from non-empty RG metadata (row_count may be < max _id after deletes)
-        let next_id = footer.row_groups.iter()
+        let next_id = footer
+            .row_groups
+            .iter()
             .filter(|rg| rg.row_count > 0)
             .map(|rg| rg.max_id)
             .max()
@@ -249,7 +278,9 @@ impl OnDemandStorage {
             .unwrap_or(crate::storage::FIRST_ROW_ID);
         let cached_v4_footer: Option<V4Footer> = Some(footer);
 
-        let columns: Vec<ColumnData> = schema.columns.iter()
+        let columns: Vec<ColumnData> = schema
+            .columns
+            .iter()
             .map(|(_, col_type)| ColumnData::new(*col_type))
             .collect();
         let nulls = vec![Vec::new(); header.column_count as usize];
@@ -258,69 +289,80 @@ impl OnDemandStorage {
 
         // Handle WAL recovery and initialization for safe/max durability
         let wal_path = Self::wal_path(path);
-        let (wal_writer, wal_buffer, recovered_next_id) = if durability != super::DurabilityLevel::Fast {
-            if wal_path.exists() {
-                // Replay WAL for crash recovery
-                let mut reader = super::incremental::WalReader::open(&wal_path)?;
-                let all_records = reader.read_all()?;
-                
-                // P0-3: Collect committed txn_ids for recovery filtering
-                let committed_txns: std::collections::HashSet<u64> = all_records.iter()
-                    .filter_map(|r| match r {
-                        super::incremental::WalRecord::TxnCommit { txn_id } => Some(*txn_id),
-                        _ => None,
-                    })
-                    .collect();
-                
-                // Filter: keep only auto-commit (txn_id=0) and committed txn DML records
-                // ALSO: idempotency guard — skip Insert/BatchInsert records whose IDs
-                // are already in the base file (id < next_id). This prevents duplicate
-                // rows if WAL is replayed after the base file was already saved.
-                let base_next_id = next_id; // next_id from base file before WAL recovery
-                let records: Vec<_> = all_records.into_iter().filter(|r| {
-                    match r {
-                        super::incremental::WalRecord::Insert { txn_id, id, .. } => {
-                            (*txn_id == 0 || committed_txns.contains(txn_id))
-                                && *id >= base_next_id // Skip if already persisted
-                        }
-                        super::incremental::WalRecord::BatchInsert { txn_id, start_id, rows, .. } => {
-                            let end_id = *start_id + rows.len() as u64;
-                            (*txn_id == 0 || committed_txns.contains(txn_id))
-                                && end_id > base_next_id // Keep if any rows are new
-                        }
-                        super::incremental::WalRecord::Delete { txn_id, id, .. } => {
-                            (*txn_id == 0 || committed_txns.contains(txn_id))
-                                && *id < base_next_id // Only delete rows that exist in base
-                        }
-                        _ => true, // Keep checkpoints, txn boundaries
-                    }
-                }).collect();
-                
-                // Find max ID from WAL records (handles both Insert and BatchInsert)
-                let max_wal_id = records.iter().filter_map(|r| {
-                    match r {
-                        super::incremental::WalRecord::Insert { id, .. } => Some(*id),
-                        super::incremental::WalRecord::BatchInsert { start_id, rows, .. } => {
-                            Some(*start_id + rows.len() as u64 - 1)
-                        }
-                        _ => None,
-                    }
-                }).max();
-                
-                let recovered_id = max_wal_id.map(|id| id + 1).unwrap_or(next_id);
-                
-                // Open for append
-                let writer = super::incremental::WalWriter::open(&wal_path)?;
-                (Some(writer), records, recovered_id)
+        let (wal_writer, wal_buffer, recovered_next_id) =
+            if durability != super::DurabilityLevel::Fast {
+                if wal_path.exists() {
+                    // Replay WAL for crash recovery
+                    let mut reader = super::incremental::WalReader::open(&wal_path)?;
+                    let all_records = reader.read_all()?;
+
+                    // P0-3: Collect committed txn_ids for recovery filtering
+                    let committed_txns: std::collections::HashSet<u64> = all_records
+                        .iter()
+                        .filter_map(|r| match r {
+                            super::incremental::WalRecord::TxnCommit { txn_id } => Some(*txn_id),
+                            _ => None,
+                        })
+                        .collect();
+
+                    // Filter: keep only auto-commit (txn_id=0) and committed txn DML records
+                    // ALSO: idempotency guard — skip Insert/BatchInsert records whose IDs
+                    // are already in the base file (id < next_id). This prevents duplicate
+                    // rows if WAL is replayed after the base file was already saved.
+                    let base_next_id = next_id; // next_id from base file before WAL recovery
+                    let records: Vec<_> = all_records
+                        .into_iter()
+                        .filter(|r| {
+                            match r {
+                                super::incremental::WalRecord::Insert { txn_id, id, .. } => {
+                                    (*txn_id == 0 || committed_txns.contains(txn_id))
+                                        && *id >= base_next_id // Skip if already persisted
+                                }
+                                super::incremental::WalRecord::BatchInsert {
+                                    txn_id,
+                                    start_id,
+                                    rows,
+                                    ..
+                                } => {
+                                    let end_id = *start_id + rows.len() as u64;
+                                    (*txn_id == 0 || committed_txns.contains(txn_id))
+                                        && end_id > base_next_id // Keep if any rows are new
+                                }
+                                super::incremental::WalRecord::Delete { txn_id, id, .. } => {
+                                    (*txn_id == 0 || committed_txns.contains(txn_id))
+                                        && *id < base_next_id // Only delete rows that exist in base
+                                }
+                                _ => true, // Keep checkpoints, txn boundaries
+                            }
+                        })
+                        .collect();
+
+                    // Find max ID from WAL records (handles both Insert and BatchInsert)
+                    let max_wal_id = records
+                        .iter()
+                        .filter_map(|r| match r {
+                            super::incremental::WalRecord::Insert { id, .. } => Some(*id),
+                            super::incremental::WalRecord::BatchInsert {
+                                start_id, rows, ..
+                            } => Some(*start_id + rows.len() as u64 - 1),
+                            _ => None,
+                        })
+                        .max();
+
+                    let recovered_id = max_wal_id.map(|id| id + 1).unwrap_or(next_id);
+
+                    // Open for append
+                    let writer = super::incremental::WalWriter::open(&wal_path)?;
+                    (Some(writer), records, recovered_id)
+                } else {
+                    // Create new WAL
+                    let writer = super::incremental::WalWriter::create(&wal_path, next_id)?;
+                    (Some(writer), Vec::new(), next_id)
+                }
             } else {
-                // Create new WAL
-                let writer = super::incremental::WalWriter::create(&wal_path, next_id)?;
-                (Some(writer), Vec::new(), next_id)
-            }
-        } else {
-            (None, Vec::new(), next_id)
-        };
-        
+                (None, Vec::new(), next_id)
+            };
+
         let final_next_id = recovered_next_id.max(next_id);
         let cached_fo = header.footer_offset;
 
@@ -330,28 +372,29 @@ impl OnDemandStorage {
         Ok(Self {
             path: path.to_path_buf(),
             file: RwLock::new(Some(file)),
+            write_file: RwLock::new(None),
+            delta_file: RwLock::new(None),
             mmap_cache: RwLock::new(mmap_cache),
             header: RwLock::new(header),
             schema: RwLock::new(schema),
             column_index: RwLock::new(column_index),
             columns: RwLock::new(columns),
-            ids: RwLock::new(Vec::new()),  // Empty - lazy loaded when needed
+            ids: RwLock::new(Vec::new()), // Empty - lazy loaded when needed
             next_id: AtomicU64::new(final_next_id),
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(deleted),
-            id_to_idx: RwLock::new(None),  // Lazy loaded when needed
-            active_count: AtomicU64::new(
-                if let Some(ref f) = cached_v4_footer {
-                    // Footer already loaded: derive active count from per-RG metadata.
-                    // Allows DELETE to skip header pwrite while fresh backends still get
-                    // the correct count (footer.deletion_count is always kept in sync).
-                    f.row_groups.iter()
-                        .map(|rg| (rg.row_count as u64).saturating_sub(rg.deletion_count as u64))
-                        .sum::<u64>()
-                } else {
-                    id_count as u64
-                }
-            ),
+            id_to_idx: RwLock::new(None), // Lazy loaded when needed
+            active_count: AtomicU64::new(if let Some(ref f) = cached_v4_footer {
+                // Footer already loaded: derive active count from per-RG metadata.
+                // Allows DELETE to skip header pwrite while fresh backends still get
+                // the correct count (footer.deletion_count is always kept in sync).
+                f.row_groups
+                    .iter()
+                    .map(|rg| (rg.row_count as u64).saturating_sub(rg.deletion_count as u64))
+                    .sum::<u64>()
+            } else {
+                id_count as u64
+            }),
             durability,
             wal_writer: RwLock::new(wal_writer),
             wal_buffer: RwLock::new(wal_buffer),
@@ -362,7 +405,10 @@ impl OnDemandStorage {
             v4_base_loaded: AtomicBool::new(false),
             cached_footer_offset: AtomicU64::new(cached_fo),
             v4_footer: RwLock::new(cached_v4_footer),
-            delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
+            delta_store: RwLock::new(
+                DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path)),
+            ),
+            sync_pending: AtomicU8::new(0),
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
             page_cache: RwLock::new(HashMap::new()),
             scan_buf: std::sync::Mutex::new(Vec::new()),
@@ -374,15 +420,11 @@ impl OnDemandStorage {
             global_lock: parking_lot::RwLock::new(()),
         })
     }
-    
+
     /// Open for reading only, reusing a pre-opened File and known file_len.
     /// Skips DeltaStore::load (saves 1 stat syscall) and internal File::open (saves 1 open syscall).
     /// For pure read paths only — DeltaStore is initialized empty (no pending updates).
-    pub fn open_for_read_with_file(
-        path: &Path,
-        file: File,
-        file_len: u64,
-    ) -> io::Result<Self> {
+    pub fn open_for_read_with_file(path: &Path, file: File, file_len: u64) -> io::Result<Self> {
         // Apply pending delete state before creating the mmap so reads see fresh data
         let _ = apply_pending_deletes(path);
         let mut mmap_cache = MmapCache::new();
@@ -392,9 +434,12 @@ impl OnDemandStorage {
         let header = OnDemandHeader::from_bytes(&header_bytes)?;
 
         if header.footer_offset == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Unsupported legacy file format (V3). Please re-create the table."));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unsupported legacy file format (V3). Please re-create the table.",
+            ));
         }
-        
+
         let id_count = header.row_count as usize;
         let footer_byte_count = (file_len - header.footer_offset) as usize;
         let mut footer_bytes = vec![0u8; footer_byte_count];
@@ -402,7 +447,9 @@ impl OnDemandStorage {
         let footer = V4Footer::from_bytes(&footer_bytes)?;
         let schema = footer.schema.clone();
         let column_index: Vec<ColumnIndexEntry> = Vec::new();
-        let next_id = footer.row_groups.iter()
+        let next_id = footer
+            .row_groups
+            .iter()
             .filter(|rg| rg.row_count > 0)
             .map(|rg| rg.max_id)
             .max()
@@ -410,7 +457,9 @@ impl OnDemandStorage {
             .unwrap_or(crate::storage::FIRST_ROW_ID);
         let cached_v4_footer: Option<V4Footer> = Some(footer);
 
-        let columns: Vec<ColumnData> = schema.columns.iter()
+        let columns: Vec<ColumnData> = schema
+            .columns
+            .iter()
             .map(|(_, col_type)| ColumnData::new(*col_type))
             .collect();
         let nulls = vec![Vec::new(); header.column_count as usize];
@@ -422,6 +471,8 @@ impl OnDemandStorage {
         Ok(Self {
             path: path.to_path_buf(),
             file: RwLock::new(Some(file)),
+            write_file: RwLock::new(None),
+            delta_file: RwLock::new(None),
             mmap_cache: RwLock::new(mmap_cache),
             header: RwLock::new(header),
             schema: RwLock::new(schema),
@@ -432,15 +483,14 @@ impl OnDemandStorage {
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(deleted),
             id_to_idx: RwLock::new(None),
-            active_count: AtomicU64::new(
-                if let Some(ref f) = cached_v4_footer {
-                    f.row_groups.iter()
-                        .map(|rg| (rg.row_count as u64).saturating_sub(rg.deletion_count as u64))
-                        .sum::<u64>()
-                } else {
-                    id_count as u64
-                }
-            ),
+            active_count: AtomicU64::new(if let Some(ref f) = cached_v4_footer {
+                f.row_groups
+                    .iter()
+                    .map(|rg| (rg.row_count as u64).saturating_sub(rg.deletion_count as u64))
+                    .sum::<u64>()
+            } else {
+                id_count as u64
+            }),
             durability: super::DurabilityLevel::Fast,
             wal_writer: RwLock::new(None),
             wal_buffer: RwLock::new(Vec::new()),
@@ -451,7 +501,10 @@ impl OnDemandStorage {
             v4_base_loaded: AtomicBool::new(false),
             cached_footer_offset: AtomicU64::new(cached_fo),
             v4_footer: RwLock::new(cached_v4_footer),
-            delta_store: RwLock::new(DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path))),
+            delta_store: RwLock::new(
+                DeltaStore::load(path).unwrap_or_else(|_| DeltaStore::new(path)),
+            ),
+            sync_pending: AtomicU8::new(0),
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
             page_cache: RwLock::new(HashMap::new()),
             scan_buf: std::sync::Mutex::new(Vec::new()),
@@ -471,12 +524,91 @@ impl OnDemandStorage {
         self.auto_flush_rows.store(rows, Ordering::SeqCst);
         self.auto_flush_bytes.store(bytes, Ordering::SeqCst);
     }
-    
+
     /// Get current auto-flush configuration
     pub fn get_auto_flush(&self) -> (u64, u64) {
-        (self.auto_flush_rows.load(Ordering::SeqCst), self.auto_flush_bytes.load(Ordering::SeqCst))
+        (
+            self.auto_flush_rows.load(Ordering::SeqCst),
+            self.auto_flush_bytes.load(Ordering::SeqCst),
+        )
     }
-    
+
+    #[inline]
+    pub fn mark_sync_pending(&self) {
+        self.mark_main_sync_pending();
+    }
+
+    #[inline]
+    pub fn mark_main_sync_pending(&self) {
+        self.sync_pending
+            .fetch_or(SYNC_PENDING_MAIN, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub fn mark_delta_sync_pending(&self) {
+        self.sync_pending
+            .fetch_or(SYNC_PENDING_DELTA, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub fn mark_deltastore_sync_pending(&self) {
+        self.sync_pending
+            .fetch_or(SYNC_PENDING_DELTASTORE, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub fn sync_pending(&self) -> bool {
+        self.sync_pending_bits() != 0
+    }
+
+    #[inline]
+    pub fn footer_offset_hint(&self) -> u64 {
+        self.cached_footer_offset.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn sync_pending_bits(&self) -> u8 {
+        self.sync_pending.load(Ordering::SeqCst)
+    }
+
+    #[inline]
+    pub fn main_sync_pending(&self) -> bool {
+        self.sync_pending_bits() & SYNC_PENDING_MAIN != 0
+    }
+
+    #[inline]
+    pub fn delta_sync_pending(&self) -> bool {
+        self.sync_pending_bits() & SYNC_PENDING_DELTA != 0
+    }
+
+    #[inline]
+    pub fn deltastore_sync_pending(&self) -> bool {
+        self.sync_pending_bits() & SYNC_PENDING_DELTASTORE != 0
+    }
+
+    #[inline]
+    pub fn clear_sync_pending(&self) {
+        self.sync_pending.store(0, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub fn clear_main_sync_pending(&self) {
+        self.sync_pending
+            .fetch_and(!SYNC_PENDING_MAIN, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub fn clear_delta_sync_pending(&self) {
+        self.sync_pending
+            .fetch_and(!SYNC_PENDING_DELTA, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub fn clear_deltastore_sync_pending(&self) {
+        self.sync_pending
+            .fetch_and(!SYNC_PENDING_DELTASTORE, Ordering::SeqCst);
+    }
+
     /// Acquire global read lock for thread-safe concurrent reads.
     /// Returns a guard that releases the lock when dropped.
     /// Multiple readers can hold the lock simultaneously.
@@ -484,7 +616,7 @@ impl OnDemandStorage {
     pub fn read_lock(&self) -> parking_lot::RwLockReadGuard<()> {
         self.global_lock.read()
     }
-    
+
     /// Acquire global write lock for thread-safe writes.
     /// Returns a guard that releases the lock when dropped.
     /// Only one writer can hold the lock; readers are blocked while held.
@@ -492,37 +624,39 @@ impl OnDemandStorage {
     pub fn write_lock(&self) -> parking_lot::RwLockWriteGuard<()> {
         self.global_lock.write()
     }
-    
+
     /// Estimate current in-memory data size in bytes
     pub fn estimate_memory_bytes(&self) -> u64 {
         let columns = self.columns.read();
         let mut total: u64 = 0;
-        
+
         for col in columns.iter() {
             total += col.estimate_memory_bytes() as u64;
         }
-        
+
         // Add overhead for IDs (8 bytes each)
         total += self.ids.read().len() as u64 * 8;
-        
+
         // Add overhead for null bitmaps
         for null_bitmap in self.nulls.read().iter() {
             total += null_bitmap.len() as u64;
         }
-        
+
         // Add deleted bitmap
         total += self.deleted.read().len() as u64;
-        
+
         total
     }
-    
+
     /// Read bytes from the file using the user-space page cache.
     /// On cache miss, performs a positioned read (pread) and caches the 4KB page.
     /// On cache hit, copies bytes from the cached heap page — zero mmap page faults.
     /// This eliminates repeated soft page faults on macOS for point lookup paths.
     pub(crate) fn read_cached_bytes(&self, abs_offset: u64, dst: &mut [u8]) -> io::Result<()> {
         let len = dst.len();
-        if len == 0 { return Ok(()); }
+        if len == 0 {
+            return Ok(());
+        }
         let mut written = 0usize;
         let mut cur_off = abs_offset;
         while written < len {
@@ -533,7 +667,8 @@ impl OnDemandStorage {
             {
                 let cache = self.page_cache.read();
                 if let Some(page) = cache.get(&page_num) {
-                    dst[written..written + to_copy].copy_from_slice(&page[page_off..page_off + to_copy]);
+                    dst[written..written + to_copy]
+                        .copy_from_slice(&page[page_off..page_off + to_copy]);
                     written += to_copy;
                     cur_off += to_copy as u64;
                     continue;
@@ -543,11 +678,19 @@ impl OnDemandStorage {
             let mut buf = [0u8; 4096];
             {
                 let file_guard = self.file.read();
-                let file = file_guard.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "file not open"))?;
+                let file = file_guard
+                    .as_ref()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "file not open"))?;
                 #[cfg(unix)]
-                { use std::os::unix::fs::FileExt; let _ = file.read_at(&mut buf, page_num * 4096); }
+                {
+                    use std::os::unix::fs::FileExt;
+                    let _ = file.read_at(&mut buf, page_num * 4096);
+                }
                 #[cfg(windows)]
-                { use std::os::windows::fs::FileExt; let _ = file.seek_read(&mut buf, page_num * 4096); }
+                {
+                    use std::os::windows::fs::FileExt;
+                    let _ = file.seek_read(&mut buf, page_num * 4096);
+                }
             }
             dst[written..written + to_copy].copy_from_slice(&buf[page_off..page_off + to_copy]);
             written += to_copy;
@@ -561,8 +704,10 @@ impl OnDemandStorage {
     /// Called after every write (save_v4, append_row_group, open_v4_data).
     pub(crate) fn invalidate_page_cache(&self) {
         self.page_cache.write().clear();
-        self.scan_buf_file_size.store(0, std::sync::atomic::Ordering::Release);
-        self.scan_buf_f16_file_size.store(0, std::sync::atomic::Ordering::Release);
+        self.scan_buf_file_size
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.scan_buf_f16_file_size
+            .store(0, std::sync::atomic::Ordering::Release);
     }
 
     /// Check if auto-flush is needed and perform it if so
@@ -570,7 +715,7 @@ impl OnDemandStorage {
     fn maybe_auto_flush(&self) -> io::Result<bool> {
         let rows_threshold = self.auto_flush_rows.load(Ordering::SeqCst);
         let bytes_threshold = self.auto_flush_bytes.load(Ordering::SeqCst);
-        
+
         // Check row threshold
         if rows_threshold > 0 {
             let pending = self.pending_rows.load(Ordering::SeqCst);
@@ -580,7 +725,7 @@ impl OnDemandStorage {
                 return Ok(true);
             }
         }
-        
+
         // Check memory threshold
         if bytes_threshold > 0 {
             let mem_bytes = self.estimate_memory_bytes();
@@ -590,7 +735,7 @@ impl OnDemandStorage {
                 return Ok(true);
             }
         }
-        
+
         Ok(false)
     }
 
@@ -638,9 +783,12 @@ impl OnDemandStorage {
     pub fn open_or_create(path: &Path) -> io::Result<Self> {
         Self::open_or_create_with_durability(path, super::DurabilityLevel::Fast)
     }
-    
+
     /// Create or open storage with specified durability level
-    pub fn open_or_create_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+    pub fn open_or_create_with_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+    ) -> io::Result<Self> {
         if path.exists() {
             Self::open_with_durability(path, durability)
         } else {
@@ -652,19 +800,22 @@ impl OnDemandStorage {
     pub fn open_for_write(path: &Path) -> io::Result<Self> {
         Self::open_for_write_with_durability(path, super::DurabilityLevel::Fast)
     }
-    
+
     /// Open for write with specified durability level
     /// IMPORTANT: For memory efficiency, column data is loaded lazily.
     /// - For INSERT: use open_for_insert() which only loads metadata
     /// - For UPDATE/DELETE: this function loads all column data
-    pub fn open_for_write_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+    pub fn open_for_write_with_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+    ) -> io::Result<Self> {
         if !path.exists() {
             return Self::create_with_durability(path, durability);
         }
-        
+
         // Open the storage first
         let storage = Self::open_with_durability(path, durability)?;
-        
+
         // If there are existing rows, load all column data into memory
         // This is required because save() rewrites the entire file from self.columns
         let row_count = storage.header.read().row_count as usize;
@@ -676,7 +827,7 @@ impl OnDemandStorage {
             let schema = storage.schema.read();
             let mut columns = storage.columns.write();
             let mut nulls = storage.nulls.write();
-            
+
             // Always reinitialize columns with correct types from schema
             // The initial columns vector may have placeholder Int64 types
             if schema.column_count() > 0 {
@@ -688,43 +839,49 @@ impl OnDemandStorage {
                 }
             }
         }
-        
+
         Ok(storage)
     }
-    
+
     /// Open for INSERT operations only - memory efficient!
     /// Only loads metadata (header, schema, ids), NOT column data.
     /// New data is written to a delta file and merged on read or compact.
     pub fn open_for_insert(path: &Path) -> io::Result<Self> {
         Self::open_for_insert_with_durability(path, super::DurabilityLevel::Fast)
     }
-    
+
     /// Open for INSERT with specified durability - memory efficient!
-    pub fn open_for_insert_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+    pub fn open_for_insert_with_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+    ) -> io::Result<Self> {
         if !path.exists() {
             return Self::create_with_durability(path, durability);
         }
-        
+
         // Just open without loading column data - metadata only
         Self::open_with_durability(path, durability)
     }
-    
+
     /// Open for SCHEMA changes only - MOST memory efficient!
     /// Only loads header, schema, and column index. Does NOT load IDs or column data.
     /// Use for: ALTER TABLE ADD/DROP/RENAME COLUMN, TRUNCATE
     pub fn open_for_schema_change(path: &Path) -> io::Result<Self> {
         Self::open_for_schema_change_with_durability(path, super::DurabilityLevel::Fast)
     }
-    
+
     /// Open for SCHEMA changes with specified durability.
     /// Delegates to open_with_durability (V4-only format).
-    pub fn open_for_schema_change_with_durability(path: &Path, durability: super::DurabilityLevel) -> io::Result<Self> {
+    pub fn open_for_schema_change_with_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+    ) -> io::Result<Self> {
         if !path.exists() {
             return Self::create_with_durability(path, durability);
         }
         Self::open_with_durability(path, durability)
     }
-    
+
     /// Get the delta file path for this storage
     fn delta_path(base_path: &Path) -> PathBuf {
         let mut delta = base_path.to_path_buf();
@@ -740,7 +897,9 @@ impl OnDemandStorage {
     /// Record a cell-level update in the delta store.
     /// Used by UPDATE to avoid delete+insert for single-cell changes.
     pub fn delta_update_cell(&self, row_id: u64, column_name: &str, new_value: crate::data::Value) {
-        self.delta_store.write().update_cell(row_id, column_name, new_value);
+        self.delta_store
+            .write()
+            .update_cell(row_id, column_name, new_value);
     }
 
     /// Record a full row update in the delta store.
@@ -801,7 +960,12 @@ impl OnDemandStorage {
 
     /// Scan a numeric column for rows in [low, high] and return their row IDs directly.
     /// Returns None if not applicable (column not found, etc.).
-    pub fn scan_numeric_range_with_ids(&self, col_name: &str, low: f64, high: f64) -> io::Result<Option<Vec<u64>>> {
+    pub fn scan_numeric_range_with_ids(
+        &self,
+        col_name: &str,
+        low: f64,
+        high: f64,
+    ) -> io::Result<Option<Vec<u64>>> {
         self.scan_numeric_range_mmap_with_ids(col_name, low, high)
     }
 
@@ -817,7 +981,20 @@ impl OnDemandStorage {
 
     /// Save the delta store to disk (called during save path).
     pub fn save_delta_store(&self) -> io::Result<()> {
-        self.delta_store.write().save()
+        let mut delta_store = self.delta_store.write();
+        let was_dirty = delta_store.is_dirty();
+        delta_store.save()?;
+        drop(delta_store);
+
+        if was_dirty {
+            if self.durability == super::DurabilityLevel::Max {
+                self.clear_deltastore_sync_pending();
+            } else {
+                self.mark_deltastore_sync_pending();
+            }
+        }
+
+        Ok(())
     }
 
     /// Clear the delta store (called after compaction merges deltas into base).
@@ -825,7 +1002,9 @@ impl OnDemandStorage {
         let mut ds = self.delta_store.write();
         ds.clear();
         ds.save()?;
-        ds.remove_file()
+        ds.remove_file()?;
+        self.clear_deltastore_sync_pending();
+        Ok(())
     }
 
     /// Get a read reference to the delta store (for DeltaMerger on read path).
@@ -881,10 +1060,8 @@ impl OnDemandStorage {
             let mut columns = self.columns.write();
 
             // Build id→index map for fast lookup
-            let id_to_idx: std::collections::HashMap<u64, usize> = ids.iter()
-                .enumerate()
-                .map(|(i, &id)| (id, i))
-                .collect();
+            let id_to_idx: std::collections::HashMap<u64, usize> =
+                ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
             for (row_id, col_updates) in &all_updates {
                 if let Some(&row_idx) = id_to_idx.get(row_id) {
@@ -900,24 +1077,31 @@ impl OnDemandStorage {
                                         }
                                     }
                                     crate::data::Value::Float64(v) => {
-                                        if let ColumnData::Float64(ref mut data) = columns[col_idx] {
+                                        if let ColumnData::Float64(ref mut data) = columns[col_idx]
+                                        {
                                             if row_idx < data.len() {
                                                 data[row_idx] = *v;
                                             }
                                         }
                                     }
                                     crate::data::Value::String(s) => {
-                                        if let ColumnData::String { offsets, data } = &mut columns[col_idx] {
+                                        if let ColumnData::String { offsets, data } =
+                                            &mut columns[col_idx]
+                                        {
                                             // For strings, we need to rebuild — update in-place is complex
                                             // For compaction (rare), this is acceptable
-                                            let mut strings: Vec<String> = Vec::with_capacity(offsets.len().saturating_sub(1));
+                                            let mut strings: Vec<String> =
+                                                Vec::with_capacity(offsets.len().saturating_sub(1));
                                             for i in 0..offsets.len().saturating_sub(1) {
                                                 let start = offsets[i] as usize;
                                                 let end = offsets[i + 1] as usize;
                                                 if i == row_idx {
                                                     strings.push(s.clone());
                                                 } else {
-                                                    strings.push(String::from_utf8_lossy(&data[start..end]).to_string());
+                                                    strings.push(
+                                                        String::from_utf8_lossy(&data[start..end])
+                                                            .to_string(),
+                                                    );
                                                 }
                                             }
                                             // Rebuild
@@ -931,7 +1115,8 @@ impl OnDemandStorage {
                                         }
                                     }
                                     crate::data::Value::Bool(v) => {
-                                        if let ColumnData::Bool { data, .. } = &mut columns[col_idx] {
+                                        if let ColumnData::Bool { data, .. } = &mut columns[col_idx]
+                                        {
                                             let byte_idx = row_idx / 8;
                                             let bit_idx = row_idx % 8;
                                             if byte_idx < data.len() {
@@ -990,10 +1175,8 @@ impl OnDemandStorage {
             let schema = self.schema.read();
             let mut columns = self.columns.write();
 
-            let id_to_idx: ahash::AHashMap<u64, usize> = ids.iter()
-                .enumerate()
-                .map(|(i, &id)| (id, i))
-                .collect();
+            let id_to_idx: ahash::AHashMap<u64, usize> =
+                ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
             for (row_id, col_updates) in &all_updates {
                 if let Some(&row_idx) = id_to_idx.get(row_id) {
@@ -1003,24 +1186,35 @@ impl OnDemandStorage {
                                 match &record.new_value {
                                     crate::data::Value::Int64(v) => {
                                         if let ColumnData::Int64(ref mut data) = columns[col_idx] {
-                                            if row_idx < data.len() { data[row_idx] = *v; }
+                                            if row_idx < data.len() {
+                                                data[row_idx] = *v;
+                                            }
                                         }
                                     }
                                     crate::data::Value::Float64(v) => {
-                                        if let ColumnData::Float64(ref mut data) = columns[col_idx] {
-                                            if row_idx < data.len() { data[row_idx] = *v; }
+                                        if let ColumnData::Float64(ref mut data) = columns[col_idx]
+                                        {
+                                            if row_idx < data.len() {
+                                                data[row_idx] = *v;
+                                            }
                                         }
                                     }
                                     crate::data::Value::String(s) => {
-                                        if let ColumnData::String { offsets, data } = &mut columns[col_idx] {
-                                            let mut strings: Vec<String> = Vec::with_capacity(offsets.len().saturating_sub(1));
+                                        if let ColumnData::String { offsets, data } =
+                                            &mut columns[col_idx]
+                                        {
+                                            let mut strings: Vec<String> =
+                                                Vec::with_capacity(offsets.len().saturating_sub(1));
                                             for i in 0..offsets.len().saturating_sub(1) {
                                                 let start = offsets[i] as usize;
                                                 let end = offsets[i + 1] as usize;
                                                 if i == row_idx {
                                                     strings.push(s.clone());
                                                 } else {
-                                                    strings.push(String::from_utf8_lossy(&data[start..end]).to_string());
+                                                    strings.push(
+                                                        String::from_utf8_lossy(&data[start..end])
+                                                            .to_string(),
+                                                    );
                                                 }
                                             }
                                             data.clear();
@@ -1033,12 +1227,16 @@ impl OnDemandStorage {
                                         }
                                     }
                                     crate::data::Value::Bool(v) => {
-                                        if let ColumnData::Bool { data, .. } = &mut columns[col_idx] {
+                                        if let ColumnData::Bool { data, .. } = &mut columns[col_idx]
+                                        {
                                             let byte_idx = row_idx / 8;
                                             let bit_idx = row_idx % 8;
                                             if byte_idx < data.len() {
-                                                if *v { data[byte_idx] |= 1 << bit_idx; }
-                                                else { data[byte_idx] &= !(1 << bit_idx); }
+                                                if *v {
+                                                    data[byte_idx] |= 1 << bit_idx;
+                                                } else {
+                                                    data[byte_idx] &= !(1 << bit_idx);
+                                                }
                                             }
                                         }
                                     }
@@ -1057,17 +1255,17 @@ impl OnDemandStorage {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = File::open(delta_path)?;
         let mut max_id: u64 = 0;
-        
+
         loop {
             // Read record count
             let mut count_buf = [0u8; 8];
             match file.read_exact(&mut count_buf) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             }
             let record_count = u64::from_le_bytes(count_buf) as usize;
-            
+
             // Read IDs and track max
             for _ in 0..record_count {
                 let mut id_buf = [0u8; 8];
@@ -1075,7 +1273,7 @@ impl OnDemandStorage {
                 let id = u64::from_le_bytes(id_buf);
                 max_id = max_id.max(id);
             }
-            
+
             // Skip rest of record (int columns)
             let mut count_buf4 = [0u8; 4];
             file.read_exact(&mut count_buf4)?;
@@ -1087,7 +1285,7 @@ impl OnDemandStorage {
                 file.seek(SeekFrom::Current(name_len as i64))?;
                 file.seek(SeekFrom::Current((record_count * 8) as i64))?;
             }
-            
+
             // Skip float columns
             file.read_exact(&mut count_buf4)?;
             let float_col_count = u32::from_le_bytes(count_buf4) as usize;
@@ -1098,7 +1296,7 @@ impl OnDemandStorage {
                 file.seek(SeekFrom::Current(name_len as i64))?;
                 file.seek(SeekFrom::Current((record_count * 8) as i64))?;
             }
-            
+
             // Skip string columns (variable length - need to read lengths)
             file.read_exact(&mut count_buf4)?;
             let string_col_count = u32::from_le_bytes(count_buf4) as usize;
@@ -1114,7 +1312,7 @@ impl OnDemandStorage {
                     file.seek(SeekFrom::Current(str_len as i64))?;
                 }
             }
-            
+
             // Skip bool columns
             file.read_exact(&mut count_buf4)?;
             let bool_col_count = u32::from_le_bytes(count_buf4) as usize;
@@ -1126,7 +1324,7 @@ impl OnDemandStorage {
                 let skip_bytes = (record_count + 7) / 8;
                 file.seek(SeekFrom::Current(skip_bytes as i64))?;
             }
-            
+
             // Skip binary columns (variable length)
             file.read_exact(&mut count_buf4)?;
             let binary_col_count = u32::from_le_bytes(count_buf4) as usize;
@@ -1143,25 +1341,25 @@ impl OnDemandStorage {
                 }
             }
         }
-        
+
         Ok(max_id)
     }
-    
+
     /// Check if delta file exists
     pub fn has_delta(&self) -> bool {
         Self::delta_path(&self.path).exists()
     }
-    
+
     /// Load all column data from disk into memory
     /// This is needed before write operations to preserve existing data
     fn load_all_columns_into_memory(&self) -> io::Result<()> {
         let header = self.header.read();
         let total_rows = header.row_count as usize;
-        
+
         if total_rows == 0 {
             return Ok(());
         }
-        
+
         // V4 files: load all RG data into memory for write operations
         if header.footer_offset > 0 {
             drop(header);
@@ -1172,10 +1370,10 @@ impl OnDemandStorage {
             self.apply_pending_deltas_in_place();
             return Ok(());
         }
-        
+
         let schema = self.schema.read();
         let column_index = self.column_index.read();
-        
+
         // CRITICAL: Load IDs first since they're lazy-loaded
         // Without this, insert operations will think there are 0 existing rows
         drop(header);
@@ -1185,22 +1383,22 @@ impl OnDemandStorage {
         let header = self.header.read();
         let schema = self.schema.read();
         let column_index = self.column_index.read();
-        
+
         let file_guard = self.file.read();
-        let file = file_guard.as_ref().ok_or_else(|| {
-            err_not_conn("File not open")
-        })?;
-        
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open"))?;
+
         let mut mmap_cache = self.mmap_cache.write();
         let mut columns = self.columns.write();
         let mut nulls = self.nulls.write();
-        
+
         let column_index_len = column_index.len();
-        
+
         // Load each column from disk
         for col_idx in 0..schema.column_count() {
             let (_, col_type) = &schema.columns[col_idx];
-            
+
             // Handle columns added via ALTER TABLE that don't have disk data yet
             if col_idx >= column_index_len {
                 // Column exists in schema but not on disk - create padded column
@@ -1210,11 +1408,17 @@ impl OnDemandStorage {
                     match &mut col_data {
                         ColumnData::Int64(v) => v.push(0),
                         ColumnData::Float64(v) => v.push(0.0),
-                        ColumnData::String { offsets, .. } => offsets.push(*offsets.last().unwrap_or(&0)),
-                        ColumnData::Binary { offsets, .. } => offsets.push(*offsets.last().unwrap_or(&0)),
+                        ColumnData::String { offsets, .. } => {
+                            offsets.push(*offsets.last().unwrap_or(&0))
+                        }
+                        ColumnData::Binary { offsets, .. } => {
+                            offsets.push(*offsets.last().unwrap_or(&0))
+                        }
                         ColumnData::Bool { data, len } => {
                             let byte_idx = *len / 8;
-                            if byte_idx >= data.len() { data.push(0); }
+                            if byte_idx >= data.len() {
+                                data.push(0);
+                            }
                             *len += 1;
                         }
                         ColumnData::StringDict { indices, .. } => indices.push(0),
@@ -1222,13 +1426,13 @@ impl OnDemandStorage {
                         ColumnData::Float16List { .. } => {} // pads implicitly
                     }
                 }
-                
+
                 if col_idx < columns.len() {
                     columns[col_idx] = col_data;
                 } else {
                     columns.push(col_data);
                 }
-                
+
                 // Empty null bitmap for new columns
                 if col_idx < nulls.len() {
                     nulls[col_idx] = Vec::new();
@@ -1237,9 +1441,9 @@ impl OnDemandStorage {
                 }
                 continue;
             }
-            
+
             let index_entry = &column_index[col_idx];
-            
+
             // Read column data
             let col_data = self.read_column_range_mmap(
                 &mut mmap_cache,
@@ -1250,14 +1454,14 @@ impl OnDemandStorage {
                 total_rows,
                 total_rows,
             )?;
-            
+
             // Store in columns array
             if col_idx < columns.len() {
                 columns[col_idx] = col_data;
             } else {
                 columns.push(col_data);
             }
-            
+
             // Read null bitmap for this column
             let null_len = index_entry.null_length as usize;
             if null_len > 0 {
@@ -1270,126 +1474,47 @@ impl OnDemandStorage {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
-    /// Insert rows to delta file (memory efficient - doesn't load existing data)
-    /// Returns the IDs assigned to the inserted rows
-    pub fn insert_rows_to_delta(&self, rows: &[HashMap<String, ColumnValue>]) -> io::Result<Vec<u64>> {
-        if rows.is_empty() {
-            return Ok(Vec::new());
+
+    fn append_typed_to_delta_with_ids(
+        &self,
+        ids: &[u64],
+        int_columns: &HashMap<String, Vec<i64>>,
+        float_columns: &HashMap<String, Vec<f64>>,
+        string_columns: &HashMap<String, Vec<String>>,
+        bool_columns: &HashMap<String, Vec<bool>>,
+    ) -> io::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
         }
-        
+
         let delta_path = Self::delta_path(&self.path);
-        
-        // Get schema to handle partial columns correctly
-        let schema = self.schema.read();
-        
-        // Build column data from rows - ensure all columns have same length
-        let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
-        let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
-        let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
-        let mut binary_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-        let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
-        
-        // Initialize column vectors based on schema
-        for (col_name, col_type) in &schema.columns {
-            match col_type {
-                ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
-                ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
-                ColumnType::Timestamp | ColumnType::Date => { 
-                    int_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
-                }
-                ColumnType::Float64 | ColumnType::Float32 => { 
-                    float_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
-                }
-                ColumnType::String | ColumnType::StringDict => { 
-                    string_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
-                }
-                ColumnType::Binary => { 
-                    binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
-                }
-                ColumnType::FixedList | ColumnType::Float16List => { 
-                    binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
-                }
-                ColumnType::Bool => { 
-                    bool_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
-                }
-                ColumnType::Null => { 
-                    // Null columns are handled as strings with empty default
-                    string_columns.insert(col_name.clone(), Vec::with_capacity(rows.len())); 
-                }
+        let mut delta_file = self.delta_file.write();
+        if delta_file.is_none() {
+            if let Some(parent) = delta_path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&delta_path)?;
+            *delta_file = Some(file);
         }
-        
-        // For each row, add values for ALL schema columns (default for missing)
-        for row in rows {
-            for (col_name, col_type) in &schema.columns {
-                let val = row.get(col_name);
-                match col_type {
-                    ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
-                    ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
-                    ColumnType::Timestamp | ColumnType::Date => {
-                        let v = val.and_then(|v| if let ColumnValue::Int64(n) = v { Some(*n) } else { None }).unwrap_or(0);
-                        int_columns.get_mut(col_name).unwrap().push(v);
-                    }
-                    ColumnType::Float64 | ColumnType::Float32 => {
-                        let v = val.and_then(|v| if let ColumnValue::Float64(n) = v { Some(*n) } else { None }).unwrap_or(0.0);
-                        float_columns.get_mut(col_name).unwrap().push(v);
-                    }
-                    ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
-                        let v = val.and_then(|v| if let ColumnValue::String(s) = v { Some(s.clone()) } else { None }).unwrap_or_default();
-                        string_columns.get_mut(col_name).unwrap().push(v);
-                    }
-                    ColumnType::Binary => {
-                        let v = val.and_then(|v| if let ColumnValue::Binary(b) = v { Some(b.clone()) } else { None }).unwrap_or_default();
-                        binary_columns.get_mut(col_name).unwrap().push(v);
-                    }
-                    ColumnType::FixedList | ColumnType::Float16List => {
-                        let v = val.and_then(|v| match v {
-                            ColumnValue::FixedList(b) | ColumnValue::Binary(b) => Some(b.clone()),
-                            _ => None,
-                        }).unwrap_or_default();
-                        binary_columns.get_mut(col_name).unwrap().push(v);
-                    }
-                    ColumnType::Bool => {
-                        let v = val.and_then(|v| if let ColumnValue::Bool(b) = v { Some(*b) } else { None }).unwrap_or(false);
-                        bool_columns.get_mut(col_name).unwrap().push(v);
-                    }
-                }
-            }
-        }
-        
-        drop(schema);
-        
-        // Allocate IDs
-        let mut ids = Vec::with_capacity(rows.len());
-        for _ in 0..rows.len() {
-            ids.push(self.next_id.fetch_add(1, Ordering::SeqCst));
-        }
-        
-        // Write delta file (append mode)
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&delta_path)?;
-        
-        // Delta format: [record_count:u64][ids...][schema...][column_data...]
-        // Simple row-oriented format for delta (converted to columnar on compact)
-        let record_count = rows.len() as u64;
-        file.write_all(&record_count.to_le_bytes())?;
-        
-        // Write IDs
-        for id in &ids {
+        let file = delta_file
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "delta file not open"))?;
+
+        file.write_all(&(ids.len() as u64).to_le_bytes())?;
+        for id in ids {
             file.write_all(&id.to_le_bytes())?;
         }
-        
-        // Write schema + data for each column type
-        // Int columns
+
         let int_col_count = int_columns.len() as u32;
         file.write_all(&int_col_count.to_le_bytes())?;
-        for (name, values) in &int_columns {
+        for (name, values) in int_columns {
             let name_bytes = name.as_bytes();
             file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
             file.write_all(name_bytes)?;
@@ -1397,11 +1522,10 @@ impl OnDemandStorage {
                 file.write_all(&v.to_le_bytes())?;
             }
         }
-        
-        // Float columns
+
         let float_col_count = float_columns.len() as u32;
         file.write_all(&float_col_count.to_le_bytes())?;
-        for (name, values) in &float_columns {
+        for (name, values) in float_columns {
             let name_bytes = name.as_bytes();
             file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
             file.write_all(name_bytes)?;
@@ -1409,11 +1533,10 @@ impl OnDemandStorage {
                 file.write_all(&v.to_le_bytes())?;
             }
         }
-        
-        // String columns
+
         let string_col_count = string_columns.len() as u32;
         file.write_all(&string_col_count.to_le_bytes())?;
-        for (name, values) in &string_columns {
+        for (name, values) in string_columns {
             let name_bytes = name.as_bytes();
             file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
             file.write_all(name_bytes)?;
@@ -1423,11 +1546,10 @@ impl OnDemandStorage {
                 file.write_all(v_bytes)?;
             }
         }
-        
-        // Bool columns  
+
         let bool_col_count = bool_columns.len() as u32;
         file.write_all(&bool_col_count.to_le_bytes())?;
-        for (name, values) in &bool_columns {
+        for (name, values) in bool_columns {
             let name_bytes = name.as_bytes();
             file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
             file.write_all(name_bytes)?;
@@ -1435,16 +1557,184 @@ impl OnDemandStorage {
                 file.write_all(&[if *v { 1u8 } else { 0u8 }])?;
             }
         }
-        
+
         file.flush()?;
-        
         if self.durability == super::DurabilityLevel::Max {
             file.sync_all()?;
+            self.clear_delta_sync_pending();
+        } else {
+            self.mark_delta_sync_pending();
         }
-        
+
+        Ok(())
+    }
+
+    /// Insert rows to delta file (memory efficient - doesn't load existing data)
+    /// Returns the IDs assigned to the inserted rows
+    pub fn insert_rows_to_delta(
+        &self,
+        rows: &[HashMap<String, ColumnValue>],
+    ) -> io::Result<Vec<u64>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let delta_path = Self::delta_path(&self.path);
+
+        // Get schema to handle partial columns correctly
+        let schema = self.schema.read();
+
+        // Build column data from rows - ensure all columns have same length
+        let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
+        let mut binary_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
+
+        // Initialize column vectors based on schema
+        for (col_name, col_type) in &schema.columns {
+            match col_type {
+                ColumnType::Int64
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Timestamp
+                | ColumnType::Date => {
+                    int_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
+                }
+                ColumnType::Float64 | ColumnType::Float32 => {
+                    float_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
+                }
+                ColumnType::String | ColumnType::StringDict => {
+                    string_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
+                }
+                ColumnType::Binary => {
+                    binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
+                }
+                ColumnType::FixedList | ColumnType::Float16List => {
+                    binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
+                }
+                ColumnType::Bool => {
+                    bool_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
+                }
+                ColumnType::Null => {
+                    // Null columns are handled as strings with empty default
+                    string_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
+                }
+            }
+        }
+
+        // For each row, add values for ALL schema columns (default for missing)
+        for row in rows {
+            for (col_name, col_type) in &schema.columns {
+                let val = row.get(col_name);
+                match col_type {
+                    ColumnType::Int64
+                    | ColumnType::Int8
+                    | ColumnType::Int16
+                    | ColumnType::Int32
+                    | ColumnType::UInt8
+                    | ColumnType::UInt16
+                    | ColumnType::UInt32
+                    | ColumnType::UInt64
+                    | ColumnType::Timestamp
+                    | ColumnType::Date => {
+                        let v = val
+                            .and_then(|v| {
+                                if let ColumnValue::Int64(n) = v {
+                                    Some(*n)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        int_columns.get_mut(col_name).unwrap().push(v);
+                    }
+                    ColumnType::Float64 | ColumnType::Float32 => {
+                        let v = val
+                            .and_then(|v| {
+                                if let ColumnValue::Float64(n) = v {
+                                    Some(*n)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0.0);
+                        float_columns.get_mut(col_name).unwrap().push(v);
+                    }
+                    ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
+                        let v = val
+                            .and_then(|v| {
+                                if let ColumnValue::String(s) = v {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        string_columns.get_mut(col_name).unwrap().push(v);
+                    }
+                    ColumnType::Binary => {
+                        let v = val
+                            .and_then(|v| {
+                                if let ColumnValue::Binary(b) = v {
+                                    Some(b.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        binary_columns.get_mut(col_name).unwrap().push(v);
+                    }
+                    ColumnType::FixedList | ColumnType::Float16List => {
+                        let v = val
+                            .and_then(|v| match v {
+                                ColumnValue::FixedList(b) | ColumnValue::Binary(b) => {
+                                    Some(b.clone())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        binary_columns.get_mut(col_name).unwrap().push(v);
+                    }
+                    ColumnType::Bool => {
+                        let v = val
+                            .and_then(|v| {
+                                if let ColumnValue::Bool(b) = v {
+                                    Some(*b)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(false);
+                        bool_columns.get_mut(col_name).unwrap().push(v);
+                    }
+                }
+            }
+        }
+
+        drop(schema);
+
+        // Allocate IDs
+        let mut ids = Vec::with_capacity(rows.len());
+        for _ in 0..rows.len() {
+            ids.push(self.next_id.fetch_add(1, Ordering::SeqCst));
+        }
+
+        self.append_typed_to_delta_with_ids(
+            &ids,
+            &int_columns,
+            &float_columns,
+            &string_columns,
+            &bool_columns,
+        )?;
         Ok(ids)
     }
-    
+
     /// Insert typed columns to delta file (memory efficient - doesn't load existing data)
     /// Returns the IDs assigned to the inserted rows
     fn insert_typed_to_delta(
@@ -1452,126 +1742,314 @@ impl OnDemandStorage {
         int_columns: HashMap<String, Vec<i64>>,
         float_columns: HashMap<String, Vec<f64>>,
         string_columns: HashMap<String, Vec<String>>,
-        _binary_columns: HashMap<String, Vec<Vec<u8>>>,  // Not yet implemented in delta
+        _binary_columns: HashMap<String, Vec<Vec<u8>>>, // Not yet implemented in delta
         bool_columns: HashMap<String, Vec<bool>>,
     ) -> io::Result<Vec<u64>> {
         // Determine row count
-        let row_count = int_columns.values().map(|v| v.len()).max().unwrap_or(0)
+        let row_count = int_columns
+            .values()
+            .map(|v| v.len())
+            .max()
+            .unwrap_or(0)
             .max(float_columns.values().map(|v| v.len()).max().unwrap_or(0))
             .max(string_columns.values().map(|v| v.len()).max().unwrap_or(0))
             .max(bool_columns.values().map(|v| v.len()).max().unwrap_or(0));
-        
+
         if row_count == 0 {
             return Ok(Vec::new());
         }
-        
+
         let delta_path = Self::delta_path(&self.path);
-        
+
         // Allocate IDs
         let mut ids = Vec::with_capacity(row_count);
         for _ in 0..row_count {
             ids.push(self.next_id.fetch_add(1, Ordering::SeqCst));
         }
-        
-        // Write delta file (append mode)
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&delta_path)?;
-        
-        // Delta format: [record_count:u64][ids...][schema...][column_data...]
-        file.write_all(&(row_count as u64).to_le_bytes())?;
-        
-        // Write IDs
-        for id in &ids {
-            file.write_all(&id.to_le_bytes())?;
-        }
-        
-        // Write int columns
-        let int_col_count = int_columns.len() as u32;
-        file.write_all(&int_col_count.to_le_bytes())?;
-        for (name, values) in &int_columns {
-            let name_bytes = name.as_bytes();
-            file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
-            file.write_all(name_bytes)?;
-            for v in values {
-                file.write_all(&v.to_le_bytes())?;
-            }
-        }
-        
-        // Write float columns
-        let float_col_count = float_columns.len() as u32;
-        file.write_all(&float_col_count.to_le_bytes())?;
-        for (name, values) in &float_columns {
-            let name_bytes = name.as_bytes();
-            file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
-            file.write_all(name_bytes)?;
-            for v in values {
-                file.write_all(&v.to_le_bytes())?;
-            }
-        }
-        
-        // Write string columns
-        let string_col_count = string_columns.len() as u32;
-        file.write_all(&string_col_count.to_le_bytes())?;
-        for (name, values) in &string_columns {
-            let name_bytes = name.as_bytes();
-            file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
-            file.write_all(name_bytes)?;
-            for v in values {
-                let v_bytes = v.as_bytes();
-                file.write_all(&(v_bytes.len() as u32).to_le_bytes())?;
-                file.write_all(v_bytes)?;
-            }
-        }
-        
-        // Write bool columns
-        let bool_col_count = bool_columns.len() as u32;
-        file.write_all(&bool_col_count.to_le_bytes())?;
-        for (name, values) in &bool_columns {
-            let name_bytes = name.as_bytes();
-            file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
-            file.write_all(name_bytes)?;
-            for v in values {
-                file.write_all(&[if *v { 1u8 } else { 0u8 }])?;
-            }
-        }
-        
-        file.flush()?;
-        
-        if self.durability == super::DurabilityLevel::Max {
-            file.sync_all()?;
-        }
-        
+
+        self.append_typed_to_delta_with_ids(
+            &ids,
+            &int_columns,
+            &float_columns,
+            &string_columns,
+            &bool_columns,
+        )?;
         Ok(ids)
     }
-    
+
+    /// Spill mmap-only V4 memtable rows to the delta sidecar instead of
+    /// rewriting the base file. This keeps explicit `flush()` on small OLTP
+    /// bursts fast while preserving cross-process visibility through the
+    /// existing delta merge path.
+    pub fn spill_pending_v4_rows_to_delta(&self) -> io::Result<bool> {
+        if !self.is_v4_format() {
+            return Ok(false);
+        }
+
+        let pending = self.pending_v4_in_memory_rows();
+        if pending == 0 {
+            return Ok(false);
+        }
+
+        let footer_guard = self.v4_footer.read();
+        let Some(footer) = footer_guard.as_ref() else {
+            return Ok(false);
+        };
+        let on_disk_rows: usize = footer
+            .row_groups
+            .iter()
+            .map(|rg| rg.row_count as usize)
+            .sum();
+        if on_disk_rows == 0 {
+            // New/empty tables must write the initial base file so schema/footer metadata
+            // is persisted together with the first rows.
+            return Ok(false);
+        }
+
+        let ids = self.ids.read();
+        let ids_len = ids.len();
+        if ids_len < pending {
+            return Ok(false);
+        }
+        let pending_start = ids_len - pending;
+        if ids.first().copied().unwrap_or(0) == 1 && pending_start < on_disk_rows {
+            // Some persisted base rows are mixed into the in-memory prefix. Fall back to a
+            // full save so we do not misclassify base rows as pending append-only rows.
+            return Ok(false);
+        }
+        let deleted = self.deleted.read();
+        if ids.first().copied().unwrap_or(0) == 1 {
+            for row_idx in 0..pending_start.min(on_disk_rows) {
+                let byte_idx = row_idx / 8;
+                let bit_idx = row_idx % 8;
+                if byte_idx < deleted.len() && ((deleted[byte_idx] >> bit_idx) & 1 == 1) {
+                    // Persisted-base deletes require a full rewrite or delete-vector update.
+                    return Ok(false);
+                }
+            }
+        }
+        let mut live_row_indices_abs = Vec::with_capacity(pending);
+        let mut live_row_indices_local = Vec::with_capacity(pending);
+        for row_idx in pending_start..ids_len {
+            let byte_idx = row_idx / 8;
+            let bit_idx = row_idx % 8;
+            let is_deleted = byte_idx < deleted.len() && ((deleted[byte_idx] >> bit_idx) & 1 == 1);
+            if !is_deleted {
+                live_row_indices_abs.push(row_idx);
+                live_row_indices_local.push(row_idx - pending_start);
+            }
+        }
+        let pending_ids: Vec<u64> = live_row_indices_abs
+            .iter()
+            .map(|&row_idx| ids[row_idx])
+            .collect();
+        drop(ids);
+
+        let schema = self.schema.read();
+        let columns = self.columns.read();
+        let nulls = self.nulls.read();
+        if schema.columns != footer.schema.columns {
+            // Schema evolution must go through the normal save path so the base footer and
+            // column layout stay in sync with what readers expect on reopen.
+            return Ok(false);
+        }
+        if columns.len() < schema.column_count() {
+            return Ok(false);
+        }
+
+        let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
+        let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
+
+        for (col_idx, (col_name, col_type)) in schema.columns.iter().enumerate() {
+            if let Some(bitmap) = nulls.get(col_idx) {
+                for &row_idx in &live_row_indices_abs {
+                    let byte_idx = row_idx / 8;
+                    let bit_idx = row_idx % 8;
+                    if byte_idx < bitmap.len() && (bitmap[byte_idx] >> bit_idx) & 1 == 1 {
+                        return Ok(false);
+                    }
+                }
+            }
+
+            let sliced = columns[col_idx].slice_range(pending_start, ids_len);
+            match col_type {
+                ColumnType::Int64
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Timestamp
+                | ColumnType::Date => {
+                    let ColumnData::Int64(values) = sliced else {
+                        return Ok(false);
+                    };
+                    if live_row_indices_local
+                        .iter()
+                        .any(|&row_idx| row_idx >= values.len())
+                    {
+                        return Ok(false);
+                    }
+                    let filtered: Vec<i64> = live_row_indices_local
+                        .iter()
+                        .map(|&row_idx| values[row_idx])
+                        .collect();
+                    int_columns.insert(col_name.clone(), filtered);
+                }
+                ColumnType::Float64 | ColumnType::Float32 => {
+                    let ColumnData::Float64(values) = sliced else {
+                        return Ok(false);
+                    };
+                    if live_row_indices_local
+                        .iter()
+                        .any(|&row_idx| row_idx >= values.len())
+                    {
+                        return Ok(false);
+                    }
+                    let filtered: Vec<f64> = live_row_indices_local
+                        .iter()
+                        .map(|&row_idx| values[row_idx])
+                        .collect();
+                    float_columns.insert(col_name.clone(), filtered);
+                }
+                ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
+                    let normalized = if matches!(sliced, ColumnData::StringDict { .. }) {
+                        sliced.decode_string_dict()
+                    } else {
+                        sliced
+                    };
+                    let ColumnData::String { offsets, data } = normalized else {
+                        return Ok(false);
+                    };
+                    let mut values = Vec::with_capacity(live_row_indices_local.len());
+                    for &row_idx in &live_row_indices_local {
+                        if row_idx + 1 >= offsets.len() {
+                            return Ok(false);
+                        }
+                        let start = offsets[row_idx] as usize;
+                        let end = offsets[row_idx + 1] as usize;
+                        if start > end || end > data.len() {
+                            return Ok(false);
+                        }
+                        values.push(
+                            std::str::from_utf8(&data[start..end])
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                    }
+                    string_columns.insert(col_name.clone(), values);
+                }
+                ColumnType::Bool => {
+                    let ColumnData::Bool { data, len } = sliced else {
+                        return Ok(false);
+                    };
+                    let mut values = Vec::with_capacity(live_row_indices_local.len());
+                    for &row_idx in &live_row_indices_local {
+                        if row_idx >= len {
+                            return Ok(false);
+                        }
+                        let byte_idx = row_idx / 8;
+                        let bit_idx = row_idx % 8;
+                        let value = byte_idx < data.len() && ((data[byte_idx] >> bit_idx) & 1 == 1);
+                        values.push(value);
+                    }
+                    bool_columns.insert(col_name.clone(), values);
+                }
+                ColumnType::Binary | ColumnType::FixedList | ColumnType::Float16List => {
+                    return Ok(false);
+                }
+            }
+        }
+
+        drop(deleted);
+        drop(nulls);
+        drop(columns);
+        drop(schema);
+
+        if !pending_ids.is_empty() {
+            self.append_typed_to_delta_with_ids(
+                &pending_ids,
+                &int_columns,
+                &float_columns,
+                &string_columns,
+                &bool_columns,
+            )?;
+        }
+
+        let truncate_bitmap = |bitmap: &mut Vec<u8>, row_count: usize| {
+            let new_len = (row_count + 7) / 8;
+            bitmap.truncate(new_len);
+            if row_count == 0 {
+                bitmap.clear();
+            } else if row_count % 8 != 0 {
+                if let Some(last) = bitmap.last_mut() {
+                    *last &= (1u8 << (row_count % 8)) - 1;
+                }
+            }
+        };
+
+        if pending_start == 0 {
+            self.ids.write().clear();
+            self.columns.write().clear();
+            self.nulls.write().clear();
+            self.deleted.write().clear();
+        } else {
+            self.ids.write().truncate(pending_start);
+            {
+                let mut columns = self.columns.write();
+                for column in columns.iter_mut() {
+                    *column = column.slice_range(0, pending_start);
+                }
+            }
+            {
+                let mut nulls = self.nulls.write();
+                for bitmap in nulls.iter_mut() {
+                    truncate_bitmap(bitmap, pending_start);
+                }
+            }
+            {
+                let mut deleted = self.deleted.write();
+                truncate_bitmap(&mut deleted, pending_start);
+            }
+        }
+        *self.id_to_idx.write() = None;
+        self.pending_rows.store(0, Ordering::SeqCst);
+        Ok(true)
+    }
+
     /// Compact: merge delta file into base file
-    /// 
+    ///
     /// MEMORY EFFICIENT: Uses column-streaming merge.
     /// Processes one column at a time via mmap, never loading all columns simultaneously.
     /// Peak memory ≈ max(single column) + delta data, instead of ALL columns + delta.
-    /// 
+    ///
     /// For a 10M-row × 5-column table, this reduces peak memory from ~800MB to ~160MB.
     pub fn compact(&self) -> io::Result<()> {
         let delta_path = Self::delta_path(&self.path);
         if !delta_path.exists() {
             return Ok(());
         }
-        
+
         self.load_all_columns_into_memory()?;
         self.merge_delta_file(&delta_path)?;
         self.save()?;
-        
+
         // Delete delta file
+        *self.delta_file.write() = None;
         let _ = std::fs::remove_file(&delta_path);
-        
+
         Ok(())
     }
-    
+
     /// Convert an Arrow ArrayRef to ColumnData, preserving nulls.
     fn arrow_array_to_column_data(array: &dyn arrow::array::Array) -> ColumnData {
-        use arrow::array::{Int64Array, Float64Array, StringArray, BooleanArray, BinaryArray, Array};
+        use arrow::array::{
+            Array, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray,
+        };
         use arrow::datatypes::DataType as ArrowDT;
         match array.data_type() {
             ArrowDT::Int64 => {
@@ -1640,43 +2118,54 @@ impl OnDemandStorage {
                 data: vec![0u8; (count + 7) / 8],
                 len: count,
             },
-            ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
-            ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
-            ColumnType::Timestamp | ColumnType::Date => {
-                ColumnData::Int64(vec![0i64; count])
-            }
-            ColumnType::Float64 | ColumnType::Float32 => {
-                ColumnData::Float64(vec![0.0f64; count])
-            }
-            ColumnType::String | ColumnType::StringDict => {
-                ColumnData::String { offsets: vec![0u32; count + 1], data: Vec::new() }
-            }
-            ColumnType::Binary => {
-                ColumnData::Binary { offsets: vec![0u32; count + 1], data: Vec::new() }
-            }
-            ColumnType::FixedList => ColumnData::FixedList { data: Vec::new(), dim: 0 },
-            ColumnType::Float16List => ColumnData::Float16List { data: Vec::new(), dim: 0 },
+            ColumnType::Int64
+            | ColumnType::Int8
+            | ColumnType::Int16
+            | ColumnType::Int32
+            | ColumnType::UInt8
+            | ColumnType::UInt16
+            | ColumnType::UInt32
+            | ColumnType::UInt64
+            | ColumnType::Timestamp
+            | ColumnType::Date => ColumnData::Int64(vec![0i64; count]),
+            ColumnType::Float64 | ColumnType::Float32 => ColumnData::Float64(vec![0.0f64; count]),
+            ColumnType::String | ColumnType::StringDict => ColumnData::String {
+                offsets: vec![0u32; count + 1],
+                data: Vec::new(),
+            },
+            ColumnType::Binary => ColumnData::Binary {
+                offsets: vec![0u32; count + 1],
+                data: Vec::new(),
+            },
+            ColumnType::FixedList => ColumnData::FixedList {
+                data: Vec::new(),
+                dim: 0,
+            },
+            ColumnType::Float16List => ColumnData::Float16List {
+                data: Vec::new(),
+                dim: 0,
+            },
             ColumnType::Null => ColumnData::Int64(vec![0i64; count]),
         }
     }
-    
+
     // compact_column_streaming removed — was legacy dead code (326 lines).
     // save() always produces V4 format; compact() uses in-memory merge path.
-    
+
     /// Read delta file and merge into in-memory columns
     fn merge_delta_file(&self, delta_path: &Path) -> io::Result<()> {
         let mut file = File::open(delta_path)?;
-        
+
         loop {
             // Try to read record count
             let mut count_buf = [0u8; 8];
             match file.read_exact(&mut count_buf) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             }
             let record_count = u64::from_le_bytes(count_buf) as usize;
-            
+
             // Read IDs
             let mut delta_ids = Vec::with_capacity(record_count);
             for _ in 0..record_count {
@@ -1684,7 +2173,7 @@ impl OnDemandStorage {
                 file.read_exact(&mut id_buf)?;
                 delta_ids.push(u64::from_le_bytes(id_buf));
             }
-            
+
             // Read int columns
             let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
             let mut count_buf = [0u8; 4];
@@ -1705,7 +2194,7 @@ impl OnDemandStorage {
                 }
                 int_columns.insert(name, values);
             }
-            
+
             // Read float columns
             let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
             file.read_exact(&mut count_buf)?;
@@ -1725,7 +2214,7 @@ impl OnDemandStorage {
                 }
                 float_columns.insert(name, values);
             }
-            
+
             // Read string columns
             let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
             file.read_exact(&mut count_buf)?;
@@ -1749,7 +2238,7 @@ impl OnDemandStorage {
                 }
                 string_columns.insert(name, values);
             }
-            
+
             // Read bool columns
             let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
             file.read_exact(&mut count_buf)?;
@@ -1769,7 +2258,7 @@ impl OnDemandStorage {
                 }
                 bool_columns.insert(name, values);
             }
-            
+
             // Merge into in-memory columns PRESERVING original delta IDs
             // This is critical for correct ID assignment after delete operations
             self.insert_typed_with_ids(
@@ -1781,10 +2270,10 @@ impl OnDemandStorage {
                 bool_columns,
             )?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Read delta file and return column data without merging into memory
     /// Returns: (delta_ids, column_data_map) where column_data_map is column_name -> ColumnData
     fn read_delta_data(&self) -> io::Result<Option<(Vec<u64>, HashMap<String, ColumnData>)>> {
@@ -1792,28 +2281,28 @@ impl OnDemandStorage {
         if !delta_path.exists() {
             return Ok(None);
         }
-        
+
         let mut file = File::open(&delta_path)?;
         let mut all_ids: Vec<u64> = Vec::new();
         let mut all_columns: HashMap<String, ColumnData> = HashMap::new();
-        
+
         loop {
             // Try to read record count
             let mut count_buf = [0u8; 8];
             match file.read_exact(&mut count_buf) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             }
             let record_count = u64::from_le_bytes(count_buf) as usize;
-            
+
             // Read IDs
             for _ in 0..record_count {
                 let mut id_buf = [0u8; 8];
                 file.read_exact(&mut id_buf)?;
                 all_ids.push(u64::from_le_bytes(id_buf));
             }
-            
+
             // Read int columns
             let mut count_buf4 = [0u8; 4];
             file.read_exact(&mut count_buf4)?;
@@ -1825,15 +2314,17 @@ impl OnDemandStorage {
                 let mut name_buf = vec![0u8; name_len];
                 file.read_exact(&mut name_buf)?;
                 let name = String::from_utf8_lossy(&name_buf).to_string();
-                
-                let col_data = all_columns.entry(name).or_insert_with(|| ColumnData::new(ColumnType::Int64));
+
+                let col_data = all_columns
+                    .entry(name)
+                    .or_insert_with(|| ColumnData::new(ColumnType::Int64));
                 for _ in 0..record_count {
                     let mut v_buf = [0u8; 8];
                     file.read_exact(&mut v_buf)?;
                     col_data.push_i64(i64::from_le_bytes(v_buf));
                 }
             }
-            
+
             // Read float columns
             file.read_exact(&mut count_buf4)?;
             let float_col_count = u32::from_le_bytes(count_buf4) as usize;
@@ -1844,15 +2335,17 @@ impl OnDemandStorage {
                 let mut name_buf = vec![0u8; name_len];
                 file.read_exact(&mut name_buf)?;
                 let name = String::from_utf8_lossy(&name_buf).to_string();
-                
-                let col_data = all_columns.entry(name).or_insert_with(|| ColumnData::new(ColumnType::Float64));
+
+                let col_data = all_columns
+                    .entry(name)
+                    .or_insert_with(|| ColumnData::new(ColumnType::Float64));
                 for _ in 0..record_count {
                     let mut v_buf = [0u8; 8];
                     file.read_exact(&mut v_buf)?;
                     col_data.push_f64(f64::from_le_bytes(v_buf));
                 }
             }
-            
+
             // Read string columns
             file.read_exact(&mut count_buf4)?;
             let string_col_count = u32::from_le_bytes(count_buf4) as usize;
@@ -1863,8 +2356,10 @@ impl OnDemandStorage {
                 let mut name_buf = vec![0u8; name_len];
                 file.read_exact(&mut name_buf)?;
                 let name = String::from_utf8_lossy(&name_buf).to_string();
-                
-                let col_data = all_columns.entry(name).or_insert_with(|| ColumnData::new(ColumnType::String));
+
+                let col_data = all_columns
+                    .entry(name)
+                    .or_insert_with(|| ColumnData::new(ColumnType::String));
                 for _ in 0..record_count {
                     let mut str_len_buf = [0u8; 4];
                     file.read_exact(&mut str_len_buf)?;
@@ -1875,7 +2370,7 @@ impl OnDemandStorage {
                     col_data.push_string(&val);
                 }
             }
-            
+
             // Read bool columns
             file.read_exact(&mut count_buf4)?;
             let bool_col_count = u32::from_le_bytes(count_buf4) as usize;
@@ -1886,8 +2381,10 @@ impl OnDemandStorage {
                 let mut name_buf = vec![0u8; name_len];
                 file.read_exact(&mut name_buf)?;
                 let name = String::from_utf8_lossy(&name_buf).to_string();
-                
-                let col_data = all_columns.entry(name).or_insert_with(|| ColumnData::new(ColumnType::Bool));
+
+                let col_data = all_columns
+                    .entry(name)
+                    .or_insert_with(|| ColumnData::new(ColumnType::Bool));
                 for _ in 0..record_count {
                     let mut v_buf = [0u8; 1];
                     file.read_exact(&mut v_buf)?;
@@ -1895,82 +2392,128 @@ impl OnDemandStorage {
                 }
             }
         }
-        
+
         if all_ids.is_empty() {
             Ok(None)
         } else {
             Ok(Some((all_ids, all_columns)))
         }
     }
-    
+
     /// Get the total row count including delta rows (for accurate row_count reporting)
     fn delta_row_count(&self) -> usize {
         let delta_path = Self::delta_path(&self.path);
         if !delta_path.exists() {
             return 0;
         }
-        
+
         // Quick count without reading all data
         if let Ok(mut file) = File::open(&delta_path) {
             let mut total = 0usize;
             loop {
                 let mut count_buf = [0u8; 8];
                 match file.read_exact(&mut count_buf) {
-                    Ok(_) => {},
+                    Ok(_) => {}
                     Err(_) => break,
                 }
                 let record_count = u64::from_le_bytes(count_buf) as usize;
                 total += record_count;
-                
+
                 // Skip the rest of this record block
                 // IDs
-                if file.seek(SeekFrom::Current((record_count * 8) as i64)).is_err() { break; }
-                
+                if file
+                    .seek(SeekFrom::Current((record_count * 8) as i64))
+                    .is_err()
+                {
+                    break;
+                }
+
                 // Int columns
                 let mut count_buf4 = [0u8; 4];
-                if file.read_exact(&mut count_buf4).is_err() { break; }
+                if file.read_exact(&mut count_buf4).is_err() {
+                    break;
+                }
                 let int_col_count = u32::from_le_bytes(count_buf4) as usize;
                 for _ in 0..int_col_count {
                     let mut len_buf = [0u8; 2];
-                    if file.read_exact(&mut len_buf).is_err() { break; }
+                    if file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
                     let name_len = u16::from_le_bytes(len_buf) as usize;
-                    if file.seek(SeekFrom::Current(name_len as i64 + (record_count * 8) as i64)).is_err() { break; }
+                    if file
+                        .seek(SeekFrom::Current(
+                            name_len as i64 + (record_count * 8) as i64,
+                        ))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-                
+
                 // Float columns
-                if file.read_exact(&mut count_buf4).is_err() { break; }
+                if file.read_exact(&mut count_buf4).is_err() {
+                    break;
+                }
                 let float_col_count = u32::from_le_bytes(count_buf4) as usize;
                 for _ in 0..float_col_count {
                     let mut len_buf = [0u8; 2];
-                    if file.read_exact(&mut len_buf).is_err() { break; }
+                    if file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
                     let name_len = u16::from_le_bytes(len_buf) as usize;
-                    if file.seek(SeekFrom::Current(name_len as i64 + (record_count * 8) as i64)).is_err() { break; }
+                    if file
+                        .seek(SeekFrom::Current(
+                            name_len as i64 + (record_count * 8) as i64,
+                        ))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-                
+
                 // String columns - variable length, need to read each
-                if file.read_exact(&mut count_buf4).is_err() { break; }
+                if file.read_exact(&mut count_buf4).is_err() {
+                    break;
+                }
                 let string_col_count = u32::from_le_bytes(count_buf4) as usize;
                 for _ in 0..string_col_count {
                     let mut len_buf = [0u8; 2];
-                    if file.read_exact(&mut len_buf).is_err() { break; }
+                    if file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
                     let name_len = u16::from_le_bytes(len_buf) as usize;
-                    if file.seek(SeekFrom::Current(name_len as i64)).is_err() { break; }
+                    if file.seek(SeekFrom::Current(name_len as i64)).is_err() {
+                        break;
+                    }
                     for _ in 0..record_count {
                         let mut str_len_buf = [0u8; 4];
-                        if file.read_exact(&mut str_len_buf).is_err() { break; }
+                        if file.read_exact(&mut str_len_buf).is_err() {
+                            break;
+                        }
                         let str_len = u32::from_le_bytes(str_len_buf) as usize;
-                        if file.seek(SeekFrom::Current(str_len as i64)).is_err() { break; }
+                        if file.seek(SeekFrom::Current(str_len as i64)).is_err() {
+                            break;
+                        }
                     }
                 }
-                
+
                 // Bool columns
-                if file.read_exact(&mut count_buf4).is_err() { break; }
+                if file.read_exact(&mut count_buf4).is_err() {
+                    break;
+                }
                 let bool_col_count = u32::from_le_bytes(count_buf4) as usize;
                 for _ in 0..bool_col_count {
                     let mut len_buf = [0u8; 2];
-                    if file.read_exact(&mut len_buf).is_err() { break; }
+                    if file.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
                     let name_len = u16::from_le_bytes(len_buf) as usize;
-                    if file.seek(SeekFrom::Current(name_len as i64 + record_count as i64)).is_err() { break; }
+                    if file
+                        .seek(SeekFrom::Current(name_len as i64 + record_count as i64))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
             total
@@ -1978,5 +2521,4 @@ impl OnDemandStorage {
             0
         }
     }
-
 }

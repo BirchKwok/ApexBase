@@ -56,6 +56,9 @@ except ImportError:
 
 class TestSingleRecordStorage:
     """Test single record storage (dict format)"""
+
+    PERSON_SCHEMA = {"name": "str", "age": "int", "score": "float", "city": "str"}
+    STREAM_SCHEMA = {"name": "str", "seq": "int", "bucket": "str", "score": "float"}
     
     def test_store_single_dict_basic(self):
         """Test storing a single basic dictionary"""
@@ -183,7 +186,7 @@ class TestSingleRecordStorage:
         monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
         with tempfile.TemporaryDirectory() as temp_dir:
             writer = ApexClient(dirpath=temp_dir, durability="fast")
-            writer.create_table("default")
+            writer.create_table("default", schema=self.PERSON_SCHEMA)
             writer.store({"name": ["seed"], "age": [1], "score": [1.0], "city": ["BJ"]})
 
             writer.store({"name": "shared_memtable", "age": 2, "score": 2.0, "city": "SH"})
@@ -201,7 +204,7 @@ class TestSingleRecordStorage:
         monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
         with tempfile.TemporaryDirectory() as temp_dir:
             writer = ApexClient(dirpath=temp_dir, durability="fast")
-            writer.create_table("default")
+            writer.create_table("default", schema=self.PERSON_SCHEMA)
             writer.store({"name": ["seed"], "age": [1], "score": [1.0], "city": ["BJ"]})
 
             writer.store({"name": "pending_memtable", "age": 2, "score": 2.0, "city": "SH"})
@@ -268,7 +271,7 @@ class TestSingleRecordStorage:
         monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, durability="fast")
-            client.create_table("default")
+            client.create_table("default", schema=self.PERSON_SCHEMA)
             client.store({"name": ["seed"], "age": [1], "score": [1.0], "city": ["BJ"]})
 
             client.store({"name": "m2", "age": 2, "score": 2.0, "city": "SH"})
@@ -303,7 +306,7 @@ class TestSingleRecordStorage:
         monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, durability="fast")
-            client.create_table("default")
+            client.create_table("default", schema=self.PERSON_SCHEMA)
             client.store({"name": ["seed"], "age": [1], "score": [1.0], "city": ["BJ"]})
 
             client.store({"name": "pending_delete", "age": 2, "score": 2.0, "city": "SH"})
@@ -324,6 +327,35 @@ class TestSingleRecordStorage:
             assert reopened.count_rows() == 1
             assert reopened.retrieve(1)["name"] == "seed"
             assert reopened.retrieve(2) is None
+            reopened.close()
+
+    def test_fast_delete_then_sql_update_same_id_stays_deleted(self, monkeypatch):
+        """Deleting a row must not let a later SQL UPDATE resurrect it."""
+        monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir, durability="fast")
+            client.create_table("default")
+            client.store({"name": ["seed"], "age": [1], "score": [1.0], "city": ["BJ"]})
+
+            assert client.retrieve(1)["name"] == "seed"
+            assert client.delete(1) is True
+            assert client.count_rows() == 0
+            assert client.retrieve(1) is None
+
+            updated = client.execute(
+                "UPDATE default SET score = 9.0 WHERE _id = 1"
+            ).scalar()
+            assert updated == 0
+            assert client.count_rows() == 0
+            assert client.retrieve(1) is None
+
+            client.flush()
+            client.close()
+
+            reopened = ApexClient(dirpath=temp_dir)
+            reopened.use_table("default")
+            assert reopened.count_rows() == 0
+            assert reopened.retrieve(1) is None
             reopened.close()
 
     def test_fast_replace_exact_schema_uses_delta_overlay(self, monkeypatch):
@@ -367,7 +399,7 @@ class TestSingleRecordStorage:
         monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, durability="fast")
-            client.create_table("default")
+            client.create_table("default", schema=self.PERSON_SCHEMA)
             client.store({
                 "name": ["alice", "bob", "charlie"],
                 "age": [25, 30, 35],
@@ -409,7 +441,7 @@ class TestSingleRecordStorage:
         monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, durability="fast")
-            client.create_table("default")
+            client.create_table("default", schema=self.STREAM_SCHEMA)
             client.store({
                 "name": ["seed_0", "seed_1"],
                 "seq": [0, 1],
@@ -461,7 +493,7 @@ class TestSingleRecordStorage:
         monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, durability="fast")
-            client.create_table("default")
+            client.create_table("default", schema=self.STREAM_SCHEMA)
             client.store({
                 "name": ["base_0", "base_1", "base_2"],
                 "seq": [0, 1, 2],
@@ -516,7 +548,7 @@ class TestSingleRecordStorage:
         monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
         with tempfile.TemporaryDirectory() as temp_dir:
             writer = ApexClient(dirpath=temp_dir, durability="fast")
-            writer.create_table("default")
+            writer.create_table("default", schema=self.STREAM_SCHEMA)
             writer.store({
                 "name": ["base_0", "base_1"],
                 "seq": [0, 1],
@@ -557,7 +589,7 @@ class TestSingleRecordStorage:
         monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir, durability="fast")
-            client.create_table("default")
+            client.create_table("default", schema=self.STREAM_SCHEMA)
             client.store({
                 "name": ["seed"],
                 "seq": [0],

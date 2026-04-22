@@ -4284,6 +4284,124 @@ impl OnDemandStorage {
     /// Overwrite one numeric cell by `_id` using the V4 row-group id section.
     /// Returns None unless the target row exists, is active, and the SET column is
     /// PLAIN numeric in an uncompressed RCIX row group.
+    pub fn locate_numeric_cell_for_update(
+        &self,
+        id: u64,
+        set_col: &str,
+    ) -> io::Result<Option<(u64, u64, u8, u64)>> {
+        if set_col == "_id" {
+            return Ok(None);
+        }
+
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let footer_offset = self.footer_offset_hint();
+        if footer_offset == 0 {
+            return Ok(None);
+        }
+
+        let schema = &footer.schema;
+        let set_idx = match schema.get_index(set_col) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let set_type = schema.columns[set_idx].1;
+        let is_numeric = matches!(
+            set_type,
+            ColumnType::Int64
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Timestamp
+                | ColumnType::Date
+                | ColumnType::Float64
+                | ColumnType::Float32
+        );
+        if !is_numeric {
+            return Ok(None);
+        }
+
+        let (rg_i, rg_meta) = match footer
+            .row_groups
+            .iter()
+            .enumerate()
+            .find(|(_, rg)| rg.min_id <= id && id <= rg.max_id && rg.row_count > 0)
+        {
+            Some(v) => v,
+            None => return Ok(Some((footer_offset, 0, 0, 0))),
+        };
+        if rg_i >= footer.col_offsets.len() || set_idx >= footer.col_offsets[rg_i].len() {
+            return Ok(None);
+        }
+
+        let rg_rows = rg_meta.row_count as usize;
+        let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        if rg_end > mmap_ref.len() {
+            return Ok(None);
+        }
+
+        let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+        let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { 1 };
+        let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+        if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
+            return Ok(None);
+        }
+
+        let body = &rg_bytes[32..];
+        let guess = id.saturating_sub(rg_meta.min_id) as usize;
+        if guess >= rg_rows {
+            return Ok(Some((footer_offset, 0, 0, 0)));
+        }
+        let id_start = guess * 8;
+        if id_start + 8 > body.len() {
+            return Ok(None);
+        }
+        let actual_id = u64::from_le_bytes(body[id_start..id_start + 8].try_into().unwrap());
+        if actual_id != id {
+            return Ok(None);
+        }
+
+        let bitmap_len = (rg_rows + 7) / 8;
+        let del_off = rg_rows * 8 + guess / 8;
+        if del_off >= body.len() {
+            return Ok(None);
+        }
+        if ((body[del_off] >> (guess % 8)) & 1) == 1 {
+            return Ok(Some((footer_offset, 0, 0, 0)));
+        }
+
+        let set_col_off = footer.col_offsets[rg_i][set_idx] as usize;
+        if set_col_off + bitmap_len + 1 + 8 > body.len() {
+            return Ok(None);
+        }
+        let set_data = &body[set_col_off + bitmap_len..];
+        if set_data.is_empty() || set_data[0] != COL_ENCODING_PLAIN {
+            return Ok(None);
+        }
+
+        let value_file_offset =
+            rg_meta.offset + 32 + (set_col_off + bitmap_len + 1 + 8 + guess * 8) as u64;
+        let null_byte_file_offset = rg_meta.offset + 32 + (set_col_off + guess / 8) as u64;
+        Ok(Some((
+            footer_offset,
+            null_byte_file_offset,
+            1u8 << (guess % 8),
+            value_file_offset,
+        )))
+    }
+
     pub fn update_by_id_inplace(
         &self,
         id: u64,
@@ -4400,10 +4518,18 @@ impl OnDemandStorage {
         }
 
         use std::io::{Seek, SeekFrom, Write};
-        let mut write_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)?;
+        let mut write_file_guard = self.write_file.write();
+        if write_file_guard.is_none() {
+            *write_file_guard = Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&self.path)?,
+            );
+        }
+        let write_file = write_file_guard
+            .as_mut()
+            .ok_or_else(|| err_not_conn("Write file not open"))?;
         let mut null_byte = null_byte;
         null_byte &= !(1u8 << (guess % 8));
         write_file.seek(SeekFrom::Start(null_byte_file_offset))?;
@@ -4413,6 +4539,60 @@ impl OnDemandStorage {
 
         drop(mmap_guard);
         drop(file_guard);
+        Ok(Some((1, true)))
+    }
+
+    pub fn update_numeric_cell_cached(
+        &self,
+        footer_offset: u64,
+        null_byte_file_offset: u64,
+        null_mask: u8,
+        value_file_offset: u64,
+        new_value_bytes: &[u8; 8],
+    ) -> io::Result<Option<(i64, bool)>> {
+        if footer_offset == 0 || self.footer_offset_hint() != footer_offset {
+            return Ok(None);
+        }
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open"))?;
+
+        let mut null_byte = [0u8; 1];
+        pread_fallback(file, &mut null_byte, null_byte_file_offset)?;
+        if (null_byte[0] & null_mask) != 0 {
+            return Ok(Some((0, false)));
+        }
+
+        let mut current = [0u8; 8];
+        pread_fallback(file, &mut current, value_file_offset)?;
+        if current == *new_value_bytes {
+            return Ok(Some((1, false)));
+        }
+
+        use std::io::{Seek, SeekFrom, Write};
+        let mut write_file_guard = self.write_file.write();
+        if write_file_guard.is_none() {
+            *write_file_guard = Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&self.path)?,
+            );
+        }
+        let write_file = write_file_guard
+            .as_mut()
+            .ok_or_else(|| err_not_conn("Write file not open"))?;
+
+        let updated_null = null_byte[0] & !null_mask;
+        if updated_null != null_byte[0] {
+            write_file.seek(SeekFrom::Start(null_byte_file_offset))?;
+            write_file.write_all(&[updated_null])?;
+        }
+        write_file.seek(SeekFrom::Start(value_file_offset))?;
+        write_file.write_all(new_value_bytes)?;
+
         Ok(Some((1, true)))
     }
 

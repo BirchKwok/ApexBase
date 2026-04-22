@@ -73,12 +73,31 @@ pub enum QuerySignature {
         value: String,
     },
 
+    /// `SELECT * FROM <table> WHERE col = 'val' LIMIT N [OFFSET M]` — early-terminating string equality scan
+    StringEqualityFilterLimit {
+        table: Option<String>,
+        column: String,
+        value: String,
+        limit: usize,
+        offset: usize,
+    },
+
     /// `SELECT col1, col2 FROM <table> WHERE filter_col = 'val'` — projected string equality scan
     ProjectedStringEqualityFilter {
         table: Option<String>,
         columns: Vec<String>,
         column: String,
         value: String,
+    },
+
+    /// `SELECT col1, col2 FROM <table> WHERE filter_col = 'val' LIMIT N [OFFSET M]` — projected early-terminating string equality scan
+    ProjectedStringEqualityFilterLimit {
+        table: Option<String>,
+        columns: Vec<String>,
+        column: String,
+        value: String,
+        limit: usize,
+        offset: usize,
     },
 
     /// `SELECT * FROM <table> WHERE col LIKE 'pattern'` — mmap LIKE scan
@@ -132,7 +151,9 @@ impl QuerySignature {
                 | QuerySignature::SimpleScanLimit { .. }
                 | QuerySignature::ProjectedScanLimit { .. }
                 | QuerySignature::StringEqualityFilter { .. }
+                | QuerySignature::StringEqualityFilterLimit { .. }
                 | QuerySignature::ProjectedStringEqualityFilter { .. }
+                | QuerySignature::ProjectedStringEqualityFilterLimit { .. }
                 | QuerySignature::LikeFilter { .. }
                 | QuerySignature::TableFunction
                 | QuerySignature::Explain
@@ -174,7 +195,9 @@ impl QuerySignature {
                 | QuerySignature::SimpleScanLimit { .. }
                 | QuerySignature::ProjectedScanLimit { .. }
                 | QuerySignature::StringEqualityFilter { .. }
+                | QuerySignature::StringEqualityFilterLimit { .. }
                 | QuerySignature::ProjectedStringEqualityFilter { .. }
+                | QuerySignature::ProjectedStringEqualityFilterLimit { .. }
                 | QuerySignature::LikeFilter { .. }
         )
     }
@@ -353,7 +376,6 @@ pub fn classify(sql: &str) -> QuerySignature {
         }
 
         if has_where
-            && !has_limit
             && !has_order
             && !has_group
             && !has_join
@@ -364,6 +386,20 @@ pub fn classify(sql: &str) -> QuerySignature {
             && !su.contains(" LIKE ")
             && s.contains('\'')
         {
+            if has_limit {
+                if let Some((column, value, limit, offset)) =
+                    extract_string_equality_with_limit(s, su)
+                {
+                    return QuerySignature::ProjectedStringEqualityFilterLimit {
+                        table: extract_from_table(s, su),
+                        columns,
+                        column,
+                        value,
+                        limit,
+                        offset,
+                    };
+                }
+            }
             if let Some((column, value)) = extract_string_equality(s, su) {
                 return QuerySignature::ProjectedStringEqualityFilter {
                     table: extract_from_table(s, su),
@@ -409,7 +445,6 @@ pub fn classify(sql: &str) -> QuerySignature {
     // ── String equality: SELECT * ... WHERE col = 'val' (no LIMIT/ORDER/GROUP/JOIN/BETWEEN/IN) ──
     if is_exact_star_select
         && has_where
-        && !has_limit
         && !has_order
         && !has_group
         && !has_join
@@ -420,6 +455,17 @@ pub fn classify(sql: &str) -> QuerySignature {
         && !su.contains(" LIKE ")
         && s.contains('\'')
     {
+        if has_limit {
+            if let Some((col, val, limit, offset)) = extract_string_equality_with_limit(s, su) {
+                return QuerySignature::StringEqualityFilterLimit {
+                    table: extract_from_table(s, su),
+                    column: col,
+                    value: val,
+                    limit,
+                    offset,
+                };
+            }
+        }
         if let Some((col, val)) = extract_string_equality(s, su) {
             return QuerySignature::StringEqualityFilter {
                 table: extract_from_table(s, su),
@@ -618,6 +664,33 @@ fn has_exact_star_projection(sql: &str, su: &str) -> bool {
 fn extract_string_equality(sql: &str, su: &str) -> Option<(String, String)> {
     let where_pos = su.find("WHERE")?;
     let after_where = sql[where_pos + 5..].trim().trim_end_matches(';');
+    parse_string_equality_clause(after_where)
+}
+
+/// Extract (column, value, limit, offset) from
+/// `WHERE col = 'val' LIMIT N [OFFSET M]`.
+fn extract_string_equality_with_limit(
+    sql: &str,
+    su: &str,
+) -> Option<(String, String, usize, usize)> {
+    let where_pos = su.find("WHERE")?;
+    let limit_pos = su.rfind("LIMIT")?;
+    if limit_pos <= where_pos {
+        return None;
+    }
+
+    let where_clause = sql[where_pos + 5..limit_pos].trim();
+    let (column, value) = parse_string_equality_clause(where_clause)?;
+    let after_limit = sql[limit_pos + "LIMIT".len()..]
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let (limit, offset) = parse_limit_offset_clause(after_limit)?;
+    Some((column, value, limit, offset))
+}
+
+fn parse_string_equality_clause(clause: &str) -> Option<(String, String)> {
+    let after_where = clause.trim();
     let eq_pos = after_where.find('=')?;
     let col = after_where[..eq_pos].trim().trim_matches('"').to_string();
     if col.contains(' ') || col.contains('(') {
@@ -634,6 +707,23 @@ fn extract_string_equality(sql: &str, su: &str) -> Option<(String, String)> {
         return None;
     }
     Some((col, val))
+}
+
+fn parse_limit_offset_clause(clause: &str) -> Option<(usize, usize)> {
+    let mut parts = clause.split_whitespace();
+    let limit = parts.next()?.parse::<usize>().ok()?;
+    let offset = match parts.next() {
+        None => 0,
+        Some(keyword) if keyword.eq_ignore_ascii_case("OFFSET") => {
+            let parsed = parts.next()?.parse::<usize>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            parsed
+        }
+        Some(_) => return None,
+    };
+    Some((limit, offset))
 }
 
 /// Extract table name from `FROM <table>` clause using original-case SQL + uppercased version.
@@ -900,6 +990,27 @@ mod tests {
                 columns: vec!["name".to_string()],
                 column: "city".to_string(),
                 value: "NYC".to_string(),
+            }
+        );
+        assert_eq!(
+            classify("SELECT * FROM t WHERE city = 'NYC' LIMIT 1"),
+            QuerySignature::StringEqualityFilterLimit {
+                table: Some("t".to_string()),
+                column: "city".to_string(),
+                value: "NYC".to_string(),
+                limit: 1,
+                offset: 0,
+            }
+        );
+        assert_eq!(
+            classify("SELECT name FROM t WHERE city = 'NYC' LIMIT 5 OFFSET 2"),
+            QuerySignature::ProjectedStringEqualityFilterLimit {
+                table: Some("t".to_string()),
+                columns: vec!["name".to_string()],
+                column: "city".to_string(),
+                value: "NYC".to_string(),
+                limit: 5,
+                offset: 2,
             }
         );
     }

@@ -30,6 +30,8 @@ static GLOBAL_DICT_CACHE: once_cell::sync::Lazy<
     RwLock<HashMap<(PathBuf, String), (SystemTime, Arc<(Vec<String>, Vec<u16>)>)>>,
 > = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
+type FirstStringRowIdCache = ahash::AHashMap<Box<str>, u64>;
+
 /// Get or build a global dict cache entry. Returns Arc to avoid cloning 1M+ entries.
 pub fn get_global_dict_cache(
     path: &Path,
@@ -389,6 +391,9 @@ pub struct TableStorageBackend {
     /// Cached string dictionary indices for GROUP BY acceleration
     /// col_name -> (dict_strings, group_ids)
     dict_cache: RwLock<HashMap<String, (Vec<String>, Vec<u16>)>>,
+    /// High-cardinality string equality accelerator for `WHERE col = 'x' LIMIT 1`.
+    /// Stores the first active row id for each distinct string value.
+    first_string_row_id_cache: RwLock<HashMap<String, Arc<FirstStringRowIdCache>>>,
 }
 
 impl TableStorageBackend {
@@ -409,6 +414,7 @@ impl TableStorageBackend {
             row_count: RwLock::new(row_count),
             dirty: RwLock::new(false),
             dict_cache: RwLock::new(HashMap::new()),
+            first_string_row_id_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -442,6 +448,7 @@ impl TableStorageBackend {
             row_count: RwLock::new(0),
             dirty: RwLock::new(false),
             dict_cache: RwLock::new(HashMap::new()),
+            first_string_row_id_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -744,6 +751,49 @@ impl TableStorageBackend {
         total
     }
 
+    #[inline]
+    fn invalidate_query_caches(&self) {
+        self.cached_columns.write().clear();
+        self.dict_cache.write().clear();
+        self.first_string_row_id_cache.write().clear();
+        invalidate_global_dict_cache(self.path());
+    }
+
+    fn get_or_build_first_string_row_id_cache(
+        &self,
+        col_name: &str,
+    ) -> io::Result<Option<Arc<FirstStringRowIdCache>>> {
+        {
+            let cache = self.first_string_row_id_cache.read();
+            if let Some(cached) = cache.get(col_name) {
+                return Ok(Some(Arc::clone(cached)));
+            }
+        }
+
+        let built = match self.storage.build_first_string_row_id_cache(col_name)? {
+            Some(cache) => Arc::new(cache),
+            None => return Ok(None),
+        };
+
+        let mut caches = self.first_string_row_id_cache.write();
+        if let Some(existing) = caches.get(col_name) {
+            return Ok(Some(Arc::clone(existing)));
+        }
+        caches.insert(col_name.to_string(), Arc::clone(&built));
+        Ok(Some(built))
+    }
+
+    #[inline]
+    pub fn first_row_id_for_string_eq(
+        &self,
+        col_name: &str,
+        value: &str,
+    ) -> io::Result<Option<u64>> {
+        Ok(self
+            .get_or_build_first_string_row_id_cache(col_name)?
+            .and_then(|cache| cache.get(value).copied()))
+    }
+
     // ========================================================================
     // Write APIs
     // ========================================================================
@@ -828,7 +878,7 @@ impl TableStorageBackend {
         *self.row_count.write() += rows.len() as u64;
 
         // Invalidate cache (data changed)
-        self.cached_columns.write().clear();
+        self.invalidate_query_caches();
         *self.dirty.write() = true;
 
         Ok(ids)
@@ -887,7 +937,7 @@ impl TableStorageBackend {
         *self.row_count.write() += ids.len() as u64;
 
         // Invalidate cache (data changed)
-        self.cached_columns.write().clear();
+        self.invalidate_query_caches();
         *self.dirty.write() = true;
 
         Ok(ids)
@@ -947,7 +997,7 @@ impl TableStorageBackend {
         *self.row_count.write() += ids.len() as u64;
 
         // Invalidate cache (data changed)
-        self.cached_columns.write().clear();
+        self.invalidate_query_caches();
         *self.dirty.write() = true;
 
         Ok(ids)
@@ -1009,14 +1059,31 @@ impl TableStorageBackend {
         }
 
         *self.row_count.write() += ids.len() as u64;
-        self.cached_columns.write().clear();
+        self.invalidate_query_caches();
         *self.dirty.write() = true;
         Ok(ids)
     }
 
     /// Save changes to disk
     pub fn save(&self) -> io::Result<()> {
+        if self.storage.pending_v4_in_memory_rows() > 0
+            && self.storage.spill_pending_v4_rows_to_delta()?
+        {
+            if self.has_pending_deltas() {
+                self.storage.save_delta_store()?;
+            }
+            self.invalidate_query_caches();
+            *self.dirty.write() = false;
+            return Ok(());
+        }
         self.storage.save()?;
+        *self.dirty.write() = false;
+        Ok(())
+    }
+
+    /// Force a full base-file rewrite instead of using append-only spill fast paths.
+    pub fn save_full(&self) -> io::Result<()> {
+        self.storage.save_full()?;
         *self.dirty.write() = false;
         Ok(())
     }
@@ -1042,12 +1109,14 @@ impl TableStorageBackend {
         values: &std::collections::HashMap<String, crate::data::Value>,
     ) {
         self.storage.delta_update_row(row_id, values);
+        self.invalidate_query_caches();
     }
 
     /// Record a row deletion in DeltaStore without rewriting the base file.
     pub fn delta_delete_row(&self, row_id: u64) -> io::Result<bool> {
         let result = self.storage.delta_delete_row(row_id)?;
         if result {
+            self.invalidate_query_caches();
             *self.dirty.write() = true;
         }
         Ok(result)
@@ -1057,6 +1126,7 @@ impl TableStorageBackend {
     pub fn delete_pending_v4_in_memory_row(&self, row_id: u64) -> bool {
         let result = self.storage.delete_pending_v4_in_memory_row(row_id);
         if result {
+            self.invalidate_query_caches();
             *self.dirty.write() = true;
         }
         result
@@ -1070,6 +1140,7 @@ impl TableStorageBackend {
     ) -> io::Result<bool> {
         let result = self.storage.delta_update_existing_row(row_id, values)?;
         if result {
+            self.invalidate_query_caches();
             *self.dirty.write() = true;
         }
         Ok(result)
@@ -1078,6 +1149,7 @@ impl TableStorageBackend {
     /// Batch update multiple rows in a single lock acquisition.
     pub fn delta_batch_update_rows(&self, batch: &[(u64, &str, crate::data::Value)]) {
         self.storage.delta_batch_update_rows(batch);
+        self.invalidate_query_caches();
     }
 
     /// Scan a numeric column for rows in [low, high] and return matching row IDs.
@@ -1114,8 +1186,13 @@ impl TableStorageBackend {
         set_col: &str,
         new_value_bytes: &[u8; 8],
     ) -> io::Result<Option<(i64, bool)>> {
-        self.storage
-            .update_by_id_inplace(id, set_col, new_value_bytes)
+        let result = self
+            .storage
+            .update_by_id_inplace(id, set_col, new_value_bytes)?;
+        if matches!(result, Some((_, true))) {
+            self.storage.mark_sync_pending();
+        }
+        Ok(result)
     }
 
     /// O(1) existence check for a V4 `_id` using row-group id/deletion sections.
@@ -1151,7 +1228,9 @@ impl TableStorageBackend {
 
     /// Compact deltas into the base file (merge updates, apply deletes, rewrite).
     pub fn compact_deltas(&self) -> io::Result<()> {
-        self.storage.compact_deltas()
+        self.storage.compact_deltas()?;
+        self.invalidate_query_caches();
+        Ok(())
     }
 
     /// Explicitly sync data to disk (fsync)
@@ -1220,6 +1299,7 @@ impl TableStorageBackend {
     pub fn delete(&self, id: u64) -> bool {
         let result = self.storage.delete(id);
         if result {
+            self.invalidate_query_caches();
             *self.dirty.write() = true;
         }
         result
@@ -1229,6 +1309,7 @@ impl TableStorageBackend {
     pub fn delete_batch(&self, ids: &[u64]) -> bool {
         let result = self.storage.delete_batch(ids);
         if result {
+            self.invalidate_query_caches();
             *self.dirty.write() = true;
         }
         result
@@ -1286,8 +1367,7 @@ impl TableStorageBackend {
         let result = self.storage.replace(id, &cv_data)?;
         if result {
             *self.dirty.write() = true;
-            // Invalidate cache
-            self.cached_columns.write().clear();
+            self.invalidate_query_caches();
             // Update row count
             *self.row_count.write() = self.storage.row_count();
         }
@@ -1317,6 +1397,7 @@ impl TableStorageBackend {
         // Update our schema cache
         let mut schema = self.schema.write();
         schema.push((name.to_string(), dtype));
+        self.invalidate_query_caches();
         *self.dirty.write() = true;
         Ok(())
     }
@@ -1333,6 +1414,7 @@ impl TableStorageBackend {
             schema.remove(idx);
         }
 
+        self.invalidate_query_caches();
         *self.dirty.write() = true;
         Ok(())
     }
@@ -1360,6 +1442,7 @@ impl TableStorageBackend {
         // Also update the underlying OnDemandStorage schema so that
         // save() and update_v4_footer_schema() persist the new name.
         self.storage.rename_column_in_schema(old_name, new_name);
+        self.invalidate_query_caches();
         Ok(())
     }
 
@@ -2342,6 +2425,205 @@ impl TableStorageBackend {
         Ok(Some(batch))
     }
 
+    /// Read a single row by ID with projection, reusing the point-lookup path.
+    pub fn read_row_by_id_projected_to_arrow(
+        &self,
+        id: u64,
+        column_names: &[&str],
+    ) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
+        use crate::data::Value;
+        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use std::sync::Arc;
+
+        if column_names.is_empty() {
+            let schema = Arc::new(Schema::new(Vec::<Field>::new()));
+            return Ok(Some(arrow::record_batch::RecordBatch::new_empty(schema)));
+        }
+
+        if column_names.len() == 1 && column_names[0] == "_id" {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "_id",
+                ArrowDataType::Int64,
+                false,
+            )]));
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                schema,
+                vec![Arc::new(Int64Array::from(vec![id as i64]))],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            return Ok(Some(batch));
+        }
+
+        let requested_cols: Vec<&str> = column_names
+            .iter()
+            .copied()
+            .filter(|name| *name != "_id")
+            .collect();
+
+        if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
+            if let Some(row_vals) = self.storage.retrieve_rcix_projected(id, column_names)? {
+                let schema = self.schema.read();
+                let mut fields: Vec<Field> = Vec::with_capacity(row_vals.len());
+                let mut arrays: Vec<ArrayRef> = Vec::with_capacity(fields.capacity());
+
+                for (col_name, value) in row_vals {
+                    let nullable = col_name != "_id";
+                    let (arrow_dt, array): (ArrowDataType, ArrayRef) = match value {
+                        Value::Int64(v) => {
+                            (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![v])))
+                        }
+                        Value::Float64(v) => (
+                            ArrowDataType::Float64,
+                            Arc::new(Float64Array::from(vec![v])),
+                        ),
+                        Value::String(s) => (
+                            ArrowDataType::Utf8,
+                            Arc::new(StringArray::from(vec![s.as_str()])),
+                        ),
+                        Value::Bool(v) => (
+                            ArrowDataType::Boolean,
+                            Arc::new(BooleanArray::from(vec![v])),
+                        ),
+                        Value::Binary(bytes) => {
+                            use arrow::array::BinaryArray;
+                            (
+                                ArrowDataType::Binary,
+                                Arc::new(BinaryArray::from(vec![Some(bytes.as_slice())])),
+                            )
+                        }
+                        Value::Null => {
+                            let dt = schema
+                                .iter()
+                                .find(|(name, _)| name == &col_name)
+                                .map(|(_, dt)| dt.clone())
+                                .unwrap_or(crate::data::DataType::String);
+                            Self::create_typed_null_array(&dt)
+                        }
+                        _ => {
+                            let dt = schema
+                                .iter()
+                                .find(|(name, _)| name == &col_name)
+                                .map(|(_, dt)| dt.clone())
+                                .unwrap_or(crate::data::DataType::String);
+                            Self::create_typed_null_array(&dt)
+                        }
+                    };
+                    fields.push(Field::new(&col_name, arrow_dt, nullable));
+                    arrays.push(array);
+                }
+
+                let schema = Arc::new(Schema::new(fields));
+                let batch = arrow::record_batch::RecordBatch::try_new(schema, arrays)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                return Ok(Some(batch));
+            }
+            return Ok(None);
+        }
+
+        let row_data = match self
+            .storage
+            .read_row_by_id(id, Some(requested_cols.as_slice()))?
+        {
+            Some(data) => data,
+            None => return Ok(None),
+        };
+
+        let schema = self.schema.read();
+        let include_id = column_names.contains(&"_id");
+        let mut fields: Vec<Field> =
+            Vec::with_capacity(requested_cols.len() + usize::from(include_id));
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(fields.capacity());
+
+        if include_id {
+            fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            arrays.push(Arc::new(Int64Array::from(vec![id as i64])));
+        }
+
+        for &col_name in &requested_cols {
+            let dt = match schema.iter().find(|(name, _)| name == col_name) {
+                Some((_, dt)) => dt,
+                None => continue,
+            };
+
+            let (arrow_dt, array): (ArrowDataType, ArrayRef) = if let Some(col_data) =
+                row_data.get(col_name)
+            {
+                match col_data {
+                    ColumnData::Int64(values) if !values.is_empty() => (
+                        ArrowDataType::Int64,
+                        Arc::new(Int64Array::from(vec![values[0]])),
+                    ),
+                    ColumnData::Float64(values) if !values.is_empty() => (
+                        ArrowDataType::Float64,
+                        Arc::new(Float64Array::from(vec![values[0]])),
+                    ),
+                    ColumnData::String {
+                        offsets,
+                        data: bytes,
+                    } if offsets.len() > 1 => {
+                        let start = offsets[0] as usize;
+                        let end = offsets[1] as usize;
+                        let s = std::str::from_utf8(&bytes[start..end]).ok();
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![s])))
+                    }
+                    ColumnData::Bool { data: packed, len } if *len > 0 => {
+                        let val = !packed.is_empty() && (packed[0] & 1) == 1;
+                        (
+                            ArrowDataType::Boolean,
+                            Arc::new(BooleanArray::from(vec![Some(val)])),
+                        )
+                    }
+                    ColumnData::Binary {
+                        offsets,
+                        data: bytes,
+                    } if offsets.len() > 1 => {
+                        use arrow::array::BinaryArray;
+                        let start = offsets[0] as usize;
+                        let end = offsets[1] as usize;
+                        (
+                            ArrowDataType::Binary,
+                            Arc::new(BinaryArray::from(vec![Some(&bytes[start..end] as &[u8])])),
+                        )
+                    }
+                    ColumnData::StringDict {
+                        indices,
+                        dict_offsets,
+                        dict_data,
+                    } if !indices.is_empty() => {
+                        let idx = indices[0];
+                        let s = if idx == 0 {
+                            None
+                        } else {
+                            let dict_idx = (idx - 1) as usize;
+                            if dict_idx + 1 < dict_offsets.len() {
+                                let start = dict_offsets[dict_idx] as usize;
+                                let end = dict_offsets[dict_idx + 1] as usize;
+                                std::str::from_utf8(&dict_data[start..end])
+                                    .ok()
+                                    .map(|v| v.to_string())
+                            } else {
+                                None
+                            }
+                        };
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(vec![s])))
+                    }
+                    _ => Self::create_typed_null_array(dt),
+                }
+            } else {
+                Self::create_typed_null_array(dt)
+            };
+
+            fields.push(Field::new(col_name, arrow_dt, true));
+            arrays.push(array);
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let batch = arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(Some(batch))
+    }
+
     /// Batch retrieve multiple rows by IDs.
     /// Fast path: retrieve_many_mmap (one footer lock + one mmap slice per RG).
     /// Fallback: per-ID retrieve_rcix loop (for non-RCIX files).
@@ -2696,35 +2978,22 @@ impl TableStorageBackend {
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
-        // V4 mmap-only: fall back to full batch read + Arrow filter
-        if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
-            let full_batch = self.read_columns_to_arrow(column_names, 0, None)?;
-            if full_batch.num_rows() == 0 {
-                return Ok(full_batch);
-            }
-            if let Some(col) = full_batch.column_by_name(filter_column) {
-                if let Some(str_arr) = col.as_any().downcast_ref::<StringArray>() {
-                    let mask: arrow::array::BooleanArray = str_arr
-                        .iter()
-                        .map(|v| {
-                            v.map(|s| {
-                                if filter_eq {
-                                    s == filter_value
-                                } else {
-                                    s != filter_value
-                                }
-                            })
-                        })
-                        .collect();
-                    let filtered = arrow::compute::filter_record_batch(&full_batch, &mask)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                    // Apply offset + limit
-                    let start = offset.min(filtered.num_rows());
-                    let len = limit.min(filtered.num_rows().saturating_sub(start));
-                    return Ok(filtered.slice(start, len));
+        if filter_eq && limit == 1 && offset == 0 {
+            if let Some(cache) = self.get_or_build_first_string_row_id_cache(filter_column)? {
+                if let Some(&row_id) = cache.get(filter_value) {
+                    let batch = if let Some(cols) = column_names {
+                        self.read_row_by_id_projected_to_arrow(row_id, cols)?
+                    } else {
+                        self.read_row_by_id_to_arrow(row_id)?
+                    };
+                    if let Some(batch) = batch {
+                        return Ok(batch);
+                    }
+                    self.first_string_row_id_cache.write().remove(filter_column);
+                } else {
+                    return self.read_columns_to_arrow(column_names, 0, Some(0));
                 }
             }
-            return Ok(full_batch);
         }
 
         let (col_data, matching_indices) = self.storage.read_columns_filtered_string_with_limit(
@@ -3119,8 +3388,11 @@ impl TableStorageBackend {
         let result = self
             .storage
             .delete_where_numeric_range_inplace(col_name, low, high)?;
-        if result.is_some() {
+        if let Some(count) = result {
             *self.dirty.write() = false; // written directly to disk
+            if count > 0 {
+                self.storage.mark_sync_pending();
+            }
         }
         Ok(result)
     }
@@ -3129,8 +3401,11 @@ impl TableStorageBackend {
     /// Returns `Some(newly_deleted)` on success, `None` if fast path unavailable.
     pub fn delete_ids_inplace_v4(&self, ids: &[u64]) -> io::Result<Option<i64>> {
         let result = self.storage.delete_ids_inplace_v4(ids)?;
-        if result.is_some() {
+        if let Some(count) = result {
             *self.dirty.write() = false;
+            if count > 0 {
+                self.storage.mark_sync_pending();
+            }
         }
         Ok(result)
     }
@@ -3208,13 +3483,6 @@ impl TableStorageBackend {
         use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
-
-        // V4 mmap-only: fall back to full batch read + Arrow filter
-        if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
-            // Delegate to the non-fast-path: read full batch, caller will apply WHERE
-            let full_batch = self.read_columns_to_arrow(column_names, 0, None)?;
-            return Ok(full_batch);
-        }
 
         let (col_data, matching_indices) = self
             .storage

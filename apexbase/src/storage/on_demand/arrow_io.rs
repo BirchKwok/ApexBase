@@ -2430,6 +2430,126 @@ impl OnDemandStorage {
         self.read_columns_filtered_string(column_names, filter_column, filter_value, filter_eq)
     }
 
+    /// Build a lazy cache of `string_value -> first active row id` for high-cardinality
+    /// equality lookups, enabling near-random-access performance for `LIMIT 1`.
+    pub fn build_first_string_row_id_cache(
+        &self,
+        col_name: &str,
+    ) -> io::Result<Option<ahash::AHashMap<Box<str>, u64>>> {
+        if self.has_pending_deltas() || self.delta_row_count() > 0 {
+            return Ok(None);
+        }
+
+        let schema = self.schema.read();
+        let col_idx = match schema.get_index(col_name) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let col_type = schema.columns[col_idx].1;
+        if !matches!(col_type, ColumnType::String | ColumnType::StringDict) {
+            return Ok(None);
+        }
+        drop(schema);
+
+        let row_ids = self.read_ids(0, None)?;
+        if row_ids.is_empty() {
+            return Ok(Some(ahash::AHashMap::new()));
+        }
+
+        let (mut column, deleted, packed_nulls, bool_nulls): (
+            ColumnData,
+            Vec<u8>,
+            Vec<u8>,
+            Option<Vec<bool>>,
+        ) = if self.is_v4_format() && !self.has_v4_in_memory_data() {
+            let footer = match self.get_or_load_footer()? {
+                Some(footer) => footer,
+                None => return Ok(Some(ahash::AHashMap::new())),
+            };
+            let (cols, deleted, nulls) = self.scan_columns_mmap_with_nulls(&[col_idx], &footer)?;
+            let column = cols
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| ColumnData::new(ColumnType::String));
+            let packed_nulls = nulls.into_iter().next().unwrap_or_default();
+            (column, deleted, packed_nulls, None)
+        } else {
+            let deleted = self.deleted.read().clone();
+            let packed_nulls = {
+                let nulls = self.nulls.read();
+                if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                    Some(nulls[col_idx].clone())
+                } else {
+                    None
+                }
+            };
+            let column = {
+                let columns = self.columns.read();
+                if col_idx < columns.len() && columns[col_idx].len() > 0 {
+                    Some(columns[col_idx].clone())
+                } else {
+                    None
+                }
+            }
+            .or_else(|| self.read_columns(Some(&[col_name]), 0, None).ok()?.remove(col_name))
+            .unwrap_or_else(|| ColumnData::new(ColumnType::String));
+            let bool_nulls = if packed_nulls.is_none() {
+                Some(self.get_null_mask(col_name, 0, row_ids.len()))
+            } else {
+                None
+            };
+            (column, deleted, packed_nulls.unwrap_or_default(), bool_nulls)
+        };
+
+        if matches!(column, ColumnData::StringDict { .. }) {
+            column = column.decode_string_dict();
+        }
+
+        let ColumnData::String { offsets, data } = column else {
+            return Ok(None);
+        };
+
+        let count = offsets.len().saturating_sub(1).min(row_ids.len());
+        let has_deleted = deleted.iter().any(|&b| b != 0);
+        let has_packed_nulls = !packed_nulls.is_empty();
+        let bool_nulls = bool_nulls.as_deref();
+        let mut cache = ahash::AHashMap::with_capacity(count);
+
+        for row_idx in 0..count {
+            if has_deleted {
+                let byte_idx = row_idx / 8;
+                let bit_idx = row_idx % 8;
+                if byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 != 0 {
+                    continue;
+                }
+            }
+
+            if has_packed_nulls {
+                let byte_idx = row_idx / 8;
+                let bit_idx = row_idx % 8;
+                if byte_idx < packed_nulls.len() && (packed_nulls[byte_idx] >> bit_idx) & 1 != 0 {
+                    continue;
+                }
+            } else if let Some(nulls) = bool_nulls {
+                if row_idx < nulls.len() && nulls[row_idx] {
+                    continue;
+                }
+            }
+
+            let start = offsets[row_idx] as usize;
+            let end = offsets[row_idx + 1] as usize;
+            if start > end || end > data.len() {
+                continue;
+            }
+
+            if let Ok(value) = std::str::from_utf8(&data[start..end]) {
+                cache.entry(Box::<str>::from(value)).or_insert(row_ids[row_idx]);
+            }
+        }
+
+        Ok(Some(cache))
+    }
+
     /// Read columns with numeric range filter and early termination for LIMIT
     /// Optimized for SELECT * WHERE col BETWEEN low AND high LIMIT n
     pub fn read_columns_filtered_range_with_limit(

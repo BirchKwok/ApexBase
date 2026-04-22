@@ -132,6 +132,42 @@ class TestBasicQueryOperations:
                 assert result["id"] >= 5
             
             client.close()
+
+    def test_string_equality_limit_uses_simple_query_shapes(self):
+        """Simple equality + LIMIT should return the first matching row correctly."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            test_data = [
+                {"name": "Alice", "city": "NYC", "score": 10},
+                {"name": "Bob", "city": "LA", "score": 20},
+                {"name": "Bob", "city": "Seattle", "score": 30},
+            ]
+            client.store(test_data)
+
+            rv = client.query(where_clause="name = 'Bob'", limit=1)
+            assert len(rv) == 1
+            assert rv.first()["name"] == "Bob"
+
+            projected = client.execute(
+                "SELECT city, score FROM default WHERE name = 'Bob' LIMIT 1"
+            ).first()
+            assert projected is not None
+            assert set(projected.keys()) == {"city", "score"}
+            assert projected["score"] == 20
+
+            first = client.execute(
+                "SELECT city, score FROM default WHERE name = 'Bob' LIMIT 1"
+            ).first()
+            assert first == {"city": "LA", "score": 20}
+
+            missing = client.execute(
+                "SELECT city, score FROM default WHERE name = 'Nobody' LIMIT 1"
+            ).to_dict()
+            assert missing == []
+
+            client.close()
     
     def test_query_with_complex_conditions(self):
         """Test querying with complex conditions"""

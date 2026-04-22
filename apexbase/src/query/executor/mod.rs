@@ -1130,6 +1130,28 @@ impl ApexExecutor {
                 }
                 // Fall through to full parse if fast path unavailable
             }
+            QuerySignature::StringEqualityFilterLimit {
+                ref table,
+                column,
+                value,
+                limit,
+                offset,
+            } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    if backend.pending_v4_in_memory_rows() == 0 {
+                        if let Ok(batch) = backend.read_columns_filtered_string_with_limit_to_arrow(
+                            None, column, value, true, *limit, *offset,
+                        ) {
+                            return Ok(ApexResult::Data(batch));
+                        }
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
             QuerySignature::ProjectedStringEqualityFilter {
                 ref table,
                 columns,
@@ -1148,6 +1170,35 @@ impl ApexExecutor {
                             column,
                             value,
                             true,
+                        ) {
+                            return Ok(ApexResult::Data(batch));
+                        }
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::ProjectedStringEqualityFilterLimit {
+                ref table,
+                columns,
+                column,
+                value,
+                limit,
+                offset,
+            } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    if backend.pending_v4_in_memory_rows() == 0 {
+                        let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                        if let Ok(batch) = backend.read_columns_filtered_string_with_limit_to_arrow(
+                            Some(col_refs.as_slice()),
+                            column,
+                            value,
+                            true,
+                            *limit,
+                            *offset,
                         ) {
                             return Ok(ApexResult::Data(batch));
                         }
