@@ -39,6 +39,18 @@ fn dict_to_values(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, Value>> 
     Ok(fields)
 }
 
+#[inline]
+fn sort_and_dedupe_ids(ids: &[u64]) -> Vec<u64> {
+    if ids.len() < 2 {
+        return ids.to_vec();
+    }
+
+    let mut sorted_ids = ids.to_vec();
+    sorted_ids.sort_unstable();
+    sorted_ids.dedup();
+    sorted_ids
+}
+
 /// Convert Python value to Value
 fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     use pyo3::types::PyBytes;
@@ -2338,9 +2350,7 @@ impl ApexStorageImpl {
                 });
 
             if let Some(backend) = maybe_backend {
-                let mut sorted_ids = ids.clone();
-                sorted_ids.sort_unstable();
-                sorted_ids.dedup();
+                let sorted_ids = sort_and_dedupe_ids(ids);
                 let batch_result =
                     py.allow_threads(|| backend.read_rows_by_ids_to_arrow(&sorted_ids));
                 if let Ok(batch) = batch_result {

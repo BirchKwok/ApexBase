@@ -1004,6 +1004,16 @@ class ApexBaseBench:
         })
         self._next_id += 1
 
+    def bench_oltp_insert_one_durable(self):
+        self.client.store_durable_one({
+            "name": "oltp_one",
+            "age": 31,
+            "score": 77.0,
+            "city": "Beijing",
+            "category": "Books",
+        })
+        self._next_id += 1
+
     def bench_oltp_insert_read_own_row(self):
         row_id = self._next_id
         self.client.store({
@@ -1297,7 +1307,7 @@ OLTP_DEFAULT_BENCHMARKS = [
 ]
 
 OLTP_DURABLE_WRITE_BENCHMARKS = [
-    ("Durable Insert 1 row", "bench_oltp_insert_one"),
+    ("Durable Insert 1 row", "bench_oltp_insert_one_durable"),
     ("Durable UPDATE by ID", "bench_oltp_update_by_id"),
 ]
 
@@ -1595,7 +1605,7 @@ def run_oltp_durable_benchmarks(engines, warmup, iterations):
 
     print("\n--- OLTP Microbenchmarks (Durable Fair) ---")
     print("  Explicitly forces persistence on every timed write for durability-oriented comparison.")
-    print("  ApexBase uses flush(); SQLite uses FULL sync + WAL checkpoint; DuckDB uses CHECKPOINT.")
+    print("  ApexBase uses store_durable_one() for single-row inserts and flush() for updates; SQLite uses FULL sync + WAL checkpoint; DuckDB uses CHECKPOINT.")
 
     # Keep SQLite in durable mode only for this section.
     for eng_name, bench in engines:
@@ -1622,16 +1632,21 @@ def run_oltp_durable_benchmarks(engines, warmup, iterations):
             row = f"  {bench_name:<34}"
             for eng_name, bench in engines:
                 fn = getattr(bench, method_name, None)
+                if fn is None and method_name == "bench_oltp_insert_one_durable":
+                    fn = getattr(bench, "bench_oltp_insert_one", None)
                 if fn is None:
                     row += f" | {'N/A':>{col_width}}"
                     continue
 
                 try:
                     if eng_name == "ApexBase":
-                        def durable_fn(fn=fn, bench=bench):
-                            result = fn()
-                            bench.client.flush()
-                            return result
+                        if method_name == "bench_oltp_insert_one_durable":
+                            durable_fn = fn
+                        else:
+                            def durable_fn(fn=fn, bench=bench):
+                                result = fn()
+                                bench.client.flush()
+                                return result
                     elif eng_name == "SQLite":
                         def durable_fn(fn=fn, bench=bench):
                             result = fn()

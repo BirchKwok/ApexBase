@@ -6326,12 +6326,37 @@ impl OnDemandStorage {
         let n_ids = ids.len();
 
         // ── Step 1: Map each input ID → rg_i (one footer read, no per-ID lock) ─
+        let non_empty_row_groups: Vec<(u64, u64, usize)> = footer
+            .row_groups
+            .iter()
+            .enumerate()
+            .filter_map(|(rg_i, rg)| (rg.row_count > 0).then_some((rg.min_id, rg.max_id, rg_i)))
+            .collect();
         let mut rg_map: Vec<Vec<(usize, u64)>> = vec![Vec::new(); footer.row_groups.len()];
-        for (out_pos, &id) in ids.iter().enumerate() {
-            for (rg_i, rg) in footer.row_groups.iter().enumerate() {
-                if rg.row_count > 0 && rg.min_id <= id && id <= rg.max_id {
-                    rg_map[rg_i].push((out_pos, id));
-                    break;
+        if !non_empty_row_groups.is_empty() {
+            let ids_are_sorted = ids.windows(2).all(|pair| pair[0] <= pair[1]);
+            if ids_are_sorted {
+                let mut rg_pos = 0usize;
+                for (out_pos, &id) in ids.iter().enumerate() {
+                    while rg_pos < non_empty_row_groups.len()
+                        && non_empty_row_groups[rg_pos].1 < id
+                    {
+                        rg_pos += 1;
+                    }
+                    if let Some(&(min_id, max_id, rg_i)) = non_empty_row_groups.get(rg_pos) {
+                        if min_id <= id && id <= max_id {
+                            rg_map[rg_i].push((out_pos, id));
+                        }
+                    }
+                }
+            } else {
+                for (out_pos, &id) in ids.iter().enumerate() {
+                    let rg_pos = non_empty_row_groups.partition_point(|(_, max_id, _)| *max_id < id);
+                    if let Some(&(min_id, max_id, rg_i)) = non_empty_row_groups.get(rg_pos) {
+                        if min_id <= id && id <= max_id {
+                            rg_map[rg_i].push((out_pos, id));
+                        }
+                    }
                 }
             }
         }
@@ -6397,6 +6422,7 @@ impl OnDemandStorage {
 
             // Resolve local_idx for each ID in this RG (O(1) guess + optional binary search)
             let mut valid_hits: Vec<(usize, usize)> = Vec::with_capacity(hits.len()); // (out_pos, local_idx)
+            let mut ids_cow_cache = None;
             for &(out_pos, id) in hits {
                 let guess = id.saturating_sub(rg_meta.min_id) as usize;
                 let local_idx = if guess < rg_rows {
@@ -6404,12 +6430,14 @@ impl OnDemandStorage {
                     if off + 8 <= body.len() {
                         let stored = u64::from_le_bytes(body[off..off+8].try_into().unwrap());
                         if stored == id { guess } else {
-                            let ids_cow = bytes_as_u64_slice(&body[..ids_section_len], rg_rows);
+                            let ids_cow = ids_cow_cache
+                                .get_or_insert_with(|| bytes_as_u64_slice(&body[..ids_section_len], rg_rows));
                             match ids_cow.binary_search(&id) { Ok(i) => i, Err(_) => continue }
                         }
                     } else { continue }
                 } else {
-                    let ids_cow = bytes_as_u64_slice(&body[..ids_section_len], rg_rows);
+                    let ids_cow = ids_cow_cache
+                        .get_or_insert_with(|| bytes_as_u64_slice(&body[..ids_section_len], rg_rows));
                     match ids_cow.binary_search(&id) { Ok(i) => i, Err(_) => continue }
                 };
 

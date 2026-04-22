@@ -73,6 +73,18 @@ thread_local! {
         std::cell::RefCell::new(AHashMap::new());
 }
 
+#[inline]
+fn sort_and_dedupe_ids(ids: &[u64]) -> Vec<u64> {
+    if ids.len() < 2 {
+        return ids.to_vec();
+    }
+
+    let mut sorted_ids = ids.to_vec();
+    sorted_ids.sort_unstable();
+    sorted_ids.dedup();
+    sorted_ids
+}
+
 /// Store a session variable (SET VARIABLE name = value).
 pub fn set_session_variable(name: &str, value: crate::data::Value) {
     SESSION_VARS.with(|m| m.borrow_mut().insert(name.to_lowercase(), value));
@@ -1002,9 +1014,7 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    let mut sorted_ids = ids.clone();
-                    sorted_ids.sort_unstable();
-                    sorted_ids.dedup();
+                    let sorted_ids = sort_and_dedupe_ids(ids);
                     if let Ok(batch) = backend.read_rows_by_ids_to_arrow(&sorted_ids) {
                         if batch.num_rows() > 0 {
                             return Ok(ApexResult::Data(batch));
@@ -1026,9 +1036,7 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    let mut sorted_ids = ids.clone();
-                    sorted_ids.sort_unstable();
-                    sorted_ids.dedup();
+                    let sorted_ids = sort_and_dedupe_ids(ids);
                     if let Ok(batch) = backend.read_rows_by_ids_to_arrow(&sorted_ids) {
                         if batch.num_rows() > 0 {
                             if let Some(projected) = Self::project_batch_by_names(&batch, columns)?

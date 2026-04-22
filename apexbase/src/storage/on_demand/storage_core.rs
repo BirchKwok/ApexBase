@@ -1507,58 +1507,64 @@ impl OnDemandStorage {
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "delta file not open"))?;
 
-        file.write_all(&(ids.len() as u64).to_le_bytes())?;
+        // Delta spill is the hot path for explicit flush() on tiny OLTP bursts.
+        // Buffer small per-field writes so a 1-row durable flush is not dominated
+        // by dozens of tiny append syscalls.
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut *file);
+
+        writer.write_all(&(ids.len() as u64).to_le_bytes())?;
         for id in ids {
-            file.write_all(&id.to_le_bytes())?;
+            writer.write_all(&id.to_le_bytes())?;
         }
 
         let int_col_count = int_columns.len() as u32;
-        file.write_all(&int_col_count.to_le_bytes())?;
+        writer.write_all(&int_col_count.to_le_bytes())?;
         for (name, values) in int_columns {
             let name_bytes = name.as_bytes();
-            file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
-            file.write_all(name_bytes)?;
+            writer.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
+            writer.write_all(name_bytes)?;
             for v in values {
-                file.write_all(&v.to_le_bytes())?;
+                writer.write_all(&v.to_le_bytes())?;
             }
         }
 
         let float_col_count = float_columns.len() as u32;
-        file.write_all(&float_col_count.to_le_bytes())?;
+        writer.write_all(&float_col_count.to_le_bytes())?;
         for (name, values) in float_columns {
             let name_bytes = name.as_bytes();
-            file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
-            file.write_all(name_bytes)?;
+            writer.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
+            writer.write_all(name_bytes)?;
             for v in values {
-                file.write_all(&v.to_le_bytes())?;
+                writer.write_all(&v.to_le_bytes())?;
             }
         }
 
         let string_col_count = string_columns.len() as u32;
-        file.write_all(&string_col_count.to_le_bytes())?;
+        writer.write_all(&string_col_count.to_le_bytes())?;
         for (name, values) in string_columns {
             let name_bytes = name.as_bytes();
-            file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
-            file.write_all(name_bytes)?;
+            writer.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
+            writer.write_all(name_bytes)?;
             for v in values {
                 let v_bytes = v.as_bytes();
-                file.write_all(&(v_bytes.len() as u32).to_le_bytes())?;
-                file.write_all(v_bytes)?;
+                writer.write_all(&(v_bytes.len() as u32).to_le_bytes())?;
+                writer.write_all(v_bytes)?;
             }
         }
 
         let bool_col_count = bool_columns.len() as u32;
-        file.write_all(&bool_col_count.to_le_bytes())?;
+        writer.write_all(&bool_col_count.to_le_bytes())?;
         for (name, values) in bool_columns {
             let name_bytes = name.as_bytes();
-            file.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
-            file.write_all(name_bytes)?;
+            writer.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
+            writer.write_all(name_bytes)?;
             for v in values {
-                file.write_all(&[if *v { 1u8 } else { 0u8 }])?;
+                writer.write_all(&[if *v { 1u8 } else { 0u8 }])?;
             }
         }
 
-        file.flush()?;
+        writer.flush()?;
+        drop(writer);
         if self.durability == super::DurabilityLevel::Max {
             file.sync_all()?;
             self.clear_delta_sync_pending();
@@ -1777,6 +1783,47 @@ impl OnDemandStorage {
         Ok(ids)
     }
 
+    fn discard_pending_v4_rows_from(&self, pending_start: usize) {
+        let truncate_bitmap = |bitmap: &mut Vec<u8>, row_count: usize| {
+            let new_len = (row_count + 7) / 8;
+            bitmap.truncate(new_len);
+            if row_count == 0 {
+                bitmap.clear();
+            } else if row_count % 8 != 0 {
+                if let Some(last) = bitmap.last_mut() {
+                    *last &= (1u8 << (row_count % 8)) - 1;
+                }
+            }
+        };
+
+        if pending_start == 0 {
+            self.ids.write().clear();
+            self.columns.write().clear();
+            self.nulls.write().clear();
+            self.deleted.write().clear();
+        } else {
+            self.ids.write().truncate(pending_start);
+            {
+                let mut columns = self.columns.write();
+                for column in columns.iter_mut() {
+                    *column = column.slice_range(0, pending_start);
+                }
+            }
+            {
+                let mut nulls = self.nulls.write();
+                for bitmap in nulls.iter_mut() {
+                    truncate_bitmap(bitmap, pending_start);
+                }
+            }
+            {
+                let mut deleted = self.deleted.write();
+                truncate_bitmap(&mut deleted, pending_start);
+            }
+        }
+        *self.id_to_idx.write() = None;
+        self.pending_rows.store(0, Ordering::SeqCst);
+    }
+
     /// Spill mmap-only V4 memtable rows to the delta sidecar instead of
     /// rewriting the base file. This keeps explicit `flush()` on small OLTP
     /// bursts fast while preserving cross-process visibility through the
@@ -1826,6 +1873,152 @@ impl OnDemandStorage {
                     // Persisted-base deletes require a full rewrite or delete-vector update.
                     return Ok(false);
                 }
+            }
+        }
+        if pending == 1 {
+            let row_idx_abs = pending_start;
+            let byte_idx = row_idx_abs / 8;
+            let bit_idx = row_idx_abs % 8;
+            let is_deleted =
+                byte_idx < deleted.len() && ((deleted[byte_idx] >> bit_idx) & 1 == 1);
+            if !is_deleted {
+                let pending_id = ids[row_idx_abs];
+                drop(ids);
+
+                let schema = self.schema.read();
+                let columns = self.columns.read();
+                let nulls = self.nulls.read();
+                if schema.columns != footer.schema.columns {
+                    return Ok(false);
+                }
+                if columns.len() < schema.column_count() {
+                    return Ok(false);
+                }
+
+                let mut int_columns: HashMap<String, Vec<i64>> =
+                    HashMap::with_capacity(schema.column_count());
+                let mut float_columns: HashMap<String, Vec<f64>> =
+                    HashMap::with_capacity(schema.column_count());
+                let mut string_columns: HashMap<String, Vec<String>> =
+                    HashMap::with_capacity(schema.column_count());
+                let mut bool_columns: HashMap<String, Vec<bool>> =
+                    HashMap::with_capacity(schema.column_count());
+
+                for (col_idx, (col_name, col_type)) in schema.columns.iter().enumerate() {
+                    if let Some(bitmap) = nulls.get(col_idx) {
+                        let byte_idx = row_idx_abs / 8;
+                        let bit_idx = row_idx_abs % 8;
+                        if byte_idx < bitmap.len() && (bitmap[byte_idx] >> bit_idx) & 1 == 1 {
+                            return Ok(false);
+                        }
+                    }
+
+                    match (&columns[col_idx], col_type) {
+                        (
+                            ColumnData::Int64(values),
+                            ColumnType::Int64
+                            | ColumnType::Int8
+                            | ColumnType::Int16
+                            | ColumnType::Int32
+                            | ColumnType::UInt8
+                            | ColumnType::UInt16
+                            | ColumnType::UInt32
+                            | ColumnType::UInt64
+                            | ColumnType::Timestamp
+                            | ColumnType::Date,
+                        ) => {
+                            let Some(&value) = values.get(row_idx_abs) else {
+                                return Ok(false);
+                            };
+                            int_columns.insert(col_name.clone(), vec![value]);
+                        }
+                        (ColumnData::Float64(values), ColumnType::Float64 | ColumnType::Float32) => {
+                            let Some(&value) = values.get(row_idx_abs) else {
+                                return Ok(false);
+                            };
+                            float_columns.insert(col_name.clone(), vec![value]);
+                        }
+                        (
+                            ColumnData::String { offsets, data },
+                            ColumnType::String | ColumnType::Null,
+                        ) => {
+                            let Some((&start, &end)) =
+                                offsets.get(row_idx_abs).zip(offsets.get(row_idx_abs + 1))
+                            else {
+                                return Ok(false);
+                            };
+                            let start = start as usize;
+                            let end = end as usize;
+                            if start > end || end > data.len() {
+                                return Ok(false);
+                            }
+                            string_columns.insert(
+                                col_name.clone(),
+                                vec![std::str::from_utf8(&data[start..end])
+                                    .unwrap_or("")
+                                    .to_string()],
+                            );
+                        }
+                        (
+                            ColumnData::StringDict {
+                                indices,
+                                dict_offsets,
+                                dict_data,
+                            },
+                            ColumnType::StringDict,
+                        ) => {
+                            let Some(&dict_idx) = indices.get(row_idx_abs) else {
+                                return Ok(false);
+                            };
+                            if dict_idx == 0 {
+                                return Ok(false);
+                            }
+                            let di = (dict_idx - 1) as usize;
+                            let Some((&start, &end)) =
+                                dict_offsets.get(di).zip(dict_offsets.get(di + 1))
+                            else {
+                                return Ok(false);
+                            };
+                            let start = start as usize;
+                            let end = end as usize;
+                            if start > end || end > dict_data.len() {
+                                return Ok(false);
+                            }
+                            string_columns.insert(
+                                col_name.clone(),
+                                vec![std::str::from_utf8(&dict_data[start..end])
+                                    .unwrap_or("")
+                                    .to_string()],
+                            );
+                        }
+                        (ColumnData::Bool { data, len }, ColumnType::Bool) => {
+                            if row_idx_abs >= *len {
+                                return Ok(false);
+                            }
+                            let byte_idx = row_idx_abs / 8;
+                            let bit_idx = row_idx_abs % 8;
+                            let value =
+                                byte_idx < data.len() && ((data[byte_idx] >> bit_idx) & 1 == 1);
+                            bool_columns.insert(col_name.clone(), vec![value]);
+                        }
+                        _ => return Ok(false),
+                    }
+                }
+
+                drop(deleted);
+                drop(nulls);
+                drop(columns);
+                drop(schema);
+
+                self.append_typed_to_delta_with_ids(
+                    &[pending_id],
+                    &int_columns,
+                    &float_columns,
+                    &string_columns,
+                    &bool_columns,
+                )?;
+                self.discard_pending_v4_rows_from(pending_start);
+                return Ok(true);
             }
         }
         let mut live_row_indices_abs = Vec::with_capacity(pending);
@@ -1979,45 +2172,7 @@ impl OnDemandStorage {
                 &bool_columns,
             )?;
         }
-
-        let truncate_bitmap = |bitmap: &mut Vec<u8>, row_count: usize| {
-            let new_len = (row_count + 7) / 8;
-            bitmap.truncate(new_len);
-            if row_count == 0 {
-                bitmap.clear();
-            } else if row_count % 8 != 0 {
-                if let Some(last) = bitmap.last_mut() {
-                    *last &= (1u8 << (row_count % 8)) - 1;
-                }
-            }
-        };
-
-        if pending_start == 0 {
-            self.ids.write().clear();
-            self.columns.write().clear();
-            self.nulls.write().clear();
-            self.deleted.write().clear();
-        } else {
-            self.ids.write().truncate(pending_start);
-            {
-                let mut columns = self.columns.write();
-                for column in columns.iter_mut() {
-                    *column = column.slice_range(0, pending_start);
-                }
-            }
-            {
-                let mut nulls = self.nulls.write();
-                for bitmap in nulls.iter_mut() {
-                    truncate_bitmap(bitmap, pending_start);
-                }
-            }
-            {
-                let mut deleted = self.deleted.write();
-                truncate_bitmap(&mut deleted, pending_start);
-            }
-        }
-        *self.id_to_idx.write() = None;
-        self.pending_rows.store(0, Ordering::SeqCst);
+        self.discard_pending_v4_rows_from(pending_start);
         Ok(true)
     }
 
