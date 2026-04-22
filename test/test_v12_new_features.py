@@ -9,7 +9,6 @@ Tests for HTAP Gap Analysis v12 new features:
 import pytest
 import tempfile
 import shutil
-import time
 
 from apexbase import ApexClient
 
