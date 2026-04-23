@@ -3893,7 +3893,13 @@ impl OnDemandStorage {
         } // All read guards dropped here
 
         // Phase 2: Write V4 format from active data (no lock contention).
-        let rg_size = DEFAULT_ROW_GROUP_SIZE as usize;
+        let adaptive_rg_size =
+            Self::compute_adaptive_row_group_size(&schema_clone, &active_columns, active_count);
+        {
+            let mut header = self.header.write();
+            header.row_group_size = adaptive_rg_size;
+        }
+        let rg_size = adaptive_rg_size as usize;
 
         // Write placeholder header
         writer.write_all(&[0u8; HEADER_SIZE])?;
@@ -5733,6 +5739,80 @@ impl OnDemandStorage {
 
     fn stats_sidecar_path(&self) -> PathBuf {
         PathBuf::from(format!("{}.stats", self.path.display()))
+    }
+
+    fn compute_adaptive_row_group_size(
+        schema: &OnDemandSchema,
+        columns: &[ColumnData],
+        row_count: usize,
+    ) -> u32 {
+        if row_count == 0 || schema.columns.is_empty() {
+            return DEFAULT_ROW_GROUP_SIZE;
+        }
+        if row_count < DEFAULT_ROW_GROUP_SIZE as usize {
+            return DEFAULT_ROW_GROUP_SIZE;
+        }
+
+        let sample_rows = row_count.min(2048);
+        let estimated_width: f64 = schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(col_idx, (_, col_type))| {
+                Self::estimate_column_row_width(columns.get(col_idx), *col_type, sample_rows)
+            })
+            .sum();
+
+        if estimated_width < 20.0 {
+            131_072
+        } else if estimated_width > 100.0 {
+            32_768
+        } else {
+            DEFAULT_ROW_GROUP_SIZE
+        }
+    }
+
+    fn estimate_column_row_width(
+        column: Option<&ColumnData>,
+        col_type: ColumnType,
+        sample_rows: usize,
+    ) -> f64 {
+        match column {
+            Some(ColumnData::Bool { .. }) | Some(ColumnData::Int64(_)) | Some(ColumnData::Float64(_)) => {
+                match col_type {
+                    ColumnType::Bool => 1.0,
+                    _ => 8.0,
+                }
+            }
+            Some(ColumnData::String { offsets, .. }) => {
+                let rows = offsets.len().saturating_sub(1).min(sample_rows);
+                if rows == 0 {
+                    16.0
+                } else {
+                    let total = offsets[rows] as f64 - offsets[0] as f64;
+                    4.0 + total / rows as f64
+                }
+            }
+            Some(ColumnData::Binary { offsets, .. }) => {
+                let rows = offsets.len().saturating_sub(1).min(sample_rows);
+                if rows == 0 {
+                    16.0
+                } else {
+                    let total = offsets[rows] as f64 - offsets[0] as f64;
+                    4.0 + total / rows as f64
+                }
+            }
+            Some(ColumnData::StringDict { .. }) => 4.0,
+            Some(ColumnData::FixedList { dim, .. }) => (*dim as f64 * 4.0).max(8.0),
+            Some(ColumnData::Float16List { dim, .. }) => (*dim as f64 * 2.0).max(4.0),
+            None => match col_type {
+                ColumnType::Bool => 1.0,
+                ColumnType::Binary | ColumnType::String | ColumnType::StringDict => 16.0,
+                ColumnType::FixedList => 32.0,
+                ColumnType::Float16List => 16.0,
+                _ => 8.0,
+            },
+        }
     }
 
     fn write_col_stats_sidecar(&self, schema: &OnDemandSchema, columns: &[ColumnData]) {

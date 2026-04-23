@@ -174,6 +174,20 @@ fn projected_values_to_columns_dict<'py>(
     columns: &[String],
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
     let columns_dict = PyDict::new_bound(py);
+    if vals.len() >= columns.len()
+        && columns.iter().enumerate().all(|(idx, requested_col)| {
+            vals.get(idx)
+                .map(|(col_name, _)| col_name == requested_col)
+                .unwrap_or(false)
+        })
+    {
+        for (requested_col, (_, val)) in columns.iter().zip(vals.iter()) {
+            let pyval = value_to_py(py, val)?;
+            columns_dict.set_item(requested_col.as_str(), PyList::new_bound(py, [pyval]))?;
+        }
+        return Ok(Some(columns_dict));
+    }
+
     for requested_col in columns {
         let Some((_, val)) = vals.iter().find(|(col_name, _)| col_name == requested_col) else {
             return Ok(None);
@@ -182,6 +196,34 @@ fn projected_values_to_columns_dict<'py>(
         columns_dict.set_item(requested_col.as_str(), PyList::new_bound(py, [pyval]))?;
     }
     Ok(Some(columns_dict))
+}
+
+fn projected_values_to_row_dict<'py>(
+    py: Python<'py>,
+    vals: &[(String, Value)],
+    columns: &[String],
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let row = PyDict::new_bound(py);
+    if vals.len() >= columns.len()
+        && columns.iter().enumerate().all(|(idx, requested_col)| {
+            vals.get(idx)
+                .map(|(col_name, _)| col_name == requested_col)
+                .unwrap_or(false)
+        })
+    {
+        for (requested_col, (_, val)) in columns.iter().zip(vals.iter()) {
+            row.set_item(requested_col.as_str(), value_to_py(py, val)?)?;
+        }
+        return Ok(Some(row));
+    }
+
+    for requested_col in columns {
+        let Some((_, val)) = vals.iter().find(|(col_name, _)| col_name == requested_col) else {
+            return Ok(None);
+        };
+        row.set_item(requested_col.as_str(), value_to_py(py, val)?)?;
+    }
+    Ok(Some(row))
 }
 
 #[derive(Clone, Copy)]
@@ -2295,7 +2337,12 @@ impl ApexStorageImpl {
 
             if let Some(backend) = maybe_backend {
                 if !backend.has_pending_deltas() {
-                    let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
+                    let projected_cols: Vec<&str> = columns.iter().map(String::as_str).collect();
+                    let rcix_result = py.allow_threads(|| {
+                        backend
+                            .storage
+                            .retrieve_rcix_projected(*id, &projected_cols)
+                    });
                     let vals_result = match rcix_result {
                         Ok(Some(vals)) => Some(vals),
                         _ => py
@@ -2305,23 +2352,9 @@ impl ApexStorageImpl {
                     };
                     if let Some(vals) = vals_result {
                         let out = PyDict::new_bound(py);
-                        let columns_dict = PyDict::new_bound(py);
-                        let mut all_found = true;
-                        for requested_col in columns {
-                            if let Some((_, val)) =
-                                vals.iter().find(|(col_name, _)| col_name == requested_col)
-                            {
-                                let pyval = value_to_py(py, val)?;
-                                columns_dict.set_item(
-                                    requested_col.as_str(),
-                                    PyList::new_bound(py, [pyval]),
-                                )?;
-                            } else {
-                                all_found = false;
-                                break;
-                            }
-                        }
-                        if all_found {
+                        if let Some(columns_dict) =
+                            projected_values_to_columns_dict(py, &vals, columns)?
+                        {
                             out.set_item("columns_dict", columns_dict)?;
                             out.set_item("rows_affected", 0i64)?;
                             return Ok(out.into());
@@ -3868,9 +3901,10 @@ impl ApexStorageImpl {
             return Ok(None);
         }
 
+        let requested_cols: Vec<&str> = columns.iter().map(String::as_str).collect();
         let vals_result = backend
             .storage
-            .retrieve_rcix(id as u64)
+            .retrieve_rcix_projected(id as u64, &requested_cols)
             .ok()
             .flatten()
             .or_else(|| {
@@ -3885,14 +3919,9 @@ impl ApexStorageImpl {
         };
 
         let out = PyDict::new_bound(py);
-        let columns_dict = PyDict::new_bound(py);
-        for requested_col in &columns {
-            let Some((_, val)) = vals.iter().find(|(col_name, _)| col_name == requested_col) else {
-                return Ok(None);
-            };
-            let pyval = value_to_py(py, val)?;
-            columns_dict.set_item(requested_col.as_str(), PyList::new_bound(py, [pyval]))?;
-        }
+        let Some(columns_dict) = projected_values_to_columns_dict(py, &vals, &columns)? else {
+            return Ok(None);
+        };
         out.set_item("columns_dict", columns_dict)?;
         out.set_item("rows_affected", 0i64)?;
         Ok(Some(out.into()))
@@ -3998,9 +4027,10 @@ impl ApexStorageImpl {
             return Ok(None);
         };
 
+        let requested_cols: Vec<&str> = columns.iter().map(String::as_str).collect();
         let vals_result = backend
             .storage
-            .retrieve_rcix(row_id)
+            .retrieve_rcix_projected(row_id, &requested_cols)
             .ok()
             .flatten()
             .or_else(|| backend.storage.read_row_by_id_values(row_id).ok().flatten());
@@ -4052,9 +4082,10 @@ impl ApexStorageImpl {
             return Ok(None);
         }
 
+        let requested_cols: Vec<&str> = columns.iter().map(String::as_str).collect();
         let vals_result = backend
             .storage
-            .retrieve_rcix(id as u64)
+            .retrieve_rcix_projected(id as u64, &requested_cols)
             .ok()
             .flatten()
             .or_else(|| {
@@ -4068,13 +4099,9 @@ impl ApexStorageImpl {
             return Ok(None);
         };
 
-        let row = PyDict::new_bound(py);
-        for requested_col in &columns {
-            let Some((_, val)) = vals.iter().find(|(col_name, _)| col_name == requested_col) else {
-                return Ok(None);
-            };
-            row.set_item(requested_col.as_str(), value_to_py(py, val)?)?;
-        }
+        let Some(row) = projected_values_to_row_dict(py, &vals, &columns)? else {
+            return Ok(None);
+        };
         Ok(Some(row.into()))
     }
 

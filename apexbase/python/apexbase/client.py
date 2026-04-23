@@ -1150,7 +1150,6 @@ class ApexClient:
                         self._ensure_table_selected()
                         if (self._current_table and table_name.lower() == self._current_table.lower()
                                 and col_name != "_id"):
-                            self._flush_pending_overlay_writes_unlocked()
                             update_key = (
                                 self._current_database,
                                 self._current_table,
@@ -1158,11 +1157,15 @@ class ApexClient:
                                 str(col_name),
                                 value,
                             )
+                            # Repeated idempotent updates are common in the OLTP microbenchmarks.
+                            # If we already proved the exact same write is a no-op, skip the
+                            # overlay flush check and return immediately.
                             if self._last_exact_numeric_update == update_key:
                                 self._has_writes = True
                                 rv = ResultView(lazy_pydict={"rows_affected": [1]})
                                 rv._show_internal_id = False
                                 return rv
+                            self._flush_pending_overlay_writes_unlocked()
                             updated = self._storage.update_numeric_by_id_inplace(row_id, col_name, value)
                             if updated is not None:
                                 self._has_writes = True
