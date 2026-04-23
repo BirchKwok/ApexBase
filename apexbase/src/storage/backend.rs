@@ -399,13 +399,12 @@ pub struct TableStorageBackend {
 impl TableStorageBackend {
     /// Helper to build Self from storage (reduces code duplication)
     #[inline]
-    fn from_storage(path: &Path, storage: OnDemandStorage) -> Self {
+    fn from_storage_with_row_count(path: &Path, storage: OnDemandStorage, row_count: u64) -> Self {
         let storage_schema = storage.get_schema();
         let schema: Vec<(String, DataType)> = storage_schema
             .into_iter()
             .map(|(name, ct)| (name, column_type_to_datatype(ct)))
             .collect();
-        let row_count = storage.row_count();
         Self {
             path: path.to_path_buf(),
             storage,
@@ -416,6 +415,12 @@ impl TableStorageBackend {
             dict_cache: RwLock::new(HashMap::new()),
             first_string_row_id_cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    #[inline]
+    fn from_storage(path: &Path, storage: OnDemandStorage) -> Self {
+        let row_count = storage.row_count();
+        Self::from_storage_with_row_count(path, storage, row_count)
     }
 
     pub fn create(path: &Path) -> io::Result<Self> {
@@ -515,7 +520,8 @@ impl TableStorageBackend {
         durability: super::DurabilityLevel,
     ) -> io::Result<Self> {
         let storage = OnDemandStorage::open_for_insert_with_durability(path, durability)?;
-        Ok(Self::from_storage(path, storage))
+        let row_count = storage.base_row_count();
+        Ok(Self::from_storage_with_row_count(path, storage, row_count))
     }
 
     /// Open for DELETE operations — mmap only, does NOT load column data into memory.
@@ -1210,6 +1216,22 @@ impl TableStorageBackend {
         self.storage.has_pending_deltas()
     }
 
+    /// Check whether pending DeltaStore updates touch a specific column.
+    pub fn pending_delta_updates_column(&self, column_name: &str) -> bool {
+        self.storage.delta_updates_column(column_name)
+    }
+
+    /// Return row IDs whose pending DeltaStore update sets `column_name` to `value`.
+    pub fn pending_delta_string_update_matches(&self, column_name: &str, value: &str) -> Vec<u64> {
+        self.storage
+            .delta_rows_with_string_update(column_name, value)
+    }
+
+    /// Return row IDs from the committed append-only `.delta` file where a string column matches.
+    pub fn delta_string_match_ids(&self, column_name: &str, value: &str) -> io::Result<Vec<u64>> {
+        self.storage.delta_string_match_ids(column_name, value)
+    }
+
     /// Get the file path for this backend
     pub fn path(&self) -> &Path {
         &self.path
@@ -1556,7 +1578,10 @@ impl TableStorageBackend {
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
-        let use_cache = start_row == 0 && row_count.is_none();
+        let base_rows = self.base_row_count();
+        let has_delta =
+            self.has_delta() || self.row_count() > base_rows || self.active_row_count() > base_rows;
+        let use_cache = start_row == 0 && row_count.is_none() && !has_delta;
 
         // OPTIMIZATION: V4 fast path — build Arrow directly from in-memory or mmap columns
         // Bypasses read_columns→HashMap→get_null_mask→Vec<bool> pipeline entirely
@@ -1574,7 +1599,7 @@ impl TableStorageBackend {
         // OPTIMIZATION: V4 fast path for LIMIT reads (start_row=0, row_count=Some)
         // Use to_arrow_batch_with_limit which leverages RCIX for O(1) column seeks —
         // reads only the needed rows instead of loading the full table.
-        if start_row == 0 && row_count.is_some() {
+        if start_row == 0 && row_count.is_some() && !has_delta {
             let limit = row_count.unwrap();
             if let Ok(batch) = self.storage.to_arrow_batch_with_limit(
                 column_names,
@@ -1927,7 +1952,7 @@ impl TableStorageBackend {
             }
         }
 
-        let schema = Arc::new(Schema::new(fields));
+        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
         arrow::record_batch::RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
@@ -2107,7 +2132,7 @@ impl TableStorageBackend {
             }
         }
 
-        let schema = Arc::new(Schema::new(fields));
+        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
         arrow::record_batch::RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
@@ -2133,7 +2158,7 @@ impl TableStorageBackend {
                 .storage
                 .extract_rows_by_indices_to_arrow(row_indices, col_refs)?
             {
-                return Ok(batch);
+                return self.apply_delta_overlay_to_batch(batch);
             }
             // Fallback (extraction returned None) — load full table
             let full_batch = self.read_columns_to_arrow(col_refs, 0, None)?;
@@ -2151,8 +2176,10 @@ impl TableStorageBackend {
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
                 })
                 .collect::<io::Result<Vec<_>>>()?;
-            return arrow::record_batch::RecordBatch::try_new(full_batch.schema(), taken_columns)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+            let batch =
+                arrow::record_batch::RecordBatch::try_new(full_batch.schema(), taken_columns)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            return self.apply_delta_overlay_to_batch(batch);
         }
 
         let schema = self.schema.read();
@@ -2261,7 +2288,59 @@ impl TableStorageBackend {
             arrays.push(array);
         }
 
-        let schema = Arc::new(Schema::new(fields));
+        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+        let batch = arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        self.apply_delta_overlay_to_batch(batch)
+    }
+
+    fn apply_delta_overlay_to_batch(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        if batch.num_rows() == 0 || !self.has_pending_deltas() {
+            return Ok(batch);
+        }
+
+        let Some(row_ids) = Self::row_ids_from_batch(&batch) else {
+            return Ok(batch);
+        };
+
+        let delta = self.storage.delta_store();
+        crate::storage::DeltaMerger::merge(&batch, &delta, &row_ids)
+    }
+
+    fn row_ids_from_batch(batch: &arrow::record_batch::RecordBatch) -> Option<Vec<u64>> {
+        use arrow::array::Array;
+
+        let id_col = batch.column_by_name("_id")?;
+        if let Some(arr) = id_col.as_any().downcast_ref::<arrow::array::Int64Array>() {
+            Some((0..arr.len()).map(|i| arr.value(i) as u64).collect())
+        } else {
+            id_col
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
+        }
+    }
+
+    fn project_record_batch_by_names(
+        batch: arrow::record_batch::RecordBatch,
+        column_names: Option<&[&str]>,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        let Some(cols) = column_names else {
+            return Ok(batch);
+        };
+
+        let mut fields = Vec::with_capacity(cols.len());
+        let mut arrays = Vec::with_capacity(cols.len());
+        for &name in cols {
+            if let Ok(idx) = batch.schema().index_of(name) {
+                fields.push(batch.schema().field(idx).clone());
+                arrays.push(batch.column(idx).clone());
+            }
+        }
+        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
         arrow::record_batch::RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
@@ -2646,7 +2725,36 @@ impl TableStorageBackend {
         // Fast path: one footer lock + one mmap body slice per RG
         if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
             if let Ok(Some(batch)) = self.storage.retrieve_many_mmap(ids) {
-                return Ok(batch);
+                let batch = self.apply_delta_overlay_to_batch(batch)?;
+                if !self.has_delta() || batch.num_rows() == ids.len() {
+                    return Ok(batch);
+                }
+
+                let found_ids = Self::row_ids_from_batch(&batch)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<std::collections::HashSet<_>>();
+                let missing_ids: Vec<u64> = ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !found_ids.contains(id))
+                    .collect();
+                if missing_ids.is_empty() {
+                    return Ok(batch);
+                }
+
+                let delta_batch = self.storage.read_delta_rows_by_ids_to_arrow(&missing_ids)?;
+                if delta_batch.num_rows() == 0 {
+                    return Ok(batch);
+                }
+                if batch.num_rows() == 0 {
+                    return Ok(delta_batch);
+                }
+
+                let schema = batch.schema();
+                let refs = vec![&batch, &delta_batch];
+                return arrow::compute::concat_batches(&schema, refs)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
             }
         }
 
@@ -2736,7 +2844,7 @@ impl TableStorageBackend {
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        Ok(batch)
+        self.apply_delta_overlay_to_batch(batch)
     }
 
     /// Create a typed null array with a single null value
@@ -2775,6 +2883,68 @@ impl TableStorageBackend {
         }
     }
 
+    fn read_string_filter_with_delta_column_updates(
+        &self,
+        column_names: Option<&[&str]>,
+        filter_column: &str,
+        filter_value: &str,
+        base_indices: &[usize],
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::StringArray;
+        use arrow::compute::kernels::cmp;
+        use std::collections::HashSet;
+
+        let mut batches = Vec::new();
+        let mut seen_ids = HashSet::new();
+
+        if !base_indices.is_empty() {
+            let batch = self.read_columns_by_indices_to_arrow(base_indices, None)?;
+            if let Some(ids) = Self::row_ids_from_batch(&batch) {
+                seen_ids.extend(ids);
+            }
+            if batch.num_rows() > 0 {
+                batches.push(batch);
+            }
+        }
+
+        let mut extra_ids = self.pending_delta_string_update_matches(filter_column, filter_value);
+        if self.has_delta() {
+            extra_ids.extend(self.delta_string_match_ids(filter_column, filter_value)?);
+        }
+        extra_ids.sort_unstable();
+        extra_ids.dedup();
+        extra_ids.retain(|id| !seen_ids.contains(id));
+        if !extra_ids.is_empty() {
+            let batch = self.read_rows_by_ids_to_arrow(&extra_ids)?;
+            if batch.num_rows() > 0 {
+                batches.push(batch);
+            }
+        }
+
+        if batches.is_empty() {
+            return self.read_columns_to_arrow(column_names, 0, Some(0));
+        }
+
+        let schema = batches[0].schema();
+        let refs: Vec<&arrow::record_batch::RecordBatch> = batches.iter().collect();
+        let combined = arrow::compute::concat_batches(&schema, refs)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        let Some(col) = combined.column_by_name(filter_column) else {
+            return Self::project_record_batch_by_names(combined, column_names);
+        };
+        let Some(str_arr) = col.as_any().downcast_ref::<StringArray>() else {
+            return Self::project_record_batch_by_names(combined, column_names);
+        };
+        let scalar_arr = StringArray::from(vec![Some(filter_value)]);
+        let scalar = arrow::array::Scalar::new(&scalar_arr);
+        let mask = cmp::eq(str_arr, &scalar)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let filtered = arrow::compute::filter_record_batch(&combined, &mask)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Self::project_record_batch_by_names(filtered, column_names)
+    }
+
     /// Read columns with STRING predicate pushdown to Arrow
     /// Filters rows at storage level for string equality (much faster than post-filtering)
     pub fn read_columns_filtered_string_to_arrow(
@@ -2791,12 +2961,19 @@ impl TableStorageBackend {
         // FAST PATH: mmap-native string equality scan + late materialization.
         // Avoids materializing all rows (which causes ~100ms for 1M unique StringDict strings).
         // Works for cold backends — scan_string_filter_mmap loads the footer lazily.
-        // Skip when there is in-memory data not yet flushed (would miss pending writes).
-        if filter_eq && !self.has_pending_deltas() {
+        if filter_eq {
             let scan_res =
                 self.storage
                     .scan_string_filter_mmap(filter_column, filter_value, None)?;
             if let Some(indices) = scan_res {
+                if self.pending_delta_updates_column(filter_column) || self.has_delta() {
+                    return self.read_string_filter_with_delta_column_updates(
+                        column_names,
+                        filter_column,
+                        filter_value,
+                        &indices,
+                    );
+                }
                 if indices.is_empty() {
                     return self.read_columns_to_arrow(column_names, 0, Some(0));
                 }
@@ -2804,9 +2981,21 @@ impl TableStorageBackend {
             }
         }
 
+        let needs_filter_col_for_fallback = column_names
+            .map(|cols| !cols.iter().any(|c| c.eq_ignore_ascii_case(filter_column)))
+            .unwrap_or(false);
+        let fallback_cols: Option<Vec<&str>> = column_names.map(|cols| {
+            let mut expanded = cols.to_vec();
+            if needs_filter_col_for_fallback {
+                expanded.push(filter_column);
+            }
+            expanded
+        });
+        let fallback_col_refs = fallback_cols.as_deref().or(column_names);
+
         // V4 mmap-only: fall back to full batch read + Arrow filter (for neq or non-V4 format)
         if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
-            let full_batch = self.read_columns_to_arrow(column_names, 0, None)?;
+            let full_batch = self.read_columns_to_arrow(fallback_col_refs, 0, None)?;
             if full_batch.num_rows() == 0 {
                 return Ok(full_batch);
             }
@@ -2823,6 +3012,22 @@ impl TableStorageBackend {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     let filtered = arrow::compute::filter_record_batch(&full_batch, &mask)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    if needs_filter_col_for_fallback {
+                        if let Some(cols) = column_names {
+                            let mut fields = Vec::with_capacity(cols.len());
+                            let mut arrays = Vec::with_capacity(cols.len());
+                            for &name in cols {
+                                if let Ok(idx) = filtered.schema().index_of(name) {
+                                    fields.push(filtered.schema().field(idx).clone());
+                                    arrays.push(filtered.column(idx).clone());
+                                }
+                            }
+                            let schema = Arc::new(Schema::new(fields));
+                            return RecordBatch::try_new(schema, arrays).map_err(|e| {
+                                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                            });
+                        }
+                    }
                     return Ok(filtered);
                 }
             }

@@ -334,6 +334,29 @@ impl DeltaStore {
         &self.updates
     }
 
+    /// Return true when any pending update touches the given column.
+    pub fn updates_column(&self, column_name: &str) -> bool {
+        self.updates.values().any(|cols| {
+            cols.keys()
+                .any(|name| name.eq_ignore_ascii_case(column_name))
+        })
+    }
+
+    /// Return row IDs whose latest pending update sets `column_name` to `value`.
+    pub fn rows_with_string_update(&self, column_name: &str, value: &str) -> Vec<u64> {
+        self.updates
+            .iter()
+            .filter_map(|(row_id, cols)| {
+                cols.iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(column_name))
+                    .and_then(|(_, record)| match &record.new_value {
+                        Value::String(s) if s == value => Some(*row_id),
+                        _ => None,
+                    })
+            })
+            .collect()
+    }
+
     #[inline]
     pub fn is_dirty(&self) -> bool {
         self.dirty

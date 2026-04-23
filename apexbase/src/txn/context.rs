@@ -92,14 +92,19 @@ pub struct TxnContext {
     write_set: Vec<TxnWrite>,
     /// Set of (table, row_id) pairs written (for fast conflict check)
     write_keys: HashSet<(String, u64)>,
+    /// Pending insert count per table (for monotonic row-id reservation)
+    pending_insert_counts: HashMap<String, u64>,
     /// Tables touched (for table-level lock tracking)
     tables_touched: HashSet<String>,
     /// Whether the transaction is read-only
     read_only: bool,
     /// Whether the transaction has been committed or aborted
     finished: bool,
-    /// Savepoints: (name, write_set_len_at_savepoint, write_keys_snapshot)
-    savepoints: Vec<(String, usize, HashSet<(String, u64)>)>,
+    /// Savepoints: (name, write_set_len_at_savepoint).
+    ///
+    /// write_keys are rebuilt only on rollback, keeping the common successful
+    /// statement path O(1) even when a transaction already has many writes.
+    savepoints: Vec<(String, usize)>,
 }
 
 impl TxnContext {
@@ -111,6 +116,7 @@ impl TxnContext {
             read_set: Vec::new(),
             write_set: Vec::new(),
             write_keys: HashSet::new(),
+            pending_insert_counts: HashMap::new(),
             tables_touched: HashSet::new(),
             read_only,
             finished: false,
@@ -190,6 +196,10 @@ impl TxnContext {
             ));
         }
         self.write_keys.insert(key);
+        *self
+            .pending_insert_counts
+            .entry(table.to_string())
+            .or_insert(0) += 1;
         self.tables_touched.insert(table.to_string());
         self.write_set.push(TxnWrite::Insert {
             table: table.to_string(),
@@ -259,6 +269,11 @@ impl TxnContext {
         &self.write_keys
     }
 
+    /// Number of buffered inserts for a table.
+    pub fn pending_insert_count(&self, table: &str) -> u64 {
+        self.pending_insert_counts.get(table).copied().unwrap_or(0)
+    }
+
     /// Get tables touched
     pub fn tables_touched(&self) -> &HashSet<String> {
         &self.tables_touched
@@ -284,25 +299,27 @@ impl TxnContext {
         self.write_set.iter().rev().cloned().collect()
     }
 
+    /// Take buffered writes when a transaction commits.
+    pub fn take_write_set(&mut self) -> Vec<TxnWrite> {
+        std::mem::take(&mut self.write_set)
+    }
+
     // ========================================================================
     // Savepoints
     // ========================================================================
 
     /// Create a savepoint at the current write-set position
     pub fn savepoint(&mut self, name: &str) {
-        self.savepoints.push((
-            name.to_string(),
-            self.write_set.len(),
-            self.write_keys.clone(),
-        ));
+        self.savepoints
+            .push((name.to_string(), self.write_set.len()));
     }
 
     /// Rollback to a named savepoint — truncate write_set and restore write_keys
     pub fn rollback_to_savepoint(&mut self, name: &str) -> io::Result<()> {
-        if let Some(pos) = self.savepoints.iter().rposition(|(n, _, _)| n == name) {
-            let (_, ws_len, keys_snapshot) = self.savepoints[pos].clone();
+        if let Some(pos) = self.savepoints.iter().rposition(|(n, _)| n == name) {
+            let ws_len = self.savepoints[pos].1;
             self.write_set.truncate(ws_len);
-            self.write_keys = keys_snapshot;
+            self.rebuild_write_indexes();
             // Remove this savepoint and all later ones
             self.savepoints.truncate(pos);
             Ok(())
@@ -316,7 +333,7 @@ impl TxnContext {
 
     /// Release a named savepoint (just removes it, keeps writes)
     pub fn release_savepoint(&mut self, name: &str) -> io::Result<()> {
-        if let Some(pos) = self.savepoints.iter().rposition(|(n, _, _)| n == name) {
+        if let Some(pos) = self.savepoints.iter().rposition(|(n, _)| n == name) {
             self.savepoints.remove(pos);
             Ok(())
         } else {
@@ -332,9 +349,22 @@ impl TxnContext {
         self.read_set.clear();
         self.write_set.clear();
         self.write_keys.clear();
+        self.pending_insert_counts.clear();
         self.tables_touched.clear();
         self.savepoints.clear();
         self.finished = true;
+    }
+
+    fn rebuild_write_indexes(&mut self) {
+        self.write_keys.clear();
+        self.pending_insert_counts.clear();
+        for write in &self.write_set {
+            let table = write.table().to_string();
+            self.write_keys.insert((table.clone(), write.row_id()));
+            if matches!(write, TxnWrite::Insert { .. }) {
+                *self.pending_insert_counts.entry(table).or_insert(0) += 1;
+            }
+        }
     }
 }
 
@@ -391,5 +421,20 @@ mod tests {
         // Undo is in reverse order
         assert_eq!(undos[0].row_id(), 1);
         assert_eq!(undos[1].row_id(), 0);
+    }
+
+    #[test]
+    fn test_savepoint_rebuilds_write_indexes_on_rollback() {
+        let mut ctx = TxnContext::new(1, 100, false);
+        ctx.buffer_insert("users", 0, make_row("alice")).unwrap();
+        ctx.savepoint("sp1");
+        ctx.buffer_insert("users", 1, make_row("bob")).unwrap();
+
+        ctx.rollback_to_savepoint("sp1").unwrap();
+
+        assert_eq!(ctx.write_count(), 1);
+        assert_eq!(ctx.pending_insert_count("users"), 1);
+        assert!(ctx.write_keys().contains(&("users".to_string(), 0)));
+        assert!(!ctx.write_keys().contains(&("users".to_string(), 1)));
     }
 }

@@ -647,6 +647,36 @@ pub fn invalidate_storage_cache(path: &Path) {
     STORAGE_CACHE.remove(path);
 }
 
+#[inline]
+fn storage_effective_modified(path: &Path) -> std::time::SystemTime {
+    let modified = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    let mut delta_path = path.to_path_buf();
+    let name = delta_path.file_name().unwrap_or_default().to_string_lossy();
+    delta_path.set_file_name(format!("{}.delta", name));
+
+    let delta_modified = std::fs::metadata(delta_path)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    if delta_modified > modified {
+        delta_modified
+    } else {
+        modified
+    }
+}
+
+#[inline]
+fn refresh_storage_cache_signature(path: &Path) {
+    if let Some(mut entry) = STORAGE_CACHE.get_mut(path) {
+        let value = entry.value_mut();
+        value.1 = storage_effective_modified(path);
+        value.2.store(now_nanos(), Ordering::Relaxed);
+    }
+}
+
 /// Register an already-open backend in the SQL executor cache.
 ///
 /// Used by storage-level memtable appends: SQL reads should see the same warm
@@ -657,9 +687,7 @@ pub fn cache_backend_pub(path: &Path, backend: Arc<TableStorageBackend>) {
         evict_lru_cache_entries();
     }
 
-    let modified = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let modified = storage_effective_modified(path);
 
     STORAGE_CACHE.insert(
         path.to_path_buf(),
@@ -684,24 +712,34 @@ pub fn get_cached_backend_pub(path: &Path) -> io::Result<Arc<TableStorageBackend
     get_cached_backend(path)
 }
 
-/// Get or open a cached storage backend
-/// Auto-compacts delta files before reading to ensure data consistency
+/// Get or open a cached storage backend.
+/// Read paths merge pending `.delta` rows on demand; they must not compact,
+/// because a small transaction append would otherwise become a full-table rewrite.
 #[inline]
 fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     let cache_key = path.to_path_buf();
+    let delta_path = {
+        let mut dp = cache_key.clone();
+        let name = dp.file_name().unwrap_or_default().to_string_lossy();
+        dp.set_file_name(format!("{}.delta", name));
+        dp
+    };
+    let delta_meta_initial = std::fs::metadata(&delta_path).ok();
 
     // FASTEST PATH: if backend was validated within last 500ms, skip ALL stat() syscalls.
     // Uses AtomicU64 for last_access so no write-lock is needed on the warm hit path.
     // DashMap::get is lock-free for reads
-    if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
-        let pair = entry.pair();
-        let value = pair.1;
-        let last_access = &value.2;
-        if nanos_elapsed(last_access.load(Ordering::Relaxed)) < 500_000_000 {
-            let backend = Arc::clone(&value.0);
-            // Refresh last_access atomically — no write lock needed
-            last_access.store(now_nanos(), Ordering::Relaxed);
-            return Ok(backend);
+    if delta_meta_initial.is_none() {
+        if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
+            let pair = entry.pair();
+            let value = pair.1;
+            let last_access = &value.2;
+            if nanos_elapsed(last_access.load(Ordering::Relaxed)) < 500_000_000 {
+                let backend = Arc::clone(&value.0);
+                // Refresh last_access atomically — no write lock needed
+                last_access.store(now_nanos(), Ordering::Relaxed);
+                return Ok(backend);
+            }
         }
     }
 
@@ -713,55 +751,38 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         .modified()
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
-    // Check for delta file - combine path construction with existence check
-    let delta_path = {
-        let mut dp = cache_key.clone();
-        let name = dp.file_name().unwrap_or_default().to_string_lossy();
-        dp.set_file_name(format!("{}.delta", name));
-        dp
-    };
-
     // Check delta metadata (also gets modified time if exists)
-    let (has_delta, effective_modified) = match std::fs::metadata(&delta_path) {
-        Ok(delta_meta) => {
+    let effective_modified = match delta_meta_initial {
+        Some(delta_meta) => {
             let delta_modified = delta_meta
                 .modified()
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            (
-                true,
-                if delta_modified > modified {
-                    delta_modified
-                } else {
-                    modified
-                },
-            )
+            if delta_modified > modified {
+                delta_modified
+            } else {
+                modified
+            }
         }
-        Err(_) => (false, modified),
+        None => modified,
     };
 
-    // Try read from cache first (only if no delta file pending)
-    if !has_delta {
-        if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
-            let pair = entry.pair();
-            let value = pair.1;
-            let cached_time = value.1;
-            let last_access = &value.2;
-            if cached_time >= effective_modified {
-                let backend = Arc::clone(&value.0);
-                last_access.store(now_nanos(), Ordering::Relaxed);
-                return Ok(backend);
-            }
+    // Try read from cache first. The effective mtime includes the append-only
+    // delta file so committed txn inserts invalidate stale cached backends.
+    if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
+        let pair = entry.pair();
+        let value = pair.1;
+        let cached_time = value.1;
+        let last_access = &value.2;
+        if cached_time >= effective_modified {
+            let backend = Arc::clone(&value.0);
+            last_access.store(now_nanos(), Ordering::Relaxed);
+            return Ok(backend);
         }
     }
 
-    // Open backend — reuse pre-opened file when no delta (saves File::open + DeltaStore stat)
-    let backend = Arc::new(if has_delta {
-        drop(file); // release read handle before write path opens its own
-        let storage = TableStorageBackend::open_for_write(path)?;
-        storage.compact()?;
-        invalidate_storage_cache(path);
-        TableStorageBackend::open(path)?
-    } else {
+    // Open backend using the already-opened file (saves another File::open).
+    // Pending `.delta` data is read lazily by storage-level scan/extract paths.
+    let backend = Arc::new(
         match TableStorageBackend::open_with_file(path, file, file_len) {
             Ok(b) => b,
             Err(_) => {
@@ -778,15 +799,8 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
                 let meta2 = file2.metadata()?;
                 TableStorageBackend::open_with_file(path, file2, meta2.len())?
             }
-        }
-    });
-
-    // Use current time as modified (avoid extra metadata call after compaction)
-    let new_modified = if has_delta {
-        std::time::SystemTime::now() // Just compacted, use current time
-    } else {
-        effective_modified // No change, reuse
-    };
+        },
+    );
 
     // LRU eviction before insert - check cache size and evict if needed
     if STORAGE_CACHE.len() >= MAX_CACHE_ENTRIES {
@@ -797,7 +811,7 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         cache_key,
         (
             Arc::clone(&backend),
-            new_modified,
+            effective_modified,
             Arc::new(AtomicU64::new(now_nanos())),
         ),
     );
@@ -928,8 +942,9 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if backend.has_pending_deltas() {
-                        // Fall through so the general executor applies DeltaMerger overlays.
+                    if backend.has_pending_deltas() || backend.has_delta() {
+                        // Fall through so the general executor applies DeltaMerger overlays
+                        // and append-only transaction delta rows.
                     } else {
                         if backend.storage.is_v4_format()
                             && !backend.storage.has_v4_in_memory_data()
@@ -989,8 +1004,9 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if backend.has_pending_deltas() {
-                        // Fall through so the general executor applies DeltaMerger overlays.
+                    if backend.has_pending_deltas() || backend.has_delta() {
+                        // Fall through so the general executor applies DeltaMerger overlays
+                        // and append-only transaction delta rows.
                     } else {
                         if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(*id) {
                             if let Some(projected) = Self::project_batch_by_names(&batch, columns)?

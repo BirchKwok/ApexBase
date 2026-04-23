@@ -8,6 +8,18 @@ const SYNC_PENDING_MAIN: u8 = 0b001;
 const SYNC_PENDING_DELTA: u8 = 0b010;
 const SYNC_PENDING_DELTASTORE: u8 = 0b100;
 
+struct DeltaStringIndexCache {
+    len: u64,
+    modified: std::time::SystemTime,
+    index: HashMap<String, HashMap<String, Vec<u64>>>,
+}
+
+static DELTA_STRING_INDEX_CACHE: once_cell::sync::Lazy<RwLock<HashMap<PathBuf, DeltaStringIndexCache>>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
+static DELTA_ROW_COUNT_CACHE: once_cell::sync::Lazy<
+    RwLock<HashMap<PathBuf, (u64, std::time::SystemTime, usize)>>,
+> = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
+
 /// High-performance on-demand columnar storage
 ///
 /// Key features:
@@ -363,7 +375,18 @@ impl OnDemandStorage {
                 (None, Vec::new(), next_id)
             };
 
-        let final_next_id = recovered_next_id.max(next_id);
+        let delta_next_id = {
+            let delta_path = Self::delta_path(path);
+            if delta_path.exists() {
+                Self::get_max_id_from_delta_fast(&delta_path)
+                    .ok()
+                    .map(|id| id.saturating_add(1))
+                    .unwrap_or(next_id)
+            } else {
+                next_id
+            }
+        };
+        let final_next_id = recovered_next_id.max(next_id).max(delta_next_id);
         let cached_fo = header.footer_offset;
 
         // Read compression type from header flags
@@ -890,6 +913,13 @@ impl OnDemandStorage {
         delta
     }
 
+    fn delta_meta_path(delta_path: &Path) -> PathBuf {
+        let mut meta = delta_path.to_path_buf();
+        let name = meta.file_name().unwrap_or_default().to_string_lossy();
+        meta.set_file_name(format!("{}.meta", name));
+        meta
+    }
+
     // ========================================================================
     // DeltaStore accessors (Phase 4.5)
     // ========================================================================
@@ -977,6 +1007,18 @@ impl OnDemandStorage {
     /// Get the number of pending delta updates.
     pub fn delta_update_count(&self) -> usize {
         self.delta_store.read().update_count()
+    }
+
+    /// Check whether pending DeltaStore updates modify a specific column.
+    pub fn delta_updates_column(&self, column_name: &str) -> bool {
+        self.delta_store.read().updates_column(column_name)
+    }
+
+    /// Return row IDs whose pending DeltaStore update sets `column_name` to `value`.
+    pub fn delta_rows_with_string_update(&self, column_name: &str, value: &str) -> Vec<u64> {
+        self.delta_store
+            .read()
+            .rows_with_string_update(column_name, value)
     }
 
     /// Save the delta store to disk (called during save path).
@@ -1345,6 +1387,25 @@ impl OnDemandStorage {
         Ok(max_id)
     }
 
+    fn get_max_id_from_delta_fast(delta_path: &Path) -> io::Result<u64> {
+        let meta_path = Self::delta_meta_path(delta_path);
+        if let Ok(bytes) = std::fs::read(&meta_path) {
+            if bytes.len() == 8 {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&bytes);
+                return Ok(u64::from_le_bytes(buf));
+            }
+        }
+
+        let max_id = Self::get_max_id_from_delta(delta_path)?;
+        let _ = Self::write_delta_max_id(delta_path, max_id);
+        Ok(max_id)
+    }
+
+    fn write_delta_max_id(delta_path: &Path, max_id: u64) -> io::Result<()> {
+        std::fs::write(Self::delta_meta_path(delta_path), max_id.to_le_bytes())
+    }
+
     /// Check if delta file exists
     pub fn has_delta(&self) -> bool {
         Self::delta_path(&self.path).exists()
@@ -1571,6 +1632,9 @@ impl OnDemandStorage {
         } else {
             self.mark_delta_sync_pending();
         }
+        if let Some(max_id) = ids.iter().copied().max() {
+            let _ = Self::write_delta_max_id(&delta_path, max_id);
+        }
 
         Ok(())
     }
@@ -1586,6 +1650,14 @@ impl OnDemandStorage {
         }
 
         let delta_path = Self::delta_path(&self.path);
+        let delta_before = std::fs::metadata(&delta_path).ok().map(|metadata| {
+            (
+                metadata.len(),
+                metadata
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            )
+        });
 
         // Get schema to handle partial columns correctly
         let schema = self.schema.read();
@@ -1738,7 +1810,88 @@ impl OnDemandStorage {
             &string_columns,
             &bool_columns,
         )?;
+        Self::refresh_delta_insert_caches(&delta_path, delta_before, &ids, &string_columns);
         Ok(ids)
+    }
+
+    fn refresh_delta_insert_caches(
+        delta_path: &Path,
+        before: Option<(u64, std::time::SystemTime)>,
+        ids: &[u64],
+        string_columns: &HashMap<String, Vec<String>>,
+    ) {
+        if ids.is_empty() {
+            return;
+        }
+
+        let Ok(metadata) = std::fs::metadata(delta_path) else {
+            return;
+        };
+        let file_len = metadata.len();
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+        {
+            let mut cache = DELTA_ROW_COUNT_CACHE.write();
+            if cache.len() > 128 {
+                cache.clear();
+            }
+            match before {
+                None => {
+                    cache.insert(delta_path.to_path_buf(), (file_len, modified, ids.len()));
+                }
+                Some((before_len, before_modified)) => {
+                    if let Some(entry) = cache.get_mut(delta_path) {
+                        if entry.0 == before_len && entry.1 >= before_modified {
+                            entry.0 = file_len;
+                            entry.1 = modified;
+                            entry.2 += ids.len();
+                        }
+                    }
+                }
+            }
+        }
+
+        let append_strings =
+            |index: &mut HashMap<String, HashMap<String, Vec<u64>>>| {
+                for (column, values) in string_columns {
+                    let value_index = index.entry(column.clone()).or_default();
+                    for (row_idx, id) in ids.iter().copied().enumerate() {
+                        if let Some(value) = values.get(row_idx) {
+                            value_index.entry(value.clone()).or_default().push(id);
+                        }
+                    }
+                }
+            };
+
+        let mut cache = DELTA_STRING_INDEX_CACHE.write();
+        if cache.len() > 128 {
+            cache.clear();
+        }
+        match before {
+            None => {
+                let mut index = HashMap::new();
+                append_strings(&mut index);
+                cache.insert(
+                    delta_path.to_path_buf(),
+                    DeltaStringIndexCache {
+                        len: file_len,
+                        modified,
+                        index,
+                    },
+                );
+            }
+            Some((before_len, before_modified)) => {
+                if let Some(entry) = cache.get_mut(delta_path) {
+                    if entry.len == before_len && entry.modified >= before_modified {
+                        append_strings(&mut entry.index);
+                        entry.len = file_len;
+                        entry.modified = modified;
+                    }
+                }
+            }
+        }
     }
 
     /// Insert typed columns to delta file (memory efficient - doesn't load existing data)
@@ -2196,6 +2349,7 @@ impl OnDemandStorage {
         // Delete delta file
         *self.delta_file.write() = None;
         let _ = std::fs::remove_file(&delta_path);
+        let _ = std::fs::remove_file(Self::delta_meta_path(&delta_path));
 
         Ok(())
     }
@@ -2555,125 +2709,512 @@ impl OnDemandStorage {
         }
     }
 
+    #[inline]
+    fn column_string_at(col: &ColumnData, row_idx: usize) -> Option<&str> {
+        match col {
+            ColumnData::String { offsets, data } => {
+                if row_idx + 1 >= offsets.len() {
+                    return None;
+                }
+                let start = offsets[row_idx] as usize;
+                let end = offsets[row_idx + 1] as usize;
+                if start <= end && end <= data.len() {
+                    std::str::from_utf8(&data[start..end]).ok()
+                } else {
+                    None
+                }
+            }
+            ColumnData::StringDict {
+                indices,
+                dict_offsets,
+                dict_data,
+            } => {
+                let dict_idx = *indices.get(row_idx)?;
+                if dict_idx == 0 {
+                    return None;
+                }
+                let di = (dict_idx - 1) as usize;
+                let start = *dict_offsets.get(di)? as usize;
+                let end = if di + 1 < dict_offsets.len() {
+                    dict_offsets[di + 1] as usize
+                } else {
+                    dict_data.len()
+                };
+                if start <= end && end <= dict_data.len() {
+                    std::str::from_utf8(&dict_data[start..end]).ok()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn column_binary_at(col: &ColumnData, row_idx: usize) -> Option<&[u8]> {
+        match col {
+            ColumnData::Binary { offsets, data } => {
+                if row_idx + 1 >= offsets.len() {
+                    return None;
+                }
+                let start = offsets[row_idx] as usize;
+                let end = offsets[row_idx + 1] as usize;
+                if start <= end && end <= data.len() {
+                    Some(&data[start..end])
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn column_bool_at(col: &ColumnData, row_idx: usize) -> Option<bool> {
+        match col {
+            ColumnData::Bool { data, len } if row_idx < *len => {
+                let byte_idx = row_idx / 8;
+                let bit_idx = row_idx % 8;
+                data.get(byte_idx).map(|b| ((b >> bit_idx) & 1) == 1)
+            }
+            _ => None,
+        }
+    }
+
+    /// Return committed append-only delta row IDs whose string column equals `target`.
+    /// This lets string equality filters stay mmap-fast without compacting `.delta`.
+    pub fn delta_string_match_ids(&self, column_name: &str, target: &str) -> io::Result<Vec<u64>> {
+        let delta_path = Self::delta_path(&self.path);
+        if !delta_path.exists() {
+            DELTA_STRING_INDEX_CACHE.write().remove(&delta_path);
+            return Ok(Vec::new());
+        };
+
+        #[inline]
+        fn take_slice<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> io::Result<&'a [u8]> {
+            let end = pos
+                .checked_add(len)
+                .ok_or_else(|| err_data("delta string scan offset overflow"))?;
+            if end > bytes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "delta string scan truncated",
+                ));
+            }
+            let out = &bytes[*pos..end];
+            *pos = end;
+            Ok(out)
+        }
+
+        #[inline]
+        fn read_u16(bytes: &[u8], pos: &mut usize) -> io::Result<u16> {
+            let raw = take_slice(bytes, pos, 2)?;
+            Ok(u16::from_le_bytes(raw.try_into().unwrap()))
+        }
+
+        #[inline]
+        fn read_u32(bytes: &[u8], pos: &mut usize) -> io::Result<u32> {
+            let raw = take_slice(bytes, pos, 4)?;
+            Ok(u32::from_le_bytes(raw.try_into().unwrap()))
+        }
+
+        #[inline]
+        fn read_u64(bytes: &[u8], pos: &mut usize) -> io::Result<u64> {
+            let raw = take_slice(bytes, pos, 8)?;
+            Ok(u64::from_le_bytes(raw.try_into().unwrap()))
+        }
+
+        fn parse_delta_string_index(
+            bytes: &[u8],
+            index: &mut HashMap<String, HashMap<String, Vec<u64>>>,
+        ) -> io::Result<()> {
+            let mut pos = 0usize;
+            while pos < bytes.len() {
+            if bytes.len() - pos < 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "delta string scan truncated record count",
+                ));
+            }
+            let record_count = read_u64(&bytes, &mut pos)? as usize;
+
+            let mut ids = Vec::with_capacity(record_count);
+            for _ in 0..record_count {
+                ids.push(read_u64(&bytes, &mut pos)?);
+            }
+
+            let int_col_count = read_u32(&bytes, &mut pos)? as usize;
+            for _ in 0..int_col_count {
+                let name_len = read_u16(&bytes, &mut pos)? as usize;
+                take_slice(&bytes, &mut pos, name_len)?;
+                take_slice(&bytes, &mut pos, record_count * 8)?;
+            }
+
+            let float_col_count = read_u32(&bytes, &mut pos)? as usize;
+            for _ in 0..float_col_count {
+                let name_len = read_u16(&bytes, &mut pos)? as usize;
+                take_slice(&bytes, &mut pos, name_len)?;
+                take_slice(&bytes, &mut pos, record_count * 8)?;
+            }
+
+            let string_col_count = read_u32(&bytes, &mut pos)? as usize;
+            for _ in 0..string_col_count {
+                let name_len = read_u16(&bytes, &mut pos)? as usize;
+                let name = take_slice(&bytes, &mut pos, name_len)?;
+                let col_name = String::from_utf8_lossy(name).into_owned();
+                let col_index = index.entry(col_name).or_default();
+
+                for row_idx in 0..record_count {
+                    let str_len = read_u32(&bytes, &mut pos)? as usize;
+                    let value = take_slice(&bytes, &mut pos, str_len)?;
+                    if let Some(id) = ids.get(row_idx) {
+                        let value = String::from_utf8_lossy(value).into_owned();
+                        col_index.entry(value).or_default().push(*id);
+                    }
+                }
+            }
+
+            let bool_col_count = read_u32(&bytes, &mut pos)? as usize;
+            for _ in 0..bool_col_count {
+                let name_len = read_u16(&bytes, &mut pos)? as usize;
+                take_slice(&bytes, &mut pos, name_len)?;
+                take_slice(&bytes, &mut pos, record_count)?;
+            }
+        }
+            Ok(())
+        }
+
+        let metadata = std::fs::metadata(&delta_path)?;
+        let file_len = metadata.len();
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+        let mut cache = DELTA_STRING_INDEX_CACHE.write();
+        if cache.len() > 128 {
+            cache.clear();
+        }
+
+        let entry = cache.entry(delta_path.clone()).or_insert_with(|| DeltaStringIndexCache {
+            len: 0,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            index: HashMap::new(),
+        });
+
+        let up_to_date = entry.len == file_len && entry.modified >= modified;
+        let can_append = entry.len > 0 && entry.len < file_len && entry.modified <= modified;
+        if !up_to_date && !can_append {
+            entry.len = 0;
+            entry.index.clear();
+        }
+
+        if !up_to_date {
+            let bytes = std::fs::read(&delta_path)?;
+            let start = if can_append { entry.len as usize } else { 0 };
+            parse_delta_string_index(&bytes[start..], &mut entry.index)?;
+            entry.len = file_len;
+            entry.modified = modified;
+        }
+
+        Ok(entry
+            .index
+            .get(column_name)
+            .and_then(|values| values.get(target))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Materialize committed append-only delta rows by ID in caller order.
+    pub fn read_delta_rows_by_ids_to_arrow(
+        &self,
+        ids: &[u64],
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::{
+            ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray,
+        };
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema_cols = self.schema.read().columns.clone();
+        let empty_batch = || -> io::Result<arrow::record_batch::RecordBatch> {
+            let mut fields = Vec::with_capacity(schema_cols.len() + 1);
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema_cols.len() + 1);
+            fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            arrays.push(Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef);
+            for (name, col_type) in &schema_cols {
+                let (dt, array): (ArrowDataType, ArrayRef) = match col_type {
+                    ColumnType::Bool => (
+                        ArrowDataType::Boolean,
+                        Arc::new(BooleanArray::from(Vec::<Option<bool>>::new())),
+                    ),
+                    ColumnType::Float32 | ColumnType::Float64 => (
+                        ArrowDataType::Float64,
+                        Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
+                    ),
+                    ColumnType::Binary | ColumnType::FixedList | ColumnType::Float16List => (
+                        ArrowDataType::Binary,
+                        Arc::new(BinaryArray::from(Vec::<Option<&[u8]>>::new())),
+                    ),
+                    ColumnType::String | ColumnType::StringDict | ColumnType::Null => (
+                        ArrowDataType::Utf8,
+                        Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+                    ),
+                    _ => (
+                        ArrowDataType::Int64,
+                        Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
+                    ),
+                };
+                fields.push(Field::new(name, dt, true));
+                arrays.push(array);
+            }
+            arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+        };
+
+        if ids.is_empty() {
+            return empty_batch();
+        }
+
+        let Some((delta_ids, delta_columns)) = self.read_delta_data()? else {
+            return empty_batch();
+        };
+        let delta_pos: HashMap<u64, usize> = delta_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, id)| (*id, idx))
+            .collect();
+        let positions: Vec<(u64, usize)> = ids
+            .iter()
+            .filter_map(|id| delta_pos.get(id).copied().map(|pos| (*id, pos)))
+            .collect();
+        if positions.is_empty() {
+            return empty_batch();
+        }
+
+        let mut fields = Vec::with_capacity(schema_cols.len() + 1);
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema_cols.len() + 1);
+        let row_ids: Vec<i64> = positions.iter().map(|(id, _)| *id as i64).collect();
+        fields.push(Field::new("_id", ArrowDataType::Int64, false));
+        arrays.push(Arc::new(Int64Array::from(row_ids)) as ArrayRef);
+
+        for (name, col_type) in &schema_cols {
+            let column = delta_columns.get(name);
+            let (dt, array): (ArrowDataType, ArrayRef) = match col_type {
+                ColumnType::Bool => {
+                    let values: Vec<Option<bool>> = positions
+                        .iter()
+                        .map(|(_, row_idx)| column.and_then(|c| Self::column_bool_at(c, *row_idx)))
+                        .collect();
+                    (ArrowDataType::Boolean, Arc::new(BooleanArray::from(values)))
+                }
+                ColumnType::Float32 | ColumnType::Float64 => {
+                    let values: Vec<Option<f64>> = positions
+                        .iter()
+                        .map(|(_, row_idx)| match column {
+                            Some(ColumnData::Float64(values)) => values.get(*row_idx).copied(),
+                            _ => None,
+                        })
+                        .collect();
+                    (ArrowDataType::Float64, Arc::new(Float64Array::from(values)))
+                }
+                ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
+                    let values: Vec<Option<String>> = positions
+                        .iter()
+                        .map(|(_, row_idx)| {
+                            column
+                                .and_then(|c| Self::column_string_at(c, *row_idx))
+                                .map(str::to_owned)
+                        })
+                        .collect();
+                    let refs: Vec<Option<&str>> = values.iter().map(|v| v.as_deref()).collect();
+                    (ArrowDataType::Utf8, Arc::new(StringArray::from(refs)))
+                }
+                ColumnType::Binary | ColumnType::FixedList | ColumnType::Float16List => {
+                    let values: Vec<Option<Vec<u8>>> = positions
+                        .iter()
+                        .map(|(_, row_idx)| {
+                            column
+                                .and_then(|c| Self::column_binary_at(c, *row_idx))
+                                .map(|b| b.to_vec())
+                        })
+                        .collect();
+                    let refs: Vec<Option<&[u8]>> = values.iter().map(|v| v.as_deref()).collect();
+                    (ArrowDataType::Binary, Arc::new(BinaryArray::from(refs)))
+                }
+                _ => {
+                    let values: Vec<Option<i64>> = positions
+                        .iter()
+                        .map(|(_, row_idx)| match column {
+                            Some(ColumnData::Int64(values)) => values.get(*row_idx).copied(),
+                            _ => None,
+                        })
+                        .collect();
+                    (ArrowDataType::Int64, Arc::new(Int64Array::from(values)))
+                }
+            };
+            fields.push(Field::new(name, dt, true));
+            arrays.push(array);
+        }
+
+        arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
     /// Get the total row count including delta rows (for accurate row_count reporting)
     fn delta_row_count(&self) -> usize {
         let delta_path = Self::delta_path(&self.path);
-        if !delta_path.exists() {
+        let Ok(metadata) = std::fs::metadata(&delta_path) else {
+            DELTA_ROW_COUNT_CACHE.write().remove(&delta_path);
             return 0;
+        };
+
+        let file_len = metadata.len();
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+        {
+            let cache = DELTA_ROW_COUNT_CACHE.read();
+            if let Some((cached_len, cached_modified, cached_count)) = cache.get(&delta_path) {
+                if *cached_len == file_len && *cached_modified >= modified {
+                    return *cached_count;
+                }
+            }
         }
 
-        // Quick count without reading all data
-        if let Ok(mut file) = File::open(&delta_path) {
-            let mut total = 0usize;
-            loop {
-                let mut count_buf = [0u8; 8];
-                match file.read_exact(&mut count_buf) {
-                    Ok(_) => {}
-                    Err(_) => break,
+        let (start, mut total) = {
+            let cache = DELTA_ROW_COUNT_CACHE.read();
+            if let Some((cached_len, cached_modified, cached_count)) = cache.get(&delta_path) {
+                if *cached_len < file_len && *cached_modified <= modified {
+                    (*cached_len, *cached_count)
+                } else {
+                    (0, 0)
                 }
-                let record_count = u64::from_le_bytes(count_buf) as usize;
-                total += record_count;
+            } else {
+                (0, 0)
+            }
+        };
 
-                // Skip the rest of this record block
-                // IDs
+        let Ok(mut file) = File::open(&delta_path) else {
+            return 0;
+        };
+        if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+            total = 0;
+            let _ = file.seek(SeekFrom::Start(0));
+        }
+
+        loop {
+            let mut count_buf = [0u8; 8];
+            match file.read_exact(&mut count_buf) {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            let record_count = u64::from_le_bytes(count_buf) as usize;
+            total += record_count;
+
+            // Skip the rest of this record block
+            // IDs
+            if file
+                .seek(SeekFrom::Current((record_count * 8) as i64))
+                .is_err()
+            {
+                break;
+            }
+
+            // Int columns
+            let mut count_buf4 = [0u8; 4];
+            if file.read_exact(&mut count_buf4).is_err() {
+                break;
+            }
+            let int_col_count = u32::from_le_bytes(count_buf4) as usize;
+            for _ in 0..int_col_count {
+                let mut len_buf = [0u8; 2];
+                if file.read_exact(&mut len_buf).is_err() {
+                    break;
+                }
+                let name_len = u16::from_le_bytes(len_buf) as usize;
                 if file
-                    .seek(SeekFrom::Current((record_count * 8) as i64))
+                    .seek(SeekFrom::Current(
+                        name_len as i64 + (record_count * 8) as i64,
+                    ))
                     .is_err()
                 {
                     break;
                 }
+            }
 
-                // Int columns
-                let mut count_buf4 = [0u8; 4];
-                if file.read_exact(&mut count_buf4).is_err() {
+            // Float columns
+            if file.read_exact(&mut count_buf4).is_err() {
+                break;
+            }
+            let float_col_count = u32::from_le_bytes(count_buf4) as usize;
+            for _ in 0..float_col_count {
+                let mut len_buf = [0u8; 2];
+                if file.read_exact(&mut len_buf).is_err() {
                     break;
                 }
-                let int_col_count = u32::from_le_bytes(count_buf4) as usize;
-                for _ in 0..int_col_count {
-                    let mut len_buf = [0u8; 2];
-                    if file.read_exact(&mut len_buf).is_err() {
-                        break;
-                    }
-                    let name_len = u16::from_le_bytes(len_buf) as usize;
-                    if file
-                        .seek(SeekFrom::Current(
-                            name_len as i64 + (record_count * 8) as i64,
-                        ))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-
-                // Float columns
-                if file.read_exact(&mut count_buf4).is_err() {
+                let name_len = u16::from_le_bytes(len_buf) as usize;
+                if file
+                    .seek(SeekFrom::Current(
+                        name_len as i64 + (record_count * 8) as i64,
+                    ))
+                    .is_err()
+                {
                     break;
                 }
-                let float_col_count = u32::from_le_bytes(count_buf4) as usize;
-                for _ in 0..float_col_count {
-                    let mut len_buf = [0u8; 2];
-                    if file.read_exact(&mut len_buf).is_err() {
-                        break;
-                    }
-                    let name_len = u16::from_le_bytes(len_buf) as usize;
-                    if file
-                        .seek(SeekFrom::Current(
-                            name_len as i64 + (record_count * 8) as i64,
-                        ))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
+            }
 
-                // String columns - variable length, need to read each
-                if file.read_exact(&mut count_buf4).is_err() {
+            // String columns - variable length, need to read each
+            if file.read_exact(&mut count_buf4).is_err() {
+                break;
+            }
+            let string_col_count = u32::from_le_bytes(count_buf4) as usize;
+            for _ in 0..string_col_count {
+                let mut len_buf = [0u8; 2];
+                if file.read_exact(&mut len_buf).is_err() {
                     break;
                 }
-                let string_col_count = u32::from_le_bytes(count_buf4) as usize;
-                for _ in 0..string_col_count {
-                    let mut len_buf = [0u8; 2];
-                    if file.read_exact(&mut len_buf).is_err() {
-                        break;
-                    }
-                    let name_len = u16::from_le_bytes(len_buf) as usize;
-                    if file.seek(SeekFrom::Current(name_len as i64)).is_err() {
-                        break;
-                    }
-                    for _ in 0..record_count {
-                        let mut str_len_buf = [0u8; 4];
-                        if file.read_exact(&mut str_len_buf).is_err() {
-                            break;
-                        }
-                        let str_len = u32::from_le_bytes(str_len_buf) as usize;
-                        if file.seek(SeekFrom::Current(str_len as i64)).is_err() {
-                            break;
-                        }
-                    }
-                }
-
-                // Bool columns
-                if file.read_exact(&mut count_buf4).is_err() {
+                let name_len = u16::from_le_bytes(len_buf) as usize;
+                if file.seek(SeekFrom::Current(name_len as i64)).is_err() {
                     break;
                 }
-                let bool_col_count = u32::from_le_bytes(count_buf4) as usize;
-                for _ in 0..bool_col_count {
-                    let mut len_buf = [0u8; 2];
-                    if file.read_exact(&mut len_buf).is_err() {
+                for _ in 0..record_count {
+                    let mut str_len_buf = [0u8; 4];
+                    if file.read_exact(&mut str_len_buf).is_err() {
                         break;
                     }
-                    let name_len = u16::from_le_bytes(len_buf) as usize;
-                    if file
-                        .seek(SeekFrom::Current(name_len as i64 + record_count as i64))
-                        .is_err()
-                    {
+                    let str_len = u32::from_le_bytes(str_len_buf) as usize;
+                    if file.seek(SeekFrom::Current(str_len as i64)).is_err() {
                         break;
                     }
                 }
             }
-            total
-        } else {
-            0
+
+            // Bool columns
+            if file.read_exact(&mut count_buf4).is_err() {
+                break;
+            }
+            let bool_col_count = u32::from_le_bytes(count_buf4) as usize;
+            for _ in 0..bool_col_count {
+                let mut len_buf = [0u8; 2];
+                if file.read_exact(&mut len_buf).is_err() {
+                    break;
+                }
+                let name_len = u16::from_le_bytes(len_buf) as usize;
+                if file
+                    .seek(SeekFrom::Current(name_len as i64 + record_count as i64))
+                    .is_err()
+                {
+                    break;
+                }
+            }
         }
+
+        let mut cache = DELTA_ROW_COUNT_CACHE.write();
+        if cache.len() > 128 {
+            cache.clear();
+        }
+        cache.insert(delta_path, (file_len, modified, total));
+        total
     }
 }

@@ -3,6 +3,65 @@
 impl ApexExecutor {
     // ========== DDL Execution Methods ==========
 
+    fn delta_path_for_table(table_path: &Path) -> PathBuf {
+        let mut delta = table_path.to_path_buf();
+        let name = delta.file_name().unwrap_or_default().to_string_lossy();
+        delta.set_file_name(format!("{}.delta", name));
+        delta
+    }
+
+    fn delta_meta_path_for_delta(delta_path: &Path) -> PathBuf {
+        let mut meta = delta_path.to_path_buf();
+        let name = meta.file_name().unwrap_or_default().to_string_lossy();
+        meta.set_file_name(format!("{}.meta", name));
+        meta
+    }
+
+    fn deltastore_path_for_table(table_path: &Path) -> PathBuf {
+        let mut path = table_path.to_path_buf();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        path.set_file_name(format!("{}.deltastore", name));
+        path
+    }
+
+    fn remove_table_sidecars(table_path: &Path) {
+        let delta_path = Self::delta_path_for_table(table_path);
+        let deltastore_path = Self::deltastore_path_for_table(table_path);
+        let mut deltastore_tmp = table_path.to_path_buf();
+        let name = deltastore_tmp
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        deltastore_tmp.set_file_name(format!("{}.deltastore.tmp", name));
+
+        let _ = std::fs::remove_file(Self::delta_meta_path_for_delta(&delta_path));
+        let _ = std::fs::remove_file(&delta_path);
+        let _ = std::fs::remove_file(&deltastore_path);
+        let _ = std::fs::remove_file(&deltastore_tmp);
+    }
+
+    fn materialize_table_sidecars(table_path: &Path) -> io::Result<()> {
+        let delta_path = Self::delta_path_for_table(table_path);
+        if delta_path.exists() {
+            let storage = TableStorageBackend::open_for_compact(table_path)?;
+            storage.compact()?;
+            invalidate_storage_cache(table_path);
+            crate::storage::engine::engine().invalidate(table_path);
+        }
+
+        let deltastore_path = Self::deltastore_path_for_table(table_path);
+        if deltastore_path.exists() {
+            let storage = TableStorageBackend::open_for_write(table_path)?;
+            if storage.has_pending_deltas() {
+                storage.save_full()?;
+                invalidate_storage_cache(table_path);
+                crate::storage::engine::engine().invalidate(table_path);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Execute CREATE TABLE statement
     /// High-performance: O(1) - just creates file header
     fn execute_create_table(
@@ -140,6 +199,10 @@ impl ApexExecutor {
         invalidate_storage_cache(&table_path);
         crate::storage::engine::engine().invalidate(&table_path);
         
+        // Schema rewrites must see all committed append-only rows and cell deltas.
+        // Keep SELECT fast by avoiding auto-compact there; pay this cost only for DDL.
+        Self::materialize_table_sidecars(table_path)?;
+
         // Note: ALTER TABLE operations need to preserve existing data, so we use open_for_write
         // which loads all column data. For true schema-only operations (like TRUNCATE),
         // we can use open_for_schema_change which only loads metadata.
@@ -179,8 +242,8 @@ impl ApexExecutor {
         // Invalidate caches before write
         invalidate_storage_cache(storage_path);
         // On Windows, engine insert_cache may hold mmaps that block file truncate (OS error 1224)
-        #[cfg(target_os = "windows")]
         crate::storage::engine::engine().invalidate(storage_path);
+        Self::remove_table_sidecars(storage_path);
         
         // OPTIMIZATION: Use open_for_schema_change - only loads metadata, NOT column data
         let old_storage = TableStorageBackend::open_for_schema_change(storage_path)?;
@@ -195,11 +258,11 @@ impl ApexExecutor {
             storage.add_column(name, dtype.clone())?;
         }
         storage.save()?;
+        Self::remove_table_sidecars(storage_path);
         
         // Invalidate cache after write to ensure subsequent reads get fresh data
         invalidate_storage_cache(storage_path);
         invalidate_table_stats(&storage_path.to_string_lossy());
-        #[cfg(target_os = "windows")]
         crate::storage::engine::engine().invalidate(storage_path);
         
         Ok(ApexResult::Scalar(0))
@@ -567,9 +630,12 @@ impl ApexExecutor {
     
     /// Helper: clean up temp CTE files
     fn cleanup_temp_table(path: &Path) {
+        let delta_path = Self::delta_path_for_table(path);
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path.with_extension("apex.wal"));
         let _ = std::fs::remove_file(path.with_extension("apex.lock"));
+        let _ = std::fs::remove_file(Self::delta_meta_path_for_delta(&delta_path));
+        let _ = std::fs::remove_file(&delta_path);
         let _ = std::fs::remove_file(path.with_extension("apex.deltastore"));
         invalidate_storage_cache(path);
     }

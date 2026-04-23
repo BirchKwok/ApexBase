@@ -35,6 +35,37 @@ class TestTransactionBasics:
         df = client.execute("SELECT name FROM txn_test ORDER BY name").to_pandas()
         assert list(df['name']) == ['Alice', 'Bob']
 
+    def test_repeated_txn_inserts_assign_unique_ids_after_reopen(self):
+        """Repeated committed txn inserts keep monotonic IDs across reopen."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            c = ApexClient(temp_dir)
+            c.create_table('txn_ids', {'name': 'string', 'value': 'int'})
+            c.use_table('txn_ids')
+            c.store([{'name': 'base', 'value': 0}])
+
+            for i in range(20):
+                c.execute('BEGIN')
+                c.execute(f"INSERT INTO txn_ids (name, value) VALUES ('txn_{i}', {i})")
+                c.execute('COMMIT')
+
+            df = c.execute(
+                "SELECT _id, name, value FROM txn_ids ORDER BY _id",
+                show_internal_id=True,
+            ).to_pandas()
+            ids = list(df['_id'])
+            assert ids == list(range(1, 22))
+            c.close()
+
+            c = ApexClient(temp_dir)
+            c.use_table('txn_ids')
+            df = c.execute(
+                "SELECT _id, name, value FROM txn_ids ORDER BY _id",
+                show_internal_id=True,
+            ).to_pandas()
+            ids = list(df['_id'])
+            assert ids == list(range(1, 22))
+            c.close()
+
     def test_rollback_discards_insert(self, client):
         """INSERT within a rolled-back transaction is discarded."""
         client.store([{'name': 'Alice', 'age': 25, 'city': 'NYC'}])
@@ -314,6 +345,127 @@ class TestTransactionIsolation:
 
             # After commit, should still see both
             assert c.count_rows() == 2
+            c.close()
+
+    def test_read_your_insert_after_filter_column_delta_update(self):
+        """String-filter read-your-writes stays correct when the filter column has DeltaStore updates."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            c = ApexClient(temp_dir)
+            c.create_table('ryw_delta', {'name': 'string', 'score': 'float'})
+            c.use_table('ryw_delta')
+            c.store([{'name': f'base_{i}', 'score': float(i)} for i in range(10)])
+            c.flush()
+
+            c.execute('BEGIN')
+            c.execute("UPDATE ryw_delta SET name = 'renamed_base' WHERE _id = 1")
+            c.execute('COMMIT')
+
+            c.execute('BEGIN')
+            c.execute("INSERT INTO ryw_delta (name, score) VALUES ('own_delta', 42.0)")
+            rows = c.execute(
+                "SELECT _id, name, score FROM ryw_delta WHERE name = 'own_delta'",
+                show_internal_id=True,
+            ).to_dict()
+            assert len(rows) == 1
+            assert rows[0]['_id'] is not None
+            assert rows[0]['name'] == 'own_delta'
+            assert rows[0]['score'] == 42.0
+            c.execute('COMMIT')
+            c.close()
+
+    def test_committed_txn_insert_visible_to_string_filter_without_compaction(self):
+        """Committed txn inserts in .delta are visible to string equality filters."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            c = ApexClient(temp_dir)
+            c.create_table('delta_filter', {'name': 'string', 'score': 'float'})
+            c.use_table('delta_filter')
+            c.store([{'name': f'base_{i}', 'score': float(i)} for i in range(100)])
+            c.flush()
+
+            c.execute('BEGIN')
+            c.execute("INSERT INTO delta_filter (name, score) VALUES ('committed_delta', 99.0)")
+            c.execute('COMMIT')
+
+            rows = c.execute(
+                "SELECT _id, name, score FROM delta_filter WHERE name = 'committed_delta'",
+                show_internal_id=True,
+            ).to_dict()
+            assert len(rows) == 1
+            assert rows[0]['name'] == 'committed_delta'
+            assert rows[0]['score'] == 99.0
+
+            table_path = os.path.join(temp_dir, 'delta_filter.apex')
+            assert os.path.exists(f'{table_path}.delta')
+            c.close()
+
+    def test_committed_txn_insert_visible_to_numeric_filter_without_compaction(self):
+        """Committed txn inserts in .delta are visible to numeric predicates."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            c = ApexClient(temp_dir)
+            c.create_table('delta_numeric', {'name': 'string', 'score': 'int'})
+            c.use_table('delta_numeric')
+            c.store([{'name': f'base_{i}', 'score': i} for i in range(10)])
+            c.flush()
+
+            c.execute('BEGIN')
+            c.execute("INSERT INTO delta_numeric (name, score) VALUES ('numeric_delta', 12345)")
+            c.execute('COMMIT')
+
+            rows = c.execute(
+                "SELECT name, score FROM delta_numeric WHERE score = 12345"
+            ).to_dict()
+            assert rows == [{'name': 'numeric_delta', 'score': 12345}]
+
+            table_path = os.path.join(temp_dir, 'delta_numeric.apex')
+            assert os.path.exists(f'{table_path}.delta')
+            c.close()
+
+    def test_committed_delta_cache_updates_after_append_and_truncate(self):
+        """Delta string/count caches stay correct across appends and table truncate."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            c = ApexClient(temp_dir)
+            c.create_table('delta_cache', {'name': 'string', 'score': 'int'})
+            c.use_table('delta_cache')
+            c.store([{'name': 'base', 'score': 1}])
+            c.flush()
+
+            for i in range(3):
+                c.execute('BEGIN')
+                c.execute(
+                    f"INSERT INTO delta_cache (name, score) VALUES ('cached_{i}', {10 + i})"
+                )
+                c.execute('COMMIT')
+
+            assert c.execute(
+                "SELECT COUNT(*) FROM delta_cache WHERE name = 'cached_1'"
+            ).scalar() == 1
+            assert c.execute(
+                "SELECT COUNT(*) FROM delta_cache WHERE name = '__missing_delta_cache__'"
+            ).scalar() == 0
+
+            c.execute('BEGIN')
+            c.execute("INSERT INTO delta_cache (name, score) VALUES ('after_cache', 99)")
+            c.execute('COMMIT')
+            rows = c.execute(
+                "SELECT name, score FROM delta_cache WHERE name = 'after_cache'"
+            ).to_dict()
+            assert rows == [{'name': 'after_cache', 'score': 99}]
+            assert c.count_rows() == 5
+
+            c.execute('TRUNCATE TABLE delta_cache')
+            assert c.count_rows() == 0
+            assert c.execute(
+                "SELECT COUNT(*) FROM delta_cache WHERE name = 'after_cache'"
+            ).scalar() == 0
+
+            c.execute('BEGIN')
+            c.execute("INSERT INTO delta_cache (name, score) VALUES ('after_truncate', 7)")
+            c.execute('COMMIT')
+            rows = c.execute(
+                "SELECT name, score FROM delta_cache WHERE name = 'after_truncate'"
+            ).to_dict()
+            assert rows == [{'name': 'after_truncate', 'score': 7}]
+            assert c.count_rows() == 1
             c.close()
 
     def test_savepoint_partial_rollback(self):

@@ -3720,7 +3720,9 @@ impl OnDemandStorage {
             let _ = self.clear_delta_store();
             self.checkpoint_wal();
             *self.delta_file.write() = None;
-            let _ = std::fs::remove_file(Self::delta_path(&self.path));
+            let delta_path = Self::delta_path(&self.path);
+            let _ = std::fs::remove_file(&delta_path);
+            let _ = std::fs::remove_file(Self::delta_meta_path(&delta_path));
         }
         result
     }

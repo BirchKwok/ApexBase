@@ -30,11 +30,9 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         let mgr = crate::txn::txn_manager();
 
-        // Extract buffered writes before commit validation
-        let writes = mgr.with_context(txn_id, |ctx| Ok(ctx.write_set().to_vec()))?;
-
-        // Commit validates OCC conflicts (read-set + write-set check)
-        mgr.commit(txn_id).map_err(|e| {
+        // Commit validates OCC conflicts and returns buffered writes without
+        // cloning them in the executor first.
+        let writes = mgr.commit_with_writes(txn_id).map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("Transaction conflict: {}", e))
         })?;
 
@@ -47,10 +45,18 @@ impl ApexExecutor {
             affected_tables.insert(table_path);
         }
 
-        // Phase 1: Write TxnBegin to each affected table's WAL
+        // Phase 1: Write TxnBegin to each affected table's WAL, if that table
+        // is using a WAL-backed durability mode. Do not use get_cached_backend()
+        // here: that read path compacts pending .delta files and turns small
+        // transaction commits into full-table rewrites.
+        let mut wal_backends: std::collections::HashMap<
+            std::path::PathBuf,
+            TableStorageBackend,
+        > = std::collections::HashMap::new();
         for table_path in &affected_tables {
-            if let Ok(backend) = get_cached_backend(table_path) {
+            if let Ok(Some(backend)) = Self::open_txn_wal_backend(table_path) {
                 let _ = backend.storage.wal_write_txn_begin(txn_id);
+                wal_backends.insert(table_path.clone(), backend);
             }
         }
 
@@ -60,7 +66,7 @@ impl ApexExecutor {
             use crate::txn::context::TxnWrite;
             let table_name = write.table();
             let table_path = Self::resolve_table_path(table_name, base_dir, default_table_path);
-            if let Ok(backend) = get_cached_backend(&table_path) {
+            if let Some(backend) = wal_backends.get(&table_path) {
                 match write {
                     TxnWrite::Insert { data, row_id, .. } => {
                         use crate::storage::on_demand::ColumnValue as CV;
@@ -95,20 +101,11 @@ impl ApexExecutor {
         }
 
         // Phase 3: Apply buffered writes to storage
-        let mut applied = 0i64;
-        for write in &writes {
-            let result = Self::apply_txn_write(write, base_dir, default_table_path);
-            match result {
-                Ok(count) => applied += count,
-                Err(e) => {
-                    eprintln!("Warning: failed to apply txn write: {}", e);
-                }
-            }
-        }
+        let applied = Self::apply_txn_writes(&writes, base_dir, default_table_path);
 
         // Phase 4: Write TxnCommit to each affected table's WAL (flush + optional sync)
         for table_path in &affected_tables {
-            if let Ok(backend) = get_cached_backend(table_path) {
+            if let Some(backend) = wal_backends.get(table_path) {
                 let _ = backend.storage.wal_write_txn_commit(txn_id);
             }
         }
@@ -120,6 +117,156 @@ impl ApexExecutor {
         }
 
         Ok(ApexResult::Scalar(applied))
+    }
+
+    fn open_txn_wal_backend(storage_path: &Path) -> io::Result<Option<TableStorageBackend>> {
+        let wal_path = {
+            let mut p = storage_path.to_path_buf();
+            let ext = p
+                .extension()
+                .map(|e| format!("{}.wal", e.to_string_lossy()))
+                .unwrap_or_else(|| "wal".to_string());
+            p.set_extension(ext);
+            p
+        };
+        if !wal_path.exists() {
+            return Ok(None);
+        }
+
+        TableStorageBackend::open_for_insert_with_durability(
+            storage_path,
+            crate::storage::DurabilityLevel::Safe,
+        )
+        .map(Some)
+    }
+
+    /// Apply buffered writes while coalescing adjacent INSERTs into one storage append.
+    fn apply_txn_writes(
+        writes: &[crate::txn::context::TxnWrite],
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> i64 {
+        use crate::txn::context::TxnWrite;
+
+        let mut applied = 0i64;
+        let mut idx = 0usize;
+        while idx < writes.len() {
+            match &writes[idx] {
+                TxnWrite::Insert { table, data, .. } => {
+                    let columns = Self::txn_insert_columns(data);
+                    let mut values_list = Vec::new();
+                    let mut row_maps = Vec::new();
+                    let mut next_idx = idx;
+                    while next_idx < writes.len() {
+                        match &writes[next_idx] {
+                            TxnWrite::Insert {
+                                table: next_table,
+                                data: next_data,
+                                ..
+                            } if next_table == table
+                                && Self::txn_insert_columns(next_data) == columns =>
+                            {
+                                row_maps.push(next_data.clone());
+                                values_list.push(
+                                    columns
+                                        .iter()
+                                        .map(|c| next_data.get(c).cloned().unwrap_or(Value::Null))
+                                        .collect::<Vec<_>>(),
+                                );
+                                next_idx += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
+                    match Self::try_apply_txn_insert_delta(&table_path, &row_maps) {
+                        Ok(Some(count)) => applied += count,
+                        Ok(None) => {
+                            match Self::execute_insert(&table_path, Some(&columns), &values_list) {
+                                Ok(_) => applied += values_list.len() as i64,
+                                Err(e) => {
+                                    eprintln!("Warning: failed to apply txn insert batch: {}", e)
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("Warning: failed to apply txn insert delta: {}", e),
+                    }
+                    idx = next_idx;
+                }
+                _ => {
+                    match Self::apply_txn_write(&writes[idx], base_dir, default_table_path) {
+                        Ok(count) => applied += count,
+                        Err(e) => eprintln!("Warning: failed to apply txn write: {}", e),
+                    }
+                    idx += 1;
+                }
+            }
+        }
+        applied
+    }
+
+    fn txn_insert_columns(data: &std::collections::HashMap<String, Value>) -> Vec<String> {
+        let mut columns: Vec<String> = data.keys().cloned().collect();
+        columns.sort_unstable();
+        columns
+    }
+
+    /// Fast committed txn INSERT path for simple existing tables.
+    ///
+    /// The fallback `execute_insert` path is still used for schema evolution,
+    /// partial INSERTs, constraints, indexes, or FTS tables.
+    fn try_apply_txn_insert_delta(
+        storage_path: &Path,
+        rows: &[std::collections::HashMap<String, Value>],
+    ) -> io::Result<Option<i64>> {
+        if rows.is_empty() || !storage_path.exists() {
+            return Ok(Some(0));
+        }
+
+        let storage = TableStorageBackend::open_for_insert(storage_path)?;
+        if storage.storage.has_constraints() {
+            return Ok(None);
+        }
+
+        let schema = storage.get_schema();
+        let schema_cols: std::collections::HashSet<&str> =
+            schema.iter().map(|(name, _)| name.as_str()).collect();
+        for row in rows {
+            if row.len() != schema_cols.len()
+                || row
+                    .keys()
+                    .any(|name| name == "_id" || !schema_cols.contains(name.as_str()))
+            {
+                return Ok(None);
+            }
+        }
+
+        let (base_dir, table_name) = base_dir_and_table(storage_path);
+        {
+            let idx_mgr_arc = get_index_manager(&base_dir, &table_name);
+            let idx_mgr = idx_mgr_arc.lock();
+            if !idx_mgr.list_indexes().is_empty() {
+                return Ok(None);
+            }
+        }
+        if Self::table_fts_enabled(&base_dir, &table_name) {
+            return Ok(None);
+        }
+
+        let ids = storage.insert_rows_to_delta(rows)?;
+        refresh_storage_cache_signature(storage_path);
+        invalidate_table_stats(&storage_path.to_string_lossy());
+        Ok(Some(ids.len() as i64))
+    }
+
+    fn table_fts_enabled(base_dir: &Path, table_name: &str) -> bool {
+        let cfg = Self::read_fts_config(base_dir);
+        cfg.as_object()
+            .and_then(|o| o.get(table_name))
+            .and_then(|entry| entry.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 
     /// Apply a single buffered write from a committed transaction
@@ -155,6 +302,12 @@ impl ApexExecutor {
                 ..
             } => {
                 let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
+                if let Some(count) =
+                    Self::try_apply_txn_update_by_id_fast(&table_path, *row_id, new_data)?
+                {
+                    return Ok(count);
+                }
+
                 let assignments: Vec<(String, SqlExpr)> = new_data
                     .iter()
                     .map(|(col, val)| (col.clone(), SqlExpr::Literal(val.clone())))
@@ -168,6 +321,70 @@ impl ApexExecutor {
                 Ok(1)
             }
         }
+    }
+
+    fn try_apply_txn_update_by_id_fast(
+        storage_path: &Path,
+        row_id: u64,
+        new_data: &std::collections::HashMap<String, Value>,
+    ) -> io::Result<Option<i64>> {
+        if new_data.is_empty() || new_data.contains_key("_id") {
+            return Ok(None);
+        }
+
+        let storage = TableStorageBackend::open_for_insert(storage_path)?;
+        if storage.storage.has_constraints() {
+            return Ok(None);
+        }
+
+        let (base_dir, table_name) = base_dir_and_table(storage_path);
+        {
+            let idx_mgr_arc = get_index_manager(&base_dir, &table_name);
+            let idx_mgr = idx_mgr_arc.lock();
+            if !idx_mgr.list_indexes().is_empty() {
+                return Ok(None);
+            }
+        }
+        if Self::table_fts_enabled(&base_dir, &table_name) {
+            return Ok(None);
+        }
+
+        match storage.row_id_active_rcix(row_id)? {
+            Some(true) => {}
+            Some(false) => return Ok(Some(0)),
+            None => return Ok(None),
+        }
+
+        if new_data.len() == 1 {
+            let (col_name, value) = new_data.iter().next().unwrap();
+            let bytes_opt = match value {
+                Value::Float64(f) => Some(f.to_le_bytes()),
+                Value::Int64(i) => Some(i.to_le_bytes()),
+                Value::Int32(i) => Some((*i as i64).to_le_bytes()),
+                _ => None,
+            };
+            if let Some(bytes) = bytes_opt {
+                if let Some((count, physically_written)) =
+                    storage.update_by_id_inplace(row_id, col_name, &bytes)?
+                {
+                    if physically_written {
+                        invalidate_storage_cache(storage_path);
+                        invalidate_table_stats(&storage_path.to_string_lossy());
+                    }
+                    return Ok(Some(count));
+                }
+            }
+        }
+
+        let batch: Vec<(u64, &str, Value)> = new_data
+            .iter()
+            .map(|(col, val)| (row_id, col.as_str(), val.clone()))
+            .collect();
+        storage.delta_batch_update_rows(&batch);
+        storage.save_delta_store()?;
+        invalidate_storage_cache(storage_path);
+        invalidate_table_stats(&storage_path.to_string_lossy());
+        Ok(Some(1))
     }
 
     /// Execute ROLLBACK for a specific transaction
@@ -234,34 +451,37 @@ impl ApexExecutor {
                 values,
             } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
-                let storage = TableStorageBackend::open(&table_path)?;
+                let storage = TableStorageBackend::open_for_insert(&table_path)?;
                 let schema = storage.get_schema();
                 // Reserve synthetic row IDs from the storage allocator so transactional
                 // inserts follow the same 1-based monotonic sequence as committed rows.
-                let existing_inserts = mgr.with_context(txn_id, |ctx| {
-                    Ok(ctx.write_set().iter().filter(|write| {
-                        matches!(write, crate::txn::context::TxnWrite::Insert { table: t, .. } if t == &table)
-                    }).count() as u64)
-                })?;
+                let existing_inserts =
+                    mgr.with_context(txn_id, |ctx| Ok(ctx.pending_insert_count(&table)))?;
                 let base_id =
                     storage.next_id_value().max(crate::storage::FIRST_ROW_ID) + existing_inserts;
-                let mut buffered = 0i64;
+                let col_names: Vec<String> = if let Some(cols) = &columns {
+                    cols.clone()
+                } else {
+                    schema.iter().map(|(n, _)| n.clone()).collect()
+                };
+                let mut pending_rows = Vec::with_capacity(values.len());
                 for (ri, row_values) in values.iter().enumerate() {
                     let row_id = base_id + ri as u64;
-                    let col_names: Vec<String> = if let Some(cols) = &columns {
-                        cols.clone()
-                    } else {
-                        schema.iter().map(|(n, _)| n.clone()).collect()
-                    };
                     let mut data = std::collections::HashMap::new();
                     for (i, val) in row_values.iter().enumerate() {
                         if i < col_names.len() {
                             data.insert(col_names[i].clone(), val.clone());
                         }
                     }
-                    mgr.with_context(txn_id, |ctx| ctx.buffer_insert(&table, row_id, data))?;
-                    buffered += 1;
+                    pending_rows.push((row_id, data));
                 }
+                let buffered = pending_rows.len() as i64;
+                mgr.with_context(txn_id, |ctx| {
+                    for (row_id, data) in pending_rows {
+                        ctx.buffer_insert(&table, row_id, data)?;
+                    }
+                    Ok(())
+                })?;
                 Ok(ApexResult::Scalar(buffered))
             }
             SqlStatement::Delete {
@@ -269,8 +489,21 @@ impl ApexExecutor {
                 where_clause,
             } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
-                let storage = TableStorageBackend::open(&table_path)?;
+                let storage = TableStorageBackend::open_for_insert(&table_path)?;
                 let mut buffered = 0i64;
+
+                if let Some(where_expr) = &where_clause {
+                    if let Some(rid) = Self::extract_id_equality_filter(where_expr) {
+                        if let Some(batch) = storage.read_row_by_id_to_arrow(rid)? {
+                            let old_data = Self::row_value_map_from_batch(&batch, 0);
+                            mgr.with_context(txn_id, |ctx| {
+                                ctx.buffer_delete(&table, rid, old_data)
+                            })?;
+                            return Ok(ApexResult::Scalar(1));
+                        }
+                        return Ok(ApexResult::Scalar(0));
+                    }
+                }
 
                 // Read ALL columns so we can capture old_data for VersionStore (snapshot isolation)
                 let batch = storage.read_columns_to_arrow(None, 0, None)?;
@@ -326,7 +559,27 @@ impl ApexExecutor {
                 where_clause,
             } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
-                let storage = TableStorageBackend::open(&table_path)?;
+                let storage = TableStorageBackend::open_for_insert(&table_path)?;
+
+                if let Some(where_expr) = &where_clause {
+                    if let Some(rid) = Self::extract_id_equality_filter(where_expr) {
+                        if let Some(batch) = storage.read_row_by_id_to_arrow(rid)? {
+                            let old_data = Self::row_value_map_from_batch(&batch, 0);
+                            let mut new_data = std::collections::HashMap::new();
+                            for (col, expr) in &assignments {
+                                if let SqlExpr::Literal(val) = expr {
+                                    new_data.insert(col.clone(), val.clone());
+                                }
+                            }
+                            mgr.with_context(txn_id, |ctx| {
+                                ctx.buffer_update(&table, rid, old_data, new_data)
+                            })?;
+                            return Ok(ApexResult::Scalar(1));
+                        }
+                        return Ok(ApexResult::Scalar(0));
+                    }
+                }
+
                 // Read ALL columns for old_data capture (snapshot isolation)
                 let batch = storage.read_columns_to_arrow(None, 0, None)?;
                 let col_names: Vec<String> = batch
@@ -400,7 +653,8 @@ impl ApexExecutor {
                 let writes = mgr.with_context(txn_id, |ctx| Ok(ctx.write_set().to_vec()))?;
 
                 // Collect inserts and deletes for this table (own writes)
-                let mut inserted_rows: Vec<&std::collections::HashMap<String, Value>> = Vec::new();
+                let mut inserted_rows: Vec<(u64, &std::collections::HashMap<String, Value>)> =
+                    Vec::new();
                 let mut deleted_ids: std::collections::HashSet<u64> =
                     std::collections::HashSet::new();
                 let mut updated_rows: Vec<(u64, &std::collections::HashMap<String, Value>)> =
@@ -408,8 +662,13 @@ impl ApexExecutor {
                 for w in &writes {
                     use crate::txn::context::TxnWrite;
                     match w {
-                        TxnWrite::Insert { table, data, .. } if table == &table_name => {
-                            inserted_rows.push(data);
+                        TxnWrite::Insert {
+                            table,
+                            row_id,
+                            data,
+                            ..
+                        } if table == &table_name => {
+                            inserted_rows.push((*row_id, data));
                         }
                         TxnWrite::Delete { table, row_id, .. } if table == &table_name => {
                             deleted_ids.insert(*row_id);
@@ -562,8 +821,11 @@ impl ApexExecutor {
                 }
 
                 // Append buffered inserts (own writes)
-                for insert_data in &inserted_rows {
+                for (row_id, insert_data) in &inserted_rows {
                     let mut row = vec![Value::Null; num_cols];
+                    if let Some(ci) = col_names.iter().position(|n| n == "_id") {
+                        row[ci] = Value::Int64(*row_id as i64);
+                    }
                     for (col, val) in *insert_data {
                         if let Some(ci) = col_names.iter().position(|n| n == col) {
                             row[ci] = val.clone();
@@ -779,14 +1041,15 @@ impl ApexExecutor {
             match field.data_type() {
                 DataType::Int64 => {
                     let mut builder = Int64Builder::with_capacity(num_rows);
-                    for row in rows {
-                        match row.get(col_idx) {
-                            Some(Value::Int64(v)) => builder.append_value(*v),
-                            Some(Value::Int32(v)) => builder.append_value(*v as i64),
-                            Some(Value::Null) | None => builder.append_null(),
-                            _ => builder.append_null(),
-                        }
-                    }
+	                    for row in rows {
+	                        match row.get(col_idx) {
+	                            Some(Value::Int64(v)) => builder.append_value(*v),
+	                            Some(Value::Int32(v)) => builder.append_value(*v as i64),
+	                            Some(Value::UInt64(v)) => builder.append_value(*v as i64),
+	                            Some(Value::Null) | None => builder.append_null(),
+	                            _ => builder.append_null(),
+	                        }
+	                    }
                     arrays.push(Arc::new(builder.finish()));
                 }
                 DataType::UInt64 => {
@@ -879,6 +1142,21 @@ impl ApexExecutor {
         } else {
             Value::Null
         }
+    }
+
+    fn row_value_map_from_batch(
+        batch: &RecordBatch,
+        row: usize,
+    ) -> std::collections::HashMap<String, Value> {
+        let mut data = std::collections::HashMap::new();
+        for (ci, field) in batch.schema().fields().iter().enumerate() {
+            let name = field.name();
+            if name == "_id" {
+                continue;
+            }
+            data.insert(name.clone(), Self::arrow_value_at_col(batch.column(ci), row));
+        }
+        data
     }
 
     // ========== Index Maintenance Helpers ==========
@@ -1961,6 +2239,10 @@ impl ApexExecutor {
         if !table_path.exists() {
             return Err(err_not_found(format!("Table '{}' does not exist", table)));
         }
+
+        // REINDEX must rebuild from committed values, including txn append
+        // sidecars and DeltaStore cell updates.
+        Self::materialize_table_sidecars(&table_path)?;
 
         let idx_mgr_arc = get_index_manager(base_dir, table);
         let mut idx_mgr = idx_mgr_arc.lock();

@@ -345,6 +345,7 @@ impl ApexExecutor {
                         let col_refs = if has_scalar_subquery
                             || stmt.where_clause.is_some()
                             || backend.has_pending_deltas()
+                            || backend.has_delta()
                         {
                             None
                         } else {
@@ -368,6 +369,7 @@ impl ApexExecutor {
                             && stmt.group_by.is_empty()
                             && stmt.joins.is_empty()
                             && !backend.has_pending_deltas()
+                            && !backend.has_delta()
                         {
                             if let Some(result) = Self::try_mmap_aggregation(&backend, &stmt)? {
                                 return Ok(result);
@@ -401,6 +403,7 @@ impl ApexExecutor {
                             && stmt.group_by.is_empty()
                             && !has_aggregation_check
                             && !backend.has_pending_deltas()
+                            && !backend.has_delta()
                         {
                             if let Some(ref where_clause) = stmt.where_clause {
                                 if let Some(id) = Self::extract_id_equality_filter(where_clause) {
@@ -453,7 +456,7 @@ impl ApexExecutor {
                     // FAST PATH 0: Check for _id = X pattern (O(1) lookup)
                         if let Some(where_clause) = &stmt.where_clause {
                             if let Some(id) = Self::extract_id_equality_filter(where_clause) {
-                                if !backend.has_pending_deltas() {
+                                if !backend.has_pending_deltas() && !backend.has_delta() {
                                     if let Some(batch) = backend.read_row_by_id_to_arrow(id)? {
                                         batch
                                     } else {
@@ -516,7 +519,10 @@ impl ApexExecutor {
                                 // FAST PATH 5: Mmap IN filter on string column
                                 } else if let Some(result) = Self::try_fast_mmap_in_filter(&backend, &stmt, storage_path)? {
                                     return Ok(result);
-                                } else if backend.is_mmap_only() && !backend.has_pending_deltas() {
+                                } else if backend.is_mmap_only()
+                                    && !backend.has_pending_deltas()
+                                    && !backend.has_delta()
+                                {
                                     // MMAP FAST PATH: byte-level scan + point lookups
                                     if let Some(where_clause) = &stmt.where_clause {
                                         let _limit_with_off = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
@@ -1204,13 +1210,6 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         limit: Option<usize>,
     ) -> io::Result<Option<RecordBatch>> {
-        // Skip fast path if delta store has pending updates — the in-memory scan
-        // bypasses DeltaMerger and would return stale data. Fall through to the
-        // standard mmap read path which applies DeltaMerger overlay.
-        if backend.has_pending_deltas() {
-            return Ok(None);
-        }
-
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
@@ -1220,7 +1219,7 @@ impl ApexExecutor {
             Some(v) => v,
             None => return Ok(None),
         };
-        
+
         // Column projection pushdown
         let projected_cols: Option<Vec<String>> = if stmt.is_select_star() {
             None
@@ -1231,6 +1230,17 @@ impl ApexExecutor {
             .map(|cols| cols.iter().map(|s| s.as_str()).collect());
         
         let result = if let Some(lim) = limit {
+            if backend.pending_delta_updates_column(&col_name) || backend.has_delta() {
+                let full = backend.read_columns_filtered_string_to_arrow(
+                    col_refs.as_deref(),
+                    &col_name,
+                    &filter_value,
+                    true,
+                )?;
+                let offset = stmt.offset.unwrap_or(0).min(full.num_rows());
+                let len = lim.min(full.num_rows().saturating_sub(offset));
+                full.slice(offset, len)
+            } else {
             backend.read_columns_filtered_string_with_limit_to_arrow(
                 col_refs.as_deref(),
                 &col_name,
@@ -1239,6 +1249,7 @@ impl ApexExecutor {
                 lim,
                 stmt.offset.unwrap_or(0),
             )?
+            }
         } else {
             backend.read_columns_filtered_string_to_arrow(
                 col_refs.as_deref(),
@@ -1260,7 +1271,7 @@ impl ApexExecutor {
     ) -> io::Result<Option<RecordBatch>> {
         use crate::query::sql_parser::BinaryOperator;
         
-        if backend.has_pending_deltas() {
+        if backend.has_pending_deltas() || backend.has_delta() {
             return Ok(None);
         }
 
@@ -1464,7 +1475,7 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() { return Ok(None); }
+        if backend.has_pending_deltas() || backend.has_delta() { return Ok(None); }
 
         use crate::query::AggregateFunc;
         use crate::query::sql_parser::BinaryOperator;
@@ -1651,7 +1662,7 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() { return Ok(None); }
+        if backend.has_pending_deltas() || backend.has_delta() { return Ok(None); }
 
         use crate::query::AggregateFunc;
         
@@ -1877,7 +1888,7 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() { return Ok(None); }
+        if backend.has_pending_deltas() || backend.has_delta() { return Ok(None); }
 
         use crate::query::AggregateFunc;
         
@@ -2274,7 +2285,7 @@ impl ApexExecutor {
         storage_path: &Path,
     ) -> io::Result<Option<ApexResult>> {
         use crate::query::sql_parser::BinaryOperator;
-        if !backend.is_mmap_only() || backend.has_pending_deltas() { return Ok(None); }
+        if !backend.is_mmap_only() || backend.has_pending_deltas() || backend.has_delta() { return Ok(None); }
         // Without LIMIT the result set can be very large; sequential Arrow scan is faster
         // than index intersection + scatter read for high-selectivity filters.
         if stmt.limit.is_none() { return Ok(None); }
@@ -2619,7 +2630,7 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         storage_path: &Path,
     ) -> io::Result<Option<ApexResult>> {
-        if !backend.is_mmap_only() || backend.has_pending_deltas() { return Ok(None); }
+        if !backend.is_mmap_only() || backend.has_pending_deltas() || backend.has_delta() { return Ok(None); }
 
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
@@ -2728,7 +2739,7 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
-        if backend.has_pending_deltas() { return Ok(None); }
+        if backend.has_pending_deltas() || backend.has_delta() { return Ok(None); }
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
@@ -2943,6 +2954,12 @@ impl ApexExecutor {
         let k = limit + offset;
         if k == 0 {
             return backend.read_columns_to_arrow(None, 0, Some(0));
+        }
+
+        if backend.has_delta() {
+            let full_batch = backend.read_columns_to_arrow(None, 0, None)?;
+            let sorted = Self::apply_order_by_topk(&full_batch, &stmt.order_by, Some(k))?;
+            return Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset);
         }
 
         if !backend.has_pending_deltas() {

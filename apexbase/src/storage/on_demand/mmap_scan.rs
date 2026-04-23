@@ -1320,12 +1320,35 @@ impl OnDemandStorage {
     pub fn read_ids(&self, start_row: usize, row_count: Option<usize>) -> io::Result<Vec<u64>> {
         // Ensure IDs are loaded (lazy loading)
         self.ensure_ids_loaded()?;
-        
+
         let ids = self.ids.read();
-        let total = ids.len();
+        let base_total = ids.len();
+        let delta_rows = self.delta_row_count();
+        let total = base_total + delta_rows;
         let start = start_row.min(total);
         let count = row_count.map(|c| c.min(total - start)).unwrap_or(total - start);
-        Ok(ids[start..start + count].to_vec())
+        let end = start + count;
+
+        let mut result = Vec::with_capacity(count);
+        if start < base_total {
+            let base_end = end.min(base_total);
+            result.extend_from_slice(&ids[start..base_end]);
+        }
+        drop(ids);
+
+        if end > base_total {
+            if let Some((delta_ids, _)) = self.read_delta_data()? {
+                let delta_start = start.saturating_sub(base_total);
+                let delta_end = end
+                    .saturating_sub(base_total)
+                    .min(delta_ids.len());
+                if delta_start < delta_end {
+                    result.extend_from_slice(&delta_ids[delta_start..delta_end]);
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Read IDs for specific row indices (optimized for scattered access, lazy loads)
@@ -2589,17 +2612,31 @@ impl OnDemandStorage {
                     global_off: usize, col_rcix: usize, has_deletes: bool,
                 }
                 let mut rg_descs: Vec<RgDesc> = Vec::with_capacity(footer.row_groups.len());
+                let target_len_i64 = target_bytes.len() as i64;
                 let mut off = 0usize;
                 for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+                    let global_off = off;
+                    off += rg_meta.row_count as usize;
+
+                    if let Some(zmaps) = footer.zone_maps.get(rg_i) {
+                        if let Some(zm) = zmaps
+                            .iter()
+                            .find(|z| z.col_idx as usize == col_idx && !z.is_float)
+                        {
+                            if target_len_i64 < zm.min_bits || target_len_i64 > zm.max_bits {
+                                continue;
+                            }
+                        }
+                    }
+
                     rg_descs.push(RgDesc {
                         rg_offset: rg_meta.offset as usize,
                         rg_data_size: rg_meta.data_size as usize,
                         rg_rows: rg_meta.row_count as usize,
-                        global_off: off,
+                        global_off,
                         col_rcix: footer.col_offsets[rg_i][col_idx] as usize,
                         has_deletes: rg_meta.deletion_count > 0,
                     });
-                    off += rg_meta.row_count as usize;
                 }
 
                 let target_len = target_bytes.len();
@@ -3776,23 +3813,37 @@ impl OnDemandStorage {
                     let payload = &col_bytes[enc_offset..];
                     let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
                     let n = count.min(rg_rows).min((payload.len() - 8) / 8);
+                    let no_nulls = !null_bytes.iter().any(|&b| b != 0);
+                    let unlimited = max_matches == usize::MAX;
                     if is_int {
                         let low_i = low.ceil() as i64;
                         let high_i = high.floor() as i64;
                         let vals = bytes_as_i64_slice(&payload[8..], n);
-                        for i in 0..n {
-                            if matches.len() >= max_matches { break; }
-                            if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                            if vals[i] >= low_i && vals[i] <= high_i { matches.push(global_row_offset + i); }
+                        if !has_deletes && no_nulls && unlimited {
+                            for (i, &v) in vals.iter().enumerate() {
+                                if v >= low_i && v <= high_i { matches.push(global_row_offset + i); }
+                            }
+                        } else {
+                            for i in 0..n {
+                                if matches.len() >= max_matches { break; }
+                                if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                if !no_nulls && (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                if vals[i] >= low_i && vals[i] <= high_i { matches.push(global_row_offset + i); }
+                            }
                         }
                     } else {
                         let vals = bytes_as_f64_slice(&payload[8..], n);
-                        for i in 0..n {
-                            if matches.len() >= max_matches { break; }
-                            if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                            if vals[i] >= low && vals[i] <= high { matches.push(global_row_offset + i); }
+                        if !has_deletes && no_nulls && unlimited {
+                            for (i, &v) in vals.iter().enumerate() {
+                                if v >= low && v <= high { matches.push(global_row_offset + i); }
+                            }
+                        } else {
+                            for i in 0..n {
+                                if matches.len() >= max_matches { break; }
+                                if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                if !no_nulls && (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                if vals[i] >= low && vals[i] <= high { matches.push(global_row_offset + i); }
+                            }
                         }
                     }
                     global_row_offset += rg_rows;
@@ -3915,11 +3966,25 @@ impl OnDemandStorage {
         let is_float = matches!(col_type, ColumnType::Float64 | ColumnType::Float32);
         if !is_int && !is_float { return Ok(None); }
 
-        // Build lookup set
-        let value_set: std::collections::HashSet<i64> = values.iter().copied().collect();
+        let mut small_values: Vec<i64> = values.to_vec();
+        small_values.sort_unstable();
+        small_values.dedup();
+        let use_small_values = small_values.len() <= 16;
+        let value_set: ahash::AHashSet<i64> = if use_small_values {
+            ahash::AHashSet::new()
+        } else {
+            small_values.iter().copied().collect()
+        };
+        let matches_value = |v: i64| -> bool {
+            if use_small_values {
+                small_values.contains(&v)
+            } else {
+                value_set.contains(&v)
+            }
+        };
         // For zone map pruning: compute min/max of IN values
-        let in_min = values.iter().copied().min().unwrap();
-        let in_max = values.iter().copied().max().unwrap();
+        let in_min = *small_values.first().unwrap();
+        let in_max = *small_values.last().unwrap();
 
         let col_count = schema.column_count();
         let file_guard = self.file.read();
@@ -3979,21 +4044,35 @@ impl OnDemandStorage {
                     let payload = &col_bytes[enc_offset..];
                     let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
                     let n = count.min(rg_rows).min((payload.len() - 8) / 8);
+                    let no_nulls = !null_bytes.iter().any(|&b| b != 0);
+                    let unlimited = max_matches == usize::MAX;
                     if is_int {
                         let vals = bytes_as_i64_slice(&payload[8..], n);
-                        for i in 0..n {
-                            if matches.len() >= max_matches { break; }
-                            if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                            if value_set.contains(&vals[i]) { matches.push(global_row_offset + i); }
+                        if !has_deletes && no_nulls && unlimited {
+                            for (i, &v) in vals.iter().enumerate() {
+                                if matches_value(v) { matches.push(global_row_offset + i); }
+                            }
+                        } else {
+                            for i in 0..n {
+                                if matches.len() >= max_matches { break; }
+                                if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                if !no_nulls && (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                if matches_value(vals[i]) { matches.push(global_row_offset + i); }
+                            }
                         }
                     } else {
                         let vals = bytes_as_f64_slice(&payload[8..], n);
-                        for i in 0..n {
-                            if matches.len() >= max_matches { break; }
-                            if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                            if (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                            if value_set.contains(&(vals[i] as i64)) { matches.push(global_row_offset + i); }
+                        if !has_deletes && no_nulls && unlimited {
+                            for (i, &v) in vals.iter().enumerate() {
+                                if matches_value(v as i64) { matches.push(global_row_offset + i); }
+                            }
+                        } else {
+                            for i in 0..n {
+                                if matches.len() >= max_matches { break; }
+                                if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                if !no_nulls && (null_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
+                                if matches_value(vals[i] as i64) { matches.push(global_row_offset + i); }
+                            }
                         }
                     }
                     global_row_offset += rg_rows;
@@ -4025,13 +4104,13 @@ impl OnDemandStorage {
                             if !has_deletes {
                                 for i in 0..vals.len() {
                                     if matches.len() >= max_matches { break; }
-                                    if value_set.contains(&vals[i]) { matches.push(global_row_offset + i); }
+                                    if matches_value(vals[i]) { matches.push(global_row_offset + i); }
                                 }
                             } else {
                                 for i in 0..vals.len() {
                                     if matches.len() >= max_matches { break; }
                                     if (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
-                                    if value_set.contains(&vals[i]) { matches.push(global_row_offset + i); }
+                                    if matches_value(vals[i]) { matches.push(global_row_offset + i); }
                                 }
                             }
                         } else {
@@ -4040,13 +4119,13 @@ impl OnDemandStorage {
                             if !has_deletes {
                                 for i in 0..vals.len() {
                                     if matches.len() >= max_matches { break; }
-                                    if value_set.contains(&(vals[i] as i64)) { matches.push(global_row_offset + i); }
+                                    if matches_value(vals[i] as i64) { matches.push(global_row_offset + i); }
                                 }
                             } else {
                                 for i in 0..vals.len() {
                                     if matches.len() >= max_matches { break; }
                                     if (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
-                                    if value_set.contains(&(vals[i] as i64)) { matches.push(global_row_offset + i); }
+                                    if matches_value(vals[i] as i64) { matches.push(global_row_offset + i); }
                                 }
                             }
                         }
@@ -4063,7 +4142,7 @@ impl OnDemandStorage {
                                     if matches.len() >= max_matches { break; }
                                     if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
                                     if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
-                                    if value_set.contains(&vals[i]) { matches.push(global_row_offset + i); }
+                                    if matches_value(vals[i]) { matches.push(global_row_offset + i); }
                                 }
                             }
                             ColumnData::Float64(vals) => {
@@ -4071,7 +4150,7 @@ impl OnDemandStorage {
                                     if matches.len() >= max_matches { break; }
                                     if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
                                     if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 { continue; }
-                                    if value_set.contains(&(vals[i] as i64)) { matches.push(global_row_offset + i); }
+                                    if matches_value(vals[i] as i64) { matches.push(global_row_offset + i); }
                                 }
                             }
                             _ => {}

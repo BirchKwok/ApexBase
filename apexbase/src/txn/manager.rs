@@ -13,7 +13,7 @@ use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 
 use super::conflict::{ConflictDetector, ConflictResult};
-use super::context::TxnContext;
+use super::context::{TxnContext, TxnWrite};
 use crate::storage::mvcc::gc::GarbageCollector;
 use crate::storage::mvcc::snapshot::{Snapshot, SnapshotManager};
 use crate::storage::mvcc::version_store::{next_timestamp, VersionStore};
@@ -213,6 +213,14 @@ impl TxnManager {
     /// 4. If valid: apply writes, record commit, release snapshot
     /// 5. If conflict: abort transaction
     pub fn commit(&self, txn_id: TxnId) -> io::Result<()> {
+        self.commit_with_writes(txn_id).map(|_| ())
+    }
+
+    /// COMMIT and return the committed write set to the caller.
+    ///
+    /// This lets the query executor apply buffered writes to storage without
+    /// cloning the write set before validation.
+    pub fn commit_with_writes(&self, txn_id: TxnId) -> io::Result<Vec<TxnWrite>> {
         let mut txns = self.active_txns.write();
         let txn = txns.get_mut(&txn_id).ok_or_else(|| {
             io::Error::new(
@@ -242,7 +250,7 @@ impl TxnManager {
             drop(txns);
             self.snapshot_manager.release(snapshot_id);
             self.total_committed.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // OCC Validation
@@ -257,7 +265,7 @@ impl TxnManager {
             drop(txns);
             self.snapshot_manager.release(snapshot_id);
             self.total_aborted.fetch_add(1, Ordering::Relaxed);
-            return validation_result.to_io_result();
+            return validation_result.to_io_result().map(|_| Vec::new());
         }
 
         // Commit successful
@@ -265,8 +273,8 @@ impl TxnManager {
         self.conflict_detector
             .record_commit(&txn.context, commit_ts);
 
-        // Extract write set for VersionStore recording before removing context
-        let writes = txn.context.write_set().to_vec();
+        // Extract write set for VersionStore recording and executor storage apply.
+        let writes = txn.context.take_write_set();
 
         txn.status = TxnStatus::Committed;
         txn.context.set_finished();
@@ -276,7 +284,6 @@ impl TxnManager {
 
         // Record committed writes in per-table VersionStores for MVCC visibility
         for write in &writes {
-            use crate::txn::context::TxnWrite;
             match write {
                 TxnWrite::Insert {
                     table,
@@ -331,7 +338,7 @@ impl TxnManager {
             self.gc.maybe_run(store, &self.snapshot_manager);
         }
 
-        Ok(())
+        Ok(writes)
     }
 
     /// ROLLBACK - Abort a transaction and discard all writes

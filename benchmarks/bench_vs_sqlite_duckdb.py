@@ -62,6 +62,8 @@ CITIES = ["Beijing", "Shanghai", "Guangzhou", "Shenzhen", "Hangzhou",
           "Nanjing", "Chengdu", "Wuhan", "Xian", "Qingdao"]
 CATEGORIES = ["Electronics", "Clothing", "Food", "Sports", "Books",
               "Home", "Auto", "Health", "Travel", "Gaming"]
+TXN_BACKLOG_ROWS = 1500
+TXN_BACKLOG_MISSING_NAME = "__txn_backlog_missing__"
 
 
 def generate_data(n: int):
@@ -214,6 +216,8 @@ class SQLiteBench:
         self.n = len(data["name"])
         self.conn = None
         self.shared_inputs = build_shared_inputs(self.n)
+        self._txn_counter = 0
+        self._txn_backlog_ready = False
 
     def _connect(self):
         self.conn = sqlite3.connect(self.db_path)
@@ -251,6 +255,8 @@ class SQLiteBench:
                 category TEXT
             )
         """)
+        self._txn_counter = 0
+        self._txn_backlog_ready = False
 
     def cold_start_setup(self):
         if self.conn:
@@ -412,6 +418,148 @@ class SQLiteBench:
         self.conn.execute("DELETE FROM bench WHERE _id = ?", (cur.lastrowid,))
         self.conn.commit()
 
+    def _next_txn_prefix(self, count=1):
+        start = self._txn_counter
+        self._txn_counter += count
+        return f"txn_sqlite_{start}"
+
+    def _txn_rows(self, prefix, count):
+        return [
+            (f"{prefix}_{i}", 30 + (i % 25), 70.0 + (i % 17), CITIES[i % len(CITIES)], CATEGORIES[i % len(CATEGORIES)])
+            for i in range(count)
+        ]
+
+    def bench_txn_empty_commit(self):
+        self.conn.execute("BEGIN")
+        self.conn.execute("COMMIT")
+
+    def bench_txn_empty_rollback(self):
+        self.conn.execute("BEGIN")
+        self.conn.execute("ROLLBACK")
+
+    def bench_txn_read_count_commit(self):
+        self.conn.execute("BEGIN")
+        result = self._scalar("SELECT COUNT(*) FROM bench")
+        self.conn.execute("COMMIT")
+        return result
+
+    def bench_txn_insert_one_commit(self):
+        row = self._txn_rows(self._next_txn_prefix(), 1)[0]
+        self.conn.execute("BEGIN")
+        self.conn.execute(
+            "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+            row,
+        )
+        self.conn.execute("COMMIT")
+
+    def bench_txn_insert_10_commit(self):
+        rows = self._txn_rows(self._next_txn_prefix(10), 10)
+        self.conn.execute("BEGIN")
+        for row in rows:
+            self.conn.execute(
+                "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+                row,
+            )
+        self.conn.execute("COMMIT")
+
+    def bench_txn_multi_insert_10_commit(self):
+        rows = self._txn_rows(self._next_txn_prefix(10), 10)
+        placeholders = ",".join(["(?,?,?,?,?)"] * len(rows))
+        params = [value for row in rows for value in row]
+        self.conn.execute("BEGIN")
+        self.conn.execute(
+            f"INSERT INTO bench (name, age, score, city, category) VALUES {placeholders}",
+            params,
+        )
+        self.conn.execute("COMMIT")
+
+    def bench_txn_insert_100_commit(self):
+        rows = self._txn_rows(self._next_txn_prefix(100), 100)
+        self.conn.execute("BEGIN")
+        for row in rows:
+            self.conn.execute(
+                "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+                row,
+            )
+        self.conn.execute("COMMIT")
+
+    def bench_txn_multi_insert_100_commit(self):
+        rows = self._txn_rows(self._next_txn_prefix(100), 100)
+        placeholders = ",".join(["(?,?,?,?,?)"] * len(rows))
+        params = [value for row in rows for value in row]
+        self.conn.execute("BEGIN")
+        self.conn.execute(
+            f"INSERT INTO bench (name, age, score, city, category) VALUES {placeholders}",
+            params,
+        )
+        self.conn.execute("COMMIT")
+
+    def bench_txn_insert_10_rollback(self):
+        rows = self._txn_rows(self._next_txn_prefix(10), 10)
+        self.conn.execute("BEGIN")
+        for row in rows:
+            self.conn.execute(
+                "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+                row,
+            )
+        self.conn.execute("ROLLBACK")
+
+    def bench_txn_update_by_id_commit(self):
+        point_lookup_id = self.shared_inputs["point_lookup_id"]
+        self.conn.execute("BEGIN")
+        self.conn.execute("UPDATE bench SET score = 77.0 WHERE _id = ?", (point_lookup_id,))
+        self.conn.execute("COMMIT")
+
+    def bench_txn_insert_read_own_commit(self):
+        row = self._txn_rows(self._next_txn_prefix(), 1)[0]
+        self.conn.execute("BEGIN")
+        cur = self.conn.execute(
+            "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+            row,
+        )
+        result = self._query_all("SELECT * FROM bench WHERE _id = ?", (cur.lastrowid,))
+        self.conn.execute("COMMIT")
+        return result
+
+    def setup_txn_backlog_1500(self):
+        if self._txn_backlog_ready:
+            return
+        for _ in range(TXN_BACKLOG_ROWS):
+            row = self._txn_rows(self._next_txn_prefix(), 1)[0]
+            self.conn.execute("BEGIN")
+            self.conn.execute(
+                "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+                row,
+            )
+            self.conn.execute("COMMIT")
+        self._txn_backlog_ready = True
+
+    def bench_txn_backlog_string_miss_commit(self):
+        self.conn.execute("BEGIN")
+        result = self._query_all(
+            "SELECT * FROM bench WHERE name = ?",
+            (TXN_BACKLOG_MISSING_NAME,),
+        )
+        self.conn.execute("COMMIT")
+        return result
+
+    def bench_txn_backlog_count_commit(self):
+        self.conn.execute("BEGIN")
+        result = self._scalar("SELECT COUNT(*) FROM bench")
+        self.conn.execute("COMMIT")
+        return result
+
+    def bench_txn_backlog_insert_read_own_by_name_commit(self):
+        row = self._txn_rows(self._next_txn_prefix(), 1)[0]
+        self.conn.execute("BEGIN")
+        self.conn.execute(
+            "INSERT INTO bench (name, age, score, city, category) VALUES (?,?,?,?,?)",
+            row,
+        )
+        result = self._query_all("SELECT * FROM bench WHERE name = ?", (row[0],))
+        self.conn.execute("COMMIT")
+        return result
+
     def bench_insert_1k(self):
         rows = [(f"new_{i}", 25, 50.0, "Beijing", "Books") for i in range(1000)]
         self.conn.executemany(
@@ -540,6 +688,8 @@ class DuckDBBench:
         self.conn = None
         self.shared_inputs = build_shared_inputs(self.n)
         self._next_rowid = 0
+        self._txn_counter = 0
+        self._txn_backlog_ready = False
 
     def _connect(self):
         self.conn = duckdb.connect(self.db_path)
@@ -574,6 +724,8 @@ class DuckDBBench:
                 category VARCHAR
             )
         """)
+        self._txn_counter = 0
+        self._txn_backlog_ready = False
 
     def cold_start_setup(self):
         if self.conn:
@@ -746,6 +898,133 @@ class DuckDBBench:
         self._next_rowid += 1
         self.conn.execute("DELETE FROM bench WHERE rowid = ?", (rowid,))
 
+    def _next_txn_prefix(self, count=1):
+        start = self._txn_counter
+        self._txn_counter += count
+        return f"txn_duckdb_{start}"
+
+    def _txn_rows(self, prefix, count):
+        return [
+            (f"{prefix}_{i}", 30 + (i % 25), 70.0 + (i % 17), CITIES[i % len(CITIES)], CATEGORIES[i % len(CATEGORIES)])
+            for i in range(count)
+        ]
+
+    def bench_txn_empty_commit(self):
+        self.conn.execute("BEGIN TRANSACTION")
+        self.conn.execute("COMMIT")
+
+    def bench_txn_empty_rollback(self):
+        self.conn.execute("BEGIN TRANSACTION")
+        self.conn.execute("ROLLBACK")
+
+    def bench_txn_read_count_commit(self):
+        self.conn.execute("BEGIN TRANSACTION")
+        result = self._scalar("SELECT COUNT(*) FROM bench")
+        self.conn.execute("COMMIT")
+        return result
+
+    def bench_txn_insert_one_commit(self):
+        row = self._txn_rows(self._next_txn_prefix(), 1)[0]
+        self.conn.execute("BEGIN TRANSACTION")
+        self.conn.execute("INSERT INTO bench VALUES (?,?,?,?,?)", row)
+        self.conn.execute("COMMIT")
+        self._next_rowid += 1
+
+    def bench_txn_insert_10_commit(self):
+        rows = self._txn_rows(self._next_txn_prefix(10), 10)
+        self.conn.execute("BEGIN TRANSACTION")
+        for row in rows:
+            self.conn.execute("INSERT INTO bench VALUES (?,?,?,?,?)", row)
+        self.conn.execute("COMMIT")
+        self._next_rowid += 10
+
+    def bench_txn_multi_insert_10_commit(self):
+        rows = self._txn_rows(self._next_txn_prefix(10), 10)
+        placeholders = ",".join(["(?,?,?,?,?)"] * len(rows))
+        params = [value for row in rows for value in row]
+        self.conn.execute("BEGIN TRANSACTION")
+        self.conn.execute(f"INSERT INTO bench VALUES {placeholders}", params)
+        self.conn.execute("COMMIT")
+        self._next_rowid += 10
+
+    def bench_txn_insert_100_commit(self):
+        rows = self._txn_rows(self._next_txn_prefix(100), 100)
+        self.conn.execute("BEGIN TRANSACTION")
+        for row in rows:
+            self.conn.execute("INSERT INTO bench VALUES (?,?,?,?,?)", row)
+        self.conn.execute("COMMIT")
+        self._next_rowid += 100
+
+    def bench_txn_multi_insert_100_commit(self):
+        rows = self._txn_rows(self._next_txn_prefix(100), 100)
+        placeholders = ",".join(["(?,?,?,?,?)"] * len(rows))
+        params = [value for row in rows for value in row]
+        self.conn.execute("BEGIN TRANSACTION")
+        self.conn.execute(f"INSERT INTO bench VALUES {placeholders}", params)
+        self.conn.execute("COMMIT")
+        self._next_rowid += 100
+
+    def bench_txn_insert_10_rollback(self):
+        rows = self._txn_rows(self._next_txn_prefix(10), 10)
+        self.conn.execute("BEGIN TRANSACTION")
+        for row in rows:
+            self.conn.execute("INSERT INTO bench VALUES (?,?,?,?,?)", row)
+        self.conn.execute("ROLLBACK")
+
+    def bench_txn_update_by_id_commit(self):
+        rowid = self.shared_inputs["point_lookup_id"] - 1
+        self.conn.execute("BEGIN TRANSACTION")
+        self.conn.execute("UPDATE bench SET score = 77.0 WHERE rowid = ?", (rowid,))
+        self.conn.execute("COMMIT")
+
+    def bench_txn_insert_read_own_commit(self):
+        row = self._txn_rows(self._next_txn_prefix(), 1)[0]
+        rowid = self._next_rowid
+        self.conn.execute("BEGIN TRANSACTION")
+        self.conn.execute("INSERT INTO bench VALUES (?,?,?,?,?)", row)
+        result = self._query_all("SELECT rowid + 1 AS _id, * FROM bench WHERE rowid = ?", (rowid,))
+        self.conn.execute("COMMIT")
+        self._next_rowid += 1
+        return result
+
+    def setup_txn_backlog_1500(self):
+        if self._txn_backlog_ready:
+            return
+        for _ in range(TXN_BACKLOG_ROWS):
+            row = self._txn_rows(self._next_txn_prefix(), 1)[0]
+            self.conn.execute("BEGIN TRANSACTION")
+            self.conn.execute("INSERT INTO bench VALUES (?,?,?,?,?)", row)
+            self.conn.execute("COMMIT")
+            self._next_rowid += 1
+        self._txn_backlog_ready = True
+
+    def bench_txn_backlog_string_miss_commit(self):
+        self.conn.execute("BEGIN TRANSACTION")
+        result = self._query_all(
+            "SELECT rowid + 1 AS _id, * FROM bench WHERE name = ?",
+            (TXN_BACKLOG_MISSING_NAME,),
+        )
+        self.conn.execute("COMMIT")
+        return result
+
+    def bench_txn_backlog_count_commit(self):
+        self.conn.execute("BEGIN TRANSACTION")
+        result = self._scalar("SELECT COUNT(*) FROM bench")
+        self.conn.execute("COMMIT")
+        return result
+
+    def bench_txn_backlog_insert_read_own_by_name_commit(self):
+        row = self._txn_rows(self._next_txn_prefix(), 1)[0]
+        self.conn.execute("BEGIN TRANSACTION")
+        self.conn.execute("INSERT INTO bench VALUES (?,?,?,?,?)", row)
+        result = self._query_all(
+            "SELECT rowid + 1 AS _id, * FROM bench WHERE name = ?",
+            (row[0],),
+        )
+        self.conn.execute("COMMIT")
+        self._next_rowid += 1
+        return result
+
     def bench_insert_1k(self):
         # Use executemany for reliable cross-version compatibility
         rows = [(f"new_{i}", 25, 50.0, "Beijing", "Books") for i in range(1000)]
@@ -866,6 +1145,8 @@ class ApexBaseBench:
         self.low_memory = low_memory
         self.shared_inputs = build_shared_inputs(self.n)
         self._next_id = 1
+        self._txn_counter = 0
+        self._txn_backlog_ready = False
 
     def _query_all(self, sql):
         return self.client.execute(sql, show_internal_id=True).to_dict()
@@ -888,6 +1169,8 @@ class ApexBaseBench:
         self.client = ApexClient(self.db_dir, drop_if_exists=True)
         self.client.create_table('default')
         self._next_id = 1
+        self._txn_counter = 0
+        self._txn_backlog_ready = False
 
     def cold_start_setup(self):
         """Close and reopen client — clears all Python/Rust-side caches (arrow_batch_cache etc.)."""
@@ -1064,6 +1347,140 @@ class ApexBaseBench:
         })
         self._next_id += 1
         return self.client.delete(id=row_id)
+
+    def _next_txn_prefix(self, count=1):
+        start = self._txn_counter
+        self._txn_counter += count
+        return f"txn_apex_{start}"
+
+    def _txn_rows_sql(self, prefix, count):
+        return [
+            f"('{prefix}_{i}', {30 + (i % 25)}, {70.0 + (i % 17):.1f}, "
+            f"'{CITIES[i % len(CITIES)]}', '{CATEGORIES[i % len(CATEGORIES)]}')"
+            for i in range(count)
+        ]
+
+    def bench_txn_empty_commit(self):
+        self.client.execute("BEGIN")
+        self.client.execute("COMMIT")
+
+    def bench_txn_empty_rollback(self):
+        self.client.execute("BEGIN")
+        self.client.execute("ROLLBACK")
+
+    def bench_txn_read_count_commit(self):
+        self.client.execute("BEGIN")
+        result = self.client.execute("SELECT COUNT(*) FROM default").scalar()
+        self.client.execute("COMMIT")
+        return result
+
+    def bench_txn_insert_one_commit(self):
+        values = self._txn_rows_sql(self._next_txn_prefix(), 1)[0]
+        self.client.execute("BEGIN")
+        self.client.execute(f"INSERT INTO default (name, age, score, city, category) VALUES {values}")
+        self.client.execute("COMMIT")
+        self._next_id += 1
+
+    def bench_txn_insert_10_commit(self):
+        rows = self._txn_rows_sql(self._next_txn_prefix(10), 10)
+        self.client.execute("BEGIN")
+        for values in rows:
+            self.client.execute(f"INSERT INTO default (name, age, score, city, category) VALUES {values}")
+        self.client.execute("COMMIT")
+        self._next_id += 10
+
+    def bench_txn_multi_insert_10_commit(self):
+        rows = self._txn_rows_sql(self._next_txn_prefix(10), 10)
+        self.client.execute("BEGIN")
+        self.client.execute(
+            "INSERT INTO default (name, age, score, city, category) VALUES "
+            + ", ".join(rows)
+        )
+        self.client.execute("COMMIT")
+        self._next_id += 10
+
+    def bench_txn_insert_100_commit(self):
+        rows = self._txn_rows_sql(self._next_txn_prefix(100), 100)
+        self.client.execute("BEGIN")
+        for values in rows:
+            self.client.execute(f"INSERT INTO default (name, age, score, city, category) VALUES {values}")
+        self.client.execute("COMMIT")
+        self._next_id += 100
+
+    def bench_txn_multi_insert_100_commit(self):
+        rows = self._txn_rows_sql(self._next_txn_prefix(100), 100)
+        self.client.execute("BEGIN")
+        self.client.execute(
+            "INSERT INTO default (name, age, score, city, category) VALUES "
+            + ", ".join(rows)
+        )
+        self.client.execute("COMMIT")
+        self._next_id += 100
+
+    def bench_txn_insert_10_rollback(self):
+        rows = self._txn_rows_sql(self._next_txn_prefix(10), 10)
+        self.client.execute("BEGIN")
+        for values in rows:
+            self.client.execute(f"INSERT INTO default (name, age, score, city, category) VALUES {values}")
+        self.client.execute("ROLLBACK")
+
+    def bench_txn_update_by_id_commit(self):
+        point_lookup_id = self.shared_inputs["point_lookup_id"]
+        self.client.execute("BEGIN")
+        self.client.execute(f"UPDATE default SET score = 77.0 WHERE _id = {point_lookup_id}")
+        self.client.execute("COMMIT")
+
+    def bench_txn_insert_read_own_commit(self):
+        prefix = self._next_txn_prefix()
+        values = self._txn_rows_sql(prefix, 1)[0]
+        self.client.execute("BEGIN")
+        self.client.execute(f"INSERT INTO default (name, age, score, city, category) VALUES {values}")
+        result = self.client.execute(
+            f"SELECT * FROM default WHERE name = '{prefix}_0'",
+            show_internal_id=True,
+        ).to_dict()
+        self.client.execute("COMMIT")
+        self._next_id += 1
+        return result
+
+    def setup_txn_backlog_1500(self):
+        if self._txn_backlog_ready:
+            return
+        for _ in range(TXN_BACKLOG_ROWS):
+            values = self._txn_rows_sql(self._next_txn_prefix(), 1)[0]
+            self.client.execute("BEGIN")
+            self.client.execute(f"INSERT INTO default (name, age, score, city, category) VALUES {values}")
+            self.client.execute("COMMIT")
+            self._next_id += 1
+        self._txn_backlog_ready = True
+
+    def bench_txn_backlog_string_miss_commit(self):
+        self.client.execute("BEGIN")
+        result = self.client.execute(
+            f"SELECT * FROM default WHERE name = '{TXN_BACKLOG_MISSING_NAME}'",
+            show_internal_id=True,
+        ).to_dict()
+        self.client.execute("COMMIT")
+        return result
+
+    def bench_txn_backlog_count_commit(self):
+        self.client.execute("BEGIN")
+        result = self.client.execute("SELECT COUNT(*) FROM default").scalar()
+        self.client.execute("COMMIT")
+        return result
+
+    def bench_txn_backlog_insert_read_own_by_name_commit(self):
+        prefix = self._next_txn_prefix()
+        values = self._txn_rows_sql(prefix, 1)[0]
+        self.client.execute("BEGIN")
+        self.client.execute(f"INSERT INTO default (name, age, score, city, category) VALUES {values}")
+        result = self.client.execute(
+            f"SELECT * FROM default WHERE name = '{prefix}_0'",
+            show_internal_id=True,
+        ).to_dict()
+        self.client.execute("COMMIT")
+        self._next_id += 1
+        return result
 
     def bench_insert_1k(self):
         data_1k = {
@@ -1309,6 +1726,35 @@ OLTP_DEFAULT_BENCHMARKS = [
 OLTP_DURABLE_WRITE_BENCHMARKS = [
     ("Durable Insert 1 row", "bench_oltp_insert_one_durable"),
     ("Durable UPDATE by ID", "bench_oltp_update_by_id"),
+]
+
+TXN_BENCHMARKS = [
+    ("TXN empty BEGIN+COMMIT", "bench_txn_empty_commit"),
+    ("TXN empty BEGIN+ROLLBACK", "bench_txn_empty_rollback"),
+    ("TXN read COUNT+COMMIT", "bench_txn_read_count_commit"),
+    ("TXN INSERT 1 + COMMIT", "bench_txn_insert_one_commit"),
+    ("TXN INSERT 10 stmts + COMMIT", "bench_txn_insert_10_commit"),
+    ("TXN multi-row INSERT 10 + COMMIT", "bench_txn_multi_insert_10_commit"),
+    ("TXN INSERT 100 stmts + COMMIT", "bench_txn_insert_100_commit"),
+    ("TXN multi-row INSERT 100 + COMMIT", "bench_txn_multi_insert_100_commit"),
+    ("TXN INSERT 10 + ROLLBACK", "bench_txn_insert_10_rollback"),
+    ("TXN UPDATE by ID + COMMIT", "bench_txn_update_by_id_commit"),
+    ("TXN INSERT+read-own-row+COMMIT", "bench_txn_insert_read_own_commit"),
+    (
+        "TXN backlog string miss + COMMIT",
+        "bench_txn_backlog_string_miss_commit",
+        "setup_txn_backlog_1500",
+    ),
+    (
+        "TXN backlog COUNT(*) + COMMIT",
+        "bench_txn_backlog_count_commit",
+        "setup_txn_backlog_1500",
+    ),
+    (
+        "TXN backlog INSERT+read-own-name+COMMIT",
+        "bench_txn_backlog_insert_read_own_by_name_commit",
+        "setup_txn_backlog_1500",
+    ),
 ]
 
 
@@ -1694,6 +2140,68 @@ def run_oltp_durable_benchmarks(engines, warmup, iterations):
     return rows
 
 
+def run_txn_benchmarks(engines, warmup, iterations):
+    """Run explicit transaction microbenchmarks on the already-loaded engines."""
+    if not engines:
+        return []
+
+    print("\n--- Transaction Microbenchmarks (Explicit BEGIN/COMMIT) ---")
+    print("  Uses already-loaded tables; write cases keep each engine's default transaction durability profile.")
+    print("  Includes control-only, read-only, commit, rollback, update, and read-own-write transaction paths.")
+    print(f"  Backlog cases pre-seed {TXN_BACKLOG_ROWS} committed single-row transactions before timing.")
+
+    eng_names = [name for name, _ in engines]
+    col_width = 16
+    header = f"  {'Operation':<38}"
+    for name in eng_names:
+        header += f" | {name:>{col_width}}"
+    if len(eng_names) >= 2:
+        header += f" | {'Ratio (Apex/Best)':>{col_width}}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    rows = []
+    for spec in TXN_BENCHMARKS:
+        bench_name, method_name = spec[:2]
+        setup_method = spec[2] if len(spec) > 2 else None
+        values = {}
+        row = f"  {bench_name:<38}"
+        for eng_name, bench in engines:
+            if setup_method is not None:
+                setup_fn = getattr(bench, setup_method, None)
+                if setup_fn is not None:
+                    setup_fn()
+            fn = getattr(bench, method_name, None)
+            if fn is None:
+                row += f" | {'N/A':>{col_width}}"
+                continue
+            try:
+                ms = run_bench_nogc(fn, warmup=warmup, iterations=iterations)
+                values[eng_name] = ms
+                row += f" | {fmt_ms(ms):>{col_width}}"
+            except Exception:
+                row += f" | {'N/A':>{col_width}}"
+
+        if len(eng_names) >= 2 and "ApexBase" in values:
+            others = {k: v for k, v in values.items() if k != "ApexBase"}
+            if others:
+                best_other = min(others.values())
+                ratio = values["ApexBase"] / best_other if best_other > 0 else float("inf")
+                if ratio < 1:
+                    label = f"{ratio:.2f}x (faster)"
+                elif ratio < 1.05:
+                    label = "~1.0x (tied)"
+                else:
+                    label = f"{ratio:.1f}x (slower)"
+                row += f" | {label:>{col_width}}"
+        print(row)
+        rows.append({
+            "operation": bench_name,
+            **{k: round(v, 3) for k, v in values.items()},
+        })
+    return rows
+
+
 def run_apex_buffered_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
     """Show ApexBase's explicit client-local buffered write mode.
 
@@ -1954,7 +2462,7 @@ def main():
     print(f"\nDataset: {N:,} rows × 5 columns (name, age, score, city, category)")
     print(f"Warmup: {WARMUP} iterations, Timed: {ITERS} iterations (average)")
     print("Fairness mode: default rankings use normal engine APIs and comparable result materialization.")
-    print("Layout: OLAP fair ranking, HTAP fair ranking, OLTP default/durable microbenchmarks, and ApexBase isolated fast-path modes.")
+    print("Layout: OLAP fair ranking, HTAP fair ranking, OLTP/transaction microbenchmarks, and ApexBase isolated fast-path modes.")
     print("HTAP Q/s workload: COUNT + two full-table GROUP BY scans + filtered LIMIT 100, materialized to Python rows.")
     if args.low_memory:
         print("Mode: LOW-MEMORY (ApexBase-only cache stress mode; not a cross-engine apples-to-apples setting)")
@@ -2334,6 +2842,11 @@ def main():
         warmup=WARMUP,
         iterations=ITERS,
     )
+    txn_results = run_txn_benchmarks(
+        engines,
+        warmup=WARMUP,
+        iterations=ITERS,
+    )
     buffered_oltp_results = run_apex_buffered_oltp_benchmarks(
         tmpdir,
         oltp_results,
@@ -2361,6 +2874,7 @@ def main():
             "qps": qps_results,
             "oltp_microbenchmarks": oltp_results,
             "oltp_durable_microbenchmarks": durable_oltp_results,
+            "transaction_microbenchmarks": txn_results,
             "apexbase_buffered_oltp": buffered_oltp_results,
             "apexbase_memtable_oltp": memtable_oltp_results,
         }
