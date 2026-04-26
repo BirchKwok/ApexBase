@@ -177,6 +177,33 @@ class TestOltpStringFilter:
         for row in result:
             assert row["city"] == "Shenzhen"
 
+    def test_string_eq_limit_cache_invalidates_after_write(self, oltp_client):
+        sql = "SELECT user_id, city, age FROM default WHERE city = 'Beijing' LIMIT 10"
+        before = oltp_client.execute(sql).to_dict()
+        assert [row["user_id"] for row in before] == [1, 6, 11, 16, 21, 26, 31, 36, 41, 46]
+
+        oltp_client.execute("DELETE FROM default WHERE _id = 1")
+
+        after = oltp_client.execute(sql).to_dict()
+        assert [row["user_id"] for row in after] == [6, 11, 16, 21, 26, 31, 36, 41, 46, 51]
+
+    def test_string_eq_limit_cache_invalidates_after_store(self, oltp_client):
+        sql = "SELECT user_id, city, age FROM default WHERE city = 'CacheBust' LIMIT 1"
+        assert oltp_client.execute(sql).to_dict() == []
+
+        oltp_client.store({
+            "user_id": 2001,
+            "age": 33,
+            "balance": 0.0,
+            "city": "CacheBust",
+            "active": True,
+        })
+        oltp_client.flush()
+
+        assert oltp_client.execute(sql).to_dict() == [
+            {"user_id": 2001, "city": "CacheBust", "age": 33}
+        ]
+
     def test_string_eq_full_scan(self, oltp_client):
         result = oltp_client.execute("SELECT * FROM default WHERE city = 'Beijing'")
         assert len(result) == 200
@@ -238,6 +265,12 @@ class TestOltpConsistency:
         oltp_client.store([{"user_id": 9999, "age": 1, "balance": 0.0, "city": "Beijing", "active": True}])
         result = oltp_client.execute("SELECT COUNT(*) as cnt FROM default WHERE city = 'Beijing'")
         assert result[0]["cnt"] == 1
+        result = oltp_client.execute("SELECT COUNT(city) as cnt FROM default WHERE city = 'Beijing'")
+        assert result[0]["cnt"] == 1
+        result = oltp_client.execute("SELECT SUM(age) as total_age FROM default WHERE city = 'Beijing'")
+        assert result[0]["total_age"] == 1
+        result = oltp_client.execute("SELECT MAX(age) as max_age FROM default WHERE city = 'Beijing'")
+        assert result[0]["max_age"] == 1
 
     @pytest.mark.skipif(not PANDAS_AVAILABLE, reason="pandas not available")
     def test_query_to_pandas(self, oltp_client):

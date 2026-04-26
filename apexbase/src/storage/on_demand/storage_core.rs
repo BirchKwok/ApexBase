@@ -1009,6 +1009,11 @@ impl OnDemandStorage {
         self.delta_store.read().update_count()
     }
 
+    /// Get the number of pending delta deletes.
+    pub fn delta_delete_count(&self) -> usize {
+        self.delta_store.read().delete_count()
+    }
+
     /// Check whether pending DeltaStore updates modify a specific column.
     pub fn delta_updates_column(&self, column_name: &str) -> bool {
         self.delta_store.read().updates_column(column_name)

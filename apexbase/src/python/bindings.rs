@@ -51,6 +51,68 @@ fn sort_and_dedupe_ids(ids: &[u64]) -> Vec<u64> {
     sorted_ids
 }
 
+/// Parse aggregate expressions from SELECT clause: "SELECT COUNT(*) as cnt, AVG(score)"
+/// Returns Vec of (function_name, optional_column_name, optional_alias)
+fn parse_agg_select(sql: &str) -> Option<Vec<(String, Option<String>, Option<String>)>> {
+    let upper = sql.to_ascii_uppercase();
+    let select_start = upper.find("SELECT")? + 6;
+    let from_pos = upper[select_start..].find(" FROM")?;
+    let select_clause = &sql[select_start..select_start + from_pos];
+    let mut result = Vec::new();
+    for part in select_clause.split(',') {
+        let part = part.trim();
+        let part_upper = part.to_ascii_uppercase();
+        if let Some(lp) = part_upper.find('(') {
+            let func_name = part_upper[..lp].trim().to_string();
+            if matches!(func_name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                // Find closing paren
+                let after_lp = &part[lp + 1..];
+                if let Some(rp) = after_lp.find(')') {
+                    let inner = after_lp[..rp].trim();
+                    let col = if inner == "*" || inner.is_empty() {
+                        None
+                    } else {
+                        Some(inner.trim_matches('"').to_string())
+                    };
+                    // Check for alias after closing paren
+                    let after_paren = after_lp[rp + 1..].trim();
+                    let alias = if after_paren.to_ascii_uppercase().starts_with("AS ") {
+                        Some(after_paren[3..].trim().trim_matches('"').to_string())
+                    } else if !after_paren.is_empty() && !after_paren.starts_with(',') {
+                        Some(after_paren.trim().trim_matches('"').to_string())
+                    } else {
+                        None
+                    };
+                    result.push((func_name, col, alias));
+                }
+            }
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+/// Compute sum/min/max from an Arrow array (Int64 or Float64)
+fn agg_array_stats(arr: &dyn arrow::array::Array) -> (f64, f64, f64, bool) {
+    use arrow::array::{Float64Array, Int64Array};
+    if let Some(ia) = arr.as_any().downcast_ref::<Int64Array>() {
+        let sum: i64 = ia.iter().flatten().sum();
+        let min = ia.iter().flatten().min().unwrap_or(i64::MAX);
+        let max = ia.iter().flatten().max().unwrap_or(i64::MIN);
+        (sum as f64, min as f64, max as f64, true)
+    } else if let Some(fa) = arr.as_any().downcast_ref::<Float64Array>() {
+        let sum: f64 = fa.iter().flatten().sum();
+        let min = fa.iter().flatten().fold(f64::INFINITY, f64::min);
+        let max = fa.iter().flatten().fold(f64::NEG_INFINITY, f64::max);
+        (sum, min, max, false)
+    } else {
+        (0.0, 0.0, 0.0, false)
+    }
+}
+
 /// Convert Python value to Value
 fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     use pyo3::types::PyBytes;
@@ -1557,6 +1619,102 @@ impl ApexStorageImpl {
         Ok(Some(ids.into_iter().map(|id| id as i64).collect()))
     }
 
+    /// Fast OLTP append for multiple schema-stable transaction rows.
+    fn store_rows_delta(
+        &self,
+        py: Python<'_>,
+        rows: &Bound<'_, PyList>,
+    ) -> PyResult<Option<Vec<i64>>> {
+        if rows.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut all_fields = Vec::with_capacity(rows.len());
+        for item in rows.iter() {
+            let row = item.downcast::<PyDict>()?;
+            let fields = dict_to_values(row)?;
+            if fields.is_empty() {
+                return Ok(None);
+            }
+            if fields.values().any(|value| {
+                matches!(
+                    value,
+                    Value::Null
+                        | Value::Binary(_)
+                        | Value::FixedList(_)
+                        | Value::Json(_)
+                        | Value::Array(_)
+                )
+            }) {
+                return Ok(None);
+            }
+            all_fields.push(fields);
+        }
+
+        let (table_path, table_name) = self.get_current_table_info()?;
+        let base_dir = table_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+
+        if let Ok(index_mgr) = crate::storage::index::IndexManager::load(&table_name, &base_dir) {
+            if !index_mgr.catalog_is_empty() {
+                return Ok(None);
+            }
+        }
+
+        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
+        let backend = self.get_backend_for_insert()?;
+
+        if !backend.storage.is_v4_format() || backend.storage.has_constraints() {
+            return Ok(None);
+        }
+
+        let schema = backend.storage.get_schema();
+        if schema.is_empty() {
+            return Ok(None);
+        }
+        let schema_cols: std::collections::HashSet<&str> =
+            schema.iter().map(|(name, _)| name.as_str()).collect();
+        for fields in &all_fields {
+            if schema_cols.len() != fields.len()
+                || fields
+                    .keys()
+                    .any(|name| !schema_cols.contains(name.as_str()))
+            {
+                return Ok(None);
+            }
+        }
+
+        let durability = self.durability;
+        let lock_file = if durability != DurabilityLevel::Fast {
+            Some(
+                Self::acquire_write_lock(&table_path)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        let result = py.allow_threads(|| {
+            backend
+                .insert_rows_to_delta(&all_fields)
+                .map_err(|e| PyIOError::new_err(e.to_string()))
+        });
+
+        if let Some(lf) = lock_file {
+            Self::release_lock(lf);
+        }
+
+        let ids = result?;
+        self.cached_backends
+            .remove(&Self::backend_cache_key(&table_path, &table_name));
+        crate::query::executor::invalidate_storage_cache(&table_path);
+        crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
+
+        Ok(Some(ids.into_iter().map(|id| id as i64).collect()))
+    }
+
     /// Direct durable single-row append for the same narrow schema-stable OLTP
     /// case as `store_one_delta()`, but with an immediate file sync so callers
     /// do not need a separate `flush()`.
@@ -2436,7 +2594,10 @@ impl ApexStorageImpl {
                 });
 
             if let Some(backend) = maybe_backend {
-                if !backend.has_pending_deltas() {
+                let can_use_limit_scan = !backend.has_pending_deltas()
+                    || (backend.pending_delta_delete_count() == 0
+                        && !backend.pending_delta_updates_column(column));
+                if can_use_limit_scan {
                     if *limit == 1 && *offset == 0 {
                         let row_id_result =
                             py.allow_threads(|| backend.first_row_id_for_string_eq(column, value));
@@ -2512,7 +2673,10 @@ impl ApexStorageImpl {
                 });
 
             if let Some(backend) = maybe_backend {
-                if !backend.has_pending_deltas() {
+                let can_use_limit_scan = !backend.has_pending_deltas()
+                    || (backend.pending_delta_delete_count() == 0
+                        && !backend.pending_delta_updates_column(column));
+                if can_use_limit_scan {
                     if *limit == 1 && *offset == 0 {
                         let row_id_result =
                             py.allow_threads(|| backend.first_row_id_for_string_eq(column, value));
@@ -2570,24 +2734,211 @@ impl ApexStorageImpl {
             }
         }
 
+        // ── FAST PATH: SELECT * ... WHERE numeric_col <op> value LIMIT N [OFFSET M] ──
+        if let QuerySignature::NumericRangeFilterLimit {
+            ref table,
+            column,
+            low,
+            high,
+            limit,
+            offset,
+        } = &sig
+        {
+            if self.current_txn_id.read().is_none() {
+                let (target_table, target_path) = self.resolve_signature_table(
+                    table.as_deref(),
+                    &table_name,
+                    &table_path,
+                    &base_dir,
+                );
+                let maybe_backend = self
+                    .cached_backends
+                    .get(&target_table)
+                    .map(|v| Arc::clone(&v))
+                    .or_else(|| {
+                        crate::query::get_cached_backend_pub(&target_path)
+                            .ok()
+                            .map(|b| {
+                                self.cached_backends
+                                    .insert(target_table.clone(), Arc::clone(&b));
+                                b
+                            })
+                    });
+
+                if let Some(backend) = maybe_backend {
+                    if !backend.has_pending_deltas() && !backend.has_delta() {
+                        let needed = (*offset).saturating_add(*limit);
+                        let batch_result =
+                            py.allow_threads(|| -> std::io::Result<Option<RecordBatch>> {
+                                let Some(indices) = backend.scan_numeric_range_mmap(
+                                    column,
+                                    *low,
+                                    *high,
+                                    Some(needed),
+                                )?
+                                else {
+                                    return Ok(None);
+                                };
+                                let final_indices: Vec<usize> =
+                                    indices.into_iter().skip(*offset).take(*limit).collect();
+                                if final_indices.is_empty() {
+                                    backend.read_columns_to_arrow(None, 0, Some(0)).map(Some)
+                                } else {
+                                    backend
+                                        .read_columns_by_indices_to_arrow(&final_indices, None)
+                                        .map(Some)
+                                }
+                            });
+
+                        if let Ok(Some(batch)) = batch_result {
+                            let out = PyDict::new_bound(py);
+                            let columns_dict = PyDict::new_bound(py);
+                            let schema = batch.schema();
+                            for col_idx in 0..batch.num_columns() {
+                                let col_name = schema.field(col_idx).name();
+                                let arr = batch.column(col_idx);
+                                let col_list = arrow_col_to_pylist(py, arr)?;
+                                columns_dict.set_item(col_name, col_list)?;
+                            }
+                            out.set_item("columns_dict", columns_dict)?;
+                            out.set_item("rows_affected", 0i64)?;
+                            return Ok(out.into());
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── FAST PATH: projected numeric comparison + LIMIT ──
+        if let QuerySignature::ProjectedNumericRangeFilterLimit {
+            ref table,
+            columns,
+            column,
+            low,
+            high,
+            limit,
+            offset,
+        } = &sig
+        {
+            if self.current_txn_id.read().is_none() {
+                let (target_table, target_path) = self.resolve_signature_table(
+                    table.as_deref(),
+                    &table_name,
+                    &table_path,
+                    &base_dir,
+                );
+                let maybe_backend = self
+                    .cached_backends
+                    .get(&target_table)
+                    .map(|v| Arc::clone(&v))
+                    .or_else(|| {
+                        crate::query::get_cached_backend_pub(&target_path)
+                            .ok()
+                            .map(|b| {
+                                self.cached_backends
+                                    .insert(target_table.clone(), Arc::clone(&b));
+                                b
+                            })
+                    });
+
+                if let Some(backend) = maybe_backend {
+                    if !backend.has_pending_deltas() && !backend.has_delta() {
+                        let needed = (*offset).saturating_add(*limit);
+                        let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                        let batch_result =
+                            py.allow_threads(|| -> std::io::Result<Option<RecordBatch>> {
+                                let Some(indices) = backend.scan_numeric_range_mmap(
+                                    column,
+                                    *low,
+                                    *high,
+                                    Some(needed),
+                                )?
+                                else {
+                                    return Ok(None);
+                                };
+                                let final_indices: Vec<usize> =
+                                    indices.into_iter().skip(*offset).take(*limit).collect();
+                                if final_indices.is_empty() {
+                                    backend
+                                        .read_columns_to_arrow(
+                                            Some(col_refs.as_slice()),
+                                            0,
+                                            Some(0),
+                                        )
+                                        .map(Some)
+                                } else {
+                                    backend
+                                        .read_columns_by_indices_to_arrow(
+                                            &final_indices,
+                                            Some(col_refs.as_slice()),
+                                        )
+                                        .map(Some)
+                                }
+                            });
+
+                        if let Ok(Some(batch)) = batch_result {
+                            let out = PyDict::new_bound(py);
+                            let columns_dict = PyDict::new_bound(py);
+                            let schema = batch.schema();
+                            for col_idx in 0..batch.num_columns() {
+                                let col_name = schema.field(col_idx).name();
+                                let arr = batch.column(col_idx);
+                                let col_list = arrow_col_to_pylist(py, arr)?;
+                                columns_dict.set_item(col_name, col_list)?;
+                            }
+                            out.set_item("columns_dict", columns_dict)?;
+                            out.set_item("rows_affected", 0i64)?;
+                            return Ok(out.into());
+                        }
+                    }
+                }
+            }
+        }
+
         // ── FAST PATH: SELECT * LIMIT N — pread RCIX, returns columnar dict ──
-        if let QuerySignature::SimpleScanLimit { limit, ref table } = &sig {
+        if let QuerySignature::SimpleScanLimit {
+            limit,
+            offset,
+            ref table,
+        } = &sig
+        {
             let (_, target_path) =
                 self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
             if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
                 if backend.pending_v4_in_memory_rows() == 0 {
                     let limit = *limit;
-                    let batch_result =
-                        py.allow_threads(|| match backend.storage.get_or_load_footer() {
-                            Ok(Some(footer)) => {
-                                let col_indices: Vec<usize> =
-                                    (0..footer.schema.column_count()).collect();
+                    let offset = *offset;
+                    let batch_result = py.allow_threads(|| {
+                        if offset > 0 {
+                            if backend.has_pending_deltas()
+                                || backend.has_delta()
+                                || backend.active_row_count() != backend.row_count()
+                            {
+                                Ok(None)
+                            } else {
+                                let end = offset
+                                    .saturating_add(limit)
+                                    .min(backend.row_count() as usize);
+                                let indices: Vec<usize> = (offset..end).collect();
                                 backend
-                                    .storage
-                                    .to_arrow_batch_pread_rcix(&col_indices, true, limit)
+                                    .read_columns_by_indices_to_arrow(&indices, None)
+                                    .map(Some)
                             }
-                            _ => Ok(None),
-                        });
+                        } else {
+                            match backend.storage.get_or_load_footer() {
+                                Ok(Some(footer)) => {
+                                    let col_indices: Vec<usize> =
+                                        (0..footer.schema.column_count()).collect();
+                                    backend.storage.to_arrow_batch_pread_rcix(
+                                        &col_indices,
+                                        true,
+                                        limit,
+                                    )
+                                }
+                                _ => Ok(None),
+                            }
+                        }
+                    });
                     if let Ok(Some(batch)) = batch_result {
                         if batch.num_rows() > 0 {
                             let out = PyDict::new_bound(py);
@@ -2602,6 +2953,290 @@ impl ApexStorageImpl {
                             out.set_item("columns_dict", columns_dict)?;
                             out.set_item("rows_affected", 0i64)?;
                             return Ok(out.into());
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── FAST PATH: SELECT col1, col2 FROM table — projected full scan ──
+        if let QuerySignature::ProjectedFullScan { ref table, columns } = &sig {
+            if self.current_txn_id.read().is_none() {
+                let (_, target_path) = self.resolve_signature_table(
+                    table.as_deref(),
+                    &table_name,
+                    &table_path,
+                    &base_dir,
+                );
+                if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
+                    if backend.pending_v4_in_memory_rows() == 0 {
+                        let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                        let batch_result = py.allow_threads(|| {
+                            backend.read_columns_to_arrow(Some(col_refs.as_slice()), 0, None)
+                        });
+                        if let Ok(batch) = batch_result {
+                            if batch.num_rows() > 0 {
+                                let out = PyDict::new_bound(py);
+                                let columns_dict = PyDict::new_bound(py);
+                                let schema = batch.schema();
+                                for col_idx in 0..batch.num_columns() {
+                                    let col_name = schema.field(col_idx).name();
+                                    let arr = batch.column(col_idx);
+                                    let col_list = arrow_col_to_pylist(py, arr)?;
+                                    columns_dict.set_item(col_name, col_list)?;
+                                }
+                                out.set_item("columns_dict", columns_dict)?;
+                                out.set_item("rows_affected", 0i64)?;
+                                return Ok(out.into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── FAST PATH: SELECT * WHERE col > N LIMIT M — numeric range filter ──
+        if let QuerySignature::NumericRangeFilterLimit {
+            ref table,
+            column,
+            low,
+            high,
+            limit,
+            offset,
+        } = &sig
+        {
+            if self.current_txn_id.read().is_none() {
+                let (_, target_path) = self.resolve_signature_table(
+                    table.as_deref(),
+                    &table_name,
+                    &table_path,
+                    &base_dir,
+                );
+                if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
+                    if !backend.has_pending_deltas()
+                        && !backend.has_delta()
+                        && backend.pending_v4_in_memory_rows() == 0
+                    {
+                        let needed = (*offset).saturating_add(*limit);
+                        let scan_result = py.allow_threads(|| {
+                            backend.scan_numeric_range_mmap(column, *low, *high, Some(needed))
+                        });
+                        if let Ok(Some(indices)) = scan_result {
+                            let final_indices: Vec<usize> =
+                                indices.into_iter().skip(*offset).take(*limit).collect();
+                            let batch_result = py.allow_threads(|| {
+                                if final_indices.is_empty() {
+                                    backend.read_columns_to_arrow(None, 0, Some(0))
+                                } else {
+                                    backend.read_columns_by_indices_to_arrow(&final_indices, None)
+                                }
+                            });
+                            if let Ok(batch) = batch_result {
+                                if batch.num_rows() > 0 {
+                                    let out = PyDict::new_bound(py);
+                                    let columns_dict = PyDict::new_bound(py);
+                                    let schema = batch.schema();
+                                    for col_idx in 0..batch.num_columns() {
+                                        let col_name = schema.field(col_idx).name();
+                                        let arr = batch.column(col_idx);
+                                        let col_list = arrow_col_to_pylist(py, arr)?;
+                                        columns_dict.set_item(col_name, col_list)?;
+                                    }
+                                    out.set_item("columns_dict", columns_dict)?;
+                                    out.set_item("rows_affected", 0i64)?;
+                                    return Ok(out.into());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── FAST PATH: Filtered string equality aggregation (pre-parse) ──
+        if let QuerySignature::FilteredStringAgg {
+            ref table,
+            ref filter_column,
+            ref filter_value,
+        } = &sig
+        {
+            if self.current_txn_id.read().is_none() {
+                let (_, target_path) = self.resolve_signature_table(
+                    table.as_deref(),
+                    &table_name,
+                    &table_path,
+                    &base_dir,
+                );
+                if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
+                    if backend.is_mmap_only()
+                        && !backend.has_pending_deltas()
+                        && !backend.has_delta()
+                        && backend.pending_v4_in_memory_rows() == 0
+                    {
+                        let filter_col = filter_column.clone();
+                        let filter_val = filter_value.clone();
+                        // Parse aggregation expressions from SQL
+                        if let Some(agg_exprs) = parse_agg_select(sql) {
+                            // Collect unique columns needed by the storage fast path.
+                            // Add "*" when COUNT(*) / COUNT(1) is present so the storage
+                            // layer returns the true match count without an extra scan.
+                            let mut unique_cols: Vec<String> = Vec::new();
+                            for (func, col, _alias) in &agg_exprs {
+                                let is_count_star = func == "COUNT"
+                                    && col
+                                        .as_ref()
+                                        .map(|c| {
+                                            c == "*"
+                                                || c.chars()
+                                                    .next()
+                                                    .map(|ch| ch.is_ascii_digit())
+                                                    .unwrap_or(false)
+                                        })
+                                        .unwrap_or(true);
+                                if is_count_star {
+                                    if !unique_cols.iter().any(|c| c == "*") {
+                                        unique_cols.push("*".to_string());
+                                    }
+                                } else if let Some(c) = col {
+                                    if !unique_cols.contains(c) {
+                                        unique_cols.push(c.clone());
+                                    }
+                                }
+                            }
+                            let col_refs: Vec<&str> =
+                                unique_cols.iter().map(|s| s.as_str()).collect();
+                            // Single-pass: scan string filter + aggregate in one sequential pass
+                            let agg_result = py.allow_threads(|| {
+                                backend.execute_filtered_string_agg_mmap(
+                                    &filter_col,
+                                    &filter_val,
+                                    &col_refs,
+                                )
+                            });
+                            if let Ok(Some(stats)) = agg_result {
+                                // Build stat lookup: column name -> (count, sum, min, max, is_int)
+                                let mut stat_map: std::collections::HashMap<
+                                    &str,
+                                    (i64, f64, f64, f64, bool),
+                                > = std::collections::HashMap::new();
+                                for (i, col_name) in col_refs.iter().enumerate() {
+                                    if i < stats.len() {
+                                        stat_map.insert(col_name, stats[i]);
+                                    }
+                                }
+                                let match_count = stat_map.get("*").map(|s| s.0).unwrap_or(0);
+
+                                let out = PyDict::new_bound(py);
+                                let columns_dict = PyDict::new_bound(py);
+                                for (func, col, alias) in &agg_exprs {
+                                    let output_name = if let Some(a) = alias {
+                                        a.clone()
+                                    } else if let Some(c) = col {
+                                        format!("{}({})", func, c)
+                                    } else {
+                                        format!("{}(*)", func)
+                                    };
+                                    match func.as_str() {
+                                        "COUNT" => {
+                                            let count = if let Some(c) = col {
+                                                let is_count_star = c == "*"
+                                                    || c.chars()
+                                                        .next()
+                                                        .map(|ch| ch.is_ascii_digit())
+                                                        .unwrap_or(false);
+                                                if is_count_star {
+                                                    match_count
+                                                } else {
+                                                    stat_map
+                                                        .get(c.as_str())
+                                                        .map(|s| s.0)
+                                                        .unwrap_or(0)
+                                                }
+                                            } else {
+                                                match_count
+                                            };
+                                            columns_dict.set_item(
+                                                &output_name,
+                                                PyList::new_bound(py, &[count]),
+                                            )?;
+                                        }
+                                        "SUM" | "AVG" | "MIN" | "MAX" => {
+                                            if let Some(c) = col {
+                                                let (count, sum, min_v, max_v, is_int) = stat_map
+                                                    .get(c.as_str())
+                                                    .copied()
+                                                    .unwrap_or((0, 0.0, 0.0, 0.0, false));
+                                                match func.as_str() {
+                                                    "SUM" => {
+                                                        if is_int {
+                                                            columns_dict.set_item(
+                                                                &output_name,
+                                                                PyList::new_bound(
+                                                                    py,
+                                                                    &[sum as i64],
+                                                                ),
+                                                            )?;
+                                                        } else {
+                                                            columns_dict.set_item(
+                                                                &output_name,
+                                                                PyList::new_bound(py, &[sum]),
+                                                            )?;
+                                                        }
+                                                    }
+                                                    "AVG" => {
+                                                        let avg = if count > 0 {
+                                                            sum / count as f64
+                                                        } else {
+                                                            0.0
+                                                        };
+                                                        columns_dict.set_item(
+                                                            &output_name,
+                                                            PyList::new_bound(py, &[avg]),
+                                                        )?;
+                                                    }
+                                                    "MIN" => {
+                                                        if is_int {
+                                                            columns_dict.set_item(
+                                                                &output_name,
+                                                                PyList::new_bound(
+                                                                    py,
+                                                                    &[min_v as i64],
+                                                                ),
+                                                            )?;
+                                                        } else {
+                                                            columns_dict.set_item(
+                                                                &output_name,
+                                                                PyList::new_bound(py, &[min_v]),
+                                                            )?;
+                                                        }
+                                                    }
+                                                    "MAX" => {
+                                                        if is_int {
+                                                            columns_dict.set_item(
+                                                                &output_name,
+                                                                PyList::new_bound(
+                                                                    py,
+                                                                    &[max_v as i64],
+                                                                ),
+                                                            )?;
+                                                        } else {
+                                                            columns_dict.set_item(
+                                                                &output_name,
+                                                                PyList::new_bound(py, &[max_v]),
+                                                            )?;
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                out.set_item("columns_dict", columns_dict)?;
+                                out.set_item("rows_affected", 0i64)?;
+                                return Ok(out.into());
+                            }
                         }
                     }
                 }
@@ -2645,7 +3280,10 @@ impl ApexStorageImpl {
                     | QuerySignature::StringEqualityFilterLimit { .. }
                     | QuerySignature::ProjectedStringEqualityFilter { .. }
                     | QuerySignature::ProjectedStringEqualityFilterLimit { .. }
+                    | QuerySignature::NumericRangeFilterLimit { .. }
+                    | QuerySignature::ProjectedNumericRangeFilterLimit { .. }
                     | QuerySignature::LikeFilter { .. }
+                    | QuerySignature::FilteredStringAgg { .. }
                     | QuerySignature::TableFunction
             );
 
@@ -3063,15 +3701,38 @@ impl ApexStorageImpl {
         crate::query::executor::set_query_root_dir(&self.root_dir);
 
         // FAST PATH: SELECT * LIMIT N — build Arrow batch directly from V4
-        if let QuerySignature::SimpleScanLimit { limit, ref table } = &sig {
+        if let QuerySignature::SimpleScanLimit {
+            limit,
+            offset,
+            ref table,
+        } = &sig
+        {
             let (_, target_path) =
                 self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
             if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
                 if backend.pending_v4_in_memory_rows() == 0 {
-                    if let Ok(batch) = backend
-                        .storage
-                        .to_arrow_batch_with_limit(None, false, *limit)
-                    {
+                    let batch_result = if *offset > 0 {
+                        if backend.has_pending_deltas()
+                            || backend.has_delta()
+                            || backend.active_row_count() != backend.row_count()
+                        {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "simple scan offset fast path unavailable",
+                            ))
+                        } else {
+                            let end = (*offset)
+                                .saturating_add(*limit)
+                                .min(backend.row_count() as usize);
+                            let indices: Vec<usize> = (*offset..end).collect();
+                            backend.read_columns_by_indices_to_arrow(&indices, None)
+                        }
+                    } else {
+                        backend
+                            .storage
+                            .to_arrow_batch_with_limit(None, false, *limit)
+                    };
+                    if let Ok(batch) = batch_result {
                         if batch.num_rows() > 0 || batch.num_columns() > 0 {
                             let mut buf = Vec::with_capacity(batch.get_array_memory_size() + 256);
                             {

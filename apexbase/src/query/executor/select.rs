@@ -49,10 +49,10 @@ static GLOBAL_BETWEEN_GROUP_AGG_CACHE: once_cell::sync::Lazy<
 
 /// Represents a single scannable leaf predicate from an OR decomposition.
 enum OrLeafPredicate {
-    StringEq(String, String),           // (col, value)
-    NumericRange(String, f64, f64),     // (col, low, high) — covers =, >, >=, <, <=, BETWEEN
-    NumericIn(String, Vec<i64>),        // (col, values)
-    StringIn(String, Vec<String>),      // (col, values)
+    StringEq(String, String),       // (col, value)
+    NumericRange(String, f64, f64), // (col, low, high) — covers =, >, >=, <, <=, BETWEEN
+    NumericIn(String, Vec<i64>),    // (col, values)
+    StringIn(String, Vec<String>),  // (col, values)
 }
 
 impl ApexExecutor {
@@ -63,7 +63,8 @@ impl ApexExecutor {
     }
 
     fn single_group_agg_signature(agg_cols: &[(&str, bool)]) -> String {
-        agg_cols.iter()
+        agg_cols
+            .iter()
             .map(|(col, is_count)| format!("{}:{}", col, if *is_count { "count" } else { "value" }))
             .collect::<Vec<_>>()
             .join("|")
@@ -231,13 +232,9 @@ impl ApexExecutor {
                 agg_col,
             )?
         } else {
-            backend.storage.execute_between_group_agg(
-                filter_col,
-                lo,
-                hi,
-                group_col,
-                agg_col,
-            )?
+            backend
+                .storage
+                .execute_between_group_agg(filter_col, lo, hi, group_col, agg_col)?
         };
 
         let raw = match raw {
@@ -251,12 +248,21 @@ impl ApexExecutor {
     }
 
     /// Execute SELECT statement with base_dir for proper subquery table resolution
-    fn execute_select_with_base_dir(mut stmt: SelectStatement, storage_path: &Path, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+    fn execute_select_with_base_dir(
+        mut stmt: SelectStatement,
+        storage_path: &Path,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<ApexResult> {
         // Resolve MATCH()/FUZZY_MATCH() predicates to _id IN (...) before anything else
         if let Some(ref wc) = stmt.where_clause {
             if Self::expr_has_fts_match(wc) {
                 let (_, table_name) = crate::query::executor::base_dir_and_table_pub(storage_path);
-                let resolved = Self::resolve_fts_in_expr(stmt.where_clause.take().unwrap(), base_dir, &table_name)?;
+                let resolved = Self::resolve_fts_in_expr(
+                    stmt.where_clause.take().unwrap(),
+                    base_dir,
+                    &table_name,
+                )?;
                 stmt.where_clause = Some(resolved);
             }
         }
@@ -271,66 +277,100 @@ impl ApexExecutor {
         // FAST PATH: Pure COUNT(*) without WHERE/GROUP BY - O(1) from metadata
         // Skip for TableFunction sources (read_csv/read_parquet/read_json) — no stored backend.
         // Also skip for TopkDistance — it has different row semantics.
-        let from_is_table_fn = matches!(&stmt.from,
-            Some(FromItem::TableFunction { .. }) | Some(FromItem::TopkDistance { .. }));
+        let from_is_table_fn = matches!(
+            &stmt.from,
+            Some(FromItem::TableFunction { .. }) | Some(FromItem::TopkDistance { .. })
+        );
         if !from_is_table_fn && Self::is_pure_count_star(&stmt) {
             if !storage_path.exists() {
-                let tbl = storage_path.file_stem().unwrap_or_default().to_string_lossy();
-                return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' does not exist", tbl)));
+                let tbl = storage_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Table '{}' does not exist", tbl),
+                ));
             }
             let backend = get_cached_backend(storage_path)?;
             let count = backend.active_row_count() as i64;
-            
-            let output_name = if let Some(SelectColumn::Aggregate { alias, .. }) = stmt.columns.first() {
-                alias.clone().unwrap_or_else(|| "COUNT(*)".to_string())
-            } else {
-                "COUNT(*)".to_string()
-            };
-            let schema = Arc::new(Schema::new(vec![
-                Field::new(&output_name, ArrowDataType::Int64, false),
-            ]));
+
+            let output_name =
+                if let Some(SelectColumn::Aggregate { alias, .. }) = stmt.columns.first() {
+                    alias.clone().unwrap_or_else(|| "COUNT(*)".to_string())
+                } else {
+                    "COUNT(*)".to_string()
+                };
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                &output_name,
+                ArrowDataType::Int64,
+                false,
+            )]));
             let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
-            let batch = RecordBatch::try_new(schema, vec![array])
-                .map_err(|e| err_data( e.to_string()))?;
+            let batch =
+                RecordBatch::try_new(schema, vec![array]).map_err(|e| err_data(e.to_string()))?;
             return Ok(ApexResult::Data(batch));
         }
-        
+
         // Check for derived table (FROM subquery) - resolve table path from subquery's FROM clause
         let batch = match &stmt.from {
-            Some(FromItem::TopkDistance { col, query, k, metric, .. }) => {
-                Self::execute_topk_distance(storage_path, col, query, *k, metric)?
-            }
-            Some(FromItem::TableFunction { func, file, options, .. }) => {
-                Self::read_table_function(func, file, options)?
-            }
-            Some(FromItem::Subquery { stmt: sub_stmt, .. }) => {
-                match sub_stmt.as_ref() {
-                    crate::query::SqlStatement::Select(sel) => {
-                        let sub_path = Self::resolve_from_table_path(sel, base_dir, default_table_path);
-                        Self::execute_select_with_base_dir(sel.clone(), &sub_path, base_dir, default_table_path)?.to_record_batch()?
-                    }
-                    crate::query::SqlStatement::Union(u) => {
-                        Self::execute_union(u.clone(), base_dir, default_table_path)?.to_record_batch()?
-                    }
-                    _ => return Err(err_input("Subquery must be SELECT or set operation")),
+            Some(FromItem::TopkDistance {
+                col,
+                query,
+                k,
+                metric,
+                ..
+            }) => Self::execute_topk_distance(storage_path, col, query, *k, metric)?,
+            Some(FromItem::TableFunction {
+                func,
+                file,
+                options,
+                ..
+            }) => Self::read_table_function(func, file, options)?,
+            Some(FromItem::Subquery { stmt: sub_stmt, .. }) => match sub_stmt.as_ref() {
+                crate::query::SqlStatement::Select(sel) => {
+                    let sub_path = Self::resolve_from_table_path(sel, base_dir, default_table_path);
+                    Self::execute_select_with_base_dir(
+                        sel.clone(),
+                        &sub_path,
+                        base_dir,
+                        default_table_path,
+                    )?
+                    .to_record_batch()?
                 }
-            }
+                crate::query::SqlStatement::Union(u) => {
+                    Self::execute_union(u.clone(), base_dir, default_table_path)?
+                        .to_record_batch()?
+                }
+                _ => return Err(err_input("Subquery must be SELECT or set operation")),
+            },
             None => {
                 // No FROM clause (e.g., SELECT 1, 1) — create a single-row virtual batch
-                let schema = Arc::new(Schema::new(vec![
-                    Field::new("_dummy", ArrowDataType::Int64, false),
-                ]));
-                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![0i64])) as ArrayRef])
-                    .map_err(|e| err_data(e.to_string()))?
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "_dummy",
+                    ArrowDataType::Int64,
+                    false,
+                )]));
+                RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(Int64Array::from(vec![0i64])) as ArrayRef],
+                )
+                .map_err(|e| err_data(e.to_string()))?
             }
             Some(FromItem::Table { .. }) => {
                 // Normal table - read from storage
                 if !storage_path.exists() {
-                    let tbl = storage_path.file_stem().unwrap_or_default().to_string_lossy();
-                    return Err(io::Error::new(io::ErrorKind::NotFound, format!("Table '{}' does not exist", tbl)));
+                    let tbl = storage_path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("Table '{}' does not exist", tbl),
+                    ));
                 } else {
                     let backend = get_cached_backend(storage_path)?;
-                    
+
                     // Check if any SELECT column contains a scalar subquery
                     // Scalar subqueries may reference arbitrary columns, so read all
                     let has_scalar_subquery = stmt.columns.iter().any(|col| {
@@ -340,7 +380,7 @@ impl ApexExecutor {
                             false
                         }
                     });
-                    
+
                     if backend.pending_v4_in_memory_rows() > 0 {
                         let col_refs = if has_scalar_subquery
                             || stmt.where_clause.is_some()
@@ -351,10 +391,24 @@ impl ApexExecutor {
                         } else {
                             Self::get_col_refs(&stmt)
                         };
-                        backend.read_columns_to_arrow(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref(), 0, None)?
+                        backend.read_columns_to_arrow(
+                            col_refs
+                                .as_ref()
+                                .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                                .as_deref(),
+                            0,
+                            None,
+                        )?
                     } else if has_scalar_subquery {
                         let col_refs = Self::get_col_refs(&stmt);
-                        backend.read_columns_to_arrow(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref(), 0, None)?
+                        backend.read_columns_to_arrow(
+                            col_refs
+                                .as_ref()
+                                .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                                .as_deref(),
+                            0,
+                            None,
+                        )?
                     } else {
                         // Check conditions for late materialization optimization
                         let has_aggregation_check = stmt.columns.iter().any(|col| {
@@ -375,20 +429,60 @@ impl ApexExecutor {
                                 return Ok(result);
                             }
                         }
-                        
+
+                        // FAST PATH: Filtered aggregation with string equality
+                        // SELECT COUNT(*), AVG(col), MAX(col) FROM table WHERE str_col = 'val'
+                        if has_aggregation_check
+                            && stmt.where_clause.is_some()
+                            && stmt.group_by.is_empty()
+                            && stmt.joins.is_empty()
+                            && stmt.limit.is_none()
+                            && stmt.order_by.is_empty()
+                            && !backend.has_pending_deltas()
+                            && !backend.has_delta()
+                        {
+                            if let Some(result) =
+                                Self::try_fast_filtered_string_agg(&backend, &stmt)?
+                            {
+                                return Ok(result);
+                            }
+                        }
+
+                        // Correctness fallback for filtered aggregates when delta-backed
+                        // rows are present. The generic full-batch path can miss string
+                        // overlay state, but the string-filter reader already merges it.
+                        if has_aggregation_check
+                            && stmt.where_clause.is_some()
+                            && stmt.group_by.is_empty()
+                            && stmt.joins.is_empty()
+                            && stmt.limit.is_none()
+                            && stmt.order_by.is_empty()
+                        {
+                            if let Some(filtered) =
+                                Self::try_fast_string_filter_no_limit(&backend, &stmt)?
+                            {
+                                return Self::execute_aggregation(&filtered, &stmt);
+                            }
+                        }
+
                         // Late Materialization for WHERE: with WHERE (no ORDER BY)
                         // Works for both SELECT * and projected column queries.
                         let where_cols = stmt.where_columns();
-                        let has_window_func = stmt.columns.iter().any(|col| matches!(col, SelectColumn::WindowFunction { .. }));
+                        let has_window_func = stmt
+                            .columns
+                            .iter()
+                            .any(|col| matches!(col, SelectColumn::WindowFunction { .. }));
                         let can_late_materialize_where = stmt.where_clause.is_some()
                             && stmt.order_by.is_empty()
                             && stmt.group_by.is_empty()
                             && !has_aggregation_check
                             && !has_window_func
                             && !where_cols.is_empty();
-                        
+
                         // Late Materialization for ORDER BY: SELECT * with ORDER BY + LIMIT (no WHERE)
-                        let order_cols: Vec<String> = stmt.order_by.iter()
+                        let order_cols: Vec<String> = stmt
+                            .order_by
+                            .iter()
                             .map(|o| o.column.trim_matches('"').to_string())
                             .collect();
                         let can_late_materialize_order = stmt.is_select_star()
@@ -397,7 +491,7 @@ impl ApexExecutor {
                             && stmt.limit.is_some()
                             && stmt.group_by.is_empty()
                             && !has_aggregation_check;
-                        
+
                         // EARLY FAST PATH: _id = X point lookup — skip CBO entirely
                         if !has_scalar_subquery
                             && stmt.group_by.is_empty()
@@ -408,7 +502,11 @@ impl ApexExecutor {
                             if let Some(ref where_clause) = stmt.where_clause {
                                 if let Some(id) = Self::extract_id_equality_filter(where_clause) {
                                     if let Some(row_batch) = backend.read_row_by_id_to_arrow(id)? {
-                                        let projected = Self::apply_projection_with_storage(&row_batch, &stmt.columns, Some(storage_path))?;
+                                        let projected = Self::apply_projection_with_storage(
+                                            &row_batch,
+                                            &stmt.columns,
+                                            Some(storage_path),
+                                        )?;
                                         return Ok(ApexResult::Data(projected));
                                     }
                                 }
@@ -430,13 +528,15 @@ impl ApexExecutor {
                             } else {
                                 let table_key = storage_path.to_string_lossy();
                                 let cbo_strategy = QueryPlanner::plan_select_pub(
-                                    &stmt, Some(&*idx_mgr), &table_key,
+                                    &stmt,
+                                    Some(&*idx_mgr),
+                                    &table_key,
                                 );
                                 matches!(
                                     cbo_strategy,
                                     ExecutionStrategy::OlapFullScan
-                                    | ExecutionStrategy::OlapAggregation
-                                    | ExecutionStrategy::OlapFilteredScan
+                                        | ExecutionStrategy::OlapAggregation
+                                        | ExecutionStrategy::OlapFilteredScan
                                 )
                             }
                         };
@@ -446,14 +546,18 @@ impl ApexExecutor {
                         if !cbo_skip_index {
                             if let Some(ref where_clause) = stmt.where_clause {
                                 if let Some(result) = Self::try_index_accelerated_read(
-                                    &backend, &stmt, where_clause, base_dir, storage_path,
+                                    &backend,
+                                    &stmt,
+                                    where_clause,
+                                    base_dir,
+                                    storage_path,
                                 )? {
                                     return Ok(result);
                                 }
                             }
                         }
 
-                    // FAST PATH 0: Check for _id = X pattern (O(1) lookup)
+                        // FAST PATH 0: Check for _id = X pattern (O(1) lookup)
                         if let Some(where_clause) = &stmt.where_clause {
                             if let Some(id) = Self::extract_id_equality_filter(where_clause) {
                                 if !backend.has_pending_deltas() && !backend.has_delta() {
@@ -466,11 +570,21 @@ impl ApexExecutor {
                                             backend.read_columns_to_arrow(None, 0, Some(0))?
                                         } else {
                                             // Apply WHERE filter on the mmap-read batch
-                                            let filtered = Self::apply_filter_with_storage(&batch, where_clause, storage_path)?;
+                                            let filtered = Self::apply_filter_with_storage(
+                                                &batch,
+                                                where_clause,
+                                                storage_path,
+                                            )?;
                                             if filtered.num_rows() == 0 {
                                                 return Ok(ApexResult::Empty(filtered.schema()));
                                             }
-                                            return Ok(ApexResult::Data(Self::apply_projection_with_storage(&filtered, &stmt.columns, Some(storage_path))?));
+                                            return Ok(ApexResult::Data(
+                                                Self::apply_projection_with_storage(
+                                                    &filtered,
+                                                    &stmt.columns,
+                                                    Some(storage_path),
+                                                )?,
+                                            ));
                                         }
                                     }
                                 } else {
@@ -479,45 +593,80 @@ impl ApexExecutor {
                                     if batch.num_rows() == 0 {
                                         backend.read_columns_to_arrow(None, 0, Some(0))?
                                     } else {
-                                        let filtered = Self::apply_filter_with_storage(&batch, where_clause, storage_path)?;
+                                        let filtered = Self::apply_filter_with_storage(
+                                            &batch,
+                                            where_clause,
+                                            storage_path,
+                                        )?;
                                         if filtered.num_rows() == 0 {
                                             return Ok(ApexResult::Empty(filtered.schema()));
                                         }
-                                        return Ok(ApexResult::Data(Self::apply_projection_with_storage(&filtered, &stmt.columns, Some(storage_path))?));
+                                        return Ok(ApexResult::Data(
+                                            Self::apply_projection_with_storage(
+                                                &filtered,
+                                                &stmt.columns,
+                                                Some(storage_path),
+                                            )?,
+                                        ));
                                     }
                                 }
-                            } else if let Some(result) = Self::try_fast_filter_group_order(&backend, &stmt)? {
+                            } else if let Some(result) =
+                                Self::try_fast_filter_group_order(&backend, &stmt)?
+                            {
                                 // FAST PATH for Complex (Filter+Group+Order) - biggest optimization
                                 return Ok(result);
                             } else if can_late_materialize_where {
                                 // FAST PATH 1: Try dictionary-based filter for simple string equality (with LIMIT)
-                                if let Some(result) = Self::try_fast_string_filter(&backend, &stmt)? {
+                                if let Some(result) = Self::try_fast_string_filter(&backend, &stmt)?
+                                {
                                     result
                                 // FAST PATH 1b: String equality without LIMIT - storage-level scan
-                                } else if let Some(result) = Self::try_fast_string_filter_no_limit(&backend, &stmt)? {
+                                } else if let Some(result) =
+                                    Self::try_fast_string_filter_no_limit(&backend, &stmt)?
+                                {
                                     if !stmt.is_select_star() {
-                                        let projected = Self::apply_projection_with_storage(&result, &stmt.columns, Some(storage_path))?;
+                                        let projected = Self::apply_projection_with_storage(
+                                            &result,
+                                            &stmt.columns,
+                                            Some(storage_path),
+                                        )?;
                                         return Ok(ApexResult::Data(projected));
                                     }
                                     return Ok(ApexResult::Data(result));
                                 // FAST PATH 1c: LIKE pattern scan (prefix/suffix/contains)
-                                } else if let Some(result) = Self::try_fast_like_filter(&backend, &stmt)? {
+                                } else if let Some(result) =
+                                    Self::try_fast_like_filter(&backend, &stmt)?
+                                {
                                     if !stmt.is_select_star() {
-                                        let projected = Self::apply_projection_with_storage(&result, &stmt.columns, Some(storage_path))?;
+                                        let projected = Self::apply_projection_with_storage(
+                                            &result,
+                                            &stmt.columns,
+                                            Some(storage_path),
+                                        )?;
                                         return Ok(ApexResult::Data(projected));
                                     }
                                     return Ok(ApexResult::Data(result));
                                 // FAST PATH 2: Try numeric range filter for BETWEEN
-                                } else if let Some(result) = Self::try_fast_numeric_range_filter(&backend, &stmt)? {
+                                } else if let Some(result) =
+                                    Self::try_fast_numeric_range_filter(&backend, &stmt)?
+                                {
                                     result
                                 // FAST PATH 3: Try combined string + numeric filter for multi-condition
-                                } else if let Some(result) = Self::try_fast_multi_condition_filter(&backend, &stmt)? {
+                                } else if let Some(result) =
+                                    Self::try_fast_multi_condition_filter(&backend, &stmt)?
+                                {
                                     result
                                 // FAST PATH 4: Mmap multi-condition AND on two different numeric columns
-                                } else if let Some(result) = Self::try_fast_mmap_multi_condition(&backend, &stmt, storage_path)? {
+                                } else if let Some(result) = Self::try_fast_mmap_multi_condition(
+                                    &backend,
+                                    &stmt,
+                                    storage_path,
+                                )? {
                                     return Ok(result);
                                 // FAST PATH 5: Mmap IN filter on string column
-                                } else if let Some(result) = Self::try_fast_mmap_in_filter(&backend, &stmt, storage_path)? {
+                                } else if let Some(result) =
+                                    Self::try_fast_mmap_in_filter(&backend, &stmt, storage_path)?
+                                {
                                     return Ok(result);
                                 } else if backend.is_mmap_only()
                                     && !backend.has_pending_deltas()
@@ -525,79 +674,194 @@ impl ApexExecutor {
                                 {
                                     // MMAP FAST PATH: byte-level scan + point lookups
                                     if let Some(where_clause) = &stmt.where_clause {
-                                        let _limit_with_off = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+                                        let _limit_with_off =
+                                            stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
                                         let (matching_indices, prefer_index_materialization) =
-                                            if let Some((col, val)) = Self::extract_string_equality(where_clause) {
-                                            (backend.scan_string_filter_mmap(&col, &val, _limit_with_off)?, false)
-                                        } else if let Some((col, low, high)) = Self::extract_between_range(where_clause) {
-                                            (backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?, false)
-                                        } else if let Some((col, low, high)) = Self::extract_two_sided_same_col_range(where_clause) {
-                                            // col >= N AND col <= M — logically equivalent to BETWEEN
-                                            (backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?, false)
-                                        } else if let Some((col, low, high)) = Self::extract_single_comparison_as_range(where_clause) {
-                                            (backend.scan_numeric_range_mmap(&col, low, high, _limit_with_off)?, false)
-                                        } else if let Some((col, values)) = Self::extract_in_string_filter(where_clause) {
-                                            (backend.scan_string_in_mmap(&col, &values, _limit_with_off)?, true)
-                                        } else if let Some((col, nums)) = Self::extract_in_numeric_filter(where_clause)
-                                            .or_else(|| Self::extract_or_numeric_equalities(where_clause))
-                                        {
-                                            // Numeric IN or OR-of-equalities: single-pass mmap scan
-                                            (backend.scan_numeric_in_mmap(&col, &nums, _limit_with_off)?, true)
-                                        } else if let Some(leaves) = Self::extract_or_leaf_predicates(where_clause) {
-                                            // General OR decomposition: scan each leaf, union indices
-                                            match Self::scan_or_leaves_mmap(&backend, &leaves, _limit_with_off)? {
-                                                Some(v) if !v.is_empty() => (Some(v), true),
-                                                Some(_) => (None, true), // empty result
-                                                None => (None, true),
-                                            }
-                                        } else {
-                                            (None, false)
-                                        };
+                                            if let Some((col, val)) =
+                                                Self::extract_string_equality(where_clause)
+                                            {
+                                                (
+                                                    backend.scan_string_filter_mmap(
+                                                        &col,
+                                                        &val,
+                                                        _limit_with_off,
+                                                    )?,
+                                                    false,
+                                                )
+                                            } else if let Some((col, low, high)) =
+                                                Self::extract_between_range(where_clause)
+                                            {
+                                                (
+                                                    backend.scan_numeric_range_mmap(
+                                                        &col,
+                                                        low,
+                                                        high,
+                                                        _limit_with_off,
+                                                    )?,
+                                                    false,
+                                                )
+                                            } else if let Some((col, low, high)) =
+                                                Self::extract_two_sided_same_col_range(where_clause)
+                                            {
+                                                // col >= N AND col <= M — logically equivalent to BETWEEN
+                                                (
+                                                    backend.scan_numeric_range_mmap(
+                                                        &col,
+                                                        low,
+                                                        high,
+                                                        _limit_with_off,
+                                                    )?,
+                                                    false,
+                                                )
+                                            } else if let Some((col, low, high)) =
+                                                Self::extract_single_comparison_as_range(
+                                                    where_clause,
+                                                )
+                                            {
+                                                (
+                                                    backend.scan_numeric_range_mmap(
+                                                        &col,
+                                                        low,
+                                                        high,
+                                                        _limit_with_off,
+                                                    )?,
+                                                    false,
+                                                )
+                                            } else if let Some((col, values)) =
+                                                Self::extract_in_string_filter(where_clause)
+                                            {
+                                                (
+                                                    backend.scan_string_in_mmap(
+                                                        &col,
+                                                        &values,
+                                                        _limit_with_off,
+                                                    )?,
+                                                    true,
+                                                )
+                                            } else if let Some((col, nums)) =
+                                                Self::extract_in_numeric_filter(where_clause)
+                                                    .or_else(|| {
+                                                        Self::extract_or_numeric_equalities(
+                                                            where_clause,
+                                                        )
+                                                    })
+                                            {
+                                                // Numeric IN or OR-of-equalities: single-pass mmap scan
+                                                (
+                                                    backend.scan_numeric_in_mmap(
+                                                        &col,
+                                                        &nums,
+                                                        _limit_with_off,
+                                                    )?,
+                                                    true,
+                                                )
+                                            } else if let Some(leaves) =
+                                                Self::extract_or_leaf_predicates(where_clause)
+                                            {
+                                                // General OR decomposition: scan each leaf, union indices
+                                                match Self::scan_or_leaves_mmap(
+                                                    &backend,
+                                                    &leaves,
+                                                    _limit_with_off,
+                                                )? {
+                                                    Some(v) if !v.is_empty() => (Some(v), true),
+                                                    Some(_) => (None, true), // empty result
+                                                    None => (None, true),
+                                                }
+                                            } else {
+                                                (None, false)
+                                            };
                                         if let Some(indices) = matching_indices {
                                             if indices.is_empty() {
-                                                return Ok(ApexResult::Empty(Arc::new(Schema::empty())));
+                                                return Ok(ApexResult::Empty(Arc::new(
+                                                    Schema::empty(),
+                                                )));
                                             }
                                             let batch = if prefer_index_materialization {
-                                                Self::read_matching_rows_by_indices(&backend, &stmt, &indices)?
+                                                Self::read_matching_rows_by_indices(
+                                                    &backend, &stmt, &indices,
+                                                )?
                                             } else {
-                                                Self::read_matching_rows_adaptive(&backend, &stmt, &indices)?
+                                                Self::read_matching_rows_adaptive(
+                                                    &backend, &stmt, &indices,
+                                                )?
                                             };
-                                            
+
                                             // Apply ORDER BY with LIMIT if needed
                                             if !stmt.order_by.is_empty() {
-                                                let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
-                                                let sort_batch = Self::augment_batch_for_order_by(&batch, &stmt.columns, &stmt.order_by)?;
-                                                let sorted = Self::apply_order_by_topk(&sort_batch, &stmt.order_by, k)?;
-                                                let limited = Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset)?;
-                                                let projected = Self::apply_projection_with_storage(&limited, &stmt.columns, Some(storage_path))?;
+                                                let k = stmt
+                                                    .limit
+                                                    .map(|l| l + stmt.offset.unwrap_or(0));
+                                                let sort_batch = Self::augment_batch_for_order_by(
+                                                    &batch,
+                                                    &stmt.columns,
+                                                    &stmt.order_by,
+                                                )?;
+                                                let sorted = Self::apply_order_by_topk(
+                                                    &sort_batch,
+                                                    &stmt.order_by,
+                                                    k,
+                                                )?;
+                                                let limited = Self::apply_limit_offset(
+                                                    &sorted,
+                                                    stmt.limit,
+                                                    stmt.offset,
+                                                )?;
+                                                let projected =
+                                                    Self::apply_projection_with_storage(
+                                                        &limited,
+                                                        &stmt.columns,
+                                                        Some(storage_path),
+                                                    )?;
                                                 return Ok(ApexResult::Data(projected));
                                             }
-                                            
+
                                             if !stmt.is_select_star() {
-                                                let projected = Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
+                                                let projected =
+                                                    Self::apply_projection_with_storage(
+                                                        &batch,
+                                                        &stmt.columns,
+                                                        Some(storage_path),
+                                                    )?;
                                                 return Ok(ApexResult::Data(projected));
                                             }
                                             return Ok(ApexResult::Data(batch));
                                         }
                                     }
-                                    let filtered = Self::execute_with_late_materialization(&backend, &stmt, storage_path)?;
+                                    let filtered = Self::execute_with_late_materialization(
+                                        &backend,
+                                        &stmt,
+                                        storage_path,
+                                    )?;
                                     if filtered.num_rows() == 0 {
                                         return Ok(ApexResult::Empty(filtered.schema()));
                                     }
                                     if !stmt.is_select_star() {
-                                        let projected = Self::apply_projection_with_storage(&filtered, &stmt.columns, Some(storage_path))?;
+                                        let projected = Self::apply_projection_with_storage(
+                                            &filtered,
+                                            &stmt.columns,
+                                            Some(storage_path),
+                                        )?;
                                         return Ok(ApexResult::Data(projected));
                                     }
                                     return Ok(ApexResult::Data(filtered));
                                 } else {
                                     // Late materialization for WHERE path
                                     // Return directly to avoid applying WHERE filter twice
-                                    let filtered = Self::execute_with_late_materialization(&backend, &stmt, storage_path)?;
+                                    let filtered = Self::execute_with_late_materialization(
+                                        &backend,
+                                        &stmt,
+                                        storage_path,
+                                    )?;
                                     if filtered.num_rows() == 0 {
                                         return Ok(ApexResult::Empty(filtered.schema()));
                                     }
                                     if !stmt.is_select_star() {
-                                        let projected = Self::apply_projection_with_storage(&filtered, &stmt.columns, Some(storage_path))?;
+                                        let projected = Self::apply_projection_with_storage(
+                                            &filtered,
+                                            &stmt.columns,
+                                            Some(storage_path),
+                                        )?;
                                         return Ok(ApexResult::Data(projected));
                                     }
                                     return Ok(ApexResult::Data(filtered));
@@ -605,62 +869,105 @@ impl ApexExecutor {
                             } else if !stmt.group_by.is_empty() {
                                 // GROUP BY with WHERE: use dict-encoded path for faster string aggregation
                                 let col_refs = Self::get_col_refs(&stmt);
-                                backend.read_columns_to_arrow_dict(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref())?
-                            } else if let Some(batch) = Self::try_numeric_predicate_pushdown(&backend, &stmt)? {
+                                backend.read_columns_to_arrow_dict(
+                                    col_refs
+                                        .as_ref()
+                                        .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                                        .as_deref(),
+                                )?
+                            } else if let Some(batch) =
+                                Self::try_numeric_predicate_pushdown(&backend, &stmt)?
+                            {
                                 batch
                             } else {
                                 let col_refs = Self::get_col_refs(&stmt);
-                                backend.read_columns_to_arrow(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref(), 0, None)?
+                                backend.read_columns_to_arrow(
+                                    col_refs
+                                        .as_ref()
+                                        .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                                        .as_deref(),
+                                    0,
+                                    None,
+                                )?
                             }
                         } else if can_late_materialize_where {
                             // FAST PATH 1: Try dictionary-based filter for simple string equality
                             if let Some(result) = Self::try_fast_string_filter(&backend, &stmt)? {
                                 result
                             // FAST PATH 1b: No-LIMIT string filter (uses mmap scan + late materialization)
-                            } else if let Some(result) = Self::try_fast_string_filter_no_limit(&backend, &stmt)? {
+                            } else if let Some(result) =
+                                Self::try_fast_string_filter_no_limit(&backend, &stmt)?
+                            {
                                 result
                             // FAST PATH 1c: LIKE pattern scan (prefix/suffix/contains)
-                            } else if let Some(result) = Self::try_fast_like_filter(&backend, &stmt)? {
+                            } else if let Some(result) =
+                                Self::try_fast_like_filter(&backend, &stmt)?
+                            {
                                 result
                             // FAST PATH 2: Try numeric range filter for BETWEEN
-                            } else if let Some(result) = Self::try_fast_numeric_range_filter(&backend, &stmt)? {
+                            } else if let Some(result) =
+                                Self::try_fast_numeric_range_filter(&backend, &stmt)?
+                            {
                                 result
                             // FAST PATH 3: Try combined string + numeric filter for multi-condition
-                            } else if let Some(result) = Self::try_fast_multi_condition_filter(&backend, &stmt)? {
+                            } else if let Some(result) =
+                                Self::try_fast_multi_condition_filter(&backend, &stmt)?
+                            {
                                 result
                             } else {
                                 // Late materialization for SELECT * WHERE path
-                                Self::execute_with_late_materialization(&backend, &stmt, storage_path)?
+                                Self::execute_with_late_materialization(
+                                    &backend,
+                                    &stmt,
+                                    storage_path,
+                                )?
                             }
                         } else if stmt.where_clause.is_some() && stmt.limit.is_none() {
                             // FAST PATH: String filter without LIMIT (uses dictionary scan)
-                            if let Some(result) = Self::try_fast_string_filter_no_limit(&backend, &stmt)? {
+                            if let Some(result) =
+                                Self::try_fast_string_filter_no_limit(&backend, &stmt)?
+                            {
                                 result
                             // FAST PATH: LIKE pattern scan (prefix/suffix/contains)
-                            } else if let Some(result) = Self::try_fast_like_filter(&backend, &stmt)? {
+                            } else if let Some(result) =
+                                Self::try_fast_like_filter(&backend, &stmt)?
+                            {
                                 result
-                            } else if let Some(batch) = Self::try_numeric_predicate_pushdown(&backend, &stmt)? {
+                            } else if let Some(batch) =
+                                Self::try_numeric_predicate_pushdown(&backend, &stmt)?
+                            {
                                 batch
                             } else {
                                 let col_refs = Self::get_col_refs(&stmt);
-                                backend.read_columns_to_arrow(col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()).as_deref(), 0, None)?
+                                backend.read_columns_to_arrow(
+                                    col_refs
+                                        .as_ref()
+                                        .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                                        .as_deref(),
+                                    0,
+                                    None,
+                                )?
                             }
                         } else if can_late_materialize_order {
                             // Late materialization for ORDER BY + LIMIT path
                             Self::execute_with_order_late_materialization(&backend, &stmt)?
                         } else {
                             let col_refs = Self::get_col_refs(&stmt);
-                            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+                            let col_refs_vec: Option<Vec<&str>> = col_refs
+                                .as_ref()
+                                .map(|v| v.iter().map(|s| s.as_str()).collect());
                             let can_pushdown_limit = stmt.where_clause.is_none()
                                 && stmt.order_by.is_empty()
                                 && stmt.group_by.is_empty()
                                 && !has_aggregation_check;
-                            
+
                             // Note: V4 fast agg disabled - Arrow clone+SIMD outperforms due to cache warming
-                            
+
                             if !stmt.group_by.is_empty() {
                                 // V4 FAST PATH: Cached GROUP BY
-                                if let Some(result) = Self::try_fast_cached_group_by(&backend, &stmt)? {
+                                if let Some(result) =
+                                    Self::try_fast_cached_group_by(&backend, &stmt)?
+                                {
                                     return Ok(result);
                                 }
                                 // Fallback: dict-encoded Arrow path
@@ -671,7 +978,11 @@ impl ApexExecutor {
                                 } else {
                                     None
                                 };
-                                backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, _row_limit)?
+                                backend.read_columns_to_arrow(
+                                    col_refs_vec.as_deref(),
+                                    0,
+                                    _row_limit,
+                                )?
                             }
                         }
                     }
@@ -685,12 +996,10 @@ impl ApexExecutor {
         // Check for aggregation BEFORE checking empty batch
         // Aggregations like COUNT(*) should return 0 for empty tables
         // Also check for aggregates inside expressions (e.g., CASE WHEN SUM(x) > 100 ...)
-        let has_aggregation = stmt.columns.iter().any(|col| {
-            match col {
-                SelectColumn::Aggregate { .. } => true,
-                SelectColumn::Expression { expr, .. } => Self::expr_contains_aggregate(expr),
-                _ => false,
-            }
+        let has_aggregation = stmt.columns.iter().any(|col| match col {
+            SelectColumn::Aggregate { .. } => true,
+            SelectColumn::Expression { expr, .. } => Self::expr_contains_aggregate(expr),
+            _ => false,
         });
 
         if batch.num_rows() == 0 {
@@ -717,7 +1026,10 @@ impl ApexExecutor {
         }
 
         // Check for window functions
-        let has_window = stmt.columns.iter().any(|col| matches!(col, SelectColumn::WindowFunction { .. }));
+        let has_window = stmt
+            .columns
+            .iter()
+            .any(|col| matches!(col, SelectColumn::WindowFunction { .. }));
         if has_window {
             return Self::execute_window_function(&filtered, &stmt);
         }
@@ -740,7 +1052,8 @@ impl ApexExecutor {
             } else {
                 filtered
             };
-            let projected = Self::apply_projection_with_storage(&sorted, &stmt.columns, Some(storage_path))?;
+            let projected =
+                Self::apply_projection_with_storage(&sorted, &stmt.columns, Some(storage_path))?;
             let deduped = Self::deduplicate_batch(&projected)?;
             Self::apply_limit_offset(&deduped, stmt.limit, stmt.offset)?
         } else {
@@ -749,7 +1062,8 @@ impl ApexExecutor {
                 let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
                 // Pre-evaluate any SELECT expression aliases referenced in ORDER BY
                 // (e.g. SELECT array_distance(vec,[…]) AS dist … ORDER BY dist)
-                let sort_batch = Self::augment_batch_for_order_by(&filtered, &stmt.columns, &stmt.order_by)?;
+                let sort_batch =
+                    Self::augment_batch_for_order_by(&filtered, &stmt.columns, &stmt.order_by)?;
                 let sorted = Self::apply_order_by_topk(&sort_batch, &stmt.order_by, k)?;
                 Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset)?
             } else {
@@ -771,17 +1085,22 @@ impl ApexExecutor {
         base_dir: &Path,
         storage_path: &Path,
     ) -> io::Result<Option<ApexResult>> {
-        use crate::storage::index::index_manager::PredicateHint;
         use crate::query::sql_parser::BinaryOperator;
+        use crate::storage::index::index_manager::PredicateHint;
 
         // Skip index path for mmap-only: per-row reads would each do a full mmap scan
-        if backend.is_mmap_only() { return Ok(None); }
+        if backend.is_mmap_only() {
+            return Ok(None);
+        }
 
         // Only use index for simple queries: no GROUP BY, no aggregation, no JOIN
         if !stmt.group_by.is_empty() || !stmt.joins.is_empty() {
             return Ok(None);
         }
-        let has_agg = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Aggregate { .. }));
+        let has_agg = stmt
+            .columns
+            .iter()
+            .any(|c| matches!(c, SelectColumn::Aggregate { .. }));
         if has_agg {
             return Ok(None);
         }
@@ -801,7 +1120,8 @@ impl ApexExecutor {
         let mut idx_mgr = idx_mgr_arc.lock();
 
         // Filter to predicates that have indexes
-        let indexed_preds: Vec<(String, PredicateHint)> = predicates.into_iter()
+        let indexed_preds: Vec<(String, PredicateHint)> = predicates
+            .into_iter()
             .filter(|(col, _)| idx_mgr.has_index_on(col))
             .collect();
 
@@ -813,7 +1133,9 @@ impl ApexExecutor {
         let table_key = storage_path.to_string_lossy();
         if let Some(stats) = get_table_stats(&table_key) {
             let selectivity = QueryPlanner::estimate_selectivity(where_clause, &stats);
-            if stats.row_count > 0 && !QueryPlanner::should_use_index("", selectivity, stats.row_count) {
+            if stats.row_count > 0
+                && !QueryPlanner::should_use_index("", selectivity, stats.row_count)
+            {
                 return Ok(None); // CBO says full scan is cheaper, skip index lookup
             }
         }
@@ -828,7 +1150,8 @@ impl ApexExecutor {
                         None => r.row_ids,
                         Some(existing) => {
                             // Intersect: keep only IDs in both sets
-                            let set: std::collections::HashSet<u64> = r.row_ids.into_iter().collect();
+                            let set: std::collections::HashSet<u64> =
+                                r.row_ids.into_iter().collect();
                             existing.into_iter().filter(|id| set.contains(id)).collect()
                         }
                     });
@@ -853,7 +1176,11 @@ impl ApexExecutor {
         // Read matching rows by their _ids
         // CBO: use ANALYZE stats to decide index vs full scan cost
         let total_rows = backend.active_row_count();
-        let selectivity = if total_rows > 0 { row_ids.len() as f64 / total_rows as f64 } else { 1.0 };
+        let selectivity = if total_rows > 0 {
+            row_ids.len() as f64 / total_rows as f64
+        } else {
+            1.0
+        };
         if !QueryPlanner::should_use_index("", selectivity, total_rows as u64) {
             return Ok(None); // Cost model says full scan is cheaper
         }
@@ -923,12 +1250,19 @@ impl ApexExecutor {
 
     /// Extract index-usable predicates from an expression (flattens AND chains).
     /// Each predicate is (column_name, PredicateHint).
-    fn extract_index_predicates(expr: &SqlExpr, out: &mut Vec<(String, crate::storage::index::index_manager::PredicateHint)>) {
+    fn extract_index_predicates(
+        expr: &SqlExpr,
+        out: &mut Vec<(String, crate::storage::index::index_manager::PredicateHint)>,
+    ) {
         use crate::query::sql_parser::BinaryOperator;
         use crate::storage::index::index_manager::PredicateHint;
         match expr {
             // AND chain: recurse into both sides
-            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
                 Self::extract_index_predicates(left, out);
                 Self::extract_index_predicates(right, out);
             }
@@ -945,7 +1279,9 @@ impl ApexExecutor {
                                 BinaryOperator::Le => Some(PredicateHint::Lte(val)),
                                 _ => None,
                             };
-                            if let Some(hint) = h { out.push((col.clone(), hint)); }
+                            if let Some(hint) = h {
+                                out.push((col.clone(), hint));
+                            }
                         }
                     }
                 } else if let SqlExpr::Column(col) = right.as_ref() {
@@ -959,19 +1295,38 @@ impl ApexExecutor {
                                 BinaryOperator::Le => Some(PredicateHint::Gte(val)),
                                 _ => None,
                             };
-                            if let Some(hint) = h { out.push((col.clone(), hint)); }
+                            if let Some(hint) = h {
+                                out.push((col.clone(), hint));
+                            }
                         }
                     }
                 }
             }
-            SqlExpr::Between { column, low, high, negated } => {
+            SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => {
                 if !negated && column != "_id" {
-                    if let (Some(low_val), Some(high_val)) = (Self::expr_to_value(low), Self::expr_to_value(high)) {
-                        out.push((column.clone(), PredicateHint::Range { low: low_val, high: high_val }));
+                    if let (Some(low_val), Some(high_val)) =
+                        (Self::expr_to_value(low), Self::expr_to_value(high))
+                    {
+                        out.push((
+                            column.clone(),
+                            PredicateHint::Range {
+                                low: low_val,
+                                high: high_val,
+                            },
+                        ));
                     }
                 }
             }
-            SqlExpr::In { column, values, negated } => {
+            SqlExpr::In {
+                column,
+                values,
+                negated,
+            } => {
                 if !negated && column != "_id" {
                     out.push((column.clone(), PredicateHint::In(values.clone())));
                 }
@@ -1000,11 +1355,15 @@ impl ApexExecutor {
         let mut known_values: HashMap<String, Value> = HashMap::new();
         for (col, hint) in indexed_preds {
             match hint {
-                PredicateHint::Eq(val) => { known_values.insert(col.clone(), val.clone()); }
+                PredicateHint::Eq(val) => {
+                    known_values.insert(col.clone(), val.clone());
+                }
                 PredicateHint::In(_) if row_ids.len() <= 1 => {
                     return Ok(None);
                 }
-                _ => { return Ok(None); } // Range predicates: values vary per row
+                _ => {
+                    return Ok(None);
+                } // Range predicates: values vary per row
             }
         }
         if known_values.is_empty() {
@@ -1036,8 +1395,12 @@ impl ApexExecutor {
                         return Ok(None);
                     }
                 }
-                SelectColumn::All => { return Ok(None); }
-                _ => { return Ok(None); } // Aggregate, expression, etc.
+                SelectColumn::All => {
+                    return Ok(None);
+                }
+                _ => {
+                    return Ok(None);
+                } // Aggregate, expression, etc.
             }
         }
 
@@ -1056,12 +1419,20 @@ impl ApexExecutor {
             let val = &known_values[col_name];
             match val {
                 Value::Int64(v) => {
-                    fields.push(Field::new(col_name, arrow::datatypes::DataType::Int64, true));
+                    fields.push(Field::new(
+                        col_name,
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    ));
                     let arr = Int64Array::from(vec![*v; n]);
                     arrays.push(Arc::new(arr) as ArrayRef);
                 }
                 Value::Float64(f) => {
-                    fields.push(Field::new(col_name, arrow::datatypes::DataType::Float64, true));
+                    fields.push(Field::new(
+                        col_name,
+                        arrow::datatypes::DataType::Float64,
+                        true,
+                    ));
                     let arr = Float64Array::from(vec![*f; n]);
                     arrays.push(Arc::new(arr) as ArrayRef);
                 }
@@ -1071,11 +1442,17 @@ impl ApexExecutor {
                     arrays.push(Arc::new(arr) as ArrayRef);
                 }
                 Value::Bool(b) => {
-                    fields.push(Field::new(col_name, arrow::datatypes::DataType::Boolean, true));
+                    fields.push(Field::new(
+                        col_name,
+                        arrow::datatypes::DataType::Boolean,
+                        true,
+                    ));
                     let arr = BooleanArray::from(vec![*b; n]);
                     arrays.push(Arc::new(arr) as ArrayRef);
                 }
-                _ => { return Ok(None); } // Unsupported value type for index-only scan
+                _ => {
+                    return Ok(None);
+                } // Unsupported value type for index-only scan
             }
         }
 
@@ -1084,8 +1461,7 @@ impl ApexExecutor {
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema, arrays)
-            .map_err(|e| err_data(e.to_string()))?;
+        let batch = RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
 
         // Apply ORDER BY if present
         let sorted = if !stmt.order_by.is_empty() {
@@ -1163,7 +1539,9 @@ impl ApexExecutor {
         // Avoids materializing non-matching rows — only builds Arrow arrays for hits.
         // Returns None for compressed/non-RCIX files → falls through to old paths.
         let limit_with_offset = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
-        if let Some(batch) = backend.scan_like_and_extract_mmap(&col_name, &pattern, limit_with_offset)? {
+        if let Some(batch) =
+            backend.scan_like_and_extract_mmap(&col_name, &pattern, limit_with_offset)?
+        {
             let offset = stmt.offset.unwrap_or(0);
             let result = if offset > 0 {
                 let n = batch.num_rows().saturating_sub(offset);
@@ -1179,10 +1557,11 @@ impl ApexExecutor {
         }
 
         // Fallback: index-based extraction (compressed/non-RCIX files)
-        let mut indices = match backend.scan_like_filter_mmap(&col_name, &pattern, limit_with_offset)? {
-            Some(v) => v,
-            None => return Ok(None),
-        };
+        let mut indices =
+            match backend.scan_like_filter_mmap(&col_name, &pattern, limit_with_offset)? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
 
         if indices.is_empty() {
             let empty = Self::read_matching_rows_adaptive(backend, stmt, &indices)?;
@@ -1196,14 +1575,16 @@ impl ApexExecutor {
                 return Ok(Some(empty));
             }
             indices = indices[offset..].to_vec();
-         }
+        }
         if let Some(lim) = stmt.limit {
             indices.truncate(lim);
         }
 
-        Ok(Some(Self::read_matching_rows_adaptive(backend, stmt, &indices)?))
+        Ok(Some(Self::read_matching_rows_adaptive(
+            backend, stmt, &indices,
+        )?))
     }
-    
+
     /// Unified implementation for string equality filter fast path
     fn try_fast_string_filter_impl(
         backend: &TableStorageBackend,
@@ -1214,7 +1595,7 @@ impl ApexExecutor {
             Some(w) => w,
             None => return Ok(None),
         };
-        
+
         let (col_name, filter_value) = match Self::extract_string_equality(where_clause) {
             Some(v) => v,
             None => return Ok(None),
@@ -1226,9 +1607,10 @@ impl ApexExecutor {
         } else {
             Some(stmt.required_columns().unwrap_or_default())
         };
-        let col_refs: Option<Vec<&str>> = projected_cols.as_ref()
+        let col_refs: Option<Vec<&str>> = projected_cols
+            .as_ref()
             .map(|cols| cols.iter().map(|s| s.as_str()).collect());
-        
+
         let result = if let Some(lim) = limit {
             if backend.pending_delta_updates_column(&col_name) || backend.has_delta() {
                 let full = backend.read_columns_filtered_string_to_arrow(
@@ -1241,14 +1623,14 @@ impl ApexExecutor {
                 let len = lim.min(full.num_rows().saturating_sub(offset));
                 full.slice(offset, len)
             } else {
-            backend.read_columns_filtered_string_with_limit_to_arrow(
-                col_refs.as_deref(),
-                &col_name,
-                &filter_value,
-                true,
-                lim,
-                stmt.offset.unwrap_or(0),
-            )?
+                backend.read_columns_filtered_string_with_limit_to_arrow(
+                    col_refs.as_deref(),
+                    &col_name,
+                    &filter_value,
+                    true,
+                    lim,
+                    stmt.offset.unwrap_or(0),
+                )?
             }
         } else {
             backend.read_columns_filtered_string_to_arrow(
@@ -1258,7 +1640,7 @@ impl ApexExecutor {
                 true,
             )?
         };
-        
+
         Ok(Some(result))
     }
 
@@ -1270,7 +1652,7 @@ impl ApexExecutor {
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
         use crate::query::sql_parser::BinaryOperator;
-        
+
         if backend.has_pending_deltas() || backend.has_delta() {
             return Ok(None);
         }
@@ -1281,7 +1663,9 @@ impl ApexExecutor {
         };
 
         if backend.is_mmap_only() {
-            if stmt.limit.is_none() { return Ok(None); }
+            if stmt.limit.is_none() {
+                return Ok(None);
+            }
             let (col, lo, hi) = match Self::extract_any_numeric_range(where_clause) {
                 Some(v) => v,
                 None => return Ok(None),
@@ -1303,10 +1687,15 @@ impl ApexExecutor {
         if stmt.limit.is_none() {
             return Ok(None);
         }
-        
+
         // Extract BETWEEN pattern: col BETWEEN low AND high
         let (col_name, low, high) = match where_clause {
-            SqlExpr::Between { column, low, high, negated } => {
+            SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => {
                 if *negated {
                     return Ok(None);
                 }
@@ -1315,7 +1704,11 @@ impl ApexExecutor {
                 (column.trim_matches('"').to_string(), low_val, high_val)
             }
             // Also handle col >= low AND col <= high pattern
-            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
                 let (col1, op1, val1) = match Self::extract_comparison(left) {
                     Ok(v) => v,
                     Err(_) => return Ok(None),
@@ -1324,11 +1717,11 @@ impl ApexExecutor {
                     Ok(v) => v,
                     Err(_) => return Ok(None),
                 };
-                
+
                 if col1 != col2 {
                     return Ok(None);
                 }
-                
+
                 // Determine low and high from the operators
                 let (low, high) = match (op1, op2) {
                     (BinaryOperator::Ge, BinaryOperator::Le) => (val1, val2),
@@ -1341,13 +1734,14 @@ impl ApexExecutor {
             }
             _ => return Ok(None),
         };
-        
+
         let projected_cols: Option<Vec<String>> = if stmt.is_select_star() {
             None
         } else {
             Some(stmt.required_columns().unwrap_or_default())
         };
-        let col_refs: Option<Vec<&str>> = projected_cols.as_ref()
+        let col_refs: Option<Vec<&str>> = projected_cols
+            .as_ref()
             .map(|cols| cols.iter().map(|s| s.as_str()).collect());
 
         let limit = stmt.limit.unwrap_or(100);
@@ -1362,10 +1756,10 @@ impl ApexExecutor {
             limit,
             offset,
         )?;
-        
+
         Ok(Some(result))
     }
-    
+
     /// Helper to extract numeric value from SqlExpr
     fn extract_numeric_value(expr: &SqlExpr) -> io::Result<f64> {
         match expr {
@@ -1373,12 +1767,14 @@ impl ApexExecutor {
             SqlExpr::Literal(Value::Int32(n)) => Ok(*n as f64),
             SqlExpr::Literal(Value::Float64(n)) => Ok(*n),
             SqlExpr::Literal(Value::Float32(n)) => Ok(*n as f64),
-            _ => Err(err_input( "not a number")),
+            _ => Err(err_input("not a number")),
         }
     }
-    
+
     /// Helper to extract comparison from binary op
-    fn extract_comparison(expr: &SqlExpr) -> io::Result<(String, crate::query::sql_parser::BinaryOperator, f64)> {
+    fn extract_comparison(
+        expr: &SqlExpr,
+    ) -> io::Result<(String, crate::query::sql_parser::BinaryOperator, f64)> {
         use crate::query::sql_parser::BinaryOperator;
         match expr {
             SqlExpr::BinaryOp { left, op, right } => {
@@ -1395,14 +1791,14 @@ impl ApexExecutor {
                             BinaryOperator::Lt => BinaryOperator::Gt,
                             BinaryOperator::Ge => BinaryOperator::Le,
                             BinaryOperator::Le => BinaryOperator::Ge,
-                            _ => return Err(err_input( "unsupported op")),
+                            _ => return Err(err_input("unsupported op")),
                         };
                         Ok((col.trim_matches('"').to_string(), flipped_op, val))
                     }
-                    _ => Err(err_input( "not a comparison")),
+                    _ => Err(err_input("not a comparison")),
                 }
             }
-            _ => Err(err_input( "not a binary op")),
+            _ => Err(err_input("not a binary op")),
         }
     }
 
@@ -1413,61 +1809,59 @@ impl ApexExecutor {
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
         use crate::query::sql_parser::BinaryOperator;
-        
-        if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
+
+        if backend.has_pending_deltas() || backend.is_mmap_only() {
+            return Ok(None);
+        }
 
         // Must have LIMIT
         if stmt.limit.is_none() {
             return Ok(None);
         }
-        
+
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
         };
-        
+
         // Must be AND of two conditions
         let (left_cond, right_cond) = match where_clause {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
-                (left.as_ref(), right.as_ref())
-            }
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => (left.as_ref(), right.as_ref()),
             _ => return Ok(None),
         };
-        
+
         // Try to extract string equality and numeric comparison from either order
-        let (str_col, str_val, num_col, num_op, num_val) = 
+        let (str_col, str_val, num_col, num_op, num_val) =
             if let (Some((sc, sv)), Some((nc, no, nv))) = (
                 Self::extract_string_equality(left_cond),
-                Self::extract_numeric_comparison(right_cond)
+                Self::extract_numeric_comparison(right_cond),
             ) {
                 (sc, sv, nc, no, nv)
             } else if let (Some((sc, sv)), Some((nc, no, nv))) = (
                 Self::extract_string_equality(right_cond),
-                Self::extract_numeric_comparison(left_cond)
+                Self::extract_numeric_comparison(left_cond),
             ) {
                 (sc, sv, nc, no, nv)
             } else {
                 return Ok(None);
             };
-        
+
         let limit = stmt.limit.unwrap_or(100);
         let offset = stmt.offset.unwrap_or(0);
-        
+
         // Use storage-level combined filter
         let result = backend.read_columns_filtered_string_numeric_with_limit_to_arrow(
             None, // All columns (SELECT *)
-            &str_col,
-            &str_val,
-            &num_col,
-            &num_op,
-            num_val,
-            limit,
-            offset,
+            &str_col, &str_val, &num_col, &num_op, num_val, limit, offset,
         )?;
-        
+
         Ok(Some(result))
     }
-    
+
     /// FAST PATH for Complex (Filter+Group+Order) queries
     /// Optimized for: SELECT group_col, AGG(agg_col) FROM table WHERE filter_col = 'value' GROUP BY group_col ORDER BY agg DESC LIMIT n
     /// Uses single-pass execution with direct dictionary indexing for maximum performance
@@ -1475,40 +1869,49 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() || backend.has_delta() { return Ok(None); }
+        if backend.has_pending_deltas() || backend.has_delta() {
+            return Ok(None);
+        }
 
-        use crate::query::AggregateFunc;
         use crate::query::sql_parser::BinaryOperator;
-        
+        use crate::query::AggregateFunc;
+
         // Check pattern: must have WHERE, GROUP BY, ORDER BY, and LIMIT
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
         };
-        
+
         if stmt.group_by.is_empty() || stmt.order_by.is_empty() || stmt.limit.is_none() {
             return Ok(None);
         }
-        
+
         // Support: string equality (col = 'val') OR BETWEEN (col BETWEEN low AND high)
         enum FilterType<'a> {
             StringEq(String, &'a str),
             Between(String, f64, f64),
         }
-        
+
         let filter = match where_clause {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                match (left.as_ref(), right.as_ref()) {
-                    (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val))) => {
-                        FilterType::StringEq(col.trim_matches('"').to_string(), val.as_str())
-                    }
-                    (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
-                        FilterType::StringEq(col.trim_matches('"').to_string(), val.as_str())
-                    }
-                    _ => return Ok(None),
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => match (left.as_ref(), right.as_ref()) {
+                (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val))) => {
+                    FilterType::StringEq(col.trim_matches('"').to_string(), val.as_str())
                 }
-            }
-            SqlExpr::Between { column, low, high, negated } if !negated => {
+                (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
+                    FilterType::StringEq(col.trim_matches('"').to_string(), val.as_str())
+                }
+                _ => return Ok(None),
+            },
+            SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } if !negated => {
                 let low_val = Self::extract_numeric_value(low).ok();
                 let high_val = Self::extract_numeric_value(high).ok();
                 if let (Some(lo), Some(hi)) = (low_val, high_val) {
@@ -1519,13 +1922,13 @@ impl ApexExecutor {
             }
             _ => return Ok(None),
         };
-        
+
         // Must have exactly one GROUP BY column (string)
         if stmt.group_by.len() != 1 {
             return Ok(None);
         }
         let group_col = stmt.group_by[0].trim_matches('"');
-        
+
         // Must have exactly one ORDER BY clause
         if stmt.order_by.len() != 1 {
             return Ok(None);
@@ -1533,7 +1936,7 @@ impl ApexExecutor {
         let order_clause = &stmt.order_by[0];
         let order_col = order_clause.column.trim_matches('"');
         let descending = order_clause.descending;
-        
+
         // Check if we have exactly one aggregate column
         let mut agg_func = None;
         let mut agg_col = None;
@@ -1543,33 +1946,38 @@ impl ApexExecutor {
                 agg_col = column.as_deref();
             }
         }
-        
+
         let agg_func = match agg_func {
             Some(f) => f,
             None => return Ok(None),
         };
-        
+
         // Support SUM, COUNT, and AVG
-        if !matches!(agg_func, AggregateFunc::Sum | AggregateFunc::Count | AggregateFunc::Avg) {
+        if !matches!(
+            agg_func,
+            AggregateFunc::Sum | AggregateFunc::Count | AggregateFunc::Avg
+        ) {
             return Ok(None);
         }
-        
+
         // Check HAVING clause - must be simple
         if let Some(having) = &stmt.having {
             match having {
-                SqlExpr::BinaryOp { left, op: BinaryOperator::Gt, right } => {
-                    match (left.as_ref(), right.as_ref()) {
-                        (SqlExpr::Column(_col), SqlExpr::Literal(Value::Int64(_val))) => {}
-                        _ => return Ok(None),
-                    }
-                }
+                SqlExpr::BinaryOp {
+                    left,
+                    op: BinaryOperator::Gt,
+                    right,
+                } => match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(_col), SqlExpr::Literal(Value::Int64(_val))) => {}
+                    _ => return Ok(None),
+                },
                 _ => return Ok(None),
             }
         }
-        
+
         let limit = stmt.limit.unwrap_or(100);
         let offset = stmt.offset.unwrap_or(0);
-        
+
         // For string equality filter, use existing storage-level path
         match &filter {
             FilterType::StringEq(filter_col, filter_val) => {
@@ -1578,15 +1986,8 @@ impl ApexExecutor {
                     return Ok(None);
                 }
                 match backend.execute_filter_group_order(
-                    filter_col,
-                    filter_val,
-                    group_col,
-                    agg_col,
-                    agg_func,
-                    order_col,
-                    descending,
-                    limit,
-                    offset,
+                    filter_col, filter_val, group_col, agg_col, agg_func, order_col, descending,
+                    limit, offset,
                 ) {
                     Ok(Some(result)) => Ok(Some(ApexResult::Data(result))),
                     Ok(None) => Ok(None),
@@ -1595,51 +1996,63 @@ impl ApexExecutor {
             }
             FilterType::Between(filter_col, lo, hi) => {
                 let raw = match Self::get_cached_between_group_agg(
-                    backend,
-                    filter_col,
-                    *lo,
-                    *hi,
-                    group_col,
-                    agg_col,
+                    backend, filter_col, *lo, *hi, group_col, agg_col,
                 )? {
                     Some(r) => r,
                     _ => return Ok(None),
                 };
-                
+
                 // Compute final aggregated values
-                let mut results: Vec<(String, f64)> = raw.iter().map(|(k, sum, count)| {
-                    let val = match agg_func {
-                        AggregateFunc::Sum => *sum,
-                        AggregateFunc::Count => *count as f64,
-                        AggregateFunc::Avg => if *count > 0 { *sum / *count as f64 } else { 0.0 },
-                        _ => *sum,
-                    };
-                    (k.clone(), val)
-                }).collect();
-                
+                let mut results: Vec<(String, f64)> = raw
+                    .iter()
+                    .map(|(k, sum, count)| {
+                        let val = match agg_func {
+                            AggregateFunc::Sum => *sum,
+                            AggregateFunc::Count => *count as f64,
+                            AggregateFunc::Avg => {
+                                if *count > 0 {
+                                    *sum / *count as f64
+                                } else {
+                                    0.0
+                                }
+                            }
+                            _ => *sum,
+                        };
+                        (k.clone(), val)
+                    })
+                    .collect();
+
                 // Sort
                 if descending {
-                    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    results
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 } else {
-                    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    results
+                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 }
                 let results: Vec<_> = results.into_iter().skip(offset).take(limit).collect();
-                
+
                 if results.is_empty() {
                     return Ok(None);
                 }
-                
+
                 // Build Arrow result
                 let group_values: Vec<&str> = results.iter().map(|(k, _)| k.as_str()).collect();
                 let agg_values: Vec<f64> = results.iter().map(|(_, v)| *v).collect();
-                
+
                 let group_col_name = group_col.to_string();
-                let agg_col_name = stmt.columns.iter().find_map(|c| {
-                    if let SelectColumn::Aggregate { alias, .. } = c {
-                        alias.clone().or_else(|| Some(order_col.to_string()))
-                    } else { None }
-                }).unwrap_or_else(|| order_col.to_string());
-                
+                let agg_col_name = stmt
+                    .columns
+                    .iter()
+                    .find_map(|c| {
+                        if let SelectColumn::Aggregate { alias, .. } = c {
+                            alias.clone().or_else(|| Some(order_col.to_string()))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| order_col.to_string());
+
                 let schema = Arc::new(Schema::new(vec![
                     Field::new(&group_col_name, ArrowDataType::Utf8, false),
                     Field::new(&agg_col_name, ArrowDataType::Float64, false),
@@ -1648,78 +2061,86 @@ impl ApexExecutor {
                     Arc::new(StringArray::from(group_values)),
                     Arc::new(Float64Array::from(agg_values)),
                 ];
-                let result = RecordBatch::try_new(schema, arrays)
-                    .map_err(|e| err_data(e.to_string()))?;
-                
+                let result =
+                    RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
+
                 Ok(Some(ApexResult::Data(result)))
             }
         }
     }
-    
+
     /// V4 FAST PATH for GROUP BY queries without WHERE
     /// Handles: SELECT group_col, AGG1(col1), AGG2(col2) FROM table GROUP BY group_col
     fn try_fast_v4_group_by(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() || backend.has_delta() { return Ok(None); }
+        if backend.has_pending_deltas() || backend.has_delta() {
+            return Ok(None);
+        }
 
         use crate::query::AggregateFunc;
-        
+
         // Must be single GROUP BY column, no WHERE, no ORDER BY
         if stmt.group_by.len() != 1 || stmt.where_clause.is_some() || !stmt.order_by.is_empty() {
             return Ok(None);
         }
-        
+
         let group_col = stmt.group_by[0].trim_matches('"');
-        
+
         // Extract aggregate columns: (col_name_or_"*", is_count_star, func, alias)
         let mut agg_info: Vec<(&str, bool, AggregateFunc, Option<String>)> = Vec::new();
-        
+
         for col in &stmt.columns {
             match col {
-                SelectColumn::Aggregate { func, column, alias, .. } => {
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    alias,
+                    ..
+                } => {
                     let is_count_star = matches!(func, AggregateFunc::Count) && column.is_none();
                     let col_name = column.as_deref().unwrap_or("*");
                     agg_info.push((col_name, is_count_star, func.clone(), alias.clone()));
                 }
                 SelectColumn::Column(name) => {
-                    if name.trim_matches('"') == group_col { continue; }
+                    if name.trim_matches('"') == group_col {
+                        continue;
+                    }
                     return Ok(None);
                 }
                 SelectColumn::ColumnAlias { column, .. } => {
-                    if column.trim_matches('"') == group_col { continue; }
+                    if column.trim_matches('"') == group_col {
+                        continue;
+                    }
                     return Ok(None);
                 }
                 _ => return Ok(None),
             }
         }
-        
+
         if agg_info.is_empty() {
             return Ok(None);
         }
-        
+
         // Build agg_cols for storage call
-        let agg_cols: Vec<(&str, bool)> = agg_info.iter()
+        let agg_cols: Vec<(&str, bool)> = agg_info
+            .iter()
             .map(|(col, is_count, _, _)| (*col, *is_count))
             .collect();
-        
+
         let raw = match backend.execute_group_agg(group_col, &agg_cols)? {
             Some(r) if !r.is_empty() => r,
             _ => return Ok(None),
         };
-        
+
         // Build result: group_col + one column per aggregate
         let num_groups = raw.len();
         let group_values: Vec<&str> = raw.iter().map(|(k, _)| k.as_str()).collect();
-        
-        let mut fields: Vec<Field> = vec![
-            Field::new(group_col, ArrowDataType::Utf8, false),
-        ];
-        let mut arrays: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(group_values)),
-        ];
-        
+
+        let mut fields: Vec<Field> = vec![Field::new(group_col, ArrowDataType::Utf8, false)];
+        let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(group_values))];
+
         for (ai, (_, _, func, alias)) in agg_info.iter().enumerate() {
             let col_name = alias.as_deref().unwrap_or(match func {
                 AggregateFunc::Count => "COUNT(*)",
@@ -1728,17 +2149,26 @@ impl ApexExecutor {
                 AggregateFunc::Min => "MIN",
                 AggregateFunc::Max => "MAX",
             });
-            
-            let values: Vec<f64> = raw.iter().map(|(_, aggs)| {
-                let (sum, count) = aggs[ai];
-                match func {
-                    AggregateFunc::Count => count as f64,
-                    AggregateFunc::Avg => if count > 0 { sum / count as f64 } else { 0.0 },
-                    AggregateFunc::Sum => sum,
-                    _ => sum,
-                }
-            }).collect();
-            
+
+            let values: Vec<f64> = raw
+                .iter()
+                .map(|(_, aggs)| {
+                    let (sum, count) = aggs[ai];
+                    match func {
+                        AggregateFunc::Count => count as f64,
+                        AggregateFunc::Avg => {
+                            if count > 0 {
+                                sum / count as f64
+                            } else {
+                                0.0
+                            }
+                        }
+                        AggregateFunc::Sum => sum,
+                        _ => sum,
+                    }
+                })
+                .collect();
+
             // Use Int64 for COUNT, Float64 for others
             if matches!(func, AggregateFunc::Count) {
                 let int_values: Vec<i64> = values.iter().map(|v| *v as i64).collect();
@@ -1749,12 +2179,11 @@ impl ApexExecutor {
                 arrays.push(Arc::new(Float64Array::from(values)));
             }
         }
-        
+
         // Apply HAVING if present
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema, arrays)
-            .map_err(|e| err_data(e.to_string()))?;
-        
+        let batch = RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
+
         let mut result = if let Some(having) = &stmt.having {
             let mask = Self::evaluate_predicate(&batch, having)?;
             let filtered = arrow::compute::filter_record_batch(&batch, &mask)
@@ -1788,21 +2217,38 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
+        if backend.has_pending_deltas() || backend.is_mmap_only() {
+            return Ok(None);
+        }
 
         use crate::query::AggregateFunc;
-        
+
         // Collect unique column names needed for aggregation
         let mut unique_cols: Vec<String> = Vec::new();
         for col in &stmt.columns {
-            if let SelectColumn::Aggregate { func, column, distinct, .. } = col {
-                if *distinct { return Ok(None); } // DISTINCT needs full scan
+            if let SelectColumn::Aggregate {
+                func,
+                column,
+                distinct,
+                ..
+            } = col
+            {
+                if *distinct {
+                    return Ok(None);
+                } // DISTINCT needs full scan
                 let name = column.as_deref().unwrap_or("*");
-                if name == "_id" { return Ok(None); } // _id stored separately
-                // COUNT(col) and AVG(col) must exclude NULLs: the storage fast path
-                // returns total-row-count which would be wrong when NULLs are present.
-                // Fall back to the full Arrow scan which respects null_count().
-                let is_star_or_const = name == "*" || name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+                if name == "_id" {
+                    return Ok(None);
+                } // _id stored separately
+                  // COUNT(col) and AVG(col) must exclude NULLs: the storage fast path
+                  // returns total-row-count which would be wrong when NULLs are present.
+                  // Fall back to the full Arrow scan which respects null_count().
+                let is_star_or_const = name == "*"
+                    || name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false);
                 if !is_star_or_const {
                     if matches!(func, AggregateFunc::Count | AggregateFunc::Avg) {
                         return Ok(None);
@@ -1815,27 +2261,47 @@ impl ApexExecutor {
                 return Ok(None); // Non-aggregate column present
             }
         }
-        if unique_cols.is_empty() { return Ok(None); }
-        
+        if unique_cols.is_empty() {
+            return Ok(None);
+        }
+
         let col_refs: Vec<&str> = unique_cols.iter().map(|s| s.as_str()).collect();
         let raw = match backend.execute_simple_agg(&col_refs)? {
             Some(r) => r,
             None => return Ok(None),
         };
-        
+
         // Build result
         let mut fields: Vec<Field> = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
-        
+
         for col in &stmt.columns {
-            if let SelectColumn::Aggregate { func, column, alias, .. } = col {
+            if let SelectColumn::Aggregate {
+                func,
+                column,
+                alias,
+                ..
+            } = col
+            {
                 let col_name = column.as_deref().unwrap_or("*");
-                let fn_name = match func { AggregateFunc::Count => "COUNT", AggregateFunc::Sum => "SUM", AggregateFunc::Avg => "AVG", AggregateFunc::Min => "MIN", AggregateFunc::Max => "MAX" };
-                let output_name = alias.clone().unwrap_or_else(|| if let Some(c) = column { format!("{}({})", fn_name, c) } else { format!("{}(*)", fn_name) });
-                
+                let fn_name = match func {
+                    AggregateFunc::Count => "COUNT",
+                    AggregateFunc::Sum => "SUM",
+                    AggregateFunc::Avg => "AVG",
+                    AggregateFunc::Min => "MIN",
+                    AggregateFunc::Max => "MAX",
+                };
+                let output_name = alias.clone().unwrap_or_else(|| {
+                    if let Some(c) = column {
+                        format!("{}({})", fn_name, c)
+                    } else {
+                        format!("{}(*)", fn_name)
+                    }
+                });
+
                 let idx = unique_cols.iter().position(|s| s == col_name).unwrap_or(0);
                 let (count, sum, min_v, max_v, is_int) = raw[idx];
-                
+
                 match func {
                     AggregateFunc::Count => {
                         fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
@@ -1876,11 +2342,235 @@ impl ApexExecutor {
                 }
             }
         }
-        
+
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema, arrays)
-            .map_err(|e| err_data(e.to_string()))?;
+        let batch = RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
         Ok(Some(ApexResult::Data(batch)))
+    }
+
+    /// V4 FAST PATH: Filtered aggregation with string equality WHERE
+    /// Handles: SELECT COUNT(*), AVG(col), MAX(col) FROM table WHERE str_col = 'val'
+    /// Scans string column for matching indices, then computes aggregates directly.
+    fn try_fast_filtered_string_agg(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::AggregateFunc;
+
+        if !backend.is_mmap_only() || backend.has_pending_deltas() || backend.has_delta() {
+            return Ok(None);
+        }
+
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+
+        let (filter_col, filter_val) = match Self::extract_string_equality(where_clause) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // Collect unique aggregation columns. Add "*" when COUNT(*)/COUNT(1)
+        // is present so the storage path returns the real match count.
+        let mut unique_cols: Vec<String> = Vec::new();
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate {
+                func,
+                column,
+                distinct,
+                ..
+            } = col
+            {
+                if *distinct {
+                    return Ok(None);
+                }
+                if let Some(col_name) = column {
+                    let is_count_star = matches!(func, AggregateFunc::Count)
+                        && (col_name.as_str() == "*"
+                            || col_name
+                                .chars()
+                                .next()
+                                .map(|c| c.is_ascii_digit())
+                                .unwrap_or(false));
+                    if is_count_star {
+                        if !unique_cols.iter().any(|c| c == "*") {
+                            unique_cols.push("*".to_string());
+                        }
+                    } else if !unique_cols.contains(col_name) {
+                        unique_cols.push(col_name.clone());
+                    }
+                } else if !matches!(func, AggregateFunc::Count) {
+                    return Ok(None);
+                } else if !unique_cols.iter().any(|c| c == "*") {
+                    unique_cols.push("*".to_string());
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+
+        let col_refs: Vec<&str> = unique_cols.iter().map(|s| s.as_str()).collect();
+
+        // Single-pass: scan string filter + aggregate in one sequential pass
+        use std::collections::HashMap;
+        let agg_results =
+            match backend.execute_filtered_string_agg_mmap(&filter_col, &filter_val, &col_refs)? {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+
+        // Build stat lookup: column name -> (count, sum, min, max, is_int)
+        let mut stat_map: HashMap<&str, (i64, f64, f64, f64, bool)> = HashMap::new();
+        for (i, &col_name) in col_refs.iter().enumerate() {
+            if i < agg_results.len() {
+                stat_map.insert(col_name, agg_results[i]);
+            }
+        }
+
+        let match_count = stat_map.get("*").map(|s| s.0).unwrap_or(0);
+
+        // Build result
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate {
+                func,
+                column,
+                alias,
+                ..
+            } = col
+            {
+                let fn_name = match func {
+                    AggregateFunc::Count => "COUNT",
+                    AggregateFunc::Sum => "SUM",
+                    AggregateFunc::Avg => "AVG",
+                    AggregateFunc::Min => "MIN",
+                    AggregateFunc::Max => "MAX",
+                };
+                let output_name = alias.clone().unwrap_or_else(|| {
+                    if let Some(c) = column {
+                        format!("{}({})", fn_name, c)
+                    } else {
+                        format!("{}(*)", fn_name)
+                    }
+                });
+
+                match func {
+                    AggregateFunc::Count => {
+                        let count = if let Some(col_name) = column {
+                            let is_count_star = col_name.as_str() == "*"
+                                || col_name
+                                    .chars()
+                                    .next()
+                                    .map(|c| c.is_ascii_digit())
+                                    .unwrap_or(false);
+                            if is_count_star {
+                                match_count
+                            } else {
+                                stat_map.get(col_name.as_str()).map(|s| s.0).unwrap_or(0)
+                            }
+                        } else {
+                            match_count
+                        };
+                        fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
+                        arrays.push(Arc::new(Int64Array::from(vec![count])));
+                    }
+                    AggregateFunc::Sum
+                    | AggregateFunc::Avg
+                    | AggregateFunc::Min
+                    | AggregateFunc::Max => {
+                        let col_name = column.as_ref().unwrap();
+                        let (count, sum, min_v, max_v, is_int) = stat_map
+                            .get(col_name.as_str())
+                            .copied()
+                            .unwrap_or((0, 0.0, 0.0, 0.0, false));
+
+                        match func {
+                            AggregateFunc::Sum => {
+                                if is_int {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Int64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Int64Array::from(vec![sum as i64])));
+                                } else {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Float64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Float64Array::from(vec![sum])));
+                                }
+                            }
+                            AggregateFunc::Avg => {
+                                let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+                                fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
+                                arrays.push(Arc::new(Float64Array::from(vec![avg])));
+                            }
+                            AggregateFunc::Min => {
+                                if count == 0 {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Float64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Float64Array::from(vec![None::<f64>])));
+                                } else if is_int {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Int64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Int64Array::from(vec![min_v as i64])));
+                                } else {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Float64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Float64Array::from(vec![min_v])));
+                                }
+                            }
+                            AggregateFunc::Max => {
+                                if count == 0 {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Float64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Float64Array::from(vec![None::<f64>])));
+                                } else if is_int {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Int64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Int64Array::from(vec![max_v as i64])));
+                                } else {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Float64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Float64Array::from(vec![max_v])));
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+        }
+
+        if fields.is_empty() {
+            return Ok(None);
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let result = RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
+        Ok(Some(ApexResult::Data(result)))
     }
 
     /// V4 FAST PATH: Cached GROUP BY (builds dict cache on first call, reuses on subsequent calls)
@@ -1888,12 +2578,15 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() || backend.has_delta() { return Ok(None); }
+        if backend.has_pending_deltas() || backend.has_delta() {
+            return Ok(None);
+        }
 
         use crate::query::AggregateFunc;
-        
-        // Must be 1 or 2 GROUP BY columns, no WHERE
-        if stmt.group_by.is_empty() || stmt.group_by.len() > 2 || stmt.where_clause.is_some() || !stmt.order_by.is_empty() {
+
+        // Must be 1 or 2 GROUP BY columns, no WHERE.
+        // ORDER BY/LIMIT can be applied after the cached aggregate result is built.
+        if stmt.group_by.is_empty() || stmt.group_by.len() > 2 || stmt.where_clause.is_some() {
             return Ok(None);
         }
 
@@ -1906,44 +2599,58 @@ impl ApexExecutor {
         if stmt.group_by.len() != 1 {
             return Ok(None);
         }
-        
+
         let group_col = stmt.group_by[0].trim_matches('"');
-        
+
         // Extract aggregate info
         let mut agg_info: Vec<(&str, bool, AggregateFunc, Option<String>)> = Vec::new();
         for col in &stmt.columns {
             match col {
-                SelectColumn::Aggregate { func, column, alias, .. } => {
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    alias,
+                    ..
+                } => {
                     let is_count_star = matches!(func, AggregateFunc::Count) && column.is_none();
                     let col_name = column.as_deref().unwrap_or("*");
                     agg_info.push((col_name, is_count_star, func.clone(), alias.clone()));
                 }
                 SelectColumn::Column(name) => {
-                    if name.trim_matches('"') == group_col { continue; }
+                    if name.trim_matches('"') == group_col {
+                        continue;
+                    }
                     return Ok(None);
                 }
                 SelectColumn::ColumnAlias { column, .. } => {
-                    if column.trim_matches('"') == group_col { continue; }
+                    if column.trim_matches('"') == group_col {
+                        continue;
+                    }
                     return Ok(None);
                 }
                 _ => return Ok(None),
             }
         }
-        if agg_info.is_empty() { return Ok(None); }
-        
+        if agg_info.is_empty() {
+            return Ok(None);
+        }
+
         // Get or build cached dict (global cache — survives backend reopens)
         let dict_arc = match crate::storage::backend::get_global_dict_cache(
-            backend.path(), group_col, &backend.storage,
+            backend.path(),
+            group_col,
+            &backend.storage,
         )? {
             Some(c) => c,
             None => return Ok(None),
         };
         let (dict_strings, group_ids) = (dict_arc.0.as_slice(), dict_arc.1.as_slice());
-        
-        let agg_cols: Vec<(&str, bool)> = agg_info.iter()
+
+        let agg_cols: Vec<(&str, bool)> = agg_info
+            .iter()
             .map(|(col, is_count, _, _)| (*col, *is_count))
             .collect();
-        
+
         let raw = match Self::get_cached_single_group_agg(
             backend,
             group_col,
@@ -1954,27 +2661,47 @@ impl ApexExecutor {
             Some(r) => r,
             _ => return Ok(None),
         };
-        
+
         // Build result
         let num_groups = raw.len();
         let group_values: Vec<&str> = raw.iter().map(|(k, _)| k.as_str()).collect();
-        
+
         let mut fields: Vec<Field> = vec![Field::new(group_col, ArrowDataType::Utf8, false)];
         let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(group_values))];
-        
-        for (ai, (_, _, func, alias)) in agg_info.iter().enumerate() {
-            let col_name = alias.as_deref().unwrap_or(match func {
-                AggregateFunc::Count => "COUNT(*)", AggregateFunc::Avg => "AVG",
-                AggregateFunc::Sum => "SUM", AggregateFunc::Min => "MIN", AggregateFunc::Max => "MAX",
-            });
-            let values: Vec<f64> = raw.iter().map(|(_, aggs)| {
-                let (sum, count) = aggs[ai];
-                match func {
-                    AggregateFunc::Count => count as f64,
-                    AggregateFunc::Avg => if count > 0 { sum / count as f64 } else { 0.0 },
-                    _ => sum,
+
+        for (ai, (agg_col, _, func, alias)) in agg_info.iter().enumerate() {
+            let output_name;
+            let col_name = match alias {
+                Some(alias) => alias.as_str(),
+                None => {
+                    output_name = match func {
+                        AggregateFunc::Count if *agg_col == "*" => "COUNT(*)".to_string(),
+                        AggregateFunc::Count => format!("COUNT({})", agg_col),
+                        AggregateFunc::Avg => format!("AVG({})", agg_col),
+                        AggregateFunc::Sum => format!("SUM({})", agg_col),
+                        AggregateFunc::Min => format!("MIN({})", agg_col),
+                        AggregateFunc::Max => format!("MAX({})", agg_col),
+                    };
+                    output_name.as_str()
                 }
-            }).collect();
+            };
+            let values: Vec<f64> = raw
+                .iter()
+                .map(|(_, aggs)| {
+                    let (sum, count) = aggs[ai];
+                    match func {
+                        AggregateFunc::Count => count as f64,
+                        AggregateFunc::Avg => {
+                            if count > 0 {
+                                sum / count as f64
+                            } else {
+                                0.0
+                            }
+                        }
+                        _ => sum,
+                    }
+                })
+                .collect();
             if matches!(func, AggregateFunc::Count) {
                 let int_values: Vec<i64> = values.iter().map(|v| *v as i64).collect();
                 fields.push(Field::new(col_name, ArrowDataType::Int64, false));
@@ -1984,23 +2711,34 @@ impl ApexExecutor {
                 arrays.push(Arc::new(Float64Array::from(values)));
             }
         }
-        
+
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema, arrays)
-            .map_err(|e| err_data(e.to_string()))?;
-        
+        let batch = RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
+
         // Apply HAVING
-        if let Some(having) = &stmt.having {
+        let mut result = if let Some(having) = &stmt.having {
             let mask = Self::evaluate_predicate(&batch, having)?;
             let filtered = arrow::compute::filter_record_batch(&batch, &mask)
                 .map_err(|e| err_data(e.to_string()))?;
             if filtered.num_rows() == 0 {
                 return Ok(Some(ApexResult::Empty(filtered.schema())));
             }
-            return Ok(Some(ApexResult::Data(filtered)));
+            filtered
+        } else {
+            batch
+        };
+
+        if !stmt.order_by.is_empty() {
+            let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+            let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            result = Self::apply_order_by_topk(&result, &resolved_ob, k)?;
         }
-        
-        Ok(Some(ApexResult::Data(batch)))
+
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            result = Self::apply_limit_offset(&result, stmt.limit, stmt.offset)?;
+        }
+
+        Ok(Some(ApexResult::Data(result)))
     }
 
     /// 2-column GROUP BY fast path using dict caches for both columns.
@@ -2017,35 +2755,50 @@ impl ApexExecutor {
         let mut agg_info: Vec<(&str, bool, AggregateFunc, Option<String>)> = Vec::new();
         for col in &stmt.columns {
             match col {
-                SelectColumn::Aggregate { func, column, alias, .. } => {
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    alias,
+                    ..
+                } => {
                     let is_count_star = matches!(func, AggregateFunc::Count) && column.is_none();
                     let col_name = column.as_deref().unwrap_or("*");
                     agg_info.push((col_name, is_count_star, func.clone(), alias.clone()));
                 }
                 SelectColumn::Column(name) => {
                     let n = name.trim_matches('"');
-                    if n == group_col1 || n == group_col2 { continue; }
+                    if n == group_col1 || n == group_col2 {
+                        continue;
+                    }
                     return Ok(None);
                 }
                 SelectColumn::ColumnAlias { column, .. } => {
                     let n = column.trim_matches('"');
-                    if n == group_col1 || n == group_col2 { continue; }
+                    if n == group_col1 || n == group_col2 {
+                        continue;
+                    }
                     return Ok(None);
                 }
                 _ => return Ok(None),
             }
         }
-        if agg_info.is_empty() { return Ok(None); }
+        if agg_info.is_empty() {
+            return Ok(None);
+        }
 
         // Get dict caches for both group columns
         let dict1_arc = match crate::storage::backend::get_global_dict_cache(
-            backend.path(), group_col1, &backend.storage,
+            backend.path(),
+            group_col1,
+            &backend.storage,
         )? {
             Some(c) => c,
             None => return Ok(None),
         };
         let dict2_arc = match crate::storage::backend::get_global_dict_cache(
-            backend.path(), group_col2, &backend.storage,
+            backend.path(),
+            group_col2,
+            &backend.storage,
         )? {
             Some(c) => c,
             None => return Ok(None),
@@ -2054,7 +2807,8 @@ impl ApexExecutor {
         let (dict1_strings, group_ids1) = (dict1_arc.0.as_slice(), dict1_arc.1.as_slice());
         let (dict2_strings, group_ids2) = (dict2_arc.0.as_slice(), dict2_arc.1.as_slice());
 
-        let agg_cols: Vec<(&str, bool)> = agg_info.iter()
+        let agg_cols: Vec<(&str, bool)> = agg_info
+            .iter()
             .map(|(col, is_count, _, _)| (*col, *is_count))
             .collect();
 
@@ -2088,10 +2842,10 @@ impl ApexExecutor {
         for (ai, (_, _, func, alias)) in agg_info.iter().enumerate() {
             let col_name = alias.as_deref().unwrap_or(match func {
                 AggregateFunc::Count => "COUNT(*)",
-                AggregateFunc::Avg   => "AVG",
-                AggregateFunc::Sum   => "SUM",
-                AggregateFunc::Min   => "MIN",
-                AggregateFunc::Max   => "MAX",
+                AggregateFunc::Avg => "AVG",
+                AggregateFunc::Sum => "SUM",
+                AggregateFunc::Min => "MIN",
+                AggregateFunc::Max => "MAX",
             });
             match func {
                 AggregateFunc::Count => {
@@ -2100,10 +2854,17 @@ impl ApexExecutor {
                     arrays.push(Arc::new(Int64Array::from(vals)));
                 }
                 AggregateFunc::Avg => {
-                    let vals: Vec<f64> = raw.iter().map(|(_, aggs)| {
-                        let (sum, cnt) = aggs[ai];
-                        if cnt > 0 { sum / cnt as f64 } else { 0.0 }
-                    }).collect();
+                    let vals: Vec<f64> = raw
+                        .iter()
+                        .map(|(_, aggs)| {
+                            let (sum, cnt) = aggs[ai];
+                            if cnt > 0 {
+                                sum / cnt as f64
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect();
                     fields.push(Field::new(col_name, ArrowDataType::Float64, false));
                     arrays.push(Arc::new(Float64Array::from(vals)));
                 }
@@ -2116,8 +2877,8 @@ impl ApexExecutor {
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let mut batch = RecordBatch::try_new(schema, arrays)
-            .map_err(|e| err_data(e.to_string()))?;
+        let mut batch =
+            RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
 
         // Apply HAVING
         if let Some(having) = &stmt.having {
@@ -2135,9 +2896,11 @@ impl ApexExecutor {
     /// Helper to extract LIKE pattern: col LIKE 'pattern' (non-negated only)
     fn extract_like_pattern(expr: &SqlExpr) -> Option<(String, String)> {
         match expr {
-            SqlExpr::Like { column, pattern, negated } if !negated => {
-                Some((column.trim_matches('"').to_string(), pattern.clone()))
-            }
+            SqlExpr::Like {
+                column,
+                pattern,
+                negated,
+            } if !negated => Some((column.trim_matches('"').to_string(), pattern.clone())),
             _ => None,
         }
     }
@@ -2146,24 +2909,33 @@ impl ApexExecutor {
     fn extract_string_equality(expr: &SqlExpr) -> Option<(String, String)> {
         use crate::query::sql_parser::BinaryOperator;
         match expr {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                match (left.as_ref(), right.as_ref()) {
-                    (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val))) |
-                    (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
-                        Some((col.trim_matches('"').to_string(), val.clone()))
-                    }
-                    _ => None,
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => match (left.as_ref(), right.as_ref()) {
+                (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val)))
+                | (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
+                    Some((col.trim_matches('"').to_string(), val.clone()))
                 }
-            }
+                _ => None,
+            },
             _ => None,
         }
     }
-    
+
     /// Helper to extract BETWEEN range: col BETWEEN low AND high
     fn extract_between_range(expr: &SqlExpr) -> Option<(String, f64, f64)> {
         match expr {
-            SqlExpr::Between { column, low, high, negated } => {
-                if *negated { return None; }
+            SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => {
+                if *negated {
+                    return None;
+                }
                 let col = column.trim_matches('"').to_string();
                 let low_val = Self::extract_numeric_value(low).ok()?;
                 let high_val = Self::extract_numeric_value(high).ok()?;
@@ -2225,7 +2997,7 @@ impl ApexExecutor {
                         (f64::MIN, prev)
                     }
                     BinaryOperator::Le => (f64::MIN, val),
-                    BinaryOperator::Eq => (val, val),  // exact match as degenerate range [N, N]
+                    BinaryOperator::Eq => (val, val), // exact match as degenerate range [N, N]
                     _ => return None,
                 };
                 Some((col, low, high))
@@ -2233,7 +3005,7 @@ impl ApexExecutor {
             _ => None,
         }
     }
-    
+
     /// Extract a two-sided AND range on the SAME column: col >= N AND col <= M etc.
     /// Returns (col, inclusive_low, inclusive_high) with strict-inequality adjustment.
     /// Each side is extracted via extract_single_comparison_as_range; the intersection
@@ -2241,13 +3013,21 @@ impl ApexExecutor {
     fn extract_two_sided_same_col_range(expr: &SqlExpr) -> Option<(String, f64, f64)> {
         use crate::query::sql_parser::BinaryOperator;
         match expr {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
                 let (col1, lo1, hi1) = Self::extract_single_comparison_as_range(left.as_ref())?;
                 let (col2, lo2, hi2) = Self::extract_single_comparison_as_range(right.as_ref())?;
-                if col1 != col2 { return None; }
-                let combined_low  = lo1.max(lo2);
+                if col1 != col2 {
+                    return None;
+                }
+                let combined_low = lo1.max(lo2);
                 let combined_high = hi1.min(hi2);
-                if combined_low > combined_high { return None; }
+                if combined_low > combined_high {
+                    return None;
+                }
                 Some((col1, combined_low, combined_high))
             }
             _ => None,
@@ -2257,8 +3037,12 @@ impl ApexExecutor {
     /// Extract any single-column numeric range from an expression.
     /// Handles: BETWEEN, col op N (single comparison including equality).
     fn extract_any_numeric_range(expr: &SqlExpr) -> Option<(String, f64, f64)> {
-        if let Some(r) = Self::extract_between_range(expr) { return Some(r); }
-        if let Some(r) = Self::extract_single_comparison_as_range(expr) { return Some(r); }
+        if let Some(r) = Self::extract_between_range(expr) {
+            return Some(r);
+        }
+        if let Some(r) = Self::extract_single_comparison_as_range(expr) {
+            return Some(r);
+        }
         None
     }
 
@@ -2268,8 +3052,12 @@ impl ApexExecutor {
         let (mut i, mut j) = (0, 0);
         while i < a.len() && j < b.len() {
             match a[i].cmp(&b[j]) {
-                std::cmp::Ordering::Equal   => { result.push(a[i]); i += 1; j += 1; }
-                std::cmp::Ordering::Less    => i += 1,
+                std::cmp::Ordering::Equal => {
+                    result.push(a[i]);
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => i += 1,
                 std::cmp::Ordering::Greater => j += 1,
             }
         }
@@ -2285,10 +3073,14 @@ impl ApexExecutor {
         storage_path: &Path,
     ) -> io::Result<Option<ApexResult>> {
         use crate::query::sql_parser::BinaryOperator;
-        if !backend.is_mmap_only() || backend.has_pending_deltas() || backend.has_delta() { return Ok(None); }
+        if !backend.is_mmap_only() || backend.has_pending_deltas() || backend.has_delta() {
+            return Ok(None);
+        }
         // Without LIMIT the result set can be very large; sequential Arrow scan is faster
         // than index intersection + scatter read for high-selectivity filters.
-        if stmt.limit.is_none() { return Ok(None); }
+        if stmt.limit.is_none() {
+            return Ok(None);
+        }
 
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
@@ -2296,9 +3088,11 @@ impl ApexExecutor {
         };
         // Must be top-level AND
         let (left_cond, right_cond) = match where_clause {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
-                (left.as_ref(), right.as_ref())
-            }
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => (left.as_ref(), right.as_ref()),
             _ => return Ok(None),
         };
 
@@ -2324,13 +3118,19 @@ impl ApexExecutor {
                     }
                     intersected = intersected[offset..].to_vec();
                 }
-                if let Some(lim) = stmt.limit { intersected.truncate(lim); }
+                if let Some(lim) = stmt.limit {
+                    intersected.truncate(lim);
+                }
                 if intersected.is_empty() {
                     return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
                 }
                 let batch = Self::read_matching_rows_adaptive(backend, stmt, &intersected)?;
                 if !stmt.is_select_star() {
-                    let projected = Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
+                    let projected = Self::apply_projection_with_storage(
+                        &batch,
+                        &stmt.columns,
+                        Some(storage_path),
+                    )?;
                     return Ok(Some(ApexResult::Data(projected)));
                 }
                 return Ok(Some(ApexResult::Data(batch)));
@@ -2342,8 +3142,9 @@ impl ApexExecutor {
         let str_num = Self::extract_string_equality(left_cond)
             .and_then(|(sc, sv)| Self::extract_any_numeric_range(right_cond).map(|r| (sc, sv, r)))
             .or_else(|| {
-                Self::extract_string_equality(right_cond)
-                    .and_then(|(sc, sv)| Self::extract_any_numeric_range(left_cond).map(|r| (sc, sv, r)))
+                Self::extract_string_equality(right_cond).and_then(|(sc, sv)| {
+                    Self::extract_any_numeric_range(left_cond).map(|r| (sc, sv, r))
+                })
             });
 
         let (str_col, str_val, (num_col, num_lo, num_hi)) = match str_num {
@@ -2380,7 +3181,8 @@ impl ApexExecutor {
 
         let batch = Self::read_matching_rows_adaptive(backend, stmt, &intersected)?;
         if !stmt.is_select_star() {
-            let projected = Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
+            let projected =
+                Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
             return Ok(Some(ApexResult::Data(projected)));
         }
         Ok(Some(ApexResult::Data(batch)))
@@ -2390,8 +3192,14 @@ impl ApexExecutor {
     /// Returns (column_name, vec_of_string_values) if all values are strings.
     fn extract_in_string_filter(expr: &SqlExpr) -> Option<(String, Vec<String>)> {
         match expr {
-            SqlExpr::In { column, values, negated } => {
-                if *negated { return None; }
+            SqlExpr::In {
+                column,
+                values,
+                negated,
+            } => {
+                if *negated {
+                    return None;
+                }
                 let col = column.trim_matches('"').to_string();
                 let mut strs = Vec::with_capacity(values.len());
                 for v in values {
@@ -2400,7 +3208,9 @@ impl ApexExecutor {
                         _ => return None,
                     }
                 }
-                if strs.is_empty() { return None; }
+                if strs.is_empty() {
+                    return None;
+                }
                 Some((col, strs))
             }
             _ => None,
@@ -2411,8 +3221,14 @@ impl ApexExecutor {
     /// Returns (column_name, vec_of_i64_values) if all values are integers.
     fn extract_in_numeric_filter(expr: &SqlExpr) -> Option<(String, Vec<i64>)> {
         match expr {
-            SqlExpr::In { column, values, negated } => {
-                if *negated { return None; }
+            SqlExpr::In {
+                column,
+                values,
+                negated,
+            } => {
+                if *negated {
+                    return None;
+                }
                 let col = column.trim_matches('"').to_string();
                 let mut nums = Vec::with_capacity(values.len());
                 for v in values {
@@ -2422,7 +3238,9 @@ impl ApexExecutor {
                         _ => return None,
                     }
                 }
-                if nums.is_empty() { return None; }
+                if nums.is_empty() {
+                    return None;
+                }
                 Some((col, nums))
             }
             _ => None,
@@ -2437,20 +3255,34 @@ impl ApexExecutor {
         let mut col_name: Option<String> = None;
         Self::collect_or_numeric_equalities(expr, &mut col_name, &mut values)?;
         let col = col_name?;
-        if values.len() < 2 { return None; }
+        if values.len() < 2 {
+            return None;
+        }
         Some((col, values))
     }
 
     /// Recursively collect col = N leaves from an OR tree.
-    fn collect_or_numeric_equalities(expr: &SqlExpr, col_name: &mut Option<String>, values: &mut Vec<i64>) -> Option<()> {
+    fn collect_or_numeric_equalities(
+        expr: &SqlExpr,
+        col_name: &mut Option<String>,
+        values: &mut Vec<i64>,
+    ) -> Option<()> {
         use crate::query::sql_parser::BinaryOperator;
         match expr {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::Or,
+                right,
+            } => {
                 Self::collect_or_numeric_equalities(left, col_name, values)?;
                 Self::collect_or_numeric_equalities(right, col_name, values)?;
                 Some(())
             }
-            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => {
                 let (c, v) = match (left.as_ref(), right.as_ref()) {
                     (SqlExpr::Column(c), lit) | (lit, SqlExpr::Column(c)) => {
                         let val = match lit {
@@ -2464,9 +3296,13 @@ impl ApexExecutor {
                 };
                 match col_name {
                     Some(ref existing) => {
-                        if *existing != c { return None; }
+                        if *existing != c {
+                            return None;
+                        }
                     }
-                    None => { *col_name = Some(c); }
+                    None => {
+                        *col_name = Some(c);
+                    }
                 }
                 values.push(v);
                 Some(())
@@ -2480,7 +3316,11 @@ impl ApexExecutor {
     fn extract_or_leaf_predicates(expr: &SqlExpr) -> Option<Vec<OrLeafPredicate>> {
         use crate::query::sql_parser::BinaryOperator;
         match expr {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::Or,
+                right,
+            } => {
                 let mut left_leaves = Self::extract_or_leaf_predicates(left)?;
                 let right_leaves = Self::extract_or_leaf_predicates(right)?;
                 left_leaves.extend(right_leaves);
@@ -2490,7 +3330,9 @@ impl ApexExecutor {
                 // Try to classify this as a single scannable predicate
                 if let Some((col, val)) = Self::extract_string_equality(expr) {
                     Some(vec![OrLeafPredicate::StringEq(col, val)])
-                } else if let Some((col, low, high)) = Self::extract_single_comparison_as_range(expr) {
+                } else if let Some((col, low, high)) =
+                    Self::extract_single_comparison_as_range(expr)
+                {
                     Some(vec![OrLeafPredicate::NumericRange(col, low, high)])
                 } else if let Some((col, low, high)) = Self::extract_between_range(expr) {
                     Some(vec![OrLeafPredicate::NumericRange(col, low, high)])
@@ -2515,16 +3357,31 @@ impl ApexExecutor {
         use crate::storage::on_demand::MmapScanPred;
 
         // Try parallel path: convert leaves to MmapScanPred (skip StringIn — rare, needs multi-call)
-        let has_string_in = leaves.iter().any(|l| matches!(l, OrLeafPredicate::StringIn(..)));
+        let has_string_in = leaves
+            .iter()
+            .any(|l| matches!(l, OrLeafPredicate::StringIn(..)));
         if leaves.len() >= 2 && !has_string_in {
-            let preds: Vec<MmapScanPred> = leaves.iter().map(|leaf| match leaf {
-                OrLeafPredicate::StringEq(col, val) => MmapScanPred::StringEq { col, value: val },
-                OrLeafPredicate::NumericRange(col, low, high) => MmapScanPred::NumericRange { col, low: *low, high: *high },
-                OrLeafPredicate::NumericIn(col, nums) => MmapScanPred::NumericIn { col, values: nums },
-                OrLeafPredicate::StringIn(..) => unreachable!(),
-            }).collect();
+            let preds: Vec<MmapScanPred> = leaves
+                .iter()
+                .map(|leaf| match leaf {
+                    OrLeafPredicate::StringEq(col, val) => {
+                        MmapScanPred::StringEq { col, value: val }
+                    }
+                    OrLeafPredicate::NumericRange(col, low, high) => MmapScanPred::NumericRange {
+                        col,
+                        low: *low,
+                        high: *high,
+                    },
+                    OrLeafPredicate::NumericIn(col, nums) => {
+                        MmapScanPred::NumericIn { col, values: nums }
+                    }
+                    OrLeafPredicate::StringIn(..) => unreachable!(),
+                })
+                .collect();
             if let Some(mut indices) = backend.scan_multi_predicates_parallel(&preds)? {
-                if let Some(lim) = limit { indices.truncate(lim); }
+                if let Some(lim) = limit {
+                    indices.truncate(lim);
+                }
                 return Ok(Some(indices));
             }
             // Parallel path returned None (e.g. compressed data) — fall through to sequential
@@ -2573,12 +3430,15 @@ impl ApexExecutor {
     ) -> io::Result<RecordBatch> {
         use arrow::array::{ArrayRef, UInt32Array};
 
-        let indices_arr = UInt32Array::from(
-            row_indices.iter().map(|&i| i as u32).collect::<Vec<_>>()
-        );
-        let taken_columns: Vec<ArrayRef> = full_batch.columns().iter()
-            .map(|col| arrow::compute::take(col.as_ref(), &indices_arr, None)
-                .map_err(|e| err_data(e.to_string())))
+        let indices_arr =
+            UInt32Array::from(row_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        let taken_columns: Vec<ArrayRef> = full_batch
+            .columns()
+            .iter()
+            .map(|col| {
+                arrow::compute::take(col.as_ref(), &indices_arr, None)
+                    .map_err(|e| err_data(e.to_string()))
+            })
             .collect::<io::Result<Vec<_>>>()?;
         RecordBatch::try_new(full_batch.schema(), taken_columns)
             .map_err(|e| err_data(e.to_string()))
@@ -2590,7 +3450,8 @@ impl ApexExecutor {
         row_indices: &[usize],
     ) -> io::Result<RecordBatch> {
         let col_refs = Self::get_col_refs(stmt);
-        let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref()
+        let col_refs_vec: Option<Vec<&str>> = col_refs
+            .as_ref()
             .map(|v| v.iter().map(|s| s.as_str()).collect());
 
         if row_indices.is_empty() {
@@ -2630,7 +3491,9 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         storage_path: &Path,
     ) -> io::Result<Option<ApexResult>> {
-        if !backend.is_mmap_only() || backend.has_pending_deltas() || backend.has_delta() { return Ok(None); }
+        if !backend.is_mmap_only() || backend.has_pending_deltas() || backend.has_delta() {
+            return Ok(None);
+        }
 
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
@@ -2664,7 +3527,8 @@ impl ApexExecutor {
 
         let batch = Self::read_matching_rows_by_indices(backend, stmt, &all_indices)?;
         if !stmt.is_select_star() {
-            let projected = Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
+            let projected =
+                Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
             return Ok(Some(ApexResult::Data(projected)));
         }
         Ok(Some(ApexResult::Data(batch)))
@@ -2674,15 +3538,17 @@ impl ApexExecutor {
     fn extract_bool_equality(expr: &SqlExpr) -> Option<(String, bool)> {
         use crate::query::sql_parser::BinaryOperator;
         match expr {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                match (left.as_ref(), right.as_ref()) {
-                    (SqlExpr::Column(col), SqlExpr::Literal(Value::Bool(val))) |
-                    (SqlExpr::Literal(Value::Bool(val)), SqlExpr::Column(col)) => {
-                        Some((col.trim_matches('"').to_string(), *val))
-                    }
-                    _ => None,
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => match (left.as_ref(), right.as_ref()) {
+                (SqlExpr::Column(col), SqlExpr::Literal(Value::Bool(val)))
+                | (SqlExpr::Literal(Value::Bool(val)), SqlExpr::Column(col)) => {
+                    Some((col.trim_matches('"').to_string(), *val))
                 }
-            }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -2700,7 +3566,7 @@ impl ApexExecutor {
                     BinaryOperator::Eq => "=",
                     _ => return None,
                 };
-                
+
                 match (left.as_ref(), right.as_ref()) {
                     (SqlExpr::Column(col), lit) => {
                         if let Ok(val) = Self::extract_numeric_value(lit) {
@@ -2739,7 +3605,9 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
-        if backend.has_pending_deltas() || backend.has_delta() { return Ok(None); }
+        if backend.has_pending_deltas() || backend.has_delta() {
+            return Ok(None);
+        }
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
@@ -2747,7 +3615,9 @@ impl ApexExecutor {
 
         // --- mmap_only path: scan → indices → scatter read (LIMIT only) ---
         if backend.is_mmap_only() {
-            if stmt.limit.is_none() { return Ok(None); }
+            if stmt.limit.is_none() {
+                return Ok(None);
+            }
             let (col, lo, hi) = match Self::extract_any_numeric_range(where_clause) {
                 Some(v) => v,
                 None => return Ok(None),
@@ -2772,7 +3642,8 @@ impl ApexExecutor {
         };
         // Column projection pushdown
         let col_refs = Self::get_col_refs(stmt);
-        let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref()
+        let col_refs_vec: Option<Vec<&str>> = col_refs
+            .as_ref()
             .map(|v| v.iter().map(|s| s.as_str()).collect());
         let batch = backend.read_columns_filtered_to_arrow(
             col_refs_vec.as_deref(),
@@ -2812,10 +3683,13 @@ impl ApexExecutor {
                 }
                 sel_cols
             });
-            let col_refs_strs: Option<Vec<&str>> = col_refs_vec.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+            let col_refs_strs: Option<Vec<&str>> = col_refs_vec
+                .as_ref()
+                .map(|v| v.iter().map(|s| s.as_str()).collect());
             let full_batch = backend.read_columns_to_arrow(col_refs_strs.as_deref(), 0, None)?;
             if full_batch.num_rows() > 0 {
-                let mask = Self::evaluate_predicate_with_storage(&full_batch, where_clause, storage_path)?;
+                let mask =
+                    Self::evaluate_predicate_with_storage(&full_batch, where_clause, storage_path)?;
                 return compute::filter_record_batch(&full_batch, &mask)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
             }
@@ -2825,11 +3699,11 @@ impl ApexExecutor {
         // Step 1: Read only columns needed for WHERE clause
         let where_cols = stmt.where_columns();
         let where_col_refs: Vec<&str> = where_cols.iter().map(|s| s.as_str()).collect();
-        
+
         // Also include _id for later row identification
         let mut cols_to_read: Vec<&str> = vec!["_id"];
         cols_to_read.extend(where_col_refs.iter());
-        
+
         // OPTIMIZATION: Streaming filter evaluation with early termination
         // Read data in chunks and stop once we have enough matches
         let total_rows = backend.row_count() as usize;
@@ -2840,27 +3714,35 @@ impl ApexExecutor {
         } else {
             50_000
         };
-        
+
         let limited_indices: Vec<usize> = if let Some(need) = need_count {
             let mut indices = Vec::with_capacity(need);
             let mut start_row: usize = 0;
-            
+
             while start_row < total_rows && indices.len() < need {
                 let rows_to_read = chunk_size.min(total_rows - start_row);
-                let filter_batch = backend.read_columns_to_arrow(Some(&cols_to_read), start_row, Some(rows_to_read))?;
-                
+                let filter_batch = backend.read_columns_to_arrow(
+                    Some(&cols_to_read),
+                    start_row,
+                    Some(rows_to_read),
+                )?;
+
                 if filter_batch.num_rows() == 0 {
                     break;
                 }
-                
-                let mask = Self::evaluate_predicate_with_storage(&filter_batch, where_clause, storage_path)?;
-                
+
+                let mask = Self::evaluate_predicate_with_storage(
+                    &filter_batch,
+                    where_clause,
+                    storage_path,
+                )?;
+
                 #[cfg(test)]
                 {
                     let true_count = mask.iter().filter(|v| *v == Some(true)).count();
                     eprintln!("DEBUG late_mat chunk: mask true_count={}", true_count);
                 }
-                
+
                 // Collect matching indices from this chunk
                 for (i, v) in mask.iter().enumerate() {
                     if v == Some(true) {
@@ -2870,10 +3752,10 @@ impl ApexExecutor {
                         }
                     }
                 }
-                
+
                 start_row += rows_to_read;
             }
-            
+
             // Apply offset
             if let Some(offset) = stmt.offset {
                 indices.into_iter().skip(offset).collect()
@@ -2884,34 +3766,42 @@ impl ApexExecutor {
             // No LIMIT - use streaming chunks to avoid loading all data at once
             let mut all_indices = Vec::new();
             let mut start_row: usize = 0;
-            
+
             while start_row < total_rows {
                 let rows_to_read = chunk_size.min(total_rows - start_row);
-                let filter_batch = backend.read_columns_to_arrow(Some(&cols_to_read), start_row, Some(rows_to_read))?;
-                
+                let filter_batch = backend.read_columns_to_arrow(
+                    Some(&cols_to_read),
+                    start_row,
+                    Some(rows_to_read),
+                )?;
+
                 if filter_batch.num_rows() == 0 {
                     break;
                 }
-                
-                let mask = Self::evaluate_predicate_with_storage(&filter_batch, where_clause, storage_path)?;
-                
+
+                let mask = Self::evaluate_predicate_with_storage(
+                    &filter_batch,
+                    where_clause,
+                    storage_path,
+                )?;
+
                 // Collect matching indices from this chunk
                 for (i, v) in mask.iter().enumerate() {
                     if v == Some(true) {
                         all_indices.push(start_row + i);
                     }
                 }
-                
+
                 start_row += rows_to_read;
             }
-            
+
             all_indices
         };
-        
+
         if limited_indices.is_empty() {
             return backend.read_columns_to_arrow(None, 0, Some(0));
         }
-        
+
         // Step 4: Read ALL columns but only for matching row indices.
         // NOTE: limited_indices are positions in the ACTIVE row sequence (deleted rows excluded).
         // For V4 mmap-only backends, read_columns_by_indices_to_arrow delegates to
@@ -2923,20 +3813,31 @@ impl ApexExecutor {
         if backend.is_mmap_only() {
             use arrow::array::ArrayRef;
             let col_refs = Self::get_col_refs(stmt);
-            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+            let col_refs_vec: Option<Vec<&str>> = col_refs
+                .as_ref()
+                .map(|v| v.iter().map(|s| s.as_str()).collect());
             let full_batch = backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, None)?;
             let indices_arr = arrow::array::UInt32Array::from(
-                limited_indices.iter().map(|&i| i as u32).collect::<Vec<_>>()
+                limited_indices
+                    .iter()
+                    .map(|&i| i as u32)
+                    .collect::<Vec<_>>(),
             );
-            let taken_cols: Vec<ArrayRef> = full_batch.columns().iter()
-                .map(|col| arrow::compute::take(col.as_ref(), &indices_arr, None)
-                    .map_err(|e| err_data(e.to_string())))
+            let taken_cols: Vec<ArrayRef> = full_batch
+                .columns()
+                .iter()
+                .map(|col| {
+                    arrow::compute::take(col.as_ref(), &indices_arr, None)
+                        .map_err(|e| err_data(e.to_string()))
+                })
                 .collect::<io::Result<Vec<_>>>()?;
             arrow::record_batch::RecordBatch::try_new(full_batch.schema(), taken_cols)
                 .map_err(|e| err_data(e.to_string()))
         } else {
             let col_refs = Self::get_col_refs(stmt);
-            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+            let col_refs_vec: Option<Vec<&str>> = col_refs
+                .as_ref()
+                .map(|v| v.iter().map(|s| s.as_str()).collect());
             backend.read_columns_by_indices_to_arrow(&limited_indices, col_refs_vec.as_deref())
         }
     }
@@ -2963,12 +3864,9 @@ impl ApexExecutor {
         }
 
         if !backend.has_pending_deltas() {
-            if let Some(indices) = Self::get_cached_order_topk_indices(
-                backend,
-                &stmt.order_by,
-                limit,
-                offset,
-            ) {
+            if let Some(indices) =
+                Self::get_cached_order_topk_indices(backend, &stmt.order_by, limit, offset)
+            {
                 if indices.is_empty() {
                     return backend.read_columns_to_arrow(None, 0, Some(0));
                 }
@@ -2981,12 +3879,32 @@ impl ApexExecutor {
         if stmt.order_by.len() == 2 && !backend.has_pending_deltas() {
             let o0 = &stmt.order_by[0];
             let o1 = &stmt.order_by[1];
-            let c0 = { let c = o0.column.trim_matches('"'); if let Some(p) = c.rfind('.') { &c[p+1..] } else { c } };
-            let c1 = { let c = o1.column.trim_matches('"'); if let Some(p) = c.rfind('.') { &c[p+1..] } else { c } };
-            if let Some(indices) = backend.order_topk_str_float64(
-                c0, !o0.descending, c1, !o1.descending, k, offset,
-            )? {
-                Self::store_cached_order_topk_indices(backend, &stmt.order_by, limit, offset, &indices);
+            let c0 = {
+                let c = o0.column.trim_matches('"');
+                if let Some(p) = c.rfind('.') {
+                    &c[p + 1..]
+                } else {
+                    c
+                }
+            };
+            let c1 = {
+                let c = o1.column.trim_matches('"');
+                if let Some(p) = c.rfind('.') {
+                    &c[p + 1..]
+                } else {
+                    c
+                }
+            };
+            if let Some(indices) =
+                backend.order_topk_str_float64(c0, !o0.descending, c1, !o1.descending, k, offset)?
+            {
+                Self::store_cached_order_topk_indices(
+                    backend,
+                    &stmt.order_by,
+                    limit,
+                    offset,
+                    &indices,
+                );
                 if !indices.is_empty() {
                     return backend.read_columns_by_indices_to_arrow(&indices, None);
                 }
@@ -2998,10 +3916,21 @@ impl ApexExecutor {
         if backend.is_mmap_only() && stmt.order_by.len() == 1 && !backend.has_pending_deltas() {
             let clause = &stmt.order_by[0];
             let col_name = clause.column.trim_matches('"');
-            let actual_col = if let Some(p) = col_name.rfind('.') { &col_name[p+1..] } else { col_name };
+            let actual_col = if let Some(p) = col_name.rfind('.') {
+                &col_name[p + 1..]
+            } else {
+                col_name
+            };
             if let Some(heap) = backend.scan_top_k_indices_mmap(actual_col, k, clause.descending)? {
-                let final_indices: Vec<usize> = heap.into_iter().skip(offset).map(|(idx, _)| idx).collect();
-                Self::store_cached_order_topk_indices(backend, &stmt.order_by, limit, offset, &final_indices);
+                let final_indices: Vec<usize> =
+                    heap.into_iter().skip(offset).map(|(idx, _)| idx).collect();
+                Self::store_cached_order_topk_indices(
+                    backend,
+                    &stmt.order_by,
+                    limit,
+                    offset,
+                    &final_indices,
+                );
                 if !final_indices.is_empty() {
                     return backend.read_columns_by_indices_to_arrow(&final_indices, None);
                 }
@@ -3010,7 +3939,9 @@ impl ApexExecutor {
         }
 
         // Step 1: Read only columns needed for ORDER BY
-        let order_cols: Vec<&str> = stmt.order_by.iter()
+        let order_cols: Vec<&str> = stmt
+            .order_by
+            .iter()
             .map(|o| {
                 let col = o.column.trim_matches('"');
                 if let Some(dot_pos) = col.rfind('.') {
@@ -3020,16 +3951,16 @@ impl ApexExecutor {
                 }
             })
             .collect();
-        
+
         let sort_batch = backend.read_columns_to_arrow(Some(&order_cols), 0, None)?;
         let num_rows = sort_batch.num_rows();
-        
+
         if num_rows == 0 {
             return backend.read_columns_to_arrow(None, 0, Some(0));
         }
 
         let k_actual = k.min(num_rows);
-        
+
         // Step 2: Find top-k indices using optimized streaming algorithm
         let final_indices: Vec<usize> = if stmt.order_by.len() == 1 && k_actual <= 100 {
             let clause = &stmt.order_by[0];
@@ -3039,20 +3970,24 @@ impl ApexExecutor {
             } else {
                 col_name
             };
-            
+
             if let Some(col) = sort_batch.column_by_name(actual_col) {
                 // Fast path for Float64 DESC (most common case)
                 if let Some(float_arr) = col.as_any().downcast_ref::<Float64Array>() {
                     let descending = clause.descending;
-                    
+
                     // Streaming top-k: maintain sorted list of top k (value, index) pairs
                     let mut top_k: Vec<(f64, usize)> = Vec::with_capacity(k_actual + 1);
-                    
+
                     if descending {
                         // DESC: keep k largest values
                         for i in 0..num_rows {
-                            let val = if float_arr.is_null(i) { f64::NEG_INFINITY } else { float_arr.value(i) };
-                            
+                            let val = if float_arr.is_null(i) {
+                                f64::NEG_INFINITY
+                            } else {
+                                float_arr.value(i)
+                            };
+
                             if top_k.len() < k_actual {
                                 let pos = top_k.partition_point(|(v, _)| *v > val);
                                 top_k.insert(pos, (val, i));
@@ -3065,8 +4000,12 @@ impl ApexExecutor {
                     } else {
                         // ASC: keep k smallest values
                         for i in 0..num_rows {
-                            let val = if float_arr.is_null(i) { f64::INFINITY } else { float_arr.value(i) };
-                            
+                            let val = if float_arr.is_null(i) {
+                                f64::INFINITY
+                            } else {
+                                float_arr.value(i)
+                            };
+
                             if top_k.len() < k_actual {
                                 let pos = top_k.partition_point(|(v, _)| *v < val);
                                 top_k.insert(pos, (val, i));
@@ -3077,16 +4016,20 @@ impl ApexExecutor {
                             }
                         }
                     }
-                    
+
                     top_k.into_iter().skip(offset).map(|(_, idx)| idx).collect()
                 } else if let Some(int_arr) = col.as_any().downcast_ref::<Int64Array>() {
                     let descending = clause.descending;
                     let mut top_k: Vec<(i64, usize)> = Vec::with_capacity(k_actual + 1);
-                    
+
                     if descending {
                         for i in 0..num_rows {
-                            let val = if int_arr.is_null(i) { i64::MIN } else { int_arr.value(i) };
-                            
+                            let val = if int_arr.is_null(i) {
+                                i64::MIN
+                            } else {
+                                int_arr.value(i)
+                            };
+
                             if top_k.len() < k_actual {
                                 let pos = top_k.partition_point(|(v, _)| *v > val);
                                 top_k.insert(pos, (val, i));
@@ -3098,8 +4041,12 @@ impl ApexExecutor {
                         }
                     } else {
                         for i in 0..num_rows {
-                            let val = if int_arr.is_null(i) { i64::MAX } else { int_arr.value(i) };
-                            
+                            let val = if int_arr.is_null(i) {
+                                i64::MAX
+                            } else {
+                                int_arr.value(i)
+                            };
+
                             if top_k.len() < k_actual {
                                 let pos = top_k.partition_point(|(v, _)| *v < val);
                                 top_k.insert(pos, (val, i));
@@ -3110,13 +4057,23 @@ impl ApexExecutor {
                             }
                         }
                     }
-                    
+
                     top_k.into_iter().skip(offset).map(|(_, idx)| idx).collect()
                 } else {
-                    Self::compute_topk_indices_generic(&sort_batch, &stmt.order_by, k_actual, stmt.offset)
+                    Self::compute_topk_indices_generic(
+                        &sort_batch,
+                        &stmt.order_by,
+                        k_actual,
+                        stmt.offset,
+                    )
                 }
             } else {
-                Self::compute_topk_indices_generic(&sort_batch, &stmt.order_by, k_actual, stmt.offset)
+                Self::compute_topk_indices_generic(
+                    &sort_batch,
+                    &stmt.order_by,
+                    k_actual,
+                    stmt.offset,
+                )
             }
         } else {
             Self::compute_topk_indices_generic(&sort_batch, &stmt.order_by, k_actual, stmt.offset)
@@ -3124,13 +4081,25 @@ impl ApexExecutor {
 
         if final_indices.is_empty() {
             if !backend.has_pending_deltas() {
-                Self::store_cached_order_topk_indices(backend, &stmt.order_by, limit, offset, &final_indices);
+                Self::store_cached_order_topk_indices(
+                    backend,
+                    &stmt.order_by,
+                    limit,
+                    offset,
+                    &final_indices,
+                );
             }
             return backend.read_columns_to_arrow(None, 0, Some(0));
         }
 
         if !backend.has_pending_deltas() {
-            Self::store_cached_order_topk_indices(backend, &stmt.order_by, limit, offset, &final_indices);
+            Self::store_cached_order_topk_indices(
+                backend,
+                &stmt.order_by,
+                limit,
+                offset,
+                &final_indices,
+            );
         }
 
         // Step 3: Read ALL columns but only for top-k row indices
@@ -3154,7 +4123,11 @@ impl ApexExecutor {
         let mut alias_map: std::collections::HashMap<String, &crate::query::SqlExpr> =
             std::collections::HashMap::new();
         for sc in select_cols {
-            if let SelectColumn::Expression { expr, alias: Some(alias) } = sc {
+            if let SelectColumn::Expression {
+                expr,
+                alias: Some(alias),
+            } = sc
+            {
                 alias_map.insert(alias.to_lowercase(), expr);
             }
         }
@@ -3170,7 +4143,7 @@ impl ApexExecutor {
                 continue; // already handled by apply_order_by_topk expression path
             }
             let cn = ob.column.trim_matches('"');
-            let cn = cn.rfind('.').map_or(cn, |p| &cn[p+1..]);
+            let cn = cn.rfind('.').map_or(cn, |p| &cn[p + 1..]);
             if batch.column_by_name(cn).is_none() {
                 // Try to resolve as alias
                 if let Some(expr) = alias_map.get(&cn.to_lowercase()) {
@@ -3184,8 +4157,12 @@ impl ApexExecutor {
             return Ok(batch.clone());
         }
 
-        let mut fields: Vec<Field> =
-            batch.schema().fields().iter().map(|f| (**f).clone()).collect();
+        let mut fields: Vec<Field> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (**f).clone())
+            .collect();
         let mut cols = batch.columns().to_vec();
         for (name, arr) in extra {
             fields.push(Field::new(&name, arr.data_type().clone(), true));
@@ -3197,79 +4174,124 @@ impl ApexExecutor {
 
     /// Generic top-k computation using partial sort (fallback for complex cases)
     fn compute_topk_indices_generic(
-    sort_batch: &RecordBatch,
-    order_by: &[crate::query::OrderByClause],
-    k: usize,
-    offset: Option<usize>,
-) -> Vec<usize> {
-    let num_rows = sort_batch.num_rows();
+        sort_batch: &RecordBatch,
+        order_by: &[crate::query::OrderByClause],
+        k: usize,
+        offset: Option<usize>,
+    ) -> Vec<usize> {
+        let num_rows = sort_batch.num_rows();
 
-    // FAST PATH: 2-column (StringArray, Float64Array) — typed comparison, no closure overhead
-    if order_by.len() == 2 {
-        let col0_name = { let c = order_by[0].column.trim_matches('"'); if let Some(p) = c.rfind('.') { &c[p+1..] } else { c } };
-        let col1_name = { let c = order_by[1].column.trim_matches('"'); if let Some(p) = c.rfind('.') { &c[p+1..] } else { c } };
-        let arr0 = sort_batch.column_by_name(col0_name);
-        let arr1 = sort_batch.column_by_name(col1_name);
-        if let (Some(a0), Some(a1)) = (arr0, arr1) {
-            use arrow::array::StringArray as SA;
-            use arrow::array::Float64Array as FA;
-            if let (Some(str_arr), Some(flt_arr)) = (
-                a0.as_any().downcast_ref::<SA>(),
-                a1.as_any().downcast_ref::<FA>(),
-            ) {
-                use ahash::AHashMap;
-                // Build dict for string col → u16 id (1-based, 0=null)
-                let mut dict: AHashMap<&str, u16> = AHashMap::with_capacity(64);
-                let mut dict_vals: Vec<&str> = Vec::with_capacity(64);
-                let str_ids: Vec<u16> = (0..num_rows).map(|i| {
-                    if str_arr.is_null(i) { return 0u16; }
-                    let s = str_arr.value(i);
-                    let next = dict_vals.len() as u16 + 1;
-                    *dict.entry(s).or_insert_with(|| { dict_vals.push(s); next })
-                }).collect();
-                // Sort dict entries to get alphabetical rank mapping
-                let mut sorted: Vec<(u16, &str)> = dict_vals.iter()
-                    .enumerate().map(|(i, &s)| (i as u16 + 1, s)).collect();
-                sorted.sort_unstable_by_key(|&(_, s)| s);
-                let mut rank_of = vec![0u16; dict_vals.len() + 1];
-                for (rank, &(id, _)) in sorted.iter().enumerate() {
-                    rank_of[id as usize] = rank as u16;
+        // FAST PATH: 2-column (StringArray, Float64Array) — typed comparison, no closure overhead
+        if order_by.len() == 2 {
+            let col0_name = {
+                let c = order_by[0].column.trim_matches('"');
+                if let Some(p) = c.rfind('.') {
+                    &c[p + 1..]
+                } else {
+                    c
                 }
-                let asc0 = !order_by[0].descending;
-                let desc1 = order_by[1].descending;
-                // Pack (str_rank, score_sortable_bits) into (u64, u64) composite key
-                let mut packed: Vec<(u64, u64, usize)> = (0..num_rows).map(|i| {
-                    let sid = str_ids[i] as usize;
-                    let sr = if sid == 0 { u16::MAX as u64 } else { rank_of[sid] as u64 };
-                    let sk0 = if asc0 { sr } else { u16::MAX as u64 - sr };
-                    let f = if flt_arr.is_null(i) { f64::NEG_INFINITY } else { flt_arr.value(i) };
-                    let fb = f.to_bits();
-                    let fs = if fb >> 63 == 0 { fb ^ (1u64 << 63) } else { !fb };
-                    let sk1 = if desc1 { !fs } else { fs };
-                    (sk0, sk1, i)
-                }).collect();
-                if k < num_rows {
-                    packed.select_nth_unstable_by_key(k - 1, |&(a, b, _)| (a, b));
-                    packed.truncate(k);
+            };
+            let col1_name = {
+                let c = order_by[1].column.trim_matches('"');
+                if let Some(p) = c.rfind('.') {
+                    &c[p + 1..]
+                } else {
+                    c
                 }
-                packed.sort_unstable_by_key(|&(a, b, _)| (a, b));
-                let off = offset.unwrap_or(0);
-                return packed.into_iter().skip(off).map(|(_, _, idx)| idx).collect();
+            };
+            let arr0 = sort_batch.column_by_name(col0_name);
+            let arr1 = sort_batch.column_by_name(col1_name);
+            if let (Some(a0), Some(a1)) = (arr0, arr1) {
+                use arrow::array::Float64Array as FA;
+                use arrow::array::StringArray as SA;
+                if let (Some(str_arr), Some(flt_arr)) = (
+                    a0.as_any().downcast_ref::<SA>(),
+                    a1.as_any().downcast_ref::<FA>(),
+                ) {
+                    use ahash::AHashMap;
+                    // Build dict for string col → u16 id (1-based, 0=null)
+                    let mut dict: AHashMap<&str, u16> = AHashMap::with_capacity(64);
+                    let mut dict_vals: Vec<&str> = Vec::with_capacity(64);
+                    let str_ids: Vec<u16> = (0..num_rows)
+                        .map(|i| {
+                            if str_arr.is_null(i) {
+                                return 0u16;
+                            }
+                            let s = str_arr.value(i);
+                            let next = dict_vals.len() as u16 + 1;
+                            *dict.entry(s).or_insert_with(|| {
+                                dict_vals.push(s);
+                                next
+                            })
+                        })
+                        .collect();
+                    // Sort dict entries to get alphabetical rank mapping
+                    let mut sorted: Vec<(u16, &str)> = dict_vals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &s)| (i as u16 + 1, s))
+                        .collect();
+                    sorted.sort_unstable_by_key(|&(_, s)| s);
+                    let mut rank_of = vec![0u16; dict_vals.len() + 1];
+                    for (rank, &(id, _)) in sorted.iter().enumerate() {
+                        rank_of[id as usize] = rank as u16;
+                    }
+                    let asc0 = !order_by[0].descending;
+                    let desc1 = order_by[1].descending;
+                    // Pack (str_rank, score_sortable_bits) into (u64, u64) composite key
+                    let mut packed: Vec<(u64, u64, usize)> = (0..num_rows)
+                        .map(|i| {
+                            let sid = str_ids[i] as usize;
+                            let sr = if sid == 0 {
+                                u16::MAX as u64
+                            } else {
+                                rank_of[sid] as u64
+                            };
+                            let sk0 = if asc0 { sr } else { u16::MAX as u64 - sr };
+                            let f = if flt_arr.is_null(i) {
+                                f64::NEG_INFINITY
+                            } else {
+                                flt_arr.value(i)
+                            };
+                            let fb = f.to_bits();
+                            let fs = if fb >> 63 == 0 {
+                                fb ^ (1u64 << 63)
+                            } else {
+                                !fb
+                            };
+                            let sk1 = if desc1 { !fs } else { fs };
+                            (sk0, sk1, i)
+                        })
+                        .collect();
+                    if k < num_rows {
+                        packed.select_nth_unstable_by_key(k - 1, |&(a, b, _)| (a, b));
+                        packed.truncate(k);
+                    }
+                    packed.sort_unstable_by_key(|&(a, b, _)| (a, b));
+                    let off = offset.unwrap_or(0);
+                    return packed
+                        .into_iter()
+                        .skip(off)
+                        .map(|(_, _, idx)| idx)
+                        .collect();
+                }
             }
         }
-    }
-    
-    let sort_cols: Vec<(ArrayRef, bool)> = order_by.iter()
-        .filter_map(|clause| {
-            let col_name = clause.column.trim_matches('"');
-            let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
-                &col_name[dot_pos + 1..]
-            } else {
-                col_name
-            };
-            sort_batch.column_by_name(actual_col).map(|col| (col.clone(), clause.descending))
-        })
-        .collect();
+
+        let sort_cols: Vec<(ArrayRef, bool)> = order_by
+            .iter()
+            .filter_map(|clause| {
+                let col_name = clause.column.trim_matches('"');
+                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
+                    &col_name[dot_pos + 1..]
+                } else {
+                    col_name
+                };
+                sort_batch
+                    .column_by_name(actual_col)
+                    .map(|col| (col.clone(), clause.descending))
+            })
+            .collect();
 
         let compare_rows = |a: usize, b: usize| -> std::cmp::Ordering {
             for (col, descending) in &sort_cols {
@@ -3282,7 +4304,7 @@ impl ApexExecutor {
         };
 
         let mut indices: Vec<usize> = (0..num_rows).collect();
-        
+
         if k < num_rows {
             indices.select_nth_unstable_by(k - 1, |&a, &b| compare_rows(a, b));
             indices.truncate(k);
@@ -3295,29 +4317,31 @@ impl ApexExecutor {
             indices
         }
     }
-    
+
     /// Fast path for combined WHERE filter + GROUP BY on dictionary columns
     /// Does filter and aggregation in a single pass without intermediate materialization
     fn try_fast_filter_groupby(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
-        if backend.has_pending_deltas() || backend.is_mmap_only() { return Ok(None); }
+        if backend.has_pending_deltas() || backend.is_mmap_only() {
+            return Ok(None);
+        }
 
+        use crate::query::AggregateFunc;
         use arrow::array::DictionaryArray;
         use arrow::datatypes::UInt32Type;
-        use crate::query::AggregateFunc;
-        
+
         // Only handle simple patterns: WHERE col = 'value' with single-column GROUP BY
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
         };
-        
+
         if stmt.group_by.len() != 1 {
             return Ok(None);
         }
-        
+
         // Extract filter column and value
         let (filter_col, filter_value) = match where_clause {
             SqlExpr::BinaryOp { left, op, right } => {
@@ -3337,16 +4361,22 @@ impl ApexExecutor {
             }
             _ => return Ok(None),
         };
-        
+
         let group_col = stmt.group_by[0].trim_matches('"').to_string();
-        
+
         // Find aggregate column
         let mut agg_col_name: Option<String> = None;
         let mut agg_func: Option<AggregateFunc> = None;
         let mut agg_alias: Option<String> = None;
-        
+
         for col in &stmt.columns {
-            if let SelectColumn::Aggregate { func, column, alias, .. } = col {
+            if let SelectColumn::Aggregate {
+                func,
+                column,
+                alias,
+                ..
+            } = col
+            {
                 if let Some(col_name) = column {
                     let actual = col_name.trim_matches('"');
                     if actual != "*" {
@@ -3358,33 +4388,40 @@ impl ApexExecutor {
                 break;
             }
         }
-        
+
         let agg_col_name = match agg_col_name {
             Some(c) => c,
             None => return Ok(None),
         };
-        
+
         // Read only needed columns
-        let cols_to_read: Vec<&str> = vec![filter_col.as_str(), group_col.as_str(), agg_col_name.as_str()];
+        let cols_to_read: Vec<&str> = vec![
+            filter_col.as_str(),
+            group_col.as_str(),
+            agg_col_name.as_str(),
+        ];
         let batch = backend.read_columns_to_arrow(Some(&cols_to_read), 0, None)?;
-        
+
         if batch.num_rows() == 0 {
             return Ok(None);
         }
-        
+
         let num_rows = batch.num_rows();
-        
+
         // Get filter column as dictionary
         let filter_arr = match batch.column_by_name(&filter_col) {
             Some(c) => c,
             None => return Ok(None),
         };
-        
-        let filter_dict = match filter_arr.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+
+        let filter_dict = match filter_arr
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+        {
             Some(d) => d,
             None => return Ok(None),
         };
-        
+
         // Find filter key
         let filter_keys = filter_dict.keys();
         let filter_values = filter_dict.values();
@@ -3392,7 +4429,7 @@ impl ApexExecutor {
             Some(s) => s,
             None => return Ok(None),
         };
-        
+
         let mut target_filter_key: Option<u32> = None;
         for i in 0..filter_str_values.len() {
             if filter_str_values.value(i) == filter_value {
@@ -3400,29 +4437,34 @@ impl ApexExecutor {
                 break;
             }
         }
-        
+
         let target_filter_key = match target_filter_key {
             Some(k) => k,
             None => {
                 // Value not in dictionary - return empty result
-                let schema = Arc::new(Schema::new(vec![
-                    Field::new(&group_col, ArrowDataType::Utf8, false),
-                ]));
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    &group_col,
+                    ArrowDataType::Utf8,
+                    false,
+                )]));
                 return Ok(Some(RecordBatch::new_empty(schema)));
             }
         };
-        
+
         // Get group column as dictionary
         let group_arr = match batch.column_by_name(&group_col) {
             Some(c) => c,
             None => return Ok(None),
         };
-        
-        let group_dict = match group_arr.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+
+        let group_dict = match group_arr
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+        {
             Some(d) => d,
             None => return Ok(None),
         };
-        
+
         let group_keys = group_dict.keys();
         let group_values = group_dict.values();
         let group_str_values = match group_values.as_any().downcast_ref::<StringArray>() {
@@ -3430,25 +4472,28 @@ impl ApexExecutor {
             None => return Ok(None),
         };
         let group_dict_size = group_str_values.len() + 1;
-        
+
         // Get aggregate column
         let agg_arr = match batch.column_by_name(&agg_col_name) {
             Some(c) => c,
             None => return Ok(None),
         };
-        
+
         let agg_float = agg_arr.as_any().downcast_ref::<Float64Array>();
         let agg_int = agg_arr.as_any().downcast_ref::<Int64Array>();
-        
+
         // Single-pass: filter + aggregate
         let mut counts: Vec<i64> = vec![0; group_dict_size];
         let mut sums: Vec<f64> = vec![0.0; group_dict_size];
-        
+
         let filter_key_values = filter_keys.values();
         let group_key_values = group_keys.values();
-        
+
         if let Some(float_arr) = agg_float {
-            if filter_keys.null_count() == 0 && group_keys.null_count() == 0 && float_arr.null_count() == 0 {
+            if filter_keys.null_count() == 0
+                && group_keys.null_count() == 0
+                && float_arr.null_count() == 0
+            {
                 let float_values = float_arr.values();
                 for i in 0..num_rows {
                     if unsafe { *filter_key_values.get_unchecked(i) } == target_filter_key {
@@ -3462,7 +4507,11 @@ impl ApexExecutor {
             } else {
                 for i in 0..num_rows {
                     if !filter_keys.is_null(i) && filter_keys.value(i) == target_filter_key {
-                        let gk = if group_keys.is_null(i) { 0 } else { group_keys.value(i) as usize + 1 };
+                        let gk = if group_keys.is_null(i) {
+                            0
+                        } else {
+                            group_keys.value(i) as usize + 1
+                        };
                         counts[gk] += 1;
                         if !float_arr.is_null(i) {
                             sums[gk] += float_arr.value(i);
@@ -3473,7 +4522,11 @@ impl ApexExecutor {
         } else if let Some(int_arr) = agg_int {
             for i in 0..num_rows {
                 if !filter_keys.is_null(i) && filter_keys.value(i) == target_filter_key {
-                    let gk = if group_keys.is_null(i) { 0 } else { group_keys.value(i) as usize + 1 };
+                    let gk = if group_keys.is_null(i) {
+                        0
+                    } else {
+                        group_keys.value(i) as usize + 1
+                    };
                     counts[gk] += 1;
                     if !int_arr.is_null(i) {
                         sums[gk] += int_arr.value(i) as f64;
@@ -3483,12 +4536,12 @@ impl ApexExecutor {
         } else {
             return Ok(None);
         }
-        
+
         // Collect results - pre-allocate with estimated group count
         let estimated_groups = (group_dict_size / 4).max(16);
         let mut result_groups: Vec<&str> = Vec::with_capacity(estimated_groups);
         let mut result_values: Vec<f64> = Vec::with_capacity(estimated_groups);
-        
+
         for gk in 1..group_dict_size {
             if counts[gk] > 0 {
                 result_groups.push(group_str_values.value(gk - 1));
@@ -3501,7 +4554,7 @@ impl ApexExecutor {
                 result_values.push(value);
             }
         }
-        
+
         // Build result batch
         let agg_field_name = agg_alias.unwrap_or_else(|| {
             let func_name = match agg_func {
@@ -3512,29 +4565,30 @@ impl ApexExecutor {
             };
             format!("{}({})", func_name, agg_col_name)
         });
-        
+
         let schema = Arc::new(Schema::new(vec![
             Field::new(&group_col, ArrowDataType::Utf8, false),
             Field::new(&agg_field_name, ArrowDataType::Float64, true),
         ]));
-        
+
         let mut result_batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(StringArray::from(result_groups)),
                 Arc::new(Float64Array::from(result_values)),
             ],
-        ).map_err(|e| err_data( e.to_string()))?;
-        
+        )
+        .map_err(|e| err_data(e.to_string()))?;
+
         // Apply ORDER BY if present
         if !stmt.order_by.is_empty() {
             let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
             result_batch = Self::apply_order_by_topk(&result_batch, &stmt.order_by, k)?;
         }
-        
+
         // Apply LIMIT/OFFSET
         result_batch = Self::apply_limit_offset(&result_batch, stmt.limit, stmt.offset)?;
-        
+
         Ok(Some(result_batch))
     }
 
@@ -3549,40 +4603,46 @@ impl ApexExecutor {
     ) -> io::Result<RecordBatch> {
         use arrow::array::DictionaryArray;
         use arrow::datatypes::UInt32Type;
-        
+
         // FAST PATH: Try combined filter + GROUP BY on dictionary columns in single pass
         if let Some(result) = Self::try_fast_filter_groupby(backend, stmt)? {
             return Ok(result);
         }
-        
+
         // Step 1: Read only columns needed for WHERE clause
         let where_cols = stmt.where_columns();
         let where_col_refs: Vec<&str> = where_cols.iter().map(|s| s.as_str()).collect();
-        
+
         let filter_batch = backend.read_columns_to_arrow(Some(&where_col_refs), 0, None)?;
-        
+
         if filter_batch.num_rows() == 0 {
             let col_refs = Self::get_col_refs(stmt);
-            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+            let col_refs_vec: Option<Vec<&str>> = col_refs
+                .as_ref()
+                .map(|v| v.iter().map(|s| s.as_str()).collect());
             return backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, Some(0));
         }
-        
+
         // Step 2: Apply WHERE filter to get matching row indices
         let where_clause = stmt.where_clause.as_ref().unwrap();
-        let mask = Self::evaluate_predicate_with_storage(&filter_batch, where_clause, storage_path)?;
-        
+        let mask =
+            Self::evaluate_predicate_with_storage(&filter_batch, where_clause, storage_path)?;
+
         // Collect matching indices
-        let indices: Vec<usize> = mask.iter()
+        let indices: Vec<usize> = mask
+            .iter()
             .enumerate()
             .filter_map(|(i, v)| if v == Some(true) { Some(i) } else { None })
             .collect();
-        
+
         if indices.is_empty() {
             let col_refs = Self::get_col_refs(stmt);
-            let col_refs_vec: Option<Vec<&str>> = col_refs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+            let col_refs_vec: Option<Vec<&str>> = col_refs
+                .as_ref()
+                .map(|v| v.iter().map(|s| s.as_str()).collect());
             return backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, Some(0));
         }
-        
+
         // Step 3: Read only required columns (GROUP BY + aggregates) for matching rows
         let required_cols = stmt.required_columns();
         let other_cols: Vec<&str> = if let Some(ref cols) = required_cols {
@@ -3593,51 +4653,55 @@ impl ApexExecutor {
         } else {
             Vec::new()
         };
-        
+
         // Read other columns for matching indices only
         if other_cols.is_empty() {
             // All needed columns are in WHERE - just filter the batch
             let indices_array = arrow::array::UInt64Array::from(
-                indices.iter().map(|&i| i as u64).collect::<Vec<_>>()
+                indices.iter().map(|&i| i as u64).collect::<Vec<_>>(),
             );
             let columns: Vec<ArrayRef> = filter_batch
                 .columns()
                 .iter()
                 .map(|col| compute::take(col, &indices_array, None))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| err_data( e.to_string()))?;
+                .map_err(|e| err_data(e.to_string()))?;
             RecordBatch::try_new(filter_batch.schema(), columns)
-                .map_err(|e| err_data( e.to_string()))
+                .map_err(|e| err_data(e.to_string()))
         } else {
             // Need to read additional columns for matching rows
             let other_batch = backend.read_columns_by_indices_to_arrow(&indices, None)?;
-            
+
             // Also filter the WHERE columns batch
             let indices_array = arrow::array::UInt64Array::from(
-                indices.iter().map(|&i| i as u64).collect::<Vec<_>>()
+                indices.iter().map(|&i| i as u64).collect::<Vec<_>>(),
             );
             let where_columns: Vec<ArrayRef> = filter_batch
                 .columns()
                 .iter()
                 .map(|col| compute::take(col, &indices_array, None))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| err_data( e.to_string()))?;
-            
+                .map_err(|e| err_data(e.to_string()))?;
+
             // Merge: use other_batch as base (has _id and other columns)
             // Add WHERE columns that aren't already present
-            let mut fields: Vec<Field> = other_batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+            let mut fields: Vec<Field> = other_batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect();
             let mut arrays: Vec<ArrayRef> = other_batch.columns().to_vec();
-            
+
             for (i, field) in filter_batch.schema().fields().iter().enumerate() {
                 if other_batch.column_by_name(field.name()).is_none() {
                     fields.push(field.as_ref().clone());
                     arrays.push(where_columns[i].clone());
                 }
             }
-            
+
             let schema = Arc::new(Schema::new(fields));
-            RecordBatch::try_new(schema, arrays)
-                .map_err(|e| err_data( e.to_string()))
+            RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))
         }
     }
 
@@ -3646,7 +4710,11 @@ impl ApexExecutor {
     /// Recursively replace every `FtsMatch { query, fuzzy }` node in an expression with
     /// `In { column: "_id", values: [matching doc ids] }`.  Requires the FtsManager to
     /// be registered for `base_dir` (via `register_fts_manager` or `CREATE FTS INDEX`).
-    fn resolve_fts_in_expr(expr: SqlExpr, base_dir: &Path, table_name: &str) -> io::Result<SqlExpr> {
+    fn resolve_fts_in_expr(
+        expr: SqlExpr,
+        base_dir: &Path,
+        table_name: &str,
+    ) -> io::Result<SqlExpr> {
         match expr {
             SqlExpr::FtsMatch { query, fuzzy } => {
                 let mgr = crate::query::executor::get_fts_manager(base_dir)
@@ -3654,43 +4722,48 @@ impl ApexExecutor {
                         io::ErrorKind::Other,
                         format!("FTS not initialised for this database. Run CREATE FTS INDEX ON {} first.", table_name),
                     ))?;
-                let engine = mgr.get_engine(table_name)
+                let engine = mgr
+                    .get_engine(table_name)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
                 let ids: Vec<u64> = if fuzzy {
-                    engine.fuzzy_search(&query, 1)
+                    engine
+                        .fuzzy_search(&query, 1)
                         .map(|r| r.iter().map(|id| id as u64).collect())
                         .unwrap_or_default()
                 } else {
-                    engine.search_ids(&query)
-                        .unwrap_or_default()
+                    engine.search_ids(&query).unwrap_or_default()
                 };
                 if ids.is_empty() {
                     // _id < 0  — guaranteed empty (all valid _id are >= 1)
                     Ok(SqlExpr::BinaryOp {
-                        left:  Box::new(SqlExpr::Column("_id".to_string())),
-                        op:    crate::query::sql_parser::BinaryOperator::Lt,
+                        left: Box::new(SqlExpr::Column("_id".to_string())),
+                        op: crate::query::sql_parser::BinaryOperator::Lt,
                         right: Box::new(SqlExpr::Literal(crate::data::Value::Int64(0))),
                     })
                 } else {
-                    let values: Vec<crate::data::Value> = ids.into_iter()
+                    let values: Vec<crate::data::Value> = ids
+                        .into_iter()
                         .map(|id| crate::data::Value::Int64(id as i64))
                         .collect();
-                    Ok(SqlExpr::In { column: "_id".to_string(), values, negated: false })
+                    Ok(SqlExpr::In {
+                        column: "_id".to_string(),
+                        values,
+                        negated: false,
+                    })
                 }
             }
-            SqlExpr::BinaryOp { left, op, right } => {
-                Ok(SqlExpr::BinaryOp {
-                    left:  Box::new(Self::resolve_fts_in_expr(*left,  base_dir, table_name)?),
-                    op,
-                    right: Box::new(Self::resolve_fts_in_expr(*right, base_dir, table_name)?),
-                })
-            }
-            SqlExpr::UnaryOp { op, expr } => {
-                Ok(SqlExpr::UnaryOp { op, expr: Box::new(Self::resolve_fts_in_expr(*expr, base_dir, table_name)?) })
-            }
-            SqlExpr::Paren(inner) => {
-                Ok(SqlExpr::Paren(Box::new(Self::resolve_fts_in_expr(*inner, base_dir, table_name)?)))
-            }
+            SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+                left: Box::new(Self::resolve_fts_in_expr(*left, base_dir, table_name)?),
+                op,
+                right: Box::new(Self::resolve_fts_in_expr(*right, base_dir, table_name)?),
+            }),
+            SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
+                op,
+                expr: Box::new(Self::resolve_fts_in_expr(*expr, base_dir, table_name)?),
+            }),
+            SqlExpr::Paren(inner) => Ok(SqlExpr::Paren(Box::new(Self::resolve_fts_in_expr(
+                *inner, base_dir, table_name,
+            )?))),
             // All other variants have no nested SqlExpr that could contain FtsMatch
             other => Ok(other),
         }
@@ -3698,7 +4771,9 @@ impl ApexExecutor {
 
     /// Detect `SELECT explode_rename(topk_distance(col,[q],k,'m'), "n1","n2") FROM table`.
     /// Returns `(col, query, k, metric, names)` if the pattern matches, else `None`.
-    fn detect_topk_explode(stmt: &SelectStatement) -> Option<(&str, &[f64], usize, &str, &[String])> {
+    fn detect_topk_explode(
+        stmt: &SelectStatement,
+    ) -> Option<(&str, &[f64], usize, &str, &[String])> {
         // Must have a real FROM table (not None / subquery / table-function)
         if !matches!(&stmt.from, Some(FromItem::Table { .. })) {
             return None;
@@ -3710,8 +4785,20 @@ impl ApexExecutor {
                 ..
             } = &stmt.columns[0]
             {
-                if let SqlExpr::TopkDistance { col, query, k, metric } = inner.as_ref() {
-                    return Some((col.as_str(), query.as_slice(), *k, metric.as_str(), names.as_slice()));
+                if let SqlExpr::TopkDistance {
+                    col,
+                    query,
+                    k,
+                    metric,
+                } = inner.as_ref()
+                {
+                    return Some((
+                        col.as_str(),
+                        query.as_slice(),
+                        *k,
+                        metric.as_str(),
+                        names.as_slice(),
+                    ));
                 }
             }
         }
@@ -3737,7 +4824,10 @@ impl ApexExecutor {
         use arrow::array::{BinaryArray, Float64Array, Int64Array};
 
         if !storage_path.exists() {
-            let tbl = storage_path.file_stem().unwrap_or_default().to_string_lossy();
+            let tbl = storage_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("topk_distance: table '{}' does not exist", tbl),
@@ -3756,43 +4846,53 @@ impl ApexExecutor {
         let backend = get_cached_backend(storage_path)?;
 
         // Output schema: names[0]=Int64(_id), names[1]=Float64(dist)
-        let id_field   = Field::new(&names[0], ArrowDataType::Int64,   false);
+        let id_field = Field::new(&names[0], ArrowDataType::Int64, false);
         let dist_field = Field::new(&names[1], ArrowDataType::Float64, false);
         let out_schema = Arc::new(Schema::new(vec![id_field, dist_field]));
 
-        use crate::query::vector_ops::{DistanceComputer, topk_heap_direct_parallel, topk_heap_direct_parallel_fixed};
+        use crate::query::vector_ops::{
+            topk_heap_direct_parallel, topk_heap_direct_parallel_fixed, DistanceComputer,
+        };
         let computer = DistanceComputer::new(metric_enum, query_f32);
 
         // FAST PATH: zero-copy scan directly on OS mmap (no Arrow batch, no memcpy)
-        let direct_topk = backend.topk_fixedlist_direct(col, &computer, k)
-            .ok().flatten()
+        let direct_topk = backend
+            .topk_fixedlist_direct(col, &computer, k)
+            .ok()
+            .flatten()
             .or_else(|| backend.topk_binary_direct(col, &computer, k).ok().flatten());
         if let Some(topk) = direct_topk {
             if topk.is_empty() {
                 return RecordBatch::try_new(
                     out_schema,
                     vec![
-                        Arc::new(Int64Array::from(Vec::<i64>::new()))   as ArrayRef,
+                        Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
                         Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
                     ],
-                ).map_err(|e| err_data(e.to_string()));
+                )
+                .map_err(|e| err_data(e.to_string()));
             }
             // Read only the _id column (8MB) instead of all columns (512MB+)
             let id_batch = backend.read_columns_to_arrow(Some(&["_id"]), 0, None)?;
             let id_col = id_batch.column_by_name("_id");
-            let ids: Vec<i64> = topk.iter().map(|(row_idx, _)| {
-                id_col.and_then(|a| a.as_any().downcast_ref::<arrow::array::Int64Array>())
-                      .map(|a| a.value(*row_idx))
-                      .unwrap_or(*row_idx as i64)
-            }).collect();
+            let ids: Vec<i64> = topk
+                .iter()
+                .map(|(row_idx, _)| {
+                    id_col
+                        .and_then(|a| a.as_any().downcast_ref::<arrow::array::Int64Array>())
+                        .map(|a| a.value(*row_idx))
+                        .unwrap_or(*row_idx as i64)
+                })
+                .collect();
             let dists: Vec<f64> = topk.iter().map(|(_, d)| *d as f64).collect();
             return RecordBatch::try_new(
                 out_schema,
                 vec![
-                    Arc::new(Int64Array::from(ids))    as ArrayRef,
+                    Arc::new(Int64Array::from(ids)) as ArrayRef,
                     Arc::new(Float64Array::from(dists)) as ArrayRef,
                 ],
-            ).map_err(|e| err_data(e.to_string()));
+            )
+            .map_err(|e| err_data(e.to_string()));
         }
 
         // FALLBACK: full Arrow path (Binary columns / compressed RGs)
@@ -3802,7 +4902,7 @@ impl ApexExecutor {
             return RecordBatch::try_new(
                 out_schema,
                 vec![
-                    Arc::new(Int64Array::from(Vec::<i64>::new()))   as ArrayRef,
+                    Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
                     Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
                 ],
             )
@@ -3815,7 +4915,10 @@ impl ApexExecutor {
                 format!("topk_distance: column '{}' not found", col),
             )
         })?;
-        let topk = if let Some(fixed_arr) = bin_col.as_any().downcast_ref::<arrow::array::FixedSizeListArray>() {
+        let topk = if let Some(fixed_arr) = bin_col
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeListArray>()
+        {
             topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
         } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
             topk_heap_direct_parallel(bin_arr, &computer, k)
@@ -3843,7 +4946,7 @@ impl ApexExecutor {
         RecordBatch::try_new(
             out_schema,
             vec![
-                Arc::new(Int64Array::from(ids))    as ArrayRef,
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
                 Arc::new(Float64Array::from(dists)) as ArrayRef,
             ],
         )
@@ -3871,7 +4974,10 @@ impl ApexExecutor {
         use arrow::datatypes::DataType as ArrowDT;
 
         if !storage_path.exists() {
-            let tbl = storage_path.file_stem().unwrap_or_default().to_string_lossy();
+            let tbl = storage_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("topk_distance: table '{}' does not exist", tbl),
@@ -3918,9 +5024,14 @@ impl ApexExecutor {
         })?;
 
         // Parallel O(n/T log k) heap — dispatch on Binary vs FixedSizeList
-        use crate::query::vector_ops::{DistanceComputer, topk_heap_direct_parallel, topk_heap_direct_parallel_fixed};
+        use crate::query::vector_ops::{
+            topk_heap_direct_parallel, topk_heap_direct_parallel_fixed, DistanceComputer,
+        };
         let computer = DistanceComputer::new(metric_enum, query_f32);
-        let topk = if let Some(fixed_arr) = bin_col.as_any().downcast_ref::<arrow::array::FixedSizeListArray>() {
+        let topk = if let Some(fixed_arr) = bin_col
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeListArray>()
+        {
             topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
         } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
             topk_heap_direct_parallel(bin_arr, &computer, k)
@@ -3961,8 +5072,9 @@ impl ApexExecutor {
     fn expr_has_fts_match(expr: &SqlExpr) -> bool {
         match expr {
             SqlExpr::FtsMatch { .. } => true,
-            SqlExpr::BinaryOp { left, right, .. } =>
-                Self::expr_has_fts_match(left) || Self::expr_has_fts_match(right),
+            SqlExpr::BinaryOp { left, right, .. } => {
+                Self::expr_has_fts_match(left) || Self::expr_has_fts_match(right)
+            }
             SqlExpr::UnaryOp { expr, .. } => Self::expr_has_fts_match(expr),
             SqlExpr::Paren(inner) => Self::expr_has_fts_match(inner),
             _ => false,

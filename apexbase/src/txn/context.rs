@@ -94,6 +94,8 @@ pub struct TxnContext {
     write_keys: HashSet<(String, u64)>,
     /// Pending insert count per table (for monotonic row-id reservation)
     pending_insert_counts: HashMap<String, u64>,
+    /// First storage row ID observed for transactional inserts per table.
+    insert_base_ids: HashMap<String, u64>,
     /// Tables touched (for table-level lock tracking)
     tables_touched: HashSet<String>,
     /// Whether the transaction is read-only
@@ -117,6 +119,7 @@ impl TxnContext {
             write_set: Vec::new(),
             write_keys: HashSet::new(),
             pending_insert_counts: HashMap::new(),
+            insert_base_ids: HashMap::new(),
             tables_touched: HashSet::new(),
             read_only,
             finished: false,
@@ -274,6 +277,18 @@ impl TxnContext {
         self.pending_insert_counts.get(table).copied().unwrap_or(0)
     }
 
+    /// First storage row ID observed for inserts into this table in this transaction.
+    pub fn insert_base_id(&self, table: &str) -> Option<u64> {
+        self.insert_base_ids.get(table).copied()
+    }
+
+    /// Remember the initial storage row ID for a table's transactional inserts.
+    pub fn remember_insert_base_id(&mut self, table: &str, base_id: u64) {
+        self.insert_base_ids
+            .entry(table.to_string())
+            .or_insert(base_id);
+    }
+
     /// Get tables touched
     pub fn tables_touched(&self) -> &HashSet<String> {
         &self.tables_touched
@@ -350,6 +365,7 @@ impl TxnContext {
         self.write_set.clear();
         self.write_keys.clear();
         self.pending_insert_counts.clear();
+        self.insert_base_ids.clear();
         self.tables_touched.clear();
         self.savepoints.clear();
         self.finished = true;

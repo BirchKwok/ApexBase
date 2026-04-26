@@ -451,17 +451,30 @@ impl ApexExecutor {
                 values,
             } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
-                let storage = TableStorageBackend::open_for_insert(&table_path)?;
-                let schema = storage.get_schema();
                 // Reserve synthetic row IDs from the storage allocator so transactional
                 // inserts follow the same 1-based monotonic sequence as committed rows.
-                let existing_inserts =
-                    mgr.with_context(txn_id, |ctx| Ok(ctx.pending_insert_count(&table)))?;
-                let base_id =
-                    storage.next_id_value().max(crate::storage::FIRST_ROW_ID) + existing_inserts;
+                let (existing_inserts, cached_base_id) = mgr.with_context(txn_id, |ctx| {
+                    Ok((ctx.pending_insert_count(&table), ctx.insert_base_id(&table)))
+                })?;
+                let mut storage = None;
+                let base_root = if let Some(base_id) = cached_base_id {
+                    base_id
+                } else {
+                    let opened = TableStorageBackend::open_for_insert(&table_path)?;
+                    let base_id = opened.next_id_value().max(crate::storage::FIRST_ROW_ID);
+                    storage = Some(opened);
+                    base_id
+                };
+                let remember_base_id = cached_base_id.is_none();
+                let base_id = base_root + existing_inserts;
                 let col_names: Vec<String> = if let Some(cols) = &columns {
                     cols.clone()
                 } else {
+                    let opened = match storage.take() {
+                        Some(opened) => opened,
+                        None => TableStorageBackend::open_for_insert(&table_path)?,
+                    };
+                    let schema = opened.get_schema();
                     schema.iter().map(|(n, _)| n.clone()).collect()
                 };
                 let mut pending_rows = Vec::with_capacity(values.len());
@@ -477,6 +490,9 @@ impl ApexExecutor {
                 }
                 let buffered = pending_rows.len() as i64;
                 mgr.with_context(txn_id, |ctx| {
+                    if remember_base_id {
+                        ctx.remember_insert_base_id(&table, base_root);
+                    }
                     for (row_id, data) in pending_rows {
                         ctx.buffer_insert(&table, row_id, data)?;
                     }

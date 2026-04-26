@@ -1221,6 +1221,11 @@ impl TableStorageBackend {
         self.storage.delta_updates_column(column_name)
     }
 
+    /// Count pending DeltaStore deletes.
+    pub fn pending_delta_delete_count(&self) -> usize {
+        self.storage.delta_delete_count()
+    }
+
     /// Return row IDs whose pending DeltaStore update sets `column_name` to `value`.
     pub fn pending_delta_string_update_matches(&self, column_name: &str, value: &str) -> Vec<u64> {
         self.storage
@@ -3201,6 +3206,27 @@ impl TableStorageBackend {
             }
         }
 
+        if filter_eq
+            && limit > 0
+            && self.pending_delta_delete_count() == 0
+            && !self.pending_delta_updates_column(filter_column)
+        {
+            let needed = offset.saturating_add(limit);
+            if let Some(indices) =
+                self.scan_string_filter_mmap(filter_column, filter_value, Some(needed))?
+            {
+                if indices.len() >= needed || !self.has_delta() {
+                    let final_indices: Vec<usize> =
+                        indices.into_iter().skip(offset).take(limit).collect();
+                    if final_indices.is_empty() {
+                        return self.read_columns_to_arrow(column_names, 0, Some(0));
+                    }
+                    let batch = self.read_columns_by_indices_to_arrow(&final_indices, column_names)?;
+                    return Self::project_record_batch_by_names(batch, column_names);
+                }
+            }
+        }
+
         let (col_data, matching_indices) = self.storage.read_columns_filtered_string_with_limit(
             column_names,
             filter_column,
@@ -3866,6 +3892,17 @@ impl TableStorageBackend {
         agg_cols: &[&str],
     ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
         self.storage.execute_simple_agg(agg_cols)
+    }
+
+    /// Single-pass filtered string aggregation: scan string column and aggregate
+    /// numeric columns in one sequential pass per row group.
+    pub fn execute_filtered_string_agg_mmap(
+        &self,
+        filter_col: &str,
+        target: &str,
+        agg_cols: &[&str],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        self.storage.execute_filtered_string_agg_mmap(filter_col, target, agg_cols)
     }
 
     /// Build cached string dictionary indices for a column

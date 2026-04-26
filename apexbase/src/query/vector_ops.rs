@@ -20,6 +20,8 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BinaryArray, Float32Array, Float64Array, StringArray};
 use rayon::prelude::*;
 
+const MAX_BLOCKED_BATCH_QUERIES: usize = 32;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fast reciprocal-sqrt: NEON FRSQRTE + 1 Newton-Raphson step on AArch64,
 // plain 1/sqrt elsewhere.  Caller must ensure x > 0.
@@ -281,6 +283,444 @@ pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+/// Squared L2 norm (Σ aᵢ²) for a single vector.
+///
+/// Uses the same 16-way unrolled accumulation style as the other hot kernels so
+/// batch cosine can reuse a row norm across multiple queries without falling
+/// back to iterator-heavy code.
+#[inline(always)]
+pub fn l2_norm_squared(a: &[f32]) -> f32 {
+    let n = a.len();
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let c = n / 16;
+    for i in 0..c {
+        let o = i * 16;
+        s0 += a[o] * a[o] + a[o + 1] * a[o + 1] + a[o + 2] * a[o + 2] + a[o + 3] * a[o + 3];
+        s1 += a[o + 4] * a[o + 4] + a[o + 5] * a[o + 5] + a[o + 6] * a[o + 6] + a[o + 7] * a[o + 7];
+        s2 += a[o + 8] * a[o + 8]
+            + a[o + 9] * a[o + 9]
+            + a[o + 10] * a[o + 10]
+            + a[o + 11] * a[o + 11];
+        s3 += a[o + 12] * a[o + 12]
+            + a[o + 13] * a[o + 13]
+            + a[o + 14] * a[o + 14]
+            + a[o + 15] * a[o + 15];
+    }
+    let mut s = s0 + s1 + s2 + s3;
+    for &x in &a[c * 16..] {
+        s += x * x;
+    }
+    s
+}
+
+/// Compute dot(row, query_j) for every query while streaming the row only once.
+///
+/// This is used by blocked batch cosine search where the row norm is already
+/// shared across queries. Compared with calling `inner_product(row, query)` N
+/// times, this keeps the hot row in registers/L1 and avoids rereading it for
+/// each query.
+#[inline(always)]
+fn batch_inner_products(
+    row: &[f32],
+    queries: &[&[f32]],
+    dots: &mut [f32; MAX_BLOCKED_BATCH_QUERIES],
+) {
+    let n_queries = queries.len();
+    debug_assert!(n_queries <= MAX_BLOCKED_BATCH_QUERIES);
+    dots[..n_queries].fill(0.0);
+
+    let n = row.len();
+    let c = n / 16;
+    for i in 0..c {
+        let o = i * 16;
+        let r0 = unsafe { *row.get_unchecked(o) };
+        let r1 = unsafe { *row.get_unchecked(o + 1) };
+        let r2 = unsafe { *row.get_unchecked(o + 2) };
+        let r3 = unsafe { *row.get_unchecked(o + 3) };
+        let r4 = unsafe { *row.get_unchecked(o + 4) };
+        let r5 = unsafe { *row.get_unchecked(o + 5) };
+        let r6 = unsafe { *row.get_unchecked(o + 6) };
+        let r7 = unsafe { *row.get_unchecked(o + 7) };
+        let r8 = unsafe { *row.get_unchecked(o + 8) };
+        let r9 = unsafe { *row.get_unchecked(o + 9) };
+        let r10 = unsafe { *row.get_unchecked(o + 10) };
+        let r11 = unsafe { *row.get_unchecked(o + 11) };
+        let r12 = unsafe { *row.get_unchecked(o + 12) };
+        let r13 = unsafe { *row.get_unchecked(o + 13) };
+        let r14 = unsafe { *row.get_unchecked(o + 14) };
+        let r15 = unsafe { *row.get_unchecked(o + 15) };
+
+        let mut qi = 0usize;
+        while qi + 4 <= n_queries {
+            let q0 = unsafe { *queries.get_unchecked(qi) };
+            let q1 = unsafe { *queries.get_unchecked(qi + 1) };
+            let q2 = unsafe { *queries.get_unchecked(qi + 2) };
+            let q3 = unsafe { *queries.get_unchecked(qi + 3) };
+
+            dots[qi] += r0 * unsafe { *q0.get_unchecked(o) }
+                + r1 * unsafe { *q0.get_unchecked(o + 1) }
+                + r2 * unsafe { *q0.get_unchecked(o + 2) }
+                + r3 * unsafe { *q0.get_unchecked(o + 3) }
+                + r4 * unsafe { *q0.get_unchecked(o + 4) }
+                + r5 * unsafe { *q0.get_unchecked(o + 5) }
+                + r6 * unsafe { *q0.get_unchecked(o + 6) }
+                + r7 * unsafe { *q0.get_unchecked(o + 7) }
+                + r8 * unsafe { *q0.get_unchecked(o + 8) }
+                + r9 * unsafe { *q0.get_unchecked(o + 9) }
+                + r10 * unsafe { *q0.get_unchecked(o + 10) }
+                + r11 * unsafe { *q0.get_unchecked(o + 11) }
+                + r12 * unsafe { *q0.get_unchecked(o + 12) }
+                + r13 * unsafe { *q0.get_unchecked(o + 13) }
+                + r14 * unsafe { *q0.get_unchecked(o + 14) }
+                + r15 * unsafe { *q0.get_unchecked(o + 15) };
+            dots[qi + 1] += r0 * unsafe { *q1.get_unchecked(o) }
+                + r1 * unsafe { *q1.get_unchecked(o + 1) }
+                + r2 * unsafe { *q1.get_unchecked(o + 2) }
+                + r3 * unsafe { *q1.get_unchecked(o + 3) }
+                + r4 * unsafe { *q1.get_unchecked(o + 4) }
+                + r5 * unsafe { *q1.get_unchecked(o + 5) }
+                + r6 * unsafe { *q1.get_unchecked(o + 6) }
+                + r7 * unsafe { *q1.get_unchecked(o + 7) }
+                + r8 * unsafe { *q1.get_unchecked(o + 8) }
+                + r9 * unsafe { *q1.get_unchecked(o + 9) }
+                + r10 * unsafe { *q1.get_unchecked(o + 10) }
+                + r11 * unsafe { *q1.get_unchecked(o + 11) }
+                + r12 * unsafe { *q1.get_unchecked(o + 12) }
+                + r13 * unsafe { *q1.get_unchecked(o + 13) }
+                + r14 * unsafe { *q1.get_unchecked(o + 14) }
+                + r15 * unsafe { *q1.get_unchecked(o + 15) };
+            dots[qi + 2] += r0 * unsafe { *q2.get_unchecked(o) }
+                + r1 * unsafe { *q2.get_unchecked(o + 1) }
+                + r2 * unsafe { *q2.get_unchecked(o + 2) }
+                + r3 * unsafe { *q2.get_unchecked(o + 3) }
+                + r4 * unsafe { *q2.get_unchecked(o + 4) }
+                + r5 * unsafe { *q2.get_unchecked(o + 5) }
+                + r6 * unsafe { *q2.get_unchecked(o + 6) }
+                + r7 * unsafe { *q2.get_unchecked(o + 7) }
+                + r8 * unsafe { *q2.get_unchecked(o + 8) }
+                + r9 * unsafe { *q2.get_unchecked(o + 9) }
+                + r10 * unsafe { *q2.get_unchecked(o + 10) }
+                + r11 * unsafe { *q2.get_unchecked(o + 11) }
+                + r12 * unsafe { *q2.get_unchecked(o + 12) }
+                + r13 * unsafe { *q2.get_unchecked(o + 13) }
+                + r14 * unsafe { *q2.get_unchecked(o + 14) }
+                + r15 * unsafe { *q2.get_unchecked(o + 15) };
+            dots[qi + 3] += r0 * unsafe { *q3.get_unchecked(o) }
+                + r1 * unsafe { *q3.get_unchecked(o + 1) }
+                + r2 * unsafe { *q3.get_unchecked(o + 2) }
+                + r3 * unsafe { *q3.get_unchecked(o + 3) }
+                + r4 * unsafe { *q3.get_unchecked(o + 4) }
+                + r5 * unsafe { *q3.get_unchecked(o + 5) }
+                + r6 * unsafe { *q3.get_unchecked(o + 6) }
+                + r7 * unsafe { *q3.get_unchecked(o + 7) }
+                + r8 * unsafe { *q3.get_unchecked(o + 8) }
+                + r9 * unsafe { *q3.get_unchecked(o + 9) }
+                + r10 * unsafe { *q3.get_unchecked(o + 10) }
+                + r11 * unsafe { *q3.get_unchecked(o + 11) }
+                + r12 * unsafe { *q3.get_unchecked(o + 12) }
+                + r13 * unsafe { *q3.get_unchecked(o + 13) }
+                + r14 * unsafe { *q3.get_unchecked(o + 14) }
+                + r15 * unsafe { *q3.get_unchecked(o + 15) };
+            qi += 4;
+        }
+
+        while qi < n_queries {
+            let q = unsafe { *queries.get_unchecked(qi) };
+            dots[qi] += r0 * unsafe { *q.get_unchecked(o) }
+                + r1 * unsafe { *q.get_unchecked(o + 1) }
+                + r2 * unsafe { *q.get_unchecked(o + 2) }
+                + r3 * unsafe { *q.get_unchecked(o + 3) }
+                + r4 * unsafe { *q.get_unchecked(o + 4) }
+                + r5 * unsafe { *q.get_unchecked(o + 5) }
+                + r6 * unsafe { *q.get_unchecked(o + 6) }
+                + r7 * unsafe { *q.get_unchecked(o + 7) }
+                + r8 * unsafe { *q.get_unchecked(o + 8) }
+                + r9 * unsafe { *q.get_unchecked(o + 9) }
+                + r10 * unsafe { *q.get_unchecked(o + 10) }
+                + r11 * unsafe { *q.get_unchecked(o + 11) }
+                + r12 * unsafe { *q.get_unchecked(o + 12) }
+                + r13 * unsafe { *q.get_unchecked(o + 13) }
+                + r14 * unsafe { *q.get_unchecked(o + 14) }
+                + r15 * unsafe { *q.get_unchecked(o + 15) };
+            qi += 1;
+        }
+    }
+
+    for i in (c * 16)..n {
+        let rv = unsafe { *row.get_unchecked(i) };
+        for (qi, q) in queries.iter().enumerate() {
+            dots[qi] += rv * unsafe { *q.get_unchecked(i) };
+        }
+    }
+}
+
+#[inline(always)]
+fn batch_l1_distances(
+    row: &[f32],
+    queries: &[&[f32]],
+    distances: &mut [f32; MAX_BLOCKED_BATCH_QUERIES],
+) {
+    let n_queries = queries.len();
+    debug_assert!(n_queries <= MAX_BLOCKED_BATCH_QUERIES);
+    distances[..n_queries].fill(0.0);
+    let n = row.len();
+    let c = n / 16;
+
+    let mut qi = 0usize;
+    while qi + 4 <= n_queries {
+        let q0 = unsafe { *queries.get_unchecked(qi) };
+        let q1 = unsafe { *queries.get_unchecked(qi + 1) };
+        let q2 = unsafe { *queries.get_unchecked(qi + 2) };
+        let q3 = unsafe { *queries.get_unchecked(qi + 3) };
+
+        let mut s0 = 0.0f32;
+        let mut s1 = 0.0f32;
+        let mut s2 = 0.0f32;
+        let mut s3 = 0.0f32;
+
+        for i in 0..c {
+            let o = i * 16;
+            let r0 = unsafe { *row.get_unchecked(o) };
+            let r1 = unsafe { *row.get_unchecked(o + 1) };
+            let r2 = unsafe { *row.get_unchecked(o + 2) };
+            let r3 = unsafe { *row.get_unchecked(o + 3) };
+            let r4 = unsafe { *row.get_unchecked(o + 4) };
+            let r5 = unsafe { *row.get_unchecked(o + 5) };
+            let r6 = unsafe { *row.get_unchecked(o + 6) };
+            let r7 = unsafe { *row.get_unchecked(o + 7) };
+            let r8 = unsafe { *row.get_unchecked(o + 8) };
+            let r9 = unsafe { *row.get_unchecked(o + 9) };
+            let r10 = unsafe { *row.get_unchecked(o + 10) };
+            let r11 = unsafe { *row.get_unchecked(o + 11) };
+            let r12 = unsafe { *row.get_unchecked(o + 12) };
+            let r13 = unsafe { *row.get_unchecked(o + 13) };
+            let r14 = unsafe { *row.get_unchecked(o + 14) };
+            let r15 = unsafe { *row.get_unchecked(o + 15) };
+
+            s0 += (r0 - unsafe { *q0.get_unchecked(o) }).abs()
+                + (r1 - unsafe { *q0.get_unchecked(o + 1) }).abs()
+                + (r2 - unsafe { *q0.get_unchecked(o + 2) }).abs()
+                + (r3 - unsafe { *q0.get_unchecked(o + 3) }).abs()
+                + (r4 - unsafe { *q0.get_unchecked(o + 4) }).abs()
+                + (r5 - unsafe { *q0.get_unchecked(o + 5) }).abs()
+                + (r6 - unsafe { *q0.get_unchecked(o + 6) }).abs()
+                + (r7 - unsafe { *q0.get_unchecked(o + 7) }).abs()
+                + (r8 - unsafe { *q0.get_unchecked(o + 8) }).abs()
+                + (r9 - unsafe { *q0.get_unchecked(o + 9) }).abs()
+                + (r10 - unsafe { *q0.get_unchecked(o + 10) }).abs()
+                + (r11 - unsafe { *q0.get_unchecked(o + 11) }).abs()
+                + (r12 - unsafe { *q0.get_unchecked(o + 12) }).abs()
+                + (r13 - unsafe { *q0.get_unchecked(o + 13) }).abs()
+                + (r14 - unsafe { *q0.get_unchecked(o + 14) }).abs()
+                + (r15 - unsafe { *q0.get_unchecked(o + 15) }).abs();
+            s1 += (r0 - unsafe { *q1.get_unchecked(o) }).abs()
+                + (r1 - unsafe { *q1.get_unchecked(o + 1) }).abs()
+                + (r2 - unsafe { *q1.get_unchecked(o + 2) }).abs()
+                + (r3 - unsafe { *q1.get_unchecked(o + 3) }).abs()
+                + (r4 - unsafe { *q1.get_unchecked(o + 4) }).abs()
+                + (r5 - unsafe { *q1.get_unchecked(o + 5) }).abs()
+                + (r6 - unsafe { *q1.get_unchecked(o + 6) }).abs()
+                + (r7 - unsafe { *q1.get_unchecked(o + 7) }).abs()
+                + (r8 - unsafe { *q1.get_unchecked(o + 8) }).abs()
+                + (r9 - unsafe { *q1.get_unchecked(o + 9) }).abs()
+                + (r10 - unsafe { *q1.get_unchecked(o + 10) }).abs()
+                + (r11 - unsafe { *q1.get_unchecked(o + 11) }).abs()
+                + (r12 - unsafe { *q1.get_unchecked(o + 12) }).abs()
+                + (r13 - unsafe { *q1.get_unchecked(o + 13) }).abs()
+                + (r14 - unsafe { *q1.get_unchecked(o + 14) }).abs()
+                + (r15 - unsafe { *q1.get_unchecked(o + 15) }).abs();
+            s2 += (r0 - unsafe { *q2.get_unchecked(o) }).abs()
+                + (r1 - unsafe { *q2.get_unchecked(o + 1) }).abs()
+                + (r2 - unsafe { *q2.get_unchecked(o + 2) }).abs()
+                + (r3 - unsafe { *q2.get_unchecked(o + 3) }).abs()
+                + (r4 - unsafe { *q2.get_unchecked(o + 4) }).abs()
+                + (r5 - unsafe { *q2.get_unchecked(o + 5) }).abs()
+                + (r6 - unsafe { *q2.get_unchecked(o + 6) }).abs()
+                + (r7 - unsafe { *q2.get_unchecked(o + 7) }).abs()
+                + (r8 - unsafe { *q2.get_unchecked(o + 8) }).abs()
+                + (r9 - unsafe { *q2.get_unchecked(o + 9) }).abs()
+                + (r10 - unsafe { *q2.get_unchecked(o + 10) }).abs()
+                + (r11 - unsafe { *q2.get_unchecked(o + 11) }).abs()
+                + (r12 - unsafe { *q2.get_unchecked(o + 12) }).abs()
+                + (r13 - unsafe { *q2.get_unchecked(o + 13) }).abs()
+                + (r14 - unsafe { *q2.get_unchecked(o + 14) }).abs()
+                + (r15 - unsafe { *q2.get_unchecked(o + 15) }).abs();
+            s3 += (r0 - unsafe { *q3.get_unchecked(o) }).abs()
+                + (r1 - unsafe { *q3.get_unchecked(o + 1) }).abs()
+                + (r2 - unsafe { *q3.get_unchecked(o + 2) }).abs()
+                + (r3 - unsafe { *q3.get_unchecked(o + 3) }).abs()
+                + (r4 - unsafe { *q3.get_unchecked(o + 4) }).abs()
+                + (r5 - unsafe { *q3.get_unchecked(o + 5) }).abs()
+                + (r6 - unsafe { *q3.get_unchecked(o + 6) }).abs()
+                + (r7 - unsafe { *q3.get_unchecked(o + 7) }).abs()
+                + (r8 - unsafe { *q3.get_unchecked(o + 8) }).abs()
+                + (r9 - unsafe { *q3.get_unchecked(o + 9) }).abs()
+                + (r10 - unsafe { *q3.get_unchecked(o + 10) }).abs()
+                + (r11 - unsafe { *q3.get_unchecked(o + 11) }).abs()
+                + (r12 - unsafe { *q3.get_unchecked(o + 12) }).abs()
+                + (r13 - unsafe { *q3.get_unchecked(o + 13) }).abs()
+                + (r14 - unsafe { *q3.get_unchecked(o + 14) }).abs()
+                + (r15 - unsafe { *q3.get_unchecked(o + 15) }).abs();
+        }
+
+        for i in (c * 16)..n {
+            let rv = unsafe { *row.get_unchecked(i) };
+            s0 += (rv - unsafe { *q0.get_unchecked(i) }).abs();
+            s1 += (rv - unsafe { *q1.get_unchecked(i) }).abs();
+            s2 += (rv - unsafe { *q2.get_unchecked(i) }).abs();
+            s3 += (rv - unsafe { *q3.get_unchecked(i) }).abs();
+        }
+
+        distances[qi] = s0;
+        distances[qi + 1] = s1;
+        distances[qi + 2] = s2;
+        distances[qi + 3] = s3;
+        qi += 4;
+    }
+
+    while qi < n_queries {
+        distances[qi] = l1_distance(row, unsafe { *queries.get_unchecked(qi) });
+        qi += 1;
+    }
+}
+
+#[inline(always)]
+fn batch_linf_distances(
+    row: &[f32],
+    queries: &[&[f32]],
+    distances: &mut [f32; MAX_BLOCKED_BATCH_QUERIES],
+) {
+    let n_queries = queries.len();
+    debug_assert!(n_queries <= MAX_BLOCKED_BATCH_QUERIES);
+    distances[..n_queries].fill(0.0);
+    let n = row.len();
+    let c = n / 16;
+
+    let mut qi = 0usize;
+    while qi + 4 <= n_queries {
+        let q0 = unsafe { *queries.get_unchecked(qi) };
+        let q1 = unsafe { *queries.get_unchecked(qi + 1) };
+        let q2 = unsafe { *queries.get_unchecked(qi + 2) };
+        let q3 = unsafe { *queries.get_unchecked(qi + 3) };
+
+        let mut m0 = 0.0f32;
+        let mut m1 = 0.0f32;
+        let mut m2 = 0.0f32;
+        let mut m3 = 0.0f32;
+
+        for i in 0..c {
+            let o = i * 16;
+            let r0 = unsafe { *row.get_unchecked(o) };
+            let r1 = unsafe { *row.get_unchecked(o + 1) };
+            let r2 = unsafe { *row.get_unchecked(o + 2) };
+            let r3 = unsafe { *row.get_unchecked(o + 3) };
+            let r4 = unsafe { *row.get_unchecked(o + 4) };
+            let r5 = unsafe { *row.get_unchecked(o + 5) };
+            let r6 = unsafe { *row.get_unchecked(o + 6) };
+            let r7 = unsafe { *row.get_unchecked(o + 7) };
+            let r8 = unsafe { *row.get_unchecked(o + 8) };
+            let r9 = unsafe { *row.get_unchecked(o + 9) };
+            let r10 = unsafe { *row.get_unchecked(o + 10) };
+            let r11 = unsafe { *row.get_unchecked(o + 11) };
+            let r12 = unsafe { *row.get_unchecked(o + 12) };
+            let r13 = unsafe { *row.get_unchecked(o + 13) };
+            let r14 = unsafe { *row.get_unchecked(o + 14) };
+            let r15 = unsafe { *row.get_unchecked(o + 15) };
+
+            m0 = m0
+                .max((r0 - unsafe { *q0.get_unchecked(o) }).abs())
+                .max((r1 - unsafe { *q0.get_unchecked(o + 1) }).abs())
+                .max((r2 - unsafe { *q0.get_unchecked(o + 2) }).abs())
+                .max((r3 - unsafe { *q0.get_unchecked(o + 3) }).abs())
+                .max((r4 - unsafe { *q0.get_unchecked(o + 4) }).abs())
+                .max((r5 - unsafe { *q0.get_unchecked(o + 5) }).abs())
+                .max((r6 - unsafe { *q0.get_unchecked(o + 6) }).abs())
+                .max((r7 - unsafe { *q0.get_unchecked(o + 7) }).abs())
+                .max((r8 - unsafe { *q0.get_unchecked(o + 8) }).abs())
+                .max((r9 - unsafe { *q0.get_unchecked(o + 9) }).abs())
+                .max((r10 - unsafe { *q0.get_unchecked(o + 10) }).abs())
+                .max((r11 - unsafe { *q0.get_unchecked(o + 11) }).abs())
+                .max((r12 - unsafe { *q0.get_unchecked(o + 12) }).abs())
+                .max((r13 - unsafe { *q0.get_unchecked(o + 13) }).abs())
+                .max((r14 - unsafe { *q0.get_unchecked(o + 14) }).abs())
+                .max((r15 - unsafe { *q0.get_unchecked(o + 15) }).abs());
+            m1 = m1
+                .max((r0 - unsafe { *q1.get_unchecked(o) }).abs())
+                .max((r1 - unsafe { *q1.get_unchecked(o + 1) }).abs())
+                .max((r2 - unsafe { *q1.get_unchecked(o + 2) }).abs())
+                .max((r3 - unsafe { *q1.get_unchecked(o + 3) }).abs())
+                .max((r4 - unsafe { *q1.get_unchecked(o + 4) }).abs())
+                .max((r5 - unsafe { *q1.get_unchecked(o + 5) }).abs())
+                .max((r6 - unsafe { *q1.get_unchecked(o + 6) }).abs())
+                .max((r7 - unsafe { *q1.get_unchecked(o + 7) }).abs())
+                .max((r8 - unsafe { *q1.get_unchecked(o + 8) }).abs())
+                .max((r9 - unsafe { *q1.get_unchecked(o + 9) }).abs())
+                .max((r10 - unsafe { *q1.get_unchecked(o + 10) }).abs())
+                .max((r11 - unsafe { *q1.get_unchecked(o + 11) }).abs())
+                .max((r12 - unsafe { *q1.get_unchecked(o + 12) }).abs())
+                .max((r13 - unsafe { *q1.get_unchecked(o + 13) }).abs())
+                .max((r14 - unsafe { *q1.get_unchecked(o + 14) }).abs())
+                .max((r15 - unsafe { *q1.get_unchecked(o + 15) }).abs());
+            m2 = m2
+                .max((r0 - unsafe { *q2.get_unchecked(o) }).abs())
+                .max((r1 - unsafe { *q2.get_unchecked(o + 1) }).abs())
+                .max((r2 - unsafe { *q2.get_unchecked(o + 2) }).abs())
+                .max((r3 - unsafe { *q2.get_unchecked(o + 3) }).abs())
+                .max((r4 - unsafe { *q2.get_unchecked(o + 4) }).abs())
+                .max((r5 - unsafe { *q2.get_unchecked(o + 5) }).abs())
+                .max((r6 - unsafe { *q2.get_unchecked(o + 6) }).abs())
+                .max((r7 - unsafe { *q2.get_unchecked(o + 7) }).abs())
+                .max((r8 - unsafe { *q2.get_unchecked(o + 8) }).abs())
+                .max((r9 - unsafe { *q2.get_unchecked(o + 9) }).abs())
+                .max((r10 - unsafe { *q2.get_unchecked(o + 10) }).abs())
+                .max((r11 - unsafe { *q2.get_unchecked(o + 11) }).abs())
+                .max((r12 - unsafe { *q2.get_unchecked(o + 12) }).abs())
+                .max((r13 - unsafe { *q2.get_unchecked(o + 13) }).abs())
+                .max((r14 - unsafe { *q2.get_unchecked(o + 14) }).abs())
+                .max((r15 - unsafe { *q2.get_unchecked(o + 15) }).abs());
+            m3 = m3
+                .max((r0 - unsafe { *q3.get_unchecked(o) }).abs())
+                .max((r1 - unsafe { *q3.get_unchecked(o + 1) }).abs())
+                .max((r2 - unsafe { *q3.get_unchecked(o + 2) }).abs())
+                .max((r3 - unsafe { *q3.get_unchecked(o + 3) }).abs())
+                .max((r4 - unsafe { *q3.get_unchecked(o + 4) }).abs())
+                .max((r5 - unsafe { *q3.get_unchecked(o + 5) }).abs())
+                .max((r6 - unsafe { *q3.get_unchecked(o + 6) }).abs())
+                .max((r7 - unsafe { *q3.get_unchecked(o + 7) }).abs())
+                .max((r8 - unsafe { *q3.get_unchecked(o + 8) }).abs())
+                .max((r9 - unsafe { *q3.get_unchecked(o + 9) }).abs())
+                .max((r10 - unsafe { *q3.get_unchecked(o + 10) }).abs())
+                .max((r11 - unsafe { *q3.get_unchecked(o + 11) }).abs())
+                .max((r12 - unsafe { *q3.get_unchecked(o + 12) }).abs())
+                .max((r13 - unsafe { *q3.get_unchecked(o + 13) }).abs())
+                .max((r14 - unsafe { *q3.get_unchecked(o + 14) }).abs())
+                .max((r15 - unsafe { *q3.get_unchecked(o + 15) }).abs());
+        }
+
+        for i in (c * 16)..n {
+            let rv = unsafe { *row.get_unchecked(i) };
+            m0 = m0.max((rv - unsafe { *q0.get_unchecked(i) }).abs());
+            m1 = m1.max((rv - unsafe { *q1.get_unchecked(i) }).abs());
+            m2 = m2.max((rv - unsafe { *q2.get_unchecked(i) }).abs());
+            m3 = m3.max((rv - unsafe { *q3.get_unchecked(i) }).abs());
+        }
+
+        distances[qi] = m0;
+        distances[qi + 1] = m1;
+        distances[qi + 2] = m2;
+        distances[qi + 3] = m3;
+        qi += 4;
+    }
+
+    while qi < n_queries {
+        distances[qi] = linf_distance(row, unsafe { *queries.get_unchecked(qi) });
+        qi += 1;
+    }
+}
+
 /// Cosine similarity cos(a,b) = dot(a,b) / (‖a‖·‖b‖).
 /// Returns 0.0 if either vector is zero.
 #[inline(always)]
@@ -519,29 +959,28 @@ unsafe fn linf_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
 pub struct DistanceComputer {
     pub metric: DistanceMetric,
     pub query: Vec<f32>,
-    /// Pre-computed ‖query‖ for cosine metrics (0.0 for others).
-    query_norm: f32,
+    /// Pre-computed ‖query‖², reused by cosine/L2 batch fast paths.
+    query_norm_sq: f32,
     /// Pre-computed 1/‖query‖ for cosine metrics (0.0 for others).
     query_norm_recip: f32,
 }
 
 impl DistanceComputer {
     pub fn new(metric: DistanceMetric, query: Vec<f32>) -> Self {
-        let query_norm = match metric {
-            DistanceMetric::CosineSimilarity | DistanceMetric::CosineDistance => {
-                query.iter().map(|x| x * x).sum::<f32>().sqrt()
-            }
-            _ => 0.0,
-        };
-        let query_norm_recip = if query_norm > 0.0 {
-            1.0 / query_norm
+        let query_norm_sq = query.iter().map(|x| x * x).sum::<f32>();
+        let query_norm_recip = if query_norm_sq > 0.0
+            && matches!(
+                metric,
+                DistanceMetric::CosineSimilarity | DistanceMetric::CosineDistance
+            ) {
+            1.0 / query_norm_sq.sqrt()
         } else {
             0.0
         };
         Self {
             metric,
             query,
-            query_norm,
+            query_norm_sq,
             query_norm_recip,
         }
     }
@@ -561,6 +1000,55 @@ impl DistanceComputer {
             DistanceMetric::CosineDistance => {
                 1.0 - cosine_similarity_fused(a, &self.query, self.query_norm_recip)
             }
+        }
+    }
+
+    #[inline(always)]
+    pub fn compute_topk_ordering(&self, a: &[f32]) -> f32 {
+        match self.metric {
+            DistanceMetric::L2 => l2_squared(a, &self.query),
+            _ => self.compute(a),
+        }
+    }
+
+    #[inline(always)]
+    pub fn finalize_topk_distance(&self, score: f32) -> f32 {
+        match self.metric {
+            DistanceMetric::L2 => score.sqrt(),
+            _ => score,
+        }
+    }
+
+    #[inline(always)]
+    pub fn compute_cosine_topk_ordering_from_dot(&self, dot: f32, row_norm_recip: f32) -> f32 {
+        let sim = if row_norm_recip == 0.0 || self.query_norm_recip == 0.0 {
+            0.0
+        } else {
+            dot * row_norm_recip * self.query_norm_recip
+        };
+        match self.metric {
+            DistanceMetric::CosineSimilarity => sim,
+            DistanceMetric::CosineDistance => 1.0 - sim,
+            _ => unreachable!("cosine helper only valid for cosine metrics"),
+        }
+    }
+
+    #[inline(always)]
+    pub fn compute_dot_topk_ordering_from_dot(&self, dot: f32) -> f32 {
+        match self.metric {
+            DistanceMetric::InnerProduct => dot,
+            DistanceMetric::NegInnerProduct => -dot,
+            _ => unreachable!("dot helper only valid for inner-product metrics"),
+        }
+    }
+
+    #[inline(always)]
+    pub fn compute_l2_topk_ordering_from_dot(&self, dot: f32, row_norm_sq: f32) -> f32 {
+        let sq = row_norm_sq + self.query_norm_sq - (2.0 * dot);
+        if sq <= 0.0 {
+            0.0
+        } else {
+            sq
         }
     }
 }
@@ -1010,6 +1498,41 @@ pub fn topk_heap_direct(
 // Parallel TopK: Rayon fold+reduce, O(n/T log k) per thread
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[derive(Copy, Clone)]
+struct TopKEntry(u32, usize);
+
+#[inline(always)]
+fn insert_topk_bits(entries: &mut Vec<TopKEntry>, k: usize, bits: u32, idx: usize) {
+    if k == 0 {
+        return;
+    }
+    if entries.len() == k && bits >= entries[entries.len() - 1].0 {
+        return;
+    }
+
+    entries.push(TopKEntry(bits, idx));
+    let mut pos = entries.len() - 1;
+    while pos > 0 && bits < entries[pos - 1].0 {
+        entries[pos] = entries[pos - 1];
+        pos -= 1;
+    }
+    entries[pos] = TopKEntry(bits, idx);
+    if entries.len() > k {
+        entries.pop();
+    }
+}
+
+#[inline(always)]
+fn topk_entries_to_result(
+    entries: Vec<TopKEntry>,
+    computer: &DistanceComputer,
+) -> Vec<(usize, f32)> {
+    entries
+        .into_iter()
+        .map(|TopKEntry(bits, idx)| (idx, computer.finalize_topk_distance(f32::from_bits(bits))))
+        .collect()
+}
+
 /// Parallel TopK on a `BinaryArray` using Rayon.
 ///
 /// Uses `DistanceComputer` which has pre-computed query-norm for cosine metrics.
@@ -1024,8 +1547,6 @@ pub fn topk_heap_direct_parallel(
     k: usize,
 ) -> Vec<(usize, f32)> {
     use rayon::prelude::*;
-    use std::cmp::Ordering;
-    use std::collections::BinaryHeap;
 
     let n = col.len();
     if k == 0 || n == 0 || computer.query.is_empty() {
@@ -1034,25 +1555,6 @@ pub fn topk_heap_direct_parallel(
     let k_capped = k.min(n);
     let dim = computer.query.len();
     let expected_bytes = dim * 4;
-
-    #[derive(Copy, Clone)]
-    struct Entry(u32, usize);
-    impl PartialEq for Entry {
-        fn eq(&self, o: &Self) -> bool {
-            self.0 == o.0
-        }
-    }
-    impl Eq for Entry {}
-    impl PartialOrd for Entry {
-        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-            Some(self.cmp(o))
-        }
-    }
-    impl Ord for Entry {
-        fn cmp(&self, o: &Self) -> Ordering {
-            self.0.cmp(&o.0)
-        }
-    }
 
     // Grab raw buffer slices ONCE — avoid Arc deref + bounds checks inside the hot loop.
     // SAFETY: these references live for the duration of the function, col is immutable.
@@ -1073,7 +1575,7 @@ pub fn topk_heap_direct_parallel(
     let t = rayon::current_num_threads().max(1);
     let chunk_size = (n + t - 1) / t;
 
-    let per_chunk: Vec<Vec<(usize, f32)>> = (0..t)
+    let per_chunk: Vec<Vec<TopKEntry>> = (0..t)
         .into_par_iter()
         .map(|tid| {
             let start = tid * chunk_size;
@@ -1086,7 +1588,7 @@ pub fn topk_heap_direct_parallel(
             let values = unsafe { std::slice::from_raw_parts(val_ptr as *const u8, val_len) };
             let offsets = unsafe { std::slice::from_raw_parts(off_ptr as *const i32, n + 1) };
 
-            let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+            let mut entries: Vec<TopKEntry> = Vec::with_capacity(k_capped);
 
             for i in start..end {
                 // Null check via raw bitmap (bit i).
@@ -1112,45 +1614,21 @@ pub fn topk_heap_direct_parallel(
                 let bytes = unsafe { values.get_unchecked(off_s..off_e) };
                 let vec = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, dim) };
 
-                let dist = computer.compute(vec);
-                let bits = dist.to_bits();
-                if heap.len() < k_capped {
-                    heap.push(Entry(bits, i));
-                } else if let Some(&Entry(top, _)) = heap.peek() {
-                    if bits < top {
-                        heap.pop();
-                        heap.push(Entry(bits, i));
-                    }
-                }
+                let score = computer.compute_topk_ordering(vec);
+                insert_topk_bits(&mut entries, k_capped, score.to_bits(), i);
             }
-            heap.into_iter()
-                .map(|Entry(b, i)| (i, f32::from_bits(b)))
-                .collect()
+            entries
         })
         .collect();
 
     // Merge T small top-k lists into final top-k (T is small, e.g. 8-16).
-    let mut final_heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+    let mut final_entries: Vec<TopKEntry> = Vec::with_capacity(k_capped);
     for chunk in per_chunk {
-        for (idx, dist) in chunk {
-            let bits = dist.to_bits();
-            if final_heap.len() < k_capped {
-                final_heap.push(Entry(bits, idx));
-            } else if let Some(&Entry(top, _)) = final_heap.peek() {
-                if bits < top {
-                    final_heap.pop();
-                    final_heap.push(Entry(bits, idx));
-                }
-            }
+        for TopKEntry(bits, idx) in chunk {
+            insert_topk_bits(&mut final_entries, k_capped, bits, idx);
         }
     }
-
-    let mut result: Vec<(usize, f32)> = final_heap
-        .into_iter()
-        .map(|Entry(b, i)| (i, f32::from_bits(b)))
-        .collect();
-    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    result
+    topk_entries_to_result(final_entries, computer)
 }
 
 /// Parallel TopK on a `FixedSizeListArray<Float32>` using Rayon.
@@ -1166,15 +1644,10 @@ pub fn topk_heap_direct_parallel_fixed(
     computer: &DistanceComputer,
     k: usize,
 ) -> Vec<(usize, f32)> {
-    use rayon::prelude::*;
-    use std::cmp::Ordering;
-    use std::collections::BinaryHeap;
-
     let n = col.len();
     if k == 0 || n == 0 || computer.query.is_empty() {
         return vec![];
     }
-    let k_capped = k.min(n);
     let dim = computer.query.len();
 
     // The values child is a flat Float32Array with n*dim elements.
@@ -1184,98 +1657,14 @@ pub fn topk_heap_direct_parallel_fixed(
         .downcast_ref::<arrow::array::Float32Array>()
         .expect("FixedSizeList child must be Float32Array");
     let floats: &[f32] = float_arr.values().as_ref();
-    // floats has length n * dim (no nulls expected for vector columns)
-
-    let float_ptr = floats.as_ptr() as usize;
-    let float_len = floats.len();
-
-    #[derive(Copy, Clone)]
-    struct Entry(u32, usize);
-    impl PartialEq for Entry {
-        fn eq(&self, o: &Self) -> bool {
-            self.0 == o.0
-        }
-    }
-    impl Eq for Entry {}
-    impl PartialOrd for Entry {
-        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-            Some(self.cmp(o))
-        }
-    }
-    impl Ord for Entry {
-        fn cmp(&self, o: &Self) -> Ordering {
-            self.0.cmp(&o.0)
-        }
-    }
-
-    let t = rayon::current_num_threads().max(1);
-    let chunk_size = (n + t - 1) / t;
-
-    let per_chunk: Vec<Vec<(usize, f32)>> = (0..t)
-        .into_par_iter()
-        .map(|tid| {
-            let start = tid * chunk_size;
-            if start >= n {
-                return vec![];
-            }
-            let end = (start + chunk_size).min(n);
-
-            // SAFETY: float_ptr is valid for `col`'s lifetime (borrow above).
-            let floats = unsafe { std::slice::from_raw_parts(float_ptr as *const f32, float_len) };
-            let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
-
-            for i in start..end {
-                let off = i * dim;
-                if off + dim > float_len {
-                    break;
-                }
-                // SAFETY: bounds checked above.
-                let vec = unsafe { floats.get_unchecked(off..off + dim) };
-                let dist = computer.compute(vec);
-                let bits = dist.to_bits();
-                if heap.len() < k_capped {
-                    heap.push(Entry(bits, i));
-                } else if let Some(&Entry(top, _)) = heap.peek() {
-                    if bits < top {
-                        heap.pop();
-                        heap.push(Entry(bits, i));
-                    }
-                }
-            }
-            heap.into_iter()
-                .map(|Entry(b, i)| (i, f32::from_bits(b)))
-                .collect()
-        })
-        .collect();
-
-    // Merge T small top-k lists.
-    let mut final_heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
-    for chunk in per_chunk {
-        for (idx, dist) in chunk {
-            let bits = dist.to_bits();
-            if final_heap.len() < k_capped {
-                final_heap.push(Entry(bits, idx));
-            } else if let Some(&Entry(top, _)) = final_heap.peek() {
-                if bits < top {
-                    final_heap.pop();
-                    final_heap.push(Entry(bits, idx));
-                }
-            }
-        }
-    }
-
-    let mut result: Vec<(usize, f32)> = final_heap
-        .into_iter()
-        .map(|Entry(b, i)| (i, f32::from_bits(b)))
-        .collect();
-    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    result
+    topk_heap_on_floats(floats, n, dim, computer, k)
 }
 
 /// Core parallel TopK on a raw contiguous `&[f32]` (no Arrow, no allocation).
 /// `floats` has length `n_rows * dim`. Zero-copy when called with an mmap slice.
 /// Returns `Vec<(row_index, f32_distance)>` sorted ascending (nearest first).
-pub fn topk_heap_on_floats(
+#[inline(always)]
+fn topk_heap_on_floats_impl(
     floats: &[f32],
     n_rows: usize,
     dim: usize,
@@ -1283,39 +1672,16 @@ pub fn topk_heap_on_floats(
     k: usize,
 ) -> Vec<(usize, f32)> {
     use rayon::prelude::*;
-    use std::cmp::Ordering;
-    use std::collections::BinaryHeap;
 
-    if k == 0 || n_rows == 0 || dim == 0 || computer.query.is_empty() {
+    if k == 0 || n_rows == 0 || dim == 0 {
         return vec![];
     }
     let k_capped = k.min(n_rows);
 
-    #[derive(Copy, Clone)]
-    struct Entry(u32, usize);
-    impl PartialEq for Entry {
-        fn eq(&self, o: &Self) -> bool {
-            self.0 == o.0
-        }
-    }
-    impl Eq for Entry {}
-    impl PartialOrd for Entry {
-        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-            Some(self.cmp(o))
-        }
-    }
-    impl Ord for Entry {
-        fn cmp(&self, o: &Self) -> Ordering {
-            self.0.cmp(&o.0)
-        }
-    }
-
-    let float_ptr = floats.as_ptr() as usize;
-    let float_len = floats.len();
     let t = rayon::current_num_threads().max(1);
     let chunk_size = (n_rows + t - 1) / t;
 
-    let per_chunk: Vec<Vec<(usize, f32)>> = (0..t)
+    let per_chunk: Vec<Vec<TopKEntry>> = (0..t)
         .into_par_iter()
         .map(|tid| {
             let start = tid * chunk_size;
@@ -1323,51 +1689,40 @@ pub fn topk_heap_on_floats(
                 return vec![];
             }
             let end = (start + chunk_size).min(n_rows);
-            let floats = unsafe { std::slice::from_raw_parts(float_ptr as *const f32, float_len) };
-            let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+            let mut entries: Vec<TopKEntry> = Vec::with_capacity(k_capped);
             for i in start..end {
                 let off = i * dim;
-                if off + dim > float_len {
+                if off + dim > floats.len() {
                     break;
                 }
                 let vec = unsafe { floats.get_unchecked(off..off + dim) };
-                let dist = computer.compute(vec);
-                let bits = dist.to_bits();
-                if heap.len() < k_capped {
-                    heap.push(Entry(bits, i));
-                } else if let Some(&Entry(top, _)) = heap.peek() {
-                    if bits < top {
-                        heap.pop();
-                        heap.push(Entry(bits, i));
-                    }
-                }
+                let score = computer.compute_topk_ordering(vec);
+                insert_topk_bits(&mut entries, k_capped, score.to_bits(), i);
             }
-            heap.into_iter()
-                .map(|Entry(b, i)| (i, f32::from_bits(b)))
-                .collect()
+            entries
         })
         .collect();
 
-    let mut final_heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+    let mut final_entries: Vec<TopKEntry> = Vec::with_capacity(k_capped);
     for chunk in per_chunk {
-        for (idx, dist) in chunk {
-            let bits = dist.to_bits();
-            if final_heap.len() < k_capped {
-                final_heap.push(Entry(bits, idx));
-            } else if let Some(&Entry(top, _)) = final_heap.peek() {
-                if bits < top {
-                    final_heap.pop();
-                    final_heap.push(Entry(bits, idx));
-                }
-            }
+        for TopKEntry(bits, idx) in chunk {
+            insert_topk_bits(&mut final_entries, k_capped, bits, idx);
         }
     }
-    let mut result: Vec<(usize, f32)> = final_heap
-        .into_iter()
-        .map(|Entry(b, i)| (i, f32::from_bits(b)))
-        .collect();
-    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    result
+    topk_entries_to_result(final_entries, computer)
+}
+
+pub fn topk_heap_on_floats(
+    floats: &[f32],
+    n_rows: usize,
+    dim: usize,
+    computer: &DistanceComputer,
+    k: usize,
+) -> Vec<(usize, f32)> {
+    if k == 0 || n_rows == 0 || dim == 0 || computer.query.is_empty() {
+        return vec![];
+    }
+    topk_heap_on_floats_impl(floats, n_rows, dim, computer, k)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1377,6 +1732,27 @@ pub fn topk_heap_on_floats(
 /// Single-query sequential TopK on a raw contiguous `&[f32]` (no Rayon overhead).
 /// Used by `batch_topk_on_floats` where outer parallelism is over N queries.
 /// Returns `Vec<(row_index, f32_distance)>` sorted ascending (nearest first).
+#[inline(always)]
+fn topk_sequential_on_floats_impl(
+    floats: &[f32],
+    n_rows: usize,
+    dim: usize,
+    computer: &DistanceComputer,
+    k: usize,
+) -> Vec<(usize, f32)> {
+    let mut entries: Vec<TopKEntry> = Vec::with_capacity(k);
+    for i in 0..n_rows {
+        let off = i * dim;
+        if off + dim > floats.len() {
+            break;
+        }
+        let vec = unsafe { floats.get_unchecked(off..off + dim) };
+        let score = computer.compute_topk_ordering(vec);
+        insert_topk_bits(&mut entries, k, score.to_bits(), i);
+    }
+    topk_entries_to_result(entries, computer)
+}
+
 fn topk_sequential_on_floats(
     floats: &[f32],
     n_rows: usize,
@@ -1384,53 +1760,245 @@ fn topk_sequential_on_floats(
     computer: &DistanceComputer,
     k: usize,
 ) -> Vec<(usize, f32)> {
-    use std::cmp::Ordering;
-    use std::collections::BinaryHeap;
+    topk_sequential_on_floats_impl(floats, n_rows, dim, computer, k)
+}
 
-    #[derive(Copy, Clone)]
-    struct Entry(u32, usize);
-    impl PartialEq for Entry {
-        fn eq(&self, o: &Self) -> bool {
-            self.0 == o.0
-        }
+/// Row-blocked multi-query TopK on a raw contiguous `&[f32]`.
+///
+/// Each Rayon worker scans a disjoint row chunk once and maintains one local
+/// heap per query. This avoids reading the full vector table once per query and
+/// works well for small/medium batch sizes where memory traffic dominates.
+fn batch_topk_blocked_on_floats(
+    floats: &[f32],
+    n_rows: usize,
+    dim: usize,
+    computers: &[DistanceComputer],
+    k: usize,
+) -> Vec<Vec<(usize, f32)>> {
+    use rayon::prelude::*;
+
+    let n_queries = computers.len();
+    debug_assert!(n_queries <= MAX_BLOCKED_BATCH_QUERIES);
+    if n_queries == 0 || k == 0 || n_rows == 0 || dim == 0 {
+        return vec![vec![]; n_queries];
     }
-    impl Eq for Entry {}
-    impl PartialOrd for Entry {
-        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-            Some(self.cmp(o))
+    let k_capped = k.min(n_rows);
+    let metric = computers[0].metric;
+    let use_shared_dot_kernel = matches!(
+        metric,
+        DistanceMetric::CosineSimilarity
+            | DistanceMetric::CosineDistance
+            | DistanceMetric::InnerProduct
+            | DistanceMetric::NegInnerProduct
+            | DistanceMetric::L2
+            | DistanceMetric::L2Squared
+            | DistanceMetric::L1
+            | DistanceMetric::LInf
+    );
+
+    if !use_shared_dot_kernel {
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+
+        #[derive(Copy, Clone)]
+        struct Entry(u32, usize);
+        impl PartialEq for Entry {
+            fn eq(&self, o: &Self) -> bool {
+                self.0 == o.0
+            }
         }
-    }
-    impl Ord for Entry {
-        fn cmp(&self, o: &Self) -> Ordering {
-            self.0.cmp(&o.0)
+        impl Eq for Entry {}
+        impl PartialOrd for Entry {
+            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+                Some(self.cmp(o))
+            }
         }
+        impl Ord for Entry {
+            fn cmp(&self, o: &Self) -> Ordering {
+                self.0.cmp(&o.0)
+            }
+        }
+
+        #[inline(always)]
+        fn push_entry(heap: &mut BinaryHeap<Entry>, k_capped: usize, score: f32, idx: usize) {
+            let bits = score.to_bits();
+            if heap.len() < k_capped {
+                heap.push(Entry(bits, idx));
+            } else if let Some(&Entry(top, _)) = heap.peek() {
+                if bits < top {
+                    heap.pop();
+                    heap.push(Entry(bits, idx));
+                }
+            }
+        }
+
+        let t = rayon::current_num_threads().max(1);
+        let chunk_size = (n_rows + t - 1) / t;
+
+        let per_chunk: Vec<Vec<Vec<(usize, f32)>>> = (0..t)
+            .into_par_iter()
+            .map(|tid| {
+                let start = tid * chunk_size;
+                if start >= n_rows {
+                    return vec![vec![]; n_queries];
+                }
+                let end = (start + chunk_size).min(n_rows);
+                let mut heaps: Vec<BinaryHeap<Entry>> = (0..n_queries)
+                    .map(|_| BinaryHeap::with_capacity(k_capped + 1))
+                    .collect();
+
+                for i in start..end {
+                    let off = i * dim;
+                    if off + dim > floats.len() {
+                        break;
+                    }
+                    let row = unsafe { floats.get_unchecked(off..off + dim) };
+                    for (heap, computer) in heaps.iter_mut().zip(computers.iter()) {
+                        push_entry(heap, k_capped, computer.compute_topk_ordering(row), i);
+                    }
+                }
+
+                heaps
+                    .into_iter()
+                    .map(|heap| {
+                        heap.into_iter()
+                            .map(|Entry(bits, idx)| (idx, f32::from_bits(bits)))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut final_heaps: Vec<BinaryHeap<Entry>> = (0..n_queries)
+            .map(|_| BinaryHeap::with_capacity(k_capped + 1))
+            .collect();
+        for chunk in per_chunk {
+            for (qi, entries) in chunk.into_iter().enumerate() {
+                let final_heap = &mut final_heaps[qi];
+                for (idx, score) in entries {
+                    push_entry(final_heap, k_capped, score, idx);
+                }
+            }
+        }
+
+        return computers
+            .iter()
+            .zip(final_heaps.into_iter())
+            .map(|(computer, heap)| {
+                let mut result: Vec<(usize, f32)> = heap
+                    .into_iter()
+                    .map(|Entry(bits, idx)| {
+                        (idx, computer.finalize_topk_distance(f32::from_bits(bits)))
+                    })
+                    .collect();
+                result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                result
+            })
+            .collect();
     }
 
-    let float_len = floats.len();
-    let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k + 1);
-    for i in 0..n_rows {
-        let off = i * dim;
-        if off + dim > float_len {
-            break;
-        }
-        let vec = unsafe { floats.get_unchecked(off..off + dim) };
-        let dist = computer.compute(vec);
-        let bits = dist.to_bits();
-        if heap.len() < k {
-            heap.push(Entry(bits, i));
-        } else if let Some(&Entry(top, _)) = heap.peek() {
-            if bits < top {
-                heap.pop();
-                heap.push(Entry(bits, i));
+    let t = rayon::current_num_threads().max(1);
+    let chunk_size = (n_rows + t - 1) / t;
+    debug_assert!(computers
+        .iter()
+        .all(|computer| computer.metric == computers[0].metric));
+    let cosine_metric = matches!(
+        metric,
+        DistanceMetric::CosineSimilarity | DistanceMetric::CosineDistance
+    );
+    let dot_metric = matches!(
+        metric,
+        DistanceMetric::InnerProduct | DistanceMetric::NegInnerProduct
+    );
+    let l2_metric = matches!(metric, DistanceMetric::L2 | DistanceMetric::L2Squared);
+    let l1_metric = matches!(metric, DistanceMetric::L1);
+    let linf_metric = matches!(metric, DistanceMetric::LInf);
+    let query_slices: Vec<&[f32]> = computers
+        .iter()
+        .map(|computer| computer.query.as_slice())
+        .collect();
+
+    let per_chunk: Vec<Vec<Vec<TopKEntry>>> = (0..t)
+        .into_par_iter()
+        .map(|tid| {
+            let start = tid * chunk_size;
+            if start >= n_rows {
+                return vec![vec![]; n_queries];
+            }
+            let end = (start + chunk_size).min(n_rows);
+            let mut entries_per_query: Vec<Vec<TopKEntry>> = (0..n_queries)
+                .map(|_| Vec::with_capacity(k_capped))
+                .collect();
+            let mut metric_scores = [0.0f32; MAX_BLOCKED_BATCH_QUERIES];
+
+            for i in start..end {
+                let off = i * dim;
+                if off + dim > floats.len() {
+                    break;
+                }
+                let row = unsafe { floats.get_unchecked(off..off + dim) };
+                let row_norm_sq = if cosine_metric || l2_metric {
+                    l2_norm_squared(row)
+                } else {
+                    0.0
+                };
+                let row_norm_recip = if cosine_metric && row_norm_sq > 0.0 {
+                    rsqrt_positive_f32(row_norm_sq)
+                } else {
+                    0.0
+                };
+                if cosine_metric || dot_metric || l2_metric {
+                    batch_inner_products(row, &query_slices, &mut metric_scores);
+                } else if l1_metric {
+                    batch_l1_distances(row, &query_slices, &mut metric_scores);
+                } else if linf_metric {
+                    batch_linf_distances(row, &query_slices, &mut metric_scores);
+                } else {
+                    unreachable!();
+                }
+                for (qi, (entries, computer)) in entries_per_query
+                    .iter_mut()
+                    .zip(computers.iter())
+                    .enumerate()
+                {
+                    let score = if cosine_metric {
+                        computer.compute_cosine_topk_ordering_from_dot(
+                            metric_scores[qi],
+                            row_norm_recip,
+                        )
+                    } else if dot_metric {
+                        computer.compute_dot_topk_ordering_from_dot(metric_scores[qi])
+                    } else if l2_metric {
+                        computer.compute_l2_topk_ordering_from_dot(metric_scores[qi], row_norm_sq)
+                    } else if l1_metric || linf_metric {
+                        metric_scores[qi]
+                    } else {
+                        unreachable!()
+                    };
+                    insert_topk_bits(entries, k_capped, score.to_bits(), i);
+                }
+            }
+            entries_per_query
+        })
+        .collect();
+
+    let mut final_entries: Vec<Vec<TopKEntry>> = (0..n_queries)
+        .map(|_| Vec::with_capacity(k_capped))
+        .collect();
+    for chunk in per_chunk {
+        for (qi, entries) in chunk.into_iter().enumerate() {
+            let final_query_entries = &mut final_entries[qi];
+            for TopKEntry(bits, idx) in entries {
+                insert_topk_bits(final_query_entries, k_capped, bits, idx);
             }
         }
     }
-    let mut result: Vec<(usize, f32)> = heap
-        .into_iter()
-        .map(|Entry(b, i)| (i, f32::from_bits(b)))
-        .collect();
-    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    result
+
+    computers
+        .iter()
+        .zip(final_entries.into_iter())
+        .map(|(computer, entries)| topk_entries_to_result(entries, computer))
+        .collect()
 }
 
 /// Adaptive batch TopK on a raw contiguous `&[f32]` database.
@@ -1462,38 +2030,32 @@ pub fn batch_topk_on_floats(
     }
     let k_capped = k.min(n_rows);
     let t = rayon::current_num_threads().max(1);
-    let float_ptr = floats.as_ptr() as usize;
-    let float_len = floats.len();
-    let query_ptr = queries.as_ptr() as usize;
-    let query_len = queries.len();
+    let computers: Vec<DistanceComputer> = (0..n_queries)
+        .map(|qi| {
+            let start = qi * dim;
+            let end = start + dim;
+            DistanceComputer::new(metric, queries[start..end].to_vec())
+        })
+        .collect();
+
+    if n_queries > 1 && n_queries <= MAX_BLOCKED_BATCH_QUERIES {
+        return batch_topk_blocked_on_floats(floats, n_rows, dim, &computers, k_capped);
+    }
 
     if n_queries < t {
         // N < threads: inner-parallel per query (full Rayon pool on each query's rows).
         // Same perf as N individual topk_heap_on_floats calls, but all within one
         // py.allow_threads scope → saves N-1 Python→Rust transitions + N-1 _id reads.
-        (0..n_queries)
-            .map(|qi| {
-                let queries =
-                    unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
-                let q_slice = &queries[qi * dim..(qi + 1) * dim];
-                let computer = DistanceComputer::new(metric, q_slice.to_vec());
-                topk_heap_on_floats(floats, n_rows, dim, &computer, k_capped)
-            })
+        computers
+            .iter()
+            .map(|computer| topk_heap_on_floats(floats, n_rows, dim, computer, k_capped))
             .collect()
     } else {
         // N >= threads: outer-parallel over queries, sequential inner per query.
         // Each Rayon thread handles N/T queries sequentially — no nested contention.
-        (0..n_queries)
-            .into_par_iter()
-            .map(|qi| {
-                let floats =
-                    unsafe { std::slice::from_raw_parts(float_ptr as *const f32, float_len) };
-                let queries =
-                    unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
-                let q_slice = &queries[qi * dim..(qi + 1) * dim];
-                let computer = DistanceComputer::new(metric, q_slice.to_vec());
-                topk_sequential_on_floats(floats, n_rows, dim, &computer, k_capped)
-            })
+        computers
+            .par_iter()
+            .map(|computer| topk_sequential_on_floats(floats, n_rows, dim, computer, k_capped))
             .collect()
     }
 }
@@ -1892,13 +2454,13 @@ fn linf_f16_scalar(d: &[u8], q: &[f32]) -> f32 {
 
 // ── Runtime dispatcher ────────────────────────────────────────────────────────
 #[inline(always)]
-fn compute_f16_row_distance(row: &[u8], c: &DistanceComputer) -> f32 {
+fn compute_f16_row_topk_ordering(row: &[u8], c: &DistanceComputer) -> f32 {
     let (q, qnr) = (&c.query, c.query_norm_recip);
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("fp16") {
         return match c.metric {
             DistanceMetric::L2Squared => unsafe { l2sq_f16_neon(row, q) },
-            DistanceMetric::L2 => unsafe { l2sq_f16_neon(row, q) }.sqrt(),
+            DistanceMetric::L2 => unsafe { l2sq_f16_neon(row, q) },
             DistanceMetric::InnerProduct => unsafe { dot_f16_neon(row, q) },
             DistanceMetric::NegInnerProduct => -unsafe { dot_f16_neon(row, q) },
             DistanceMetric::CosineSimilarity => unsafe { cosine_f16_neon(row, q, qnr) },
@@ -1910,7 +2472,7 @@ fn compute_f16_row_distance(row: &[u8], c: &DistanceComputer) -> f32 {
     #[cfg(target_arch = "aarch64")]
     return match c.metric {
         DistanceMetric::L2Squared => l2sq_f16_scalar(row, q),
-        DistanceMetric::L2 => l2sq_f16_scalar(row, q).sqrt(),
+        DistanceMetric::L2 => l2sq_f16_scalar(row, q),
         DistanceMetric::InnerProduct => dot_f16_scalar(row, q),
         DistanceMetric::NegInnerProduct => -dot_f16_scalar(row, q),
         DistanceMetric::CosineSimilarity => cosine_f16_scalar(row, q, qnr),
@@ -1924,7 +2486,7 @@ fn compute_f16_row_distance(row: &[u8], c: &DistanceComputer) -> f32 {
         if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx2") {
             return match c.metric {
                 DistanceMetric::L2Squared => unsafe { l2sq_f16_avx(row, q) },
-                DistanceMetric::L2 => unsafe { l2sq_f16_avx(row, q) }.sqrt(),
+                DistanceMetric::L2 => unsafe { l2sq_f16_avx(row, q) },
                 DistanceMetric::InnerProduct => unsafe { dot_f16_avx(row, q) },
                 DistanceMetric::NegInnerProduct => -unsafe { dot_f16_avx(row, q) },
                 DistanceMetric::CosineSimilarity => unsafe { cosine_f16_avx(row, q, qnr) },
@@ -1935,7 +2497,7 @@ fn compute_f16_row_distance(row: &[u8], c: &DistanceComputer) -> f32 {
         }
         match c.metric {
             DistanceMetric::L2Squared => l2sq_f16_scalar(row, q),
-            DistanceMetric::L2 => l2sq_f16_scalar(row, q).sqrt(),
+            DistanceMetric::L2 => l2sq_f16_scalar(row, q),
             DistanceMetric::InnerProduct => dot_f16_scalar(row, q),
             DistanceMetric::NegInnerProduct => -dot_f16_scalar(row, q),
             DistanceMetric::CosineSimilarity => cosine_f16_scalar(row, q, qnr),
@@ -1957,8 +2519,6 @@ pub fn topk_heap_on_f16_bytes(
     k: usize,
 ) -> Vec<(usize, f32)> {
     use rayon::prelude::*;
-    use std::cmp::Ordering;
-    use std::collections::BinaryHeap;
 
     if k == 0 || n_rows == 0 || dim == 0 || computer.query.is_empty() {
         return vec![];
@@ -1966,31 +2526,12 @@ pub fn topk_heap_on_f16_bytes(
     let k_capped = k.min(n_rows);
     let row_bytes = dim * 2;
 
-    #[derive(Copy, Clone)]
-    struct Entry(u32, usize);
-    impl PartialEq for Entry {
-        fn eq(&self, o: &Self) -> bool {
-            self.0 == o.0
-        }
-    }
-    impl Eq for Entry {}
-    impl PartialOrd for Entry {
-        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-            Some(self.cmp(o))
-        }
-    }
-    impl Ord for Entry {
-        fn cmp(&self, o: &Self) -> Ordering {
-            self.0.cmp(&o.0)
-        }
-    }
-
     let bytes_ptr = f16_bytes.as_ptr() as usize;
     let bytes_len = f16_bytes.len();
     let t = rayon::current_num_threads().max(1);
     let chunk = (n_rows + t - 1) / t;
 
-    let per_chunk: Vec<Vec<(usize, f32)>> = (0..t)
+    let per_chunk: Vec<Vec<TopKEntry>> = (0..t)
         .into_par_iter()
         .map(|tid| {
             let start = tid * chunk;
@@ -1999,49 +2540,26 @@ pub fn topk_heap_on_f16_bytes(
             }
             let end = (start + chunk).min(n_rows);
             let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
-            let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+            let mut entries: Vec<TopKEntry> = Vec::with_capacity(k_capped);
             for i in start..end {
                 let off = i * row_bytes;
                 if off + row_bytes > bytes_len {
                     break;
                 }
-                let dist = compute_f16_row_distance(&bytes[off..off + row_bytes], computer);
-                let dist_bits = dist.to_bits();
-                if heap.len() < k_capped {
-                    heap.push(Entry(dist_bits, i));
-                } else if let Some(&Entry(top, _)) = heap.peek() {
-                    if dist_bits < top {
-                        heap.pop();
-                        heap.push(Entry(dist_bits, i));
-                    }
-                }
+                let score = compute_f16_row_topk_ordering(&bytes[off..off + row_bytes], computer);
+                insert_topk_bits(&mut entries, k_capped, score.to_bits(), i);
             }
-            heap.into_iter()
-                .map(|Entry(b, i)| (i, f32::from_bits(b)))
-                .collect()
+            entries
         })
         .collect();
 
-    let mut final_heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k_capped + 1);
+    let mut final_entries: Vec<TopKEntry> = Vec::with_capacity(k_capped);
     for chunk in per_chunk {
-        for (idx, dist) in chunk {
-            let bits = dist.to_bits();
-            if final_heap.len() < k_capped {
-                final_heap.push(Entry(bits, idx));
-            } else if let Some(&Entry(top, _)) = final_heap.peek() {
-                if bits < top {
-                    final_heap.pop();
-                    final_heap.push(Entry(bits, idx));
-                }
-            }
+        for TopKEntry(bits, idx) in chunk {
+            insert_topk_bits(&mut final_entries, k_capped, bits, idx);
         }
     }
-    let mut result: Vec<(usize, f32)> = final_heap
-        .into_iter()
-        .map(|Entry(b, i)| (i, f32::from_bits(b)))
-        .collect();
-    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-    result
+    topk_entries_to_result(final_entries, computer)
 }
 
 /// Single-query sequential TopK on raw f16 LE bytes.
@@ -2053,53 +2571,18 @@ fn topk_sequential_on_f16_bytes(
     computer: &DistanceComputer,
     k: usize,
 ) -> Vec<(usize, f32)> {
-    use std::cmp::Ordering;
-    use std::collections::BinaryHeap;
-
-    #[derive(Copy, Clone)]
-    struct Entry(u32, usize);
-    impl PartialEq for Entry {
-        fn eq(&self, o: &Self) -> bool {
-            self.0 == o.0
-        }
-    }
-    impl Eq for Entry {}
-    impl PartialOrd for Entry {
-        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-            Some(self.cmp(o))
-        }
-    }
-    impl Ord for Entry {
-        fn cmp(&self, o: &Self) -> Ordering {
-            self.0.cmp(&o.0)
-        }
-    }
-
     let row_bytes = dim * 2;
     let bytes_len = f16_bytes.len();
-    let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(k + 1);
+    let mut entries: Vec<TopKEntry> = Vec::with_capacity(k);
     for i in 0..n_rows {
         let off = i * row_bytes;
         if off + row_bytes > bytes_len {
             break;
         }
-        let dist = compute_f16_row_distance(&f16_bytes[off..off + row_bytes], computer);
-        let dist_bits = dist.to_bits();
-        if heap.len() < k {
-            heap.push(Entry(dist_bits, i));
-        } else if let Some(&Entry(top, _)) = heap.peek() {
-            if dist_bits < top {
-                heap.pop();
-                heap.push(Entry(dist_bits, i));
-            }
-        }
+        let score = compute_f16_row_topk_ordering(&f16_bytes[off..off + row_bytes], computer);
+        insert_topk_bits(&mut entries, k, score.to_bits(), i);
     }
-    let mut result: Vec<(usize, f32)> = heap
-        .into_iter()
-        .map(|Entry(b, i)| (i, f32::from_bits(b)))
-        .collect();
-    result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    result
+    topk_entries_to_result(entries, computer)
 }
 
 /// Adaptive batch TopK on raw f16 LE bytes — N queries in one call.
@@ -2123,32 +2606,24 @@ pub fn batch_topk_on_f16_bytes(
     }
     let k_capped = k.min(n_rows);
     let t = rayon::current_num_threads().max(1);
-    let bytes_ptr = f16_bytes.as_ptr() as usize;
-    let bytes_len = f16_bytes.len();
-    let query_ptr = queries.as_ptr() as usize;
-    let query_len = queries.len();
+    let computers: Vec<DistanceComputer> = (0..n_queries)
+        .map(|qi| {
+            let start = qi * dim;
+            let end = start + dim;
+            DistanceComputer::new(metric, queries[start..end].to_vec())
+        })
+        .collect();
 
     if n_queries < t {
-        (0..n_queries)
-            .map(|qi| {
-                let f16_b =
-                    unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
-                let qs = unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
-                let q_slice = &qs[qi * dim..(qi + 1) * dim];
-                let computer = DistanceComputer::new(metric, q_slice.to_vec());
-                topk_heap_on_f16_bytes(f16_b, n_rows, dim, &computer, k_capped)
-            })
+        computers
+            .iter()
+            .map(|computer| topk_heap_on_f16_bytes(f16_bytes, n_rows, dim, computer, k_capped))
             .collect()
     } else {
-        (0..n_queries)
-            .into_par_iter()
-            .map(|qi| {
-                let f16_b =
-                    unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
-                let qs = unsafe { std::slice::from_raw_parts(query_ptr as *const f32, query_len) };
-                let q_slice = &qs[qi * dim..(qi + 1) * dim];
-                let computer = DistanceComputer::new(metric, q_slice.to_vec());
-                topk_sequential_on_f16_bytes(f16_b, n_rows, dim, &computer, k_capped)
+        computers
+            .par_iter()
+            .map(|computer| {
+                topk_sequential_on_f16_bytes(f16_bytes, n_rows, dim, computer, k_capped)
             })
             .collect()
     }

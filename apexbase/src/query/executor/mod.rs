@@ -1097,15 +1097,26 @@ impl ApexExecutor {
                 }
                 // Fall through to full parse if fast path unavailable
             }
-            QuerySignature::SimpleScanLimit { limit, ref table } => {
+            QuerySignature::SimpleScanLimit { limit, offset, ref table } => {
                 let table_path = table
                     .as_ref()
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
                     if backend.pending_v4_in_memory_rows() == 0 {
-                        if let Ok(batch) = backend.read_columns_to_arrow(None, 0, Some(*limit)) {
-                            return Ok(ApexResult::Data(batch));
+                        if *offset == 0 {
+                            if let Ok(batch) = backend.read_columns_to_arrow(None, 0, Some(*limit)) {
+                                return Ok(ApexResult::Data(batch));
+                            }
+                        } else if !backend.has_pending_deltas()
+                            && !backend.has_delta()
+                            && backend.active_row_count() == backend.row_count()
+                        {
+                            let end = (*offset).saturating_add(*limit).min(backend.row_count() as usize);
+                            let indices: Vec<usize> = (*offset..end).collect();
+                            if let Ok(batch) = backend.read_columns_by_indices_to_arrow(&indices, None) {
+                                return Ok(ApexResult::Data(batch));
+                            }
                         }
                     }
                 }
@@ -1113,6 +1124,7 @@ impl ApexExecutor {
             }
             QuerySignature::ProjectedScanLimit {
                 limit,
+                offset,
                 ref table,
                 columns,
             } => {
@@ -1125,10 +1137,85 @@ impl ApexExecutor {
                         let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
                         if let Ok(batch) = backend.read_columns_to_arrow(
                             Some(col_refs.as_slice()),
-                            0,
+                            *offset,
                             Some(*limit),
                         ) {
                             return Ok(ApexResult::Data(batch));
+                        }
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::NumericRangeFilterLimit {
+                ref table,
+                column,
+                low,
+                high,
+                limit,
+                offset,
+            } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    if !backend.has_pending_deltas() && !backend.has_delta()
+                        && backend.pending_v4_in_memory_rows() == 0
+                    {
+                        let needed = (*offset).saturating_add(*limit);
+                        if let Ok(Some(indices)) =
+                            backend.scan_numeric_range_mmap(column, *low, *high, Some(needed))
+                        {
+                            let final_indices: Vec<usize> =
+                                indices.into_iter().skip(*offset).take(*limit).collect();
+                            let batch = if final_indices.is_empty() {
+                                backend.read_columns_to_arrow(None, 0, Some(0))
+                            } else {
+                                backend.read_columns_by_indices_to_arrow(&final_indices, None)
+                            };
+                            if let Ok(batch) = batch {
+                                return Ok(ApexResult::Data(batch));
+                            }
+                        }
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::ProjectedNumericRangeFilterLimit {
+                ref table,
+                columns,
+                column,
+                low,
+                high,
+                limit,
+                offset,
+            } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    if !backend.has_pending_deltas() && !backend.has_delta()
+                        && backend.pending_v4_in_memory_rows() == 0
+                    {
+                        let needed = (*offset).saturating_add(*limit);
+                        let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                        if let Ok(Some(indices)) =
+                            backend.scan_numeric_range_mmap(column, *low, *high, Some(needed))
+                        {
+                            let final_indices: Vec<usize> =
+                                indices.into_iter().skip(*offset).take(*limit).collect();
+                            let batch = if final_indices.is_empty() {
+                                backend.read_columns_to_arrow(Some(col_refs.as_slice()), 0, Some(0))
+                            } else {
+                                backend.read_columns_by_indices_to_arrow(
+                                    &final_indices,
+                                    Some(col_refs.as_slice()),
+                                )
+                            };
+                            if let Ok(batch) = batch {
+                                return Ok(ApexResult::Data(batch));
+                            }
                         }
                     }
                 }
@@ -1246,6 +1333,25 @@ impl ApexExecutor {
                         {
                             return Ok(ApexResult::Data(batch));
                         }
+                    }
+                }
+                // Fall through to full parse if fast path unavailable
+            }
+            QuerySignature::FilteredStringAgg {
+                ref table,
+                ref filter_column,
+                ref filter_value,
+            } => {
+                let table_path = table
+                    .as_ref()
+                    .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
+                    .unwrap_or_else(|| default_table_path.to_path_buf());
+                if let Ok(backend) = get_cached_backend(&table_path) {
+                    if !backend.has_pending_deltas() && !backend.has_delta()
+                        && backend.pending_v4_in_memory_rows() == 0
+                    {
+                        // Fall through to full parse — the executor select() has
+                        // try_fast_filtered_string_agg which handles this optimally
                     }
                 }
                 // Fall through to full parse if fast path unavailable

@@ -921,6 +921,29 @@ def test_topk_distance_python_matches_order_by(client):
     assert [r["_id"] for r in topk_rows] == [r["_id"] for r in sql_rows]
 
 
+@pytest.mark.parametrize("metric", ["l2", "l2_squared", "cosine_distance", "dot", "l1", "linf"])
+def test_batch_topk_distance_matches_single_queries(client, metric):
+    """batch_topk_distance should match repeated topk_distance for f32 vector columns."""
+    rng = np.random.default_rng(123)
+    n, dim = 80, 8
+    vecs = rng.random((n, dim), dtype=np.float32)
+    client.store([{"name": str(i), "vec": vecs[i]} for i in range(n)])
+
+    queries = rng.random((3, dim), dtype=np.float32)
+    k = 5
+    batch = client.batch_topk_distance("vec", queries, k=k, metric=metric)
+
+    assert batch.shape == (3, k, 2)
+    for qi, query in enumerate(queries):
+        single = client.topk_distance("vec", query, k=k, metric=metric).to_dict()
+        batch_ids = [int(batch[qi, j, 0]) for j in range(k)]
+        batch_dists = [float(batch[qi, j, 1]) for j in range(k)]
+        assert batch_ids == [int(row["_id"]) for row in single]
+        assert batch_dists == pytest.approx(
+            [float(row["dist"]) for row in single], rel=1e-5, abs=1e-5
+        )
+
+
 def test_topk_distance_sql_explode_rename_basic(client):
     """SQL explode_rename(topk_distance(...)): returns k rows with 2 named columns."""
     _load_topk_vecs(client)

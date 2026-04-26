@@ -278,6 +278,14 @@ class ResultView:
                     k0, k1, k2 = keys
                     c0, c1, c2 = cols
                     self._data = [{k0: c0[i], k1: c1[i], k2: c2[i]} for i in range(n)]
+                elif len(keys) == 2:
+                    k0, k1 = keys
+                    c0, c1 = cols
+                    self._data = [{k0: c0[i], k1: c1[i]} for i in range(n)]
+                elif len(keys) == 1:
+                    k0 = keys[0]
+                    c0 = cols[0]
+                    self._data = [{k0: c0[i]} for i in range(n)]
                 else:
                     self._data = [{k: d[k][i] for k in keys} for i in range(n)]
                 return self._data

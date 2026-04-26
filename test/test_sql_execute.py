@@ -735,6 +735,28 @@ class TestBasicSQLExecute:
 
             client.close()
 
+    def test_execute_id_in_lookup_can_show_internal_ids(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            client.store([
+                {"name": "Alice", "age": 25},
+                {"name": "Bob", "age": 30},
+                {"name": "Charlie", "age": 35},
+            ])
+
+            result = client.execute(
+                "SELECT * FROM default WHERE _id IN (3, 1, 3, 2)",
+                show_internal_id=True,
+            )
+            rows = result.to_dict()
+            assert result.columns[0] == "_id"
+            assert [row["_id"] for row in rows] == [1, 2, 3]
+            assert [row["name"] for row in rows] == ["Alice", "Bob", "Charlie"]
+
+            client.close()
+
     def test_execute_projected_string_equality_filter_respects_projection(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
@@ -1029,6 +1051,11 @@ class TestSQLAggregates:
             # Test COUNT with WHERE
             result = client.execute("SELECT COUNT(*) as nyc_count FROM default WHERE city = 'NYC'")
             
+            assert len(result) == 1
+            assert result.scalar() == 2
+
+            result = client.execute("SELECT COUNT(city) as nyc_city_count FROM default WHERE city = 'NYC'")
+
             assert len(result) == 1
             assert result.scalar() == 2
             

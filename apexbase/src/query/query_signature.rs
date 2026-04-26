@@ -56,12 +56,17 @@ pub enum QuerySignature {
         columns: Vec<String>,
     },
 
-    /// `SELECT * FROM <table> LIMIT N` — sequential scan with early termination
-    SimpleScanLimit { limit: usize, table: Option<String> },
+    /// `SELECT * FROM <table> LIMIT N [OFFSET M]` — sequential scan with early termination
+    SimpleScanLimit {
+        limit: usize,
+        offset: usize,
+        table: Option<String>,
+    },
 
-    /// `SELECT col1, col2 FROM <table> LIMIT N` — projected sequential scan
+    /// `SELECT col1, col2 FROM <table> LIMIT N [OFFSET M]` — projected sequential scan
     ProjectedScanLimit {
         limit: usize,
+        offset: usize,
         table: Option<String>,
         columns: Vec<String>,
     },
@@ -100,6 +105,27 @@ pub enum QuerySignature {
         offset: usize,
     },
 
+    /// `SELECT * FROM <table> WHERE numeric_col <op> N LIMIT M [OFFSET K]`
+    NumericRangeFilterLimit {
+        table: Option<String>,
+        column: String,
+        low: f64,
+        high: f64,
+        limit: usize,
+        offset: usize,
+    },
+
+    /// `SELECT col1, col2 FROM <table> WHERE numeric_col <op> N LIMIT M [OFFSET K]`
+    ProjectedNumericRangeFilterLimit {
+        table: Option<String>,
+        columns: Vec<String>,
+        column: String,
+        low: f64,
+        high: f64,
+        limit: usize,
+        offset: usize,
+    },
+
     /// `SELECT * FROM <table> WHERE col LIKE 'pattern'` — mmap LIKE scan
     LikeFilter {
         table: Option<String>,
@@ -131,6 +157,13 @@ pub enum QuerySignature {
     /// CTE: WITH ... AS (...)
     Cte,
 
+    /// `SELECT COUNT(*), AVG(col), ... FROM <table> WHERE str_col = 'val'` — filtered string equality aggregation
+    FilteredStringAgg {
+        table: Option<String>,
+        filter_column: String,
+        filter_value: String,
+    },
+
     /// Everything else — full parse + plan + execute
     Complex,
 }
@@ -154,7 +187,10 @@ impl QuerySignature {
                 | QuerySignature::StringEqualityFilterLimit { .. }
                 | QuerySignature::ProjectedStringEqualityFilter { .. }
                 | QuerySignature::ProjectedStringEqualityFilterLimit { .. }
+                | QuerySignature::NumericRangeFilterLimit { .. }
+                | QuerySignature::ProjectedNumericRangeFilterLimit { .. }
                 | QuerySignature::LikeFilter { .. }
+                | QuerySignature::FilteredStringAgg { .. }
                 | QuerySignature::TableFunction
                 | QuerySignature::Explain
                 | QuerySignature::Cte
@@ -198,7 +234,10 @@ impl QuerySignature {
                 | QuerySignature::StringEqualityFilterLimit { .. }
                 | QuerySignature::ProjectedStringEqualityFilter { .. }
                 | QuerySignature::ProjectedStringEqualityFilterLimit { .. }
+                | QuerySignature::NumericRangeFilterLimit { .. }
+                | QuerySignature::ProjectedNumericRangeFilterLimit { .. }
                 | QuerySignature::LikeFilter { .. }
+                | QuerySignature::FilteredStringAgg { .. }
         )
     }
 }
@@ -366,9 +405,10 @@ pub fn classify(sql: &str) -> QuerySignature {
         }
 
         if has_limit && !has_where && !has_order && !has_group && !has_join {
-            if let Some(limit) = extract_limit_from_upper(su) {
+            if let Some((limit, offset)) = extract_limit_offset_from_upper(su) {
                 return QuerySignature::ProjectedScanLimit {
                     limit,
+                    offset,
                     table: extract_from_table(s, su),
                     columns,
                 };
@@ -410,6 +450,33 @@ pub fn classify(sql: &str) -> QuerySignature {
             }
         }
 
+        if has_where
+            && has_limit
+            && !has_order
+            && !has_group
+            && !has_join
+            && !su.contains("BETWEEN")
+            && !su.contains(" IN ")
+            && !su.contains(" LIKE ")
+            && !su.contains(" AND ")
+            && !su.contains(" OR ")
+            && !s.contains('\'')
+        {
+            if let Some((column, low, high, limit, offset)) =
+                extract_numeric_range_with_limit(s, su)
+            {
+                return QuerySignature::ProjectedNumericRangeFilterLimit {
+                    table: extract_from_table(s, su),
+                    columns,
+                    column,
+                    low,
+                    high,
+                    limit,
+                    offset,
+                };
+            }
+        }
+
         if !has_where && !has_order && !has_group && !has_join && !has_limit && !has_distinct {
             let table = extract_from_table(s, su);
             return QuerySignature::ProjectedFullScan { table, columns };
@@ -434,9 +501,10 @@ pub fn classify(sql: &str) -> QuerySignature {
 
     // ── Simple scan: SELECT * ... LIMIT N (no WHERE/ORDER/GROUP/JOIN) ──
     if is_exact_star_select && has_limit && !has_where && !has_order && !has_group && !has_join {
-        if let Some(limit) = extract_limit_from_upper(su) {
+        if let Some((limit, offset)) = extract_limit_offset_from_upper(su) {
             return QuerySignature::SimpleScanLimit {
                 limit,
+                offset,
                 table: extract_from_table(s, su),
             };
         }
@@ -475,6 +543,32 @@ pub fn classify(sql: &str) -> QuerySignature {
         }
     }
 
+    // ── Numeric comparison + LIMIT: SELECT * ... WHERE col > 1 LIMIT N ──
+    if is_exact_star_select
+        && has_where
+        && has_limit
+        && !has_order
+        && !has_group
+        && !has_join
+        && !su.contains("BETWEEN")
+        && !su.contains(" IN ")
+        && !su.contains(" LIKE ")
+        && !su.contains(" AND ")
+        && !su.contains(" OR ")
+        && !s.contains('\'')
+    {
+        if let Some((column, low, high, limit, offset)) = extract_numeric_range_with_limit(s, su) {
+            return QuerySignature::NumericRangeFilterLimit {
+                table: extract_from_table(s, su),
+                column,
+                low,
+                high,
+                limit,
+                offset,
+            };
+        }
+    }
+
     // ── LIKE filter: SELECT * ... WHERE col LIKE 'pattern' (simple, no AND/OR/NOT) ──
     if is_exact_star_select
         && su.contains(" LIKE ")
@@ -508,6 +602,22 @@ pub fn classify(sql: &str) -> QuerySignature {
     {
         let table = extract_from_table(s, su);
         return QuerySignature::FullScan { table };
+    }
+
+    // ── Filtered string equality aggregation: SELECT COUNT(*), AVG(col) ... FROM t WHERE str_col = 'val' ──
+    if has_where && !has_group && !has_order && !has_limit && !has_join && !has_distinct && !has_having {
+        let has_agg = su.contains("COUNT(") || su.contains("AVG(") || su.contains("SUM(")
+            || su.contains("MIN(") || su.contains("MAX(");
+        if has_agg {
+            if let Some((col, val)) = extract_string_equality(s, su) {
+                let table = extract_from_table(s, su);
+                return QuerySignature::FilteredStringAgg {
+                    table,
+                    filter_column: col,
+                    filter_value: val,
+                };
+            }
+        }
     }
 
     QuerySignature::Complex
@@ -589,6 +699,12 @@ fn extract_limit_from_upper(su: &str) -> Option<usize> {
         .trim_end_matches(';')
         .parse::<usize>()
         .ok()
+}
+
+/// Extract LIMIT/OFFSET values from uppercased SQL.
+fn extract_limit_offset_from_upper(su: &str) -> Option<(usize, usize)> {
+    let after_limit = su.rsplit("LIMIT").next()?;
+    parse_limit_offset_clause(after_limit.trim().trim_end_matches(';'))
 }
 
 /// Extract a simple comma-separated projection list containing only plain column references.
@@ -689,6 +805,28 @@ fn extract_string_equality_with_limit(
     Some((column, value, limit, offset))
 }
 
+/// Extract (column, inclusive-low, inclusive-high, limit, offset) from
+/// `WHERE numeric_col <op> numeric_literal LIMIT N [OFFSET M]`.
+fn extract_numeric_range_with_limit(
+    sql: &str,
+    su: &str,
+) -> Option<(String, f64, f64, usize, usize)> {
+    let where_pos = su.find("WHERE")?;
+    let limit_pos = su.rfind("LIMIT")?;
+    if limit_pos <= where_pos {
+        return None;
+    }
+
+    let where_clause = sql[where_pos + 5..limit_pos].trim();
+    let (column, low, high) = parse_numeric_comparison_clause(where_clause)?;
+    let after_limit = sql[limit_pos + "LIMIT".len()..]
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let (limit, offset) = parse_limit_offset_clause(after_limit)?;
+    Some((column, low, high, limit, offset))
+}
+
 fn parse_string_equality_clause(clause: &str) -> Option<(String, String)> {
     let after_where = clause.trim();
     let eq_pos = after_where.find('=')?;
@@ -707,6 +845,60 @@ fn parse_string_equality_clause(clause: &str) -> Option<(String, String)> {
         return None;
     }
     Some((col, val))
+}
+
+fn parse_numeric_comparison_clause(clause: &str) -> Option<(String, f64, f64)> {
+    let clause = clause.trim();
+    let (op, op_pos) = [">=", "<=", ">", "<", "="]
+        .iter()
+        .find_map(|op| clause.find(op).map(|pos| (*op, pos)))?;
+    let col = clause[..op_pos].trim().trim_matches('"');
+    if col.is_empty() || col.contains(' ') || col.contains('(') {
+        return None;
+    }
+    let rhs = clause[op_pos + op.len()..].trim();
+    let value = rhs.parse::<f64>().ok()?;
+    let (low, high) = match op {
+        "=" => (value, value),
+        ">" => (next_up_f64(value), f64::INFINITY),
+        ">=" => (value, f64::INFINITY),
+        "<" => (f64::NEG_INFINITY, next_down_f64(value)),
+        "<=" => (f64::NEG_INFINITY, value),
+        _ => return None,
+    };
+    Some((col.to_string(), low, high))
+}
+
+#[inline]
+fn next_up_f64(value: f64) -> f64 {
+    if value.is_nan() || value == f64::INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f64::from_bits(bits + 1)
+    } else {
+        f64::from_bits(bits - 1)
+    }
+}
+
+#[inline]
+fn next_down_f64(value: f64) -> f64 {
+    if value.is_nan() || value == f64::NEG_INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return -f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f64::from_bits(bits - 1)
+    } else {
+        f64::from_bits(bits + 1)
+    }
 }
 
 fn parse_limit_offset_clause(clause: &str) -> Option<(usize, usize)> {
@@ -929,20 +1121,65 @@ mod tests {
             classify("SELECT * FROM t LIMIT 100"),
             QuerySignature::SimpleScanLimit {
                 limit: 100,
+                offset: 0,
                 table: Some("t".to_string()),
             }
         );
         // With WHERE — not a simple scan
         assert_eq!(
             classify("SELECT * FROM t WHERE x > 1 LIMIT 100"),
-            QuerySignature::Complex
+            QuerySignature::NumericRangeFilterLimit {
+                limit: 100,
+                offset: 0,
+                table: Some("t".to_string()),
+                column: "x".to_string(),
+                low: next_up_f64(1.0),
+                high: f64::INFINITY,
+            }
         );
         assert_eq!(
             classify("SELECT name, age FROM t LIMIT 100"),
             QuerySignature::ProjectedScanLimit {
                 limit: 100,
+                offset: 0,
                 table: Some("t".to_string()),
                 columns: vec!["name".to_string(), "age".to_string()],
+            }
+        );
+        assert_eq!(
+            classify("SELECT name, age FROM t LIMIT 100 OFFSET 20"),
+            QuerySignature::ProjectedScanLimit {
+                limit: 100,
+                offset: 20,
+                table: Some("t".to_string()),
+                columns: vec!["name".to_string(), "age".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_numeric_range_filter_limit() {
+        assert_eq!(
+            classify("SELECT * FROM t WHERE age > 30 LIMIT 100 OFFSET 5"),
+            QuerySignature::NumericRangeFilterLimit {
+                table: Some("t".to_string()),
+                column: "age".to_string(),
+                low: next_up_f64(30.0),
+                high: f64::INFINITY,
+                limit: 100,
+                offset: 5,
+            }
+        );
+        assert_eq!(
+            classify("SELECT name FROM t WHERE score <= 50.5 LIMIT 10"),
+            QuerySignature::ProjectedNumericRangeFilterLimit {
+                table: Some("t".to_string()),
+                columns: vec!["name".to_string()],
+                column: "score".to_string(),
+                low: f64::NEG_INFINITY,
+                high: 50.5,
+                limit: 10,
+                offset: 0,
             }
         );
     }
