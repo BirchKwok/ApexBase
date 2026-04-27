@@ -535,6 +535,18 @@ impl Table {
     /// let batch = rs.to_record_batch().unwrap();
     /// ```
     pub fn execute(&self, sql: &str) -> Result<ResultSet> {
+        let sig = crate::query::query_signature::classify(sql);
+        if !matches!(
+            sig,
+            crate::query::query_signature::QuerySignature::CountStar { .. }
+        ) {
+            let engine = crate::storage::engine::engine();
+            let backend = engine.get_read_backend(&self.path)?;
+            if backend.pending_v4_in_memory_rows() > 0 {
+                backend.save()?;
+            }
+        }
+
         let base_dir = self.inner.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.inner.root_dir);
         let result = ApexExecutor::execute_with_base_dir(sql, &base_dir, &self.path);

@@ -468,6 +468,42 @@ class TestTransactionIsolation:
             assert c.count_rows() == 1
             c.close()
 
+    def test_txn_string_filter_with_committed_delta_backlog_and_own_insert(self):
+        """String equality queries stay correct inside txn even with committed delta backlog."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            c = ApexClient(temp_dir)
+            c.create_table('txn_backlog', {'name': 'string', 'score': 'int'})
+            c.use_table('txn_backlog')
+            c.store([{'name': f'base_{i}', 'score': i} for i in range(8)])
+            c.flush()
+
+            for i in range(128):
+                c.execute('BEGIN')
+                c.execute(
+                    f"INSERT INTO txn_backlog (name, score) VALUES ('delta_{i}', {1000 + i})"
+                )
+                c.execute('COMMIT')
+
+            c.execute('BEGIN')
+            assert c.execute(
+                "SELECT name, score FROM txn_backlog WHERE name = '__missing_txn_backlog__'"
+            ).to_dict() == []
+
+            c.execute(
+                "INSERT INTO txn_backlog (name, score) VALUES ('txn_visible', 4242)"
+            )
+            rows = c.execute(
+                "SELECT name, score FROM txn_backlog WHERE name = 'txn_visible'"
+            ).to_dict()
+            assert rows == [{'name': 'txn_visible', 'score': 4242}]
+            c.execute('COMMIT')
+
+            rows = c.execute(
+                "SELECT name, score FROM txn_backlog WHERE name = 'txn_visible'"
+            ).to_dict()
+            assert rows == [{'name': 'txn_visible', 'score': 4242}]
+            c.close()
+
     def test_savepoint_partial_rollback(self):
         """SAVEPOINT allows partial rollback within a transaction."""
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -3221,7 +3221,8 @@ impl TableStorageBackend {
                     if final_indices.is_empty() {
                         return self.read_columns_to_arrow(column_names, 0, Some(0));
                     }
-                    let batch = self.read_columns_by_indices_to_arrow(&final_indices, column_names)?;
+                    let batch =
+                        self.read_columns_by_indices_to_arrow(&final_indices, column_names)?;
                     return Self::project_record_batch_by_names(batch, column_names);
                 }
             }
@@ -3902,7 +3903,8 @@ impl TableStorageBackend {
         target: &str,
         agg_cols: &[&str],
     ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
-        self.storage.execute_filtered_string_agg_mmap(filter_col, target, agg_cols)
+        self.storage
+            .execute_filtered_string_agg_mmap(filter_col, target, agg_cols)
     }
 
     /// Build cached string dictionary indices for a column

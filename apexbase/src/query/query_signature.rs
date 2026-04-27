@@ -605,9 +605,19 @@ pub fn classify(sql: &str) -> QuerySignature {
     }
 
     // ── Filtered string equality aggregation: SELECT COUNT(*), AVG(col) ... FROM t WHERE str_col = 'val' ──
-    if has_where && !has_group && !has_order && !has_limit && !has_join && !has_distinct && !has_having {
-        let has_agg = su.contains("COUNT(") || su.contains("AVG(") || su.contains("SUM(")
-            || su.contains("MIN(") || su.contains("MAX(");
+    if has_where
+        && !has_group
+        && !has_order
+        && !has_limit
+        && !has_join
+        && !has_distinct
+        && !has_having
+    {
+        let has_agg = su.contains("COUNT(")
+            || su.contains("AVG(")
+            || su.contains("SUM(")
+            || su.contains("MIN(")
+            || su.contains("MAX(");
         if has_agg {
             if let Some((col, val)) = extract_string_equality(s, su) {
                 let table = extract_from_table(s, su);
@@ -1076,7 +1086,11 @@ mod tests {
         );
         assert_eq!(
             classify("SELECT name FROM t WHERE _id = 42"),
-            QuerySignature::Complex
+            QuerySignature::ProjectedPointLookup {
+                id: 42,
+                table: Some("t".to_string()),
+                columns: vec!["name".to_string()],
+            }
         );
         assert_eq!(
             classify("SELECT * FROM t WHERE _id = 42 AND age = 1"),

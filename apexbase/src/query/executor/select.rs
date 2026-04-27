@@ -1591,6 +1591,10 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         limit: Option<usize>,
     ) -> io::Result<Option<RecordBatch>> {
+        if backend.pending_v4_in_memory_rows() > 0 || backend.has_pending_deltas() {
+            return Ok(None);
+        }
+
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
@@ -2075,7 +2079,10 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() || backend.has_delta() {
+        if backend.pending_v4_in_memory_rows() > 0
+            || backend.has_pending_deltas()
+            || backend.has_delta()
+        {
             return Ok(None);
         }
 
@@ -2578,7 +2585,10 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() || backend.has_delta() {
+        if backend.pending_v4_in_memory_rows() > 0
+            || backend.has_pending_deltas()
+            || backend.has_delta()
+        {
             return Ok(None);
         }
 

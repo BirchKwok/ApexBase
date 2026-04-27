@@ -49,10 +49,8 @@ impl ApexExecutor {
         // is using a WAL-backed durability mode. Do not use get_cached_backend()
         // here: that read path compacts pending .delta files and turns small
         // transaction commits into full-table rewrites.
-        let mut wal_backends: std::collections::HashMap<
-            std::path::PathBuf,
-            TableStorageBackend,
-        > = std::collections::HashMap::new();
+        let mut wal_backends: std::collections::HashMap<std::path::PathBuf, TableStorageBackend> =
+            std::collections::HashMap::new();
         for table_path in &affected_tables {
             if let Ok(Some(backend)) = Self::open_txn_wal_backend(table_path) {
                 let _ = backend.storage.wal_write_txn_begin(txn_id);
@@ -1057,15 +1055,15 @@ impl ApexExecutor {
             match field.data_type() {
                 DataType::Int64 => {
                     let mut builder = Int64Builder::with_capacity(num_rows);
-	                    for row in rows {
-	                        match row.get(col_idx) {
-	                            Some(Value::Int64(v)) => builder.append_value(*v),
-	                            Some(Value::Int32(v)) => builder.append_value(*v as i64),
-	                            Some(Value::UInt64(v)) => builder.append_value(*v as i64),
-	                            Some(Value::Null) | None => builder.append_null(),
-	                            _ => builder.append_null(),
-	                        }
-	                    }
+                    for row in rows {
+                        match row.get(col_idx) {
+                            Some(Value::Int64(v)) => builder.append_value(*v),
+                            Some(Value::Int32(v)) => builder.append_value(*v as i64),
+                            Some(Value::UInt64(v)) => builder.append_value(*v as i64),
+                            Some(Value::Null) | None => builder.append_null(),
+                            _ => builder.append_null(),
+                        }
+                    }
                     arrays.push(Arc::new(builder.finish()));
                 }
                 DataType::UInt64 => {
@@ -1170,7 +1168,10 @@ impl ApexExecutor {
             if name == "_id" {
                 continue;
             }
-            data.insert(name.clone(), Self::arrow_value_at_col(batch.column(ci), row));
+            data.insert(
+                name.clone(),
+                Self::arrow_value_at_col(batch.column(ci), row),
+            );
         }
         data
     }
@@ -2846,7 +2847,10 @@ impl ApexExecutor {
         // ── Fast scan path: simple numeric/string predicate, no FK, no indexes ──
         // Numeric: delete_where_numeric_range_inplace — single pass, no id_to_idx HashMap.
         // String:  scan_string_filter_mmap → get_ids → delete_batch + save_delete_only.
-        if fk_children.is_empty() && indexed_cols.is_empty() {
+        if fk_children.is_empty()
+            && indexed_cols.is_empty()
+            && storage.pending_v4_in_memory_rows() == 0
+        {
             if let Some((col, low, high)) =
                 Self::extract_numeric_range_from_where(where_clause.unwrap())
             {
@@ -3059,7 +3063,10 @@ impl ApexExecutor {
         // For: all-literal SET + simple numeric WHERE + no constraints + no indexes.
         // Uses scan_and_update_inplace: single pass per SET column, writes directly to
         // the base .apex file — no DeltaStore serialization, no Arrow batch, no bincode.
-        if indexed_cols.is_empty() && !storage.storage.has_constraints() {
+        if indexed_cols.is_empty()
+            && !storage.storage.has_constraints()
+            && storage.pending_v4_in_memory_rows() == 0
+        {
             let all_lit = assignments
                 .iter()
                 .all(|(_, e)| matches!(e, SqlExpr::Literal(_)));

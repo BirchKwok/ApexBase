@@ -1097,7 +1097,11 @@ impl ApexExecutor {
                 }
                 // Fall through to full parse if fast path unavailable
             }
-            QuerySignature::SimpleScanLimit { limit, offset, ref table } => {
+            QuerySignature::SimpleScanLimit {
+                limit,
+                offset,
+                ref table,
+            } => {
                 let table_path = table
                     .as_ref()
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
@@ -1105,16 +1109,21 @@ impl ApexExecutor {
                 if let Ok(backend) = get_cached_backend(&table_path) {
                     if backend.pending_v4_in_memory_rows() == 0 {
                         if *offset == 0 {
-                            if let Ok(batch) = backend.read_columns_to_arrow(None, 0, Some(*limit)) {
+                            if let Ok(batch) = backend.read_columns_to_arrow(None, 0, Some(*limit))
+                            {
                                 return Ok(ApexResult::Data(batch));
                             }
                         } else if !backend.has_pending_deltas()
                             && !backend.has_delta()
                             && backend.active_row_count() == backend.row_count()
                         {
-                            let end = (*offset).saturating_add(*limit).min(backend.row_count() as usize);
+                            let end = (*offset)
+                                .saturating_add(*limit)
+                                .min(backend.row_count() as usize);
                             let indices: Vec<usize> = (*offset..end).collect();
-                            if let Ok(batch) = backend.read_columns_by_indices_to_arrow(&indices, None) {
+                            if let Ok(batch) =
+                                backend.read_columns_by_indices_to_arrow(&indices, None)
+                            {
                                 return Ok(ApexResult::Data(batch));
                             }
                         }
@@ -1159,7 +1168,8 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if !backend.has_pending_deltas() && !backend.has_delta()
+                    if !backend.has_pending_deltas()
+                        && !backend.has_delta()
                         && backend.pending_v4_in_memory_rows() == 0
                     {
                         let needed = (*offset).saturating_add(*limit);
@@ -1195,7 +1205,8 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if !backend.has_pending_deltas() && !backend.has_delta()
+                    if !backend.has_pending_deltas()
+                        && !backend.has_delta()
                         && backend.pending_v4_in_memory_rows() == 0
                     {
                         let needed = (*offset).saturating_add(*limit);
@@ -1231,7 +1242,7 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if backend.pending_v4_in_memory_rows() == 0 {
+                    if backend.pending_v4_in_memory_rows() == 0 && !backend.has_pending_deltas() {
                         if let Ok(batch) =
                             backend.read_columns_filtered_string_to_arrow(None, column, value, true)
                         {
@@ -1253,10 +1264,21 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if backend.pending_v4_in_memory_rows() == 0 {
-                        if let Ok(batch) = backend.read_columns_filtered_string_with_limit_to_arrow(
-                            None, column, value, true, *limit, *offset,
-                        ) {
+                    if backend.pending_v4_in_memory_rows() == 0 && !backend.has_pending_deltas() {
+                        let batch = if backend.has_delta() {
+                            backend
+                                .read_columns_filtered_string_to_arrow(None, column, value, true)
+                                .map(|full| {
+                                    let offset = (*offset).min(full.num_rows());
+                                    let len = (*limit).min(full.num_rows().saturating_sub(offset));
+                                    full.slice(offset, len)
+                                })
+                        } else {
+                            backend.read_columns_filtered_string_with_limit_to_arrow(
+                                None, column, value, true, *limit, *offset,
+                            )
+                        };
+                        if let Ok(batch) = batch {
                             return Ok(ApexResult::Data(batch));
                         }
                     }
@@ -1274,7 +1296,7 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if backend.pending_v4_in_memory_rows() == 0 {
+                    if backend.pending_v4_in_memory_rows() == 0 && !backend.has_pending_deltas() {
                         let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
                         if let Ok(batch) = backend.read_columns_filtered_string_to_arrow(
                             Some(col_refs.as_slice()),
@@ -1301,16 +1323,32 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if backend.pending_v4_in_memory_rows() == 0 {
+                    if backend.pending_v4_in_memory_rows() == 0 && !backend.has_pending_deltas() {
                         let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-                        if let Ok(batch) = backend.read_columns_filtered_string_with_limit_to_arrow(
-                            Some(col_refs.as_slice()),
-                            column,
-                            value,
-                            true,
-                            *limit,
-                            *offset,
-                        ) {
+                        let batch = if backend.has_delta() {
+                            backend
+                                .read_columns_filtered_string_to_arrow(
+                                    Some(col_refs.as_slice()),
+                                    column,
+                                    value,
+                                    true,
+                                )
+                                .map(|full| {
+                                    let offset = (*offset).min(full.num_rows());
+                                    let len = (*limit).min(full.num_rows().saturating_sub(offset));
+                                    full.slice(offset, len)
+                                })
+                        } else {
+                            backend.read_columns_filtered_string_with_limit_to_arrow(
+                                Some(col_refs.as_slice()),
+                                column,
+                                value,
+                                true,
+                                *limit,
+                                *offset,
+                            )
+                        };
+                        if let Ok(batch) = batch {
                             return Ok(ApexResult::Data(batch));
                         }
                     }
@@ -1347,7 +1385,8 @@ impl ApexExecutor {
                     .map(|tname| Self::resolve_table_path(tname, base_dir, default_table_path))
                     .unwrap_or_else(|| default_table_path.to_path_buf());
                 if let Ok(backend) = get_cached_backend(&table_path) {
-                    if !backend.has_pending_deltas() && !backend.has_delta()
+                    if !backend.has_pending_deltas()
+                        && !backend.has_delta()
                         && backend.pending_v4_in_memory_rows() == 0
                     {
                         // Fall through to full parse — the executor select() has
