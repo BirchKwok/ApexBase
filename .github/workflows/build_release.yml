@@ -78,14 +78,15 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install pytest maturin
-    - name: Build extension
+    - name: Build and install extension
       env:
         # Override .cargo/config.toml target-cpu=native to avoid SIGILL on CI runners
         RUSTFLAGS: ""
         PYO3_PYTHON: ${{ steps.py.outputs.python-path }}
         PYTHON_SYS_EXECUTABLE: ${{ steps.py.outputs.python-path }}
       run: |
-        maturin develop --release
+        maturin build --release --out dist -i ${{ steps.py.outputs.python-path }}
+        pip install dist/*.whl
     - name: Run tests
       run: |
         python -m pytest --ignore=test/test_memory_vs_duckdb.py
