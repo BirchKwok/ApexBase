@@ -55,6 +55,8 @@ jobs:
         cargo test --no-default-features ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --release
       env:
         RUST_BACKTRACE: 1
+        # Override .cargo/config.toml target-cpu=native to avoid SIGILL on CI runners
+        RUSTFLAGS: ""
 
   # ── Python tests ──
   test:
@@ -102,6 +104,9 @@ jobs:
 
     - name: Build wheels (manylinux)
       uses: PyO3/maturin-action@v1
+      env:
+        # Override .cargo/config.toml target-cpu=native to avoid SIGILL on CI runners
+        RUSTFLAGS: ""
       with:
         command: build
         args: --release --out dist --interpreter /opt/python/cp39-cp39/bin/python /opt/python/cp310-cp310/bin/python /opt/python/cp311-cp311/bin/python /opt/python/cp312-cp312/bin/python /opt/python/cp313-cp313/bin/python
@@ -142,6 +147,8 @@ jobs:
       env:
         PYO3_PYTHON: ${{ steps.py.outputs.python-path }}
         PYTHON_SYS_EXECUTABLE: ${{ steps.py.outputs.python-path }}
+        # Override .cargo/config.toml target-cpu=native to avoid SIGILL on CI runners
+        RUSTFLAGS: ""
       with:
         command: build
         args: --release --out dist --interpreter ${{ steps.py.outputs.python-path }}
@@ -218,6 +225,9 @@ jobs:
     - name: Verify crate packaging
       run: |
         cargo package --no-default-features --allow-dirty --list
+      env:
+        # Override .cargo/config.toml target-cpu=native to avoid SIGILL on CI runners
+        RUSTFLAGS: ""
 
     - name: Publish to crates.io (if version not exists)
       run: |
@@ -231,3 +241,5 @@ jobs:
         cargo publish --no-default-features --allow-dirty
       env:
         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # Override .cargo/config.toml target-cpu=native to avoid SIGILL on CI runners
+        RUSTFLAGS: ""
