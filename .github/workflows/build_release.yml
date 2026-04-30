@@ -61,6 +61,9 @@ jobs:
   # ── Python tests ──
   test:
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
@@ -76,21 +79,27 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pytest maturin
-    - name: Build and install extension
+    - name: Create virtualenv and build extension
       env:
         # Override .cargo/config.toml target-cpu=native to avoid SIGILL on CI runners
         RUSTFLAGS: ""
-        PYO3_PYTHON: ${{ steps.py.outputs.python-path }}
-        PYTHON_SYS_EXECUTABLE: ${{ steps.py.outputs.python-path }}
       run: |
-        maturin build --release --out dist -i ${{ steps.py.outputs.python-path }}
-        pip install dist/*.whl
+        python -m venv .venv
+        if [ -f .venv/Scripts/activate ]; then
+          source .venv/Scripts/activate
+        else
+          source .venv/bin/activate
+        fi
+        pip install --upgrade pip
+        pip install pytest maturin pyarrow pandas polars numpy
+        maturin develop --release
     - name: Run tests
       run: |
+        if [ -f .venv/Scripts/activate ]; then
+          source .venv/Scripts/activate
+        else
+          source .venv/bin/activate
+        fi
         python -m pytest --ignore=test/test_memory_vs_duckdb.py
 
   # ── Build Linux wheels (manylinux) ──
