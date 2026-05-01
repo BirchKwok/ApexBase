@@ -1038,9 +1038,6 @@ impl ApexStorageImpl {
             }
         }
 
-        // Pre-warm rayon global thread pool so first parallel CSV/parquet read has no thread-startup delay
-        rayon::spawn(|| {});
-
         // No default table - users must explicitly create or use a table
         // Existing .apex files in the directory are discovered lazily via use_table() or list_tables()
 
