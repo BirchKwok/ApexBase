@@ -112,6 +112,7 @@ jobs:
         python -m pip install pytest maturin
         python -m maturin build --release --out dist
         python -c "import glob, subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', glob.glob('dist/*.whl')[0]])"
+        python -c "import glob, os, pathlib, zipfile; wheel=glob.glob('dist/*.whl')[0]; z=zipfile.ZipFile(wheel); member=next(n for n in z.namelist() if n.startswith('apexbase/_core') and not n.endswith('/')); dst=pathlib.Path('apexbase')/'python'/'apexbase'/os.path.basename(member); dst.write_bytes(z.read(member)); print(f'Copied {member} -> {dst}')"
 
     - name: Run tests
       run: |
