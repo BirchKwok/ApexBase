@@ -123,12 +123,35 @@ jobs:
         env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
 
         subprocess.check_call([str(python), "-m", "pip", "install", "--upgrade", "pip"])
-        subprocess.check_call([str(python), "-m", "pip", "install", "pytest", "maturin", "pyarrow", "pandas", "polars"])
+        # Keep the native-extension test stack bounded; PyPI latest has hit
+        # macOS arm64 segfaults before the first ApexStorage construction.
+        test_deps = [
+            "pytest>=8.4,<9",
+            "maturin==1.9.1",
+            "numpy<2.4.4",
+            "pyarrow<24",
+            "pandas<3.0.2",
+            "polars<1.40",
+        ]
+        subprocess.check_call([str(python), "-m", "pip", "install", *test_deps])
         subprocess.check_call([str(python), "-m", "maturin", "develop", "--release", "--skip-install"], env=env)
+        smoke = """
+        import sys
+        import tempfile
+        sys.path.insert(0, 'apexbase/python')
+        import apexbase
+        import apexbase._core as core
+        print(apexbase.__file__)
+        print(core.__file__)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = apexbase.ApexClient(dirpath=tmpdir)
+            client.create_table('smoke')
+            client.close()
+        """
         subprocess.check_call([
             str(python),
             "-c",
-            "import sys; sys.path.insert(0, 'apexbase/python'); import apexbase, apexbase._core as core; print(apexbase.__file__); print(core.__file__)",
+            smoke,
         ], env=env)
 
         with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as path_file:
@@ -155,6 +178,7 @@ jobs:
       env:
         RUSTFLAGS: ${{ env.RUSTFLAGS }}
       with:
+        maturin-version: v1.9.1
         command: build
         args: --release --out dist --interpreter /opt/python/cp39-cp39/bin/python /opt/python/cp310-cp310/bin/python /opt/python/cp311-cp311/bin/python /opt/python/cp312-cp312/bin/python /opt/python/cp313-cp313/bin/python
         manylinux: 2014
@@ -195,6 +219,7 @@ jobs:
         PYO3_PYTHON: ${{ steps.py.outputs.python-path }}
         PYTHON_SYS_EXECUTABLE: ${{ steps.py.outputs.python-path }}
       with:
+        maturin-version: v1.9.1
         command: build
         args: --release --out dist --interpreter ${{ steps.py.outputs.python-path }}
 
@@ -215,6 +240,7 @@ jobs:
     - name: Build sdist
       uses: PyO3/maturin-action@v1
       with:
+        maturin-version: v1.9.1
         command: sdist
         args: --out dist
     - name: Upload sdist artifact
