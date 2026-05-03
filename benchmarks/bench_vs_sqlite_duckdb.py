@@ -205,7 +205,7 @@ def materialize_apex_vector_result(result_view):
 
 def materialize_duckdb_vector_result(cursor):
     if HAS_PYARROW:
-        return cursor.fetch_arrow_table()
+        return cursor.to_arrow_table()
     return cursor.fetchall()
 
 
