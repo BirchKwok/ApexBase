@@ -19,6 +19,7 @@ use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,7 +47,7 @@ enum ZoneMapResult {
 use crate::data::{DataType, Value};
 use crate::storage::TableStorageBackend;
 use ahash::AHasher;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 // ============================================================================
@@ -71,6 +72,11 @@ thread_local! {
 thread_local! {
     static SESSION_VARS: std::cell::RefCell<AHashMap<String, crate::data::Value>> =
         std::cell::RefCell::new(AHashMap::new());
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ViewCatalog {
+    views: HashMap<String, SelectStatement>,
 }
 
 #[inline]
@@ -898,6 +904,231 @@ impl ApexExecutor {
         Ok(Some(projected))
     }
 
+    fn view_catalog_path(base_dir: &Path) -> PathBuf {
+        base_dir.join(".apex_views.json")
+    }
+
+    fn read_view_catalog(base_dir: &Path) -> AHashMap<String, SelectStatement> {
+        let path = Self::view_catalog_path(base_dir);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => return AHashMap::new(),
+        };
+        let parsed: ViewCatalog = serde_json::from_str(&content).unwrap_or_default();
+        parsed
+            .views
+            .into_iter()
+            .map(|(name, stmt)| (name.to_lowercase(), stmt))
+            .collect()
+    }
+
+    fn write_view_catalog(
+        base_dir: &Path,
+        views: &AHashMap<String, SelectStatement>,
+    ) -> io::Result<()> {
+        let path = Self::view_catalog_path(base_dir);
+        let mut sorted = std::collections::BTreeMap::new();
+        for (name, stmt) in views {
+            sorted.insert(name.clone(), stmt.clone());
+        }
+        let catalog = ViewCatalog {
+            views: sorted.into_iter().collect(),
+        };
+        let json = serde_json::to_string(&catalog)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        std::fs::write(path, json)
+    }
+
+    fn persist_view(base_dir: &Path, name: &str, stmt: &SelectStatement) -> io::Result<()> {
+        let mut catalog = Self::read_view_catalog(base_dir);
+        catalog.insert(name.to_lowercase(), stmt.clone());
+        Self::write_view_catalog(base_dir, &catalog)
+    }
+
+    fn remove_persisted_view(base_dir: &Path, name: &str) -> io::Result<()> {
+        let mut catalog = Self::read_view_catalog(base_dir);
+        catalog.remove(&name.to_lowercase());
+        if catalog.is_empty() {
+            let path = Self::view_catalog_path(base_dir);
+            let _ = std::fs::remove_file(path);
+            return Ok(());
+        }
+        Self::write_view_catalog(base_dir, &catalog)
+    }
+
+    fn load_all_views(
+        base_dir: &Path,
+        session_views: &AHashMap<String, SelectStatement>,
+    ) -> AHashMap<String, SelectStatement> {
+        let mut merged = Self::read_view_catalog(base_dir);
+        for (name, stmt) in session_views {
+            merged.insert(name.to_lowercase(), stmt.clone());
+        }
+        merged
+    }
+
+    fn rewrite_statement_views(
+        stmt: SqlStatement,
+        views: &AHashMap<String, SelectStatement>,
+    ) -> SqlStatement {
+        match stmt {
+            SqlStatement::Select(select) => {
+                SqlStatement::Select(Self::rewrite_select_views(select, views))
+            }
+            SqlStatement::Union(mut union) => {
+                union.left = Box::new(Self::rewrite_statement_views(*union.left, views));
+                union.right = Box::new(Self::rewrite_statement_views(*union.right, views));
+                SqlStatement::Union(union)
+            }
+            SqlStatement::Cte {
+                name,
+                column_aliases,
+                body,
+                main,
+                recursive,
+            } => SqlStatement::Cte {
+                name,
+                column_aliases,
+                body: Box::new(Self::rewrite_statement_views(*body, views)),
+                main: Box::new(Self::rewrite_statement_views(*main, views)),
+                recursive,
+            },
+            SqlStatement::InsertSelect {
+                table,
+                columns,
+                query,
+            } => SqlStatement::InsertSelect {
+                table,
+                columns,
+                query: Box::new(Self::rewrite_statement_views(*query, views)),
+            },
+            SqlStatement::CreateTableAs {
+                table,
+                query,
+                if_not_exists,
+            } => SqlStatement::CreateTableAs {
+                table,
+                query: Box::new(Self::rewrite_statement_views(*query, views)),
+                if_not_exists,
+            },
+            SqlStatement::Explain { stmt, analyze } => SqlStatement::Explain {
+                stmt: Box::new(Self::rewrite_statement_views(*stmt, views)),
+                analyze,
+            },
+            SqlStatement::CreateView { name, stmt } => SqlStatement::CreateView {
+                name,
+                stmt: Self::rewrite_select_views(stmt, views),
+            },
+            other => other,
+        }
+    }
+
+    fn rewrite_from_item_views(
+        from: FromItem,
+        views: &AHashMap<String, SelectStatement>,
+    ) -> FromItem {
+        match from {
+            FromItem::Table { table, alias } => {
+                let table_name = table.trim_matches('"').to_lowercase();
+                if let Some(view_stmt) = views.get(&table_name) {
+                    let alias_name = alias.clone().unwrap_or_else(|| table.clone());
+                    FromItem::Subquery {
+                        stmt: Box::new(SqlStatement::Select(Self::rewrite_select_views(
+                            view_stmt.clone(),
+                            views,
+                        ))),
+                        alias: alias_name,
+                    }
+                } else {
+                    FromItem::Table { table, alias }
+                }
+            }
+            FromItem::Subquery { stmt, alias } => FromItem::Subquery {
+                stmt: Box::new(Self::rewrite_statement_views(*stmt, views)),
+                alias,
+            },
+            other => other,
+        }
+    }
+
+    fn rewrite_expr_views(expr: SqlExpr, views: &AHashMap<String, SelectStatement>) -> SqlExpr {
+        match expr {
+            SqlExpr::BinaryOp { left, op, right } => SqlExpr::BinaryOp {
+                left: Box::new(Self::rewrite_expr_views(*left, views)),
+                op,
+                right: Box::new(Self::rewrite_expr_views(*right, views)),
+            },
+            SqlExpr::UnaryOp { op, expr } => SqlExpr::UnaryOp {
+                op,
+                expr: Box::new(Self::rewrite_expr_views(*expr, views)),
+            },
+            SqlExpr::InSubquery {
+                column,
+                stmt,
+                negated,
+            } => SqlExpr::InSubquery {
+                column,
+                stmt: Box::new(Self::rewrite_select_views(*stmt, views)),
+                negated,
+            },
+            SqlExpr::ExistsSubquery { stmt } => SqlExpr::ExistsSubquery {
+                stmt: Box::new(Self::rewrite_select_views(*stmt, views)),
+            },
+            SqlExpr::ScalarSubquery { stmt } => SqlExpr::ScalarSubquery {
+                stmt: Box::new(Self::rewrite_select_views(*stmt, views)),
+            },
+            SqlExpr::Case {
+                when_then,
+                else_expr,
+            } => SqlExpr::Case {
+                when_then: when_then
+                    .into_iter()
+                    .map(|(when, then)| {
+                        (
+                            Self::rewrite_expr_views(when, views),
+                            Self::rewrite_expr_views(then, views),
+                        )
+                    })
+                    .collect(),
+                else_expr: else_expr.map(|expr| Box::new(Self::rewrite_expr_views(*expr, views))),
+            },
+            SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => SqlExpr::Between {
+                column,
+                low: Box::new(Self::rewrite_expr_views(*low, views)),
+                high: Box::new(Self::rewrite_expr_views(*high, views)),
+                negated,
+            },
+            SqlExpr::Function { name, args } => SqlExpr::Function {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|arg| Self::rewrite_expr_views(arg, views))
+                    .collect(),
+            },
+            SqlExpr::Cast { expr, data_type } => SqlExpr::Cast {
+                expr: Box::new(Self::rewrite_expr_views(*expr, views)),
+                data_type,
+            },
+            SqlExpr::Paren(expr) => {
+                SqlExpr::Paren(Box::new(Self::rewrite_expr_views(*expr, views)))
+            }
+            SqlExpr::ArrayIndex { array, index } => SqlExpr::ArrayIndex {
+                array: Box::new(Self::rewrite_expr_views(*array, views)),
+                index: Box::new(Self::rewrite_expr_views(*index, views)),
+            },
+            SqlExpr::ExplodeRename { inner, names } => SqlExpr::ExplodeRename {
+                inner: Box::new(Self::rewrite_expr_views(*inner, views)),
+                names,
+            },
+            other => other,
+        }
+    }
+
     /// Execute a SQL query on storage (single table)
     pub fn execute(sql: &str, storage_path: &Path) -> io::Result<ApexResult> {
         let base_dir = storage_path.parent().unwrap_or(storage_path);
@@ -1577,6 +1808,12 @@ impl ApexExecutor {
         base_dir: &Path,
         default_table_path: &Path,
     ) -> io::Result<ApexResult> {
+        let persisted_views = Self::read_view_catalog(base_dir);
+        let stmt = if persisted_views.is_empty() {
+            stmt
+        } else {
+            Self::rewrite_statement_views(stmt, &persisted_views)
+        };
         match stmt {
             SqlStatement::Select(select) => {
                 if select.joins.is_empty() {
@@ -1657,6 +1894,15 @@ impl ApexExecutor {
             SqlStatement::CopyToParquet { table, file_path } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 Self::execute_copy_to_parquet(&table_path, &table, &file_path)
+            }
+            SqlStatement::CopyExport {
+                table,
+                file_path,
+                format,
+                options,
+            } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                Self::execute_copy_export(&table_path, &table, &file_path, &format, &options)
             }
             SqlStatement::CopyFromParquet { table, file_path } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
@@ -1956,15 +2202,26 @@ impl ApexExecutor {
                         return Err(err_input("View name conflicts with existing table"));
                     }
 
-                    views.insert(view_name, stmt);
+                    let persisted = Self::read_view_catalog(base_dir);
+                    let rewritten_stmt = if persisted.is_empty() {
+                        stmt
+                    } else {
+                        Self::rewrite_select_views(stmt, &persisted)
+                    };
+                    Self::persist_view(base_dir, &view_name, &rewritten_stmt)?;
+                    views.insert(view_name.to_lowercase(), rewritten_stmt);
+                    last_result = Some(ApexResult::Scalar(0));
                 }
                 SqlStatement::DropView { name } => {
                     let view_name = name.trim_matches('"');
-                    views.remove(view_name);
+                    views.remove(&view_name.to_lowercase());
+                    Self::remove_persisted_view(base_dir, view_name)?;
+                    last_result = Some(ApexResult::Scalar(0));
                 }
                 // SELECT with view rewriting
                 SqlStatement::Select(mut select) => {
-                    select = Self::rewrite_select_views(select, &views);
+                    let merged_views = Self::load_all_views(base_dir, &views);
+                    select = Self::rewrite_select_views(select, &merged_views);
                     if let Some(txn_id) = current_txn {
                         last_result = Some(Self::execute_in_txn(
                             txn_id,
@@ -1981,10 +2238,24 @@ impl ApexExecutor {
                     }
                 }
                 SqlStatement::Union(union) => {
+                    let merged_views = Self::load_all_views(base_dir, &views);
+                    let union = match Self::rewrite_statement_views(
+                        SqlStatement::Union(union),
+                        &merged_views,
+                    ) {
+                        SqlStatement::Union(rewritten) => rewritten,
+                        _ => unreachable!(),
+                    };
                     last_result = Some(Self::execute_union(union, base_dir, default_table_path)?);
                 }
                 // DML/DDL statements - route through txn if active
                 other => {
+                    let merged_views = Self::load_all_views(base_dir, &views);
+                    let other = if merged_views.is_empty() {
+                        other
+                    } else {
+                        Self::rewrite_statement_views(other, &merged_views)
+                    };
                     if let Some(txn_id) = current_txn {
                         // Inside transaction: buffer DML through execute_in_txn
                         last_result = Some(Self::execute_in_txn(
@@ -2018,40 +2289,54 @@ impl ApexExecutor {
         mut select: SelectStatement,
         views: &AHashMap<String, SelectStatement>,
     ) -> SelectStatement {
-        // Rewrite FROM clause if it references a VIEW
-        if let Some(from) = &select.from {
-            match from {
-                FromItem::Table { table, alias } => {
-                    let table_name = table.trim_matches('"');
-                    if let Some(view_stmt) = views.get(table_name) {
-                        let alias_name = alias.clone().unwrap_or_else(|| table_name.to_string());
-                        select.from = Some(FromItem::Subquery {
-                            stmt: Box::new(SqlStatement::Select(view_stmt.clone())),
-                            alias: alias_name,
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Rewrite JOIN clauses if they reference VIEWs
-        let mut new_joins = Vec::with_capacity(select.joins.len());
-        for mut join in select.joins {
-            if let FromItem::Table { table, alias } = &join.right {
-                let table_name = table.trim_matches('"');
-                if let Some(view_stmt) = views.get(table_name) {
-                    let alias_name = alias.clone().unwrap_or_else(|| table_name.to_string());
-                    join.right = FromItem::Subquery {
-                        stmt: Box::new(SqlStatement::Select(view_stmt.clone())),
-                        alias: alias_name,
-                    };
-                }
-            }
-            new_joins.push(join);
-        }
-        select.joins = new_joins;
-
+        select.from = select
+            .from
+            .take()
+            .map(|from| Self::rewrite_from_item_views(from, views));
+        select.joins = select
+            .joins
+            .into_iter()
+            .map(|join| JoinClause {
+                join_type: join.join_type,
+                right: Self::rewrite_from_item_views(join.right, views),
+                on: Self::rewrite_expr_views(join.on, views),
+            })
+            .collect();
+        select.where_clause = select
+            .where_clause
+            .take()
+            .map(|expr| Self::rewrite_expr_views(expr, views));
+        select.group_by_exprs = select
+            .group_by_exprs
+            .into_iter()
+            .map(|expr| expr.map(|inner| Self::rewrite_expr_views(inner, views)))
+            .collect();
+        select.having = select
+            .having
+            .take()
+            .map(|expr| Self::rewrite_expr_views(expr, views));
+        select.order_by = select
+            .order_by
+            .into_iter()
+            .map(|mut clause| {
+                clause.expr = clause
+                    .expr
+                    .take()
+                    .map(|expr| Self::rewrite_expr_views(expr, views));
+                clause
+            })
+            .collect();
+        select.columns = select
+            .columns
+            .into_iter()
+            .map(|column| match column {
+                SelectColumn::Expression { expr, alias } => SelectColumn::Expression {
+                    expr: Self::rewrite_expr_views(expr, views),
+                    alias,
+                },
+                other => other,
+            })
+            .collect();
         select
     }
 

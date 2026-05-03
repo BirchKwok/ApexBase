@@ -529,6 +529,20 @@ class SQLiteBench:
             "SELECT city, COUNT(*) as cnt, AVG(score) FROM bench GROUP BY city HAVING cnt > 1000"
         )
 
+    def setup_view_bench(self):
+        self.conn.execute("DROP VIEW IF EXISTS bench_view")
+        self.conn.execute(
+            "CREATE VIEW bench_view AS "
+            "SELECT city, COUNT(*) AS cnt, AVG(score) AS avg_score "
+            "FROM bench GROUP BY city"
+        )
+        self.conn.commit()
+
+    def bench_view_select(self):
+        return self._query_all(
+            "SELECT city, cnt FROM bench_view WHERE cnt > 0 ORDER BY cnt DESC LIMIT 5"
+        )
+
     def bench_order_limit(self):
         return self._query_all(
             "SELECT * FROM bench ORDER BY score DESC LIMIT 100"
@@ -1055,6 +1069,19 @@ class DuckDBBench:
             "SELECT city, COUNT(*) as cnt, AVG(score) FROM bench GROUP BY city HAVING cnt > 1000"
         )
 
+    def setup_view_bench(self):
+        self.conn.execute("DROP VIEW IF EXISTS bench_view")
+        self.conn.execute(
+            "CREATE VIEW bench_view AS "
+            "SELECT city, COUNT(*) AS cnt, AVG(score) AS avg_score "
+            "FROM bench GROUP BY city"
+        )
+
+    def bench_view_select(self):
+        return self._query_all(
+            "SELECT city, cnt FROM bench_view WHERE cnt > 0 ORDER BY cnt DESC LIMIT 5"
+        )
+
     def bench_order_limit(self):
         return self._query_all(
             "SELECT * FROM bench ORDER BY score DESC LIMIT 100"
@@ -1479,6 +1506,12 @@ class ApexBaseBench:
         return self.client.execute(sql, show_internal_id=True).to_dict()
 
     def setup(self):
+        if self.client:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+            self.client = None
         if os.path.exists(self.db_dir):
             shutil.rmtree(self.db_dir)
         self.client = ApexClient(self.db_dir, drop_if_exists=True)
@@ -1544,6 +1577,22 @@ class ApexBaseBench:
     def bench_group_by_having(self):
         return self._query_all(
             "SELECT city, COUNT(*) as cnt, AVG(score) FROM default GROUP BY city HAVING cnt > 1000"
+        )
+
+    def setup_view_bench(self):
+        try:
+            self.client.execute("DROP VIEW bench_view")
+        except Exception:
+            pass
+        self.client.execute(
+            "CREATE VIEW bench_view AS "
+            "SELECT city, COUNT(*) AS cnt, AVG(score) AS avg_score "
+            "FROM default GROUP BY city"
+        )
+
+    def bench_view_select(self):
+        return self._query_all(
+            "SELECT city, cnt FROM bench_view WHERE cnt > 0 ORDER BY cnt DESC LIMIT 5"
         )
 
     def bench_order_limit(self):
@@ -1966,6 +2015,22 @@ class ApexBaseBench:
             return None
         return self.client.search_text('Electronics').tolist()
 
+    def bench_copy_to_csv(self):
+        path = os.path.join(self.db_dir, "bench_export.csv")
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        return self.client.execute(f"COPY default TO '{path}'").scalar()
+
+    def bench_copy_to_json(self):
+        path = os.path.join(self.db_dir, "bench_export.jsonl")
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        return self.client.execute(f"COPY default TO '{path}'").scalar()
+
     def close(self):
         if self.client:
             self.client.close()
@@ -1995,6 +2060,7 @@ BENCHMARKS = [
     ("GROUP BY category (10 groups)",    "bench_group_by_category", False, False, False, None),
     ("GROUP BY city ORDER BY count",     "bench_group_by_order_count", False, False, False, None),
     ("GROUP BY + HAVING",                "bench_group_by_having",  False, False, False, None),
+    ("Persistent VIEW select",           "bench_view_select",      False, False, False, "setup_view_bench"),
     ("ORDER BY score LIMIT 100",         "bench_order_limit",      False, False, False, None),
     ("Aggregation (5 funcs)",            "bench_aggregation",      False, False, False, None),
     ("Filtered aggregation (category)",  "bench_filtered_aggregation", False, False, False, None),
@@ -2037,6 +2103,7 @@ OLAP_BENCHMARK_NAMES = [
     "GROUP BY category (10 groups)",
     "GROUP BY city ORDER BY count",
     "GROUP BY + HAVING",
+    "Persistent VIEW select",
     "ORDER BY score LIMIT 100",
     "Aggregation (5 funcs)",
     "Filtered aggregation (category)",
@@ -2107,6 +2174,8 @@ OLTP_DEFAULT_BENCHMARKS = [
 
 OLTP_APEX_DIAGNOSTIC_BENCHMARKS = [
     ("Insert 10 rows (small-batch API diagnostic)", "bench_oltp_insert_10_rows"),
+    ("COPY TO CSV (Apex-only export)", "bench_copy_to_csv"),
+    ("COPY TO JSONL (Apex-only export)", "bench_copy_to_json"),
 ]
 
 OLTP_DURABLE_WRITE_BENCHMARKS = [
@@ -2653,10 +2722,10 @@ def run_apex_oltp_diagnostics(tmpdir, data, warmup, iterations):
     print("  " + "-" * (len(header) - 2))
 
     rows = []
-    diag_tmpdir = tempfile.mkdtemp(prefix="apexbase_oltp_diag_", dir=tmpdir)
-    bench = ApexBaseBench(diag_tmpdir, data)
-    try:
-        for bench_name, method_name in OLTP_APEX_DIAGNOSTIC_BENCHMARKS:
+    for bench_name, method_name in OLTP_APEX_DIAGNOSTIC_BENCHMARKS:
+        diag_tmpdir = tempfile.mkdtemp(prefix="apexbase_oltp_diag_", dir=tmpdir)
+        bench = ApexBaseBench(diag_tmpdir, data)
+        try:
             bench.setup()
             bench.bench_insert()
             fn = getattr(bench, method_name)
@@ -2666,15 +2735,15 @@ def run_apex_oltp_diagnostics(tmpdir, data, warmup, iterations):
                 "operation": bench_name,
                 "ApexBase": round(ms, 3),
             })
-    finally:
-        try:
-            bench.close()
-        except Exception:
-            pass
-        try:
-            shutil.rmtree(diag_tmpdir)
-        except Exception:
-            pass
+        finally:
+            try:
+                bench.close()
+            except Exception:
+                pass
+            try:
+                shutil.rmtree(diag_tmpdir)
+            except Exception:
+                pass
 
     return rows
 

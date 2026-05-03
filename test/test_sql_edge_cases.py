@@ -14,10 +14,7 @@ except ImportError as e:
 
 
 def xfail_sql(client, sql):
-    try:
-        return client.execute(sql)
-    except Exception as e:
-        pytest.xfail(f"Not supported: {e}")
+    return client.execute(sql)
 
 
 @pytest.fixture
@@ -548,6 +545,43 @@ class TestJoins:
         assert rows['Eng'] == 2 and rows['Sales'] == 1 and rows['HR'] == 0
 
 
+class TestOuterJoinQualifiedKeys:
+    def setup_method(self):
+        self.d = tempfile.mkdtemp()
+        self.c = ApexClient(dirpath=self.d)
+        self.c.execute("CREATE TABLE l (id INT, name STRING)")
+        self.c.execute("CREATE TABLE r (id INT, tag STRING)")
+        self.c.execute("INSERT INTO l VALUES (1,'a'),(2,'b')")
+        self.c.execute("INSERT INTO r VALUES (2,'x'),(3,'y')")
+
+    def teardown_method(self):
+        self.c.close()
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_right_join_preserves_qualified_right_key(self):
+        rv = self.c.execute("""
+            SELECT l.id AS lid, r.id AS rid, l.name, r.tag
+            FROM l RIGHT JOIN r ON l.id = r.id
+            ORDER BY r.tag
+        """)
+        assert rv.to_dict() == [
+            {"lid": 2, "rid": 2, "name": "b", "tag": "x"},
+            {"lid": None, "rid": 3, "name": None, "tag": "y"},
+        ]
+
+    def test_full_outer_join_preserves_both_join_keys(self):
+        rv = self.c.execute("""
+            SELECT l.id AS lid, r.id AS rid, l.name, r.tag
+            FROM l FULL OUTER JOIN r ON l.id = r.id
+            ORDER BY COALESCE(l.id, r.id)
+        """)
+        assert rv.to_dict() == [
+            {"lid": 1, "rid": None, "name": "a", "tag": None},
+            {"lid": 2, "rid": 2, "name": "b", "tag": "x"},
+            {"lid": None, "rid": 3, "name": None, "tag": "y"},
+        ]
+
+
 # ============================================================
 # GROUP BY + HAVING
 # ============================================================
@@ -643,6 +677,24 @@ class TestLimitOffsetEdge:
         self.c.execute("INSERT INTO t VALUES (0),(1),(2)")
         rv = self.c.execute("SELECT DISTINCT n FROM t ORDER BY n LIMIT 3")
         assert len(rv) == 3
+
+
+class TestOrderByNullHandling:
+    def setup_method(self):
+        self.d = tempfile.mkdtemp()
+        self.c = ApexClient(dirpath=self.d)
+        self.c.execute("CREATE TABLE t (v INT)")
+        self.c.execute("INSERT INTO t VALUES (NULL),(2),(1),(NULL),(3)")
+
+    def teardown_method(self):
+        self.c.close()
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_order_by_nulls_first_last(self):
+        asc = self.c.execute("SELECT v FROM t ORDER BY v NULLS FIRST").to_dict()
+        desc = self.c.execute("SELECT v FROM t ORDER BY v DESC NULLS LAST").to_dict()
+        assert [r["v"] for r in asc] == [None, None, 1, 2, 3]
+        assert [r["v"] for r in desc] == [3, 2, 1, None, None]
 
 
 # ============================================================

@@ -136,14 +136,11 @@ class TestReadCsv:
         assert abs(rv.scalar() - expected) < 1e-4
 
     def test_having(self):
-        try:
-            rv = self.c.execute(
-                f"SELECT city FROM read_csv('{self.csv}') GROUP BY city HAVING COUNT(*) > 1 ORDER BY city"
-            )
-            cities = [r['city'] for r in rv]
-            assert cities == ['Beijing', 'Shanghai']
-        except Exception as e:
-            pytest.xfail(f"HAVING on table function not yet supported: {e}")
+        rv = self.c.execute(
+            f"SELECT city FROM read_csv('{self.csv}') GROUP BY city HAVING COUNT(*) > 1 ORDER BY city"
+        )
+        cities = [r['city'] for r in rv]
+        assert cities == ['Beijing', 'Shanghai']
 
     def test_to_pandas(self):
         pytest.importorskip('pandas')
@@ -371,18 +368,15 @@ class TestReadFileCombined:
             {'name': 'Alice', 'score': 99},
             {'name': 'Bob',   'score': 55},
         ])
-        try:
-            rv = self.c.execute(f"""
-                SELECT u.name, s.score
-                FROM users u
-                JOIN read_csv('{scores}') s ON u.name = s.name
-                ORDER BY u.name
-            """)
-            assert len(rv) == 2
-            assert rv.first()['name'] == 'Alice'
-            assert rv.first()['score'] == 99
-        except Exception as e:
-            pytest.xfail(f"JOIN with table function not yet supported: {e}")
+        rv = self.c.execute(f"""
+            SELECT u.name, s.score
+            FROM users u
+            JOIN read_csv('{scores}') s ON u.name = s.name
+            ORDER BY u.name
+        """)
+        assert len(rv) == 2
+        assert rv.first()['name'] == 'Alice'
+        assert rv.first()['score'] == 99
 
     def test_where_on_join_result(self):
         scores = os.path.join(self.d, 'scores2.csv')
@@ -390,17 +384,14 @@ class TestReadFileCombined:
             {'name': 'Alice', 'score': 99},
             {'name': 'Bob',   'score': 55},
         ])
-        try:
-            rv = self.c.execute(f"""
-                SELECT u.name
-                FROM users u
-                JOIN read_csv('{scores}') s ON u.name = s.name
-                WHERE s.score >= 80
-            """)
-            assert len(rv) == 1
-            assert rv.first()['name'] == 'Alice'
-        except Exception as e:
-            pytest.xfail(f"JOIN with table function not yet supported: {e}")
+        rv = self.c.execute(f"""
+            SELECT u.name
+            FROM users u
+            JOIN read_csv('{scores}') s ON u.name = s.name
+            WHERE s.score >= 80
+        """)
+        assert len(rv) == 1
+        assert rv.first()['name'] == 'Alice'
 
     def test_csv_parquet_union(self):
         pq = os.path.join(self.d, 'extra.parquet')

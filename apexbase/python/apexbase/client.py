@@ -116,6 +116,7 @@ def _encode_vector_col(values) -> list:
 # Pre-compiled regex for SQL validation (avoids re-compilation on every query)
 _RE_CREATE_TABLE = re.compile(r"\bcreate\s+(table|view)\b", re.IGNORECASE)
 _RE_FROM_TABLE = re.compile(r"\bfrom\s+([\w]+(?:\.[\w]+)?)", re.IGNORECASE)
+_RE_FROM_OR_JOIN_TABLE = re.compile(r"\b(?:from|join)\s+([\w]+(?:\.[\w]+)?)", re.IGNORECASE)
 _RE_QUALIFIED_REF = re.compile(r"\b\w+\.\w+\b")
 _RE_SELECT_FROM = re.compile(r"\bselect\b(.*?)\bfrom\b", re.IGNORECASE | re.DOTALL)
 _RE_AGGREGATE_FUNC = re.compile(r"\b(count|sum|avg|min|max)\s*\(", re.IGNORECASE)
@@ -1834,19 +1835,21 @@ class ApexClient:
         # Cross-db qualified refs (e.g. FROM default.users) don't need a selected table
         _qualified = _RE_QUALIFIED_REF.search(sql)
         _has_qualified_ref = bool(_qualified and '.' in _qualified.group(0))
+        _references_view = self._references_persisted_view(sql)
 
         if _sig == 'table_func' or _sig == 'session':
             pass  # no table needed
         elif _sig == 'write':
             if not (sql_upper.startswith('CREATE ') or sql_upper.startswith('DROP TABLE')
-                    or sql_upper.startswith('COPY ') or _has_qualified_ref):
+                    or sql_upper.startswith('DROP VIEW')
+                    or sql_upper.startswith('COPY ') or _has_qualified_ref or _references_view):
                 self._ensure_table_selected()
         elif _sig == 'multi':
             try:
                 self._ensure_table_selected()
             except Exception:
                 pass
-        elif _has_qualified_ref or sql_upper.startswith('WITH '):
+        elif _has_qualified_ref or sql_upper.startswith('WITH ') or _references_view:
             pass  # CTE or cross-db qualified refs don't need a selected table
         elif _sig in ('count_star', 'point_lookup', 'projected_point_lookup',
                       'batch_lookup', 'projected_batch_lookup', 'scan_limit',
@@ -2439,8 +2442,34 @@ class ApexClient:
         apex_path = os.path.join(self._dirpath, f"{table_name}.apex")
         if os.path.exists(apex_path):
             return
+
+        if self._relation_exists_as_view(table_name):
+            return
         
         raise ValueError(f"Table '{m.group(1)}' not found")
+
+    def _relation_exists_as_view(self, table_name: str) -> bool:
+        view_catalog_path = os.path.join(self._dirpath, ".apex_views.json")
+        if not os.path.exists(view_catalog_path):
+            return False
+        try:
+            with open(view_catalog_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            views = payload.get("views", {})
+            return isinstance(views, dict) and table_name.lower() in views
+        except Exception:
+            return False
+
+    def _references_persisted_view(self, sql: str) -> bool:
+        for match in _RE_FROM_OR_JOIN_TABLE.finditer(sql):
+            relation = match.group(1).lower()
+            if relation in ('read_csv', 'read_json', 'read_parquet', 'topk_distance'):
+                continue
+            if '.' in relation:
+                continue
+            if self._relation_exists_as_view(relation):
+                return True
+        return False
     
     def _should_show_internal_id(self, sql: str) -> bool:
         """Determine if _id should be visible based on SQL (mirrors ApexClient logic)"""

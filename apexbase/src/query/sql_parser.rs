@@ -14,9 +14,10 @@
 use crate::data::DataType;
 use crate::data::Value;
 use crate::ApexError;
+use serde::{Deserialize, Serialize};
 
 /// Column-level constraint kinds
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ColumnConstraintKind {
     NotNull,
     PrimaryKey,
@@ -31,7 +32,7 @@ pub enum ColumnConstraintKind {
 }
 
 /// Column definition for CREATE TABLE
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
@@ -39,7 +40,7 @@ pub struct ColumnDef {
 }
 
 /// ALTER TABLE operation types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AlterTableOp {
     AddColumn { name: String, data_type: DataType },
     DropColumn { name: String },
@@ -47,7 +48,7 @@ pub enum AlterTableOp {
 }
 
 /// SQL Statement types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SqlStatement {
     Select(SelectStatement),
     Union(UnionStatement),
@@ -155,6 +156,12 @@ pub enum SqlStatement {
         table: String,
         file_path: String,
     },
+    CopyExport {
+        table: String,
+        file_path: String,
+        format: String,
+        options: Vec<(String, String)>,
+    },
     CopyFromParquet {
         table: String,
         file_path: String,
@@ -198,14 +205,14 @@ pub enum SqlStatement {
     ShowFtsIndexes,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SetOpType {
     Union,
     Intersect,
     Except,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnionStatement {
     pub left: Box<SqlStatement>,
     pub right: Box<SqlStatement>,
@@ -216,7 +223,7 @@ pub struct UnionStatement {
     pub offset: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FromItem {
     Table {
         table: String,
@@ -242,7 +249,7 @@ pub enum FromItem {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JoinType {
     Inner,
     Left,
@@ -251,7 +258,7 @@ pub enum JoinType {
     Cross,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinClause {
     pub join_type: JoinType,
     pub right: FromItem,
@@ -259,7 +266,7 @@ pub struct JoinClause {
 }
 
 /// SELECT statement structure
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectStatement {
     pub distinct: bool,
     pub columns: Vec<SelectColumn>,
@@ -275,7 +282,7 @@ pub struct SelectStatement {
 }
 
 /// Column selection in SELECT clause
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SelectColumn {
     /// SELECT *
     All,
@@ -307,7 +314,7 @@ pub enum SelectColumn {
 }
 
 /// Aggregate functions
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AggregateFunc {
     Count,
     Sum,
@@ -329,7 +336,7 @@ impl std::fmt::Display for AggregateFunc {
 }
 
 /// ORDER BY clause
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderByClause {
     pub column: String,
     pub descending: bool,
@@ -341,7 +348,7 @@ pub struct OrderByClause {
 }
 
 /// SQL Expression (for WHERE, HAVING, etc.)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SqlExpr {
     /// Column reference
     Column(String),
@@ -435,7 +442,7 @@ pub enum SqlExpr {
 }
 
 /// Binary operators
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BinaryOperator {
     // Comparison
     Eq,    // =
@@ -456,7 +463,7 @@ pub enum BinaryOperator {
 }
 
 /// Unary operators
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UnaryOperator {
     Not,
     Minus,
@@ -2359,69 +2366,23 @@ impl SqlParser {
                             };
                             match direction.as_str() {
                                 "TO" => {
-                                    return Ok(SqlStatement::CopyToParquet { table, file_path })
+                                    let (format, options) = self.parse_copy_options(&file_path)?;
+                                    if format == "PARQUET" && options.is_empty() {
+                                        return Ok(SqlStatement::CopyToParquet {
+                                            table,
+                                            file_path,
+                                        });
+                                    }
+                                    return Ok(SqlStatement::CopyExport {
+                                        table,
+                                        file_path,
+                                        format,
+                                        options,
+                                    });
                                 }
                                 "FROM" => {
-                                    // Parse optional (FORMAT CSV, HEADER true, DELIMITER ',', ...) options
-                                    let mut format: Option<String> = None;
-                                    let mut options: Vec<(String, String)> = Vec::new();
-                                    if matches!(self.current(), Token::LParen) {
-                                        self.advance();
-                                        loop {
-                                            let key = self.parse_identifier()?.to_uppercase();
-                                            if key == "FORMAT" {
-                                                let fmt_val =
-                                                    self.parse_identifier()?.to_uppercase();
-                                                format = Some(fmt_val);
-                                            } else {
-                                                let val = match self.current().clone() {
-                                                    Token::StringLit(s) => {
-                                                        self.advance();
-                                                        s
-                                                    }
-                                                    Token::Identifier(s) => {
-                                                        self.advance();
-                                                        s
-                                                    }
-                                                    Token::True => {
-                                                        self.advance();
-                                                        "true".to_string()
-                                                    }
-                                                    Token::False => {
-                                                        self.advance();
-                                                        "false".to_string()
-                                                    }
-                                                    Token::IntLit(n) => {
-                                                        self.advance();
-                                                        n.to_string()
-                                                    }
-                                                    _ => "true".to_string(),
-                                                };
-                                                options.push((key.to_lowercase(), val));
-                                            }
-                                            if !matches!(self.current(), Token::Comma) {
-                                                break;
-                                            }
-                                            self.advance();
-                                        }
-                                        self.expect(Token::RParen)?;
-                                    }
-                                    // Auto-detect format from file extension if not explicit
-                                    if format.is_none() {
-                                        let lower = file_path.to_lowercase();
-                                        if lower.ends_with(".csv") || lower.ends_with(".tsv") {
-                                            format = Some("CSV".to_string());
-                                        } else if lower.ends_with(".json")
-                                            || lower.ends_with(".ndjson")
-                                            || lower.ends_with(".jsonl")
-                                        {
-                                            format = Some("JSON".to_string());
-                                        } else {
-                                            format = Some("PARQUET".to_string());
-                                        }
-                                    }
-                                    let fmt = format.unwrap();
-                                    if fmt == "PARQUET" && options.is_empty() {
+                                    let (format, options) = self.parse_copy_options(&file_path)?;
+                                    if format == "PARQUET" && options.is_empty() {
                                         return Ok(SqlStatement::CopyFromParquet {
                                             table,
                                             file_path,
@@ -2430,7 +2391,7 @@ impl SqlParser {
                                     return Ok(SqlStatement::CopyImport {
                                         table,
                                         file_path,
-                                        format: fmt,
+                                        format,
                                         options,
                                     });
                                 }
@@ -4837,12 +4798,20 @@ impl SqlParser {
             Token::Identifier(s) => {
                 self.advance();
                 match s.to_uppercase().as_str() {
-                    "INT" | "INT64" | "INTEGER" | "BIGINT" => Ok(DataType::Int64),
-                    "FLOAT" | "FLOAT64" | "DOUBLE" | "REAL" => Ok(DataType::Float64),
+                    "TINYINT" | "INT1" => Ok(DataType::Int8),
+                    "SMALLINT" | "INT2" => Ok(DataType::Int16),
+                    "INT" | "INT4" | "INTEGER" => Ok(DataType::Int32),
+                    "BIGINT" | "INT64" => Ok(DataType::Int64),
+                    "UTINYINT" => Ok(DataType::UInt8),
+                    "USMALLINT" => Ok(DataType::UInt16),
+                    "UINTEGER" => Ok(DataType::UInt32),
+                    "UBIGINT" => Ok(DataType::UInt64),
+                    "FLOAT" | "FLOAT32" => Ok(DataType::Float32),
+                    "FLOAT64" | "DOUBLE" | "REAL" => Ok(DataType::Float64),
                     "STRING" | "TEXT" | "VARCHAR" => Ok(DataType::String),
                     "BOOL" | "BOOLEAN" => Ok(DataType::Bool),
-                    // Bytes type not supported yet, treat as String
-                    "BYTES" | "BLOB" | "BINARY" => Ok(DataType::String),
+                    "BYTES" | "BLOB" | "BINARY" | "VARBINARY" | "BYTEA" => Ok(DataType::Binary),
+                    "JSON" => Ok(DataType::Json),
                     "DECIMAL" | "NUMERIC" => {
                         // Skip optional (precision, scale) parameters
                         if matches!(self.current(), Token::LParen) {
@@ -4864,6 +4833,7 @@ impl SqlParser {
                     }
                     "TIMESTAMP" | "DATETIME" => Ok(DataType::Timestamp),
                     "DATE" => Ok(DataType::Date),
+                    "ARRAY" => Ok(DataType::Array),
                     "FLOAT16_VECTOR" | "FLOAT16VECTOR" | "F16_VECTOR" => {
                         Ok(DataType::Float16Vector)
                     }
@@ -4919,6 +4889,69 @@ impl SqlParser {
                 Err(self.syntax_error(start, "Expected ADD, DROP, or RENAME".to_string()))
             }
         }
+    }
+
+    fn parse_copy_options(
+        &mut self,
+        file_path: &str,
+    ) -> Result<(String, Vec<(String, String)>), ApexError> {
+        let mut format: Option<String> = None;
+        let mut options: Vec<(String, String)> = Vec::new();
+        if matches!(self.current(), Token::LParen) {
+            self.advance();
+            loop {
+                let key = self.parse_identifier()?.to_uppercase();
+                if key == "FORMAT" {
+                    let fmt_val = self.parse_identifier()?.to_uppercase();
+                    format = Some(fmt_val);
+                } else {
+                    let val = match self.current().clone() {
+                        Token::StringLit(s) => {
+                            self.advance();
+                            s
+                        }
+                        Token::Identifier(s) => {
+                            self.advance();
+                            s
+                        }
+                        Token::True => {
+                            self.advance();
+                            "true".to_string()
+                        }
+                        Token::False => {
+                            self.advance();
+                            "false".to_string()
+                        }
+                        Token::IntLit(n) => {
+                            self.advance();
+                            n.to_string()
+                        }
+                        _ => "true".to_string(),
+                    };
+                    options.push((key.to_lowercase(), val));
+                }
+                if !matches!(self.current(), Token::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+            self.expect(Token::RParen)?;
+        }
+
+        let format = format.unwrap_or_else(|| {
+            let lower = file_path.to_lowercase();
+            if lower.ends_with(".csv") || lower.ends_with(".tsv") {
+                "CSV".to_string()
+            } else if lower.ends_with(".json")
+                || lower.ends_with(".ndjson")
+                || lower.ends_with(".jsonl")
+            {
+                "JSON".to_string()
+            } else {
+                "PARQUET".to_string()
+            }
+        });
+        Ok((format, options))
     }
 
     /// Parse comma-separated list of identifiers
@@ -5297,6 +5330,57 @@ mod tests {
                 .any(|c| matches!(c, ColumnConstraintKind::ForeignKey { .. }));
             assert!(has_check);
             assert!(has_fk);
+        } else {
+            panic!("Expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_copy_to_csv_parsed_as_export() {
+        let stmt = SqlParser::parse("COPY t TO 'out.csv'").unwrap();
+        match stmt {
+            SqlStatement::CopyExport {
+                table,
+                file_path,
+                format,
+                options,
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(file_path, "out.csv");
+                assert_eq!(format, "CSV");
+                assert!(options.is_empty());
+            }
+            other => panic!("Expected CopyExport, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_copy_to_json_with_options() {
+        let stmt = SqlParser::parse("COPY t TO 'out.jsonl' (FORMAT JSON, HEADER false)").unwrap();
+        match stmt {
+            SqlStatement::CopyExport {
+                format, options, ..
+            } => {
+                assert_eq!(format, "JSON");
+                assert!(options.iter().any(|(k, v)| k == "header" && v == "false"));
+            }
+            other => panic!("Expected CopyExport, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_extended_numeric_and_json_types() {
+        let stmt = SqlParser::parse(
+            "CREATE TABLE t (a TINYINT, b SMALLINT, c UINTEGER, d FLOAT32, e JSON, f BLOB)",
+        )
+        .unwrap();
+        if let SqlStatement::CreateTable { columns, .. } = stmt {
+            assert_eq!(columns[0].data_type, DataType::Int8);
+            assert_eq!(columns[1].data_type, DataType::Int16);
+            assert_eq!(columns[2].data_type, DataType::UInt32);
+            assert_eq!(columns[3].data_type, DataType::Float32);
+            assert_eq!(columns[4].data_type, DataType::Json);
+            assert_eq!(columns[5].data_type, DataType::Binary);
         } else {
             panic!("Expected CreateTable");
         }

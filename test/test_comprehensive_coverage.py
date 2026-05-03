@@ -33,11 +33,8 @@ except ImportError:
 
 
 def xfail_sql(client, sql):
-    """Execute SQL; mark xfail if unimplemented, hard-fail on wrong results."""
-    try:
-        return client.execute(sql)
-    except Exception as e:
-        pytest.xfail(f"Not supported: {e}")
+    """Execute SQL and fail loudly on regressions."""
+    return client.execute(sql)
 
 
 @pytest.fixture

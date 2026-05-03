@@ -16,10 +16,7 @@ except ImportError as e:
 
 
 def _execute_or_xfail(client: ApexClient, sql: str):
-    try:
-        return client.execute(sql)
-    except Exception as e:
-        pytest.xfail(f"SQL not supported yet: {type(e).__name__}: {e}")
+    return client.execute(sql)
 
 
 class TestSqlBusinessCases:
@@ -140,7 +137,13 @@ class TestSqlBusinessCases:
             out = res.to_dict()
             assert out == [{"team": "ml", "closed_cnt": 2, "worst_mins": 300}]
 
-            # VIEW should auto-expire
+            persisted = client.execute("SELECT team, closed_cnt, worst_mins FROM v_team_sla ORDER BY team").to_dict()
+            assert persisted == [
+                {"team": "core", "closed_cnt": 3, "worst_mins": 120},
+                {"team": "ml", "closed_cnt": 2, "worst_mins": 300},
+            ]
+
+            client.execute("DROP VIEW v_team_sla")
             with pytest.raises(Exception):
                 client.execute("SELECT * FROM v_team_sla").to_dict()
 
@@ -297,7 +300,14 @@ class TestSqlBusinessCases:
             assert result[0]['salary'] == 130000
             assert result[0]['project_name'] == 'Alpha'
 
-            # Verify VIEW is session-scoped (should fail outside the execute)
+            # VIEW should remain queryable until explicitly dropped
+            persisted = client.execute(
+                "SELECT name, salary FROM v_high_performers ORDER BY salary DESC"
+            ).to_dict()
+            assert persisted[0]["name"] == "Henry"
+            assert persisted[-1]["salary"] > 90000
+
+            client.execute("DROP VIEW v_high_performers")
             with pytest.raises(Exception):
                 client.execute("SELECT * FROM v_high_performers")
 

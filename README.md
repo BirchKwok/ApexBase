@@ -742,7 +742,7 @@ cargo build --release --bin apexbase-server --no-default-features --features ser
 
 ### Connecting with Database Tools
 
-The server emulates PostgreSQL 15.0, reports a `pg_catalog` and `information_schema` compatible metadata layer, and supports `SimpleQuery` protocol. No username or password is required (authentication is disabled).
+The server emulates PostgreSQL 15.0, reports a `pg_catalog` and `information_schema` compatible metadata layer, and supports both `SimpleQuery` and `Extended Query` protocols (prepared statements; binary result format for psycopg3). No username or password is required (authentication is disabled).
 
 #### DBeaver
 

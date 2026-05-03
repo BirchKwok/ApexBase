@@ -5,6 +5,20 @@ use crate::query::vectorized_join::{
     filter_int64_batch, filter_float64_batch,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonMutationMode {
+    Set,
+    Insert,
+    Replace,
+    Remove,
+}
+
+#[derive(Clone)]
+enum JsonPathSegment {
+    Key(String),
+    Index(usize),
+}
+
 impl ApexExecutor {
     /// Apply WHERE clause filter using Arrow compute
     /// When storage_path is provided, enables Zone Map optimization and subquery support
@@ -2793,6 +2807,68 @@ impl ApexExecutor {
                 }
                 Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_str()).collect::<Vec<_>>())))
             }
+            "JSON_SET" | "JSON_INSERT" | "JSON_REPLACE" => {
+                if args.len() != 3 {
+                    return Err(err_input(format!(
+                        "{} requires 3 arguments (json, path, value)",
+                        name
+                    )));
+                }
+                let json_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let path_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                let value_arr = Self::evaluate_expr_to_array(batch, &args[2])?;
+                let json_sa = json_arr.as_any().downcast_ref::<StringArray>();
+                let path_sa = path_arr.as_any().downcast_ref::<StringArray>();
+                let mut result: Vec<Option<String>> = Vec::with_capacity(batch.num_rows());
+                for row in 0..batch.num_rows() {
+                    if json_arr.is_null(row) || path_arr.is_null(row) {
+                        result.push(None);
+                        continue;
+                    }
+                    let Some(json_str) = json_sa.map(|a| a.value(row)) else {
+                        result.push(None);
+                        continue;
+                    };
+                    let Some(path_str) = path_sa.map(|a| a.value(row)) else {
+                        result.push(None);
+                        continue;
+                    };
+                    let value = Self::arrow_value_at_col(&value_arr, row).to_json_value();
+                    let updated = match name {
+                        "JSON_SET" => Self::json_set_path(json_str, path_str, value),
+                        "JSON_INSERT" => Self::json_insert_path(json_str, path_str, value),
+                        _ => Self::json_replace_path(json_str, path_str, value),
+                    };
+                    result.push(updated);
+                }
+                Ok(Arc::new(StringArray::from(result)))
+            }
+            "JSON_REMOVE" => {
+                if args.len() != 2 {
+                    return Err(err_input("JSON_REMOVE requires 2 arguments (json, path)"));
+                }
+                let json_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let path_arr = Self::evaluate_expr_to_array(batch, &args[1])?;
+                let json_sa = json_arr.as_any().downcast_ref::<StringArray>();
+                let path_sa = path_arr.as_any().downcast_ref::<StringArray>();
+                let mut result: Vec<Option<String>> = Vec::with_capacity(batch.num_rows());
+                for row in 0..batch.num_rows() {
+                    if json_arr.is_null(row) || path_arr.is_null(row) {
+                        result.push(None);
+                        continue;
+                    }
+                    let Some(json_str) = json_sa.map(|a| a.value(row)) else {
+                        result.push(None);
+                        continue;
+                    };
+                    let Some(path_str) = path_sa.map(|a| a.value(row)) else {
+                        result.push(None);
+                        continue;
+                    };
+                    result.push(Self::json_remove_path(json_str, path_str));
+                }
+                Ok(Arc::new(StringArray::from(result)))
+            }
             // ===== Vector Distance Functions =====
             // Naming mirrors DuckDB's array functions for drop-in compatibility.
             "ARRAY_DISTANCE"            | "L2_DISTANCE"                   |
@@ -3004,6 +3080,241 @@ impl ApexExecutor {
             }
         }
         Some(current.to_string())
+    }
+
+    fn json_set_path(
+        json_str: &str,
+        path: &str,
+        value: serde_json::Value,
+    ) -> Option<String> {
+        Self::json_mutate_path(json_str, path, Some(value), JsonMutationMode::Set)
+    }
+
+    fn json_insert_path(
+        json_str: &str,
+        path: &str,
+        value: serde_json::Value,
+    ) -> Option<String> {
+        Self::json_mutate_path(json_str, path, Some(value), JsonMutationMode::Insert)
+    }
+
+    fn json_replace_path(
+        json_str: &str,
+        path: &str,
+        value: serde_json::Value,
+    ) -> Option<String> {
+        Self::json_mutate_path(json_str, path, Some(value), JsonMutationMode::Replace)
+    }
+
+    fn json_remove_path(json_str: &str, path: &str) -> Option<String> {
+        Self::json_mutate_path(json_str, path, None, JsonMutationMode::Remove)
+    }
+
+    fn json_mutate_path(
+        json_str: &str,
+        path: &str,
+        value: Option<serde_json::Value>,
+        mode: JsonMutationMode,
+    ) -> Option<String> {
+        let mut root: serde_json::Value = serde_json::from_str(json_str).ok()?;
+        let segments = Self::json_parse_path_segments(path)?;
+        if segments.is_empty() {
+            return Some(root.to_string());
+        }
+        let changed = Self::json_apply_mutation(&mut root, &segments, value, mode);
+        if changed {
+            Some(root.to_string())
+        } else {
+            Some(json_str.trim().to_string())
+        }
+    }
+
+    fn json_parse_path_segments(path: &str) -> Option<Vec<JsonPathSegment>> {
+        let mut chars = path.trim().chars().peekable();
+        if chars.peek() == Some(&'$') {
+            chars.next();
+        }
+
+        let mut segments = Vec::new();
+        while let Some(ch) = chars.peek().copied() {
+            match ch {
+                '.' => {
+                    chars.next();
+                    let mut key = String::new();
+                    while let Some(c) = chars.peek().copied() {
+                        if c == '.' || c == '[' {
+                            break;
+                        }
+                        key.push(c);
+                        chars.next();
+                    }
+                    if key.is_empty() {
+                        return None;
+                    }
+                    segments.push(JsonPathSegment::Key(key));
+                }
+                '[' => {
+                    chars.next();
+                    let mut idx = String::new();
+                    while let Some(c) = chars.peek().copied() {
+                        if c == ']' {
+                            break;
+                        }
+                        idx.push(c);
+                        chars.next();
+                    }
+                    if chars.next() != Some(']') {
+                        return None;
+                    }
+                    segments.push(JsonPathSegment::Index(idx.parse().ok()?));
+                }
+                _ => {
+                    let mut key = String::new();
+                    while let Some(c) = chars.peek().copied() {
+                        if c == '.' || c == '[' {
+                            break;
+                        }
+                        key.push(c);
+                        chars.next();
+                    }
+                    if key.is_empty() {
+                        return None;
+                    }
+                    segments.push(JsonPathSegment::Key(key));
+                }
+            }
+        }
+        Some(segments)
+    }
+
+    fn json_apply_mutation(
+        current: &mut serde_json::Value,
+        segments: &[JsonPathSegment],
+        value: Option<serde_json::Value>,
+        mode: JsonMutationMode,
+    ) -> bool {
+        if segments.is_empty() {
+            return false;
+        }
+
+        let is_last = segments.len() == 1;
+        match &segments[0] {
+            JsonPathSegment::Key(key) => {
+                if !current.is_object() {
+                    if mode == JsonMutationMode::Replace || mode == JsonMutationMode::Remove {
+                        return false;
+                    }
+                    *current = serde_json::Value::Object(serde_json::Map::new());
+                }
+                let Some(map) = current.as_object_mut() else {
+                    return false;
+                };
+                if is_last {
+                    return match mode {
+                        JsonMutationMode::Set => {
+                            map.insert(key.clone(), value.unwrap_or(serde_json::Value::Null));
+                            true
+                        }
+                        JsonMutationMode::Insert => {
+                            if map.contains_key(key) {
+                                false
+                            } else {
+                                map.insert(key.clone(), value.unwrap_or(serde_json::Value::Null));
+                                true
+                            }
+                        }
+                        JsonMutationMode::Replace => {
+                            if let Some(slot) = map.get_mut(key) {
+                                *slot = value.unwrap_or(serde_json::Value::Null);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        JsonMutationMode::Remove => map.remove(key).is_some(),
+                    };
+                }
+
+                if !map.contains_key(key) {
+                    if mode == JsonMutationMode::Replace || mode == JsonMutationMode::Remove {
+                        return false;
+                    }
+                    map.insert(
+                        key.clone(),
+                        Self::json_default_container_for(&segments[1]),
+                    );
+                }
+                let Some(child) = map.get_mut(key) else {
+                    return false;
+                };
+                Self::json_apply_mutation(child, &segments[1..], value, mode)
+            }
+            JsonPathSegment::Index(idx) => {
+                if !current.is_array() {
+                    if mode == JsonMutationMode::Replace || mode == JsonMutationMode::Remove {
+                        return false;
+                    }
+                    *current = serde_json::Value::Array(Vec::new());
+                }
+                let Some(arr) = current.as_array_mut() else {
+                    return false;
+                };
+                if is_last {
+                    return match mode {
+                        JsonMutationMode::Set => {
+                            if *idx >= arr.len() {
+                                arr.resize(*idx + 1, serde_json::Value::Null);
+                            }
+                            arr[*idx] = value.unwrap_or(serde_json::Value::Null);
+                            true
+                        }
+                        JsonMutationMode::Insert => {
+                            if *idx < arr.len() {
+                                false
+                            } else {
+                                arr.resize(*idx, serde_json::Value::Null);
+                                arr.push(value.unwrap_or(serde_json::Value::Null));
+                                true
+                            }
+                        }
+                        JsonMutationMode::Replace => {
+                            if *idx < arr.len() {
+                                arr[*idx] = value.unwrap_or(serde_json::Value::Null);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        JsonMutationMode::Remove => {
+                            if *idx < arr.len() {
+                                arr.remove(*idx);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                }
+
+                if *idx >= arr.len() {
+                    if mode == JsonMutationMode::Replace || mode == JsonMutationMode::Remove {
+                        return false;
+                    }
+                    arr.resize(*idx + 1, serde_json::Value::Null);
+                }
+                if arr[*idx].is_null() {
+                    arr[*idx] = Self::json_default_container_for(&segments[1]);
+                }
+                Self::json_apply_mutation(&mut arr[*idx], &segments[1..], value, mode)
+            }
+        }
+    }
+
+    fn json_default_container_for(next: &JsonPathSegment) -> serde_json::Value {
+        match next {
+            JsonPathSegment::Key(_) => serde_json::Value::Object(serde_json::Map::new()),
+            JsonPathSegment::Index(_) => serde_json::Value::Array(Vec::new()),
+        }
     }
 
     /// Get a value from a JSON object by key (simple parser, no external deps)

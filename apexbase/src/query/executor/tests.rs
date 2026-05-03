@@ -1195,11 +1195,8 @@ fn test_olap_boolean_filter() {
 
 /// Helper: parse + execute SQL via multi-table path with a base dir
 fn exec_multi(sql: &str, base_dir: &Path) -> io::Result<ApexResult> {
-    use crate::query::sql_parser::SqlParser;
-    let stmt = SqlParser::parse(sql)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", e)))?;
     let default_path = base_dir.join("default.apex");
-    ApexExecutor::execute_parsed_multi(stmt, base_dir, &default_path)
+    ApexExecutor::execute_with_base_dir(sql, base_dir, &default_path)
 }
 
 /// Helper: assert that a Result is an error containing expected substring
@@ -1464,6 +1461,67 @@ fn test_right_join() {
 }
 
 #[test]
+fn test_right_join_qualified_key_projection() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    exec_multi("CREATE TABLE left_t (id INT, lval TEXT)", base).unwrap();
+    exec_multi("CREATE TABLE right_t (id INT, rval TEXT)", base).unwrap();
+    exec_multi(
+        "INSERT INTO left_t (id, lval) VALUES (1, 'a'), (2, 'b')",
+        base,
+    )
+    .unwrap();
+    exec_multi(
+        "INSERT INTO right_t (id, rval) VALUES (2, 'x'), (3, 'y')",
+        base,
+    )
+    .unwrap();
+
+    let result = exec_multi(
+        "SELECT left_t.id AS lid, right_t.id AS rid, left_t.lval, right_t.rval \
+         FROM left_t RIGHT JOIN right_t ON left_t.id = right_t.id \
+         ORDER BY right_t.rval",
+        base,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+
+    let lid = batch
+        .column_by_name("lid")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let rid = batch
+        .column_by_name("rid")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let lval = batch
+        .column_by_name("lval")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let rval = batch
+        .column_by_name("rval")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(lid.value(0), 2);
+    assert!(lid.is_null(1));
+    assert_eq!(rid.value(0), 2);
+    assert_eq!(rid.value(1), 3);
+    assert_eq!(lval.value(0), "b");
+    assert!(lval.is_null(1));
+    assert_eq!(rval.value(0), "x");
+    assert_eq!(rval.value(1), "y");
+}
+
+#[test]
 fn test_full_outer_join() {
     let dir = tempdir().unwrap();
     let base = dir.path();
@@ -1478,6 +1536,63 @@ fn test_full_outer_join() {
 }
 
 #[test]
+fn test_full_outer_join_qualified_key_projection() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    exec_multi("CREATE TABLE fl (id INT, lv TEXT)", base).unwrap();
+    exec_multi("CREATE TABLE fr (id INT, rv TEXT)", base).unwrap();
+    exec_multi("INSERT INTO fl (id, lv) VALUES (1, 'a'), (2, 'b')", base).unwrap();
+    exec_multi("INSERT INTO fr (id, rv) VALUES (2, 'x'), (3, 'y')", base).unwrap();
+
+    let result = exec_multi(
+        "SELECT fl.id AS lid, fr.id AS rid, fl.lv, fr.rv \
+         FROM fl FULL OUTER JOIN fr ON fl.id = fr.id \
+         ORDER BY COALESCE(fl.id, fr.id)",
+        base,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+
+    let lid = batch
+        .column_by_name("lid")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let rid = batch
+        .column_by_name("rid")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let lv = batch
+        .column_by_name("lv")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let rv = batch
+        .column_by_name("rv")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(lid.value(0), 1);
+    assert!(rid.is_null(0));
+    assert_eq!(lid.value(1), 2);
+    assert_eq!(rid.value(1), 2);
+    assert!(lid.is_null(2));
+    assert_eq!(rid.value(2), 3);
+    assert_eq!(lv.value(0), "a");
+    assert_eq!(lv.value(1), "b");
+    assert!(lv.is_null(2));
+    assert!(rv.is_null(0));
+    assert_eq!(rv.value(1), "x");
+    assert_eq!(rv.value(2), "y");
+}
+
+#[test]
 fn test_cross_join() {
     let dir = tempdir().unwrap();
     let base = dir.path();
@@ -1489,6 +1604,158 @@ fn test_cross_join() {
     let batch = result.to_record_batch().unwrap();
     // CROSS JOIN: 2 × 3 = 6 rows
     assert_eq!(batch.num_rows(), 6);
+}
+
+#[test]
+fn test_persistent_view_across_execute_calls() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+
+    exec_multi("CREATE TABLE src (id INT, city TEXT)", base).unwrap();
+    exec_multi(
+        "INSERT INTO src (id, city) VALUES (1, 'Beijing'), (2, 'Shanghai')",
+        base,
+    )
+    .unwrap();
+    exec_multi(
+        "CREATE VIEW v_src AS SELECT id, city FROM src WHERE id >= 2",
+        base,
+    )
+    .unwrap();
+
+    let result = exec_multi("SELECT city FROM v_src", base).unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let city = batch
+        .column_by_name("city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(city.value(0), "Shanghai");
+
+    let reopened = exec_multi("SELECT COUNT(*) FROM v_src", base).unwrap();
+    let count_batch = reopened.to_record_batch().unwrap();
+    assert_eq!(
+        count_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+
+    exec_multi("DROP VIEW v_src", base).unwrap();
+    assert!(exec_multi("SELECT * FROM v_src", base).is_err());
+}
+
+#[test]
+fn test_persistent_view_over_default_table_without_default_path() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+
+    exec_multi("CREATE TABLE default (a INT)", base).unwrap();
+    exec_multi("INSERT INTO default (a) VALUES (1), (2), (3)", base).unwrap();
+    exec_multi(
+        "CREATE VIEW v_default AS SELECT a FROM default WHERE a >= 2",
+        base,
+    )
+    .unwrap();
+
+    let result =
+        ApexExecutor::execute_with_base_dir("SELECT * FROM v_default ORDER BY a", base, base)
+            .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let values = batch
+        .column_by_name("a")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(values.value(0), 2);
+    assert_eq!(values.value(1), 3);
+}
+
+#[test]
+fn test_copy_to_csv_and_json_export() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let csv_path = base.join("export.csv");
+    let json_path = base.join("export.jsonl");
+
+    exec_multi("CREATE TABLE export_t (id INT, name TEXT)", base).unwrap();
+    exec_multi(
+        "INSERT INTO export_t (id, name) VALUES (1, 'Alice'), (2, 'Bob')",
+        base,
+    )
+    .unwrap();
+
+    exec_multi(
+        &format!("COPY export_t TO '{}'", csv_path.to_string_lossy()),
+        base,
+    )
+    .unwrap();
+    exec_multi(
+        &format!("COPY export_t TO '{}'", json_path.to_string_lossy()),
+        base,
+    )
+    .unwrap();
+
+    let csv = std::fs::read_to_string(&csv_path).unwrap();
+    assert!(csv.contains("id,name"));
+    assert!(csv.contains("Alice"));
+
+    let json = std::fs::read_to_string(&json_path).unwrap();
+    assert!(json.contains("\"name\":\"Alice\""));
+    assert!(json.contains("\"name\":\"Bob\""));
+}
+
+#[test]
+fn test_json_mutation_functions() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+
+    let result = exec_multi(
+        "SELECT \
+            JSON_SET('{\"a\":1}', '$.b', 2) AS set_v, \
+            JSON_INSERT('{\"a\":1}', '$.c', 3) AS ins_v, \
+            JSON_REPLACE('{\"a\":1}', '$.a', 9) AS rep_v, \
+            JSON_REMOVE('{\"a\":1,\"b\":2}', '$.b') AS rem_v",
+        base,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let set_v = batch
+        .column_by_name("set_v")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let ins_v = batch
+        .column_by_name("ins_v")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let rep_v = batch
+        .column_by_name("rep_v")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let rem_v = batch
+        .column_by_name("rem_v")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(set_v.value(0), "{\"a\":1,\"b\":2}");
+    assert_eq!(ins_v.value(0), "{\"a\":1,\"c\":3}");
+    assert_eq!(rep_v.value(0), "{\"a\":9}");
+    assert_eq!(rem_v.value(0), "{\"a\":1}");
 }
 
 // ========== P1: Per-RG Zone Maps Tests ==========

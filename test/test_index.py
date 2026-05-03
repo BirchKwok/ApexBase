@@ -260,18 +260,14 @@ class TestIndexWithDML:
         assert len(r2.to_pandas()) == 1
 
     def test_store_api_after_index(self, client):
-        """Python store() API after CREATE INDEX - index won't auto-update (store uses bindings path)."""
+        """Python store() API after CREATE INDEX should keep SQL indexes in sync."""
         client.store([{"city": "Beijing"}])
         client.execute("CREATE INDEX idx_city ON idx_test (city)")
 
-        # store() goes through bindings, not SQL executor - index may be stale
-        # This test documents the current behavior
         client.store([{"city": "Shanghai"}])
 
-        # Full scan (COUNT with WHERE uses scan path) should find both
-        result = client.execute("SELECT COUNT(*) FROM idx_test WHERE city = 'Shanghai'")
-        df = result.to_pandas()
-        assert df.iloc[0, 0] >= 1  # At minimum scan path finds it
+        result = client.execute("SELECT city FROM idx_test WHERE city = 'Shanghai'")
+        assert result.to_dict() == [{"city": "Shanghai"}]
 
 
 class TestIndexPerformance:

@@ -49,10 +49,7 @@ except ImportError:
 
 
 def _execute_or_xfail(client: ApexClient, sql: str):
-    try:
-        return client.execute(sql)
-    except Exception as e:
-        pytest.xfail(f"SQL not supported yet: {sql} ({type(e).__name__}: {e})")
+    return client.execute(sql)
 
 
 class TestBasicSQLExecute:
@@ -190,7 +187,7 @@ class TestBasicSQLExecute:
 
             client.close()
 
-    def test_execute_temporary_view_create_select_drop(self):
+    def test_execute_persistent_view_create_select_drop(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)
             client.create_table("default")
@@ -198,18 +195,20 @@ class TestBasicSQLExecute:
             client.store([{"a": 1}, {"a": 2}])
             client.flush()
 
-            # View exists only within this execute call
+            # View should persist after the CREATE statement and be queryable separately.
             res = client.execute(
                 """
                 CREATE VIEW v AS SELECT a FROM default WHERE a >= 2;
                 SELECT * FROM v;
-                DROP VIEW v;
                 """.strip()
             )
             out = res.to_dict()
             assert out == [{"a": 2}]
 
-            # New execute: view should not exist
+            out2 = client.execute("SELECT * FROM v").to_dict()
+            assert out2 == [{"a": 2}]
+
+            client.execute("DROP VIEW v")
             with pytest.raises(Exception):
                 client.execute("SELECT * FROM v").to_dict()
 

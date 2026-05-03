@@ -2047,6 +2047,88 @@ impl ApexExecutor {
         Ok(ApexResult::Scalar(batch.num_rows() as i64))
     }
 
+    fn execute_copy_export(
+        storage_path: &Path,
+        table_name: &str,
+        file_path: &str,
+        format: &str,
+        options: &[(String, String)],
+    ) -> io::Result<ApexResult> {
+        use std::io::Write;
+
+        if format.eq_ignore_ascii_case("PARQUET") {
+            return Self::execute_copy_to_parquet(storage_path, table_name, file_path);
+        }
+        if !storage_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Table '{}' does not exist", table_name),
+            ));
+        }
+
+        let storage = TableStorageBackend::open(storage_path)?;
+        let batch = storage.read_columns_to_arrow(None, 0, None)?;
+        let schema = batch.schema();
+
+        match format.to_uppercase().as_str() {
+            "CSV" | "TSV" => {
+                let delimiter = options
+                    .iter()
+                    .find(|(k, _)| k == "delimiter" || k == "delim" || k == "sep")
+                    .and_then(|(_, v)| v.chars().next())
+                    .unwrap_or(if format.eq_ignore_ascii_case("TSV") { '\t' } else { ',' });
+                let header = options
+                    .iter()
+                    .find(|(k, _)| k == "header")
+                    .map(|(_, v)| !matches!(v.to_lowercase().as_str(), "false" | "0"))
+                    .unwrap_or(true);
+                let file = std::fs::File::create(file_path)?;
+                let mut writer = std::io::BufWriter::new(file);
+                if header {
+                    let columns: Vec<String> =
+                        schema.fields().iter().map(|field| field.name().clone()).collect();
+                    writeln!(writer, "{}", columns.join(&delimiter.to_string()))?;
+                }
+                for row in 0..batch.num_rows() {
+                    let mut cells = Vec::with_capacity(batch.num_columns());
+                    for col in 0..batch.num_columns() {
+                        let value = Self::arrow_value_at_col(batch.column(col), row);
+                        let mut cell = value.to_string();
+                        if cell.contains(delimiter)
+                            || cell.contains('"')
+                            || cell.contains('\n')
+                            || cell.contains('\r')
+                        {
+                            cell = format!("\"{}\"", cell.replace('"', "\"\""));
+                        }
+                        cells.push(cell);
+                    }
+                    writeln!(writer, "{}", cells.join(&delimiter.to_string()))?;
+                }
+                writer.flush()?;
+                Ok(ApexResult::Scalar(batch.num_rows() as i64))
+            }
+            "JSON" | "NDJSON" | "JSONL" => {
+                let file = std::fs::File::create(file_path)?;
+                let mut writer = std::io::BufWriter::new(file);
+                for row in 0..batch.num_rows() {
+                    let mut obj = serde_json::Map::with_capacity(batch.num_columns());
+                    for (col_idx, field) in schema.fields().iter().enumerate() {
+                        let value = Self::arrow_value_at_col(batch.column(col_idx), row);
+                        obj.insert(field.name().clone(), value.to_json_value());
+                    }
+                    writeln!(writer, "{}", serde_json::Value::Object(obj))?;
+                }
+                writer.flush()?;
+                Ok(ApexResult::Scalar(batch.num_rows() as i64))
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Unsupported COPY TO format: {}", other),
+            )),
+        }
+    }
+
     /// Execute COPY table FROM 'file.parquet' — import data from Parquet file into table
     fn execute_copy_from_parquet(
         storage_path: &Path,

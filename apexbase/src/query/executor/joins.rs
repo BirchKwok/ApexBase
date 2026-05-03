@@ -72,7 +72,8 @@ impl ApexExecutor {
                 result_batch = Self::cross_join(&result_batch, &right_batch)?;
             } else {
                 // Extract join keys from ON condition (supports AND with extra filter)
-                let (left_key, right_key, extra_filter) = Self::extract_join_keys_with_filter(&join_clause.on)?;
+                let (left_key, right_key, left_key_qualifier, right_key_qualifier, extra_filter) =
+                    Self::extract_join_keys_with_filter(&join_clause.on)?;
                 let right_alias = match &join_clause.right {
                     FromItem::Table { alias, .. } => alias.clone(),
                     _ => None,
@@ -86,6 +87,8 @@ impl ApexExecutor {
                     &right_key,
                     &join_clause.join_type,
                     right_alias.as_deref(),
+                    left_key_qualifier.as_deref(),
+                    right_key_qualifier.as_deref(),
                 )?;
 
                 // Apply extra ON predicates (non-equality conditions from AND)
@@ -193,7 +196,11 @@ impl ApexExecutor {
         }
 
         if clean_name == "default" {
-            default_table_path.to_path_buf()
+            if default_table_path.is_dir() {
+                base_dir.join("default.apex")
+            } else {
+                default_table_path.to_path_buf()
+            }
         } else {
             let safe_name: String = clean_name.chars()
                 .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
@@ -323,12 +330,18 @@ impl ApexExecutor {
 
     /// Extract join keys from ON condition (expects simple equality: left.col = right.col)
     fn extract_join_keys(on_expr: &SqlExpr) -> io::Result<(String, String)> {
+        let (left_col, right_col, _, _) = Self::extract_join_key_refs(on_expr)?;
+        Ok((left_col, right_col))
+    }
+
+    /// Extract join key references from ON condition, preserving optional table qualifiers.
+    fn extract_join_key_refs(on_expr: &SqlExpr) -> io::Result<(String, String, Option<String>, Option<String>)> {
         use crate::query::sql_parser::BinaryOperator;
         match on_expr {
             SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                let left_col = Self::extract_column_name(left)?;
-                let right_col = Self::extract_column_name(right)?;
-                Ok((left_col, right_col))
+                let (left_col, left_qualifier) = Self::extract_column_reference(left)?;
+                let (right_col, right_qualifier) = Self::extract_column_reference(right)?;
+                Ok((left_col, right_col, left_qualifier, right_qualifier))
             }
             _ => Err(io::Error::new(io::ErrorKind::Unsupported, "JOIN ON clause must be a simple equality")),
         }
@@ -336,22 +349,24 @@ impl ApexExecutor {
 
     /// Extract join keys from ON condition, returning an optional extra filter for non-equality predicates.
     /// Supports compound AND: ON a.id=b.id AND a.x<b.x → key=(id,id), filter=a.x<b.x
-    fn extract_join_keys_with_filter(on_expr: &SqlExpr) -> io::Result<(String, String, Option<SqlExpr>)> {
+    fn extract_join_keys_with_filter(
+        on_expr: &SqlExpr,
+    ) -> io::Result<(String, String, Option<String>, Option<String>, Option<SqlExpr>)> {
         use crate::query::sql_parser::BinaryOperator;
         match on_expr {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                let left_col = Self::extract_column_name(left)?;
-                let right_col = Self::extract_column_name(right)?;
-                Ok((left_col, right_col, None))
+            SqlExpr::BinaryOp { .. } if matches!(on_expr, SqlExpr::BinaryOp { op: BinaryOperator::Eq, .. }) => {
+                let (left_col, right_col, left_qualifier, right_qualifier) =
+                    Self::extract_join_key_refs(on_expr)?;
+                Ok((left_col, right_col, left_qualifier, right_qualifier, None))
             }
             SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
                 // Try left as equality predicate, right as extra filter
-                if let Ok((lk, rk)) = Self::extract_join_keys(left) {
-                    return Ok((lk, rk, Some(*right.clone())));
+                if let Ok((lk, rk, lq, rq)) = Self::extract_join_key_refs(left) {
+                    return Ok((lk, rk, lq, rq, Some(*right.clone())));
                 }
                 // Try right as equality predicate, left as extra filter
-                if let Ok((lk, rk)) = Self::extract_join_keys(right) {
-                    return Ok((lk, rk, Some(*left.clone())));
+                if let Ok((lk, rk, lq, rq)) = Self::extract_join_key_refs(right) {
+                    return Ok((lk, rk, lq, rq, Some(*left.clone())));
                 }
                 Err(io::Error::new(io::ErrorKind::Unsupported, "No equijoin condition found in AND ON clause"))
             }
@@ -368,24 +383,52 @@ impl ApexExecutor {
         right_key: &str,
         join_type: &JoinType,
         right_alias: Option<&str>,
+        left_key_qualifier: Option<&str>,
+        right_key_qualifier: Option<&str>,
     ) -> io::Result<RecordBatch> {
-        if right_alias.is_none() {
+        let preserve_qualified_left_key =
+            *join_type == JoinType::Right && left_key_qualifier.is_some();
+        let preserve_qualified_right_key =
+            matches!(join_type, JoinType::Right | JoinType::Full)
+                && right_key_qualifier.is_some();
+        if right_alias.is_none() && !preserve_qualified_left_key && !preserve_qualified_right_key {
             return Self::hash_join(left, right, left_key, right_key, join_type);
         }
-        let alias = right_alias.unwrap();
-        // Rename conflicting right columns to '{alias}.{col}' before joining
-        // so that projection of 'b.name' finds the right-side column directly.
-        let right_renamed = Self::prefix_conflicting_columns(right, left, right_key, alias)?;
-        // Use right_key (bare name) — it now exists in right_renamed under the same name
-        Self::hash_join(left, &right_renamed, left_key, right_key, join_type)
+        let prepared_left = if preserve_qualified_left_key {
+            Some(Self::append_qualified_join_key(left, left_key, left_key_qualifier)?)
+        } else {
+            None
+        };
+        // Prepare right-side columns before joining:
+        // - preserve alias-qualified conflicting columns for self-joins
+        // - for RIGHT/FULL joins, keep a qualified copy of the right join key so
+        //   explicit projections like `r.id` stay correct for unmatched right rows
+        let prepared_right = Self::prepare_right_join_columns(
+            right,
+            left,
+            right_key,
+            right_alias,
+            if preserve_qualified_right_key {
+                right_key_qualifier
+            } else {
+                None
+            },
+        )?;
+        let left_batch = prepared_left.as_ref().unwrap_or(left);
+        Self::hash_join(left_batch, &prepared_right, left_key, right_key, join_type)
     }
 
-    /// Prefix columns in `right` that conflict with `left` (except the join key) with `{alias}.`
-    fn prefix_conflicting_columns(
+    /// Prepare right-side columns for join output.
+    ///
+    /// - Conflicting non-key columns can be exposed as `{alias}.{col}` for self-joins.
+    /// - RIGHT/FULL joins can retain a qualified copy of the right join key (for
+    ///   projections like `table.id` on unmatched right rows).
+    fn prepare_right_join_columns(
         right: &RecordBatch,
         left: &RecordBatch,
         join_key: &str,
-        alias: &str,
+        conflict_alias: Option<&str>,
+        qualified_join_key: Option<&str>,
     ) -> io::Result<RecordBatch> {
         let left_name_vec: Vec<String> = left.schema().fields()
             .iter().map(|f| f.name().clone()).collect();
@@ -395,27 +438,94 @@ impl ApexExecutor {
         for (i, field) in right.schema().fields().iter().enumerate() {
             let name = field.name();
             let new_name = if name != join_key && left_names.contains(name.as_str()) {
-                format!("{}.{}", alias, name)
+                if let Some(alias) = conflict_alias {
+                    format!("{}.{}", alias, name)
+                } else {
+                    format!("{}_right", name)
+                }
             } else {
                 name.clone()
             };
             fields.push(arrow::datatypes::Field::new(&new_name, field.data_type().clone(), field.is_nullable()));
             arrays.push(right.column(i).clone());
+
+            if name == join_key {
+                if let Some(qualifier) = qualified_join_key {
+                    let qualified_name = format!("{}.{}", qualifier, name);
+                    if qualified_name != *name
+                        && !fields.iter().any(|f| f.name() == &qualified_name)
+                    {
+                        fields.push(arrow::datatypes::Field::new(
+                            &qualified_name,
+                            field.data_type().clone(),
+                            field.is_nullable(),
+                        ));
+                        arrays.push(right.column(i).clone());
+                    }
+                }
+            }
         }
         let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
         RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
-    /// Extract column name from expression (handles table.column and column)
-    fn extract_column_name(expr: &SqlExpr) -> io::Result<String> {
+    /// Append a qualified copy of the join key without renaming any existing columns.
+    ///
+    /// RIGHT JOIN needs this for the original left key because the swap-to-LEFT path
+    /// would otherwise drop it from the result schema.
+    fn append_qualified_join_key(
+        batch: &RecordBatch,
+        join_key: &str,
+        qualified_join_key: Option<&str>,
+    ) -> io::Result<RecordBatch> {
+        let Some(qualifier) = qualified_join_key else {
+            return Ok(batch.clone());
+        };
+        let qualified_name = format!("{}.{}", qualifier, join_key);
+        if qualified_name == join_key || batch.column_by_name(&qualified_name).is_some() {
+            return Ok(batch.clone());
+        }
+
+        let join_key_idx = batch.schema().fields().iter()
+            .position(|field| field.name() == join_key)
+            .ok_or_else(|| io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Join key '{}' not found", join_key),
+            ))?;
+
+        let mut fields: Vec<arrow::datatypes::Field> = Vec::with_capacity(batch.num_columns() + 1);
+        let mut arrays: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns() + 1);
+        for (i, field) in batch.schema().fields().iter().enumerate() {
+            fields.push(field.as_ref().clone());
+            arrays.push(batch.column(i).clone());
+            if i == join_key_idx {
+                fields.push(arrow::datatypes::Field::new(
+                    &qualified_name,
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                ));
+                arrays.push(batch.column(i).clone());
+            }
+        }
+
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
+        RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// Extract column reference from expression (handles table.column and column).
+    fn extract_column_reference(expr: &SqlExpr) -> io::Result<(String, Option<String>)> {
         match expr {
             SqlExpr::Column(name) => {
-                // Handle table.column format - take the column part
-                if let Some(dot_pos) = name.rfind('.') {
-                    Ok(name[dot_pos + 1..].to_string())
+                let clean_name = name.trim_matches('"');
+                if let Some(dot_pos) = clean_name.rfind('.') {
+                    Ok((
+                        clean_name[dot_pos + 1..].to_string(),
+                        Some(clean_name[..dot_pos].to_string()),
+                    ))
                 } else {
-                    Ok(name.clone())
+                    Ok((clean_name.to_string(), None))
                 }
             }
             _ => Err(io::Error::new(
