@@ -136,6 +136,9 @@ pub enum QuerySignature {
     /// `SELECT ... FROM read_csv(...) / read_parquet(...) / read_json(...)` — table function
     TableFunction,
 
+    /// DuckDB-style direct file reading: `SELECT * FROM 'file.parquet' / 'file.csv' / 'file.json'`
+    DirectFileRead,
+
     /// DDL: CREATE TABLE, DROP TABLE, ALTER TABLE, CREATE INDEX, etc.
     Ddl { kind: DdlKind },
 
@@ -192,6 +195,7 @@ impl QuerySignature {
                 | QuerySignature::LikeFilter { .. }
                 | QuerySignature::FilteredStringAgg { .. }
                 | QuerySignature::TableFunction
+                | QuerySignature::DirectFileRead
                 | QuerySignature::Explain
                 | QuerySignature::Cte
                 | QuerySignature::Complex
@@ -363,6 +367,25 @@ pub fn classify(sql: &str) -> QuerySignature {
         || su.contains("FROM READ_JSON(")
     {
         return QuerySignature::TableFunction;
+    }
+
+    // ── DuckDB-style direct file reading: SELECT * FROM 'file.parquet' / 'file.csv' / 'file.json' ──
+    if let Some(from_pos) = su.find("FROM '") {
+        let after_from = &su[(from_pos + "FROM '".len())..];
+        if let Some(end_quote) = after_from.find('\'') {
+            let file = &after_from[..end_quote];
+            if file.ends_with(".PARQUET")
+                || file.ends_with(".CSV")
+                || file.ends_with(".TSV")
+                || file.ends_with(".JSON")
+                || file.ends_with(".NDJSON")
+                || file.ends_with(".JSONL")
+                || file.ends_with(".CSV.GZ")
+                || file.ends_with(".CSV.GZIP")
+            {
+                return QuerySignature::DirectFileRead;
+            }
+        }
     }
 
     // ── COUNT(*) — no WHERE/GROUP/HAVING/JOIN/DISTINCT ──

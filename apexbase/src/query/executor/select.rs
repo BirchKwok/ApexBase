@@ -279,7 +279,9 @@ impl ApexExecutor {
         // Also skip for TopkDistance — it has different row semantics.
         let from_is_table_fn = matches!(
             &stmt.from,
-            Some(FromItem::TableFunction { .. }) | Some(FromItem::TopkDistance { .. })
+            Some(FromItem::TableFunction { .. })
+                | Some(FromItem::TopkDistance { .. })
+                | Some(FromItem::DirectFile { .. })
         );
         if !from_is_table_fn && Self::is_pure_count_star(&stmt) {
             if !storage_path.exists() {
@@ -326,7 +328,16 @@ impl ApexExecutor {
                 file,
                 options,
                 ..
-            }) => Self::read_table_function(func, file, options)?,
+            }) => {
+                let mut opts = options.clone();
+                if let Some(ref wc) = stmt.where_clause {
+                    if let Some(pushdown) = Self::try_extract_filter_for_pushdown(wc) {
+                        opts.push(("filter".to_string(), pushdown));
+                    }
+                }
+                Self::read_table_function(func, file, &opts)?
+            },
+            Some(FromItem::DirectFile { file, .. }) => Self::read_direct_file(file)?,
             Some(FromItem::Subquery { stmt: sub_stmt, .. }) => match sub_stmt.as_ref() {
                 crate::query::SqlStatement::Select(sel) => {
                     let sub_path = Self::resolve_from_table_path(sel, base_dir, default_table_path);
@@ -2218,6 +2229,37 @@ impl ApexExecutor {
         Ok(Some(ApexResult::Data(result)))
     }
 
+    /// Extract a simple comparison filter from a WHERE clause for pushdown
+    /// into file readers (CSV/JSON/Parquet). Returns "col>val" style string.
+    fn try_extract_filter_for_pushdown(expr: &SqlExpr) -> Option<String> {
+        use crate::query::sql_parser::BinaryOperator;
+        if let SqlExpr::BinaryOp { left, op, right } = expr {
+            if let (SqlExpr::Column(col), SqlExpr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+                let col_name = col.trim_matches('"');
+                let col_name = if let Some(d) = col_name.rfind('.') { &col_name[d + 1..] } else { col_name };
+                let op_str = match op {
+                    BinaryOperator::Gt => ">",
+                    BinaryOperator::Lt => "<",
+                    BinaryOperator::Ge => ">=",
+                    BinaryOperator::Le => "<=",
+                    BinaryOperator::Eq => "=",
+                    BinaryOperator::NotEq => "!=",
+                    _ => return None,
+                };
+                let val_str = match val {
+                    crate::data::Value::Int64(v) => v.to_string(),
+                    crate::data::Value::Int32(v) => v.to_string(),
+                    crate::data::Value::Float64(v) => v.to_string(),
+                    crate::data::Value::Float32(v) => v.to_string(),
+                    crate::data::Value::String(v) => format!("'{}'", v),
+                    _ => return None,
+                };
+                return Some(format!("{}{}{}", col_name, op_str, val_str));
+            }
+        }
+        None
+    }
+
     /// V4 FAST PATH: Simple aggregation (no GROUP BY, no WHERE)
     /// Handles: SELECT COUNT(*), AVG(col), SUM(col), MIN(col), MAX(col) FROM table
     fn try_fast_simple_agg(
@@ -2247,9 +2289,8 @@ impl ApexExecutor {
                 if name == "_id" {
                     return Ok(None);
                 } // _id stored separately
-                  // COUNT(col) and AVG(col) must exclude NULLs: the storage fast path
-                  // returns total-row-count which would be wrong when NULLs are present.
-                  // Fall back to the full Arrow scan which respects null_count().
+                   // COUNT(col) and AVG(col) must exclude NULLs: check zone maps first.
+                   // If the column has no NULLs, the storage fast path is safe.
                 let is_star_or_const = name == "*"
                     || name
                         .chars()
@@ -2258,7 +2299,9 @@ impl ApexExecutor {
                         .unwrap_or(false);
                 if !is_star_or_const {
                     if matches!(func, AggregateFunc::Count | AggregateFunc::Avg) {
-                        return Ok(None);
+                        if backend.column_has_nulls(name) {
+                            return Ok(None);
+                        }
                     }
                 }
                 if !unique_cols.contains(&name.to_string()) {

@@ -1,5 +1,51 @@
 // Transaction, DML (INSERT/DELETE/UPDATE), Index management, COPY, PRAGMA
 
+/// Parsed pushdown filter: column index, op, and comparison value
+struct PushdownFilter {
+    col_idx: usize,
+    op: u8,
+    op_eq: bool,
+    val_f64: f64,
+}
+
+fn parse_pushdown_filter(
+    filter_str: &str,
+    schema: &arrow::datatypes::Schema,
+) -> Option<PushdownFilter> {
+    let bytes = filter_str.as_bytes();
+    let op_pos = bytes.iter().position(|&b| b == b'>' || b == b'<' || b == b'=' || b == b'!')?;
+    let col_name = &filter_str[..op_pos];
+    let op = bytes[op_pos];
+    let op_eq = op_pos + 1 < bytes.len() && bytes[op_pos + 1] == b'=';
+    let val_start = if op_eq { op_pos + 2 } else { op_pos + 1 };
+    let val_str = &filter_str[val_start..];
+    let col_idx = schema.index_of(col_name).ok()?;
+    let val_f64: f64 = if val_str.starts_with('\'') || val_str.starts_with('"') {
+        return None;
+    } else {
+        val_str.parse().ok()?
+    };
+    Some(PushdownFilter { col_idx, op, op_eq, val_f64 })
+}
+
+#[inline]
+fn csv_filter_match(field: &[u8], filter: &PushdownFilter) -> bool {
+    if field.is_empty() { return false; }
+    let val: Option<f64> = std::str::from_utf8(field).ok().and_then(|s| s.parse().ok());
+    match val {
+        Some(v) => match filter.op {
+            b'>' if filter.op_eq => v >= filter.val_f64,
+            b'<' if filter.op_eq => v <= filter.val_f64,
+            b'>' => v > filter.val_f64,
+            b'<' => v < filter.val_f64,
+            b'=' => (v - filter.val_f64).abs() < 1e-12,
+            b'!' => (v - filter.val_f64).abs() >= 1e-12,
+            _ => true,
+        },
+        None => false,
+    }
+}
+
 impl ApexExecutor {
     // ========== Transaction Execution Methods ==========
 
@@ -4010,13 +4056,47 @@ impl ApexExecutor {
     ) -> io::Result<RecordBatch> {
         match func.to_uppercase().as_str() {
             "READ_CSV" => Self::read_csv_to_batch(file, options),
-            "READ_JSON" => Self::read_json_to_batch(file),
+            "READ_JSON" => Self::read_json_to_batch(file, options),
             "READ_PARQUET" => Self::read_parquet_to_batch(file),
             other => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unknown table function: {}", other),
             )),
         }
+    }
+
+    /// DuckDB-style direct file reading: auto-detect format from file extension.
+    /// Supports: .csv, .tsv, .json, .jsonl, .ndjson, .parquet, .csv.gz, .csv.gzip
+    pub(crate) fn read_direct_file(file: &str) -> io::Result<RecordBatch> {
+        let lower = file.to_lowercase();
+        if lower.ends_with(".csv.gz") || lower.ends_with(".csv.gzip") {
+            return Self::read_csv_to_batch(file, &[]);
+        }
+        if lower.ends_with(".csv") {
+            return Self::read_csv_to_batch(file, &[]);
+        }
+        if lower.ends_with(".tsv") {
+            return Self::read_csv_to_batch(
+                file,
+                &[("delimiter".to_string(), "\t".to_string())],
+            );
+        }
+        if lower.ends_with(".json")
+            || lower.ends_with(".jsonl")
+            || lower.ends_with(".ndjson")
+        {
+            return Self::read_json_to_batch(file, &[]);
+        }
+        if lower.ends_with(".parquet") {
+            return Self::read_parquet_to_batch(file);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "Unsupported file format for '{}'. Supported: .csv, .tsv, .json, .jsonl, .ndjson, .parquet, .csv.gz",
+                file
+            ),
+        ))
     }
 
     /// Read a CSV / TSV file into an Arrow RecordBatch — parallel reader.
@@ -4100,6 +4180,12 @@ impl ApexExecutor {
             })
             .collect();
 
+        // Parse filter pushdown option: "col>val" or "col<val" style
+        let filter_info = options
+            .iter()
+            .find(|(k, _)| k == "filter")
+            .and_then(|(_, v)| parse_pushdown_filter(v, &schema));
+
         let schema_ref = Arc::clone(&schema);
         let batches: Vec<io::Result<RecordBatch>> = chunks
             .par_iter()
@@ -4108,7 +4194,7 @@ impl ApexExecutor {
                 if chunk.is_empty() {
                     return Ok(RecordBatch::new_empty(Arc::clone(&schema_ref)));
                 }
-                Self::parse_csv_chunk_fast(chunk, &schema_ref, delimiter)
+                Self::parse_csv_chunk_fast(chunk, &schema_ref, delimiter, filter_info.as_ref())
             })
             .collect();
 
@@ -4123,6 +4209,7 @@ impl ApexExecutor {
         data: &[u8],
         schema: &arrow::datatypes::Schema,
         delimiter: u8,
+        filter_info: Option<&PushdownFilter>,
     ) -> io::Result<RecordBatch> {
         use arrow::array::{BooleanArray, BooleanBuilder};
         use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -4290,6 +4377,13 @@ impl ApexExecutor {
             };
             if line.is_empty() {
                 continue;
+            }
+            // Pushdown filter: skip row if filter column's value doesn't match
+            if let Some(ref fi) = filter_info {
+                let fv = Self::get_csv_field(line, fi.col_idx, delimiter);
+                if !csv_filter_match(fv, fi) {
+                    continue;
+                }
             }
             let mut fs = 0usize;
             let mut col = 0usize;
@@ -4703,7 +4797,7 @@ impl ApexExecutor {
     }
 
     /// Read a NDJSON / JSON-lines file into an Arrow RecordBatch.
-    fn read_json_to_batch(path: &str) -> io::Result<RecordBatch> {
+    fn read_json_to_batch(path: &str, _options: &[(String, String)]) -> io::Result<RecordBatch> {
         use rayon::prelude::*;
 
         let file = std::fs::File::open(path).map_err(|e| {
@@ -5444,7 +5538,7 @@ impl ApexExecutor {
     }
 
     /// Execute COPY table FROM 'file' — auto-detect format (CSV, JSON, PARQUET).
-    fn execute_copy_import(
+    pub(crate) fn execute_copy_import(
         storage_path: &Path,
         table_name: &str,
         file_path: &str,
@@ -5455,7 +5549,7 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         let batch = match format.to_uppercase().as_str() {
             "CSV" | "TSV" => Self::read_csv_to_batch(file_path, options)?,
-            "JSON" | "NDJSON" | "JSONL" => Self::read_json_to_batch(file_path)?,
+            "JSON" | "NDJSON" | "JSONL" => Self::read_json_to_batch(file_path, options)?,
             _ => Self::read_parquet_to_batch(file_path)?,
         };
 

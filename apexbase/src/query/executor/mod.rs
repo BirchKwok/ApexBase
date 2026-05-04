@@ -67,6 +67,15 @@ thread_local! {
 }
 
 // ============================================================================
+// Thread-local temp directory for CREATE TEMP TABLE storage
+// Set by embedded layer before calling execute_with_base_dir.
+// ============================================================================
+thread_local! {
+    static TEMP_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
+        std::cell::RefCell::new(None);
+}
+
+// ============================================================================
 // Thread-local session variables — SET VARIABLE / RESET VARIABLE / $varname
 // ============================================================================
 thread_local! {
@@ -120,6 +129,21 @@ pub fn clear_query_root_dir() {
 /// Get the root directory for the current thread's query context.
 pub fn get_query_root_dir() -> Option<std::path::PathBuf> {
     QUERY_ROOT_DIR.with(|r| r.borrow().clone())
+}
+
+/// Set the temp directory for the current thread's query context.
+pub fn set_temp_dir(dir: &Path) {
+    TEMP_DIR.with(|r| *r.borrow_mut() = Some(dir.to_path_buf()));
+}
+
+/// Clear the temp directory from the current thread's query context.
+pub fn clear_temp_dir() {
+    TEMP_DIR.with(|r| *r.borrow_mut() = None);
+}
+
+/// Get the temp directory for the current thread's query context.
+pub fn get_temp_dir() -> Option<std::path::PathBuf> {
+    TEMP_DIR.with(|r| r.borrow().clone())
 }
 
 // ============================================================================
@@ -877,6 +901,17 @@ impl ApexExecutor {
         invalidate_storage_cache_dir(dir);
     }
 
+    /// Derive temp table path from table name using the thread-local TEMP_DIR.
+    fn temp_table_path(table_name: &str) -> PathBuf {
+        let dir = TEMP_DIR.with(|r| r.borrow().clone())
+            .unwrap_or_else(|| PathBuf::from(".apex_tmp"));
+        let safe_name: String = table_name.chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let truncated = if safe_name.len() > 200 { &safe_name[..200] } else { &safe_name };
+        dir.join(format!("{}.apex", truncated))
+    }
+
     /// Helper to get column refs from statement's required columns
     #[inline]
     fn get_col_refs(stmt: &SelectStatement) -> Option<Vec<String>> {
@@ -1006,10 +1041,12 @@ impl ApexExecutor {
                 table,
                 query,
                 if_not_exists,
+                temp,
             } => SqlStatement::CreateTableAs {
                 table,
                 query: Box::new(Self::rewrite_statement_views(*query, views)),
                 if_not_exists,
+                temp,
             },
             SqlStatement::Explain { stmt, analyze } => SqlStatement::Explain {
                 stmt: Box::new(Self::rewrite_statement_views(*stmt, views)),
@@ -1836,8 +1873,13 @@ impl ApexExecutor {
                 table,
                 columns,
                 if_not_exists,
+                temp,
             } => {
-                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                let table_path = if temp {
+                    Self::temp_table_path(&table)
+                } else {
+                    Self::resolve_table_path(&table, base_dir, default_table_path)
+                };
                 with_table_write_lock(&table_path, || {
                     Self::execute_create_table(&table_path, &table, &columns, if_not_exists)
                 })
@@ -1936,8 +1978,13 @@ impl ApexExecutor {
                 table,
                 query,
                 if_not_exists,
+                temp,
             } => {
-                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                let table_path = if temp {
+                    Self::temp_table_path(&table)
+                } else {
+                    Self::resolve_table_path(&table, base_dir, default_table_path)
+                };
                 with_table_write_lock(&table_path, || {
                     Self::execute_create_table_as(
                         base_dir,

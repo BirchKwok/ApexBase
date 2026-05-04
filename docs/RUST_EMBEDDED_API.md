@@ -24,6 +24,7 @@ Use ApexBase as a high-performance embedded database directly from Rust — no P
 - [Indexes](#indexes)
 - [Full-Text Search](#full-text-search)
 - [Vector Search](#vector-search)
+- [Temporary Tables](#temporary-tables)
 - [Concurrency & Thread Safety](#concurrency--thread-safety)
 - [Public Helper Functions](#public-helper-functions)
 - [Error Handling](#error-handling)
@@ -632,6 +633,50 @@ let rs = items.execute(
 
 ---
 
+## Temporary Tables
+
+Register external data files (CSV, JSON, Parquet) as temporary native tables. The file is parsed once and materialized into ApexBase's mmap-backed `.apex` format stored in a `.apex_tmp/` subdirectory. Subsequent queries bypass file parsing entirely.
+
+```rust
+use apexbase::embedded::ApexDB;
+
+let db = ApexDB::open("./data")?;
+
+// Register a CSV file as a temp table
+db.register_temp_table("orders", "/data/orders.csv")?;
+
+// Query it — zone maps, bloom filters, zero-copy mmap reads
+let rs = db.execute("SELECT city, COUNT(*) FROM orders GROUP BY city")?;
+let batch = rs.to_record_batch()?;
+println!("rows: {}", batch.num_rows());
+
+// Full SQL works: WHERE, JOIN, GROUP BY, window functions, etc.
+let rs = db.execute("
+    SELECT o.city, SUM(o.amount) AS total
+    FROM orders o
+    WHERE o.amount > 100
+    GROUP BY o.city
+    ORDER BY total DESC
+    LIMIT 10
+")?;
+
+// Drop when done
+db.drop_temp_table("orders")?;
+```
+
+**Supported formats:** CSV (.csv/.tsv), JSON (.json/.ndjson/.jsonl), Parquet (.parquet) — auto-detected by file extension.
+
+**Performance:** Temp tables use memory-mapped I/O (near-zero RAM), zone maps for filter pushdown, and bloom filters for point lookups. For workloads that query the same file multiple times, `register_temp_table()` provides order-of-magnitude speedups over repeated `read_csv()` / `read_json()` calls.
+
+**Cleanup:** Temp tables are automatically removed from disk when the `ApexDB` instance is dropped.
+
+```rust
+fn register_temp_table(&self, name: &str, file_path: &str) -> Result<()>
+fn drop_temp_table(&self, name: &str) -> Result<()>
+```
+
+---
+
 ## Concurrency & Thread Safety
 
 Both `ApexDB` and `Table` are `Clone + Send + Sync`. The underlying storage engine uses fine-grained `RwLock`s, and Rayon powers parallel aggregation and vector scans.
@@ -730,6 +775,8 @@ fn process(db: &ApexDB) -> apexbase::Result<()> {
 | `use_database(name)` | `Result<()>` | Switch to named sub-database (`""` = root) |
 | `base_dir()` | `PathBuf` | Current base directory path |
 | `invalidate_cache()` | `()` | Evict all engine caches for current directory |
+| `register_temp_table(name, file_path)` | `Result<()>` | Parse a CSV/JSON/Parquet file and register as a native temp table |
+| `drop_temp_table(name)` | `Result<()>` | Drop a temp table |
 
 ### ApexDBBuilder
 

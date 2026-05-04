@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import csv as csv_mod
 import gc
 import json
 import os
@@ -23,6 +24,7 @@ import string
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -129,6 +131,38 @@ def generate_data(n: int):
         "city": cities,
         "category": categories,
     }
+
+
+def generate_benchmark_files(tmpdir, data):
+    """Generate CSV, Parquet, and NDJSON test files from benchmark data."""
+    csv_path = os.path.join(tmpdir, "bench_data.csv")
+    parquet_path = os.path.join(tmpdir, "bench_data.parquet")
+    json_path = os.path.join(tmpdir, "bench_data.jsonl")
+    n = len(data["name"])
+    columns = ["name", "age", "score", "city", "category"]
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv_mod.writer(f)
+        writer.writerow(columns)
+        for i in range(n):
+            writer.writerow([data[col][i] for col in columns])
+
+    if HAS_PANDAS:
+        import pandas as pd
+        df = pd.DataFrame(data)
+        df.to_parquet(parquet_path, index=False)
+    elif HAS_PYARROW:
+        import pyarrow.parquet as pq
+        table = pa.table(data)
+        pq.write_table(table, parquet_path)
+
+    with open(json_path, "w") as f:
+        for i in range(n):
+            row = {col: data[col][i] for col in columns}
+            json.dump(row, f)
+            f.write("\n")
+
+    return csv_path, parquet_path, json_path
 
 
 def build_shared_inputs(n: int):
@@ -959,11 +993,14 @@ class SQLiteBench:
 # ---------------------------------------------------------------------------
 
 class DuckDBBench:
-    def __init__(self, tmpdir, data):
+    def __init__(self, tmpdir, data, csv_path=None, parquet_path=None, json_path=None):
         self.db_path = os.path.join(tmpdir, "bench.duckdb")
         self.data = data
         self.n = len(data["name"])
         self.conn = None
+        self.csv_path = csv_path
+        self.parquet_path = parquet_path
+        self.json_path = json_path
         self.shared_inputs = build_shared_inputs(self.n)
         self._next_rowid = 0
         self._txn_counter = 0
@@ -1004,6 +1041,8 @@ class DuckDBBench:
         """)
         self._txn_counter = 0
         self._txn_backlog_ready = False
+        self._temp_csv_name = None
+        self._temp_json_name = None
 
     def cold_start_setup(self):
         if self.conn:
@@ -1469,6 +1508,41 @@ class DuckDBBench:
         except Exception:
             return None
 
+    def bench_csv_read_count(self):
+        return self._scalar(f"SELECT COUNT(*) FROM read_csv_auto('{self.csv_path}')")
+
+    def bench_csv_read_filter_group(self):
+        return self._query_all(
+            f"SELECT city, COUNT(*) FROM read_csv_auto('{self.csv_path}') WHERE age > 30 GROUP BY city"
+        )
+
+    def bench_csv_read_limit_1k(self):
+        return self._query_all(f"SELECT * FROM read_csv_auto('{self.csv_path}') LIMIT 1000")
+
+    def bench_json_read_count(self):
+        return self._scalar(f"SELECT COUNT(*) FROM read_json_auto('{self.json_path}')")
+
+    def bench_temp_csv_create_query(self):
+        if self._temp_csv_name is None:
+            self._temp_csv_name = f"bench_csv_temp_{uuid.uuid4().hex[:8]}"
+            self.conn.execute(f"CREATE TABLE {self._temp_csv_name} AS SELECT * FROM read_csv_auto('{self.csv_path}')")
+        return self._scalar(f"SELECT AVG(score) FROM {self._temp_csv_name} WHERE age > 30")
+
+    def bench_csv_read_order_limit(self):
+        return self._query_all(
+            f"SELECT * FROM read_csv_auto('{self.csv_path}') ORDER BY score DESC LIMIT 100"
+        )
+
+    def bench_json_read_filter(self):
+        return self._scalar(
+            f"SELECT COUNT(*) FROM read_json_auto('{self.json_path}') WHERE age > 30"
+        )
+
+    def bench_json_read_order_limit(self):
+        return self._query_all(
+            f"SELECT * FROM read_json_auto('{self.json_path}') ORDER BY score DESC LIMIT 100"
+        )
+
     def close(self):
         if self.conn:
             self.conn.close()
@@ -1479,12 +1553,15 @@ class DuckDBBench:
 # ---------------------------------------------------------------------------
 
 class ApexBaseBench:
-    def __init__(self, tmpdir, data, low_memory=False):
+    def __init__(self, tmpdir, data, low_memory=False, csv_path=None, parquet_path=None, json_path=None):
         self.db_dir = os.path.join(tmpdir, "apex_bench")
         self.data = data
         self.n = len(data["name"])
         self.client = None
         self.low_memory = low_memory
+        self.csv_path = csv_path
+        self.parquet_path = parquet_path
+        self.json_path = json_path
         self.shared_inputs = build_shared_inputs(self.n)
         self._next_id = 1
         self._txn_counter = 0
@@ -1519,6 +1596,8 @@ class ApexBaseBench:
         self._next_id = 1
         self._txn_counter = 0
         self._txn_backlog_ready = False
+        self._temp_csv_name = None
+        self._temp_json_name = None
 
     def cold_start_setup(self):
         """Close and reopen client — clears all Python/Rust-side caches (arrow_batch_cache etc.)."""
@@ -2031,6 +2110,41 @@ class ApexBaseBench:
             pass
         return self.client.execute(f"COPY default TO '{path}'").scalar()
 
+    def bench_csv_read_count(self):
+        return self._scalar(f"SELECT COUNT(*) FROM read_csv('{self.csv_path}')")
+
+    def bench_csv_read_filter_group(self):
+        return self._query_all(
+            f"SELECT city, COUNT(*) FROM read_csv('{self.csv_path}') WHERE age > 30 GROUP BY city"
+        )
+
+    def bench_csv_read_limit_1k(self):
+        return self._query_all(f"SELECT * FROM read_csv('{self.csv_path}') LIMIT 1000")
+
+    def bench_json_read_count(self):
+        return self._scalar(f"SELECT COUNT(*) FROM read_json('{self.json_path}')")
+
+    def bench_temp_csv_create_query(self):
+        if self._temp_csv_name is None:
+            self._temp_csv_name = f"bench_csv_temp_{uuid.uuid4().hex[:8]}"
+            self.client.register_temp_table(self._temp_csv_name, self.csv_path)
+        return self._scalar(f"SELECT AVG(score) FROM {self._temp_csv_name} WHERE age > 30")
+
+    def bench_csv_read_order_limit(self):
+        return self._query_all(
+            f"SELECT * FROM read_csv('{self.csv_path}') ORDER BY score DESC LIMIT 100"
+        )
+
+    def bench_json_read_filter(self):
+        return self._scalar(
+            f"SELECT COUNT(*) FROM read_json('{self.json_path}') WHERE age > 30"
+        )
+
+    def bench_json_read_order_limit(self):
+        return self._query_all(
+            f"SELECT * FROM read_json('{self.json_path}') ORDER BY score DESC LIMIT 100"
+        )
+
     def close(self):
         if self.client:
             self.client.close()
@@ -2086,6 +2200,15 @@ BENCHMARKS = [
     ("Window ROW_NUMBER PARTITION BY city",  "bench_window_row_number", False, False, False, None),
     ("FTS Index Build (name,city,category)", "bench_fts_build",         True,  False, False, None),
     ("FTS Search ('Electronics')",           "bench_fts_search",        False, False, False, None),
+    # --- File reading / temp table benchmarks ---
+    ("CSV Read + COUNT(*)",               "bench_csv_read_count",        False, False, False, None),
+    ("CSV Read + Filter + GROUP BY",      "bench_csv_read_filter_group", False, False, False, None),
+    ("CSV Read + Full Scan LIMIT 1000",   "bench_csv_read_limit_1k",     False, False, False, None),
+    ("JSON Read + COUNT(*)",              "bench_json_read_count",       False, False, False, None),
+    ("JSON Read + Filter",                "bench_json_read_filter",      False, False, False, None),
+    ("Temp Table (CSV) Query (filter+agg)","bench_temp_csv_create_query", False, False, False, None),
+    ("JSON Read + ORDER BY LIMIT 100",    "bench_json_read_order_limit", False, False, False, None),
+    ("CSV Read + ORDER BY LIMIT 100",     "bench_csv_read_order_limit",  False, False, False, None),
 ]
 
 OLAP_BENCHMARK_NAMES = [
@@ -2119,6 +2242,14 @@ OLAP_BENCHMARK_NAMES = [
     "OR cross-col (age=25 OR city=BJ)",
     "Numeric OR (age=20|30|40|50)",
     "Window ROW_NUMBER PARTITION BY city",
+    "CSV Read + COUNT(*)",
+    "CSV Read + Filter + GROUP BY",
+    "CSV Read + Full Scan LIMIT 1000",
+    "JSON Read + COUNT(*)",
+    "JSON Read + Filter",
+    "Temp Table (CSV) Query (filter+agg)",
+    "JSON Read + ORDER BY LIMIT 100",
+    "CSV Read + ORDER BY LIMIT 100",
 ]
 
 OLTP_FAIR_BENCHMARK_NAMES = [
@@ -3216,7 +3347,7 @@ def main():
             f"Vector dataset: {VECTOR_ROWS:,} rows x {VECTOR_DIM} dims (separate module), "
             f"TopK={VECTOR_K}, batch queries={VECTOR_BATCH_QUERY_COUNT}"
         )
-        print("Vector results are reported separately and do not change the 38-metric default fair scoreboard.")
+        print("Vector results are reported separately and do not change the 47-metric default fair scoreboard.")
     if args.low_memory:
         print("Mode: LOW-MEMORY (ApexBase-only cache stress mode; not a cross-engine apples-to-apples setting)")
     print()
@@ -3227,15 +3358,19 @@ def main():
     print("done.")
 
     tmpdir = tempfile.mkdtemp(prefix="apexbase_bench_")
+
+    print("Generating benchmark files (CSV/Parquet/JSON)...", end=" ", flush=True)
+    csv_path, parquet_path, json_path = generate_benchmark_files(tmpdir, data)
+    print("done.")
     results = {}
     shared_inputs = build_shared_inputs(N)
 
     engines = []
     if HAS_APEXBASE:
-        engines.append(("ApexBase", ApexBaseBench(tmpdir, data, low_memory=args.low_memory)))
+        engines.append(("ApexBase", ApexBaseBench(tmpdir, data, low_memory=args.low_memory, csv_path=csv_path, parquet_path=parquet_path, json_path=json_path)))
     engines.append(("SQLite", SQLiteBench(tmpdir, data)))
     if HAS_DUCKDB:
-        engines.append(("DuckDB", DuckDBBench(tmpdir, data)))
+        engines.append(("DuckDB", DuckDBBench(tmpdir, data, csv_path=csv_path, parquet_path=parquet_path, json_path=json_path)))
 
     if not engines:
         print("ERROR: No database engines available!")

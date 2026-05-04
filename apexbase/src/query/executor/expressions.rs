@@ -743,6 +743,9 @@ impl ApexExecutor {
             Some(FromItem::Table { alias, table, .. }) => {
                 alias.clone().unwrap_or_else(|| table.clone())
             }
+            Some(FromItem::DirectFile { alias, file, .. }) => {
+                alias.clone().unwrap_or_else(|| file.clone())
+            }
             _ => String::new(),
         };
         

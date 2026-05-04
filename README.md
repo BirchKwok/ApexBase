@@ -15,6 +15,7 @@ ApexBase is an embedded columnar database designed for **Hybrid Transactional/An
   - [Data Ingestion](#data-ingestion)
   - [SQL](#sql)
   - [File Reading Table Functions](#file-reading-table-functions)
+  - [Temporary Tables from Files](#temporary-tables-from-files)
   - [Transactions](#transactions)
   - [Indexes](#indexes)
   - [Full-Text Search](#full-text-search)
@@ -73,6 +74,7 @@ ApexBase is an embedded columnar database designed for **Hybrid Transactional/An
 - **Durability levels** — configurable `fast` / `safe` / `max` with WAL support and crash recovery
 - **Compact storage** — dictionary encoding for low-cardinality strings, LZ4 and Zstd compression
 - **File reading table functions** — `read_csv()`, `read_parquet()`, `read_json()` directly in SQL `FROM` clauses; parallel mmap parsing; full SQL (WHERE / GROUP BY / JOIN / UNION) on top of any file
+- **Temporary tables from files** — `register_temp_table()` parses CSV/JSON/Parquet once and materializes as a native .apex temp table; mmap-backed zero-copy reads, zone maps, bloom filters; order-of-magnitude faster than repeated `read_*` calls; auto-cleanup on close
 - **Parquet interop** — COPY TO / COPY FROM Parquet files
 - **PostgreSQL wire protocol** — built-in server for DBeaver, psql, DataGrip, pgAdmin, Navicat, and any PostgreSQL-compatible client; two distribution modes (Python CLI or standalone Rust binary)
 - **Arrow Flight gRPC server** — high-performance columnar data transfer over HTTP/2; streams Arrow IPC RecordBatch directly, 4–7× faster than PG wire for large result sets; accessible via `pyarrow.flight`, Go arrow, Java arrow, and any Arrow Flight client
@@ -336,6 +338,48 @@ result = client.execute("""
 | `read_json(path)` | — | Read NDJSON or pandas JSON; auto-detects format |
 
 See [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md#file-reading-table-functions) for full details.
+
+### Temporary Tables from Files
+
+Register CSV, JSON, or Parquet files as temporary native tables. The file is parsed once and stored in ApexBase's mmap-backed `.apex` format. Subsequent queries bypass file parsing entirely, leveraging zone maps, bloom filters, and zero-copy mmap reads — **an order of magnitude faster** than repeated `read_csv()` / `read_json()` / `read_parquet()` calls.
+
+```python
+# Register a CSV file as a temp table
+client.register_temp_table("orders", "/data/orders.csv")
+
+# Query it as a regular table — lightning fast, near-zero memory
+result = client.execute("SELECT city, COUNT(*) FROM orders GROUP BY city")
+
+# Full SQL works (WHERE, JOIN, GROUP BY, UNION, window functions, etc.)
+result = client.execute("""
+    SELECT o.city, u.name
+    FROM orders o
+    JOIN users u ON o.user_id = u._id
+    WHERE o.amount > 100
+    ORDER BY o.amount DESC
+    LIMIT 20
+""")
+
+# Drop when done (or just close the client — auto-cleanup)
+client.drop_temp_table("orders")
+```
+
+Also supports SQL syntax:
+
+```python
+client.execute("CREATE TEMP TABLE invoices AS SELECT * FROM read_csv('/data/invoices.csv')")
+```
+
+**Supported formats:**
+- CSV / TSV — auto-detected by `.csv` / `.tsv` extension
+- JSON / NDJSON — auto-detected by `.json` / `.ndjson` / `.jsonl` extension  
+- Parquet — auto-detected by `.parquet` extension
+
+**Memory & performance:**
+- Temp tables use memory-mapped I/O — data stays on disk, near-zero RAM footprint
+- Zone maps (min/max indexes) skip irrelevant row groups for filtered queries
+- Bloom filters accelerate point lookups
+- Cleaned up automatically when the client is closed or the database is dropped
 
 ### Transactions
 
@@ -1117,6 +1161,13 @@ ApexClient(
 | `use_table(name)` | Switch active table |
 | `list_tables()` | List all tables in the current database |
 | `current_table` | Property: current table name |
+
+**Temporary Tables**
+
+| Method | Description |
+|--------|-------------|
+| `register_temp_table(name, file_path)` | Parse a CSV/JSON/Parquet file and register as a native temp table |
+| `drop_temp_table(name)` | Drop a temp table |
 
 **Data Storage**
 

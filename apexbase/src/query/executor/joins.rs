@@ -33,6 +33,7 @@ impl ApexExecutor {
             Some(FromItem::TopkDistance { col, query, k, metric, .. }) => {
                 Self::execute_topk_distance(default_table_path, col, query, *k, metric)?
             }
+            Some(FromItem::DirectFile { file, .. }) => Self::read_direct_file(file)?,
             None => {
                 let left_backend = get_cached_backend(default_table_path)?;
                 left_backend.read_columns_to_arrow(None, 0, None)?
@@ -65,6 +66,7 @@ impl ApexExecutor {
                 FromItem::TopkDistance { col, query, k, metric, .. } => {
                     Self::execute_topk_distance(default_table_path, col, query, *k, metric)?
                 }
+                FromItem::DirectFile { file, .. } => Self::read_direct_file(file)?,
             };
 
             // CROSS JOIN has no ON clause — use cartesian product directly
@@ -75,7 +77,9 @@ impl ApexExecutor {
                 let (left_key, right_key, left_key_qualifier, right_key_qualifier, extra_filter) =
                     Self::extract_join_keys_with_filter(&join_clause.on)?;
                 let right_alias = match &join_clause.right {
-                    FromItem::Table { alias, .. } => alias.clone(),
+                    FromItem::Table { alias, .. }
+                    | FromItem::DirectFile { alias, .. }
+                    | FromItem::TableFunction { alias, .. } => alias.clone(),
                     _ => None,
                 };
 
@@ -173,6 +177,18 @@ impl ApexExecutor {
     /// thread-local QUERY_ROOT_DIR set by Python bindings before execution.
     fn resolve_table_path(table_name: &str, base_dir: &Path, default_table_path: &Path) -> std::path::PathBuf {
         let clean_name = table_name.trim_matches('"').trim_matches('`');
+
+        // Check temp dir first: temp tables shadow persistent tables
+        let safe_check: String = clean_name.chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let truncated_check = if safe_check.len() > 200 { &safe_check[..200] } else { &safe_check };
+        if let Some(temp_dir) = crate::query::executor::get_temp_dir() {
+            let temp_path = temp_dir.join(format!("{}.apex", truncated_check));
+            if temp_path.exists() {
+                return temp_path;
+            }
+        }
 
         // Handle qualified db.table syntax
         if let Some(dot_pos) = clean_name.find('.') {

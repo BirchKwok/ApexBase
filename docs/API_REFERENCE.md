@@ -8,8 +8,9 @@ Complete API reference for ApexBase Python SDK.
 2. [ResultView](#resultview) - Query results
 3. [Constants](#constants) - Module constants
 4. [File Reading Table Functions](#file-reading-table-functions) - read_csv / read_parquet / read_json
-5. [Set Operations](#set-operations) - UNION / INTERSECT / EXCEPT
-6. [Vector Search](#vector-search) - topk_distance / batch_topk_distance / SQL explode_rename
+5. [Temporary Tables from Files](#temporary-tables-from-files) - register_temp_table / drop_temp_table
+6. [Set Operations](#set-operations) - UNION / INTERSECT / EXCEPT
+7. [Vector Search](#vector-search) - topk_distance / batch_topk_distance / SQL explode_rename
 
 ---
 
@@ -1162,6 +1163,90 @@ result = client.execute("""
 - CSV and JSON files are parsed in parallel (one chunk per CPU core via Rayon).
 - Parquet files use parallel column decoding with shared metadata (zero re-parse overhead).
 - Benchmarked against Polars on 1M rows: CSV 0.95×, NDJSON 0.93×, Parquet 1.33× (Arrow output).
+
+---
+
+## Temporary Tables from Files
+
+Register external data files (CSV, JSON, Parquet) as temporary native tables. The file is parsed once and materialized into ApexBase's mmap-backed `.apex` format, stored in a `.apex_tmp/` subdirectory. Subsequent queries bypass file parsing entirely — leveraging zone maps, bloom filters, and zero-copy mmap reads for **order-of-magnitude speedups** over repeated `read_csv()` / `read_json()` / `read_parquet()` calls. Temp tables are automatically cleaned up on client close.
+
+### `register_temp_table(name, file_path)`
+
+```python
+client.register_temp_table(name: str, file_path: str)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `name` | `str` | Name for the temporary table |
+| `file_path` | `str` | Path to the data file |
+
+**Supported formats** (auto-detected by file extension):
+
+| Extension | Format | Parser |
+|-----------|--------|--------|
+| `.csv`, `.tsv` | CSV / TSV | Parallel mmap CSV parser |
+| `.json`, `.ndjson`, `.jsonl` | JSON / NDJSON | Parallel mmap JSON parser |
+| `.parquet` | Parquet | Parallel column decode with shared metadata |
+
+**Examples:**
+
+```python
+# CSV — most common use case
+client.register_temp_table("sales", "/data/sales.csv")
+
+# JSON / NDJSON
+client.register_temp_table("logs", "/data/events.ndjson")
+
+# Parquet
+client.register_temp_table("users_parquet", "/data/users.parquet")
+
+# Query the temp table like any persistent table
+result = client.execute("SELECT * FROM sales WHERE amount > 1000")
+count = client.execute("SELECT COUNT(*) FROM sales WHERE category = 'Electronics'").scalar()
+
+# Full SQL — JOINs, aggregations, window functions all work
+top = client.execute("""
+    SELECT city, SUM(amount) AS total
+    FROM sales
+    GROUP BY city
+    ORDER BY total DESC
+    LIMIT 10
+""")
+```
+
+### `drop_temp_table(name)`
+
+```python
+client.drop_temp_table(name: str)
+```
+
+Explicitly drop a temp table before client close. Temp tables are also cleaned up automatically when the client is closed or garbage-collected.
+
+```python
+client.drop_temp_table("sales")
+```
+
+### `CREATE TEMP TABLE` (SQL syntax)
+
+```python
+client.execute("CREATE TEMP TABLE invoices AS SELECT * FROM read_csv('/data/invoices.csv')")
+```
+
+This SQL syntax produces the same result as `register_temp_table()` — the table is created in the temp directory and queries resolve to it automatically.
+
+### Performance & memory characteristics
+
+| Aspect | `read_csv()` (direct) | `register_temp_table()` (temp) |
+|--------|----------------------|-------------------------------|
+| First query | Parse CSV → Arrow batch | Parse CSV → write `.apex` → read `.apex` |
+| Subsequent queries | Re-parse CSV every time | Read from mmap-backed `.apex` (zero parse) |
+| Filtered queries | Full scan every time | Zone maps skip irrelevant row groups |
+| Point lookups | Linear scan | Bloom filter acceleration |
+| Memory usage | Full batch in RAM | mmap — near-zero RAM (data on disk) |
+| Aggregate speed | Re-parse + aggregate | mmap + SIMD aggregate on columnar data |
+
+For workloads that query the same file multiple times, `register_temp_table()` provides **10–100× speedup** on subsequent queries compared to repeated `read_csv()` / `read_json()`.
 
 ---
 

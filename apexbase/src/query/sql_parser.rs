@@ -64,6 +64,7 @@ pub enum SqlStatement {
         table: String,
         columns: Vec<ColumnDef>,
         if_not_exists: bool,
+        temp: bool,
     },
     DropTable {
         table: String,
@@ -112,6 +113,7 @@ pub enum SqlStatement {
         table: String,
         query: Box<SqlStatement>,
         if_not_exists: bool,
+        temp: bool,
     },
     Explain {
         stmt: Box<SqlStatement>,
@@ -245,6 +247,11 @@ pub enum FromItem {
         query: Vec<f64>,
         k: usize,
         metric: String,
+        alias: Option<String>,
+    },
+    /// DuckDB-style direct file reading: `SELECT * FROM 'path/file.parquet'`
+    DirectFile {
+        file: String,
         alias: Option<String>,
     },
 }
@@ -1873,6 +1880,18 @@ impl SqlParser {
                     }
                     Token::Table if !unique => {
                         self.advance();
+                        // Check for TEMP / TEMPORARY
+                        let temp = if let Token::Identifier(ref kw) = self.current() {
+                            let upper = kw.to_uppercase();
+                            if upper == "TEMP" || upper == "TEMPORARY" {
+                                self.advance();
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
                         // Check for IF NOT EXISTS
                         let if_not_exists = self.parse_if_not_exists()?;
                         let table = self.parse_table_name()?;
@@ -1884,6 +1903,7 @@ impl SqlParser {
                                 table,
                                 query: Box::new(query),
                                 if_not_exists,
+                                temp,
                             });
                         }
                         // Column definitions are optional: CREATE TABLE t OR CREATE TABLE t (col INT)
@@ -1899,6 +1919,7 @@ impl SqlParser {
                             table,
                             columns,
                             if_not_exists,
+                            temp,
                         })
                     }
                     Token::Identifier(ref fts_kw) if fts_kw.to_uppercase() == "FTS" && !unique => {
@@ -2536,6 +2557,23 @@ impl SqlParser {
         let from = if matches!(self.current(), Token::From) {
             self.advance();
             match self.current().clone() {
+                Token::StringLit(file) => {
+                    self.advance();
+                    let alias = if matches!(self.current(), Token::As) {
+                        self.advance();
+                        Some(self.parse_identifier()?)
+                    } else if let Token::Identifier(a) = self.current().clone() {
+                        if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) {
+                            None
+                        } else {
+                            self.advance();
+                            Some(a)
+                        }
+                    } else {
+                        None
+                    };
+                    Some(FromItem::DirectFile { file, alias })
+                }
                 Token::Identifier(table) => {
                     self.advance();
                     let upper = table.to_uppercase();
@@ -2822,6 +2860,23 @@ impl SqlParser {
             }
 
             let right = match self.current().clone() {
+                Token::StringLit(file) => {
+                    self.advance();
+                    let alias = if matches!(self.current(), Token::As) {
+                        self.advance();
+                        Some(self.parse_identifier()?)
+                    } else if let Token::Identifier(a) = self.current().clone() {
+                        if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) {
+                            None
+                        } else {
+                            self.advance();
+                            Some(a)
+                        }
+                    } else {
+                        None
+                    };
+                    FromItem::DirectFile { file, alias }
+                }
                 Token::LParen => {
                     // JOIN (SELECT ...) alias
                     self.advance(); // consume '('

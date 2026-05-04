@@ -345,6 +345,8 @@ pub struct ApexStorageImpl {
     auto_flush_rows: RwLock<u64>,
     /// Auto-flush byte threshold (struct-level so it survives backend cache invalidation)
     auto_flush_bytes: RwLock<u64>,
+    /// Temp directory for temporary tables (root_dir/.apex_tmp/)
+    temp_dir: PathBuf,
 }
 
 /// Internal Rust-only methods (not exposed to Python)
@@ -1041,6 +1043,9 @@ impl ApexStorageImpl {
         // No default table - users must explicitly create or use a table
         // Existing .apex files in the directory are discovered lazily via use_table() or list_tables()
 
+        let temp_dir = root_dir.join(".apex_tmp");
+        let _ = fs::create_dir_all(&temp_dir);
+
         Ok(Self {
             root_dir: root_dir.clone(),
             current_database: RwLock::new(String::new()),
@@ -1058,6 +1063,7 @@ impl ApexStorageImpl {
             current_txn_id: RwLock::new(None),
             auto_flush_rows: RwLock::new(0),
             auto_flush_bytes: RwLock::new(0),
+            temp_dir,
         })
     }
 
@@ -3286,6 +3292,7 @@ impl ApexStorageImpl {
 
         let sql = sql.to_string();
         crate::query::executor::set_query_root_dir(&self.root_dir);
+        crate::query::executor::set_temp_dir(&self.temp_dir);
 
         // Return enum to avoid per-cell arrow_value_at inside allow_threads
         enum ExecOut {
@@ -3409,6 +3416,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             Ok(ExecOut::Batch(batch))
         })?;
+        crate::query::executor::clear_temp_dir();
         crate::query::executor::clear_query_root_dir();
 
         // Update transaction state after execution
@@ -3478,6 +3486,7 @@ impl ApexStorageImpl {
             .unwrap_or_else(|_| self.current_base_dir());
         let base_dir = self.current_base_dir();
         let root_dir = self.root_dir.clone();
+        let temp_dir = self.temp_dir.clone();
 
         // Execute queries in parallel using Rayon (releases GIL)
         let ipc_results: Vec<Result<Vec<u8>, String>> = py.allow_threads(|| {
@@ -3487,6 +3496,7 @@ impl ApexStorageImpl {
                 .par_iter()
                 .map(|sql| {
                     crate::query::executor::set_query_root_dir(&root_dir);
+                    crate::query::executor::set_temp_dir(&temp_dir);
 
                     // Execute query in Rust thread pool
                     let result = ApexExecutor::execute_with_base_dir(sql, &base_dir, &table_path);
@@ -3499,6 +3509,7 @@ impl ApexStorageImpl {
                         Err(e) => return Err(e.to_string()),
                     };
 
+                    crate::query::executor::clear_temp_dir();
                     crate::query::executor::clear_query_root_dir();
 
                     // Serialize to IPC format
@@ -3553,6 +3564,7 @@ impl ApexStorageImpl {
             .get_current_table_path()
             .unwrap_or_else(|_| base_dir.clone());
         crate::query::executor::set_query_root_dir(&self.root_dir);
+        crate::query::executor::set_temp_dir(&self.temp_dir);
 
         // Execute query in Rust thread pool
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
@@ -3563,6 +3575,7 @@ impl ApexStorageImpl {
                 .to_record_batch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
+        crate::query::executor::clear_temp_dir();
         crate::query::executor::clear_query_root_dir();
 
         if is_write && !table_name.is_empty() {
@@ -3696,6 +3709,7 @@ impl ApexStorageImpl {
         };
         let base_dir = self.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.root_dir);
+        crate::query::executor::set_temp_dir(&self.temp_dir);
 
         // FAST PATH: SELECT * LIMIT N — build Arrow batch directly from V4
         if let QuerySignature::SimpleScanLimit {
@@ -3830,6 +3844,7 @@ impl ApexStorageImpl {
             *self.current_table.write() = name.clone();
         }
 
+        crate::query::executor::clear_temp_dir();
         crate::query::executor::clear_query_root_dir();
         Ok(PyBytes::new_bound(py, &buf).into())
     }
@@ -3995,6 +4010,72 @@ impl ApexStorageImpl {
 
         if *self.current_table.read() == name {
             *self.current_table.write() = String::new();
+        }
+        Ok(())
+    }
+
+    /// Register a data file (CSV, JSON, Parquet) as a temporary table.
+    ///
+    /// The file is parsed once and materialized into a native .apex table stored
+    /// in a temp directory. Subsequent queries benefit from mmap zero-copy access,
+    /// zone maps, and bloom filters — an order of magnitude faster than repeated
+    /// read_csv/read_json/read_parquet calls. The temp table is cleaned up when
+    /// the ApexStorage is dropped or the client is closed.
+    fn register_temp_table(&self, name: &str, file_path: &str) -> PyResult<()> {
+        use crate::query::executor::ApexExecutor;
+
+        let temp_path = self.temp_dir.join(format!("{}.apex", name));
+        let _ = fs::create_dir_all(&self.temp_dir);
+
+        if temp_path.exists() {
+            return Err(PyValueError::new_err(format!(
+                "Temp table '{}' already exists. Use drop_temp_table() first.",
+                name
+            )));
+        }
+
+        let fmt = {
+            let lower = file_path.to_lowercase();
+            if lower.ends_with(".csv") || lower.ends_with(".tsv") {
+                "CSV"
+            } else if lower.ends_with(".json") || lower.ends_with(".ndjson") || lower.ends_with(".jsonl") {
+                "JSON"
+            } else {
+                "PARQUET"
+            }
+        };
+
+        crate::query::executor::set_temp_dir(&self.temp_dir);
+        let base_dir = self.current_base_dir();
+        let result = ApexExecutor::execute_copy_import(
+            &temp_path,
+            name,
+            file_path,
+            fmt,
+            &[],
+            &base_dir,
+            &base_dir,
+        );
+        crate::query::executor::clear_temp_dir();
+
+        match result {
+            Ok(_) => {
+                self.table_paths.write().insert(name.to_string(), temp_path);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&temp_path);
+                Err(PyIOError::new_err(format!("Failed to register temp table: {}", e)))
+            }
+        }
+    }
+
+    /// Drop a previously registered temporary table.
+    fn drop_temp_table(&self, name: &str) -> PyResult<()> {
+        if let Some(path) = self.table_paths.write().remove(name) {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(path.with_extension("apex.wal"));
+            crate::storage::engine::engine().invalidate(&path);
         }
         Ok(())
     }
@@ -4387,6 +4468,9 @@ impl ApexStorageImpl {
         self.update_by_id_numeric_cache.clear();
         self.update_by_id_cell_cache.clear();
         self.replace_exact_row_cache.clear();
+
+        // Clean up temp tables
+        let _ = fs::remove_dir_all(&self.temp_dir);
 
         // On Windows: release all mmaps so temp directories can be cleaned up.
         // On Unix: mmaps remain valid after atomic rename; keep STORAGE_CACHE alive

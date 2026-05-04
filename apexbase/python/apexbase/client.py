@@ -684,6 +684,38 @@ class ApexClient:
         with self._lock:
             return self._storage.list_tables()
 
+    def register_temp_table(self, name: str, file_path: str):
+        """Register a data file (CSV, JSON, Parquet) as a temporary table.
+
+        The file is parsed once and materialized into a native .apex table
+        stored in a temp directory. Subsequent queries on this table bypass
+        file parsing and use the mmap-backed native format with zone maps and
+        bloom filters, achieving an order-of-magnitude speedup vs repeated
+        ``read_csv()`` / ``read_json()`` / ``read_parquet()`` calls.
+
+        The temp table is automatically cleaned up when the client is closed.
+
+        Args:
+            name: Name for the temporary table.
+            file_path: Path to the data file. Supports CSV (.csv/.tsv),
+                       JSON (.json/.ndjson/.jsonl), and Parquet (.parquet).
+        """
+        self._check_connection()
+        with self._lock:
+            self._flush_pending_memtable_rows_for_read()
+            self.flush_buffered_writes()
+            self._storage.register_temp_table(name, file_path)
+
+    def drop_temp_table(self, name: str):
+        """Drop a previously registered temporary table.
+
+        Args:
+            name: Name of the temp table to drop.
+        """
+        self._check_connection()
+        with self._lock:
+            self._storage.drop_temp_table(name)
+
     # ============ Compression ============
 
     def set_compression(self, compression: str) -> bool:
@@ -2441,6 +2473,11 @@ class ApexClient:
         # Check .apex file exists directly (O(1) vs O(n) listdir)
         apex_path = os.path.join(self._dirpath, f"{table_name}.apex")
         if os.path.exists(apex_path):
+            return
+
+        # Check temp table directory
+        temp_apex_path = os.path.join(self._dirpath, ".apex_tmp", f"{table_name}.apex")
+        if os.path.exists(temp_apex_path):
             return
 
         if self._relation_exists_as_view(table_name):

@@ -70,6 +70,15 @@ struct DbInner {
     base_dir: RwLock<PathBuf>,
     table_paths: RwLock<HashMap<String, PathBuf>>,
     durability: DurabilityLevel,
+    temp_dir: PathBuf,
+    temp_tables: RwLock<HashMap<String, PathBuf>>,
+}
+
+impl Drop for DbInner {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+        crate::query::executor::clear_temp_dir();
+    }
 }
 
 impl DbInner {
@@ -83,6 +92,14 @@ impl DbInner {
     }
 
     fn resolve_table(&self, name: &str) -> Result<PathBuf> {
+        {
+            let temps = self.temp_tables.read();
+            if let Some(p) = temps.get(name) {
+                if p.exists() {
+                    return Ok(p.clone());
+                }
+            }
+        }
         {
             let paths = self.table_paths.read();
             if let Some(p) = paths.get(name) {
@@ -104,6 +121,20 @@ impl DbInner {
 
     fn unregister_table(&self, name: &str) {
         self.table_paths.write().remove(name);
+    }
+
+    fn register_temp_table(&self, name: &str, path: PathBuf) {
+        self.temp_tables.write().insert(name.to_string(), path);
+    }
+
+    fn drop_temp_table(&self, name: &str) -> Result<()> {
+        if let Some(path) = self.temp_tables.write().remove(name) {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("apex.wal"));
+            let _ = std::fs::remove_file(path.with_extension("apex.lock"));
+            crate::storage::engine::engine().invalidate(&path);
+        }
+        Ok(())
     }
 }
 
@@ -317,6 +348,61 @@ impl ApexDB {
         tables
     }
 
+    /// Register a data file (CSV, JSON, Parquet) as a temporary table.
+    ///
+    /// The file is parsed once and materialized into a native `.apex` table
+    /// stored in a temp directory. Subsequent queries on this table bypass
+    /// file parsing and use the mmap-backed native format with zone maps and
+    /// bloom filters, achieving an order-of-magnitude speedup vs repeated
+    /// `read_csv()` / `read_json()` / `read_parquet()` calls.
+    ///
+    /// The temp table is automatically cleaned up when the database is dropped.
+    pub fn register_temp_table(&self, name: &str, file_path: &str) -> Result<()> {
+        let temp_path = self.inner.temp_dir.join(format!("{}.apex", name));
+        let _ = std::fs::create_dir_all(&self.inner.temp_dir);
+
+        // Parse file → create native .apex table using COPY IMPORT
+        let fmt = {
+            let lower = file_path.to_lowercase();
+            if lower.ends_with(".csv") || lower.ends_with(".tsv") {
+                "CSV"
+            } else if lower.ends_with(".json") || lower.ends_with(".ndjson") || lower.ends_with(".jsonl") {
+                "JSON"
+            } else {
+                "PARQUET"
+            }
+        };
+
+        crate::query::executor::set_temp_dir(&self.inner.temp_dir);
+        let base_dir = self.inner.current_base_dir();
+        let result = ApexExecutor::execute_copy_import(
+            &temp_path,
+            name,
+            file_path,
+            fmt,
+            &[],
+            &base_dir,
+            &base_dir,
+        );
+        crate::query::executor::clear_temp_dir();
+
+        match result {
+            Ok(_) => {
+                self.inner.register_temp_table(name, temp_path);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_path);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Drop a previously registered temporary table.
+    pub fn drop_temp_table(&self, name: &str) -> Result<()> {
+        self.inner.drop_temp_table(name)
+    }
+
     // ── SQL ───────────────────────────────────────────────────────────────────
 
     /// Execute arbitrary SQL against the database.
@@ -331,7 +417,9 @@ impl ApexDB {
 
         let base_dir = self.inner.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.inner.root_dir);
+        crate::query::executor::set_temp_dir(&self.inner.temp_dir);
         let result = ApexExecutor::execute_with_base_dir(sql, &base_dir, &base_dir);
+        crate::query::executor::clear_temp_dir();
         crate::query::executor::clear_query_root_dir();
         let result = result?;
 
@@ -709,12 +797,17 @@ fn open_db(
     // Pre-warm rayon global thread pool (no-op if already initialized)
     rayon::spawn(|| {});
 
+    let temp_dir = root_dir.join(".apex_tmp");
+    let _ = fs::create_dir_all(&temp_dir);
+
     Ok(ApexDB {
         inner: Arc::new(DbInner {
             root_dir: root_dir.clone(),
             base_dir: RwLock::new(root_dir),
             table_paths: RwLock::new(HashMap::new()),
             durability,
+            temp_dir,
+            temp_tables: RwLock::new(HashMap::new()),
         }),
     })
 }
@@ -2651,5 +2744,117 @@ mod tests {
         db.use_database("db2").unwrap();
         let t = db.table("shared_name").unwrap();
         assert_eq!(t.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_register_temp_table_csv() {
+        let (_dir, db) = temp_db();
+        // Create a CSV file
+        let csv_path = _dir.path().join("test.csv");
+        std::fs::write(&csv_path, "name,age,score\nAlice,25,85.5\nBob,30,90.0\nCharlie,35,78.2\n").unwrap();
+
+        db.register_temp_table("people", csv_path.to_str().unwrap()).unwrap();
+
+        let table = db.table("people").unwrap();
+        assert_eq!(table.count().unwrap(), 3);
+
+        let rs = table.execute("SELECT * FROM people WHERE age > 28").unwrap();
+        let batch = rs.to_record_batch().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[test]
+    fn test_register_temp_table_json() {
+        let (_dir, db) = temp_db();
+        let json_path = _dir.path().join("test.json");
+        std::fs::write(&json_path, "{\"name\":\"Alice\",\"age\":25}\n{\"name\":\"Bob\",\"age\":30}\n{\"name\":\"Charlie\",\"age\":35}\n").unwrap();
+
+        db.register_temp_table("users", json_path.to_str().unwrap()).unwrap();
+
+        let table = db.table("users").unwrap();
+        assert_eq!(table.count().unwrap(), 3);
+
+        let rs = table.execute("SELECT COUNT(*) FROM users WHERE age >= 30").unwrap();
+        let batch = rs.to_record_batch().unwrap();
+        let count = batch.column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_temp_table_create_temp_sql() {
+        let (_dir, db) = temp_db();
+        let csv_path = _dir.path().join("items.csv");
+        std::fs::write(&csv_path, "id,price\n1,10.0\n2,20.0\n3,30.0\n4,40.0\n5,50.0\n").unwrap();
+
+        // First register via API, then verify SQL access
+        db.register_temp_table("items", csv_path.to_str().unwrap()).unwrap();
+
+        // Query via SQL
+        let rs = db.execute("SELECT * FROM items WHERE price > 25").unwrap();
+        let batch = rs.to_record_batch().unwrap();
+        assert_eq!(batch.num_rows(), 3);
+
+        // Aggregate query
+        let rs = db.execute("SELECT AVG(price) FROM items").unwrap();
+        let batch = rs.to_record_batch().unwrap();
+        let avg = batch.column(0).as_any().downcast_ref::<arrow::array::Float64Array>().unwrap().value(0);
+        assert!((avg - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_temp_table_drop() {
+        let (_dir, db) = temp_db();
+        let csv_path = _dir.path().join("data.csv");
+        std::fs::write(&csv_path, "x,y\n1,2\n3,4\n").unwrap();
+
+        db.register_temp_table("tmp", csv_path.to_str().unwrap()).unwrap();
+        assert_eq!(db.table("tmp").unwrap().count().unwrap(), 2);
+
+        db.drop_temp_table("tmp").unwrap();
+        assert!(db.table("tmp").is_err());
+    }
+
+    #[test]
+    fn test_temp_table_shadows_persistent() {
+        let (_dir, db) = temp_db();
+
+        // Create a persistent table
+        let t = db.create_table("test_shadow").unwrap();
+        let mut r = Row::new();
+        r.insert("val".to_string(), Value::Int64(999));
+        t.insert(r).unwrap();
+        assert_eq!(t.count().unwrap(), 1);
+
+        // Register temp table with same name from CSV
+        let csv_path = _dir.path().join("shadow.csv");
+        std::fs::write(&csv_path, "val\n100\n200\n300\n").unwrap();
+        db.register_temp_table("test_shadow", csv_path.to_str().unwrap()).unwrap();
+
+        // Temp table should shadow the persistent one
+        let t2 = db.table("test_shadow").unwrap();
+        assert_eq!(t2.count().unwrap(), 3);
+
+        // Drop temp table; persistent should be accessible again
+        db.drop_temp_table("test_shadow").unwrap();
+        let t3 = db.table("test_shadow").unwrap();
+        assert_eq!(t3.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_temp_table_cleanup_on_drop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let csv_path = dir.path().join("data.csv");
+        std::fs::write(&csv_path, "col\nhello\nworld\n").unwrap();
+
+        {
+            let db = ApexDB::open(dir.path()).unwrap();
+            db.register_temp_table("hi", csv_path.to_str().unwrap()).unwrap();
+            assert_eq!(db.table("hi").unwrap().count().unwrap(), 2);
+            // db dropped here — temp files should be cleaned up
+        }
+
+        // Re-open — temp table should be gone
+        let db2 = ApexDB::open(dir.path()).unwrap();
+        assert!(db2.table("hi").is_err());
     }
 }

@@ -10,13 +10,26 @@ Comprehensive examples covering 100% of the ApexBase Python API.
 4. [Data Import](#data-import)
 5. [Querying Data](#querying-data)
 6. [File Reading Table Functions](#file-reading-table-functions)
-7. [Set Operations](#set-operations)
-8. [Vector Search](#vector-search)
-9. [Column Operations](#column-operations)
-10. [Full-Text Search](#full-text-search)
-11. [Data Modification](#data-modification)
-12. [Utility Methods](#utility-methods)
-13. [Advanced Usage](#advanced-usage)
+7. [Temporary Tables from Files](#temporary-tables-from-files)
+---
+98,99c98,99
+< 8. [Set Operations](#set-operations)
+< 9. [Vector Search](#vector-search)
+---
+> 9. [Set Operations](#set-operations)
+> 10. [Vector Search](#vector-search)
+---
+< 9. [Column Operations](#column-operations)
+< 10. [Full-Text Search](#full-text-search)
+< 11. [Data Modification](#data-modification)
+< 12. [Utility Methods](#utility-methods)
+< 13. [Advanced Usage](#advanced-usage)
+---
+> 10. [Column Operations](#column-operations)
+> 11. [Full-Text Search](#full-text-search)
+> 12. [Data Modification](#data-modification)
+> 13. [Utility Methods](#utility-methods)
+> 14. [Advanced Usage](#advanced-usage)
 
 ---
 
@@ -1190,6 +1203,94 @@ ids   = batch[:, :, 0].astype(np.int64)   # (10, 3)
 dists = batch[:, :, 1]                    # (10, 3)
 print("Top-3 IDs for each query:")
 print(ids)
+```
+
+---
+
+## Temporary Tables from Files
+
+Register CSV, JSON, or Parquet files as native temp tables. The file is parsed once; all subsequent queries use the mmap-backed `.apex` format (zone maps, bloom filters, zero-copy reads).
+
+### Register a CSV file
+
+```python
+# Register — parses and materializes as native .apex
+client.register_temp_table("sales", "/data/sales.csv")
+
+# Query — no parsing overhead on subsequent calls
+monthly = client.execute("""
+    SELECT category, SUM(amount) AS total
+    FROM sales
+    WHERE amount > 100
+    GROUP BY category
+    ORDER BY total DESC
+    LIMIT 10
+""")
+
+# JOIN with a persistent table
+result = client.execute("""
+    SELECT s.*, u.name
+    FROM sales s
+    JOIN users u ON s.user_id = u._id
+    WHERE s.city = 'Beijing'
+""")
+```
+
+### Register JSON / NDJSON
+
+```python
+client.register_temp_table("logs", "/data/events.ndjson")
+
+# Aggregate over the temp table
+counts = client.execute("""
+    SELECT event_type, COUNT(*) AS cnt
+    FROM logs
+    GROUP BY event_type
+""").to_dict()
+```
+
+### Register Parquet
+
+```python
+client.register_temp_table("users", "/data/users.parquet")
+
+count = client.execute("SELECT COUNT(*) FROM users WHERE age > 30").scalar()
+```
+
+### Drop a temp table
+
+```python
+client.drop_temp_table("sales")
+# Temp tables are also auto-cleaned when client is closed
+```
+
+### CREATE TEMP TABLE (SQL syntax)
+
+```python
+client.execute("CREATE TEMP TABLE invoices AS SELECT * FROM read_csv('/data/invoices.csv')")
+```
+
+### Performance comparison
+
+For workloads that query the same file repeatedly, `register_temp_table()` provides dramatic speedups:
+
+```python
+import time
+
+# Slow: re-parses CSV every time
+t0 = time.perf_counter()
+for _ in range(100):
+    client.execute("SELECT COUNT(*) FROM read_csv('/data/big.csv')")
+print(f"read_csv repeated: {(time.perf_counter()-t0)*1000:.0f}ms")
+
+# Fast: parse once, query native .apex
+client.register_temp_table("big", "/data/big.csv")
+t0 = time.perf_counter()
+for _ in range(100):
+    client.execute("SELECT COUNT(*) FROM big")
+print(f"temp table: {(time.perf_counter()-t0)*1000:.0f}ms")
+
+client.drop_temp_table("big")
 ```
 
 ---

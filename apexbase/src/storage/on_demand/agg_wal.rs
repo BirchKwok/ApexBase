@@ -1028,7 +1028,8 @@ impl OnDemandStorage {
         }
     }
 
-    /// Returns true if the column has any NULL values in the in-memory store.
+    /// Returns true if the column has any NULL values in the in-memory store
+    /// or in the V4 footer zone maps (for mmap-only data).
     pub fn column_has_nulls(&self, col_name: &str) -> bool {
         let schema = self.schema.read();
         let col_idx = match schema.get_index(col_name) {
@@ -1036,8 +1037,19 @@ impl OnDemandStorage {
             None => return false,
         };
         let nulls = self.nulls.read();
-        if col_idx >= nulls.len() { return false; }
-        nulls[col_idx].iter().any(|&b| b != 0)
+        if col_idx < nulls.len() && nulls[col_idx].iter().any(|&b| b != 0) {
+            return true;
+        }
+        if let Ok(Some(footer)) = self.get_or_load_footer() {
+            for rg_zms in &footer.zone_maps {
+                for zm in rg_zms {
+                    if zm.col_idx as usize == col_idx && zm.has_nulls {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Fast COUNT(DISTINCT col) for string columns using the dict cache.
