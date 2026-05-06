@@ -718,11 +718,62 @@ impl ApexExecutor {
                     // 2. Columns already added (from explicit references before *)
                     for (i, field) in batch.schema().fields().iter().enumerate() {
                         let col_name = field.name();
-                        // Always skip _id in * expansion - it should only appear at its explicit position
                         if col_name == "_id" {
                             continue;
                         }
                         if !added_columns.contains(col_name) {
+                            fields.push(field.as_ref().clone());
+                            arrays.push(batch.column(i).clone());
+                            added_columns.insert(col_name.clone());
+                        }
+                    }
+                }
+                SelectColumn::AllExclude(exclude) => {
+                    for (i, field) in batch.schema().fields().iter().enumerate() {
+                        let col_name = field.name();
+                        if col_name == "_id" || exclude.iter().any(|e| e == col_name) {
+                            continue;
+                        }
+                        if !added_columns.contains(col_name) {
+                            fields.push(field.as_ref().clone());
+                            arrays.push(batch.column(i).clone());
+                            added_columns.insert(col_name.clone());
+                        }
+                    }
+                }
+                SelectColumn::AllReplace(replacements) => {
+                    let replace_cols: Vec<&str> = replacements.iter().map(|(_, col)| col.as_str()).collect();
+                    for (i, field) in batch.schema().fields().iter().enumerate() {
+                        let col_name = field.name();
+                        if col_name == "_id" || replace_cols.iter().any(|c| *c == col_name) {
+                            continue;
+                        }
+                        if !added_columns.contains(col_name) {
+                            fields.push(field.as_ref().clone());
+                            arrays.push(batch.column(i).clone());
+                            added_columns.insert(col_name.clone());
+                        }
+                    }
+                    for (expr, alias) in replacements {
+                        let array = if let Some(path) = storage_path {
+                            Self::evaluate_expr_to_array_with_storage(batch, expr, path)?
+                        } else {
+                            Self::evaluate_expr_to_array(batch, expr)?
+                        };
+                        fields.push(Field::new(alias, array.data_type().clone(), true));
+                        arrays.push(array);
+                    }
+                }
+                SelectColumn::Columns(pattern) => {
+                    let re = regex::Regex::new(pattern).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid regex pattern '{}': {}", pattern, e))
+                    })?;
+                    for (i, field) in batch.schema().fields().iter().enumerate() {
+                        let col_name = field.name();
+                        if col_name == "_id" {
+                            continue;
+                        }
+                        if re.is_match(col_name) && !added_columns.contains(col_name) {
                             fields.push(field.as_ref().clone());
                             arrays.push(batch.column(i).clone());
                             added_columns.insert(col_name.clone());

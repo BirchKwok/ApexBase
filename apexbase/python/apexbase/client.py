@@ -7,6 +7,7 @@ This module provides the ApexClient class that wraps ApexStorage with on-demand 
 import os
 import re
 import threading
+import time
 import queue
 import contextlib
 import ast
@@ -622,6 +623,7 @@ class ApexClient:
                     Example: {"name": "string", "age": "int64", "score": "float64"}
         """
         self._check_connection()
+        self._count_cache = None  # Invalidate: new table
         with self._lock:
             self._flush_pending_memtable_rows_for_read()
             self.flush_buffered_writes()
@@ -698,21 +700,19 @@ class ApexClient:
         Args:
             name: Name for the temporary table.
             file_path: Path to the data file. Supports CSV (.csv/.tsv),
-                       JSON (.json/.ndjson/.jsonl), and Parquet (.parquet).
+                        JSON (.json/.ndjson/.jsonl), and Parquet (.parquet).
         """
         self._check_connection()
+        self._count_cache = None  # temp table may shadow persistent
         with self._lock:
             self._flush_pending_memtable_rows_for_read()
             self.flush_buffered_writes()
             self._storage.register_temp_table(name, file_path)
 
     def drop_temp_table(self, name: str):
-        """Drop a previously registered temporary table.
-
-        Args:
-            name: Name of the temp table to drop.
-        """
+        """Drop a previously registered temporary table."""
         self._check_connection()
+        self._count_cache = None  # persistent table restored
         with self._lock:
             self._storage.drop_temp_table(name)
 
@@ -979,6 +979,7 @@ class ApexClient:
     def store(self, data) -> None:
         self._check_connection()
         self._ensure_table_selected()
+        self._count_cache = None  # Invalidate COUNT(*) cache on write
 
         # Acquire storage lock for thread-safe concurrent access (shared across all clients)
         storage_lock = getattr(self, '_storage_lock', None)
@@ -1409,6 +1410,20 @@ class ApexClient:
 
     def execute(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
         self._check_connection()
+        
+        # Ultra-fast COUNT(*) cache (before _execute_impl overhead)
+        _cm = _RE_SIMPLE_COUNT_STAR.match(sql)
+        if _cm:
+            _ct = _cm.group(2)
+            if not _ct or '.' not in _ct:
+                _tk = _ct or self._current_table or ''
+                _now = time.monotonic_ns()
+                _cached = getattr(self, '_count_cache', None)
+                if _cached and _cached[0] == _tk and _now - _cached[2] < 100_000_000:
+                    _ca = _cm.group(1)
+                    rv = ResultView(lazy_pydict={_ca or 'COUNT(*)': [_cached[1]]})
+                    rv._show_internal_id = False
+                    return rv
         
         # Lock-free execution: Rust layer handles concurrent reads via RwLock.
         # Python-level _storage_lock was causing serialization of all queries.
@@ -1933,6 +1948,9 @@ class ApexClient:
                     if count_table and self._current_table and count_table.lower() != self._current_table.lower():
                         raise ValueError("non-current COUNT(*) table uses the SQL executor")
                     count = self._storage.fast_row_count()
+                    # Populate Python-level cache for ultra-fast subsequent calls
+                    table_key = count_table or self._current_table or ''
+                    self._count_cache = (table_key, count, time.monotonic_ns())
                     rv = ResultView(lazy_pydict={count_alias or 'COUNT(*)': [count]})
                     rv._show_internal_id = False
                     return rv
@@ -2246,6 +2264,7 @@ class ApexClient:
             if _sig == 'write':
                 self._has_writes = True
                 self._invalidate_replace_cache()
+                self._count_cache = None  # Invalidate COUNT(*) cache on any write
 
             # ── Default path: Arrow C Data Interface (zero-copy) ──
             try:
@@ -2642,6 +2661,7 @@ class ApexClient:
         """
         self._check_connection()
         self._ensure_table_selected()
+        self._count_cache = None  # Invalidate COUNT(*) cache on delete
         
         # Safety check: require at least one parameter to prevent accidental deletion of all data
         if id is None and where is None:
@@ -2678,6 +2698,7 @@ class ApexClient:
     def replace(self, id_: int, data: dict) -> bool:
         self._check_connection()
         self._ensure_table_selected()
+        self._count_cache = None  # Invalidate COUNT(*) cache on replace
         with self._lock:
             cache_key = (self._current_database, self._current_table, int(id_))
             if self._last_exact_replace_key == cache_key and self._last_exact_replace_data == data:
@@ -2753,6 +2774,7 @@ class ApexClient:
 
     def flush(self) -> None:
         self._check_connection()
+        self._count_cache = None  # Invalidate COUNT(*) cache on flush
         with self._lock:
             if (not self._has_writes
                     and not self._buffered_write_rows

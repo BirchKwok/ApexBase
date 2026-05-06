@@ -1664,44 +1664,123 @@ impl ApexExecutor {
                 // Fall through to full parse if fast path unavailable
             }
             QuerySignature::DmlWrite => {
-                // PRE-PARSE FAST PATH: DELETE FROM <table> WHERE <col> <op> <num>
-                // Bypasses SqlParser::parse_multi (~200µs) for simple single-condition numeric predicates.
-                // Only uppercase when first byte is 'D'/'d' — skips INSERT/UPDATE/TRUNCATE entirely.
+                // PRE-PARSE FAST PATH: simple DELETE / UPDATE with single numeric WHERE.
+                // Bypasses SqlParser::parse_multi (~200µs) for the common OLTP shape.
                 let s = sql.trim().trim_end_matches(';');
-                if s.len() <= 300 && matches!(s.as_bytes().first(), Some(b'D' | b'd')) {
-                    let su = s.to_ascii_uppercase();
-                    if su.starts_with("DELETE FROM ") {
-                        let after_df = &s["DELETE FROM ".len()..];
-                        let after_df_u = &su["DELETE FROM ".len()..];
-                        if let Some(where_pos) = after_df_u.find(" WHERE ") {
-                            let table_raw = after_df[..where_pos].trim();
-                            let after_where = after_df[where_pos + 7..].trim();
-                            let after_where_u = after_where.to_ascii_uppercase();
-                            if !after_where_u.contains(" AND ")
-                                && !after_where_u.contains(" OR ")
-                                && !after_where_u.contains("NOT ")
-                                && !after_where_u.contains(" IN ")
-                                && !table_raw.contains(' ')
-                            {
-                                if let Some(expr) =
-                                    Self::try_parse_delete_numeric_where(after_where)
+                if s.len() <= 300 && !s.is_empty() {
+                    let first = s.as_bytes()[0];
+                    if first == b'D' || first == b'd' {
+                        // DELETE FROM <table> WHERE <col> <op> <num>
+                        let su = s.to_ascii_uppercase();
+                        if su.starts_with("DELETE FROM ") {
+                            let after_df = &s["DELETE FROM ".len()..];
+                            let after_df_u = &su["DELETE FROM ".len()..];
+                            if let Some(where_pos) = after_df_u.find(" WHERE ") {
+                                let table_raw = after_df[..where_pos].trim();
+                                let after_where = after_df[where_pos + 7..].trim();
+                                let after_where_u = after_where.to_ascii_uppercase();
+                                if !after_where_u.contains(" AND ")
+                                    && !after_where_u.contains(" OR ")
+                                    && !after_where_u.contains("NOT ")
+                                    && !after_where_u.contains(" IN ")
+                                    && !table_raw.contains(' ')
                                 {
-                                    let table_path = Self::resolve_table_path(
-                                        table_raw,
-                                        base_dir,
-                                        default_table_path,
-                                    );
-                                    if table_path.exists() {
-                                        return with_table_write_lock(&table_path, || {
-                                            Self::execute_delete(&table_path, Some(&expr))
-                                        });
+                                    if let Some(expr) =
+                                        Self::try_parse_delete_numeric_where(after_where)
+                                    {
+                                        let table_path = Self::resolve_table_path(
+                                            table_raw,
+                                            base_dir,
+                                            default_table_path,
+                                        );
+                                        if table_path.exists() {
+                                            return with_table_write_lock(&table_path, || {
+                                                Self::execute_delete(&table_path, Some(&expr))
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if first == b'U' || first == b'u' {
+                        // UPDATE <table> SET <col> = <num> WHERE <col> <op> <num>
+                        let su = s.to_ascii_uppercase();
+                        if su.starts_with("UPDATE ") {
+                            let after_up = &s["UPDATE ".len()..];
+                            let after_up_u = &su["UPDATE ".len()..];
+                            if let Some(set_pos) = after_up_u.find(" SET ") {
+                                let table_raw = after_up[..set_pos].trim();
+                                if !table_raw.is_empty() && !table_raw.contains(' ') {
+                                    let after_set = &after_up[set_pos + 5..];
+                                    let after_set_u = &after_up_u[set_pos + 5..];
+                                    if let Some(where_pos) = after_set_u.find(" WHERE ") {
+                                        let set_part = after_set[..where_pos].trim();
+                                        let where_part = after_set[where_pos + 7..].trim();
+                                        let where_part_u = after_set_u[where_pos + 7..].trim().to_ascii_uppercase();
+                                        if !where_part_u.contains(" AND ")
+                                            && !where_part_u.contains(" OR ")
+                                            && !where_part_u.contains("NOT ")
+                                            && !where_part_u.contains(" IN ")
+                                        {
+                                            if let Some(eq_pos) = set_part.find('=') {
+                                                let set_col = set_part[..eq_pos].trim().trim_matches('"');
+                                                let set_val_str = set_part[eq_pos + 1..].trim();
+                                                if !set_col.is_empty()
+                                                    && !set_col.contains(' ')
+                                                    && set_col != "_id"
+                                                {
+                                                    let set_val: Option<Value> =
+                                                        if set_val_str.contains('.')
+                                                            || set_val_str.contains('e')
+                                                            || set_val_str.contains('E')
+                                                        {
+                                                            set_val_str
+                                                                .parse::<f64>()
+                                                                .ok()
+                                                                .map(Value::Float64)
+                                                        } else {
+                                                            set_val_str
+                                                                .parse::<i64>()
+                                                                .ok()
+                                                                .map(Value::Int64)
+                                                        };
+                                                    if let Some(ref sv) = set_val {
+                                                        if let Some(expr) =
+                                                            Self::try_parse_delete_numeric_where(where_part)
+                                                        {
+                                                            let table_path = Self::resolve_table_path(
+                                                                table_raw,
+                                                                base_dir,
+                                                                default_table_path,
+                                                            );
+                                                            if table_path.exists() {
+                                                                let assignments = vec![(
+                                                                    set_col.to_string(),
+                                                                    SqlExpr::Literal(sv.clone()),
+                                                                )];
+                                                                return with_table_write_lock(
+                                                                    &table_path,
+                                                                    || {
+                                                                        Self::execute_update(
+                                                                            &table_path,
+                                                                            &assignments,
+                                                                            Some(&expr),
+                                                                        )
+                                                                    },
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-                // Fall through to full parse for non-DELETE or complex DELETE
+                // Fall through to full parse for complex DML or unsupported shorthand.
             }
             QuerySignature::MultiStatement => {
                 // Multi-statement: parse all at once and execute

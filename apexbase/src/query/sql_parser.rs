@@ -276,6 +276,7 @@ pub struct JoinClause {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectStatement {
     pub distinct: bool,
+    pub distinct_on: Option<Vec<String>>,
     pub columns: Vec<SelectColumn>,
     pub from: Option<FromItem>,
     pub joins: Vec<JoinClause>,
@@ -293,6 +294,12 @@ pub struct SelectStatement {
 pub enum SelectColumn {
     /// SELECT *
     All,
+    /// SELECT * EXCLUDE (col1, col2, ...)
+    AllExclude(Vec<String>),
+    /// SELECT * REPLACE (expr AS col, ...)
+    AllReplace(Vec<(SqlExpr, String)>),
+    /// SELECT COLUMNS('regex')
+    Columns(String),
     /// SELECT column_name
     Column(String),
     /// SELECT column_name AS alias
@@ -497,7 +504,20 @@ impl SelectStatement {
     pub fn is_select_star(&self) -> bool {
         self.columns
             .iter()
-            .any(|col| matches!(col, SelectColumn::All))
+            .any(|col| matches!(col, SelectColumn::All | SelectColumn::AllExclude(..) | SelectColumn::AllReplace(..) | SelectColumn::Columns(..)))
+    }
+
+    /// Check if this is a pure SELECT * (no EXCLUDE/REPLACE/COLUMNS)
+    pub fn is_pure_star(&self) -> bool {
+        let mut has_all = false;
+        for col in &self.columns {
+            match col {
+                SelectColumn::All => has_all = true,
+                SelectColumn::AllExclude(..) | SelectColumn::AllReplace(..) | SelectColumn::Columns(..) => return false,
+                _ => {}
+            }
+        }
+        has_all
     }
 
     /// Extract all column names required by this SELECT statement
@@ -510,7 +530,10 @@ impl SelectStatement {
         // Extract from SELECT clause
         for col in &self.columns {
             match col {
-                SelectColumn::All => {
+                SelectColumn::All
+                | SelectColumn::AllExclude(..)
+                | SelectColumn::AllReplace(..)
+                | SelectColumn::Columns(..) => {
                     has_star = true;
                 }
                 SelectColumn::Column(name) => {
@@ -842,6 +865,9 @@ enum Token {
     Rollback,
     Transaction,
     Read,
+    Exclude,
+    Replace,
+    ColumnsKw,
     // CTE / EXPLAIN keywords
     With,
     Explain,
@@ -1385,6 +1411,9 @@ impl SqlParser {
                     b"WITH" => Token::With,
                     b"EXPLAIN" => Token::Explain,
                     b"RECURSIVE" => Token::Recursive,
+                    b"EXCLUDE" => Token::Exclude,
+                    b"REPLACE" => Token::Replace,
+                    b"COLUMNS" => Token::ColumnsKw,
                     _ => Token::Identifier(word.to_string()),
                 };
                 tokens.push(SpannedToken {
@@ -1500,7 +1529,7 @@ impl SqlParser {
             Token::Identifier(s) => {
                 let u = s.to_uppercase();
                 // Keep list small and stable; used only for human-friendly hints.
-                const KWS: [&str; 72] = [
+                const KWS: [&str; 74] = [
                     "SELECT",
                     "FROM",
                     "WHERE",
@@ -1577,6 +1606,8 @@ impl SqlParser {
                     "WITH",
                     "EXPLAIN",
                     "RECURSIVE",
+                    "EXCLUDE",
+                    "REPLACE",
                 ];
 
                 // Fast path for common "plural" / extra trailing char typos: FROMs, WHEREs, LIKEs, LIMITs
@@ -1864,6 +1895,18 @@ impl SqlParser {
                 } else {
                     false
                 };
+                // CREATE [TEMP | TEMPORARY] TABLE ...
+                let temp = if let Token::Identifier(ref kw) = self.current() {
+                    let upper = kw.to_uppercase();
+                    if upper == "TEMP" || upper == "TEMPORARY" {
+                        self.advance();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
                 match self.current() {
                     Token::View if !unique => {
                         self.advance();
@@ -1880,18 +1923,19 @@ impl SqlParser {
                     }
                     Token::Table if !unique => {
                         self.advance();
-                        // Check for TEMP / TEMPORARY
-                        let temp = if let Token::Identifier(ref kw) = self.current() {
-                            let upper = kw.to_uppercase();
-                            if upper == "TEMP" || upper == "TEMPORARY" {
-                                self.advance();
-                                true
+                        // Check for TEMP / TEMPORARY (after TABLE — backward compat)
+                        let temp = temp
+                            || if let Token::Identifier(ref kw) = self.current() {
+                                let upper = kw.to_uppercase();
+                                if upper == "TEMP" || upper == "TEMPORARY" {
+                                    self.advance();
+                                    true
+                                } else {
+                                    false
+                                }
                             } else {
                                 false
-                            }
-                        } else {
-                            false
-                        };
+                            };
                         // Check for IF NOT EXISTS
                         let if_not_exists = self.parse_if_not_exists()?;
                         let table = self.parse_table_name()?;
@@ -2542,12 +2586,21 @@ impl SqlParser {
     fn parse_select_internal(&mut self, parse_tail: bool) -> Result<SelectStatement, ApexError> {
         self.expect(Token::Select)?;
 
-        // DISTINCT
-        let distinct = if matches!(self.current(), Token::Distinct) {
+        // DISTINCT [ON (...)]
+        let (distinct, distinct_on) = if matches!(self.current(), Token::Distinct) {
             self.advance();
-            true
+            let on = if matches!(self.current(), Token::On) {
+                self.advance();
+                self.expect(Token::LParen)?;
+                let cols = self.parse_column_list()?;
+                self.expect(Token::RParen)?;
+                Some(cols)
+            } else {
+                None
+            };
+            (true, on)
         } else {
-            false
+            (false, None)
         };
 
         // Columns
@@ -3089,6 +3142,7 @@ impl SqlParser {
 
         Ok(SelectStatement {
             distinct,
+            distinct_on,
             columns,
             from,
             joins,
@@ -3217,10 +3271,34 @@ impl SqlParser {
         let mut columns = Vec::new();
 
         loop {
-            // SELECT *
+            // SELECT *, SELECT * EXCLUDE (...), SELECT * REPLACE (...)
             if matches!(self.current(), Token::Star) {
                 self.advance();
-                columns.push(SelectColumn::All);
+                if matches!(self.current(), Token::Exclude) {
+                    self.advance();
+                    self.expect(Token::LParen)?;
+                    let exclude_cols = self.parse_column_list()?;
+                    self.expect(Token::RParen)?;
+                    columns.push(SelectColumn::AllExclude(exclude_cols));
+                } else if matches!(self.current(), Token::Replace) {
+                    self.advance();
+                    self.expect(Token::LParen)?;
+                    let mut replacements = Vec::new();
+                    loop {
+                        let expr = self.parse_expr()?;
+                        self.expect(Token::As)?;
+                        let col = self.parse_identifier()?;
+                        replacements.push((expr, col));
+                        if !matches!(self.current(), Token::Comma) {
+                            break;
+                        }
+                        self.advance();
+                    }
+                    self.expect(Token::RParen)?;
+                    columns.push(SelectColumn::AllReplace(replacements));
+                } else {
+                    columns.push(SelectColumn::All);
+                }
             }
             // Aggregate functions
             else if matches!(
@@ -3351,6 +3429,23 @@ impl SqlParser {
                         alias,
                     });
                 }
+            }
+            // COLUMNS('regex') — DuckDB-style column selection by pattern
+            else if matches!(self.current(), Token::ColumnsKw) {
+                self.advance();
+                self.expect(Token::LParen)?;
+                let pattern = if let Token::StringLit(s) = self.current().clone() {
+                    self.advance();
+                    s
+                } else {
+                    let (start, _) = self.current_span();
+                    return Err(self.syntax_error(
+                        start,
+                        "COLUMNS requires a string literal pattern".to_string(),
+                    ));
+                };
+                self.expect(Token::RParen)?;
+                columns.push(SelectColumn::Columns(pattern));
             }
             // Column or window function name
             else if matches!(self.current(), Token::Identifier(_)) {
@@ -3497,15 +3592,20 @@ impl SqlParser {
                 }
             }
             // Handle keywords that can also be function names: LEFT, RIGHT, IF, TRUNCATE
+            // Also REPLACE, EXCLUDE (when not preceded by *)
             else if matches!(
                 self.current(),
                 Token::Left | Token::Right | Token::If | Token::Truncate
+                    | Token::Replace | Token::Exclude | Token::ColumnsKw
             ) {
                 let name = match self.current() {
                     Token::Left => "LEFT",
                     Token::Right => "RIGHT",
                     Token::If => "IF",
                     Token::Truncate => "TRUNCATE",
+                    Token::Replace => "REPLACE",
+                    Token::Exclude => "EXCLUDE",
+                    Token::ColumnsKw => "COLUMNS",
                     _ => unreachable!(),
                 }
                 .to_string();
@@ -5436,6 +5536,55 @@ mod tests {
             assert_eq!(columns[3].data_type, DataType::Float32);
             assert_eq!(columns[4].data_type, DataType::Json);
             assert_eq!(columns[5].data_type, DataType::Binary);
+        } else {
+            panic!("Expected CreateTable");
+        }
+    }
+
+    // ====== CREATE TEMP / TEMPORARY TABLE parsing ======
+
+    #[test]
+    fn test_create_temp_table() {
+        let stmt = SqlParser::parse("CREATE TEMP TABLE t (a INTEGER)").unwrap();
+        if let SqlStatement::CreateTable { table, temp, columns, .. } = stmt {
+            assert_eq!(table, "t");
+            assert!(temp);
+            assert_eq!(columns.len(), 1);
+        } else {
+            panic!("Expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_create_temporary_table() {
+        let stmt = SqlParser::parse("CREATE TEMPORARY TABLE t (a INTEGER)").unwrap();
+        if let SqlStatement::CreateTable { table, temp, columns, .. } = stmt {
+            assert_eq!(table, "t");
+            assert!(temp);
+            assert_eq!(columns.len(), 1);
+        } else {
+            panic!("Expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_create_temp_table_as() {
+        let stmt = SqlParser::parse("CREATE TEMP TABLE t AS SELECT * FROM src").unwrap();
+        if let SqlStatement::CreateTableAs { table, temp, .. } = stmt {
+            assert_eq!(table, "t");
+            assert!(temp);
+        } else {
+            panic!("Expected CreateTableAs");
+        }
+    }
+
+    #[test]
+    fn test_create_temp_table_if_not_exists() {
+        let stmt = SqlParser::parse("CREATE TEMP TABLE IF NOT EXISTS t (a INTEGER)").unwrap();
+        if let SqlStatement::CreateTable { table, temp, if_not_exists, .. } = stmt {
+            assert_eq!(table, "t");
+            assert!(temp);
+            assert!(if_not_exists);
         } else {
             panic!("Expected CreateTable");
         }

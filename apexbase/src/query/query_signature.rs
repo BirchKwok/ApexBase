@@ -969,8 +969,10 @@ fn extract_from_table(sql: &str, su: &str) -> Option<String> {
 /// Extract DDL sub-kind from original-case SQL + uppercased version.
 /// Extracts table name for CREATE TABLE / DROP TABLE; returns Other for everything else.
 fn extract_ddl_kind(sql: &str, su: &str) -> DdlKind {
-    if su.starts_with("CREATE TABLE") {
-        let rest = &sql["CREATE TABLE".len()..].trim_start();
+    if su.starts_with("CREATE TABLE") || su.starts_with("CREATE TEMP TABLE") || su.starts_with("CREATE TEMPORARY TABLE") {
+        // Locate TABLE keyword in uppercased version to find offset in original SQL
+        let table_pos = su.find("TABLE").unwrap();
+        let rest = &sql[table_pos + "TABLE".len()..].trim_start();
         // Skip "IF NOT EXISTS"
         let rest = if rest.len() >= 13 && rest[..13].eq_ignore_ascii_case("IF NOT EXISTS") {
             rest[13..].trim_start()
@@ -1313,6 +1315,22 @@ mod tests {
     fn test_ddl() {
         assert_eq!(
             classify("CREATE TABLE t (id INT)"),
+            QuerySignature::Ddl {
+                kind: DdlKind::CreateTable {
+                    name: "t".to_string()
+                }
+            }
+        );
+        assert_eq!(
+            classify("CREATE TEMP TABLE t (id INT)"),
+            QuerySignature::Ddl {
+                kind: DdlKind::CreateTable {
+                    name: "t".to_string()
+                }
+            }
+        );
+        assert_eq!(
+            classify("CREATE TEMPORARY TABLE t (id INT)"),
             QuerySignature::Ddl {
                 kind: DdlKind::CreateTable {
                     name: "t".to_string()

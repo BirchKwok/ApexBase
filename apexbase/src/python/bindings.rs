@@ -4248,27 +4248,68 @@ impl ApexStorageImpl {
         }))
     }
 
-    /// Ultra-fast row count using cached backend (bypasses engine for maximum speed).
-    /// This is 2-3x faster than row_count() for COUNT(*) queries.
-    /// Uses active_row_count() so pending memtable rows are visible to COUNT(*).
-    fn fast_row_count(&self) -> PyResult<u64> {
-        let table_path = self.get_current_table_path()?;
-        if !table_path.exists() {
-            return Ok(0);
+    /// Resolve a table name to its path (handles temp tables, current dir)
+    fn resolve_table_path_for_count(&self, table_name: &str) -> PyResult<PathBuf> {
+        let clean = table_name.trim_matches('"').trim_matches('`');
+        // Check per-instance path cache first
+        {
+            let paths = self.table_paths.read();
+            if let Some(p) = paths.get(clean) {
+                return Ok(p.clone());
+            }
         }
+        let base_dir = self.current_base_dir();
+        // Check temp dir first (temp tables shadow persistent)
+        if let Some(temp_dir) = crate::query::executor::get_temp_dir() {
+            let temp_path = temp_dir.join(format!("{}.apex", clean));
+            if temp_path.exists() {
+                let mut paths = self.table_paths.write();
+                paths.insert(clean.to_string(), temp_path.clone());
+                return Ok(temp_path);
+            }
+        }
+        // Try base_dir
+        let p = base_dir.join(format!("{}.apex", clean));
+        if p.exists() {
+            let mut paths = self.table_paths.write();
+            paths.insert(clean.to_string(), p.clone());
+            return Ok(p);
+        }
+        Err(PyValueError::new_err(format!("Table not found: {}", clean)))
+    }
 
-        // Direct backend access - bypass engine completely. Use active count so
-        // storage-level memtable rows are visible before they are flushed.
-        if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+    /// Ultra-fast row count for ANY table (resolves path, uses per-instance cache)
+    fn fast_row_count_for(&self, table_name: &str) -> PyResult<u64> {
+        let table_path = self.resolve_table_path_for_count(table_name)?;
+        let cache_key = Self::backend_cache_key(&table_path, table_name);
+
+        // Per-instance backend cache (no stat(), no delta check)
+        if let Some(backend) = self.cached_backends.get(&cache_key) {
+            let backend = Arc::clone(&backend);
             return Ok(backend.active_row_count());
         }
 
-        // Fallback to engine path.
+        // Global cache fallback
+        if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+            self.cached_backends.insert(cache_key.clone(), Arc::clone(&backend));
+            return Ok(backend.active_row_count());
+        }
+
+        // Engine fallback
         let engine = crate::storage::engine::engine();
         let count = engine
             .active_row_count(&table_path)
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(count)
+    }
+
+    /// Ultra-fast row count for the CURRENT table
+    fn fast_row_count(&self) -> PyResult<u64> {
+        let table_name = self.current_table.read().clone();
+        if table_name.is_empty() {
+            return Err(PyValueError::new_err("No table selected. Call create_table() or use_table() first."));
+        }
+        self.fast_row_count_for(&table_name)
     }
 
     /// Save current table

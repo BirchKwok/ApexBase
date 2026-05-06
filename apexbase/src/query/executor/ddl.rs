@@ -358,6 +358,12 @@ impl ApexExecutor {
                 // Projection
                 let proj: Vec<String> = select.columns.iter().map(|c| match c {
                     SelectColumn::All => "*".to_string(),
+                    SelectColumn::AllExclude(exclude) => format!("* EXCLUDE ({})", exclude.join(", ")),
+                    SelectColumn::AllReplace(reps) => {
+                        let parts: Vec<String> = reps.iter().map(|(_, col)| col.clone()).collect();
+                        format!("* REPLACE ({})", parts.join(", "))
+                    }
+                    SelectColumn::Columns(pattern) => format!("COLUMNS('{}')", pattern),
                     SelectColumn::Column(name) => name.clone(),
                     SelectColumn::ColumnAlias { column, alias } => format!("{} AS {}", column, alias),
                     SelectColumn::Aggregate { func, column, .. } => {

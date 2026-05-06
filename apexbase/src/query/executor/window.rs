@@ -338,6 +338,71 @@ impl ApexExecutor {
             .map_err(|e| err_data( e.to_string()))
     }
 
+    /// DISTINCT ON: keep first row per unique combination of specified columns
+    pub(crate) fn deduplicate_batch_on(batch: &RecordBatch, on_columns: &[String]) -> io::Result<RecordBatch> {
+        if batch.num_rows() <= 1 || on_columns.is_empty() {
+            return Ok(batch.clone());
+        }
+
+        // Find column indices for the ON columns
+        let col_indices: Vec<usize> = on_columns
+            .iter()
+            .filter_map(|col_name| {
+                batch.schema().index_of(col_name).ok()
+            })
+            .collect();
+
+        if col_indices.is_empty() {
+            return Ok(batch.clone());
+        }
+
+        let num_rows = batch.num_rows();
+        let mut keep_indices: Vec<u32> = Vec::with_capacity(num_rows.min(10000));
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::with_capacity(num_rows.min(10000));
+
+        for row_idx in 0..num_rows {
+            let mut key = Vec::with_capacity(col_indices.len() * 16);
+            for &col_idx in &col_indices {
+                let col = batch.column(col_idx);
+                if col.is_null(row_idx) {
+                    key.push(0);
+                } else {
+                    key.push(1);
+                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                        key.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+                    } else if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+                        key.extend_from_slice(&arr.value(row_idx).to_bits().to_le_bytes());
+                    } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                        key.extend_from_slice(arr.value(row_idx).as_bytes());
+                    } else if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
+                        key.push(arr.value(row_idx) as u8);
+                    } else {
+                        // Fallback: use Debug representation
+                        key.extend_from_slice(format!("{:?}", col).as_bytes());
+                    }
+                }
+            }
+            if seen.insert(key) {
+                keep_indices.push(row_idx as u32);
+            }
+        }
+
+        if keep_indices.len() == num_rows {
+            return Ok(batch.clone());
+        }
+
+        let indices = arrow::array::UInt32Array::from(keep_indices);
+        let mut result_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+        for col in batch.columns() {
+            let filtered = compute::take(col.as_ref(), &indices, None)
+                .map_err(|e| err_data( e.to_string()))?;
+            result_columns.push(filtered);
+        }
+
+        RecordBatch::try_new(batch.schema(), result_columns)
+            .map_err(|e| err_data( e.to_string()))
+    }
+
     /// Append value signature for deduplication
     fn append_value_signature(sig: &mut Vec<u8>, array: &ArrayRef, idx: usize) {
         if array.is_null(idx) {

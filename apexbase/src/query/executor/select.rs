@@ -635,7 +635,7 @@ impl ApexExecutor {
                                 } else if let Some(result) =
                                     Self::try_fast_string_filter_no_limit(&backend, &stmt)?
                                 {
-                                    if !stmt.is_select_star() {
+                                    if !stmt.is_pure_star() {
                                         let projected = Self::apply_projection_with_storage(
                                             &result,
                                             &stmt.columns,
@@ -648,7 +648,7 @@ impl ApexExecutor {
                                 } else if let Some(result) =
                                     Self::try_fast_like_filter(&backend, &stmt)?
                                 {
-                                    if !stmt.is_select_star() {
+                                    if !stmt.is_pure_star() {
                                         let projected = Self::apply_projection_with_storage(
                                             &result,
                                             &stmt.columns,
@@ -827,7 +827,7 @@ impl ApexExecutor {
                                                 return Ok(ApexResult::Data(projected));
                                             }
 
-                                            if !stmt.is_select_star() {
+                                            if !stmt.is_pure_star() {
                                                 let projected =
                                                     Self::apply_projection_with_storage(
                                                         &batch,
@@ -847,7 +847,7 @@ impl ApexExecutor {
                                     if filtered.num_rows() == 0 {
                                         return Ok(ApexResult::Empty(filtered.schema()));
                                     }
-                                    if !stmt.is_select_star() {
+                                    if !stmt.is_pure_star() {
                                         let projected = Self::apply_projection_with_storage(
                                             &filtered,
                                             &stmt.columns,
@@ -867,7 +867,7 @@ impl ApexExecutor {
                                     if filtered.num_rows() == 0 {
                                         return Ok(ApexResult::Empty(filtered.schema()));
                                     }
-                                    if !stmt.is_select_star() {
+                                    if !stmt.is_pure_star() {
                                         let projected = Self::apply_projection_with_storage(
                                             &filtered,
                                             &stmt.columns,
@@ -1056,6 +1056,7 @@ impl ApexExecutor {
         }
 
         // For DISTINCT: sort without top-k limit, project, deduplicate, then limit
+        // For DISTINCT ON: sort, deduplicate by ON columns, project, then limit/offset
         // For non-DISTINCT: apply top-k sort + limit, then project
         let result = if stmt.distinct {
             let sorted = if !stmt.order_by.is_empty() {
@@ -1063,10 +1064,17 @@ impl ApexExecutor {
             } else {
                 filtered
             };
-            let projected =
-                Self::apply_projection_with_storage(&sorted, &stmt.columns, Some(storage_path))?;
-            let deduped = Self::deduplicate_batch(&projected)?;
-            Self::apply_limit_offset(&deduped, stmt.limit, stmt.offset)?
+            if let Some(ref on_cols) = stmt.distinct_on {
+                // DISTINCT ON: deduplicate by ON columns, then project + limit/offset
+                let deduped = Self::deduplicate_batch_on(&sorted, on_cols)?;
+                let projected = Self::apply_projection_with_storage(&deduped, &stmt.columns, Some(storage_path))?;
+                Self::apply_limit_offset(&projected, stmt.limit, stmt.offset)?
+            } else {
+                // Regular DISTINCT: project, deduplicate all columns, then limit
+                let projected = Self::apply_projection_with_storage(&sorted, &stmt.columns, Some(storage_path))?;
+                let deduped = Self::deduplicate_batch(&projected)?;
+                Self::apply_limit_offset(&deduped, stmt.limit, stmt.offset)?
+            }
         } else {
             // Apply ORDER BY with LIMIT optimization (top-k heap sort)
             let limited = if !stmt.order_by.is_empty() {
@@ -1244,8 +1252,8 @@ impl ApexExecutor {
             }
         };
 
-        // Apply column projection if not SELECT *
-        if !stmt.is_select_star() {
+        // Apply column projection if not pure SELECT *
+        if !stmt.is_pure_star() {
             let projected = Self::apply_projection(&result, &stmt.columns)?;
             if projected.num_rows() == 0 {
                 return Ok(Some(ApexResult::Empty(projected.schema())));
@@ -3178,7 +3186,7 @@ impl ApexExecutor {
                     return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
                 }
                 let batch = Self::read_matching_rows_adaptive(backend, stmt, &intersected)?;
-                if !stmt.is_select_star() {
+                if !stmt.is_pure_star() {
                     let projected = Self::apply_projection_with_storage(
                         &batch,
                         &stmt.columns,
@@ -3233,7 +3241,7 @@ impl ApexExecutor {
         }
 
         let batch = Self::read_matching_rows_adaptive(backend, stmt, &intersected)?;
-        if !stmt.is_select_star() {
+        if !stmt.is_pure_star() {
             let projected =
                 Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
             return Ok(Some(ApexResult::Data(projected)));
@@ -3579,7 +3587,7 @@ impl ApexExecutor {
         }
 
         let batch = Self::read_matching_rows_by_indices(backend, stmt, &all_indices)?;
-        if !stmt.is_select_star() {
+        if !stmt.is_pure_star() {
             let projected =
                 Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
             return Ok(Some(ApexResult::Data(projected)));
