@@ -11,7 +11,7 @@ ApexBase integrates a high-performance full-text search engine ([NanoFTS](https:
 3. [DDL Reference](#ddl-reference)
    - [CREATE FTS INDEX](#create-fts-index)
    - [DROP FTS INDEX](#drop-fts-index)
-   - [ALTER FTS INDEX DISABLE / ENABLE](#alter-fts-index-disable--enable)
+   - [ALTER FTS INDEX DISABLE / ENABLE](#alter-fts-index-disable-enable)
    - [SHOW FTS INDEXES](#show-fts-indexes)
 4. [Query Reference](#query-reference)
    - [MATCH()](#match)

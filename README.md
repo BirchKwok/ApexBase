@@ -1257,7 +1257,11 @@ ApexClient(
 
 ## Documentation
 
-Additional documentation is available in the `docs/` directory.
+The documentation source lives in the `docs/` directory and is built with MkDocs Material.
+
+- Documentation site: <https://birchkwok.github.io/ApexBase/>
+- Local preview: `python -m pip install -r docs/requirements.txt && python -m mkdocs serve`
+- Deployment: versioned GitHub Pages workflow in `.github/workflows/docs.yml`
 
 ## License
 

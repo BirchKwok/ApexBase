@@ -11,25 +11,13 @@ Comprehensive examples covering 100% of the ApexBase Python API.
 5. [Querying Data](#querying-data)
 6. [File Reading Table Functions](#file-reading-table-functions)
 7. [Temporary Tables from Files](#temporary-tables-from-files)
----
-98,99c98,99
-< 8. [Set Operations](#set-operations)
-< 9. [Vector Search](#vector-search)
----
-> 9. [Set Operations](#set-operations)
-> 10. [Vector Search](#vector-search)
----
-< 9. [Column Operations](#column-operations)
-< 10. [Full-Text Search](#full-text-search)
-< 11. [Data Modification](#data-modification)
-< 12. [Utility Methods](#utility-methods)
-< 13. [Advanced Usage](#advanced-usage)
----
-> 10. [Column Operations](#column-operations)
-> 11. [Full-Text Search](#full-text-search)
-> 12. [Data Modification](#data-modification)
-> 13. [Utility Methods](#utility-methods)
-> 14. [Advanced Usage](#advanced-usage)
+8. [Set Operations](#set-operations)
+9. [Vector Search](#vector-search)
+10. [Column Operations](#column-operations)
+11. [Full-Text Search](#full-text-search)
+12. [Data Modification](#data-modification)
+13. [Utility Methods](#utility-methods)
+14. [Advanced Usage](#advanced-usage)
 
 ---
 

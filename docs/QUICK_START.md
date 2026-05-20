@@ -334,4 +334,5 @@ row = results[0]
 
 - [API Reference](API_REFERENCE.md) - Complete API documentation
 - [Examples](EXAMPLES.md) - More usage examples
-- [Root README](../README.md) - Project information
+- [Core Concepts](concepts.md) - Mental model for databases, tables, durability, and results
+- [Project README](https://github.com/BirchKwok/ApexBase#readme) - Repository overview

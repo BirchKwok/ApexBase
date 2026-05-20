@@ -9,7 +9,7 @@ ApexBase supports `FLOAT16_VECTOR` columns for storing embedding vectors in half
 1. [When to use float16](#when-to-use-float16)
 2. [Creating a float16 table](#creating-a-float16-table)
 3. [Inserting vectors](#inserting-vectors)
-4. [Querying — TopK and SQL](#querying--topk-and-sql)
+4. [Querying — TopK and SQL](#querying-topk-and-sql)
 5. [SIMD acceleration details](#simd-acceleration-details)
 6. [Quantization error and precision](#quantization-error-and-precision)
 7. [Full working example](#full-working-example)

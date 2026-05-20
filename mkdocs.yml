@@ -1,0 +1,109 @@
+site_name: ApexBase
+site_author: Birch Kwok
+site_description: High-performance HTAP embedded database with Rust core and Python API
+site_url: https://birchkwok.github.io/ApexBase/
+repo_url: https://github.com/BirchKwok/ApexBase
+repo_name: birchkwok/ApexBase
+edit_uri: edit/main/docs/
+
+strict: true
+exclude_docs: |
+  README.md
+  requirements.txt
+  hooks/*.py
+
+hooks:
+  - hooks/mkdocs_version.py
+
+theme:
+  name: material
+  language: en
+  logo: img/logo.svg
+  favicon: img/favicon.svg
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.top
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.path
+    - toc.integrate
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.select
+    - content.code.annotate
+    - content.tabs.link
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  font:
+    text: false
+    code: Roboto Mono
+
+extra:
+  paths:
+    - apexbase/python
+  version:
+    provider: mike
+    default: latest
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      permalink_class: headerlink
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: installation.md
+      - Quick Start: QUICK_START.md
+      - Core Concepts: concepts.md
+  - User Guide:
+      - Python Client: user-guide/python-client.md
+      - SQL Guide: user-guide/sql.md
+      - Data Import: user-guide/data-import.md
+      - Server Protocols: user-guide/server-protocols.md
+      - Examples: EXAMPLES.md
+  - Reference:
+      - Python API: API_REFERENCE.md
+      - Rust Embedded API: RUST_EMBEDDED_API.md
+  - Features:
+      - Full-Text Search: FTS_GUIDE.md
+      - Float16 Vectors: FLOAT16_VECTOR_GUIDE.md
+  - Internals:
+      - Storage Architecture: STORAGE_ARCHITECTURE.md
+      - Engineering Guidelines: ENGINEERING_GUIDELINES.md
+      - HTAP Roadmap: HTAP_ROADMAP.md
+  - Docs Index: documentation-index.md
