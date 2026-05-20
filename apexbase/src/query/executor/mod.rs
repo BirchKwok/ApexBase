@@ -903,12 +903,24 @@ impl ApexExecutor {
 
     /// Derive temp table path from table name using the thread-local TEMP_DIR.
     fn temp_table_path(table_name: &str) -> PathBuf {
-        let dir = TEMP_DIR.with(|r| r.borrow().clone())
+        let dir = TEMP_DIR
+            .with(|r| r.borrow().clone())
             .unwrap_or_else(|| PathBuf::from(".apex_tmp"));
-        let safe_name: String = table_name.chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        let safe_name: String = table_name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
-        let truncated = if safe_name.len() > 200 { &safe_name[..200] } else { &safe_name };
+        let truncated = if safe_name.len() > 200 {
+            &safe_name[..200]
+        } else {
+            &safe_name
+        };
         dir.join(format!("{}.apex", truncated))
     }
 
@@ -1716,43 +1728,49 @@ impl ApexExecutor {
                                     if let Some(where_pos) = after_set_u.find(" WHERE ") {
                                         let set_part = after_set[..where_pos].trim();
                                         let where_part = after_set[where_pos + 7..].trim();
-                                        let where_part_u = after_set_u[where_pos + 7..].trim().to_ascii_uppercase();
+                                        let where_part_u = after_set_u[where_pos + 7..]
+                                            .trim()
+                                            .to_ascii_uppercase();
                                         if !where_part_u.contains(" AND ")
                                             && !where_part_u.contains(" OR ")
                                             && !where_part_u.contains("NOT ")
                                             && !where_part_u.contains(" IN ")
                                         {
                                             if let Some(eq_pos) = set_part.find('=') {
-                                                let set_col = set_part[..eq_pos].trim().trim_matches('"');
+                                                let set_col =
+                                                    set_part[..eq_pos].trim().trim_matches('"');
                                                 let set_val_str = set_part[eq_pos + 1..].trim();
                                                 if !set_col.is_empty()
                                                     && !set_col.contains(' ')
                                                     && set_col != "_id"
                                                 {
-                                                    let set_val: Option<Value> =
-                                                        if set_val_str.contains('.')
-                                                            || set_val_str.contains('e')
-                                                            || set_val_str.contains('E')
-                                                        {
-                                                            set_val_str
-                                                                .parse::<f64>()
-                                                                .ok()
-                                                                .map(Value::Float64)
-                                                        } else {
-                                                            set_val_str
-                                                                .parse::<i64>()
-                                                                .ok()
-                                                                .map(Value::Int64)
-                                                        };
+                                                    let set_val: Option<Value> = if set_val_str
+                                                        .contains('.')
+                                                        || set_val_str.contains('e')
+                                                        || set_val_str.contains('E')
+                                                    {
+                                                        set_val_str
+                                                            .parse::<f64>()
+                                                            .ok()
+                                                            .map(Value::Float64)
+                                                    } else {
+                                                        set_val_str
+                                                            .parse::<i64>()
+                                                            .ok()
+                                                            .map(Value::Int64)
+                                                    };
                                                     if let Some(ref sv) = set_val {
                                                         if let Some(expr) =
-                                                            Self::try_parse_delete_numeric_where(where_part)
+                                                            Self::try_parse_delete_numeric_where(
+                                                                where_part,
+                                                            )
                                                         {
-                                                            let table_path = Self::resolve_table_path(
-                                                                table_raw,
-                                                                base_dir,
-                                                                default_table_path,
-                                                            );
+                                                            let table_path =
+                                                                Self::resolve_table_path(
+                                                                    table_raw,
+                                                                    base_dir,
+                                                                    default_table_path,
+                                                                );
                                                             if table_path.exists() {
                                                                 let assignments = vec![(
                                                                     set_col.to_string(),

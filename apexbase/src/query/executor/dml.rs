@@ -932,9 +932,7 @@ impl ApexExecutor {
         index_type_str: Option<&str>,
         if_not_exists: bool,
     ) -> io::Result<ApexResult> {
-        use crate::data::Value;
-        use crate::storage::index::btree::IndexKey;
-        use crate::storage::index::{IndexManager, IndexType};
+        use crate::storage::index::IndexType;
 
         if columns.is_empty() {
             return Err(err_input("CREATE INDEX requires at least one column"));
@@ -1006,6 +1004,8 @@ impl ApexExecutor {
         // Build index from existing data
         let row_count = storage.row_count();
         if row_count > 0 {
+            const INDEX_BUILD_BATCH_ROWS: usize = 65_536;
+
             // Read _id column and all indexed columns
             let mut col_refs_owned: Vec<String> = vec!["_id".to_string()];
             for c in columns {
@@ -1014,35 +1014,58 @@ impl ApexExecutor {
                 }
             }
             let col_refs: Vec<&str> = col_refs_owned.iter().map(|s| s.as_str()).collect();
-            let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
 
-            let id_col = batch
-                .column_by_name("_id")
-                .ok_or_else(|| err_data("_id column not found"))?;
+            let build_result = (|| -> io::Result<()> {
+                let mut start_row = 0usize;
+                let total_rows = row_count as usize;
 
-            let id_arr = id_col
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .or_else(|| None);
-            let id_arr_i64 = id_col.as_any().downcast_ref::<Int64Array>();
+                while start_row < total_rows {
+                    let limit = (total_rows - start_row).min(INDEX_BUILD_BATCH_ROWS);
+                    let batch = storage.read_columns_to_arrow_window(
+                        Some(&col_refs),
+                        start_row,
+                        Some(limit),
+                    )?;
 
-            for row in 0..batch.num_rows() {
-                let row_id: u64 = if let Some(arr) = id_arr {
-                    arr.value(row)
-                } else if let Some(arr) = id_arr_i64 {
-                    arr.value(row) as u64
-                } else {
-                    row as u64
-                };
-
-                // Extract values from all indexed columns
-                let mut col_vals = std::collections::HashMap::new();
-                for col in columns {
-                    if let Some(data_col) = batch.column_by_name(col) {
-                        col_vals.insert(col.clone(), Self::arrow_value_at_col(data_col, row));
+                    if batch.num_rows() == 0 {
+                        break;
                     }
+
+                    let id_col = batch
+                        .column_by_name("_id")
+                        .ok_or_else(|| err_data("_id column not found"))?;
+
+                    let id_arr = id_col.as_any().downcast_ref::<UInt64Array>();
+                    let id_arr_i64 = id_col.as_any().downcast_ref::<Int64Array>();
+
+                    for row in 0..batch.num_rows() {
+                        let row_id: u64 = if let Some(arr) = id_arr {
+                            arr.value(row)
+                        } else if let Some(arr) = id_arr_i64 {
+                            arr.value(row) as u64
+                        } else {
+                            (start_row + row) as u64
+                        };
+
+                        // Extract values from all indexed columns
+                        let mut col_vals = std::collections::HashMap::with_capacity(columns.len());
+                        for col in columns {
+                            if let Some(data_col) = batch.column_by_name(col) {
+                                col_vals.insert(col.clone(), Self::arrow_value_at_col(data_col, row));
+                            }
+                        }
+                        idx_mgr.on_insert(row_id, &col_vals)?;
+                    }
+
+                    start_row += batch.num_rows();
                 }
-                idx_mgr.on_insert(row_id, &col_vals)?;
+
+                Ok(())
+            })();
+
+            if let Err(err) = build_result {
+                let _ = idx_mgr.drop_index(name);
+                return Err(err);
             }
         }
 

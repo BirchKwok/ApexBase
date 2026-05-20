@@ -4831,6 +4831,95 @@ impl ApexStorageImpl {
         Ok(Some(out.into()))
     }
 
+    /// Retrieve selected columns for the first N rows matching `column = value`.
+    /// This is the Python hot path for small projected equality+LIMIT SQL, avoiding
+    /// full SQL execution and Arrow round-trips through the client layer.
+    fn retrieve_projected_by_string_eq_limit(
+        &self,
+        py: Python<'_>,
+        filter_column: String,
+        value: String,
+        columns: Vec<String>,
+        limit: usize,
+        offset: usize,
+    ) -> PyResult<Option<PyObject>> {
+        if filter_column.is_empty() || columns.is_empty() {
+            return Ok(None);
+        }
+
+        let (table_path, table_name) = self.get_current_table_info()?;
+        let cache_key = Self::backend_cache_key(&table_path, &table_name);
+        let backend_opt: Option<Arc<TableStorageBackend>> = self
+            .cached_backends
+            .get(&cache_key)
+            .map(|v| Arc::clone(&v))
+            .or_else(|| {
+                crate::query::get_cached_backend_pub(&table_path)
+                    .ok()
+                    .map(|b| {
+                        self.cached_backends
+                            .insert(cache_key.clone(), Arc::clone(&b));
+                        b
+                    })
+            });
+
+        let Some(backend) = backend_opt else {
+            return Ok(None);
+        };
+        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+            return Ok(None);
+        }
+
+        let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let needed = offset.saturating_add(limit);
+        let batch_result = py.allow_threads(|| -> io::Result<Option<RecordBatch>> {
+            if limit == 0 {
+                return backend
+                    .read_columns_to_arrow(Some(col_refs.as_slice()), 0, Some(0))
+                    .map(Some);
+            }
+
+            let Some(indices) =
+                backend.scan_string_filter_mmap(&filter_column, &value, Some(needed))?
+            else {
+                return Ok(None);
+            };
+            let final_indices: Vec<usize> = indices.into_iter().skip(offset).take(limit).collect();
+            if final_indices.is_empty() {
+                backend
+                    .read_columns_to_arrow(Some(col_refs.as_slice()), 0, Some(0))
+                    .map(Some)
+            } else {
+                backend
+                    .read_columns_by_indices_to_arrow(&final_indices, Some(col_refs.as_slice()))
+                    .map(Some)
+            }
+        });
+
+        let Some(batch) = batch_result.map_err(|e| PyIOError::new_err(e.to_string()))? else {
+            return Ok(None);
+        };
+
+        let out = PyDict::new_bound(py);
+        let columns_dict = PyDict::new_bound(py);
+        if batch.num_rows() == 0 {
+            for col_name in &columns {
+                columns_dict.set_item(col_name.as_str(), PyList::empty_bound(py))?;
+            }
+        } else {
+            let schema = batch.schema();
+            for col_idx in 0..batch.num_columns() {
+                let col_name = schema.field(col_idx).name();
+                let arr = batch.column(col_idx);
+                let col_list = arrow_col_to_pylist(py, arr)?;
+                columns_dict.set_item(col_name, col_list)?;
+            }
+        }
+        out.set_item("columns_dict", columns_dict)?;
+        out.set_item("rows_affected", 0i64)?;
+        Ok(Some(out.into()))
+    }
+
     /// Retrieve selected columns for one ID as a row dict; optimized for SQL
     /// point lookups immediately consumed via ResultView.to_dict().
     fn retrieve_projected_row(

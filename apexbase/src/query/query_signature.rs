@@ -969,7 +969,10 @@ fn extract_from_table(sql: &str, su: &str) -> Option<String> {
 /// Extract DDL sub-kind from original-case SQL + uppercased version.
 /// Extracts table name for CREATE TABLE / DROP TABLE; returns Other for everything else.
 fn extract_ddl_kind(sql: &str, su: &str) -> DdlKind {
-    if su.starts_with("CREATE TABLE") || su.starts_with("CREATE TEMP TABLE") || su.starts_with("CREATE TEMPORARY TABLE") {
+    if su.starts_with("CREATE TABLE")
+        || su.starts_with("CREATE TEMP TABLE")
+        || su.starts_with("CREATE TEMPORARY TABLE")
+    {
         // Locate TABLE keyword in uppercased version to find offset in original SQL
         let table_pos = su.find("TABLE").unwrap();
         let rest = &sql[table_pos + "TABLE".len()..].trim_start();

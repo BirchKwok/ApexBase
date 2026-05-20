@@ -250,10 +250,7 @@ pub enum FromItem {
         alias: Option<String>,
     },
     /// DuckDB-style direct file reading: `SELECT * FROM 'path/file.parquet'`
-    DirectFile {
-        file: String,
-        alias: Option<String>,
-    },
+    DirectFile { file: String, alias: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -502,9 +499,15 @@ impl SelectStatement {
 
     /// Check if this query uses SELECT * (needs all columns)
     pub fn is_select_star(&self) -> bool {
-        self.columns
-            .iter()
-            .any(|col| matches!(col, SelectColumn::All | SelectColumn::AllExclude(..) | SelectColumn::AllReplace(..) | SelectColumn::Columns(..)))
+        self.columns.iter().any(|col| {
+            matches!(
+                col,
+                SelectColumn::All
+                    | SelectColumn::AllExclude(..)
+                    | SelectColumn::AllReplace(..)
+                    | SelectColumn::Columns(..)
+            )
+        })
     }
 
     /// Check if this is a pure SELECT * (no EXCLUDE/REPLACE/COLUMNS)
@@ -513,7 +516,9 @@ impl SelectStatement {
         for col in &self.columns {
             match col {
                 SelectColumn::All => has_all = true,
-                SelectColumn::AllExclude(..) | SelectColumn::AllReplace(..) | SelectColumn::Columns(..) => return false,
+                SelectColumn::AllExclude(..)
+                | SelectColumn::AllReplace(..)
+                | SelectColumn::Columns(..) => return false,
                 _ => {}
             }
         }
@@ -3595,8 +3600,13 @@ impl SqlParser {
             // Also REPLACE, EXCLUDE (when not preceded by *)
             else if matches!(
                 self.current(),
-                Token::Left | Token::Right | Token::If | Token::Truncate
-                    | Token::Replace | Token::Exclude | Token::ColumnsKw
+                Token::Left
+                    | Token::Right
+                    | Token::If
+                    | Token::Truncate
+                    | Token::Replace
+                    | Token::Exclude
+                    | Token::ColumnsKw
             ) {
                 let name = match self.current() {
                     Token::Left => "LEFT",
@@ -5546,7 +5556,13 @@ mod tests {
     #[test]
     fn test_create_temp_table() {
         let stmt = SqlParser::parse("CREATE TEMP TABLE t (a INTEGER)").unwrap();
-        if let SqlStatement::CreateTable { table, temp, columns, .. } = stmt {
+        if let SqlStatement::CreateTable {
+            table,
+            temp,
+            columns,
+            ..
+        } = stmt
+        {
             assert_eq!(table, "t");
             assert!(temp);
             assert_eq!(columns.len(), 1);
@@ -5558,7 +5574,13 @@ mod tests {
     #[test]
     fn test_create_temporary_table() {
         let stmt = SqlParser::parse("CREATE TEMPORARY TABLE t (a INTEGER)").unwrap();
-        if let SqlStatement::CreateTable { table, temp, columns, .. } = stmt {
+        if let SqlStatement::CreateTable {
+            table,
+            temp,
+            columns,
+            ..
+        } = stmt
+        {
             assert_eq!(table, "t");
             assert!(temp);
             assert_eq!(columns.len(), 1);
@@ -5581,7 +5603,13 @@ mod tests {
     #[test]
     fn test_create_temp_table_if_not_exists() {
         let stmt = SqlParser::parse("CREATE TEMP TABLE IF NOT EXISTS t (a INTEGER)").unwrap();
-        if let SqlStatement::CreateTable { table, temp, if_not_exists, .. } = stmt {
+        if let SqlStatement::CreateTable {
+            table,
+            temp,
+            if_not_exists,
+            ..
+        } = stmt
+        {
             assert_eq!(table, "t");
             assert!(temp);
             assert!(if_not_exists);

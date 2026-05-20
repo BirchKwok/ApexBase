@@ -1620,6 +1620,22 @@ class ApexClient:
                                             filter_val,
                                             None,
                                         )
+                                elif (limit_val >= 0 and offset_val >= 0 and columns
+                                      and 'ORDER' not in sql_upper
+                                      and 'GROUP' not in sql_upper and 'JOIN' not in sql_upper
+                                      and 'BETWEEN' not in sql_upper and ' IN ' not in sql_upper
+                                      and ' LIKE ' not in sql_upper
+                                      and ' AND ' not in sql_upper and ' OR ' not in sql_upper
+                                      and '>' not in sql_upper and '<' not in sql_upper):
+                                    cached_simple = (
+                                        'projected_string_eq_limit',
+                                        string_limit_table,
+                                        string_limit.group(1),
+                                        string_limit.group(2),
+                                        tuple(columns),
+                                        limit_val,
+                                        offset_val,
+                                    )
                 if len(self._simple_sql_cache) >= 256:
                     self._simple_sql_cache.clear()
                 self._simple_sql_cache[sql] = cached_simple
@@ -1716,6 +1732,30 @@ class ApexClient:
                                 rv = ResultView(lazy_pydict=columns_dict)
                                 rv._show_internal_id = show_internal_id if show_internal_id is not None else False
                                 return rv
+                except Exception:
+                    pass  # fall through to the general SQL executor
+
+            if cached_simple and cached_simple[0] == 'projected_string_eq_limit':
+                _, table_name, filter_col, filter_val, columns, limit_val, offset_val = cached_simple
+                try:
+                    self._ensure_table_selected()
+                    if self._current_table and table_name.lower() == self._current_table.lower():
+                        show_flag = show_internal_id if show_internal_id is not None else False
+                        cached_rows = self._get_cached_select_result(sql, show_flag)
+                        if cached_rows is not None:
+                            return self._result_view_from_cached_rows(cached_rows, show_flag)
+                        result = self._storage.retrieve_projected_by_string_eq_limit(
+                            filter_col, filter_val, list(columns), limit_val, offset_val
+                        )
+                        if result is not None:
+                            columns_dict = result.get('columns_dict')
+                            if columns_dict is not None:
+                                return self._result_view_from_columns_dict(
+                                    sql,
+                                    columns_dict,
+                                    show_flag,
+                                    cache_result=True,
+                                )
                 except Exception:
                     pass  # fall through to the general SQL executor
 

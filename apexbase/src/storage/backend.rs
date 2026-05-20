@@ -1962,6 +1962,37 @@ impl TableStorageBackend {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
+    /// Read an Arrow row window without forcing V4 mmap callers to rescan from row 0.
+    ///
+    /// This is intended for streaming table consumers such as CREATE INDEX. On pure
+    /// persisted V4 tables it reads only the requested active-row window; otherwise it
+    /// falls back to the general reader, preserving delta/in-memory semantics.
+    pub fn read_columns_to_arrow_window(
+        &self,
+        column_names: Option<&[&str]>,
+        start_row: usize,
+        row_count: Option<usize>,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        let base_rows = self.base_row_count();
+        let has_delta =
+            self.has_delta() || self.row_count() > base_rows || self.active_row_count() > base_rows;
+        if !has_delta {
+            let include_id = column_names
+                .map(|cols| cols.contains(&"_id"))
+                .unwrap_or(true);
+            if let Ok(Some(batch)) = self.storage.to_arrow_batch_mmap_range(
+                column_names,
+                include_id,
+                start_row,
+                row_count,
+                false,
+            ) {
+                return Ok(batch);
+            }
+        }
+        self.read_columns_to_arrow(column_names, start_row, row_count)
+    }
+
     /// Read all columns to Arrow (convenience method)
     pub fn read_all_to_arrow(&self) -> io::Result<arrow::record_batch::RecordBatch> {
         self.read_columns_to_arrow(None, 0, None)

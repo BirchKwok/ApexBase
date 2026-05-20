@@ -282,6 +282,19 @@ impl OnDemandStorage {
         row_limit: Option<usize>,
         dict_encode_strings: bool,
     ) -> io::Result<Option<RecordBatch>> {
+        self.to_arrow_batch_mmap_range(column_names, include_id, 0, row_limit, dict_encode_strings)
+    }
+
+    /// Read an active-row window from on-disk V4 Row Groups directly via mmap.
+    /// `row_offset` is counted after delete filtering, matching `row_limit` semantics.
+    pub fn to_arrow_batch_mmap_range(
+        &self,
+        column_names: Option<&[&str]>,
+        include_id: bool,
+        row_offset: usize,
+        row_limit: Option<usize>,
+        dict_encode_strings: bool,
+    ) -> io::Result<Option<RecordBatch>> {
         use arrow::array::{Int64Array, StringArray, BooleanArray, PrimitiveArray};
         use arrow::buffer::{Buffer, NullBuffer, BooleanBuffer, ScalarBuffer};
         use arrow::datatypes::{Schema, Field, DataType as ArrowDataType, Int64Type, Float64Type};
@@ -332,7 +345,10 @@ impl OnDemandStorage {
             return Ok(Some(RecordBatch::new_empty(arrow_schema)));
         }
 
-        let effective_limit = row_limit.unwrap_or(total_active).min(total_active);
+        let effective_start = row_offset.min(total_active);
+        let effective_limit = row_limit
+            .unwrap_or_else(|| total_active.saturating_sub(effective_start))
+            .min(total_active.saturating_sub(effective_start));
 
         // Get mmap for the file
         let file_guard = self.file.read();
@@ -355,6 +371,7 @@ impl OnDemandStorage {
             .collect();
         let mut null_accumulators: Vec<Vec<bool>> = vec![Vec::new(); col_indices.len()];
         let mut rows_collected: usize = 0;
+        let mut active_rows_seen: usize = 0;
 
         for (rg_idx, rg_meta) in footer.row_groups.iter().enumerate() {
             if rows_collected >= effective_limit {
@@ -365,6 +382,18 @@ impl OnDemandStorage {
             }
 
             let rg_rows = rg_meta.row_count as usize;
+            let rg_active = rg_meta.active_rows() as usize;
+            if active_rows_seen + rg_active <= effective_start {
+                active_rows_seen += rg_active;
+                continue;
+            }
+            let active_skip = effective_start.saturating_sub(active_rows_seen).min(rg_active);
+            let rows_to_take = (effective_limit - rows_collected).min(rg_active - active_skip);
+            if rows_to_take == 0 {
+                active_rows_seen += rg_active;
+                continue;
+            }
+
             let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
             if rg_end > mmap_ref.len() {
                 return Err(err_data("RG extends past EOF"));
@@ -375,8 +404,6 @@ impl OnDemandStorage {
             let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
             let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
             let has_deletes = rg_meta.deletion_count > 0;
-            let rg_active = rg_meta.active_rows() as usize;
-            let rows_to_take = (effective_limit - rows_collected).min(rg_active);
             let null_bitmap_len = (rg_rows + 7) / 8;
 
             // === RCIX fast path: O(1) direct seeks for no-compression, no-deletes ===
@@ -394,9 +421,10 @@ impl OnDemandStorage {
 
                 // Read only first rows_to_take IDs directly from mmap (avoids touching rest)
                 {
-                    let id_end = rg_body_abs + rows_to_take * 8;
+                    let id_start = rg_body_abs + active_skip * 8;
+                    let id_end = id_start + rows_to_take * 8;
                     if id_end <= mmap_ref.len() {
-                        let id_bytes = &mmap_ref[rg_body_abs..id_end];
+                        let id_bytes = &mmap_ref[id_start..id_end];
                         for i in 0..rows_to_take {
                             let id = u64::from_le_bytes(
                                 id_bytes[i * 8..(i + 1) * 8].try_into().unwrap()
@@ -431,7 +459,7 @@ impl OnDemandStorage {
                                 return Ok((create_default(col_type, rows_to_take), vec![true; rows_to_take]));
                             }
                             let col_type = schema.columns[col_idx].1;
-                            let (col_data, _) = if rows_to_take < rg_rows {
+                            let (col_data, _) = if active_skip == 0 && rows_to_take < rg_rows {
                                 read_column_encoded_partial(&mmap_ref[data_abs..], col_type, rows_to_take)?
                             } else {
                                 read_column_encoded(&mmap_ref[data_abs..], col_type)?
@@ -441,9 +469,15 @@ impl OnDemandStorage {
                             } else {
                                 col_data
                             };
+                            let col_data = if active_skip > 0 || rows_to_take < col_data.len() {
+                                col_data.slice_range(active_skip, active_skip + rows_to_take)
+                            } else {
+                                col_data
+                            };
                             let mut nulls = Vec::with_capacity(rows_to_take);
                             for i in 0..rows_to_take {
-                                nulls.push((null_bytes[i / 8] >> (i % 8)) & 1 == 1);
+                                let row = active_skip + i;
+                                nulls.push((null_bytes[row / 8] >> (row % 8)) & 1 == 1);
                             }
                             Ok((col_data, nulls))
                         }).collect();
@@ -471,7 +505,7 @@ impl OnDemandStorage {
                             continue;
                         }
                         let col_type = schema.columns[col_idx].1;
-                        let (col_data, _) = if rows_to_take < rg_rows {
+                        let (col_data, _) = if active_skip == 0 && rows_to_take < rg_rows {
                             read_column_encoded_partial(&mmap_ref[data_abs..], col_type, rows_to_take)?
                         } else {
                             read_column_encoded(&mmap_ref[data_abs..], col_type)?
@@ -481,14 +515,21 @@ impl OnDemandStorage {
                         } else {
                             col_data
                         };
+                        let col_data = if active_skip > 0 || rows_to_take < col_data.len() {
+                            col_data.slice_range(active_skip, active_skip + rows_to_take)
+                        } else {
+                            col_data
+                        };
                         col_accumulators[out_pos].append(&col_data);
                         for i in 0..rows_to_take {
-                            null_accumulators[out_pos].push((null_bytes[i / 8] >> (i % 8)) & 1 == 1);
+                            let row = active_skip + i;
+                            null_accumulators[out_pos].push((null_bytes[row / 8] >> (row % 8)) & 1 == 1);
                         }
                     }
                 }
 
                 rows_collected += rows_to_take;
+                active_rows_seen += rg_active;
                 continue; // skip sequential scan path below
             }
             // === End RCIX fast path ===
@@ -516,10 +557,15 @@ impl OnDemandStorage {
 
             // Always collect active IDs from this RG (needed for DeltaMerger overlay)
             {
+                let mut skipped = 0usize;
                 let mut taken = 0;
                 for i in 0..rg_rows {
                     if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
                         continue; // deleted
+                    }
+                    if skipped < active_skip {
+                        skipped += 1;
+                        continue;
                     }
                     let id = u64::from_le_bytes(
                         id_slice[i * 8..(i + 1) * 8].try_into().unwrap()
@@ -554,7 +600,7 @@ impl OnDemandStorage {
                 if let Some(&out_pos) = col_idx_to_out.get(&col_idx) {
                     // OPTIMIZATION: For LIMIT queries without deletes, use partial column read
                     // to avoid allocating/copying full column data (e.g., 1M rows → only 100)
-                    if !has_deletes && rows_to_take < rg_rows && encoding_version >= 1 {
+                    if !has_deletes && active_skip == 0 && rows_to_take < rg_rows && encoding_version >= 1 {
                         let (col_data, consumed) = read_column_encoded_partial(&body[pos..], col_type, rows_to_take)?;
                         pos += consumed;
                         let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
@@ -585,6 +631,7 @@ impl OnDemandStorage {
                         if has_deletes {
                             let active_indices: Vec<usize> = (0..rg_rows)
                                 .filter(|&i| (del_bytes[i / 8] >> (i % 8)) & 1 == 0)
+                                .skip(active_skip)
                                 .take(rows_to_take)
                                 .collect();
                             let filtered = col_data.filter_by_indices(&active_indices);
@@ -597,11 +644,12 @@ impl OnDemandStorage {
                                 null_accumulators[out_pos].push(is_null);
                             }
                         } else {
-                            if rows_to_take < rg_rows {
-                                let range_data = col_data.slice_range(0, rows_to_take);
+                            if active_skip > 0 || rows_to_take < rg_rows {
+                                let range_data = col_data.slice_range(active_skip, active_skip + rows_to_take);
                                 col_accumulators[out_pos].append(&range_data);
                                 for i in 0..rows_to_take {
-                                    let is_null = (null_bytes[i / 8] >> (i % 8)) & 1 == 1;
+                                    let row = active_skip + i;
+                                    let is_null = (null_bytes[row / 8] >> (row % 8)) & 1 == 1;
                                     null_accumulators[out_pos].push(is_null);
                                 }
                             } else {
@@ -635,6 +683,7 @@ impl OnDemandStorage {
                 }
             }
             rows_collected += rows_to_take;
+            active_rows_seen += rg_active;
         }
 
         drop(mmap_guard);

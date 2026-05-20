@@ -366,7 +366,10 @@ impl ApexDB {
             let lower = file_path.to_lowercase();
             if lower.ends_with(".csv") || lower.ends_with(".tsv") {
                 "CSV"
-            } else if lower.ends_with(".json") || lower.ends_with(".ndjson") || lower.ends_with(".jsonl") {
+            } else if lower.ends_with(".json")
+                || lower.ends_with(".ndjson")
+                || lower.ends_with(".jsonl")
+            {
                 "JSON"
             } else {
                 "PARQUET"
@@ -2751,14 +2754,21 @@ mod tests {
         let (_dir, db) = temp_db();
         // Create a CSV file
         let csv_path = _dir.path().join("test.csv");
-        std::fs::write(&csv_path, "name,age,score\nAlice,25,85.5\nBob,30,90.0\nCharlie,35,78.2\n").unwrap();
+        std::fs::write(
+            &csv_path,
+            "name,age,score\nAlice,25,85.5\nBob,30,90.0\nCharlie,35,78.2\n",
+        )
+        .unwrap();
 
-        db.register_temp_table("people", csv_path.to_str().unwrap()).unwrap();
+        db.register_temp_table("people", csv_path.to_str().unwrap())
+            .unwrap();
 
         let table = db.table("people").unwrap();
         assert_eq!(table.count().unwrap(), 3);
 
-        let rs = table.execute("SELECT * FROM people WHERE age > 28").unwrap();
+        let rs = table
+            .execute("SELECT * FROM people WHERE age > 28")
+            .unwrap();
         let batch = rs.to_record_batch().unwrap();
         assert_eq!(batch.num_rows(), 2);
     }
@@ -2769,14 +2779,22 @@ mod tests {
         let json_path = _dir.path().join("test.json");
         std::fs::write(&json_path, "{\"name\":\"Alice\",\"age\":25}\n{\"name\":\"Bob\",\"age\":30}\n{\"name\":\"Charlie\",\"age\":35}\n").unwrap();
 
-        db.register_temp_table("users", json_path.to_str().unwrap()).unwrap();
+        db.register_temp_table("users", json_path.to_str().unwrap())
+            .unwrap();
 
         let table = db.table("users").unwrap();
         assert_eq!(table.count().unwrap(), 3);
 
-        let rs = table.execute("SELECT COUNT(*) FROM users WHERE age >= 30").unwrap();
+        let rs = table
+            .execute("SELECT COUNT(*) FROM users WHERE age >= 30")
+            .unwrap();
         let batch = rs.to_record_batch().unwrap();
-        let count = batch.column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
+        let count = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
         assert_eq!(count, 2);
     }
 
@@ -2784,10 +2802,15 @@ mod tests {
     fn test_temp_table_create_temp_sql() {
         let (_dir, db) = temp_db();
         let csv_path = _dir.path().join("items.csv");
-        std::fs::write(&csv_path, "id,price\n1,10.0\n2,20.0\n3,30.0\n4,40.0\n5,50.0\n").unwrap();
+        std::fs::write(
+            &csv_path,
+            "id,price\n1,10.0\n2,20.0\n3,30.0\n4,40.0\n5,50.0\n",
+        )
+        .unwrap();
 
         // First register via API, then verify SQL access
-        db.register_temp_table("items", csv_path.to_str().unwrap()).unwrap();
+        db.register_temp_table("items", csv_path.to_str().unwrap())
+            .unwrap();
 
         // Query via SQL
         let rs = db.execute("SELECT * FROM items WHERE price > 25").unwrap();
@@ -2797,7 +2820,12 @@ mod tests {
         // Aggregate query
         let rs = db.execute("SELECT AVG(price) FROM items").unwrap();
         let batch = rs.to_record_batch().unwrap();
-        let avg = batch.column(0).as_any().downcast_ref::<arrow::array::Float64Array>().unwrap().value(0);
+        let avg = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap()
+            .value(0);
         assert!((avg - 30.0).abs() < 0.01);
     }
 
@@ -2807,7 +2835,8 @@ mod tests {
         let csv_path = _dir.path().join("data.csv");
         std::fs::write(&csv_path, "x,y\n1,2\n3,4\n").unwrap();
 
-        db.register_temp_table("tmp", csv_path.to_str().unwrap()).unwrap();
+        db.register_temp_table("tmp", csv_path.to_str().unwrap())
+            .unwrap();
         assert_eq!(db.table("tmp").unwrap().count().unwrap(), 2);
 
         db.drop_temp_table("tmp").unwrap();
@@ -2828,7 +2857,8 @@ mod tests {
         // Register temp table with same name from CSV
         let csv_path = _dir.path().join("shadow.csv");
         std::fs::write(&csv_path, "val\n100\n200\n300\n").unwrap();
-        db.register_temp_table("test_shadow", csv_path.to_str().unwrap()).unwrap();
+        db.register_temp_table("test_shadow", csv_path.to_str().unwrap())
+            .unwrap();
 
         // Temp table should shadow the persistent one
         let t2 = db.table("test_shadow").unwrap();
@@ -2848,7 +2878,8 @@ mod tests {
 
         {
             let db = ApexDB::open(dir.path()).unwrap();
-            db.register_temp_table("hi", csv_path.to_str().unwrap()).unwrap();
+            db.register_temp_table("hi", csv_path.to_str().unwrap())
+                .unwrap();
             assert_eq!(db.table("hi").unwrap().count().unwrap(), 2);
             // db dropped here — temp files should be cleaned up
         }

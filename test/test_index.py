@@ -96,6 +96,25 @@ class TestCreateDropIndex:
         with pytest.raises(Exception):
             client.execute("CREATE INDEX idx_foo ON idx_test (nonexistent_col)")
 
+    def test_create_index_streams_multiple_batches(self, client):
+        """CREATE INDEX should build entries beyond the first streaming batch."""
+        rows = [
+            {
+                "source": f"source_{i}",
+                "kind": f"kind_{i}",
+                "payload": f"payload_{i}",
+            }
+            for i in range(70_000)
+        ]
+        client.store(rows)
+
+        client.execute("CREATE INDEX idx_source ON idx_test (source)")
+
+        result = client.execute("SELECT * FROM idx_test WHERE source = 'source_69999'")
+        df = result.to_pandas()
+        assert len(df) == 1
+        assert df.iloc[0]["kind"] == "kind_69999"
+
 
 class TestIndexAcceleratedSelect:
     """Test that index-accelerated SELECT returns correct results."""

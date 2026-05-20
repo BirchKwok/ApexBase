@@ -143,6 +143,7 @@ class TestBasicQueryOperations:
                 {"name": "Alice", "city": "NYC", "score": 10},
                 {"name": "Bob", "city": "LA", "score": 20},
                 {"name": "Bob", "city": "Seattle", "score": 30},
+                {"name": "Bob", "city": "Austin", "score": 40},
             ]
             client.store(test_data)
 
@@ -161,6 +162,22 @@ class TestBasicQueryOperations:
                 "SELECT city, score FROM default WHERE name = 'Bob' LIMIT 1"
             ).first()
             assert first == {"city": "LA", "score": 20}
+
+            limited = client.execute(
+                "SELECT city, score FROM default WHERE name = 'Bob' LIMIT 2"
+            ).to_dict()
+            assert limited == [
+                {"city": "LA", "score": 20},
+                {"city": "Seattle", "score": 30},
+            ]
+
+            offset = client.execute(
+                "SELECT city, score FROM default WHERE name = 'Bob' LIMIT 2 OFFSET 1"
+            ).to_dict()
+            assert offset == [
+                {"city": "Seattle", "score": 30},
+                {"city": "Austin", "score": 40},
+            ]
 
             missing = client.execute(
                 "SELECT city, score FROM default WHERE name = 'Nobody' LIMIT 1"
