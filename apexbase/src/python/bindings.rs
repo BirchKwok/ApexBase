@@ -15,7 +15,7 @@ use fs2::FileExt;
 use parking_lot::RwLock;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -49,6 +49,27 @@ fn sort_and_dedupe_ids(ids: &[u64]) -> Vec<u64> {
     sorted_ids.sort_unstable();
     sorted_ids.dedup();
     sorted_ids
+}
+
+#[inline]
+fn next_up_f64_binding(value: f64) -> f64 {
+    if value.is_nan() || value == f64::INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f64::from_bits(bits + 1)
+    } else {
+        f64::from_bits(bits - 1)
+    }
+}
+
+#[inline]
+fn next_down_f64_binding(value: f64) -> f64 {
+    -next_up_f64_binding(-value)
 }
 
 /// Parse aggregate expressions from SELECT clause: "SELECT COUNT(*) as cnt, AVG(score)"
@@ -164,11 +185,88 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::String(s));
     }
 
+    // Python list/tuple of numbers → FixedList (raw LE f32 bytes), matching numpy vectors.
+    if obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() {
+        if let Ok(values) = obj.extract::<Vec<f32>>() {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            return Ok(Value::FixedList(bytes));
+        }
+    }
+
     if let Ok(bytes) = obj.extract::<Vec<u8>>() {
         return Ok(Value::Binary(bytes));
     }
 
     Ok(Value::Null)
+}
+
+fn py_to_column_value(obj: &Bound<'_, PyAny>) -> PyResult<ColumnValue> {
+    use pyo3::types::PyBytes;
+
+    if obj.is_none() {
+        return Ok(ColumnValue::Null);
+    }
+    if let Ok(b) = obj.extract::<bool>() {
+        return Ok(ColumnValue::Bool(b));
+    }
+    if let Ok(i) = obj.extract::<i64>() {
+        return Ok(ColumnValue::Int64(i));
+    }
+    if let Ok(f) = obj.extract::<f64>() {
+        return Ok(ColumnValue::Float64(f));
+    }
+    if obj.is_instance_of::<PyBytes>() {
+        if let Ok(bytes) = obj.extract::<Vec<u8>>() {
+            return Ok(ColumnValue::Binary(bytes));
+        }
+    }
+    if obj
+        .get_type()
+        .name()
+        .map(|n| n == "ndarray")
+        .unwrap_or(false)
+    {
+        if let Ok(floats) = obj
+            .call_method0("flatten")
+            .and_then(|flat| flat.call_method1("astype", ("float32",)))
+            .and_then(|f32arr| f32arr.call_method0("tobytes"))
+            .and_then(|b| b.extract::<Vec<u8>>())
+        {
+            if floats.len() % 4 == 0 {
+                return Ok(ColumnValue::FixedList(floats));
+            }
+        }
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(ColumnValue::String(s));
+    }
+    if obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() {
+        if let Ok(values) = obj.extract::<Vec<f32>>() {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            return Ok(ColumnValue::FixedList(bytes));
+        }
+    }
+    Ok(ColumnValue::Null)
+}
+
+fn dict_to_column_values(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, ColumnValue>> {
+    let mut fields = HashMap::with_capacity(dict.len());
+
+    for (key, value) in dict.iter() {
+        let key: String = key.extract()?;
+        if key == "_id" {
+            continue;
+        }
+        fields.insert(key, py_to_column_value(&value)?);
+    }
+
+    Ok(fields)
 }
 
 /// Convert ColumnValue to Python object
@@ -228,6 +326,65 @@ fn values_to_columns_dict<'py>(
         columns_dict.set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
     }
     Ok(columns_dict)
+}
+
+fn mmap_batch_columns_to_pydict<'py>(
+    py: Python<'py>,
+    batch: crate::storage::on_demand::MmapBatchColumns,
+    requested: Option<&[String]>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    use crate::storage::on_demand::MmapBatchColumn;
+    use pyo3::types::{PyBytes, PyList};
+
+    let columns_dict = PyDict::new_bound(py);
+    if batch.row_count == 0 {
+        return Ok(Some(columns_dict));
+    }
+
+    let mut columns = batch.columns;
+    let emit_column = |name: String, col: MmapBatchColumn| -> PyResult<()> {
+        match col {
+            MmapBatchColumn::I64(vals) => {
+                columns_dict.set_item(name.as_str(), PyList::new_bound(py, vals))?;
+            }
+            MmapBatchColumn::F64(vals) => {
+                columns_dict.set_item(name.as_str(), PyList::new_bound(py, vals))?;
+            }
+            MmapBatchColumn::Str(vals) => {
+                columns_dict.set_item(name.as_str(), PyList::new_bound(py, vals))?;
+            }
+            MmapBatchColumn::Bool(vals) => {
+                columns_dict.set_item(name.as_str(), PyList::new_bound(py, vals))?;
+            }
+            MmapBatchColumn::Bin(vals) => {
+                let list = PyList::empty_bound(py);
+                for val in vals {
+                    match val {
+                        Some(bytes) => list.append(PyBytes::new_bound(py, &bytes))?,
+                        None => list.append(py.None())?,
+                    }
+                }
+                columns_dict.set_item(name.as_str(), list)?;
+            }
+        }
+        Ok(())
+    };
+
+    if let Some(requested) = requested {
+        for requested_col in requested {
+            let Some(pos) = columns.iter().position(|(name, _)| name == requested_col) else {
+                return Ok(None);
+            };
+            let (name, col) = columns.swap_remove(pos);
+            emit_column(name, col)?;
+        }
+    } else {
+        for (name, col) in columns {
+            emit_column(name, col)?;
+        }
+    }
+
+    Ok(Some(columns_dict))
 }
 
 fn projected_values_to_columns_dict<'py>(
@@ -1023,6 +1180,9 @@ impl ApexStorageImpl {
 
         // Handle drop_if_exists
         if drop_if_exists {
+            crate::storage::engine::engine().invalidate_dir(&root_dir);
+            crate::query::executor::unregister_fts_manager(&root_dir);
+
             // Remove all .apex files in the directory
             if let Ok(entries) = fs::read_dir(&root_dir) {
                 for entry in entries.flatten() {
@@ -1384,13 +1544,7 @@ impl ApexStorageImpl {
         if schema.is_empty() {
             return Ok(None);
         }
-        let schema_cols: std::collections::HashSet<&str> =
-            schema.iter().map(|(name, _)| name.as_str()).collect();
-        let schema_types: HashMap<String, crate::storage::on_demand::ColumnType> = schema
-            .iter()
-            .map(|(name, ty)| (name.clone(), *ty))
-            .collect();
-        if schema_types.values().any(|ty| {
+        if schema.iter().any(|(_, ty)| {
             matches!(
                 ty,
                 crate::storage::on_demand::ColumnType::FixedList
@@ -1400,6 +1554,7 @@ impl ApexStorageImpl {
         }) {
             return Ok(None);
         }
+        let schema_len = schema.len();
 
         let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
         let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
@@ -1415,16 +1570,13 @@ impl ApexStorageImpl {
             if col_name == "_id" {
                 continue;
             }
-            if !schema_cols.contains(col_name.as_str()) {
-                return Ok(None);
-            }
             field_count += 1;
-            let Some(col_type) = schema_types.get(&col_name).copied() else {
+            let Some((_, col_type)) = schema.iter().find(|(name, _)| name == &col_name) else {
                 return Ok(None);
             };
 
             use crate::storage::on_demand::ColumnType;
-            match col_type {
+            match *col_type {
                 ColumnType::Bool => {
                     let v = if value.is_none() {
                         false
@@ -1498,7 +1650,7 @@ impl ApexStorageImpl {
             }
         }
 
-        if field_count != schema_cols.len() {
+        if field_count != schema_len {
             return Ok(None);
         }
 
@@ -1539,18 +1691,14 @@ impl ApexStorageImpl {
             return Ok(Some(Vec::new()));
         }
 
-        let fields = dict_to_values(row)?;
+        let fields = dict_to_column_values(row)?;
         if fields.is_empty() {
             return Ok(Some(Vec::new()));
         }
         if fields.values().any(|value| {
             matches!(
                 value,
-                Value::Null
-                    | Value::Binary(_)
-                    | Value::FixedList(_)
-                    | Value::Json(_)
-                    | Value::Array(_)
+                ColumnValue::Null | ColumnValue::Binary(_) | ColumnValue::FixedList(_)
             )
         }) {
             return Ok(None);
@@ -1581,12 +1729,11 @@ impl ApexStorageImpl {
         if schema.is_empty() {
             return Ok(None);
         }
-        let schema_cols: std::collections::HashSet<&str> =
-            schema.iter().map(|(name, _)| name.as_str()).collect();
-        if schema_cols.len() != fields.len()
+        let schema_len = schema.len();
+        if schema_len != fields.len()
             || fields
                 .keys()
-                .any(|name| !schema_cols.contains(name.as_str()))
+                .any(|name| !schema.iter().any(|(schema_name, _)| schema_name == name))
         {
             return Ok(None);
         }
@@ -1603,7 +1750,7 @@ impl ApexStorageImpl {
 
         let result = py.allow_threads(|| {
             backend
-                .insert_rows_to_delta(&[fields])
+                .insert_column_rows_to_delta(&[fields])
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         });
 
@@ -1635,18 +1782,14 @@ impl ApexStorageImpl {
         let mut all_fields = Vec::with_capacity(rows.len());
         for item in rows.iter() {
             let row = item.downcast::<PyDict>()?;
-            let fields = dict_to_values(row)?;
+            let fields = dict_to_column_values(row)?;
             if fields.is_empty() {
                 return Ok(None);
             }
             if fields.values().any(|value| {
                 matches!(
                     value,
-                    Value::Null
-                        | Value::Binary(_)
-                        | Value::FixedList(_)
-                        | Value::Json(_)
-                        | Value::Array(_)
+                    ColumnValue::Null | ColumnValue::Binary(_) | ColumnValue::FixedList(_)
                 )
             }) {
                 return Ok(None);
@@ -1677,13 +1820,12 @@ impl ApexStorageImpl {
         if schema.is_empty() {
             return Ok(None);
         }
-        let schema_cols: std::collections::HashSet<&str> =
-            schema.iter().map(|(name, _)| name.as_str()).collect();
+        let schema_len = schema.len();
         for fields in &all_fields {
-            if schema_cols.len() != fields.len()
+            if schema_len != fields.len()
                 || fields
                     .keys()
-                    .any(|name| !schema_cols.contains(name.as_str()))
+                    .any(|name| !schema.iter().any(|(schema_name, _)| schema_name == name))
             {
                 return Ok(None);
             }
@@ -1701,7 +1843,7 @@ impl ApexStorageImpl {
 
         let result = py.allow_threads(|| {
             backend
-                .insert_rows_to_delta(&all_fields)
+                .insert_column_rows_to_delta(&all_fields)
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         });
 
@@ -1730,18 +1872,14 @@ impl ApexStorageImpl {
             return Ok(Some(Vec::new()));
         }
 
-        let fields = dict_to_values(row)?;
+        let fields = dict_to_column_values(row)?;
         if fields.is_empty() {
             return Ok(Some(Vec::new()));
         }
         if fields.values().any(|value| {
             matches!(
                 value,
-                Value::Null
-                    | Value::Binary(_)
-                    | Value::FixedList(_)
-                    | Value::Json(_)
-                    | Value::Array(_)
+                ColumnValue::Null | ColumnValue::Binary(_) | ColumnValue::FixedList(_)
             )
         }) {
             return Ok(None);
@@ -1770,19 +1908,18 @@ impl ApexStorageImpl {
         if schema.is_empty() {
             return Ok(None);
         }
-        let schema_cols: std::collections::HashSet<&str> =
-            schema.iter().map(|(name, _)| name.as_str()).collect();
-        if schema_cols.len() != fields.len()
+        let schema_len = schema.len();
+        if schema_len != fields.len()
             || fields
                 .keys()
-                .any(|name| !schema_cols.contains(name.as_str()))
+                .any(|name| !schema.iter().any(|(schema_name, _)| schema_name == name))
         {
             return Ok(None);
         }
 
         let result = py.allow_threads(|| -> PyResult<Vec<u64>> {
             let ids = backend
-                .insert_rows_to_delta(&[fields])
+                .insert_column_rows_to_delta(&[fields])
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
             backend
                 .sync()
@@ -1883,6 +2020,13 @@ impl ApexStorageImpl {
                         // would produce f16 bytes here AND call push_float16_list_from_f32()
                         // again — causing a double conversion and garbled data.
                         col_type = Some("fixedlist");
+                    } else if item
+                        .downcast::<pyo3::types::PyList>()
+                        .ok()
+                        .and_then(|seq| seq.get_item(0).ok())
+                        .map_or(false, |first| first.extract::<f64>().is_ok())
+                    {
+                        col_type = Some("fixedlist");
                     } else if item.extract::<i64>().is_ok() {
                         col_type = Some("int");
                     } else if item.extract::<f64>().is_ok() {
@@ -1973,6 +2117,13 @@ impl ApexStorageImpl {
                             .and_then(|f32arr| f32arr.call_method0("tobytes"))
                             .and_then(|b| b.extract::<Vec<u8>>())
                         {
+                            vals.push(bytes);
+                        } else if let Ok(seq) = item.downcast::<pyo3::types::PyList>() {
+                            let mut bytes = Vec::with_capacity(seq.len() * 4);
+                            for elem in seq.iter() {
+                                let f = elem.extract::<f32>().unwrap_or(0.0);
+                                bytes.extend_from_slice(&f.to_le_bytes());
+                            }
                             vals.push(bytes);
                         } else {
                             vals.push(Vec::new());
@@ -2771,8 +2922,10 @@ impl ApexStorageImpl {
                 if let Some(backend) = maybe_backend {
                     if !backend.has_pending_deltas() && !backend.has_delta() {
                         let needed = (*offset).saturating_add(*limit);
-                        let batch_result =
-                            py.allow_threads(|| -> std::io::Result<Option<RecordBatch>> {
+                        let cols_result = py.allow_threads(
+                            || -> std::io::Result<
+                                Option<crate::storage::on_demand::MmapBatchColumns>,
+                            > {
                                 let Some(indices) = backend.scan_numeric_range_mmap(
                                     column,
                                     *low,
@@ -2784,28 +2937,62 @@ impl ApexStorageImpl {
                                 };
                                 let final_indices: Vec<usize> =
                                     indices.into_iter().skip(*offset).take(*limit).collect();
-                                if final_indices.is_empty() {
-                                    backend.read_columns_to_arrow(None, 0, Some(0)).map(Some)
-                                } else {
-                                    backend
-                                        .read_columns_by_indices_to_arrow(&final_indices, None)
-                                        .map(Some)
-                                }
-                            });
-
-                        if let Ok(Some(batch)) = batch_result {
-                            let out = PyDict::new_bound(py);
-                            let columns_dict = PyDict::new_bound(py);
-                            let schema = batch.schema();
-                            for col_idx in 0..batch.num_columns() {
-                                let col_name = schema.field(col_idx).name();
-                                let arr = batch.column(col_idx);
-                                let col_list = arrow_col_to_pylist(py, arr)?;
-                                columns_dict.set_item(col_name, col_list)?;
+                                backend
+                                    .storage
+                                    .extract_rows_by_indices_mmap_columns(&final_indices, None)
                             }
-                            out.set_item("columns_dict", columns_dict)?;
-                            out.set_item("rows_affected", 0i64)?;
-                            return Ok(out.into());
+                        );
+
+                        if let Ok(Some(batch_cols)) = cols_result {
+                            if let Some(columns_dict) =
+                                mmap_batch_columns_to_pydict(py, batch_cols, None)?
+                            {
+                                let out = PyDict::new_bound(py);
+                                out.set_item("columns_dict", columns_dict)?;
+                                out.set_item("rows_affected", 0i64)?;
+                                return Ok(out.into());
+                            }
+                        } else if let Ok(Some(final_indices)) =
+                            py.allow_threads(|| -> std::io::Result<Option<Vec<usize>>> {
+                                let Some(indices) = backend.scan_numeric_range_mmap(
+                                    column,
+                                    *low,
+                                    *high,
+                                    Some(needed),
+                                )?
+                                else {
+                                    return Ok(None);
+                                };
+                                Ok(Some(
+                                    indices.into_iter().skip(*offset).take(*limit).collect(),
+                                ))
+                            })
+                        {
+                            let batch_result =
+                                py.allow_threads(|| -> std::io::Result<Option<RecordBatch>> {
+                                    if final_indices.is_empty() {
+                                        backend.read_columns_to_arrow(None, 0, Some(0)).map(Some)
+                                    } else {
+                                        backend
+                                            .read_columns_by_indices_to_arrow(&final_indices, None)
+                                            .map(Some)
+                                    }
+                                });
+
+                            if let Ok(Some(batch)) = batch_result {
+                                let out = PyDict::new_bound(py);
+                                let columns_dict = PyDict::new_bound(py);
+                                let schema = batch.schema();
+                                for col_idx in 0..batch.num_columns() {
+                                    let col_name = schema.field(col_idx).name();
+                                    let arr = batch.column(col_idx);
+                                    let col_list = arrow_col_to_pylist(py, arr)?;
+                                    columns_dict.set_item(col_name, col_list)?;
+                                }
+                                out.set_item("columns_dict", columns_dict)?;
+                                out.set_item("rows_affected", 0i64)?;
+                                return Ok(out.into());
+                            }
                         }
                     }
                 }
@@ -2848,8 +3035,10 @@ impl ApexStorageImpl {
                     if !backend.has_pending_deltas() && !backend.has_delta() {
                         let needed = (*offset).saturating_add(*limit);
                         let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-                        let batch_result =
-                            py.allow_threads(|| -> std::io::Result<Option<RecordBatch>> {
+                        let cols_result = py.allow_threads(
+                            || -> std::io::Result<
+                                Option<crate::storage::on_demand::MmapBatchColumns>,
+                            > {
                                 let Some(indices) = backend.scan_numeric_range_mmap(
                                     column,
                                     *low,
@@ -2861,37 +3050,72 @@ impl ApexStorageImpl {
                                 };
                                 let final_indices: Vec<usize> =
                                     indices.into_iter().skip(*offset).take(*limit).collect();
-                                if final_indices.is_empty() {
-                                    backend
-                                        .read_columns_to_arrow(
-                                            Some(col_refs.as_slice()),
-                                            0,
-                                            Some(0),
-                                        )
-                                        .map(Some)
-                                } else {
-                                    backend
-                                        .read_columns_by_indices_to_arrow(
-                                            &final_indices,
-                                            Some(col_refs.as_slice()),
-                                        )
-                                        .map(Some)
-                                }
-                            });
-
-                        if let Ok(Some(batch)) = batch_result {
-                            let out = PyDict::new_bound(py);
-                            let columns_dict = PyDict::new_bound(py);
-                            let schema = batch.schema();
-                            for col_idx in 0..batch.num_columns() {
-                                let col_name = schema.field(col_idx).name();
-                                let arr = batch.column(col_idx);
-                                let col_list = arrow_col_to_pylist(py, arr)?;
-                                columns_dict.set_item(col_name, col_list)?;
+                                backend.storage.extract_rows_by_indices_mmap_columns(
+                                    &final_indices,
+                                    Some(col_refs.as_slice()),
+                                )
                             }
-                            out.set_item("columns_dict", columns_dict)?;
-                            out.set_item("rows_affected", 0i64)?;
-                            return Ok(out.into());
+                        );
+
+                        if let Ok(Some(batch_cols)) = cols_result {
+                            if let Some(columns_dict) =
+                                mmap_batch_columns_to_pydict(py, batch_cols, Some(columns))?
+                            {
+                                let out = PyDict::new_bound(py);
+                                out.set_item("columns_dict", columns_dict)?;
+                                out.set_item("rows_affected", 0i64)?;
+                                return Ok(out.into());
+                            }
+                        } else if let Ok(Some(final_indices)) =
+                            py.allow_threads(|| -> std::io::Result<Option<Vec<usize>>> {
+                                let Some(indices) = backend.scan_numeric_range_mmap(
+                                    column,
+                                    *low,
+                                    *high,
+                                    Some(needed),
+                                )?
+                                else {
+                                    return Ok(None);
+                                };
+                                Ok(Some(
+                                    indices.into_iter().skip(*offset).take(*limit).collect(),
+                                ))
+                            })
+                        {
+                            let batch_result =
+                                py.allow_threads(|| -> std::io::Result<Option<RecordBatch>> {
+                                    if final_indices.is_empty() {
+                                        backend
+                                            .read_columns_to_arrow(
+                                                Some(col_refs.as_slice()),
+                                                0,
+                                                Some(0),
+                                            )
+                                            .map(Some)
+                                    } else {
+                                        backend
+                                            .read_columns_by_indices_to_arrow(
+                                                &final_indices,
+                                                Some(col_refs.as_slice()),
+                                            )
+                                            .map(Some)
+                                    }
+                                });
+
+                            if let Ok(Some(batch)) = batch_result {
+                                let out = PyDict::new_bound(py);
+                                let columns_dict = PyDict::new_bound(py);
+                                let schema = batch.schema();
+                                for col_idx in 0..batch.num_columns() {
+                                    let col_name = schema.field(col_idx).name();
+                                    let arr = batch.column(col_idx);
+                                    let col_list = arrow_col_to_pylist(py, arr)?;
+                                    columns_dict.set_item(col_name, col_list)?;
+                                }
+                                out.set_item("columns_dict", columns_dict)?;
+                                out.set_item("rows_affected", 0i64)?;
+                                return Ok(out.into());
+                            }
                         }
                     }
                 }
@@ -3021,10 +3245,38 @@ impl ApexStorageImpl {
                         && backend.pending_v4_in_memory_rows() == 0
                     {
                         let needed = (*offset).saturating_add(*limit);
-                        let scan_result = py.allow_threads(|| {
+                        let cols_result = py.allow_threads(
+                            || -> std::io::Result<
+                                Option<crate::storage::on_demand::MmapBatchColumns>,
+                            > {
+                                let Some(indices) = backend.scan_numeric_range_mmap(
+                                    column,
+                                    *low,
+                                    *high,
+                                    Some(needed),
+                                )?
+                                else {
+                                    return Ok(None);
+                                };
+                                let final_indices: Vec<usize> =
+                                    indices.into_iter().skip(*offset).take(*limit).collect();
+                                backend
+                                    .storage
+                                    .extract_rows_by_indices_mmap_columns(&final_indices, None)
+                            }
+                        );
+                        if let Ok(Some(batch_cols)) = cols_result {
+                            if let Some(columns_dict) =
+                                mmap_batch_columns_to_pydict(py, batch_cols, None)?
+                            {
+                                let out = PyDict::new_bound(py);
+                                out.set_item("columns_dict", columns_dict)?;
+                                out.set_item("rows_affected", 0i64)?;
+                                return Ok(out.into());
+                            }
+                        } else if let Ok(Some(indices)) = py.allow_threads(|| {
                             backend.scan_numeric_range_mmap(column, *low, *high, Some(needed))
-                        });
-                        if let Ok(Some(indices)) = scan_result {
+                        }) {
                             let final_indices: Vec<usize> =
                                 indices.into_iter().skip(*offset).take(*limit).collect();
                             let batch_result = py.allow_threads(|| {
@@ -4038,7 +4290,10 @@ impl ApexStorageImpl {
             let lower = file_path.to_lowercase();
             if lower.ends_with(".csv") || lower.ends_with(".tsv") {
                 "CSV"
-            } else if lower.ends_with(".json") || lower.ends_with(".ndjson") || lower.ends_with(".jsonl") {
+            } else if lower.ends_with(".json")
+                || lower.ends_with(".ndjson")
+                || lower.ends_with(".jsonl")
+            {
                 "JSON"
             } else {
                 "PARQUET"
@@ -4065,7 +4320,10 @@ impl ApexStorageImpl {
             }
             Err(e) => {
                 let _ = fs::remove_file(&temp_path);
-                Err(PyIOError::new_err(format!("Failed to register temp table: {}", e)))
+                Err(PyIOError::new_err(format!(
+                    "Failed to register temp table: {}",
+                    e
+                )))
             }
         }
     }
@@ -4291,7 +4549,8 @@ impl ApexStorageImpl {
 
         // Global cache fallback
         if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
-            self.cached_backends.insert(cache_key.clone(), Arc::clone(&backend));
+            self.cached_backends
+                .insert(cache_key.clone(), Arc::clone(&backend));
             return Ok(backend.active_row_count());
         }
 
@@ -4307,7 +4566,9 @@ impl ApexStorageImpl {
     fn fast_row_count(&self) -> PyResult<u64> {
         let table_name = self.current_table.read().clone();
         if table_name.is_empty() {
-            return Err(PyValueError::new_err("No table selected. Call create_table() or use_table() first."));
+            return Err(PyValueError::new_err(
+                "No table selected. Call create_table() or use_table() first.",
+            ));
         }
         self.fast_row_count_for(&table_name)
     }
@@ -4497,6 +4758,8 @@ impl ApexStorageImpl {
 
     /// Close storage
     fn close(&self) -> PyResult<()> {
+        crate::query::executor::wait_fts_backfills_for_dir(&self.current_base_dir());
+
         for entry in self.cached_backends.iter() {
             let backend = entry.value();
             if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
@@ -4872,19 +5135,59 @@ impl ApexStorageImpl {
 
         let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let needed = offset.saturating_add(limit);
-        let batch_result = py.allow_threads(|| -> io::Result<Option<RecordBatch>> {
-            if limit == 0 {
-                return backend
-                    .read_columns_to_arrow(Some(col_refs.as_slice()), 0, Some(0))
-                    .map(Some);
+        if limit == 0 {
+            let out = PyDict::new_bound(py);
+            let columns_dict = PyDict::new_bound(py);
+            for col_name in &columns {
+                columns_dict.set_item(col_name.as_str(), PyList::empty_bound(py))?;
             }
+            out.set_item("columns_dict", columns_dict)?;
+            out.set_item("rows_affected", 0i64)?;
+            return Ok(Some(out.into()));
+        }
 
+        let indices_result = py.allow_threads(|| -> io::Result<Option<Vec<usize>>> {
             let Some(indices) =
                 backend.scan_string_filter_mmap(&filter_column, &value, Some(needed))?
             else {
                 return Ok(None);
             };
-            let final_indices: Vec<usize> = indices.into_iter().skip(offset).take(limit).collect();
+            Ok(Some(indices.into_iter().skip(offset).take(limit).collect()))
+        });
+
+        let Some(final_indices) = indices_result.map_err(|e| PyIOError::new_err(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+
+        if final_indices.is_empty() {
+            let out = PyDict::new_bound(py);
+            let columns_dict = PyDict::new_bound(py);
+            for col_name in &columns {
+                columns_dict.set_item(col_name.as_str(), PyList::empty_bound(py))?;
+            }
+            out.set_item("columns_dict", columns_dict)?;
+            out.set_item("rows_affected", 0i64)?;
+            return Ok(Some(out.into()));
+        }
+
+        let cols_result = py.allow_threads(|| {
+            backend
+                .storage
+                .extract_rows_by_indices_mmap_columns(&final_indices, Some(col_refs.as_slice()))
+        });
+        if let Some(batch_cols) = cols_result.map_err(|e| PyIOError::new_err(e.to_string()))? {
+            if let Some(columns_dict) =
+                mmap_batch_columns_to_pydict(py, batch_cols, Some(&columns))?
+            {
+                let out = PyDict::new_bound(py);
+                out.set_item("columns_dict", columns_dict)?;
+                out.set_item("rows_affected", 0i64)?;
+                return Ok(Some(out.into()));
+            }
+        }
+
+        let batch_result = py.allow_threads(|| -> io::Result<Option<RecordBatch>> {
             if final_indices.is_empty() {
                 backend
                     .read_columns_to_arrow(Some(col_refs.as_slice()), 0, Some(0))
@@ -4913,6 +5216,283 @@ impl ApexStorageImpl {
                 let arr = batch.column(col_idx);
                 let col_list = arrow_col_to_pylist(py, arr)?;
                 columns_dict.set_item(col_name, col_list)?;
+            }
+        }
+        out.set_item("columns_dict", columns_dict)?;
+        out.set_item("rows_affected", 0i64)?;
+        Ok(Some(out.into()))
+    }
+
+    /// Retrieve rows for `numeric_col <op> value LIMIT N [OFFSET M]` without
+    /// going through SQL parsing. The scan is executed on every call.
+    fn retrieve_by_numeric_range_limit(
+        &self,
+        py: Python<'_>,
+        filter_column: String,
+        op: String,
+        value: f64,
+        limit: usize,
+        offset: usize,
+    ) -> PyResult<Option<PyObject>> {
+        if filter_column.is_empty() {
+            return Ok(None);
+        }
+
+        let (low, high) = match op.as_str() {
+            "=" => (value, value),
+            ">" => (next_up_f64_binding(value), f64::INFINITY),
+            ">=" => (value, f64::INFINITY),
+            "<" => (f64::NEG_INFINITY, next_down_f64_binding(value)),
+            "<=" => (f64::NEG_INFINITY, value),
+            _ => return Ok(None),
+        };
+
+        let (table_path, table_name) = self.get_current_table_info()?;
+        let cache_key = Self::backend_cache_key(&table_path, &table_name);
+        let backend_opt: Option<Arc<TableStorageBackend>> = self
+            .cached_backends
+            .get(&cache_key)
+            .map(|v| Arc::clone(&v))
+            .or_else(|| {
+                crate::query::get_cached_backend_pub(&table_path)
+                    .ok()
+                    .map(|b| {
+                        self.cached_backends
+                            .insert(cache_key.clone(), Arc::clone(&b));
+                        b
+                    })
+            });
+
+        let Some(backend) = backend_opt else {
+            return Ok(None);
+        };
+        if backend.has_pending_deltas()
+            || backend.has_delta()
+            || backend.pending_v4_in_memory_rows() > 0
+        {
+            return Ok(None);
+        }
+
+        let needed = offset.saturating_add(limit);
+        let cols_result = py.allow_threads(
+            || -> io::Result<Option<crate::storage::on_demand::MmapBatchColumns>> {
+                let Some(indices) =
+                    backend.scan_numeric_range_mmap(&filter_column, low, high, Some(needed))?
+                else {
+                    return Ok(None);
+                };
+                let final_indices: Vec<usize> =
+                    indices.into_iter().skip(offset).take(limit).collect();
+                backend
+                    .storage
+                    .extract_rows_by_indices_mmap_columns(&final_indices, None)
+            },
+        );
+
+        let Some(batch_cols) = cols_result.map_err(|e| PyIOError::new_err(e.to_string()))? else {
+            return Ok(None);
+        };
+        let Some(columns_dict) = mmap_batch_columns_to_pydict(py, batch_cols, None)? else {
+            return Ok(None);
+        };
+
+        let out = PyDict::new_bound(py);
+        out.set_item("columns_dict", columns_dict)?;
+        out.set_item("rows_affected", 0i64)?;
+        Ok(Some(out.into()))
+    }
+
+    /// Execute a simple filtered numeric aggregation without SQL executor
+    /// dispatch. The storage layer scans and aggregates on every call.
+    fn execute_filtered_numeric_agg(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        table: String,
+        filter_column: String,
+        op: String,
+        value: f64,
+    ) -> PyResult<Option<PyObject>> {
+        if table.is_empty() || filter_column.is_empty() {
+            return Ok(None);
+        }
+
+        let agg_exprs = match parse_agg_select(&sql) {
+            Some(exprs) if !exprs.is_empty() => exprs,
+            _ => return Ok(None),
+        };
+
+        let (low, high) = match op.as_str() {
+            "=" => (value, value),
+            ">" => (next_up_f64_binding(value), f64::INFINITY),
+            ">=" => (value, f64::INFINITY),
+            "<" => (f64::NEG_INFINITY, next_down_f64_binding(value)),
+            "<=" => (f64::NEG_INFINITY, value),
+            _ => return Ok(None),
+        };
+
+        let (default_table_path, default_table_name) = self.get_current_table_info()?;
+        let base_dir = self.current_base_dir();
+        let target_table = table.trim_matches('"').trim_matches('`').to_string();
+        let target_path =
+            if target_table.eq_ignore_ascii_case("default") || target_table == default_table_name {
+                default_table_path
+            } else {
+                self.table_paths
+                    .read()
+                    .get(&target_table)
+                    .cloned()
+                    .unwrap_or_else(|| base_dir.join(format!("{}.apex", target_table)))
+            };
+
+        let cache_key = Self::backend_cache_key(&target_path, &target_table);
+        let backend_opt: Option<Arc<TableStorageBackend>> = self
+            .cached_backends
+            .get(&cache_key)
+            .map(|v| Arc::clone(&v))
+            .or_else(|| {
+                crate::query::get_cached_backend_pub(&target_path)
+                    .ok()
+                    .map(|b| {
+                        self.cached_backends
+                            .insert(cache_key.clone(), Arc::clone(&b));
+                        b
+                    })
+            });
+
+        let Some(backend) = backend_opt else {
+            return Ok(None);
+        };
+        if backend.has_pending_deltas()
+            || backend.has_delta()
+            || backend.pending_v4_in_memory_rows() > 0
+        {
+            return Ok(None);
+        }
+
+        let mut unique_cols: Vec<String> = Vec::new();
+        for (func, col, _) in &agg_exprs {
+            let is_count_star = func == "COUNT"
+                && col
+                    .as_ref()
+                    .map(|c| {
+                        c == "*"
+                            || c.chars()
+                                .next()
+                                .map(|ch| ch.is_ascii_digit())
+                                .unwrap_or(false)
+                    })
+                    .unwrap_or(true);
+            if is_count_star {
+                if !unique_cols.iter().any(|c| c == "*") {
+                    unique_cols.push("*".to_string());
+                }
+            } else if let Some(c) = col {
+                if !unique_cols.contains(c) {
+                    unique_cols.push(c.clone());
+                }
+            }
+        }
+        if unique_cols.is_empty() {
+            return Ok(None);
+        }
+
+        let col_refs: Vec<&str> = unique_cols.iter().map(String::as_str).collect();
+        let agg_result = py.allow_threads(|| {
+            backend.execute_filtered_numeric_agg_mmap(&filter_column, low, high, &col_refs)
+        });
+        let Some(stats) = agg_result.map_err(|e| PyIOError::new_err(e.to_string()))? else {
+            return Ok(None);
+        };
+
+        let mut stat_map: std::collections::HashMap<&str, (i64, f64, f64, f64, bool)> =
+            std::collections::HashMap::new();
+        for (idx, col_name) in col_refs.iter().enumerate() {
+            if idx < stats.len() {
+                stat_map.insert(col_name, stats[idx]);
+            }
+        }
+        let match_count = stat_map.get("*").map(|s| s.0).unwrap_or(0);
+
+        let out = PyDict::new_bound(py);
+        let columns_dict = PyDict::new_bound(py);
+        for (func, col, alias) in &agg_exprs {
+            let output_name = if let Some(a) = alias {
+                a.clone()
+            } else if let Some(c) = col {
+                format!("{}({})", func, c)
+            } else {
+                format!("{}(*)", func)
+            };
+
+            match func.as_str() {
+                "COUNT" => {
+                    let count = if let Some(c) = col {
+                        let is_count_star = c == "*"
+                            || c.chars()
+                                .next()
+                                .map(|ch| ch.is_ascii_digit())
+                                .unwrap_or(false);
+                        if is_count_star {
+                            match_count
+                        } else {
+                            stat_map.get(c.as_str()).map(|s| s.0).unwrap_or(0)
+                        }
+                    } else {
+                        match_count
+                    };
+                    columns_dict.set_item(&output_name, PyList::new_bound(py, &[count]))?;
+                }
+                "SUM" | "AVG" | "MIN" | "MAX" => {
+                    if let Some(c) = col {
+                        let (count, sum, min_v, max_v, is_int) = stat_map
+                            .get(c.as_str())
+                            .copied()
+                            .unwrap_or((0, 0.0, 0.0, 0.0, false));
+                        match func.as_str() {
+                            "SUM" => {
+                                if is_int {
+                                    columns_dict.set_item(
+                                        &output_name,
+                                        PyList::new_bound(py, &[sum as i64]),
+                                    )?;
+                                } else {
+                                    columns_dict
+                                        .set_item(&output_name, PyList::new_bound(py, &[sum]))?;
+                                }
+                            }
+                            "AVG" => {
+                                let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+                                columns_dict
+                                    .set_item(&output_name, PyList::new_bound(py, &[avg]))?;
+                            }
+                            "MIN" => {
+                                if is_int {
+                                    columns_dict.set_item(
+                                        &output_name,
+                                        PyList::new_bound(py, &[min_v as i64]),
+                                    )?;
+                                } else {
+                                    columns_dict
+                                        .set_item(&output_name, PyList::new_bound(py, &[min_v]))?;
+                                }
+                            }
+                            "MAX" => {
+                                if is_int {
+                                    columns_dict.set_item(
+                                        &output_name,
+                                        PyList::new_bound(py, &[max_v as i64]),
+                                    )?;
+                                } else {
+                                    columns_dict
+                                        .set_item(&output_name, PyList::new_bound(py, &[max_v]))?;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => return Ok(None),
             }
         }
         out.set_item("columns_dict", columns_dict)?;
@@ -5217,32 +5797,16 @@ impl ApexStorageImpl {
         sorted_ids.dedup();
 
         if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
-            if let Ok(Some(batch)) = backend.storage.retrieve_many_mmap(&sorted_ids) {
-                let num_rows = batch.num_rows();
-                if num_rows == 0 {
-                    let out = PyDict::new_bound(py);
-                    out.set_item("columns_dict", PyDict::new_bound(py))?;
-                    out.set_item("rows_affected", 0i64)?;
-                    return Ok(Some(out.into()));
-                }
-
-                let columns_dict = PyDict::new_bound(py);
-                for requested_col in &columns {
-                    let Some(col_idx) = batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .position(|field| field.name() == requested_col)
-                    else {
-                        return Ok(None);
-                    };
-                    let py_list = arrow_col_to_pylist(py, batch.column(col_idx))?;
-                    columns_dict.set_item(requested_col.as_str(), py_list)?;
-                }
-
+            if let Ok(Some(batch_cols)) = backend.storage.retrieve_many_mmap_columns(&sorted_ids) {
+                let row_count = batch_cols.row_count;
+                let Some(columns_dict) =
+                    mmap_batch_columns_to_pydict(py, batch_cols, Some(&columns))?
+                else {
+                    return Ok(None);
+                };
                 let out = PyDict::new_bound(py);
                 out.set_item("columns_dict", columns_dict)?;
-                out.set_item("rows_affected", num_rows as i64)?;
+                out.set_item("rows_affected", row_count as i64)?;
                 return Ok(Some(out.into()));
             }
         }
@@ -5324,31 +5888,25 @@ impl ApexStorageImpl {
         if let Some(backend) = backend_opt {
             let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
 
-            // Fast path: retrieve_many_mmap — one footer lock + one mmap slice per RG
-            let batch_opt =
+            // Fast path: direct mmap-to-Python columns — one footer lock + one mmap slice per RG.
+            let batch_cols_opt =
                 if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
-                    backend.storage.retrieve_many_mmap(&ids_u64).ok().flatten()
+                    backend
+                        .storage
+                        .retrieve_many_mmap_columns(&ids_u64)
+                        .ok()
+                        .flatten()
                 } else {
                     None
                 };
 
-            if let Some(batch) = batch_opt {
-                let num_rows = batch.num_rows();
-                if num_rows == 0 {
-                    let out = PyDict::new_bound(py);
-                    out.set_item("columns_dict", PyDict::new_bound(py))?;
-                    out.set_item("rows_affected", 0i64)?;
-                    return Ok(out.into());
-                }
-                let columns_dict = PyDict::new_bound(py);
-                for (i, field) in batch.schema().fields().iter().enumerate() {
-                    let col = batch.column(i);
-                    let py_list = arrow_col_to_pylist(py, col)?;
-                    columns_dict.set_item(field.name().as_str(), py_list)?;
-                }
+            if let Some(batch_cols) = batch_cols_opt {
+                let row_count = batch_cols.row_count;
+                let columns_dict = mmap_batch_columns_to_pydict(py, batch_cols, None)?
+                    .unwrap_or_else(|| PyDict::new_bound(py));
                 let out = PyDict::new_bound(py);
                 out.set_item("columns_dict", columns_dict)?;
-                out.set_item("rows_affected", num_rows as i64)?;
+                out.set_item("rows_affected", row_count as i64)?;
                 return Ok(out.into());
             }
 
@@ -5743,17 +6301,25 @@ impl ApexStorageImpl {
                 .insert(table_name.clone(), fields);
         }
 
-        // Ensure manager exists
+        // Ensure manager exists. SQL DDL may have already built and registered
+        // a manager with populated engines; reuse it so Python-side config sync
+        // does not replace a freshly backfilled FTS index with an empty one.
         if self.fts_manager.read().is_none() {
-            let fts_dir = self.current_base_dir().join("fts_indexes");
-            let config = FtsConfig {
-                lazy_load,
-                cache_size,
-                ..FtsConfig::default()
+            let base_dir = self.current_base_dir();
+            let manager = if let Some(existing) = crate::query::executor::get_fts_manager(&base_dir)
+            {
+                existing
+            } else {
+                let fts_dir = base_dir.join("fts_indexes");
+                let config = FtsConfig {
+                    lazy_load,
+                    cache_size,
+                    ..FtsConfig::default()
+                };
+                Arc::new(FtsManager::new(&fts_dir, config))
             };
-            let manager = Arc::new(FtsManager::new(&fts_dir, config));
             // Register with the global SQL executor registry (enables MATCH() in PG Wire / Arrow Flight)
-            crate::query::executor::register_fts_manager(&self.current_base_dir(), manager.clone());
+            crate::query::executor::register_fts_manager(&base_dir, manager.clone());
             *self.fts_manager.write() = Some(manager);
         } else {
             // Already initialized — ensure global registry is up to date
@@ -5794,6 +6360,7 @@ impl ApexStorageImpl {
         limit: Option<usize>,
     ) -> PyResult<Vec<(i64, f32)>> {
         let table_name = self.current_table.read().clone();
+        let base_dir = self.current_base_dir();
         let mgr = self.fts_manager.read();
 
         if let Some(m) = mgr.as_ref() {
@@ -5802,6 +6369,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             // Release GIL during search for better concurrency
             let results = py.allow_threads(|| {
+                crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
                 engine
                     .search_top_n(query, limit.unwrap_or(100))
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -5818,6 +6386,7 @@ impl ApexStorageImpl {
     #[pyo3(signature = (delete_files=false))]
     fn fts_remove_engine(&self, py: Python<'_>, delete_files: bool) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
+        crate::query::executor::wait_fts_backfill(&self.current_base_dir(), &table_name);
 
         // Remove any cached index field configuration for this table
         self.fts_index_fields.write().remove(&table_name);
@@ -5929,6 +6498,7 @@ impl ApexStorageImpl {
     #[pyo3(name = "_fts_flush")]
     fn fts_flush(&self, py: Python<'_>) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
+        let base_dir = self.current_base_dir();
         let mgr = self.fts_manager.read();
 
         if let Some(m) = mgr.as_ref() {
@@ -5937,6 +6507,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             // Release GIL during flush (I/O operation)
             py.allow_threads(|| {
+                crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
                 engine
                     .flush()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))

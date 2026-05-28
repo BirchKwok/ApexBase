@@ -16,7 +16,9 @@ use parking_lot::RwLock;
 use arrow::record_batch::RecordBatch;
 
 use crate::data::{DataType, Value};
-use crate::storage::on_demand::{ColumnData, ColumnType, CompressionType, OnDemandStorage};
+use crate::storage::on_demand::{
+    ColumnData, ColumnType, ColumnValue, CompressionType, OnDemandStorage,
+};
 use crate::table::arrow_column::ArrowStringColumn;
 use crate::table::column_table::{BitVec, TypedColumn};
 
@@ -306,12 +308,8 @@ fn float16list_to_arrow_pair(
     arrow::datatypes::DataType,
     std::sync::Arc<dyn arrow::array::Array>,
 ) {
-    use crate::storage::on_demand::f16_to_f32;
-    let f32_bytes: Vec<u8> = data
-        .chunks_exact(2)
-        .flat_map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap())).to_le_bytes())
-        .collect();
-    fixedlist_to_arrow_pair(&f32_bytes, dim)
+    let values = crate::storage::on_demand::f16_bytes_to_f32_values(data);
+    fixedlist_values_to_arrow_pair(values, dim)
 }
 
 /// Convert ColumnData::FixedList to (ArrowDataType, ArrayRef)
@@ -322,27 +320,31 @@ fn fixedlist_to_arrow_pair(
     arrow::datatypes::DataType,
     std::sync::Arc<dyn arrow::array::Array>,
 ) {
+    let values = crate::storage::on_demand::f32_le_bytes_to_values(data);
+    fixedlist_values_to_arrow_pair(values, dim)
+}
+
+fn fixedlist_values_to_arrow_pair(
+    values: Vec<f32>,
+    dim: u32,
+) -> (
+    arrow::datatypes::DataType,
+    std::sync::Arc<dyn arrow::array::Array>,
+) {
     use arrow::array::{FixedSizeListArray, Float32Array};
-    use arrow::buffer::Buffer;
     use arrow::datatypes::{DataType as ArrowDataType, Field};
     let dim_usize = dim as usize;
     let row_count = if dim_usize == 0 {
         0
     } else {
-        data.len() / (dim_usize * 4)
+        values.len() / dim_usize
     };
-    let float_buf = Buffer::from_vec(data.to_vec());
-    let float_arr = unsafe {
-        Float32Array::from(arrow::array::ArrayData::new_unchecked(
-            ArrowDataType::Float32,
-            row_count * dim_usize,
-            Some(0),
-            None,
-            0,
-            vec![float_buf],
-            vec![],
-        ))
-    };
+    let float_arr = Float32Array::from(
+        values
+            .into_iter()
+            .take(row_count * dim_usize)
+            .collect::<Vec<_>>(),
+    );
     let item_field = std::sync::Arc::new(Field::new("item", ArrowDataType::Float32, false));
     let list_dt = ArrowDataType::FixedSizeList(item_field.clone(), dim_usize as i32);
     let arr = FixedSizeListArray::new(
@@ -554,9 +556,6 @@ impl TableStorageBackend {
     /// Insert rows to delta file (memory efficient - doesn't load existing column data)
     /// Auto-compacts when delta exceeds threshold
     pub fn insert_rows_to_delta(&self, rows: &[HashMap<String, Value>]) -> io::Result<Vec<u64>> {
-        use crate::storage::on_demand::ColumnValue;
-
-        // Convert Value to ColumnValue
         let converted: Vec<HashMap<String, ColumnValue>> = rows
             .iter()
             .map(|row| {
@@ -568,7 +567,7 @@ impl TableStorageBackend {
                             Value::String(s) => ColumnValue::String(s.clone()),
                             Value::Bool(b) => ColumnValue::Bool(*b),
                             Value::Binary(b) => ColumnValue::Binary(b.clone()),
-                            Value::FixedList(b) => ColumnValue::Binary(b.clone()),
+                            Value::FixedList(b) => ColumnValue::FixedList(b.clone()),
                             _ => ColumnValue::Null,
                         };
                         (k.clone(), cv)
@@ -577,18 +576,28 @@ impl TableStorageBackend {
             })
             .collect();
 
-        let ids = self.storage.insert_rows_to_delta(&converted)?;
+        self.insert_column_rows_to_delta(&converted)
+    }
+
+    pub fn insert_column_rows_to_delta(
+        &self,
+        rows: &[HashMap<String, ColumnValue>],
+    ) -> io::Result<Vec<u64>> {
+        let ids = self.storage.insert_rows_to_delta(rows)?;
 
         // Auto-compact if delta file is too large (> 10MB or > 100K rows)
         const DELTA_SIZE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
         const DELTA_ROWS_THRESHOLD: usize = 100_000;
 
-        let delta_path = Self::delta_path(&self.path);
-        if delta_path.exists() {
+        if ids.len() >= DELTA_ROWS_THRESHOLD {
+            *self.dirty.write() = true;
+            return Ok(ids);
+        }
+
+        if ids.len() > 1 {
+            let delta_path = Self::delta_path(&self.path);
             let delta_size = std::fs::metadata(&delta_path).map(|m| m.len()).unwrap_or(0);
-            if delta_size > DELTA_SIZE_THRESHOLD || ids.len() > DELTA_ROWS_THRESHOLD {
-                // Trigger async compaction hint (actual compaction done separately)
-                // For now, just mark that compaction is needed
+            if delta_size > DELTA_SIZE_THRESHOLD {
                 *self.dirty.write() = true;
             }
         }
@@ -828,7 +837,7 @@ impl TableStorageBackend {
                                 Value::String(s) => ColumnValue::String(s.clone()),
                                 Value::Bool(b) => ColumnValue::Bool(*b),
                                 Value::Binary(b) => ColumnValue::Binary(b.clone()),
-                                Value::FixedList(b) => ColumnValue::Binary(b.clone()),
+                                Value::FixedList(b) => ColumnValue::FixedList(b.clone()),
                                 Value::Null => ColumnValue::Null,
                                 _ => ColumnValue::String(
                                     serde_json::to_string(v).unwrap_or_default(),
@@ -852,7 +861,7 @@ impl TableStorageBackend {
                                 Value::String(s) => ColumnValue::String(s.clone()),
                                 Value::Bool(b) => ColumnValue::Bool(*b),
                                 Value::Binary(b) => ColumnValue::Binary(b.clone()),
-                                Value::FixedList(b) => ColumnValue::Binary(b.clone()),
+                                Value::FixedList(b) => ColumnValue::FixedList(b.clone()),
                                 Value::Null => ColumnValue::Null,
                                 _ => ColumnValue::String(
                                     serde_json::to_string(v).unwrap_or_default(),
@@ -1559,6 +1568,21 @@ impl TableStorageBackend {
         self.read_columns_to_arrow(column_names, 0, None)
     }
 
+    /// Fast path for FTS backfill on persisted V4 tables.
+    /// Returns None when pending/delta rows require the general Arrow read path.
+    pub(crate) fn read_fts_string_columns_mmap(
+        &self,
+        column_names: &[String],
+    ) -> io::Result<Option<(Vec<u32>, Vec<(String, ColumnData)>)>> {
+        let base_rows = self.base_row_count();
+        let has_delta =
+            self.has_delta() || self.row_count() > base_rows || self.active_row_count() > base_rows;
+        if has_delta || self.storage.has_v4_in_memory_data() {
+            return Ok(None);
+        }
+        self.storage.read_fts_string_columns_mmap(column_names)
+    }
+
     /// Read specific columns directly to Arrow RecordBatch (TRUE on-demand read)
     ///
     /// This method bypasses ColumnTable and reads only the requested columns
@@ -1635,10 +1659,14 @@ impl TableStorageBackend {
             }
         }
 
-        // Read columns from storage (only the requested ones!)
+        let storage_column_names: Option<Vec<&str>> =
+            column_names.map(|cols| cols.iter().copied().filter(|name| *name != "_id").collect());
+        let storage_column_refs = storage_column_names.as_ref().map(|cols| cols.as_slice());
+
+        // Read columns from storage (only the requested physical columns!)
         let mut col_data = self
             .storage
-            .read_columns(column_names, start_row, row_count)?;
+            .read_columns(storage_column_refs, start_row, row_count)?;
 
         if col_data.is_empty() {
             // Return empty batch with schema (including _id if requested)
@@ -3938,6 +3966,19 @@ impl TableStorageBackend {
             .execute_filtered_string_agg_mmap(filter_col, target, agg_cols)
     }
 
+    /// Single-pass filtered numeric aggregation: scan numeric predicate column and
+    /// aggregate numeric columns without materializing matching rows.
+    pub fn execute_filtered_numeric_agg_mmap(
+        &self,
+        filter_col: &str,
+        low: f64,
+        high: f64,
+        agg_cols: &[&str],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        self.storage
+            .execute_filtered_numeric_agg_mmap(filter_col, low, high, agg_cols)
+    }
+
     /// Build cached string dictionary indices for a column
     pub fn build_string_dict_cache(
         &self,
@@ -4198,6 +4239,7 @@ impl IncrementalStorageBackend {
                             Value::String(s) => OnDemandColumnValue::String(s.clone()),
                             Value::Bool(b) => OnDemandColumnValue::Bool(*b),
                             Value::Binary(b) => OnDemandColumnValue::Binary(b.clone()),
+                            Value::FixedList(b) => OnDemandColumnValue::FixedList(b.clone()),
                             Value::Null => OnDemandColumnValue::Null,
                             _ => OnDemandColumnValue::String(
                                 serde_json::to_string(v).unwrap_or_default(),
@@ -4593,6 +4635,108 @@ mod tests {
             assert_eq!(batch4.num_rows(), 1);
             assert_eq!(batch4.num_columns(), 1);
         }
+    }
+
+    #[test]
+    fn test_read_columns_to_arrow_internal_id_with_projection_range() {
+        use arrow::array::{Int64Array, StringArray};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_arrow_id_projection.apex");
+
+        let backend = TableStorageBackend::create(&path).unwrap();
+        let mut rows = Vec::new();
+        for name in ["Alice", "Bob", "Charlie"] {
+            let mut row = HashMap::new();
+            row.insert("name".to_string(), Value::String(name.to_string()));
+            rows.push(row);
+        }
+        backend.insert_rows(&rows).unwrap();
+
+        let batch = backend
+            .read_columns_to_arrow(Some(&["_id", "name"]), 1, Some(1))
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.schema().field(0).name(), "_id");
+        assert_eq!(batch.schema().field(1).name(), "name");
+
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(ids.value(0), 2);
+        assert_eq!(names.value(0), "Bob");
+    }
+
+    #[test]
+    fn test_fixedlist_to_arrow_pair_uses_aligned_float_values() {
+        use arrow::array::{Array, FixedSizeListArray, Float32Array};
+
+        let raw: Vec<u8> = [1.0f32, 0.0, 0.5, 0.25, 0.75, 1.0]
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+
+        let (_dt, arr) = fixedlist_to_arrow_pair(&raw, 3);
+        let list = arr.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let values = list
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.value_length(), 3);
+        assert_eq!(values.value(0), 1.0);
+        assert_eq!(values.value(5), 1.0);
+    }
+
+    #[test]
+    fn test_insert_rows_preserves_fixedlist_for_float16_schema() {
+        use arrow::array::{Array, FixedSizeListArray, Float32Array};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_f16_fixedlist_insert.apex");
+        let backend = TableStorageBackend::create(&path).unwrap();
+        backend
+            .add_column("vec", crate::data::DataType::Float16Vector)
+            .unwrap();
+
+        let raw: Vec<u8> = [0.10f32, 0.82, 0.20]
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let mut row = HashMap::new();
+        row.insert("vec".to_string(), Value::FixedList(raw));
+        backend.insert_rows(&[row]).unwrap();
+
+        let batch = backend
+            .read_columns_to_arrow(Some(&["vec"]), 0, None)
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let values = list
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+
+        assert_eq!(list.len(), 1);
+        assert_eq!(list.value_length(), 3);
+        assert!((values.value(0) - 0.10).abs() < 2e-3);
     }
 
     #[test]

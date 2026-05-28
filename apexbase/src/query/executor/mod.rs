@@ -505,6 +505,8 @@ fn invalidate_index_cache_dir(dir: &Path) {
 // FtsManager internally manages one FtsEngine per table
 static FTS_MANAGER_CACHE: Lazy<RwLock<AHashMap<PathBuf, Arc<crate::fts::FtsManager>>>> =
     Lazy::new(|| RwLock::new(AHashMap::with_capacity(8)));
+static FTS_BACKFILL_TASKS: Lazy<RwLock<AHashMap<(PathBuf, String), std::thread::JoinHandle<()>>>> =
+    Lazy::new(|| RwLock::new(AHashMap::with_capacity(8)));
 
 /// Return the FtsManager for a base_dir if one has been registered.
 pub fn get_fts_manager(base_dir: &Path) -> Option<Arc<crate::fts::FtsManager>> {
@@ -517,6 +519,55 @@ pub fn register_fts_manager(base_dir: &Path, manager: Arc<crate::fts::FtsManager
     FTS_MANAGER_CACHE
         .write()
         .insert(base_dir.to_path_buf(), manager);
+}
+
+pub fn register_fts_backfill_task(
+    base_dir: &Path,
+    table_name: &str,
+    handle: std::thread::JoinHandle<()>,
+) {
+    let previous = FTS_BACKFILL_TASKS
+        .write()
+        .insert((base_dir.to_path_buf(), table_name.to_string()), handle);
+    if let Some(previous) = previous {
+        let _ = previous.join();
+    }
+}
+
+pub fn wait_fts_backfill(base_dir: &Path, table_name: &str) {
+    let handle = FTS_BACKFILL_TASKS
+        .write()
+        .remove(&(base_dir.to_path_buf(), table_name.to_string()));
+    if let Some(handle) = handle {
+        let _ = handle.join();
+    }
+}
+
+pub fn wait_fts_backfills_for_dir(base_dir: &Path) {
+    let handles: Vec<_> = {
+        let mut tasks = FTS_BACKFILL_TASKS.write();
+        let keys: Vec<_> = tasks
+            .keys()
+            .filter(|(dir, _)| dir == base_dir)
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| tasks.remove(&key))
+            .collect()
+    };
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
+/// Remove the FTS manager registered for a base_dir.
+///
+/// Used when a database directory is recreated in-process, so a later
+/// CREATE FTS INDEX builds fresh engines instead of reusing stale in-memory
+/// indexes whose files were deleted.
+pub fn unregister_fts_manager(base_dir: &Path) {
+    wait_fts_backfills_for_dir(base_dir);
+    FTS_MANAGER_CACHE.write().remove(base_dir);
 }
 
 /// Get or lazily create a FtsManager for a base_dir.

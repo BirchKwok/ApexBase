@@ -440,6 +440,312 @@ impl OnDemandStorage {
         let mut col_is_int = vec![false; nc];
         let mut match_count = 0i64;
 
+        if matches!(filter_type, ColumnType::StringDict) && nc <= 1 && footer.row_groups.len() > 1
+        {
+            use rayon::prelude::*;
+
+            #[derive(Clone, Copy)]
+            struct Part {
+                matches: i64,
+                count: i64,
+                sum: f64,
+                min: f64,
+                max: f64,
+                is_int: bool,
+            }
+
+            impl Part {
+                #[inline]
+                fn empty() -> Self {
+                    Self {
+                        matches: 0,
+                        count: 0,
+                        sum: 0.0,
+                        min: f64::INFINITY,
+                        max: f64::NEG_INFINITY,
+                        is_int: false,
+                    }
+                }
+
+                #[inline]
+                fn add_f64(&mut self, v: f64) {
+                    self.count += 1;
+                    self.sum += v;
+                    if v < self.min {
+                        self.min = v;
+                    }
+                    if v > self.max {
+                        self.max = v;
+                    }
+                }
+            }
+
+            let mmap_ptr = mmap_ref.as_ptr() as usize;
+            let mmap_len = mmap_ref.len();
+            let target_len = target_bytes.len();
+
+            let parts: Option<Vec<Part>> = footer
+                .row_groups
+                .par_iter()
+                .enumerate()
+                .map(|(rg_i, rg_meta)| {
+                    let mut part = Part::empty();
+                    let rg_rows = rg_meta.row_count as usize;
+                    if rg_rows == 0 {
+                        return Some(part);
+                    }
+
+                    if let Some(zmaps) = footer.zone_maps.get(rg_i) {
+                        if let Some(zm) = zmaps
+                            .iter()
+                            .find(|z| z.col_idx as usize == filter_idx && !z.is_float)
+                        {
+                            let tlen = target_len as i64;
+                            if tlen < zm.min_bits || tlen > zm.max_bits {
+                                return Some(part);
+                            }
+                        }
+                    }
+
+                    let mmap =
+                        unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len) };
+                    let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+                    if rg_end > mmap.len() || rg_end < rg_meta.offset as usize + 32 {
+                        return None;
+                    }
+                    let rg_bytes = &mmap[rg_meta.offset as usize..rg_end];
+                    let compress_flag = rg_bytes[28];
+                    let encoding_version = rg_bytes[29];
+                    if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
+                        return None;
+                    }
+
+                    let rcix = footer.col_offsets.get(rg_i)?;
+                    if rcix.len() <= filter_idx
+                        || agg_indices.iter().any(|&(ci, _)| rcix.len() <= ci)
+                    {
+                        return None;
+                    }
+
+                    let body = &rg_bytes[32..];
+                    let null_bitmap_len = (rg_rows + 7) / 8;
+                    let del_start = rg_rows * 8;
+                    let del_len = null_bitmap_len;
+                    if del_start + del_len > body.len() {
+                        return None;
+                    }
+                    let del_bytes = &body[del_start..del_start + del_len];
+                    let has_deletes = rg_meta.deletion_count > 0;
+
+                    let filter_col_off = rcix[filter_idx] as usize;
+                    if filter_col_off + null_bitmap_len >= body.len() {
+                        return None;
+                    }
+                    let filter_nulls = &body[filter_col_off..filter_col_off + null_bitmap_len];
+                    let filter_encoding = body[filter_col_off + null_bitmap_len];
+                    if filter_encoding != COL_ENCODING_PLAIN {
+                        return None;
+                    }
+                    let filter_payload = &body[filter_col_off + null_bitmap_len + 1..];
+                    if filter_payload.len() < 16 {
+                        return None;
+                    }
+
+                    let row_count =
+                        u64::from_le_bytes(filter_payload[0..8].try_into().ok()?) as usize;
+                    let dict_size =
+                        u64::from_le_bytes(filter_payload[8..16].try_into().ok()?) as usize;
+                    if dict_size == 0 {
+                        return Some(part);
+                    }
+                    let indices_start = 16usize;
+                    let indices_len = row_count.checked_mul(4)?;
+                    let dict_off_start = indices_start.checked_add(indices_len)?;
+                    let dict_offsets_len = dict_size.checked_mul(4)?;
+                    let dict_data_len_off = dict_off_start.checked_add(dict_offsets_len)?;
+                    if dict_data_len_off + 8 > filter_payload.len() {
+                        return None;
+                    }
+                    let dict_data_len = u64::from_le_bytes(
+                        filter_payload[dict_data_len_off..dict_data_len_off + 8]
+                            .try_into()
+                            .ok()?,
+                    ) as usize;
+                    let dict_data_start = dict_data_len_off + 8;
+                    let dict_offsets =
+                        bytes_as_u32_slice(&filter_payload[dict_off_start..], dict_size);
+                    let indices = bytes_as_u32_slice(&filter_payload[indices_start..], row_count);
+
+                    let mut target_dict_idx = None;
+                    for di in 0..dict_size {
+                        let ds = dict_offsets[di] as usize;
+                        let de = if di + 1 < dict_size {
+                            dict_offsets[di + 1] as usize
+                        } else {
+                            dict_data_len
+                        };
+                        if de >= ds
+                            && de - ds == target_len
+                            && dict_data_start + de <= filter_payload.len()
+                            && &filter_payload[dict_data_start + ds..dict_data_start + de]
+                                == target_bytes
+                        {
+                            target_dict_idx = Some((di + 1) as u32);
+                            break;
+                        }
+                    }
+                    let Some(tdi) = target_dict_idx else {
+                        return Some(part);
+                    };
+
+                    let n = row_count.min(rg_rows).min(indices.len());
+                    let filter_has_nulls = filter_nulls.iter().any(|&b| b != 0);
+
+                    if nc == 0 {
+                        for i in 0..n {
+                            if indices[i] != tdi {
+                                continue;
+                            }
+                            if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            if filter_has_nulls && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            part.matches += 1;
+                        }
+                        return Some(part);
+                    }
+
+                    let (agg_col_idx, _) = agg_indices[0];
+                    let agg_col_off = rcix[agg_col_idx] as usize;
+                    if agg_col_off + null_bitmap_len >= body.len() {
+                        return None;
+                    }
+                    let agg_nulls = &body[agg_col_off..agg_col_off + null_bitmap_len];
+                    let agg_encoding = body[agg_col_off + null_bitmap_len];
+                    if agg_encoding != COL_ENCODING_PLAIN {
+                        return None;
+                    }
+                    let agg_payload = &body[agg_col_off + null_bitmap_len + 1..];
+                    if agg_payload.len() < 8 {
+                        return None;
+                    }
+                    let agg_count =
+                        u64::from_le_bytes(agg_payload[0..8].try_into().ok()?) as usize;
+                    let agg_n = agg_count.min(rg_rows).min((agg_payload.len() - 8) / 8);
+                    let scan_n = n.min(agg_n);
+                    let agg_values = &agg_payload[8..];
+                    let agg_has_nulls = agg_nulls.iter().any(|&b| b != 0);
+                    let agg_type = schema.columns[agg_col_idx].1;
+
+                    match agg_type {
+                        ColumnType::Float64 | ColumnType::Float32 => {
+                            for i in 0..scan_n {
+                                if indices[i] != tdi {
+                                    continue;
+                                }
+                                if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                                    continue;
+                                }
+                                if filter_has_nulls
+                                    && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
+                                {
+                                    continue;
+                                }
+                                part.matches += 1;
+                                if agg_has_nulls && (agg_nulls[i / 8] >> (i % 8)) & 1 == 1 {
+                                    continue;
+                                }
+                                let off = i * 8;
+                                let v = f64::from_le_bytes(
+                                    agg_values[off..off + 8].try_into().ok()?,
+                                );
+                                part.add_f64(v);
+                            }
+                        }
+                        ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date => {
+                            part.is_int = true;
+                            for i in 0..scan_n {
+                                if indices[i] != tdi {
+                                    continue;
+                                }
+                                if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                                    continue;
+                                }
+                                if filter_has_nulls
+                                    && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
+                                {
+                                    continue;
+                                }
+                                part.matches += 1;
+                                if agg_has_nulls && (agg_nulls[i / 8] >> (i % 8)) & 1 == 1 {
+                                    continue;
+                                }
+                                let off = i * 8;
+                                let v = i64::from_le_bytes(
+                                    agg_values[off..off + 8].try_into().ok()?,
+                                ) as f64;
+                                part.add_f64(v);
+                            }
+                        }
+                        _ => return None,
+                    }
+
+                    Some(part)
+                })
+                .collect();
+
+            if let Some(parts) = parts {
+                let mut total = Part::empty();
+                for part in parts {
+                    total.matches += part.matches;
+                    total.count += part.count;
+                    total.sum += part.sum;
+                    if part.min < total.min {
+                        total.min = part.min;
+                    }
+                    if part.max > total.max {
+                        total.max = part.max;
+                    }
+                    total.is_int |= part.is_int;
+                }
+
+                let mut results = Vec::with_capacity(agg_cols.len());
+                let mut ci = 0usize;
+                for &col_name in agg_cols {
+                    if col_name == "*" || col_name == "1" {
+                        results.push((total.matches, 0.0, 0.0, 0.0, false));
+                    } else if ci < nc {
+                        let mn = if total.min == f64::INFINITY {
+                            0.0
+                        } else {
+                            total.min
+                        };
+                        let mx = if total.max == f64::NEG_INFINITY {
+                            0.0
+                        } else {
+                            total.max
+                        };
+                        results.push((total.count, total.sum, mn, mx, total.is_int));
+                        ci += 1;
+                    } else {
+                        results.push((0, 0.0, 0.0, 0.0, false));
+                    }
+                }
+                return Ok(Some(results));
+            }
+        }
+
         for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
             let rg_rows = rg_meta.row_count as usize;
             if rg_rows == 0 { continue; }
@@ -559,6 +865,147 @@ impl OnDemandStorage {
                                 if search_from >= raw_dict.len() { break; }
                             }
                             if let Some(tdi) = target_dict_idx {
+                                if nc <= 1 {
+                                    let n = count.min(rg_rows).min(indices.len());
+                                    if nc == 0 {
+                                        for i in 0..n {
+                                            if indices[i] == tdi {
+                                                if has_deletes
+                                                    && (body[del_start_body + i / 8] >> (i % 8))
+                                                        & 1
+                                                        == 1
+                                                {
+                                                    continue;
+                                                }
+                                                let null_byte = body
+                                                    .get(filter_col_off + i / 8)
+                                                    .copied()
+                                                    .unwrap_or(0);
+                                                if (null_byte >> (i % 8)) & 1 == 0 {
+                                                    match_count += 1;
+                                                }
+                                            }
+                                        }
+                                        continue;
+                                    }
+
+                                    let (agg_col_idx, _) = agg_indices[0];
+                                    let agg_col_off = rcix[agg_col_idx] as usize;
+                                    if agg_col_off + null_bitmap_len <= body.len() {
+                                        let agg_null =
+                                            &body[agg_col_off..agg_col_off + null_bitmap_len];
+                                        let agg_data_start = agg_col_off + null_bitmap_len + 1;
+                                        if agg_data_start <= body.len() {
+                                            let agg_encoding = body[agg_col_off + null_bitmap_len];
+                                            let agg_payload = &body[agg_data_start..];
+                                            let agg_type = schema.columns[agg_col_idx].1;
+                                            if agg_encoding == COL_ENCODING_PLAIN
+                                                && agg_payload.len() >= 8
+                                            {
+                                                let agg_count = u64::from_le_bytes(
+                                                    agg_payload[0..8].try_into().unwrap(),
+                                                )
+                                                    as usize;
+                                                let agg_n =
+                                                    agg_count.min(rg_rows).min((agg_payload.len() - 8) / 8);
+                                                let n = n.min(agg_n);
+                                                if matches!(
+                                                    agg_type,
+                                                    ColumnType::Float64 | ColumnType::Float32
+                                                ) {
+                                                    let vals =
+                                                        bytes_as_f64_slice(&agg_payload[8..], agg_n);
+                                                    for i in 0..n {
+                                                        if indices[i] != tdi {
+                                                            continue;
+                                                        }
+                                                        if has_deletes
+                                                            && (body[del_start_body + i / 8]
+                                                                >> (i % 8))
+                                                                & 1
+                                                                == 1
+                                                        {
+                                                            continue;
+                                                        }
+                                                        let filter_null = body
+                                                            .get(filter_col_off + i / 8)
+                                                            .copied()
+                                                            .unwrap_or(0);
+                                                        if (filter_null >> (i % 8)) & 1 == 1 {
+                                                            continue;
+                                                        }
+                                                        match_count += 1;
+                                                        if (agg_null[i / 8] >> (i % 8)) & 1 == 1 {
+                                                            continue;
+                                                        }
+                                                        let v = vals[i];
+                                                        col_counts[0] += 1;
+                                                        col_sums[0] += v;
+                                                        if v < col_mins[0] {
+                                                            col_mins[0] = v;
+                                                        }
+                                                        if v > col_maxs[0] {
+                                                            col_maxs[0] = v;
+                                                        }
+                                                    }
+                                                    continue;
+                                                } else if matches!(
+                                                    agg_type,
+                                                    ColumnType::Int64
+                                                        | ColumnType::Int8
+                                                        | ColumnType::Int16
+                                                        | ColumnType::Int32
+                                                        | ColumnType::UInt8
+                                                        | ColumnType::UInt16
+                                                        | ColumnType::UInt32
+                                                        | ColumnType::UInt64
+                                                        | ColumnType::Timestamp
+                                                        | ColumnType::Date
+                                                ) {
+                                                    col_is_int[0] = true;
+                                                    let vals =
+                                                        bytes_as_i64_slice(&agg_payload[8..], agg_n);
+                                                    for i in 0..n {
+                                                        if indices[i] != tdi {
+                                                            continue;
+                                                        }
+                                                        if has_deletes
+                                                            && (body[del_start_body + i / 8]
+                                                                >> (i % 8))
+                                                                & 1
+                                                                == 1
+                                                        {
+                                                            continue;
+                                                        }
+                                                        let filter_null = body
+                                                            .get(filter_col_off + i / 8)
+                                                            .copied()
+                                                            .unwrap_or(0);
+                                                        if (filter_null >> (i % 8)) & 1 == 1 {
+                                                            continue;
+                                                        }
+                                                        match_count += 1;
+                                                        if (agg_null[i / 8] >> (i % 8)) & 1 == 1 {
+                                                            continue;
+                                                        }
+                                                        let v = vals[i];
+                                                        let vf = v as f64;
+                                                        col_counts[0] += 1;
+                                                        col_sums[0] += vf;
+                                                        if vf < col_mins[0] {
+                                                            col_mins[0] = vf;
+                                                        }
+                                                        if vf > col_maxs[0] {
+                                                            col_maxs[0] = vf;
+                                                        }
+                                                    }
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let n = count.min(rg_rows);
                                 let mut result = Vec::new();
                                 for i in 0..n {
@@ -944,6 +1391,932 @@ impl OnDemandStorage {
                 results.push((0, 0.0, 0.0, 0.0, false));
             }
         }
+        Ok(Some(results))
+    }
+
+    /// Single-pass filtered numeric aggregation from mmap.
+    /// Handles simple predicates such as `WHERE age > 30` without materializing
+    /// matching rows or Arrow arrays.
+    pub fn execute_filtered_numeric_agg_mmap(
+        &self,
+        filter_col: &str,
+        low: f64,
+        high: f64,
+        agg_cols: &[&str],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let filter_idx = match schema.get_index(filter_col) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let filter_type = schema.columns[filter_idx].1;
+        let filter_is_int = matches!(
+            filter_type,
+            ColumnType::Int64
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Timestamp
+                | ColumnType::Date
+                | ColumnType::Bool
+        );
+        let filter_is_float = matches!(filter_type, ColumnType::Float64 | ColumnType::Float32);
+        if !filter_is_int && !filter_is_float {
+            return Ok(None);
+        }
+
+        let agg_indices: Vec<usize> = agg_cols
+            .iter()
+            .filter(|&&n| n != "*" && n != "1")
+            .filter_map(|&n| schema.get_index(n))
+            .collect();
+        let non_star_count = agg_cols.iter().filter(|&&n| n != "*" && n != "1").count();
+        if agg_indices.len() != non_star_count {
+            return Ok(None);
+        }
+        for &idx in &agg_indices {
+            let ct = schema.columns[idx].1;
+            let is_numeric = matches!(
+                ct,
+                ColumnType::Int64
+                    | ColumnType::Int8
+                    | ColumnType::Int16
+                    | ColumnType::Int32
+                    | ColumnType::UInt8
+                    | ColumnType::UInt16
+                    | ColumnType::UInt32
+                    | ColumnType::UInt64
+                    | ColumnType::Timestamp
+                    | ColumnType::Date
+                    | ColumnType::Float64
+                    | ColumnType::Float32
+                    | ColumnType::Bool
+            );
+            if !is_numeric {
+                return Ok(None);
+            }
+        }
+
+        enum NumView<'a> {
+            I64(std::borrow::Cow<'a, [i64]>),
+            F64(std::borrow::Cow<'a, [f64]>),
+            Bitpack(&'a [u8]),
+            Bool(&'a [u8]),
+        }
+        macro_rules! num_at {
+            ($view:expr, $idx:expr) => {
+                match $view {
+                    NumView::I64(vals) => vals.get($idx).map(|&v| v as f64),
+                    NumView::F64(vals) => vals.get($idx).copied(),
+                    NumView::Bitpack(bytes) => {
+                        crate::storage::on_demand::bitpack_decode_at_idx(bytes, $idx)
+                            .map(|v| v as f64)
+                    }
+                    NumView::Bool(bytes) => bytes
+                        .get($idx / 8)
+                        .map(|b| ((b >> ($idx % 8)) & 1) as f64),
+                }
+            };
+        }
+
+        let nc = agg_indices.len();
+        let mut col_counts = vec![0i64; nc];
+        let mut col_sums = vec![0.0f64; nc];
+        let mut col_mins = vec![f64::INFINITY; nc];
+        let mut col_maxs = vec![f64::NEG_INFINITY; nc];
+        let mut col_is_int = vec![false; nc];
+        let mut match_count = 0i64;
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "File not open"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        if nc <= 1 && footer.row_groups.len() > 1 {
+            use rayon::prelude::*;
+
+            #[derive(Clone, Copy)]
+            struct Part {
+                matches: i64,
+                count: i64,
+                sum: f64,
+                min: f64,
+                max: f64,
+                is_int: bool,
+            }
+
+            impl Part {
+                #[inline]
+                fn empty() -> Self {
+                    Self {
+                        matches: 0,
+                        count: 0,
+                        sum: 0.0,
+                        min: f64::INFINITY,
+                        max: f64::NEG_INFINITY,
+                        is_int: false,
+                    }
+                }
+
+                #[inline]
+                fn add_f64(&mut self, v: f64) {
+                    self.count += 1;
+                    self.sum += v;
+                    if v < self.min {
+                        self.min = v;
+                    }
+                    if v > self.max {
+                        self.max = v;
+                    }
+                }
+            }
+
+            let mmap_ptr = mmap_ref.as_ptr() as usize;
+            let mmap_len = mmap_ref.len();
+
+            let parts: Option<Vec<Part>> = footer
+                .row_groups
+                .par_iter()
+                .enumerate()
+                .map(|(rg_i, rg_meta)| {
+                    let mut part = Part::empty();
+                    let rg_rows = rg_meta.row_count as usize;
+                    if rg_rows == 0 {
+                        return Some(part);
+                    }
+
+                    if let Some(zmaps) = footer.zone_maps.get(rg_i) {
+                        if let Some(zm) = zmaps.iter().find(|z| z.col_idx as usize == filter_idx)
+                        {
+                            let skip = if zm.is_float {
+                                !zm.may_overlap_float_range(low, high)
+                            } else {
+                                !zm.may_overlap_int_range(low.ceil() as i64, high.floor() as i64)
+                            };
+                            if skip {
+                                return Some(part);
+                            }
+                        }
+                    }
+
+                    let mmap =
+                        unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len) };
+                    let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+                    if rg_end > mmap.len() || rg_end < rg_meta.offset as usize + 32 {
+                        return None;
+                    }
+                    let rg_bytes = &mmap[rg_meta.offset as usize..rg_end];
+                    let compress_flag = rg_bytes[28];
+                    let encoding_version = rg_bytes[29];
+                    if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
+                        return None;
+                    }
+                    let rcix = footer.col_offsets.get(rg_i)?;
+                    if rcix.len() <= filter_idx || agg_indices.iter().any(|&ci| rcix.len() <= ci)
+                    {
+                        return None;
+                    }
+
+                    let body = &rg_bytes[32..];
+                    let null_bitmap_len = (rg_rows + 7) / 8;
+                    let del_start = rg_rows * 8;
+                    let del_len = null_bitmap_len;
+                    if del_start + del_len > body.len() {
+                        return None;
+                    }
+                    let del_bytes = &body[del_start..del_start + del_len];
+                    let has_deletes = rg_meta.deletion_count > 0;
+
+                    enum AggView<'a> {
+                        None,
+                        F64(&'a [u8], usize),
+                        I64(&'a [u8], usize),
+                    }
+
+                    let agg_view = if nc == 0 {
+                        AggView::None
+                    } else {
+                        let agg_idx = agg_indices[0];
+                        let agg_off = rcix[agg_idx] as usize;
+                        if agg_off + null_bitmap_len >= body.len() {
+                            return None;
+                        }
+                        let agg_encoding = body[agg_off + null_bitmap_len];
+                        if agg_encoding != COL_ENCODING_PLAIN {
+                            return None;
+                        }
+                        let agg_payload = &body[agg_off + null_bitmap_len + 1..];
+                        if agg_payload.len() < 8 {
+                            return None;
+                        }
+                        let agg_count =
+                            u64::from_le_bytes(agg_payload[0..8].try_into().ok()?) as usize;
+                        let agg_n = agg_count.min(rg_rows).min((agg_payload.len() - 8) / 8);
+                        let agg_values = &agg_payload[8..];
+                        match schema.columns[agg_idx].1 {
+                            ColumnType::Float64 | ColumnType::Float32 => {
+                                AggView::F64(agg_values, agg_n)
+                            }
+                            ColumnType::Int64
+                            | ColumnType::Int8
+                            | ColumnType::Int16
+                            | ColumnType::Int32
+                            | ColumnType::UInt8
+                            | ColumnType::UInt16
+                            | ColumnType::UInt32
+                            | ColumnType::UInt64
+                            | ColumnType::Timestamp
+                            | ColumnType::Date
+                            | ColumnType::Bool => {
+                                part.is_int = true;
+                                AggView::I64(agg_values, agg_n)
+                            }
+                            _ => return None,
+                        }
+                    };
+
+                    let filter_off = rcix[filter_idx] as usize;
+                    if filter_off + null_bitmap_len >= body.len() {
+                        return None;
+                    }
+                    let filter_nulls = &body[filter_off..filter_off + null_bitmap_len];
+                    let filter_has_nulls = filter_nulls.iter().any(|&b| b != 0);
+                    let filter_encoding = body[filter_off + null_bitmap_len];
+                    let filter_payload = &body[filter_off + null_bitmap_len + 1..];
+                    let low_i = low.ceil() as i64;
+                    let high_i = high.floor() as i64;
+
+                    macro_rules! add_match {
+                        ($idx:expr, $filter_value:expr) => {{
+                            let row_idx = $idx;
+                            let fv = $filter_value as f64;
+                            if fv >= low && fv <= high {
+                                part.matches += 1;
+                                match agg_view {
+                                    AggView::None => {}
+                                    AggView::F64(values, n) => {
+                                        if row_idx < n {
+                                            let off = row_idx * 8;
+                                            let v = f64::from_le_bytes(
+                                                values[off..off + 8].try_into().ok()?,
+                                            );
+                                            part.add_f64(v);
+                                        }
+                                    }
+                                    AggView::I64(values, n) => {
+                                        if row_idx < n {
+                                            let off = row_idx * 8;
+                                            let v = i64::from_le_bytes(
+                                                values[off..off + 8].try_into().ok()?,
+                                            ) as f64;
+                                            part.add_f64(v);
+                                        }
+                                    }
+                                }
+                            }
+                        }};
+                    }
+
+                    macro_rules! add_int_match {
+                        ($idx:expr, $filter_value:expr) => {{
+                            let row_idx = $idx;
+                            let fv = $filter_value;
+                            if fv >= low_i && fv <= high_i {
+                                part.matches += 1;
+                                match agg_view {
+                                    AggView::None => {}
+                                    AggView::F64(values, n) => {
+                                        if row_idx < n {
+                                            let off = row_idx * 8;
+                                            let v = f64::from_le_bytes(
+                                                values[off..off + 8].try_into().ok()?,
+                                            );
+                                            part.add_f64(v);
+                                        }
+                                    }
+                                    AggView::I64(values, n) => {
+                                        if row_idx < n {
+                                            let off = row_idx * 8;
+                                            let v = i64::from_le_bytes(
+                                                values[off..off + 8].try_into().ok()?,
+                                            ) as f64;
+                                            part.add_f64(v);
+                                        }
+                                    }
+                                }
+                            }
+                        }};
+                    }
+
+                    match filter_type {
+                        ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date => {
+                            if filter_encoding == COL_ENCODING_BITPACK {
+                                if filter_payload.len() < 17 {
+                                    return None;
+                                }
+                                let count =
+                                    u64::from_le_bytes(filter_payload[0..8].try_into().ok()?)
+                                        as usize;
+                                let bit_width = filter_payload[8] as usize;
+                                let min_val =
+                                    i64::from_le_bytes(filter_payload[9..17].try_into().ok()?);
+                                let packed_bytes = (count * bit_width + 7) / 8;
+                                if filter_payload.len() < 17 + packed_bytes {
+                                    return None;
+                                }
+                                let packed = &filter_payload[17..17 + packed_bytes];
+                                let n = count.min(rg_rows);
+
+                                if bit_width == 0 {
+                                    for i in 0..n {
+                                        if has_deletes
+                                            && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                                        {
+                                            continue;
+                                        }
+                                        if filter_has_nulls
+                                            && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
+                                        {
+                                            continue;
+                                        }
+                                        add_int_match!(i, min_val);
+                                    }
+                                } else if bit_width == 6 {
+                                    if !has_deletes && !filter_has_nulls {
+                                        let n_full = n / 8;
+                                        match &agg_view {
+                                            AggView::F64(values, agg_n) => {
+                                                let n_scan = n.min(*agg_n);
+                                                let n_full_scan = n_scan / 8;
+                                                for g in 0..n_full_scan {
+                                                    let off = g * 6;
+                                                    if off + 6 > packed.len() {
+                                                        return None;
+                                                    }
+                                                    let b = &packed[off..];
+                                                    let word = u64::from_le_bytes([
+                                                        b[0], b[1], b[2], b[3], b[4], b[5], 0, 0,
+                                                    ]);
+                                                    let base = g * 8;
+                                                    for k in 0..8usize {
+                                                        let i = base + k;
+                                                        let delta = ((word >> (k * 6)) & 0x3F) as i64;
+                                                        let fv = min_val.wrapping_add(delta);
+                                                        if fv >= low_i && fv <= high_i {
+                                                            part.matches += 1;
+                                                            let off = i * 8;
+                                                            let v = f64::from_le_bytes(
+                                                                values[off..off + 8]
+                                                                    .try_into()
+                                                                    .ok()?,
+                                                            );
+                                                            part.add_f64(v);
+                                                        }
+                                                    }
+                                                }
+                                                for i in (n_full_scan * 8)..n_scan {
+                                                    let bit_offset = i * 6;
+                                                    let byte_idx = bit_offset / 8;
+                                                    let shift = bit_offset % 8;
+                                                    let b0 =
+                                                        packed.get(byte_idx).copied().unwrap_or(0)
+                                                            as u64;
+                                                    let b1 = packed
+                                                        .get(byte_idx + 1)
+                                                        .copied()
+                                                        .unwrap_or(0)
+                                                        as u64;
+                                                    let delta =
+                                                        ((b0 | (b1 << 8)) >> shift) & 0x3F;
+                                                    let fv = min_val.wrapping_add(delta as i64);
+                                                    if fv >= low_i && fv <= high_i {
+                                                        part.matches += 1;
+                                                        let off = i * 8;
+                                                        let v = f64::from_le_bytes(
+                                                            values[off..off + 8]
+                                                                .try_into()
+                                                                .ok()?,
+                                                        );
+                                                        part.add_f64(v);
+                                                    }
+                                                }
+                                                return Some(part);
+                                            }
+                                            AggView::None => {
+                                                for g in 0..n_full {
+                                                    let off = g * 6;
+                                                    if off + 6 > packed.len() {
+                                                        return None;
+                                                    }
+                                                    let b = &packed[off..];
+                                                    let word = u64::from_le_bytes([
+                                                        b[0], b[1], b[2], b[3], b[4], b[5], 0, 0,
+                                                    ]);
+                                                    for k in 0..8usize {
+                                                        let delta = ((word >> (k * 6)) & 0x3F) as i64;
+                                                        let fv = min_val.wrapping_add(delta);
+                                                        if fv >= low_i && fv <= high_i {
+                                                            part.matches += 1;
+                                                        }
+                                                    }
+                                                }
+                                                for i in (n_full * 8)..n {
+                                                    let bit_offset = i * 6;
+                                                    let byte_idx = bit_offset / 8;
+                                                    let shift = bit_offset % 8;
+                                                    let b0 =
+                                                        packed.get(byte_idx).copied().unwrap_or(0)
+                                                            as u64;
+                                                    let b1 = packed
+                                                        .get(byte_idx + 1)
+                                                        .copied()
+                                                        .unwrap_or(0)
+                                                        as u64;
+                                                    let delta =
+                                                        ((b0 | (b1 << 8)) >> shift) & 0x3F;
+                                                    let fv = min_val.wrapping_add(delta as i64);
+                                                    if fv >= low_i && fv <= high_i {
+                                                        part.matches += 1;
+                                                    }
+                                                }
+                                                return Some(part);
+                                            }
+                                            AggView::I64(_, _) => {}
+                                        }
+                                    }
+                                    let n_full = n / 8;
+                                    for g in 0..n_full {
+                                        let off = g * 6;
+                                        if off + 6 > packed.len() {
+                                            return None;
+                                        }
+                                        let b = &packed[off..];
+                                        let word = u64::from_le_bytes([
+                                            b[0], b[1], b[2], b[3], b[4], b[5], 0, 0,
+                                        ]);
+                                        let base = g * 8;
+                                        for k in 0..8usize {
+                                            let i = base + k;
+                                            if has_deletes
+                                                && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                                            {
+                                                continue;
+                                            }
+                                            if filter_has_nulls
+                                                && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
+                                            {
+                                                continue;
+                                            }
+                                            let delta = ((word >> (k * 6)) & 0x3F) as i64;
+                                            add_int_match!(i, min_val.wrapping_add(delta));
+                                        }
+                                    }
+                                    for i in (n_full * 8)..n {
+                                        if has_deletes
+                                            && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                                        {
+                                            continue;
+                                        }
+                                        if filter_has_nulls
+                                            && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
+                                        {
+                                            continue;
+                                        }
+                                        let bit_offset = i * 6;
+                                        let byte_idx = bit_offset / 8;
+                                        let shift = bit_offset % 8;
+                                        let b0 = packed.get(byte_idx).copied().unwrap_or(0) as u64;
+                                        let b1 =
+                                            packed.get(byte_idx + 1).copied().unwrap_or(0) as u64;
+                                        let delta = ((b0 | (b1 << 8)) >> shift) & 0x3F;
+                                        add_int_match!(i, min_val.wrapping_add(delta as i64));
+                                    }
+                                } else if bit_width == 7 {
+                                    let n_full = n / 8;
+                                    for g in 0..n_full {
+                                        let off = g * 7;
+                                        if off + 7 > packed.len() {
+                                            return None;
+                                        }
+                                        let b = &packed[off..off + 7];
+                                        let word = u64::from_le_bytes([
+                                            b[0], b[1], b[2], b[3], b[4], b[5], b[6], 0,
+                                        ]);
+                                        let base = g * 8;
+                                        for k in 0..8usize {
+                                            let i = base + k;
+                                            if has_deletes
+                                                && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                                            {
+                                                continue;
+                                            }
+                                            if filter_has_nulls
+                                                && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
+                                            {
+                                                continue;
+                                            }
+                                            let delta = ((word >> (k * 7)) & 0x7F) as i64;
+                                            add_int_match!(i, min_val.wrapping_add(delta));
+                                        }
+                                    }
+                                    for i in (n_full * 8)..n {
+                                        if has_deletes
+                                            && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                                        {
+                                            continue;
+                                        }
+                                        if filter_has_nulls
+                                            && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
+                                        {
+                                            continue;
+                                        }
+                                        let bit_offset = i * 7;
+                                        let byte_idx = bit_offset / 8;
+                                        let shift = bit_offset % 8;
+                                        let b0 = packed.get(byte_idx).copied().unwrap_or(0) as u64;
+                                        let b1 =
+                                            packed.get(byte_idx + 1).copied().unwrap_or(0) as u64;
+                                        let delta = ((b0 | (b1 << 8)) >> shift) & 0x7F;
+                                        add_int_match!(i, min_val.wrapping_add(delta as i64));
+                                    }
+                                } else if bit_width == 8 {
+                                    for i in 0..n {
+                                        if has_deletes
+                                            && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                                        {
+                                            continue;
+                                        }
+                                        if filter_has_nulls
+                                            && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
+                                        {
+                                            continue;
+                                        }
+                                        let delta = packed.get(i).copied().unwrap_or(0) as i64;
+                                        add_int_match!(i, min_val.wrapping_add(delta));
+                                    }
+                                } else if bit_width <= 16 {
+                                    let mask = (1u64 << bit_width) - 1;
+                                    for i in 0..n {
+                                        if has_deletes
+                                            && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                                        {
+                                            continue;
+                                        }
+                                        if filter_has_nulls
+                                            && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
+                                        {
+                                            continue;
+                                        }
+                                        let bit_offset = i * bit_width;
+                                        let byte_idx = bit_offset / 8;
+                                        let shift = bit_offset % 8;
+                                        let b0 = packed.get(byte_idx).copied().unwrap_or(0) as u64;
+                                        let b1 =
+                                            packed.get(byte_idx + 1).copied().unwrap_or(0) as u64;
+                                        let b2 =
+                                            packed.get(byte_idx + 2).copied().unwrap_or(0) as u64;
+                                        let word = b0 | (b1 << 8) | (b2 << 16);
+                                        let delta = ((word >> shift) & mask) as i64;
+                                        add_int_match!(i, min_val.wrapping_add(delta));
+                                    }
+                                } else {
+                                    return None;
+                                }
+                            } else if filter_encoding == COL_ENCODING_PLAIN {
+                                if filter_payload.len() < 8 {
+                                    return None;
+                                }
+                                let count =
+                                    u64::from_le_bytes(filter_payload[0..8].try_into().ok()?)
+                                        as usize;
+                                let n = count.min(rg_rows).min((filter_payload.len() - 8) / 8);
+                                let values = &filter_payload[8..];
+                                for i in 0..n {
+                                    if has_deletes
+                                        && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                                    {
+                                        continue;
+                                    }
+                                    if filter_has_nulls
+                                        && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
+                                    {
+                                        continue;
+                                    }
+                                    let off = i * 8;
+                                    let v =
+                                        i64::from_le_bytes(values[off..off + 8].try_into().ok()?);
+                                    add_int_match!(i, v);
+                                }
+                            } else {
+                                return None;
+                            }
+                        }
+                        ColumnType::Float64 | ColumnType::Float32 => {
+                            if filter_encoding != COL_ENCODING_PLAIN || filter_payload.len() < 8 {
+                                return None;
+                            }
+                            let count =
+                                u64::from_le_bytes(filter_payload[0..8].try_into().ok()?) as usize;
+                            let n = count.min(rg_rows).min((filter_payload.len() - 8) / 8);
+                            let values = &filter_payload[8..];
+                            for i in 0..n {
+                                if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                                    continue;
+                                }
+                                if filter_has_nulls
+                                    && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1
+                                {
+                                    continue;
+                                }
+                                let off = i * 8;
+                                let v =
+                                    f64::from_le_bytes(values[off..off + 8].try_into().ok()?);
+                                add_match!(i, v);
+                            }
+                        }
+                        _ => return None,
+                    }
+
+                    Some(part)
+                })
+                .collect();
+
+            if let Some(parts) = parts {
+                let mut total = Part::empty();
+                for part in parts {
+                    total.matches += part.matches;
+                    total.count += part.count;
+                    total.sum += part.sum;
+                    if part.min < total.min {
+                        total.min = part.min;
+                    }
+                    if part.max > total.max {
+                        total.max = part.max;
+                    }
+                    total.is_int |= part.is_int;
+                }
+
+                let mut results = Vec::with_capacity(agg_cols.len());
+                let mut ci = 0usize;
+                for &col_name in agg_cols {
+                    if col_name == "*" || col_name == "1" {
+                        results.push((total.matches, 0.0, 0.0, 0.0, false));
+                    } else if ci < nc {
+                        let mn = if total.min == f64::INFINITY {
+                            0.0
+                        } else {
+                            total.min
+                        };
+                        let mx = if total.max == f64::NEG_INFINITY {
+                            0.0
+                        } else {
+                            total.max
+                        };
+                        results.push((total.count, total.sum, mn, mx, total.is_int));
+                        ci += 1;
+                    } else {
+                        results.push((0, 0.0, 0.0, 0.0, false));
+                    }
+                }
+                return Ok(Some(results));
+            }
+        }
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 {
+                continue;
+            }
+
+            if let Some(zmaps) = footer.zone_maps.get(rg_i) {
+                if let Some(zm) = zmaps.iter().find(|z| z.col_idx as usize == filter_idx) {
+                    let skip = if zm.is_float {
+                        !zm.may_overlap_float_range(low, high)
+                    } else {
+                        !zm.may_overlap_int_range(low.ceil() as i64, high.floor() as i64)
+                    };
+                    if skip {
+                        continue;
+                    }
+                }
+            }
+
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return Err(err_data("RG extends past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            if rg_bytes.len() < 32 {
+                continue;
+            }
+            let compress_flag = rg_bytes[28];
+            let encoding_version = rg_bytes[29];
+            if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
+                return Ok(None);
+            }
+            let rcix = match footer.col_offsets.get(rg_i) {
+                Some(offsets)
+                    if offsets.len() > filter_idx
+                        && agg_indices.iter().all(|&ci| offsets.len() > ci) =>
+                {
+                    offsets
+                }
+                _ => return Ok(None),
+            };
+
+            let body = &rg_bytes[32..];
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let del_start = rg_rows * 8;
+            let del_len = null_bitmap_len;
+            if del_start + del_len > body.len() {
+                return Ok(None);
+            }
+            let del_bytes = &body[del_start..del_start + del_len];
+            let has_deletes = rg_meta.deletion_count > 0;
+
+            macro_rules! build_numeric_view {
+                ($col_idx:expr) => {{
+                    let col_idx = $col_idx;
+                    let col_off = rcix[col_idx] as usize;
+                    if col_off + null_bitmap_len >= body.len() {
+                        None
+                    } else {
+                        let null_bytes = &body[col_off..col_off + null_bitmap_len];
+                        let col_bytes = &body[col_off + null_bitmap_len..];
+                        if col_bytes.is_empty() {
+                            None
+                        } else {
+                            let encoding = col_bytes[0];
+                            let payload = &col_bytes[1..];
+                            let ct = schema.columns[col_idx].1;
+                            match ct {
+                                ColumnType::Bool => {
+                                    let need = (rg_rows + 7) / 8;
+                                    if payload.len() >= need {
+                                        Some((null_bytes, NumView::Bool(&payload[..need]), true))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                ColumnType::Int64
+                                | ColumnType::Int8
+                                | ColumnType::Int16
+                                | ColumnType::Int32
+                                | ColumnType::UInt8
+                                | ColumnType::UInt16
+                                | ColumnType::UInt32
+                                | ColumnType::UInt64
+                                | ColumnType::Timestamp
+                                | ColumnType::Date => {
+                                    if encoding == COL_ENCODING_PLAIN && payload.len() >= 8 {
+                                        let count =
+                                            u64::from_le_bytes(payload[0..8].try_into().unwrap())
+                                                as usize;
+                                        let n = count.min(rg_rows).min((payload.len() - 8) / 8);
+                                        Some((
+                                            null_bytes,
+                                            NumView::I64(bytes_as_i64_slice(&payload[8..], n)),
+                                            true,
+                                        ))
+                                    } else if encoding == COL_ENCODING_BITPACK {
+                                        Some((null_bytes, NumView::Bitpack(payload), true))
+                                    } else {
+                                        match read_column_encoded(col_bytes, ct) {
+                                            Ok((ColumnData::Int64(vals), _)) => Some((
+                                                null_bytes,
+                                                NumView::I64(std::borrow::Cow::Owned(vals)),
+                                                true,
+                                            )),
+                                            _ => None,
+                                        }
+                                    }
+                                }
+                                ColumnType::Float64 | ColumnType::Float32 => {
+                                    if encoding == COL_ENCODING_PLAIN && payload.len() >= 8 {
+                                        let count =
+                                            u64::from_le_bytes(payload[0..8].try_into().unwrap())
+                                                as usize;
+                                        let n = count.min(rg_rows).min((payload.len() - 8) / 8);
+                                        Some((
+                                            null_bytes,
+                                            NumView::F64(bytes_as_f64_slice(&payload[8..], n)),
+                                            false,
+                                        ))
+                                    } else {
+                                        match read_column_encoded(col_bytes, ct) {
+                                            Ok((ColumnData::Float64(vals), _)) => Some((
+                                                null_bytes,
+                                                NumView::F64(std::borrow::Cow::Owned(vals)),
+                                                false,
+                                            )),
+                                            _ => None,
+                                        }
+                                    }
+                                }
+                                _ => None,
+                            }
+                        }
+                    }
+                }};
+            }
+
+            let Some((filter_nulls, filter_view, _)) = build_numeric_view!(filter_idx) else {
+                return Ok(None);
+            };
+
+            let mut agg_views = Vec::with_capacity(nc);
+            for &agg_idx in &agg_indices {
+                let Some(view) = build_numeric_view!(agg_idx) else {
+                    return Ok(None);
+                };
+                agg_views.push(view);
+            }
+            for (ai, (_, _, is_int)) in agg_views.iter().enumerate() {
+                if *is_int {
+                    col_is_int[ai] = true;
+                }
+            }
+
+            let no_filter_nulls = !filter_nulls.iter().any(|&b| b != 0);
+            for i in 0..rg_rows {
+                if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                    continue;
+                }
+                if !no_filter_nulls && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1 {
+                    continue;
+                }
+                let Some(v) = num_at!(&filter_view, i) else {
+                    continue;
+                };
+                if v < low || v > high {
+                    continue;
+                }
+                match_count += 1;
+
+                for (ai, (null_bytes, view, _)) in agg_views.iter().enumerate() {
+                    if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                        continue;
+                    }
+                    let Some(av) = num_at!(view, i) else {
+                        continue;
+                    };
+                    col_counts[ai] += 1;
+                    col_sums[ai] += av;
+                    if av < col_mins[ai] {
+                        col_mins[ai] = av;
+                    }
+                    if av > col_maxs[ai] {
+                        col_maxs[ai] = av;
+                    }
+                }
+            }
+        }
+
+        drop(mmap_guard);
+        drop(file_guard);
+
+        let mut results = Vec::with_capacity(agg_cols.len());
+        let mut ci = 0usize;
+        for &col_name in agg_cols {
+            if col_name == "*" || col_name == "1" {
+                results.push((match_count, 0.0, 0.0, 0.0, false));
+            } else if ci < nc {
+                let mn = if col_mins[ci] == f64::INFINITY {
+                    0.0
+                } else {
+                    col_mins[ci]
+                };
+                let mx = if col_maxs[ci] == f64::NEG_INFINITY {
+                    0.0
+                } else {
+                    col_maxs[ci]
+                };
+                results.push((col_counts[ci], col_sums[ci], mn, mx, col_is_int[ci]));
+                ci += 1;
+            } else {
+                results.push((0, 0.0, 0.0, 0.0, false));
+            }
+        }
+
         Ok(Some(results))
     }
 

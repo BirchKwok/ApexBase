@@ -44,6 +44,48 @@ fn bytes_as_u32_slice(bytes: &[u8], n: usize) -> std::borrow::Cow<'_, [u32]> {
     }
 }
 
+#[inline(always)]
+fn bitpack_value_at(packed: &[u8], bit_width: usize, min_val: i64, idx: usize) -> Option<i64> {
+    if bit_width == 0 {
+        return Some(min_val);
+    }
+    if bit_width >= 64 {
+        return None;
+    }
+    let bit_pos = idx.checked_mul(bit_width)?;
+    let byte_off = bit_pos / 8;
+    let bit_shift = bit_pos % 8;
+    let mask = (1u64 << bit_width) - 1;
+
+    if bit_shift + bit_width <= 64 && byte_off + 8 <= packed.len() {
+        let raw = unsafe { std::ptr::read_unaligned(packed.as_ptr().add(byte_off) as *const u64) };
+        return Some(min_val.wrapping_add(((raw >> bit_shift) & mask) as i64));
+    }
+
+    let bytes_needed = (bit_shift + bit_width + 7) / 8;
+    if byte_off + bytes_needed > packed.len() {
+        return None;
+    }
+    let mut raw = 0u64;
+    for j in 0..bytes_needed {
+        raw |= (packed[byte_off + j] as u64) << (j * 8);
+    }
+    Some(min_val.wrapping_add(((raw >> bit_shift) & mask) as i64))
+}
+
+pub(crate) enum MmapBatchColumn {
+    I64(Vec<Option<i64>>),
+    F64(Vec<Option<f64>>),
+    Str(Vec<Option<String>>),
+    Bool(Vec<Option<bool>>),
+    Bin(Vec<Option<Vec<u8>>>),
+}
+
+pub(crate) struct MmapBatchColumns {
+    pub(crate) row_count: usize,
+    pub(crate) columns: Vec<(String, MmapBatchColumn)>,
+}
+
 // ─── MULTI-PREDICATE PARALLEL SCAN ──────────────────────────────────────────
 
 /// Scan predicate for `scan_multi_predicates_parallel`.
@@ -283,6 +325,150 @@ impl OnDemandStorage {
         dict_encode_strings: bool,
     ) -> io::Result<Option<RecordBatch>> {
         self.to_arrow_batch_mmap_range(column_names, include_id, 0, row_limit, dict_encode_strings)
+    }
+
+    /// Read active row ids and string columns directly from V4 mmap for FTS backfill.
+    /// The caller falls back to the general Arrow path when this returns None.
+    pub(crate) fn read_fts_string_columns_mmap(
+        &self,
+        column_names: &[String],
+    ) -> io::Result<Option<(Vec<u32>, Vec<(String, ColumnData)>)>> {
+        if column_names.is_empty() || self.has_delta() || self.has_v4_in_memory_data() {
+            return Ok(None);
+        }
+
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(Some((Vec::new(), Vec::new()))),
+        };
+        let schema = &footer.schema;
+
+        let mut col_indices = Vec::with_capacity(column_names.len());
+        for name in column_names {
+            let Some(idx) = schema.get_index(name) else {
+                return Ok(None);
+            };
+            match schema.columns[idx].1 {
+                ColumnType::String | ColumnType::StringDict => col_indices.push(idx),
+                _ => return Ok(None),
+            }
+        }
+
+        let total_active = footer.total_active_rows() as usize;
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for FTS mmap read"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        let mut doc_ids: Vec<u32> = Vec::with_capacity(total_active);
+        let mut columns: Vec<(String, ColumnData)> = column_names
+            .iter()
+            .map(|name| (name.clone(), ColumnData::new(ColumnType::String)))
+            .collect();
+
+        for (rg_idx, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 || rg_meta.active_rows() == 0 {
+                continue;
+            }
+
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return Err(err_data("RG extends past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            if rg_bytes.len() < 32 {
+                return Ok(None);
+            }
+
+            let compress_flag = rg_bytes[28];
+            let encoding_version = rg_bytes[29];
+            if compress_flag != RG_COMPRESS_NONE
+                || encoding_version < 1
+                || rg_idx >= footer.col_offsets.len()
+                || footer.col_offsets[rg_idx].is_empty()
+            {
+                return Ok(None);
+            }
+
+            let body = &rg_bytes[32..];
+            let id_byte_len = rg_rows * 8;
+            let del_vec_len = (rg_rows + 7) / 8;
+            if id_byte_len + del_vec_len > body.len() {
+                return Err(err_data("RG body truncated"));
+            }
+
+            let has_deletes = rg_meta.deletion_count > 0;
+            let del_bytes = &body[id_byte_len..id_byte_len + del_vec_len];
+            let active_indices: Option<Vec<usize>> = if has_deletes {
+                Some(
+                    (0..rg_rows)
+                        .filter(|&i| (del_bytes[i / 8] >> (i % 8)) & 1 == 0)
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            let active_len = active_indices.as_ref().map(|v| v.len()).unwrap_or(rg_rows);
+
+            if let Some(indices) = active_indices.as_ref() {
+                let ids = bytes_as_u64_slice(&body[..id_byte_len], rg_rows);
+                doc_ids.extend(indices.iter().map(|&i| ids[i] as u32));
+            } else if rg_meta.max_id == rg_meta.min_id + rg_rows as u64 - 1 {
+                doc_ids.extend((0..rg_rows).map(|i| (rg_meta.min_id + i as u64) as u32));
+            } else {
+                let ids = bytes_as_u64_slice(&body[..id_byte_len], rg_rows);
+                doc_ids.extend(ids.iter().map(|&id| id as u32));
+            }
+
+            let rg_col_offsets = &footer.col_offsets[rg_idx];
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            for (out_pos, &col_idx) in col_indices.iter().enumerate() {
+                let Some(&col_start_u32) = rg_col_offsets.get(col_idx) else {
+                    let default_col = Self::create_default_column(ColumnType::String, active_len);
+                    columns[out_pos].1.append(&default_col);
+                    continue;
+                };
+                let col_start = col_start_u32 as usize;
+                if col_start + null_bitmap_len > body.len() {
+                    return Err(err_data("RG column null bitmap truncated"));
+                }
+                let null_bytes = &body[col_start..col_start + null_bitmap_len];
+                let data_start = col_start + null_bitmap_len;
+                if data_start > body.len() {
+                    return Err(err_data("RG column data truncated"));
+                }
+
+                let col_type = schema.columns[col_idx].1;
+                let (col_data, _) = read_column_encoded(&body[data_start..], col_type)?;
+                let mut col_data = if matches!(col_data, ColumnData::StringDict { .. }) {
+                    col_data.decode_string_dict()
+                } else {
+                    col_data
+                };
+
+                if let Some(indices) = active_indices.as_ref() {
+                    col_data = col_data.filter_by_indices(indices);
+                    if null_bytes.iter().any(|&b| b != 0) {
+                        let mut active_nulls = vec![0u8; (indices.len() + 7) / 8];
+                        for (new_idx, &old_idx) in indices.iter().enumerate() {
+                            if (null_bytes[old_idx / 8] >> (old_idx % 8)) & 1 == 1 {
+                                active_nulls[new_idx / 8] |= 1 << (new_idx % 8);
+                            }
+                        }
+                        col_data.apply_null_bitmap(&active_nulls);
+                    }
+                } else if null_bytes.iter().any(|&b| b != 0) {
+                    col_data.apply_null_bitmap(null_bytes);
+                }
+
+                columns[out_pos].1.append(&col_data);
+            }
+        }
+
+        Ok(Some((doc_ids, columns)))
     }
 
     /// Read an active-row window from on-disk V4 Row Groups directly via mmap.
@@ -827,22 +1013,13 @@ impl OnDemandStorage {
                 }
                 ColumnData::FixedList { data, dim } => {
                     use arrow::array::{FixedSizeListArray, Float32Array};
-                    use arrow::buffer::Buffer;
                     let dim_usize = *dim as usize;
                     let row_count = if dim_usize == 0 { 0 } else { data.len() / (dim_usize * 4) }
                         .min(active_count);
                     let byte_len = row_count * dim_usize * 4;
-                    // Build Float32 values buffer — one copy from accumulated data
-                    let float_buf = Buffer::from_vec(data[..byte_len].to_vec());
-                    let float_arr = unsafe {
-                        Float32Array::from(arrow::array::ArrayData::new_unchecked(
-                            ArrowDataType::Float32,
-                            row_count * dim_usize,
-                            Some(0), None, 0,
-                            vec![float_buf],
-                            vec![],
-                        ))
-                    };
+                    let float_arr = Float32Array::from(
+                        crate::storage::on_demand::f32_le_bytes_to_values(&data[..byte_len]),
+                    );
                     let list_dt = ArrowDataType::FixedSizeList(
                         Arc::new(Field::new("item", ArrowDataType::Float32, false)),
                         dim_usize as i32,
@@ -857,26 +1034,15 @@ impl OnDemandStorage {
                 }
                 ColumnData::Float16List { data, dim } => {
                     use arrow::array::{FixedSizeListArray, Float32Array};
-                    use arrow::buffer::Buffer;
                     let dim_usize = *dim as usize;
                     let row_count = if dim_usize == 0 { 0 } else { data.len() / (dim_usize * 2) }
                         .min(active_count);
-                    // Decode f16 bytes to f32 bytes
-                    let mut f32_bytes: Vec<u8> = Vec::with_capacity(row_count * dim_usize * 4);
+                    let mut f32_values: Vec<f32> = Vec::with_capacity(row_count * dim_usize);
                     for chunk in data[..row_count * dim_usize * 2].chunks_exact(2) {
                         let bits = u16::from_le_bytes(chunk.try_into().unwrap());
-                        f32_bytes.extend_from_slice(&crate::storage::on_demand::f16_to_f32(bits).to_le_bytes());
+                        f32_values.push(crate::storage::on_demand::f16_to_f32(bits));
                     }
-                    let float_buf = Buffer::from_vec(f32_bytes);
-                    let float_arr = unsafe {
-                        Float32Array::from(arrow::array::ArrayData::new_unchecked(
-                            ArrowDataType::Float32,
-                            row_count * dim_usize,
-                            Some(0), None, 0,
-                            vec![float_buf],
-                            vec![],
-                        ))
-                    };
+                    let float_arr = Float32Array::from(f32_values);
                     let list_dt = ArrowDataType::FixedSizeList(
                         Arc::new(Field::new("item", ArrowDataType::Float32, false)),
                         dim_usize as i32,
@@ -3897,6 +4063,42 @@ impl OnDemandStorage {
                     }
                     global_row_offset += rg_rows;
                     continue;
+                } else if encoding == COL_ENCODING_BITPACK
+                    && is_int
+                    && col_bytes.len() >= enc_offset + 17
+                {
+                    let payload = &col_bytes[enc_offset..];
+                    let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                    let bit_width = payload[8] as usize;
+                    if bit_width < 64 {
+                        let min_val = i64::from_le_bytes(payload[9..17].try_into().unwrap());
+                        let packed_bytes = (count * bit_width + 7) / 8;
+                        if payload.len() >= 17 + packed_bytes {
+                            let packed = &payload[17..17 + packed_bytes];
+                            let n = count.min(rg_rows);
+                            let low_i = low.ceil() as i64;
+                            let high_i = high.floor() as i64;
+                            let no_nulls = !null_bytes.iter().any(|&b| b != 0);
+                            for i in 0..n {
+                                if matches.len() >= max_matches {
+                                    break;
+                                }
+                                if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                                    continue;
+                                }
+                                if !no_nulls && (null_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                                    continue;
+                                }
+                                if let Some(v) = bitpack_value_at(packed, bit_width, min_val, i) {
+                                    if v >= low_i && v <= high_i {
+                                        matches.push(global_row_offset + i);
+                                    }
+                                }
+                            }
+                            global_row_offset += rg_rows;
+                            continue;
+                        }
+                    }
                 }
             }
 
@@ -4295,10 +4497,19 @@ impl OnDemandStorage {
             let where_null = &body[where_col_off..where_col_off + null_bitmap_len];
             let where_col_bytes = &body[where_col_off + null_bitmap_len..];
 
-            // Decode WHERE column values (supports PLAIN, BITPACK, RLE)
-            let where_vals_int: Vec<i64>;
-            let where_vals_flt: Vec<f64>;
-            enum WhereVals<'a> { Int(&'a [i64]), Flt(&'a [f64]) }
+            // Decode WHERE column values (supports PLAIN, BITPACK, RLE).
+            // Keep PLAIN mmap data borrowed; copying an 8MB predicate column
+            // dominates idempotent UPDATEs on the OLTP benchmark.
+            use std::borrow::Cow;
+            enum WhereVals<'a> {
+                Int(Cow<'a, [i64]>),
+                Flt(Cow<'a, [f64]>),
+                BitPackI64 {
+                    packed: &'a [u8],
+                    bit_width: usize,
+                    min_val: i64,
+                },
+            }
             let where_vals: WhereVals<'_>;
             let n: usize;
 
@@ -4312,9 +4523,22 @@ impl OnDemandStorage {
                     let nn = count.min(rg_rows).min((payload.len() - 8) / 8);
                     let vals_cow = bytes_as_i64_slice(&payload[8..], nn);
                     n = nn;
-                    where_vals_int = vals_cow.into_owned();
-                    where_vals_flt = Vec::new();
-                    where_vals = WhereVals::Int(&where_vals_int[..nn]);
+                    where_vals = WhereVals::Int(vals_cow);
+                } else if enc == COL_ENCODING_BITPACK {
+                    let payload = &where_col_bytes[1..];
+                    if payload.len() < 17 { continue; }
+                    let count = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                    let bit_width = payload[8] as usize;
+                    if bit_width >= 64 { return Ok(None); }
+                    let min_val = i64::from_le_bytes(payload[9..17].try_into().unwrap());
+                    let packed_bytes = (count * bit_width + 7) / 8;
+                    if payload.len() < 17 + packed_bytes { return Ok(None); }
+                    n = count.min(rg_rows);
+                    where_vals = WhereVals::BitPackI64 {
+                        packed: &payload[17..17 + packed_bytes],
+                        bit_width,
+                        min_val,
+                    };
                 } else {
                     // Decode (BITPACK, RLE, etc.)
                     let (col_data, _) = read_column_encoded(where_col_bytes, where_type)?;
@@ -4322,9 +4546,7 @@ impl OnDemandStorage {
                         ColumnData::Int64(v) => {
                             let nn = v.len().min(rg_rows);
                             n = nn;
-                            where_vals_int = v;
-                            where_vals_flt = Vec::new();
-                            where_vals = WhereVals::Int(&where_vals_int[..nn]);
+                            where_vals = WhereVals::Int(Cow::Owned(v));
                         }
                         _ => continue,
                     }
@@ -4338,18 +4560,14 @@ impl OnDemandStorage {
                     let nn = count.min(rg_rows).min((payload.len() - 8) / 8);
                     let vals_cow = bytes_as_f64_slice(&payload[8..], nn);
                     n = nn;
-                    where_vals_flt = vals_cow.into_owned();
-                    where_vals_int = Vec::new();
-                    where_vals = WhereVals::Flt(&where_vals_flt[..nn]);
+                    where_vals = WhereVals::Flt(vals_cow);
                 } else {
                     let (col_data, _) = read_column_encoded(where_col_bytes, where_type)?;
                     match col_data {
                         ColumnData::Float64(v) => {
                             let nn = v.len().min(rg_rows);
                             n = nn;
-                            where_vals_flt = v;
-                            where_vals_int = Vec::new();
-                            where_vals = WhereVals::Flt(&where_vals_flt[..nn]);
+                            where_vals = WhereVals::Flt(Cow::Owned(v));
                         }
                         _ => continue,
                     }
@@ -4362,45 +4580,166 @@ impl OnDemandStorage {
             let set_data = &body[set_col_off + null_bitmap_len..];
             let set_enc = if encoding_version >= 1 && !set_data.is_empty() { set_data[0] } else { COL_ENCODING_PLAIN };
             if set_enc != COL_ENCODING_PLAIN { return Ok(None); }
+            if set_data.len() < 9 { return Ok(None); }
+            let set_count = u64::from_le_bytes(set_data[1..9].try_into().unwrap()) as usize;
+            if set_count < n || set_data.len() < 9 + n * 8 { return Ok(None); }
+            let set_values = &set_data[9..9 + n * 8];
 
             // File offset of SET column's value array:
             // rg_meta.offset (RG start) + 32 (RG header) + set_col_off + null_bitmap_len + 1 (enc byte) + 8 (count)
             let values_file_offset = (rg_meta.offset as usize + 32 + set_col_off + null_bitmap_len + 1 + 8) as u64;
 
-            // Read the current SET column values into a buffer, patch in memory, then bulk-write
-            // This replaces N individual write_at syscalls with 1 read + 1 write per RG.
-            use std::io::{Read, Seek, SeekFrom, Write};
-            let value_buf_len = n * 8;
-            let mut value_buf = vec![0u8; value_buf_len];
-            write_file.seek(SeekFrom::Start(values_file_offset))?;
-            write_file.read_exact(&mut value_buf)?;
-
+            // Lazily copy and rewrite the SET value array only when at least one
+            // matching row would physically change. Repeated idempotent UPDATEs
+            // still return the matched-row count without dirtying the file.
+            use std::io::{Seek, SeekFrom, Write};
+            let mut value_buf: Option<Vec<u8>> = None;
             let mut rg_updated = 0i64;
             match where_vals {
                 WhereVals::Int(vals) => {
-                    for i in 0..n {
-                        if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                        if (where_null[i/8] >> (i%8)) & 1 == 1 { continue; }
-                        if vals[i] >= low_i && vals[i] <= high_i {
-                            value_buf[i*8..i*8+8].copy_from_slice(new_value_bytes);
-                            rg_updated += 1;
+                    let no_nulls = !where_null.iter().any(|&b| b != 0);
+                    if !has_deletes && no_nulls {
+                        for i in 0..n {
+                            if vals[i] >= low_i && vals[i] <= high_i {
+                                let off = i * 8;
+                                if &set_values[off..off + 8] != new_value_bytes {
+                                    let buf = value_buf.get_or_insert_with(|| set_values.to_vec());
+                                    buf[off..off + 8].copy_from_slice(new_value_bytes);
+                                }
+                                rg_updated += 1;
+                            }
+                        }
+                    } else {
+                        for i in 0..n {
+                            if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            if !no_nulls && (where_null[i / 8] >> (i % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            if vals[i] >= low_i && vals[i] <= high_i {
+                                let off = i * 8;
+                                if &set_values[off..off + 8] != new_value_bytes {
+                                    let buf = value_buf.get_or_insert_with(|| set_values.to_vec());
+                                    buf[off..off + 8].copy_from_slice(new_value_bytes);
+                                }
+                                rg_updated += 1;
+                            }
                         }
                     }
                 }
                 WhereVals::Flt(vals) => {
-                    for i in 0..n {
-                        if has_deletes && (del_bytes[i/8] >> (i%8)) & 1 == 1 { continue; }
-                        if (where_null[i/8] >> (i%8)) & 1 == 1 { continue; }
-                        if vals[i] >= low && vals[i] <= high {
-                            value_buf[i*8..i*8+8].copy_from_slice(new_value_bytes);
-                            rg_updated += 1;
+                    let no_nulls = !where_null.iter().any(|&b| b != 0);
+                    if !has_deletes && no_nulls {
+                        for i in 0..n {
+                            if vals[i] >= low && vals[i] <= high {
+                                let off = i * 8;
+                                if &set_values[off..off + 8] != new_value_bytes {
+                                    let buf = value_buf.get_or_insert_with(|| set_values.to_vec());
+                                    buf[off..off + 8].copy_from_slice(new_value_bytes);
+                                }
+                                rg_updated += 1;
+                            }
+                        }
+                    } else {
+                        for i in 0..n {
+                            if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            if !no_nulls && (where_null[i / 8] >> (i % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            if vals[i] >= low && vals[i] <= high {
+                                let off = i * 8;
+                                if &set_values[off..off + 8] != new_value_bytes {
+                                    let buf = value_buf.get_or_insert_with(|| set_values.to_vec());
+                                    buf[off..off + 8].copy_from_slice(new_value_bytes);
+                                }
+                                rg_updated += 1;
+                            }
+                        }
+                    }
+                }
+                WhereVals::BitPackI64 { packed, bit_width, min_val } => {
+                    let mask = if bit_width == 0 { 0 } else { (1u64 << bit_width) - 1 };
+                    let no_nulls = !where_null.iter().any(|&b| b != 0);
+                    let handle_match =
+                        |i: usize, value_buf: &mut Option<Vec<u8>>, rg_updated: &mut i64| {
+                            let off = i * 8;
+                            if &set_values[off..off + 8] != new_value_bytes {
+                                let buf = value_buf.get_or_insert_with(|| set_values.to_vec());
+                                buf[off..off + 8].copy_from_slice(new_value_bytes);
+                            }
+                            *rg_updated += 1;
+                        };
+                    if bit_width == 0 {
+                        if min_val >= low_i && min_val <= high_i {
+                            if !has_deletes && no_nulls {
+                                for i in 0..n {
+                                    handle_match(i, &mut value_buf, &mut rg_updated);
+                                }
+                            } else {
+                                for i in 0..n {
+                                    if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                                        continue;
+                                    }
+                                    if !no_nulls && (where_null[i / 8] >> (i % 8)) & 1 == 1 {
+                                        continue;
+                                    }
+                                    handle_match(i, &mut value_buf, &mut rg_updated);
+                                }
+                            }
+                        }
+                    } else if !has_deletes && no_nulls {
+                        for i in 0..n {
+                            let bit_pos = i * bit_width;
+                            let byte_off = bit_pos / 8;
+                            let bit_shift = bit_pos % 8;
+                            let bytes_needed = (bit_shift + bit_width + 7) / 8;
+                            if byte_off + bytes_needed > packed.len() {
+                                continue;
+                            }
+                            let mut raw = 0u64;
+                            for j in 0..bytes_needed {
+                                raw |= (packed[byte_off + j] as u64) << (j * 8);
+                            }
+                            let v = min_val.wrapping_add(((raw >> bit_shift) & mask) as i64);
+                            if v >= low_i && v <= high_i {
+                                handle_match(i, &mut value_buf, &mut rg_updated);
+                            }
+                        }
+                    } else {
+                        for i in 0..n {
+                            if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            if !no_nulls && (where_null[i / 8] >> (i % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            let bit_pos = i * bit_width;
+                            let byte_off = bit_pos / 8;
+                            let bit_shift = bit_pos % 8;
+                            let bytes_needed = (bit_shift + bit_width + 7) / 8;
+                            if byte_off + bytes_needed > packed.len() {
+                                continue;
+                            }
+                            let mut raw = 0u64;
+                            for j in 0..bytes_needed {
+                                raw |= (packed[byte_off + j] as u64) << (j * 8);
+                            }
+                            let v = min_val.wrapping_add(((raw >> bit_shift) & mask) as i64);
+                            if v >= low_i && v <= high_i {
+                                handle_match(i, &mut value_buf, &mut rg_updated);
+                            }
                         }
                     }
                 }
             }
             if rg_updated > 0 {
-                write_file.seek(SeekFrom::Start(values_file_offset))?;
-                write_file.write_all(&value_buf)?;
+                if let Some(value_buf) = value_buf {
+                    write_file.seek(SeekFrom::Start(values_file_offset))?;
+                    write_file.write_all(&value_buf)?;
+                }
                 total_updated += rg_updated;
             }
         }
@@ -6384,16 +6723,8 @@ impl OnDemandStorage {
                             }
                         }
                         use arrow::array::{FixedSizeListArray, Float32Array};
-                        use arrow::buffer::Buffer;
                         use arrow::datatypes::Field as ArrowField;
-                        let float_buf = Buffer::from_vec(all_f32.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>());
-                        let float_arr = unsafe {
-                            Float32Array::from(arrow::array::ArrayData::new_unchecked(
-                                ArrowDataType::Float32,
-                                n_out * d, Some(0), None, 0,
-                                vec![float_buf], vec![],
-                            ))
-                        };
+                        let float_arr = Float32Array::from(all_f32);
                         let item_field = Arc::new(ArrowField::new("item", ArrowDataType::Float32, false));
                         let null_buf: Option<arrow::buffer::NullBuffer> = if null_bits.iter().any(|b| !b) {
                             Some(arrow::buffer::NullBuffer::from(null_bits.iter().map(|&b| b).collect::<Vec<bool>>()))
@@ -6431,18 +6762,487 @@ impl OnDemandStorage {
             .map(Some)
     }
 
+    pub(crate) fn extract_rows_by_indices_mmap_columns(
+        &self,
+        indices: &[usize],
+        col_refs: Option<&[&str]>,
+    ) -> io::Result<Option<MmapBatchColumns>> {
+        if indices.is_empty() {
+            return Ok(Some(MmapBatchColumns {
+                row_count: 0,
+                columns: Vec::new(),
+            }));
+        }
+
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_count = schema.column_count();
+
+        let include_id = col_refs
+            .map(|refs| refs.iter().any(|r| r.eq_ignore_ascii_case("_id")))
+            .unwrap_or(true);
+        let col_needed: Vec<bool> = if let Some(refs) = col_refs {
+            schema
+                .columns
+                .iter()
+                .map(|(name, _)| refs.iter().any(|r| r.eq_ignore_ascii_case(name)))
+                .collect()
+        } else {
+            vec![true; col_count]
+        };
+        if let Some(refs) = col_refs {
+            for requested in refs {
+                if !requested.eq_ignore_ascii_case("_id")
+                    && schema.get_index(requested).is_none()
+                {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let mut cumulative = 0usize;
+        let rg_bounds: Vec<(usize, usize)> = footer
+            .row_groups
+            .iter()
+            .map(|rg| {
+                let start = cumulative;
+                cumulative += rg.row_count as usize;
+                (start, cumulative)
+            })
+            .collect();
+
+        let n_rows = indices.len();
+        let mut rg_local_indices: Vec<Vec<(usize, usize)>> =
+            vec![Vec::new(); footer.row_groups.len()];
+        for (out_idx, &global_idx) in indices.iter().enumerate() {
+            let rg_i = rg_bounds.partition_point(|&(_, end)| end <= global_idx);
+            if rg_i < footer.row_groups.len() {
+                rg_local_indices[rg_i].push((out_idx, global_idx - rg_bounds[rg_i].0));
+            }
+        }
+
+        for (rg_i, local_pairs) in rg_local_indices.iter().enumerate() {
+            if local_pairs.is_empty() {
+                continue;
+            }
+            if rg_i >= footer.col_offsets.len() || footer.col_offsets[rg_i].len() < col_count {
+                return Ok(None);
+            }
+        }
+
+        enum ColBuf {
+            I64(Vec<Option<i64>>),
+            F64(Vec<Option<f64>>),
+            Str(Vec<Option<String>>),
+            Bool(Vec<Option<bool>>),
+            Bin(Vec<Option<Vec<u8>>>),
+        }
+
+        let mut found_mask = vec![false; n_rows];
+        let mut out_ids = vec![0i64; n_rows];
+        let mut col_bufs: Vec<ColBuf> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(ci, (_, ct))| {
+                if !col_needed[ci] {
+                    return ColBuf::I64(Vec::new());
+                }
+                match ct {
+                    ColumnType::Int64
+                    | ColumnType::Int8
+                    | ColumnType::Int16
+                    | ColumnType::Int32
+                    | ColumnType::UInt8
+                    | ColumnType::UInt16
+                    | ColumnType::UInt32
+                    | ColumnType::UInt64
+                    | ColumnType::Timestamp
+                    | ColumnType::Date => ColBuf::I64(vec![None; n_rows]),
+                    ColumnType::Float64 | ColumnType::Float32 => ColBuf::F64(vec![None; n_rows]),
+                    ColumnType::String | ColumnType::StringDict => {
+                        ColBuf::Str(vec![None; n_rows])
+                    }
+                    ColumnType::Bool => ColBuf::Bool(vec![None; n_rows]),
+                    ColumnType::Binary => ColBuf::Bin(vec![None; n_rows]),
+                    _ => ColBuf::Str(vec![None; n_rows]),
+                }
+            })
+            .collect();
+
+        let file_guard = self.file.read();
+        let file = match file_guard.as_ref() {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        for (rg_i, local_pairs) in rg_local_indices.iter().enumerate() {
+            if local_pairs.is_empty() {
+                continue;
+            }
+            let rg_meta = &footer.row_groups[rg_i];
+            let rg_rows = rg_meta.row_count as usize;
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return Err(err_not_conn("RG extends past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            if rg_bytes.len() < 32 {
+                return Ok(None);
+            }
+            let compress_flag = rg_bytes[28];
+            let encoding_version = rg_bytes[29];
+            if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
+                return Ok(None);
+            }
+
+            let body = &rg_bytes[32..];
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let ids_section_len = rg_rows * 8;
+            if ids_section_len + null_bitmap_len > body.len() {
+                return Ok(None);
+            }
+            let del_bytes = &body[ids_section_len..ids_section_len + null_bitmap_len];
+            let has_deletes = rg_meta.deletion_count > 0;
+            let rcix = &footer.col_offsets[rg_i];
+
+            let mut valid_pairs: Vec<(usize, usize)> = Vec::with_capacity(local_pairs.len());
+            for &(out_idx, local_idx) in local_pairs {
+                if local_idx >= rg_rows {
+                    continue;
+                }
+                if has_deletes && (del_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 {
+                    continue;
+                }
+                let id_off = local_idx * 8;
+                if id_off + 8 > ids_section_len {
+                    continue;
+                }
+                found_mask[out_idx] = true;
+                out_ids[out_idx] =
+                    u64::from_le_bytes(body[id_off..id_off + 8].try_into().unwrap()) as i64;
+                valid_pairs.push((out_idx, local_idx));
+            }
+            if valid_pairs.is_empty() {
+                continue;
+            }
+
+            for ci in 0..col_count {
+                if !col_needed[ci] {
+                    continue;
+                }
+                let ct = schema.columns[ci].1;
+                let col_off = rcix[ci] as usize;
+                if col_off + null_bitmap_len > body.len() {
+                    return Ok(None);
+                }
+                let null_bytes = &body[col_off..col_off + null_bitmap_len];
+                let col_bytes = &body[col_off + null_bitmap_len..];
+                if col_bytes.is_empty() {
+                    return Ok(None);
+                }
+                let encoding = col_bytes[0];
+                let data_bytes = &col_bytes[1..];
+
+                let extracted = match (encoding, ct, &mut col_bufs[ci]) {
+                    (
+                        COL_ENCODING_PLAIN,
+                        ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date,
+                        ColBuf::I64(vals),
+                    ) if data_bytes.len() >= 8 => {
+                        for &(out_idx, local_idx) in &valid_pairs {
+                            if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            let off = 8 + local_idx * 8;
+                            if off + 8 <= data_bytes.len() {
+                                vals[out_idx] = Some(i64::from_le_bytes(
+                                    data_bytes[off..off + 8].try_into().unwrap(),
+                                ));
+                            }
+                        }
+                        true
+                    }
+                    (
+                        COL_ENCODING_PLAIN,
+                        ColumnType::Float64 | ColumnType::Float32,
+                        ColBuf::F64(vals),
+                    ) if data_bytes.len() >= 8 => {
+                        for &(out_idx, local_idx) in &valid_pairs {
+                            if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            let off = 8 + local_idx * 8;
+                            if off + 8 <= data_bytes.len() {
+                                vals[out_idx] = Some(f64::from_le_bytes(
+                                    data_bytes[off..off + 8].try_into().unwrap(),
+                                ));
+                            }
+                        }
+                        true
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::String, ColBuf::Str(vals))
+                        if data_bytes.len() >= 8 =>
+                    {
+                        let count =
+                            u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+                        let data_len_off = 8 + (count + 1) * 4;
+                        if data_len_off + 8 > data_bytes.len() {
+                            return Ok(None);
+                        }
+                        let data_start = data_len_off + 8;
+                        for &(out_idx, local_idx) in &valid_pairs {
+                            if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1
+                                || local_idx >= count
+                            {
+                                continue;
+                            }
+                            let s_off = 8 + local_idx * 4;
+                            let e_off = s_off + 4;
+                            if e_off + 4 <= data_bytes.len() {
+                                let s = u32::from_le_bytes(
+                                    data_bytes[s_off..s_off + 4].try_into().unwrap(),
+                                ) as usize;
+                                let e = u32::from_le_bytes(
+                                    data_bytes[e_off..e_off + 4].try_into().unwrap(),
+                                ) as usize;
+                                if data_start + e <= data_bytes.len() {
+                                    vals[out_idx] = Some(
+                                        std::str::from_utf8(&data_bytes[data_start + s..data_start + e])
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        true
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::StringDict, ColBuf::Str(vals))
+                        if data_bytes.len() >= 16 =>
+                    {
+                        let row_count =
+                            u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+                        let dict_size =
+                            u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
+                        let indices_start = 16usize;
+                        let dict_off_start = indices_start + row_count * 4;
+                        let dict_data_len_off = dict_off_start + dict_size * 4;
+                        if dict_data_len_off + 8 > data_bytes.len() {
+                            return Ok(None);
+                        }
+                        let dict_data_len = u64::from_le_bytes(
+                            data_bytes[dict_data_len_off..dict_data_len_off + 8]
+                                .try_into()
+                                .unwrap(),
+                        ) as usize;
+                        let dict_data_start = dict_data_len_off + 8;
+                        for &(out_idx, local_idx) in &valid_pairs {
+                            if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1
+                                || local_idx >= row_count
+                            {
+                                continue;
+                            }
+                            let idx_off = indices_start + local_idx * 4;
+                            if idx_off + 4 > data_bytes.len() {
+                                continue;
+                            }
+                            let dict_idx =
+                                u32::from_le_bytes(data_bytes[idx_off..idx_off + 4].try_into().unwrap());
+                            if dict_idx == 0 {
+                                continue;
+                            }
+                            let di = (dict_idx - 1) as usize;
+                            if di >= dict_size {
+                                continue;
+                            }
+                            let ds_off = dict_off_start + di * 4;
+                            if ds_off + 4 > data_bytes.len() {
+                                continue;
+                            }
+                            let ds = u32::from_le_bytes(
+                                data_bytes[ds_off..ds_off + 4].try_into().unwrap(),
+                            ) as usize;
+                            let de = if di + 1 < dict_size {
+                                let de_off = ds_off + 4;
+                                if de_off + 4 <= data_bytes.len() {
+                                    u32::from_le_bytes(
+                                        data_bytes[de_off..de_off + 4].try_into().unwrap(),
+                                    ) as usize
+                                } else {
+                                    dict_data_len
+                                }
+                            } else {
+                                dict_data_len
+                            };
+                            if dict_data_start + de <= data_bytes.len() {
+                                vals[out_idx] = Some(
+                                    std::str::from_utf8(
+                                        &data_bytes[dict_data_start + ds..dict_data_start + de],
+                                    )
+                                    .unwrap_or("")
+                                    .to_string(),
+                                );
+                            }
+                        }
+                        true
+                    }
+                    (
+                        COL_ENCODING_BITPACK,
+                        ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date,
+                        ColBuf::I64(vals),
+                    ) => {
+                        for &(out_idx, local_idx) in &valid_pairs {
+                            if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            if let Some(v) = crate::storage::on_demand::bitpack_decode_at_idx(
+                                data_bytes,
+                                local_idx,
+                            ) {
+                                vals[out_idx] = Some(v);
+                            }
+                        }
+                        true
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::Bool, ColBuf::Bool(vals))
+                        if data_bytes.len() >= 8 =>
+                    {
+                        for &(out_idx, local_idx) in &valid_pairs {
+                            if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            let byte_off = 8 + local_idx / 8;
+                            if byte_off < data_bytes.len() {
+                                vals[out_idx] =
+                                    Some((data_bytes[byte_off] >> (local_idx % 8)) & 1 == 1);
+                            }
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if !extracted {
+                    return Ok(None);
+                }
+            }
+        }
+
+        drop(mmap_guard);
+        drop(file_guard);
+
+        let n_out = found_mask.iter().filter(|&&b| b).count();
+        if n_out == 0 {
+            return Ok(Some(MmapBatchColumns {
+                row_count: 0,
+                columns: Vec::new(),
+            }));
+        }
+
+        let mut columns = Vec::with_capacity(col_count + usize::from(include_id));
+        if include_id {
+            columns.push((
+                "_id".to_string(),
+                MmapBatchColumn::I64(
+                    (0..n_rows)
+                        .filter(|&i| found_mask[i])
+                        .map(|i| Some(out_ids[i]))
+                        .collect(),
+                ),
+            ));
+        }
+
+        for (ci, buf) in col_bufs.into_iter().enumerate() {
+            if !col_needed[ci] {
+                continue;
+            }
+            let name = schema.columns[ci].0.clone();
+            match buf {
+                ColBuf::I64(vals) => columns.push((
+                    name,
+                    MmapBatchColumn::I64(
+                        (0..n_rows)
+                            .filter(|&i| found_mask[i])
+                            .map(|i| vals[i])
+                            .collect(),
+                    ),
+                )),
+                ColBuf::F64(vals) => columns.push((
+                    name,
+                    MmapBatchColumn::F64(
+                        (0..n_rows)
+                            .filter(|&i| found_mask[i])
+                            .map(|i| vals[i])
+                            .collect(),
+                    ),
+                )),
+                ColBuf::Str(vals) => columns.push((
+                    name,
+                    MmapBatchColumn::Str(
+                        (0..n_rows)
+                            .filter(|&i| found_mask[i])
+                            .map(|i| vals[i].clone())
+                            .collect(),
+                    ),
+                )),
+                ColBuf::Bool(vals) => columns.push((
+                    name,
+                    MmapBatchColumn::Bool(
+                        (0..n_rows)
+                            .filter(|&i| found_mask[i])
+                            .map(|i| vals[i])
+                            .collect(),
+                    ),
+                )),
+                ColBuf::Bin(vals) => columns.push((
+                    name,
+                    MmapBatchColumn::Bin(
+                        (0..n_rows)
+                            .filter(|&i| found_mask[i])
+                            .map(|i| vals[i].clone())
+                            .collect(),
+                    ),
+                )),
+            }
+        }
+
+        Ok(Some(MmapBatchColumns {
+            row_count: n_out,
+            columns,
+        }))
+    }
+
     /// Batch retrieve multiple rows by IDs using one footer lock + one mmap body slice per RG.
     ///
     /// Compared to N × retrieve_rcix: eliminates N-1 footer lock acquisitions, N-1 RG linear
     /// scans, and all read_cached_bytes overhead (page cache lock + pread per small read).
     /// Returns None to fall back when RCIX is unavailable for any needed RG.
-    pub fn retrieve_many_mmap(&self, ids: &[u64]) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
-        use arrow::array::{ArrayRef, Int64Array, Float64Array, StringBuilder, BooleanArray, StringArray};
-        use arrow::datatypes::{Schema, Field, DataType as ArrowDataType};
-        use std::sync::Arc;
+    pub(crate) fn retrieve_many_mmap_columns(&self, ids: &[u64]) -> io::Result<Option<MmapBatchColumns>> {
 
         if ids.is_empty() {
-            return Ok(Some(arrow::record_batch::RecordBatch::new_empty(Arc::new(Schema::empty()))));
+            return Ok(Some(MmapBatchColumns { row_count: 0, columns: Vec::new() }));
         }
 
         let footer = match self.get_or_load_footer()? {
@@ -6764,57 +7564,83 @@ impl OnDemandStorage {
         drop(mmap_guard);
         drop(file_guard);
 
-        // ── Step 4: Build Arrow RecordBatch in input-ID order ─────────────────
+        // ── Step 4: Build native column buffers in input-ID order ─────────────
         let n_out: usize = found_mask.iter().filter(|&&b| b).count();
         if n_out == 0 {
-            return Ok(Some(arrow::record_batch::RecordBatch::new_empty(Arc::new(Schema::empty()))));
+            return Ok(Some(MmapBatchColumns { row_count: 0, columns: Vec::new() }));
         }
 
-        let mut fields: Vec<Field> = Vec::with_capacity(col_count + 1);
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_count + 1);
+        let mut columns: Vec<(String, MmapBatchColumn)> = Vec::with_capacity(col_count + 1);
 
         // _id column
         let id_vals: Vec<i64> = (0..n_ids).filter(|&i| found_mask[i]).map(|i| out_ids[i]).collect();
-        fields.push(Field::new("_id", ArrowDataType::Int64, false));
-        arrays.push(Arc::new(Int64Array::from(id_vals)));
+        columns.push(("_id".to_string(), MmapBatchColumn::I64(id_vals.into_iter().map(Some).collect())));
 
         for (ci, buf) in col_bufs.into_iter().enumerate() {
             let col_name = &schema.columns[ci].0;
             match buf {
                 ColBuf::I64(vals) => {
                     let v: Vec<Option<i64>> = (0..n_ids).filter(|&i| found_mask[i]).map(|i| vals[i]).collect();
-                    fields.push(Field::new(col_name, ArrowDataType::Int64, true));
-                    arrays.push(Arc::new(Int64Array::from(v)));
+                    columns.push((col_name.clone(), MmapBatchColumn::I64(v)));
                 }
                 ColBuf::F64(vals) => {
                     let v: Vec<Option<f64>> = (0..n_ids).filter(|&i| found_mask[i]).map(|i| vals[i]).collect();
-                    fields.push(Field::new(col_name, ArrowDataType::Float64, true));
-                    arrays.push(Arc::new(Float64Array::from(v)));
+                    columns.push((col_name.clone(), MmapBatchColumn::F64(v)));
                 }
                 ColBuf::Str(vals) => {
-                    let mut b = StringBuilder::with_capacity(n_out, n_out * 10);
-                    for i in 0..n_ids {
-                        if found_mask[i] {
-                            match &vals[i] {
-                                Some(s) => b.append_value(s),
-                                None => b.append_null(),
-                            }
-                        }
-                    }
-                    fields.push(Field::new(col_name, ArrowDataType::Utf8, true));
-                    arrays.push(Arc::new(b.finish()) as ArrayRef);
+                    let v: Vec<Option<String>> = (0..n_ids).filter(|&i| found_mask[i]).map(|i| vals[i].clone()).collect();
+                    columns.push((col_name.clone(), MmapBatchColumn::Str(v)));
                 }
                 ColBuf::Bool(vals) => {
                     let v: Vec<Option<bool>> = (0..n_ids).filter(|&i| found_mask[i]).map(|i| vals[i]).collect();
-                    let arr: BooleanArray = v.into_iter().collect();
-                    fields.push(Field::new(col_name, ArrowDataType::Boolean, true));
-                    arrays.push(Arc::new(arr));
+                    columns.push((col_name.clone(), MmapBatchColumn::Bool(v)));
                 }
                 ColBuf::Bin(vals) => {
-                    use arrow::array::BinaryArray;
                     let v: Vec<Option<Vec<u8>>> = (0..n_ids).filter(|&i| found_mask[i]).map(|i| vals[i].clone()).collect();
-                    let bin_data: Vec<Option<&[u8]>> = v.iter().map(|o| o.as_deref()).collect();
-                    fields.push(Field::new(col_name, ArrowDataType::Binary, true));
+                    columns.push((col_name.clone(), MmapBatchColumn::Bin(v)));
+                }
+            }
+        }
+
+        Ok(Some(MmapBatchColumns { row_count: n_out, columns }))
+    }
+
+    pub fn retrieve_many_mmap(&self, ids: &[u64]) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
+        use arrow::array::{ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use std::sync::Arc;
+
+        let Some(batch_cols) = self.retrieve_many_mmap_columns(ids)? else {
+            return Ok(None);
+        };
+        if batch_cols.row_count == 0 {
+            return Ok(Some(arrow::record_batch::RecordBatch::new_empty(Arc::new(Schema::empty()))));
+        }
+
+        let mut fields: Vec<Field> = Vec::with_capacity(batch_cols.columns.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(batch_cols.columns.len());
+        for (name, col) in batch_cols.columns {
+            match col {
+                MmapBatchColumn::I64(vals) => {
+                    fields.push(Field::new(&name, ArrowDataType::Int64, true));
+                    arrays.push(Arc::new(Int64Array::from(vals)) as ArrayRef);
+                }
+                MmapBatchColumn::F64(vals) => {
+                    fields.push(Field::new(&name, ArrowDataType::Float64, true));
+                    arrays.push(Arc::new(Float64Array::from(vals)) as ArrayRef);
+                }
+                MmapBatchColumn::Str(vals) => {
+                    fields.push(Field::new(&name, ArrowDataType::Utf8, true));
+                    arrays.push(Arc::new(StringArray::from(vals)) as ArrayRef);
+                }
+                MmapBatchColumn::Bool(vals) => {
+                    let arr: BooleanArray = vals.into_iter().collect();
+                    fields.push(Field::new(&name, ArrowDataType::Boolean, true));
+                    arrays.push(Arc::new(arr) as ArrayRef);
+                }
+                MmapBatchColumn::Bin(vals) => {
+                    let bin_data: Vec<Option<&[u8]>> = vals.iter().map(|o| o.as_deref()).collect();
+                    fields.push(Field::new(&name, ArrowDataType::Binary, true));
                     arrays.push(Arc::new(BinaryArray::from(bin_data)) as ArrayRef);
                 }
             }

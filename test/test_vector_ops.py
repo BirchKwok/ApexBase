@@ -878,6 +878,15 @@ def test_topk_distance_python_cosine_metric(client):
     assert _topk_name(client, rows[0]["_id"]) == "unit_x"
 
 
+def test_topk_distance_python_dot_metric(client):
+    """dot topk uses negative inner product so max dot sorts first."""
+    _load_topk_vecs(client)
+    rows = client.topk_distance("vec", [1.0, 0.0, 0.0], k=2, metric="dot").to_dict()
+    names = {_topk_name(client, r["_id"]) for r in rows}
+    assert names == {"unit_x", "diag"}
+    assert [r["dist"] for r in rows] == pytest.approx([-1.0, -1.0], abs=1e-5)
+
+
 def test_topk_distance_python_l1_metric(client):
     """topk_distance with l1 metric: origin nearest (dist=0), diag farthest (dist=3)."""
     _load_topk_vecs(client)
@@ -1411,6 +1420,60 @@ def test_f16_sql_cosine_similarity(f16_client):
     assert rows[1]["sim"] == pytest.approx(0.0, abs=2e-3)
 
 
+def test_f16_sql_cosine_distance_accepts_python_lists(tmp_path):
+    """FLOAT16_VECTOR SQL distance should not panic when rows are inserted as Python lists."""
+    c = ApexClient(dirpath=str(tmp_path), drop_if_exists=True)
+    c.execute("CREATE TABLE f16docs (name TEXT, vec FLOAT16_VECTOR)")
+    c.use_table("f16docs")
+    c.store([
+        {"name": "near", "vec": [0.10, 0.82, 0.20]},
+        {"name": "far", "vec": [0.80, 0.10, 0.10]},
+    ])
+
+    rows = c.execute(
+        "SELECT name, cosine_distance(vec, [0.12, 0.78, 0.25]) AS dist "
+        "FROM f16docs ORDER BY dist"
+    ).to_dict()
+
+    assert rows[0]["name"] == "near"
+    c.close()
+
+
+def test_f16_sql_cosine_distance_accepts_single_python_list(tmp_path):
+    """A single dict store() should encode Python lists correctly for FLOAT16_VECTOR columns."""
+    c = ApexClient(dirpath=str(tmp_path), drop_if_exists=True)
+    c.execute("CREATE TABLE f16docs (name TEXT, vec FLOAT16_VECTOR)")
+    c.use_table("f16docs")
+    c.store({"name": "only", "vec": [0.10, 0.82, 0.20]})
+
+    rows = c.execute(
+        "SELECT name, cosine_distance(vec, [0.10, 0.82, 0.20]) AS dist "
+        "FROM f16docs"
+    ).to_dict()
+
+    assert len(rows) == 1
+    assert rows[0]["name"] == "only"
+    assert rows[0]["dist"] == pytest.approx(0.0, abs=2e-3)
+    c.close()
+
+
+def test_f16_single_python_list_can_be_first_field(tmp_path):
+    """Vector-first single dicts should not be misclassified as columnar input."""
+    c = ApexClient(dirpath=str(tmp_path), drop_if_exists=True)
+    c.execute("CREATE TABLE f16docs (vec FLOAT16_VECTOR, name TEXT)")
+    c.use_table("f16docs")
+    c.store({"vec": [0.10, 0.82, 0.20], "name": "vector-first"})
+
+    rows = c.execute(
+        "SELECT name, cosine_distance(vec, [0.10, 0.82, 0.20]) AS dist "
+        "FROM f16docs"
+    ).to_dict()
+
+    assert rows[0]["name"] == "vector-first"
+    assert rows[0]["dist"] == pytest.approx(0.0, abs=2e-3)
+    c.close()
+
+
 def test_f16_sql_l1_l2_linf(f16_client):
     """l1_distance / array_distance / linf_distance all work on FLOAT16_VECTOR."""
     f16_client.store([
@@ -1501,13 +1564,10 @@ def test_f16_batch_topk_consistent_with_single(f16_client):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_f16_store_python_list(f16_client):
-    """FLOAT16_VECTOR column: Python list input is auto-converted via numpy before storing."""
-    # Python lists must be wrapped as numpy float32 arrays for FLOAT16_VECTOR columns;
-    # raw Python lists are encoded as f32 Binary by the client and will not interoperate
-    # with the f16 topk path.  The recommended form is np.array([...], dtype=np.float32).
+    """FLOAT16_VECTOR column accepts raw Python list input."""
     f16_client.store([
-        {"name": "a", "vec": np.array([1.0, 0.0, 0.0], dtype=np.float32)},
-        {"name": "b", "vec": np.array([0.0, 1.0, 0.0], dtype=np.float32)},
+        {"name": "a", "vec": [1.0, 0.0, 0.0]},
+        {"name": "b", "vec": [0.0, 1.0, 0.0]},
     ])
     result = f16_client.execute("SELECT COUNT(*) FROM f16vecs").to_dict()
     assert result[0]["COUNT(*)"] == 2

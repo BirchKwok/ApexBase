@@ -26,6 +26,7 @@ python -m mkdocs serve
 | --- | --- |
 | [Python API Reference](API_REFERENCE.md) | Python users who need exact method signatures |
 | [Rust Embedded API](RUST_EMBEDDED_API.md) | Rust users embedding ApexBase directly |
+| [Performance](performance.md) | Users comparing ApexBase against SQLite, DuckDB, and vector workloads |
 | [Usage Examples](EXAMPLES.md) | Users looking for task-oriented snippets |
 | [Full-Text Search Guide](FTS_GUIDE.md) | Users building text search workflows |
 | [Float16 Vector Guide](FLOAT16_VECTOR_GUIDE.md) | Users storing and querying embeddings |

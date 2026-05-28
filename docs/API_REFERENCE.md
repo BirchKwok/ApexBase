@@ -1363,7 +1363,7 @@ ApexBase has a built-in vector similarity search engine implemented entirely in 
 
 ### Vector column storage
 
-Vectors are stored as **FixedList** columns when inserted as numpy arrays (recommended) or as **Binary** columns when inserted as Python lists or tuples.
+Vectors are stored as **FixedList** columns when inserted as numpy arrays or numeric Python lists/tuples. For embedding-heavy tables, declare the column as `FLOAT16_VECTOR` to store half-precision values while keeping the same SQL distance functions.
 
 ```python
 import numpy as np
@@ -1372,13 +1372,13 @@ from apexbase import ApexClient
 client = ApexClient("./vecdb")
 client.create_table("items")
 
-# numpy arrays → FixedList column (optimal, zero-copy mmap scan)
+# numpy arrays → FixedList column
 client.store({
     "label": ["a", "b", "c"],
     "vec":   [np.random.rand(128).astype(np.float32) for _ in range(3)],
 })
 
-# Python list/tuple → Binary column (also supported)
+# Python list/tuple vectors are also accepted
 client.store({"label": "d", "vec": [0.1, 0.2, 0.3]})
 ```
 
@@ -1398,7 +1398,7 @@ Accepted type name aliases: `FLOAT16_VECTOR`, `FLOAT16VECTOR`, `F16_VECTOR`.
 
 #### Inserting float16 vectors
 
-Use a **batch store** (two or more records in one call) for optimal encoding.  Pass vectors as `numpy` arrays — any numeric dtype is accepted; the storage layer converts to float16 automatically.
+Use batch store for best throughput. Pass vectors as `numpy` arrays or numeric Python lists — any numeric dtype is accepted; the storage layer converts to float16 automatically.
 
 ```python
 import numpy as np
@@ -1412,17 +1412,13 @@ client.use_table("embeddings")
 vecs = np.random.rand(1000, 128).astype(np.float32)
 client.store([{"label": str(i), "vec": vecs[i]} for i in range(len(vecs))])
 
+# Python lists also work, including single-record writes
+client.store({"label": "queryable", "vec": [0.1, 0.2, 0.3, 0.4]})
+
 # float16 source data — stored directly
 vecs_f16 = vecs.astype(np.float16)
 client.store([{"label": str(i), "vec": vecs_f16[i]} for i in range(len(vecs_f16))])
 ```
-
-> **Note:** Always use batch store (`len(data) > 1`) for `FLOAT16_VECTOR` columns.  The single-record path converts vectors to float32 bytes before storage, which will produce incorrect distances on float16 columns.  Batch the writes or use the columnar dict API:
->
-> ```python
-> # Columnar dict — also correct and fastest
-> client.store({"label": [str(i) for i in range(n)], "vec": [vecs[i] for i in range(n)]})
-> ```
 
 #### Querying float16 vectors
 

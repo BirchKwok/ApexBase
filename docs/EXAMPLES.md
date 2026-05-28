@@ -1017,7 +1017,7 @@ client.store({
 # Single record
 client.store({"label": "query_item", "vec": np.array([0.1] * D, dtype=np.float32)})
 
-# Python list/tuple vectors also work (stored as Binary column)
+# Python list/tuple vectors also work
 client.store({"label": "list_item", "vec": [0.1, 0.2, 0.3]})
 ```
 

@@ -329,6 +329,9 @@ impl ApexExecutor {
                 options,
                 ..
             }) => {
+                if let Some(count_batch) = Self::try_fast_json_count_table_function(&stmt, func, file)? {
+                    return Ok(ApexResult::Data(count_batch));
+                }
                 let mut opts = options.clone();
                 if let Some(ref wc) = stmt.where_clause {
                     if let Some(pushdown) = Self::try_extract_filter_for_pushdown(wc) {
@@ -454,6 +457,11 @@ impl ApexExecutor {
                         {
                             if let Some(result) =
                                 Self::try_fast_filtered_string_agg(&backend, &stmt)?
+                            {
+                                return Ok(result);
+                            }
+                            if let Some(result) =
+                                Self::try_fast_filtered_numeric_agg(&backend, &stmt)?
                             {
                                 return Ok(result);
                             }
@@ -1635,6 +1643,20 @@ impl ApexExecutor {
             .map(|cols| cols.iter().map(|s| s.as_str()).collect());
 
         let result = if let Some(lim) = limit {
+            if backend.is_mmap_only()
+                && stmt.offset.unwrap_or(0) == 0
+                && !backend.has_delta()
+                && !backend.has_pending_deltas()
+            {
+                let indices =
+                    match backend.scan_string_filter_mmap(&col_name, &filter_value, Some(lim))? {
+                        Some(v) => v,
+                        None => return Ok(None),
+                    };
+                return Ok(Some(Self::read_matching_rows_adaptive(
+                    backend, stmt, &indices,
+                )?));
+            }
             if backend.pending_delta_updates_column(&col_name) || backend.has_delta() {
                 let full = backend.read_columns_filtered_string_to_arrow(
                     col_refs.as_deref(),
@@ -2268,6 +2290,71 @@ impl ApexExecutor {
         None
     }
 
+    fn count_star_output_name_for_table_fn(stmt: &SelectStatement) -> Option<String> {
+        if stmt.columns.len() != 1
+            || !stmt.group_by.is_empty()
+            || stmt.having.is_some()
+            || !stmt.joins.is_empty()
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+        {
+            return None;
+        }
+
+        match &stmt.columns[0] {
+            SelectColumn::Aggregate {
+                func,
+                column,
+                distinct,
+                alias,
+            } if matches!(func, AggregateFunc::Count) && !distinct => {
+                let column_ok = column
+                    .as_ref()
+                    .map(|c| {
+                        c == "*"
+                            || c.chars()
+                                .next()
+                                .map(|ch| ch.is_ascii_digit())
+                                .unwrap_or(false)
+                    })
+                    .unwrap_or(true);
+                if column_ok {
+                    Some(alias.clone().unwrap_or_else(|| "COUNT(*)".to_string()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn try_fast_json_count_table_function(
+        stmt: &SelectStatement,
+        func: &str,
+        file: &str,
+    ) -> io::Result<Option<RecordBatch>> {
+        if !func.eq_ignore_ascii_case("READ_JSON") {
+            return Ok(None);
+        }
+        let Some(output_name) = Self::count_star_output_name_for_table_fn(stmt) else {
+            return Ok(None);
+        };
+        let Some(count) = Self::try_fast_json_count(file, stmt.where_clause.as_ref())? else {
+            return Ok(None);
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            &output_name,
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
+        RecordBatch::try_new(schema, vec![array])
+            .map(Some)
+            .map_err(|e| err_data(e.to_string()))
+    }
+
     /// V4 FAST PATH: Simple aggregation (no GROUP BY, no WHERE)
     /// Handles: SELECT COUNT(*), AVG(col), SUM(col), MIN(col), MAX(col) FROM table
     fn try_fast_simple_agg(
@@ -2415,7 +2502,8 @@ impl ApexExecutor {
     ) -> io::Result<Option<ApexResult>> {
         use crate::query::AggregateFunc;
 
-        if !backend.is_mmap_only() || backend.has_pending_deltas() || backend.has_delta() {
+        if backend.pending_v4_in_memory_rows() > 0 || backend.has_pending_deltas() || backend.has_delta()
+        {
             return Ok(None);
         }
 
@@ -2472,11 +2560,14 @@ impl ApexExecutor {
 
         // Single-pass: scan string filter + aggregate in one sequential pass
         use std::collections::HashMap;
-        let agg_results =
-            match backend.execute_filtered_string_agg_mmap(&filter_col, &filter_val, &col_refs)? {
-                Some(r) => r,
-                None => return Ok(None),
-            };
+        let agg_results = match backend.execute_filtered_string_agg_mmap(
+            &filter_col,
+            &filter_val,
+            &col_refs,
+        )? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
 
         // Build stat lookup: column name -> (count, sum, min, max, is_int)
         let mut stat_map: HashMap<&str, (i64, f64, f64, f64, bool)> = HashMap::new();
@@ -2489,6 +2580,226 @@ impl ApexExecutor {
         let match_count = stat_map.get("*").map(|s| s.0).unwrap_or(0);
 
         // Build result
+        let mut fields: Vec<Field> = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate {
+                func,
+                column,
+                alias,
+                ..
+            } = col
+            {
+                let fn_name = match func {
+                    AggregateFunc::Count => "COUNT",
+                    AggregateFunc::Sum => "SUM",
+                    AggregateFunc::Avg => "AVG",
+                    AggregateFunc::Min => "MIN",
+                    AggregateFunc::Max => "MAX",
+                };
+                let output_name = alias.clone().unwrap_or_else(|| {
+                    if let Some(c) = column {
+                        format!("{}({})", fn_name, c)
+                    } else {
+                        format!("{}(*)", fn_name)
+                    }
+                });
+
+                match func {
+                    AggregateFunc::Count => {
+                        let count = if let Some(col_name) = column {
+                            let is_count_star = col_name.as_str() == "*"
+                                || col_name
+                                    .chars()
+                                    .next()
+                                    .map(|c| c.is_ascii_digit())
+                                    .unwrap_or(false);
+                            if is_count_star {
+                                match_count
+                            } else {
+                                stat_map.get(col_name.as_str()).map(|s| s.0).unwrap_or(0)
+                            }
+                        } else {
+                            match_count
+                        };
+                        fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
+                        arrays.push(Arc::new(Int64Array::from(vec![count])));
+                    }
+                    AggregateFunc::Sum
+                    | AggregateFunc::Avg
+                    | AggregateFunc::Min
+                    | AggregateFunc::Max => {
+                        let col_name = column.as_ref().unwrap();
+                        let (count, sum, min_v, max_v, is_int) = stat_map
+                            .get(col_name.as_str())
+                            .copied()
+                            .unwrap_or((0, 0.0, 0.0, 0.0, false));
+
+                        match func {
+                            AggregateFunc::Sum => {
+                                if is_int {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Int64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Int64Array::from(vec![sum as i64])));
+                                } else {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Float64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Float64Array::from(vec![sum])));
+                                }
+                            }
+                            AggregateFunc::Avg => {
+                                let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+                                fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
+                                arrays.push(Arc::new(Float64Array::from(vec![avg])));
+                            }
+                            AggregateFunc::Min => {
+                                if count == 0 {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Float64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Float64Array::from(vec![None::<f64>])));
+                                } else if is_int {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Int64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Int64Array::from(vec![min_v as i64])));
+                                } else {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Float64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Float64Array::from(vec![min_v])));
+                                }
+                            }
+                            AggregateFunc::Max => {
+                                if count == 0 {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Float64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Float64Array::from(vec![None::<f64>])));
+                                } else if is_int {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Int64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Int64Array::from(vec![max_v as i64])));
+                                } else {
+                                    fields.push(Field::new(
+                                        &output_name,
+                                        ArrowDataType::Float64,
+                                        true,
+                                    ));
+                                    arrays.push(Arc::new(Float64Array::from(vec![max_v])));
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+        }
+
+        if fields.is_empty() {
+            return Ok(None);
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let result = RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
+        Ok(Some(ApexResult::Data(result)))
+    }
+
+    /// V4 FAST PATH: Filtered aggregation with a numeric WHERE predicate.
+    /// Handles: SELECT COUNT(*), AVG(col), MAX(col) FROM table WHERE num_col > value
+    fn try_fast_filtered_numeric_agg(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::AggregateFunc;
+
+        if backend.pending_v4_in_memory_rows() > 0 || backend.has_pending_deltas() || backend.has_delta()
+        {
+            return Ok(None);
+        }
+
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        let (filter_col, low, high) = match Self::extract_any_numeric_range(where_clause) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let mut unique_cols: Vec<String> = Vec::new();
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate {
+                func,
+                column,
+                distinct,
+                ..
+            } = col
+            {
+                if *distinct {
+                    return Ok(None);
+                }
+                if let Some(col_name) = column {
+                    let is_count_star = matches!(func, AggregateFunc::Count)
+                        && (col_name.as_str() == "*"
+                            || col_name
+                                .chars()
+                                .next()
+                                .map(|c| c.is_ascii_digit())
+                                .unwrap_or(false));
+                    if is_count_star {
+                        if !unique_cols.iter().any(|c| c == "*") {
+                            unique_cols.push("*".to_string());
+                        }
+                    } else if !unique_cols.contains(col_name) {
+                        unique_cols.push(col_name.clone());
+                    }
+                } else if !matches!(func, AggregateFunc::Count) {
+                    return Ok(None);
+                } else if !unique_cols.iter().any(|c| c == "*") {
+                    unique_cols.push("*".to_string());
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+        if unique_cols.is_empty() {
+            return Ok(None);
+        }
+
+        let col_refs: Vec<&str> = unique_cols.iter().map(|s| s.as_str()).collect();
+        let agg_results =
+            match backend.execute_filtered_numeric_agg_mmap(&filter_col, low, high, &col_refs)? {
+                Some(r) => r,
+                None => return Ok(None),
+        };
+
+        use std::collections::HashMap;
+        let mut stat_map: HashMap<&str, (i64, f64, f64, f64, bool)> = HashMap::new();
+        for (i, &col_name) in col_refs.iter().enumerate() {
+            if i < agg_results.len() {
+                stat_map.insert(col_name, agg_results[i]);
+            }
+        }
+        let match_count = stat_map.get("*").map(|s| s.0).unwrap_or(0);
+
         let mut fields: Vec<Field> = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
 
@@ -4783,6 +5094,7 @@ impl ApexExecutor {
                         io::ErrorKind::Other,
                         format!("FTS not initialised for this database. Run CREATE FTS INDEX ON {} first.", table_name),
                     ))?;
+                crate::query::executor::wait_fts_backfill(base_dir, table_name);
                 let engine = mgr
                     .get_engine(table_name)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;

@@ -8,6 +8,14 @@ struct PushdownFilter {
     val_f64: f64,
 }
 
+#[derive(Clone)]
+struct JsonNumericFilter {
+    key: Vec<u8>,
+    op: BinaryOperator,
+    flipped: bool,
+    val_f64: f64,
+}
+
 fn parse_pushdown_filter(
     filter_str: &str,
     schema: &arrow::datatypes::Schema,
@@ -1469,6 +1477,7 @@ impl ApexExecutor {
             Ok(e) => e,
             Err(_) => return,
         };
+        crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
 
         // Determine string columns to index
         let schema = storage.get_schema();
@@ -1577,6 +1586,7 @@ impl ApexExecutor {
             Ok(e) => e,
             Err(_) => return,
         };
+        crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
 
         let ids: Vec<u64> = deleted_entries.iter().map(|(id, _)| *id).collect();
         let _ = engine.remove_documents(&ids);
@@ -4960,6 +4970,248 @@ impl ApexExecutor {
 
         let all: Vec<RecordBatch> = batches.into_iter().collect::<io::Result<Vec<_>>>()?;
         Self::merge_record_batches(all)
+    }
+
+    fn try_fast_json_count(
+        path: &str,
+        where_clause: Option<&SqlExpr>,
+    ) -> io::Result<Option<i64>> {
+        use rayon::prelude::*;
+
+        let file = std::fs::File::open(path).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Cannot open JSON file '{}': {}", path, e),
+            )
+        })?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mmap error: {}", e)))?;
+        let bytes: &[u8] = &mmap;
+
+        let start = bytes
+            .iter()
+            .position(|&b| !b.is_ascii_whitespace())
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !b.is_ascii_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(start);
+        let trimmed = &bytes[start..end];
+        if trimmed.is_empty() {
+            return Ok(Some(0));
+        }
+        if !Self::looks_like_ndjson(trimmed) {
+            return Ok(None);
+        }
+
+        let filter = match where_clause {
+            Some(expr) => Some(match Self::extract_json_numeric_filter(expr) {
+                Some(f) => f,
+                None => return Ok(None),
+            }),
+            None => None,
+        };
+
+        let n_threads = rayon::current_num_threads().min(16).max(1);
+        let mut starts: Vec<usize> = vec![0];
+        if n_threads > 1 {
+            let chunk = (trimmed.len() + n_threads - 1) / n_threads;
+            for t in 1..n_threads {
+                let approx = t * chunk;
+                if approx >= trimmed.len() {
+                    break;
+                }
+                let nl = memchr::memchr(b'\n', &trimmed[approx..])
+                    .map(|p| approx + p + 1)
+                    .unwrap_or(trimmed.len());
+                if nl != *starts.last().unwrap() {
+                    starts.push(nl);
+                }
+            }
+        }
+        starts.push(trimmed.len());
+
+        struct SendSlice(*const u8, usize);
+        unsafe impl Send for SendSlice {}
+        unsafe impl Sync for SendSlice {}
+
+        let chunks: Vec<SendSlice> = starts
+            .windows(2)
+            .map(|w| {
+                let s = &trimmed[w[0]..w[1]];
+                SendSlice(s.as_ptr(), s.len())
+            })
+            .collect();
+
+        let count: usize = chunks
+            .par_iter()
+            .map(|ss| {
+                let chunk = unsafe { std::slice::from_raw_parts(ss.0, ss.1) };
+                Self::count_json_chunk_rows(chunk, filter.as_ref())
+            })
+            .sum();
+        Ok(Some(count as i64))
+    }
+
+    fn looks_like_ndjson(bytes: &[u8]) -> bool {
+        let mut checked = 0usize;
+        let mut line_start = 0usize;
+        for nl in memchr::memchr_iter(b'\n', bytes).take(16) {
+            let raw = &bytes[line_start..nl];
+            line_start = nl + 1;
+            let line = Self::trim_ascii_json_line(raw);
+            if line.is_empty() {
+                continue;
+            }
+            if line.first() != Some(&b'{') || line.last() != Some(&b'}') {
+                return false;
+            }
+            checked += 1;
+            if checked >= 4 {
+                return true;
+            }
+        }
+        if checked == 0 && line_start < bytes.len() {
+            let line = Self::trim_ascii_json_line(&bytes[line_start..]);
+            checked = usize::from(
+                !line.is_empty() && line.first() == Some(&b'{') && line.last() == Some(&b'}'),
+            );
+        }
+        checked > 0 && memchr::memchr(b'\n', bytes).is_some()
+    }
+
+    #[inline(always)]
+    fn trim_ascii_json_line(mut line: &[u8]) -> &[u8] {
+        while line.first().is_some_and(|b| b.is_ascii_whitespace()) {
+            line = &line[1..];
+        }
+        while line.last().is_some_and(|b| b.is_ascii_whitespace()) {
+            line = &line[..line.len() - 1];
+        }
+        line
+    }
+
+    fn extract_json_numeric_filter(expr: &SqlExpr) -> Option<JsonNumericFilter> {
+        let SqlExpr::BinaryOp { left, op, right } = expr else {
+            return None;
+        };
+        let (col, val, flipped) = if let SqlExpr::Column(c) = left.as_ref() {
+            (c.as_str(), Self::literal_to_f64(right)?, false)
+        } else if let SqlExpr::Column(c) = right.as_ref() {
+            (c.as_str(), Self::literal_to_f64(left)?, true)
+        } else {
+            return None;
+        };
+        if !matches!(
+            op,
+            BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::Le
+                | BinaryOperator::Gt
+                | BinaryOperator::Ge
+        ) {
+            return None;
+        }
+        let col = col.trim_matches('"');
+        let col = col.rsplit('.').next().unwrap_or(col);
+        let mut key = Vec::with_capacity(col.len() + 2);
+        key.push(b'"');
+        key.extend_from_slice(col.as_bytes());
+        key.push(b'"');
+        Some(JsonNumericFilter {
+            key,
+            op: op.clone(),
+            flipped,
+            val_f64: val,
+        })
+    }
+
+    fn count_json_chunk_rows(data: &[u8], filter: Option<&JsonNumericFilter>) -> usize {
+        let mut count = 0usize;
+        let mut line_start = 0usize;
+        for nl in memchr::memchr_iter(b'\n', data) {
+            let line = Self::trim_ascii_json_line(&data[line_start..nl]);
+            line_start = nl + 1;
+            if Self::json_line_matches_filter(line, filter) {
+                count += 1;
+            }
+        }
+        if line_start < data.len() {
+            let line = Self::trim_ascii_json_line(&data[line_start..]);
+            if Self::json_line_matches_filter(line, filter) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[inline(always)]
+    fn json_line_matches_filter(line: &[u8], filter: Option<&JsonNumericFilter>) -> bool {
+        if line.is_empty() {
+            return false;
+        }
+        let Some(filter) = filter else {
+            return true;
+        };
+        let Some(value) = Self::json_line_numeric_value(line, &filter.key) else {
+            return false;
+        };
+        let (lhs, rhs) = if filter.flipped {
+            (filter.val_f64, value)
+        } else {
+            (value, filter.val_f64)
+        };
+        match filter.op {
+            BinaryOperator::Eq => lhs == rhs,
+            BinaryOperator::NotEq => lhs != rhs,
+            BinaryOperator::Lt => lhs < rhs,
+            BinaryOperator::Le => lhs <= rhs,
+            BinaryOperator::Gt => lhs > rhs,
+            BinaryOperator::Ge => lhs >= rhs,
+            _ => false,
+        }
+    }
+
+    fn json_line_numeric_value(line: &[u8], key: &[u8]) -> Option<f64> {
+        let mut search_from = 0usize;
+        while search_from < line.len() {
+            let pos = memchr::memmem::find(&line[search_from..], key)?;
+            let mut i = search_from + pos + key.len();
+            while i < line.len() && line[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= line.len() || line[i] != b':' {
+                search_from += pos + key.len();
+                continue;
+            }
+            i += 1;
+            while i < line.len() && line[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let quoted = i < line.len() && line[i] == b'"';
+            if quoted {
+                i += 1;
+            }
+            let mut end = i;
+            while end < line.len() {
+                let b = line[end];
+                if quoted {
+                    if b == b'"' {
+                        break;
+                    }
+                } else if b == b',' || b == b'}' || b == b']' || b.is_ascii_whitespace() {
+                    break;
+                }
+                end += 1;
+            }
+            if end > i {
+                return fast_float::parse::<f64, _>(&line[i..end]).ok();
+            }
+            return None;
+        }
+        None
     }
 
     /// Fast reader for pandas "columns" orientation: {"col": {"0": v, "1": v, ...}, ...}

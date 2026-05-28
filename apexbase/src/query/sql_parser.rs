@@ -665,9 +665,7 @@ impl SelectStatement {
                 } else {
                     name.as_str()
                 };
-                if actual_name != "_id" {
-                    columns.push(actual_name.to_string());
-                }
+                columns.push(actual_name.to_string());
             }
             SqlExpr::BinaryOp { left, right, .. } => {
                 Self::extract_columns_from_expr(left, columns);
@@ -689,9 +687,7 @@ impl SelectStatement {
                 } else {
                     column.as_str()
                 };
-                if actual_name != "_id" {
-                    columns.push(actual_name.to_string());
-                }
+                columns.push(actual_name.to_string());
             }
             SqlExpr::Case {
                 when_then,

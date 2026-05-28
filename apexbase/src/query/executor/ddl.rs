@@ -860,7 +860,7 @@ impl ApexExecutor {
         let _ = mgr.get_engine(table);
 
         // Back-fill existing rows into FTS index
-        let backfilled = Self::fts_backfill_table(base_dir, table, fields, &mgr).unwrap_or(0);
+        let backfilled = Self::fts_backfill_table(base_dir, table, fields, mgr.clone()).unwrap_or(0);
 
         let fields_desc = fields
             .map(|f| f.join(", "))
@@ -883,9 +883,29 @@ impl ApexExecutor {
         base_dir: &Path,
         table: &str,
         fields: Option<&[String]>,
-        mgr: &crate::fts::FtsManager,
+        mgr: std::sync::Arc<crate::fts::FtsManager>,
+    ) -> io::Result<usize> {
+        Self::fts_backfill_table_inner(base_dir, table, fields, mgr, true)
+    }
+
+    fn fts_backfill_table_sync(
+        base_dir: &Path,
+        table: &str,
+        fields: Option<&[String]>,
+        mgr: std::sync::Arc<crate::fts::FtsManager>,
+    ) -> io::Result<usize> {
+        Self::fts_backfill_table_inner(base_dir, table, fields, mgr, false)
+    }
+
+    fn fts_backfill_table_inner(
+        base_dir: &Path,
+        table: &str,
+        fields: Option<&[String]>,
+        mgr: std::sync::Arc<crate::fts::FtsManager>,
+        allow_async: bool,
     ) -> io::Result<usize> {
         use arrow::array::{Int64Array, StringArray, UInt64Array};
+        use arrow::compute;
 
         let table_path = base_dir.join(format!("{}.apex", table));
         if !table_path.exists() {
@@ -909,6 +929,70 @@ impl ApexExecutor {
 
         if string_cols.is_empty() {
             return Ok(0);
+        }
+
+        let estimated_count = storage.active_row_count() as usize;
+        if allow_async && estimated_count > 100_000 {
+            let base_dir = base_dir.to_path_buf();
+            let table_name = table.to_string();
+            let fields = fields.map(|f| f.to_vec());
+            let mgr = mgr.clone();
+            let handle = std::thread::spawn({
+                let base_dir = base_dir.clone();
+                let table_name = table_name.clone();
+                move || {
+                    let _ = Self::fts_backfill_table_sync(
+                        &base_dir,
+                        &table_name,
+                        fields.as_deref(),
+                        mgr,
+                    );
+                }
+            });
+            crate::query::executor::register_fts_backfill_task(&base_dir, &table_name, handle);
+            return Ok(estimated_count);
+        }
+
+        if let Some((doc_ids, column_data)) = storage.read_fts_string_columns_mmap(&string_cols)? {
+            if doc_ids.is_empty() || column_data.is_empty() {
+                return Ok(0);
+            }
+
+            let columns: Vec<(String, Vec<&str>)> = column_data
+                .iter()
+                .filter_map(|(col_name, data)| {
+                    if let crate::storage::on_demand::ColumnData::String { offsets, data } = data {
+                        let values = (0..doc_ids.len())
+                            .map(|row_idx| {
+                                if row_idx + 1 < offsets.len() {
+                                    let start = offsets[row_idx] as usize;
+                                    let end = offsets[row_idx + 1] as usize;
+                                    if end <= data.len() && start <= end {
+                                        // Storage writes valid UTF-8; skip repeat validation during FTS build.
+                                        unsafe { std::str::from_utf8_unchecked(&data[start..end]) }
+                                    } else {
+                                        ""
+                                    }
+                                } else {
+                                    ""
+                                }
+                            })
+                            .collect();
+                        Some((col_name.clone(), values))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !columns.is_empty() {
+                let count = doc_ids.len();
+                engine
+                    .add_documents_arrow_str(&doc_ids, columns)
+                    .map_err(|e| err_data(e.to_string()))?;
+                engine.flush_async().map_err(|e| err_data(e.to_string()))?;
+                return Ok(count);
+            }
         }
 
         // Read _id + string columns
@@ -936,31 +1020,53 @@ impl ApexExecutor {
             return Ok(0);
         };
 
-        // Build columnar data for FTS
-        let mut columns: Vec<(String, Vec<String>)> = Vec::new();
+        let mut string_arrays: Vec<(String, arrow::array::ArrayRef)> = Vec::new();
         for col_name in &string_cols {
             if let Some(col) = batch.column_by_name(col_name) {
-                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                    let vals: Vec<String> = (0..arr.len())
-                        .map(|i| if arr.is_null(i) { String::new() } else { arr.value(i).to_string() })
-                        .collect();
-                    columns.push((col_name.clone(), vals));
+                if col.as_any().downcast_ref::<StringArray>().is_some() {
+                    string_arrays.push((col_name.clone(), col.clone()));
+                } else if let Ok(casted) = compute::cast(col, &ArrowDataType::Utf8) {
+                    if casted.as_any().downcast_ref::<StringArray>().is_some() {
+                        string_arrays.push((col_name.clone(), casted));
+                    }
                 }
             }
         }
 
-        if columns.is_empty() {
+        if string_arrays.is_empty() {
             return Ok(0);
         }
 
+        let doc_ids: Vec<u32> = ids.iter().map(|id| *id as u32).collect();
+        let columns = string_arrays
+            .iter()
+            .map(|(col_name, col)| {
+                let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                let values = (0..ids.len())
+                    .map(|row_idx| {
+                        if row_idx < arr.len() && !arr.is_null(row_idx) {
+                            arr.value(row_idx)
+                        } else {
+                            ""
+                        }
+                    })
+                    .collect();
+                (col_name.clone(), values)
+            })
+            .collect();
+
         let count = ids.len();
-        engine.add_documents_columnar(ids, columns).map_err(|e| err_data(e.to_string()))?;
+        engine
+            .add_documents_arrow_str(&doc_ids, columns)
+            .map_err(|e| err_data(e.to_string()))?;
         engine.flush_async().map_err(|e| err_data(e.to_string()))?;
         Ok(count)
     }
 
     /// DROP FTS INDEX ON table — remove config entry and delete index files
     pub(super) fn execute_drop_fts_index(base_dir: &Path, table: &str) -> io::Result<ApexResult> {
+        crate::query::executor::wait_fts_backfill(base_dir, table);
+
         // Update config
         let mut cfg = Self::read_fts_config(base_dir);
         if let Some(obj) = cfg.as_object_mut() {
@@ -1028,7 +1134,7 @@ impl ApexExecutor {
         };
 
         // Back-fill all rows into FTS (safe to re-index already-indexed rows)
-        let backfilled = Self::fts_backfill_table(base_dir, table, fields.as_deref(), &mgr).unwrap_or(0);
+        let backfilled = Self::fts_backfill_table(base_dir, table, fields.as_deref(), mgr.clone()).unwrap_or(0);
 
         let msg = format!("FTS index enabled for '{}' ({} rows indexed)", table, backfilled);
         use arrow::array::StringArray;

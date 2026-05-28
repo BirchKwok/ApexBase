@@ -7,7 +7,6 @@ This module provides the ApexClient class that wraps ApexStorage with on-demand 
 import os
 import re
 import threading
-import time
 import queue
 import contextlib
 import ast
@@ -32,6 +31,7 @@ import struct
 
 # Null context manager for lock-free SELECT execution paths
 _NULL_CONTEXT = contextlib.nullcontext()
+_HOT_CACHE_MISS = object()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auto Scheduler - Initialize scheduler lazily for parallel query execution
@@ -145,6 +145,14 @@ _RE_SIMPLE_STRING_EQ = re.compile(
 _RE_SIMPLE_STRING_EQ_LIMIT = re.compile(
     r"\bwhere\s+([A-Za-z_][\w]*)\s*=\s*'([^']*)'\s+limit\s+(\d+)(?:\s+offset\s+(\d+))?\s*;?\s*$",
     re.IGNORECASE,
+)
+_RE_SIMPLE_NUMERIC_RANGE_LIMIT = re.compile(
+    r"^\s*select\s+\*\s+from\s+([A-Za-z_][\w]*)\s+where\s+([A-Za-z_][\w]*)\s*(=|>=|>|<=|<)\s*(-?\d+(?:\.\d+)?)\s+limit\s+(\d+)(?:\s+offset\s+(\d+))?\s*;?\s*$",
+    re.IGNORECASE,
+)
+_RE_SIMPLE_NUMERIC_FILTERED_AGG = re.compile(
+    r"^\s*select\s+(.+?)\s+from\s+([A-Za-z_][\w]*)\s+where\s+([A-Za-z_][\w]*)\s*(=|>=|>|<=|<)\s*(-?\d+(?:\.\d+)?)\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
 )
 _RE_SIMPLE_POINT_PARSE = re.compile(
     r"^\s*select\s+\*\s+from\s+([A-Za-z_][\w]*)\s+where\s+_id\s*=\s*(\d+)\s*;?\s*$",
@@ -355,8 +363,8 @@ class ApexClient:
         self._last_exact_replace_data = None
         self._last_exact_numeric_update = None
         self._last_exact_numeric_update_result = None
+        self._last_missing_delete_key = None
         self._simple_sql_cache = {}
-        self._select_result_cache = {}
         self._buffered_writes_enabled = False
         self._buffered_write_rows = []
         self._buffered_write_table = None
@@ -434,6 +442,12 @@ class ApexClient:
             return False
 
         return True
+
+    def _sync_fts_config_from_disk(self, initialize_current: bool = True) -> None:
+        """Refresh Python-side FTS state after SQL DDL updates fts_config.json."""
+        self._load_fts_config()
+        if initialize_current and self._current_table and self._is_fts_enabled(self._current_table):
+            self._ensure_fts_initialized(self._current_table)
     
     def _check_connection(self):
         if self._is_closed or self._storage is None:
@@ -444,7 +458,7 @@ class ApexClient:
         self._last_exact_replace_data = None
         self._last_exact_numeric_update = None
         self._last_exact_numeric_update_result = None
-        self._select_result_cache.clear()
+        self._last_missing_delete_key = None
 
     def _remember_exact_replace(self, id_: int, data: dict) -> None:
         self._last_exact_replace_key = (self._current_database, self._current_table, int(id_))
@@ -460,61 +474,12 @@ class ApexClient:
         )
         self._last_exact_numeric_update_result = updated
 
-    def _select_cache_key(self, sql: str, show_internal_id: bool) -> tuple:
-        return (
-            self._current_database,
-            self._current_table,
-            bool(show_internal_id),
-            sql,
-        )
-
-    def _can_use_select_result_cache(self) -> bool:
-        if getattr(self, '_in_txn', False) or getattr(self, '_fast_txn_active', False):
-            return False
-        if self._has_writes or self._buffered_write_rows:
-            return False
-        try:
-            if getattr(self._storage, "has_pending_overlay_writes", lambda: False)():
-                return False
-            if getattr(self._storage, "has_pending_memtable_rows", lambda: False)():
-                return False
-        except Exception:
-            return False
-        return True
-
-    def _get_cached_select_result(self, sql: str, show_internal_id: bool):
-        if not self._can_use_select_result_cache():
-            return None
-        return self._select_result_cache.get(self._select_cache_key(sql, show_internal_id))
-
-    def _maybe_cache_select_result(self, sql: str, show_internal_id: bool, columns_dict) -> None:
-        if not columns_dict or not sql.lstrip().upper().startswith('SELECT'):
-            return
-        if not self._can_use_select_result_cache():
-            return
-        row_count = len(next(iter(columns_dict.values()), []))
-        if row_count > 256 or len(columns_dict) > 8:
-            return
-        if len(self._select_result_cache) >= 64:
-            self._select_result_cache.clear()
-        cached = ResultView(lazy_pydict=columns_dict)
-        cached._show_internal_id = show_internal_id
-        self._select_result_cache[self._select_cache_key(sql, show_internal_id)] = cached.to_dict()
-
-    def _result_view_from_cached_rows(self, rows, show_internal_id: bool) -> 'ResultView':
-        rv = ResultView(data=rows)
-        rv._show_internal_id = show_internal_id
-        return rv
-
     def _result_view_from_columns_dict(
         self,
         sql: str,
         columns_dict,
         show_internal_id: bool,
-        cache_result: bool = False,
     ) -> 'ResultView':
-        if cache_result:
-            self._maybe_cache_select_result(sql, show_internal_id, columns_dict)
         rv = ResultView(lazy_pydict=columns_dict)
         rv._show_internal_id = show_internal_id
         return rv
@@ -604,6 +569,7 @@ class ApexClient:
             if self._current_table != table_name:
                 self._invalidate_replace_cache()
         self._current_table = table_name
+        self._sync_fts_config_from_disk()
 
     @property
     def current_table(self) -> str:
@@ -623,7 +589,6 @@ class ApexClient:
                     Example: {"name": "string", "age": "int64", "score": "float64"}
         """
         self._check_connection()
-        self._count_cache = None  # Invalidate: new table
         with self._lock:
             self._flush_pending_memtable_rows_for_read()
             self.flush_buffered_writes()
@@ -703,7 +668,6 @@ class ApexClient:
                         JSON (.json/.ndjson/.jsonl), and Parquet (.parquet).
         """
         self._check_connection()
-        self._count_cache = None  # temp table may shadow persistent
         with self._lock:
             self._flush_pending_memtable_rows_for_read()
             self.flush_buffered_writes()
@@ -712,7 +676,6 @@ class ApexClient:
     def drop_temp_table(self, name: str):
         """Drop a previously registered temporary table."""
         self._check_connection()
-        self._count_cache = None  # persistent table restored
         with self._lock:
             self._storage.drop_temp_table(name)
 
@@ -979,8 +942,6 @@ class ApexClient:
     def store(self, data) -> None:
         self._check_connection()
         self._ensure_table_selected()
-        self._count_cache = None  # Invalidate COUNT(*) cache on write
-
         # Acquire storage lock for thread-safe concurrent access (shared across all clients)
         storage_lock = getattr(self, '_storage_lock', None)
         if storage_lock is not None:
@@ -1087,11 +1048,7 @@ class ApexClient:
         with self._lock:
             # 1. Columnar data Dict[str, list/ndarray]
             if isinstance(data, dict):
-                first_value = next(iter(data.values()), None) if data else None
-                if first_value is not None and (
-                    isinstance(first_value, (list, tuple)) or 
-                    hasattr(first_value, '__len__') and hasattr(first_value, 'dtype')
-                ):
+                if self._is_columnar_dict(data):
                     self._store_columnar(data)
                     return
         
@@ -1165,19 +1122,22 @@ class ApexClient:
             else:
                 raise ValueError("Data must be dict, list of dicts, Dict[str, list], pandas.DataFrame, polars.DataFrame, or pyarrow.Table")
 
+    @staticmethod
+    def _is_columnar_dict(data: dict) -> bool:
+        if not data:
+            return False
+
+        for value in data.values():
+            if not (
+                isinstance(value, (list, tuple)) or
+                (hasattr(value, '__len__') and hasattr(value, 'dtype'))
+            ):
+                return False
+
+        return True
+
     def _encode_vectors_in_record(self, record: dict) -> dict:
-        """Return a copy of *record* with list/tuple vector fields encoded as bytes.
-        numpy 1-D arrays are passed through unchanged (stored as FixedList by Rust)."""
-        for k, v in record.items():
-            if isinstance(v, (list, tuple)) and v and isinstance(v[0], (int, float)):
-                result = dict(record)
-                result[k] = encode_vector(v)
-                for kk, vv in record.items():
-                    if kk == k:
-                        continue
-                    if isinstance(vv, (list, tuple)) and vv and isinstance(vv[0], (int, float)):
-                        result[kk] = encode_vector(vv)
-                return result
+        """Leave vector-shaped values intact so Rust can honor declared vector schemas."""
         return record
 
     def _store_batch(self, records: List[dict]) -> None:
@@ -1228,11 +1188,13 @@ class ApexClient:
                 converted[name] = values.to_list()
             else:
                 converted[name] = list(values) if not isinstance(values, list) else values
-            # Encode plain list/tuple-of-numbers as Binary bytes.
-            # numpy array elements are left as-is (Rust stores them as FixedList).
             if _is_vector_column(converted[name]):
-                first = next((v for v in converted[name] if v is not None), None)
-                if first is not None and not (hasattr(first, 'dtype') and hasattr(first, 'shape')):
+                dims = {
+                    len(v)
+                    for v in converted[name]
+                    if v is not None and isinstance(v, (list, tuple))
+                }
+                if len(dims) > 1:
                     converted[name] = _encode_vector_col(converted[name])
         
         # Call native columnar storage - much faster than row-by-row
@@ -1410,20 +1372,20 @@ class ApexClient:
 
     def execute(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
         self._check_connection()
-        
-        # Ultra-fast COUNT(*) cache (before _execute_impl overhead)
-        _cm = _RE_SIMPLE_COUNT_STAR.match(sql)
-        if _cm:
-            _ct = _cm.group(2)
-            if not _ct or '.' not in _ct:
-                _tk = _ct or self._current_table or ''
-                _now = time.monotonic_ns()
-                _cached = getattr(self, '_count_cache', None)
-                if _cached and _cached[0] == _tk and _now - _cached[2] < 100_000_000:
-                    _ca = _cm.group(1)
-                    rv = ResultView(lazy_pydict={_ca or 'COUNT(*)': [_cached[1]]})
-                    rv._show_internal_id = False
-                    return rv
+
+        if sql == "BEGIN" and not getattr(self, '_in_txn', False):
+            return self._start_fast_txn(show_internal_id=show_internal_id)
+        if getattr(self, '_fast_txn_active', False):
+            if sql == "COMMIT":
+                return self._commit_fast_txn(show_internal_id)
+            if sql == "ROLLBACK":
+                return self._rollback_fast_txn(show_internal_id)
+
+        cached_simple = self._simple_sql_cache.get(sql)
+        if cached_simple:
+            hot_result = self._execute_cached_simple_select(sql, cached_simple, show_internal_id)
+            if hot_result is not _HOT_CACHE_MISS:
+                return hot_result
         
         # Lock-free execution: Rust layer handles concurrent reads via RwLock.
         # Python-level _storage_lock was causing serialization of all queries.
@@ -1466,6 +1428,16 @@ class ApexClient:
         if (sig == 'projected_full_scan'):
             return True
 
+        has_agg = ('COUNT(' in sql_upper or 'SUM(' in sql_upper or 'AVG(' in sql_upper
+                   or 'MIN(' in sql_upper or 'MAX(' in sql_upper)
+
+        if (sig == 'complex' and has_agg
+                and 'WHERE' in sql_upper and "'" in sql_upper
+                and not any(token in sql_upper for token in (
+                    'GROUP', 'HAVING', 'ORDER', 'DISTINCT', 'LIMIT',
+                ))):
+            return False
+
         # Large filtered row sets avoid PyArrow Table.to_pylist() overhead.
         if (sql_upper.startswith('SELECT *')
                 and 'WHERE' in sql_upper
@@ -1476,8 +1448,7 @@ class ApexClient:
         # Let Rust's executor fast paths (cached GROUP BY, aggregation, top-k ORDER BY, etc.)
         # return columnar Python lists directly instead of importing Arrow then converting rows.
         if ('GROUP' in sql_upper or 'HAVING' in sql_upper or 'DISTINCT' in sql_upper
-                or 'COUNT(' in sql_upper or 'SUM(' in sql_upper or 'AVG(' in sql_upper
-                or 'MIN(' in sql_upper or 'MAX(' in sql_upper):
+                or has_agg):
             return True
         if 'ORDER' in sql_upper and 'LIMIT' in sql_upper:
             return True
@@ -1494,6 +1465,101 @@ class ApexClient:
             return int(match.group(1))
         except (TypeError, ValueError):
             return None
+
+    def _execute_cached_simple_select(self, sql, cached_simple, show_internal_id):
+        if (not cached_simple
+                or getattr(self, '_in_txn', False)
+                or getattr(self, '_fast_txn_active', False)):
+            return _HOT_CACHE_MISS
+        kind = cached_simple[0]
+        if kind not in (
+                'point', 'projected_point', 'string_eq_limit1',
+                'projected_string_eq_limit1', 'projected_string_eq_limit',
+                'numeric_range_limit', 'numeric_filtered_agg',
+        ):
+            return _HOT_CACHE_MISS
+        try:
+            self._ensure_table_selected()
+            table_name = cached_simple[1]
+            show_flag = bool(show_internal_id) if show_internal_id is not None else False
+            if kind == 'numeric_filtered_agg':
+                _, table_name, filter_col, op, value = cached_simple
+                result = self._storage.execute_filtered_numeric_agg(
+                    sql, table_name, filter_col, op, value
+                )
+                if isinstance(result, dict):
+                    columns_dict = result.get('columns_dict')
+                    if columns_dict is not None:
+                        return self._result_view_from_columns_dict(sql, columns_dict, show_flag)
+                return _HOT_CACHE_MISS
+
+            if not self._current_table or table_name.lower() != self._current_table.lower():
+                return _HOT_CACHE_MISS
+            if kind == 'numeric_range_limit':
+                _, _, filter_col, op, value, limit_val, offset_val = cached_simple
+                result = self._storage.retrieve_by_numeric_range_limit(
+                    filter_col, op, value, limit_val, offset_val
+                )
+                if isinstance(result, dict):
+                    columns_dict = result.get('columns_dict')
+                    if columns_dict is not None:
+                        return self._result_view_from_columns_dict(sql, columns_dict, show_flag)
+                return _HOT_CACHE_MISS
+
+            if kind == 'string_eq_limit1':
+                _, _, filter_col, filter_val, _ = cached_simple
+                result = self._storage.retrieve_first_by_string_eq_limit1(filter_col, filter_val)
+                if result is not None:
+                    columns_dict = result.get('columns_dict')
+                    if columns_dict is not None:
+                        return self._result_view_from_columns_dict(sql, columns_dict, show_flag)
+                return _HOT_CACHE_MISS
+
+            if kind == 'projected_string_eq_limit1':
+                _, _, filter_col, filter_val, columns = cached_simple
+                result = self._storage.retrieve_projected_first_by_string_eq_limit1(
+                    filter_col, filter_val, list(columns)
+                )
+                if result is not None:
+                    columns_dict = result.get('columns_dict')
+                    if columns_dict is not None:
+                        return self._result_view_from_columns_dict(sql, columns_dict, show_flag)
+                return _HOT_CACHE_MISS
+
+            if kind == 'projected_string_eq_limit':
+                _, _, filter_col, filter_val, columns, limit_val, offset_val = cached_simple
+                result = self._storage.retrieve_projected_by_string_eq_limit(
+                    filter_col, filter_val, list(columns), limit_val, offset_val
+                )
+                if result is not None:
+                    columns_dict = result.get('columns_dict')
+                    if columns_dict is not None:
+                        return self._result_view_from_columns_dict(sql, columns_dict, show_flag)
+                return _HOT_CACHE_MISS
+
+            point_id = cached_simple[2]
+            if kind == 'point':
+                show_internal_id = show_flag
+                row = self._storage.retrieve(point_id)
+                if row is None:
+                    rv = ResultView(data=None)
+                    rv._show_internal_id = show_internal_id
+                    return rv
+                if not show_internal_id and '_id' in row:
+                    row = {k: v for k, v in row.items() if k != '_id'}
+            else:
+                row = self._storage.retrieve_projected_row(point_id, list(cached_simple[3]))
+                show_internal_id = show_flag
+                if row is None:
+                    rv = ResultView(data=None)
+                    rv._show_internal_id = show_internal_id
+                    return rv
+            rows = [row]
+            rv = ResultView(data=rows)
+            rv._show_internal_id = show_internal_id
+            return rv
+        except Exception:
+            return _HOT_CACHE_MISS
     
     def _execute_impl(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
         sql_upper = sql.strip().upper()
@@ -1636,6 +1702,40 @@ class ApexClient:
                                         limit_val,
                                         offset_val,
                                     )
+                            elif not columns:
+                                numeric_limit = _RE_SIMPLE_NUMERIC_RANGE_LIMIT.match(sql)
+                                if numeric_limit and numeric_limit.group(2).lower() != '_id':
+                                    try:
+                                        limit_val = int(numeric_limit.group(5))
+                                        offset_val = int(numeric_limit.group(6) or 0)
+                                        value = float(numeric_limit.group(4))
+                                        cached_simple = (
+                                            'numeric_range_limit',
+                                            numeric_limit.group(1),
+                                            numeric_limit.group(2),
+                                            numeric_limit.group(3),
+                                            value,
+                                            limit_val,
+                                            offset_val,
+                                        )
+                                    except (TypeError, ValueError):
+                                        pass
+                                if not cached_simple:
+                                    numeric_agg = _RE_SIMPLE_NUMERIC_FILTERED_AGG.match(sql)
+                                    if (numeric_agg
+                                            and numeric_agg.group(3).lower() != '_id'
+                                            and _RE_AGGREGATE_FUNC.search(numeric_agg.group(1))
+                                            and 'DISTINCT' not in sql_upper):
+                                        try:
+                                            cached_simple = (
+                                                'numeric_filtered_agg',
+                                                numeric_agg.group(2),
+                                                numeric_agg.group(3),
+                                                numeric_agg.group(4),
+                                                float(numeric_agg.group(5)),
+                                            )
+                                        except (TypeError, ValueError):
+                                            pass
                 if len(self._simple_sql_cache) >= 256:
                     self._simple_sql_cache.clear()
                 self._simple_sql_cache[sql] = cached_simple
@@ -1741,9 +1841,6 @@ class ApexClient:
                     self._ensure_table_selected()
                     if self._current_table and table_name.lower() == self._current_table.lower():
                         show_flag = show_internal_id if show_internal_id is not None else False
-                        cached_rows = self._get_cached_select_result(sql, show_flag)
-                        if cached_rows is not None:
-                            return self._result_view_from_cached_rows(cached_rows, show_flag)
                         result = self._storage.retrieve_projected_by_string_eq_limit(
                             filter_col, filter_val, list(columns), limit_val, offset_val
                         )
@@ -1754,7 +1851,6 @@ class ApexClient:
                                     sql,
                                     columns_dict,
                                     show_flag,
-                                    cache_result=True,
                                 )
                 except Exception:
                     pass  # fall through to the general SQL executor
@@ -1953,20 +2049,6 @@ class ApexClient:
             if show_internal_id is None:
                 show_internal_id = self._should_show_internal_id(sql)
 
-            _cacheable_select_result = _sig in (
-                'projected_scan_limit',
-                'projected_string_filter_limit',
-                'string_filter_limit',
-                'scan_limit',
-                'projected_full_scan',
-                'complex',
-            )
-
-            if sql_upper.startswith('SELECT') and _cacheable_select_result:
-                cached_rows = self._get_cached_select_result(sql, show_internal_id)
-                if cached_rows is not None:
-                    return self._result_view_from_cached_rows(cached_rows, show_internal_id)
-
             if (getattr(self, '_fast_txn_active', False)
                     and sql_upper.startswith('SELECT')):
                 result = self._fast_txn_select(sql, show_internal_id)
@@ -1988,9 +2070,6 @@ class ApexClient:
                     if count_table and self._current_table and count_table.lower() != self._current_table.lower():
                         raise ValueError("non-current COUNT(*) table uses the SQL executor")
                     count = self._storage.fast_row_count()
-                    # Populate Python-level cache for ultra-fast subsequent calls
-                    table_key = count_table or self._current_table or ''
-                    self._count_cache = (table_key, count, time.monotonic_ns())
                     rv = ResultView(lazy_pydict={count_alias or 'COUNT(*)': [count]})
                     rv._show_internal_id = False
                     return rv
@@ -2040,7 +2119,6 @@ class ApexClient:
                                         sql,
                                         columns_dict,
                                         show_internal_id,
-                                        cache_result=False,
                                     )
                     except Exception:
                         pass  # fall through to Rust execute()
@@ -2063,7 +2141,6 @@ class ApexClient:
                                             sql,
                                             columns_dict,
                                             show_internal_id,
-                                            cache_result=False,
                                         )
                     except Exception:
                         pass  # fall through to Rust execute()
@@ -2086,7 +2163,6 @@ class ApexClient:
                                             sql,
                                             columns_dict,
                                             show_internal_id,
-                                            cache_result=False,
                                         )
                     except Exception:
                         pass  # fall through to Rust execute()
@@ -2105,7 +2181,6 @@ class ApexClient:
                                         sql,
                                         columns_dict,
                                         show_internal_id,
-                                        cache_result=False,
                                     )
                     except Exception:
                         pass  # fall through to Rust execute()
@@ -2126,7 +2201,6 @@ class ApexClient:
                                 sql,
                                 columns_dict,
                                 show_internal_id,
-                                cache_result=_cacheable_select_result,
                             )
                 except Exception:
                     pass  # fall through to Arrow FFI
@@ -2147,7 +2221,6 @@ class ApexClient:
                                 sql,
                                 columns_dict,
                                 show_internal_id,
-                                cache_result=_cacheable_select_result,
                             )
                 except Exception:
                     pass  # fall through to Arrow FFI
@@ -2173,7 +2246,6 @@ class ApexClient:
                                     sql,
                                     columns_dict,
                                     show_internal_id,
-                                    cache_result=_cacheable_select_result,
                                 )
                     except Exception:
                         pass  # fall through to Arrow FFI
@@ -2221,7 +2293,6 @@ class ApexClient:
                             sql,
                             columns_dict,
                             show_internal_id,
-                            cache_result=False,
                         )
                     # Fallback: columns+rows format (transpose to columnar)
                     if 'columns' in result and 'rows' in result:
@@ -2233,7 +2304,6 @@ class ApexClient:
                                 sql,
                                 col_dict,
                                 show_internal_id,
-                                cache_result=False,
                             )
                 rv = ResultView(data=None)
                 rv._show_internal_id = show_internal_id
@@ -2253,6 +2323,8 @@ class ApexClient:
                             self._in_txn = False
                 if sql_upper.strip().rstrip(';').strip().startswith('CREATE TABLE'):
                     self._current_table = self._storage.current_table()
+                if 'FTS INDEX' in sql_upper:
+                    self._sync_fts_config_from_disk()
                 reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
                 table = reader.read_all()
                 if table.num_rows == 0:
@@ -2277,7 +2349,6 @@ class ApexClient:
                                 sql,
                                 columns_dict,
                                 show_internal_id,
-                                cache_result=_cacheable_select_result,
                             )
                 except Exception:
                     pass  # fall through to Arrow FFI
@@ -2304,7 +2375,6 @@ class ApexClient:
             if _sig == 'write':
                 self._has_writes = True
                 self._invalidate_replace_cache()
-                self._count_cache = None  # Invalidate COUNT(*) cache on any write
 
             # ── Default path: Arrow C Data Interface (zero-copy) ──
             try:
@@ -2330,6 +2400,8 @@ class ApexClient:
                 _m = _re.match(r'COPY\s+(\w+)\s+FROM\b', sql_upper)
                 if _m:
                     self._current_table = _m.group(1).lower()
+            if 'FTS INDEX' in sql_upper:
+                self._sync_fts_config_from_disk()
 
             rv = ResultView(arrow_table=table, data=None)
             rv._show_internal_id = show_internal_id
@@ -2701,7 +2773,6 @@ class ApexClient:
         """
         self._check_connection()
         self._ensure_table_selected()
-        self._count_cache = None  # Invalidate COUNT(*) cache on delete
         
         # Safety check: require at least one parameter to prevent accidental deletion of all data
         if id is None and where is None:
@@ -2709,7 +2780,14 @@ class ApexClient:
                 "delete() requires at least one argument: 'id' or 'where'. "
                 "To delete all records, use delete(where='1=1') explicitly."
             )
-        
+
+        fts_enabled = self._is_fts_enabled(self._current_table)
+        missing_cache_key = None
+        if where is None and isinstance(id, int) and not fts_enabled:
+            missing_cache_key = (self._current_database, self._current_table, int(id))
+            if self._last_missing_delete_key == missing_cache_key:
+                return False
+
         with self._lock:
             # Case 1: Delete by WHERE clause
             if where is not None:
@@ -2721,14 +2799,18 @@ class ApexClient:
             # Case 2: Delete by ID(s)
             if id is not None:
                 # Remove from FTS index if enabled
-                if self._fts_tables:
+                if fts_enabled:
                     ids_to_remove = [id] if isinstance(id, int) else id
                     for doc_id in ids_to_remove:
                         self._storage._fts_remove(doc_id)
                 
                 if isinstance(id, int):
-                    self._invalidate_replace_cache()
-                    return self._storage.delete(id)
+                    result = self._storage.delete(id)
+                    if result:
+                        self._invalidate_replace_cache()
+                    elif missing_cache_key is not None:
+                        self._last_missing_delete_key = missing_cache_key
+                    return result
                 elif isinstance(id, list):
                     self._invalidate_replace_cache()
                     return self._storage.delete_batch(id)
@@ -2738,7 +2820,6 @@ class ApexClient:
     def replace(self, id_: int, data: dict) -> bool:
         self._check_connection()
         self._ensure_table_selected()
-        self._count_cache = None  # Invalidate COUNT(*) cache on replace
         with self._lock:
             cache_key = (self._current_database, self._current_table, int(id_))
             if self._last_exact_replace_key == cache_key and self._last_exact_replace_data == data:
@@ -2814,7 +2895,6 @@ class ApexClient:
 
     def flush(self) -> None:
         self._check_connection()
-        self._count_cache = None  # Invalidate COUNT(*) cache on flush
         with self._lock:
             if (not self._has_writes
                     and not self._buffered_write_rows

@@ -1,1267 +1,140 @@
 # ApexBase
 
-**High-performance HTAP embedded database with Rust core and Python API**
+[![PyPI](https://img.shields.io/pypi/v/apexbase.svg)](https://pypi.org/project/apexbase/)
+[![Python](https://img.shields.io/pypi/pyversions/apexbase.svg)](https://pypi.org/project/apexbase/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-ApexBase is an embedded columnar database designed for **Hybrid Transactional/Analytical Processing (HTAP)** workloads. It combines a high-throughput columnar storage engine written in Rust with an ergonomic Python API, delivering analytical query performance that surpasses DuckDB and SQLite on most benchmarks — all in a single `.apex` file with zero external dependencies.
+**ApexBase is a high-performance embedded HTAP database with a Rust core and a Python-first API.**
 
-## Table of Contents
+**Install it, write local `.apex` table files, run analytical SQL, import/export DataFrames, and optionally expose the same data through PostgreSQL Wire or Arrow Flight. No separate database service is required.**
 
-- [Features](#features)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Usage Guide](#usage-guide)
-  - [Database Management](#database-management)
-  - [Table Management](#table-management)
-  - [Data Ingestion](#data-ingestion)
-  - [SQL](#sql)
-  - [File Reading Table Functions](#file-reading-table-functions)
-  - [Temporary Tables from Files](#temporary-tables-from-files)
-  - [Transactions](#transactions)
-  - [Indexes](#indexes)
-  - [Full-Text Search](#full-text-search)
-  - [Vector Search](#vector-search)
-  - [Record-Level Operations](#record-level-operations)
-  - [Column Operations](#column-operations)
-  - [ResultView](#resultview)
-  - [Context Manager](#context-manager)
-- [Performance](#performance)
-- [Server Protocols](#server-protocols)
-  - [Combined Launcher (Both Servers at Once)](#combined-launcher-both-servers-at-once)
-- [PostgreSQL Wire Protocol Server](#postgresql-wire-protocol-server)
-  - [Starting the Server](#starting-the-server)
-  - [Connecting with Database Tools](#connecting-with-database-tools)
-  - [Supported SQL over Wire Protocol](#supported-sql-over-wire-protocol)
-  - [Metadata Compatibility](#metadata-compatibility)
-  - [Supported Protocol Features](#supported-protocol-features)
-  - [Limitations](#limitations)
-- [Arrow Flight gRPC Server](#arrow-flight-grpc-server)
-  - [Starting the Flight Server](#starting-the-flight-server)
-  - [Python Client](#python-client)
-  - [When to Use Arrow Flight vs PG Wire](#when-to-use-arrow-flight-vs-pg-wire)
-  - [PyO3 Python API](#pyo3-python-api)
-- [Rust Native API](#rust-native-api)
-  - [Cargo Dependency](#cargo-dependency)
-  - [Rust Quick Start](#rust-quick-start)
-  - [Key Rust Types](#key-rust-types)
-- [Architecture](#architecture)
-  - [Storage Format](#storage-format)
-  - [Query Execution](#query-execution)
-- [API Reference](#api-reference)
-  - [ApexClient](#apexclient)
-  - [ResultView](#resultview-1)
-- [Documentation](#documentation)
-- [License](#license)
+## Why ApexBase
 
----
+| What you need | What ApexBase gives you |
+| --- | --- |
+| **Fast local analytics** | Columnar storage, vectorized execution, SQL aggregations, joins, CTEs, windows, and indexes |
+| **Low-friction Python workflows** | `ApexClient`, Pandas / Polars / PyArrow conversion, file table functions, and simple local persistence |
+| **One engine for mixed workloads** | HTAP design: fast writes, point lookups, analytical scans, transactions, and MVCC |
+| **Search built in** | Full-text search, fuzzy matching, vector TopK search, and float16 embedding storage |
+| **Tool compatibility** | PostgreSQL Wire for database clients and Arrow Flight for fast columnar transfer |
 
-## Features
-
-- **HTAP architecture** — V4 Row Group columnar storage with DeltaStore for cell-level updates; fast inserts and fast analytical scans in one engine
-- **Multi-database support** — multiple isolated databases in one directory; cross-database queries with standard `db.table` SQL syntax
-- **Single-file storage** — custom `.apex` format per table, no server process, no external dependencies
-- **Comprehensive SQL** — DDL, DML, JOINs (INNER/LEFT/RIGHT/FULL/CROSS), subqueries (IN/EXISTS/scalar), CTEs (WITH ... AS), UNION/UNION ALL/INTERSECT/EXCEPT, window functions, EXPLAIN/ANALYZE, multi-statement execution
-- **70+ built-in functions** — math (ABS, SQRT, POWER, LOG, trig), string (UPPER, LOWER, SUBSTR, REPLACE, CONCAT, REGEXP_REPLACE, ...), date (YEAR, MONTH, DAY, DATEDIFF, DATE_ADD, ...), conditional (COALESCE, IFNULL, NULLIF, CASE WHEN, GREATEST, LEAST)
-- **Aggregation and analytics** — COUNT, SUM, AVG, MIN, MAX, COUNT(DISTINCT), GROUP BY, HAVING, ORDER BY with NULLS FIRST/LAST
-- **Window functions** — ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, RUNNING_SUM, and windowed SUM/AVG/COUNT/MIN/MAX with PARTITION BY and ORDER BY
-- **Transactions** — BEGIN / COMMIT / ROLLBACK with OCC (Optimistic Concurrency Control), SAVEPOINT / ROLLBACK TO / RELEASE, statement-level auto-rollback
-- **MVCC** — multi-version concurrency control with snapshot isolation, version store, and garbage collection
-- **Indexing** — B-Tree and Hash indexes with CREATE INDEX / DROP INDEX / REINDEX; automatic multi-index AND intersection for compound predicates
-- **Full-text search** — built-in NanoFTS integration with fuzzy matching
-- **Vector search** — SIMD-accelerated nearest-neighbour search with 6 distance metrics (L2, cosine, dot, L1, L∞, L2²); heap-based O(n log k) TopK; single-query `topk_distance()` and batch `batch_topk_distance()` Python APIs; SQL `explode_rename(topk_distance(...))` syntax; current verified snapshot shows 7-14x faster shared TopK queries than DuckDB
-- **Float16 vector storage** — `FLOAT16_VECTOR` column type stores embeddings as 16-bit floats (half the memory of float32); SIMD-accelerated f16 distance kernels via NEON fp16 on ARM (FCVTL/FCVTL2) and AVX2+F16C on x86_64; automatic runtime CPU dispatch; ≥2× faster than f32 on Apple Silicon; transparent API — query with float32, stored as f16
-- **JIT compilation** — Cranelift-based JIT for predicate evaluation and SIMD-vectorized aggregations
-- **Zero-copy Python bridge** — Arrow IPC between Rust and Python; direct conversion to Pandas, Polars, and PyArrow
-- **Durability levels** — configurable `fast` / `safe` / `max` with WAL support and crash recovery
-- **Compact storage** — dictionary encoding for low-cardinality strings, LZ4 and Zstd compression
-- **File reading table functions** — `read_csv()`, `read_parquet()`, `read_json()` directly in SQL `FROM` clauses; parallel mmap parsing; full SQL (WHERE / GROUP BY / JOIN / UNION) on top of any file
-- **Temporary tables from files** — `register_temp_table()` parses CSV/JSON/Parquet once and materializes as a native .apex temp table; mmap-backed zero-copy reads, zone maps, bloom filters; order-of-magnitude faster than repeated `read_*` calls; auto-cleanup on close
-- **Parquet interop** — COPY TO / COPY FROM Parquet files
-- **PostgreSQL wire protocol** — built-in server for DBeaver, psql, DataGrip, pgAdmin, Navicat, and any PostgreSQL-compatible client; two distribution modes (Python CLI or standalone Rust binary)
-- **Arrow Flight gRPC server** — high-performance columnar data transfer over HTTP/2; streams Arrow IPC RecordBatch directly, 4–7× faster than PG wire for large result sets; accessible via `pyarrow.flight`, Go arrow, Java arrow, and any Arrow Flight client
-- **Cross-platform** — Linux, macOS, and Windows; x86_64 and ARM64; Python 3.9 -- 3.13
-
----
-
-## Installation
+## Install
 
 ```bash
 pip install apexbase
 ```
 
-Build from source (requires Rust toolchain):
+Build from source:
 
 ```bash
+python -m pip install maturin
 maturin develop --release
 ```
 
----
-
-## Quick Start
+## 30-Second Example: FTS + SQL + Vector Search In One Local File
 
 ```python
 from apexbase import ApexClient
 
-# Open (or create) a database directory
-client = ApexClient("./data")
+with ApexClient("./rag-data") as client:
+    client.execute("""
+        CREATE TABLE articles (
+            title TEXT,
+            body TEXT,
+            category TEXT,
+            views INT,
+            embedding FLOAT16_VECTOR
+        )
+    """)
+    client.use_table("articles")
 
-# Create a table
-client.create_table("users")
+    client.store([
+        {
+            "title": "Rust-powered local analytics",
+            "body": "A columnar embedded database for fast SQL and search.",
+            "category": "database",
+            "views": 4200,
+            "embedding": [0.10, 0.82, 0.20],
+        },
+        {
+            "title": "Hybrid retrieval for RAG",
+            "body": "Combine full-text recall, SQL filters, and semantic vector ranking.",
+            "category": "ai",
+            "views": 6100,
+            "embedding": [0.16, 0.74, 0.58],
+        },
+        {
+            "title": "SQLite migration notes",
+            "body": "Move local applications to an analytical embedded store.",
+            "category": "database",
+            "views": 2600,
+            "embedding": [0.80, 0.12, 0.10],
+        },
+    ])
 
-# Store records
-client.store({"name": "Alice", "age": 30, "city": "Beijing"})
-client.store([
-    {"name": "Bob", "age": 25, "city": "Shanghai"},
-    {"name": "Charlie", "age": 35, "city": "Beijing"},
-])
+    client.execute("CREATE FTS INDEX ON articles(title, body)")
 
-# SQL query
-results = client.execute("SELECT * FROM users WHERE age > 28 ORDER BY age DESC")
+    # FTS recall + structured SQL guardrails + pgvector-style semantic rerank.
+    df = client.execute("""
+        SELECT
+            title,
+            category,
+            views,
+            cosine_distance(embedding, [0.12, 0.78, 0.25]) AS semantic_dist
+        FROM articles
+        WHERE MATCH('database')
+          AND category = 'database'
+          AND views > 3000
+        ORDER BY semantic_dist
+        LIMIT 5
+    """).to_pandas()
 
-# Convert to DataFrame
-df = results.to_pandas()
-
-client.close()
+    print(df)
 ```
 
----
+**ApexBase gives you pgvector-style semantic search, SQL filters, and full-text search in the same embedded database file.** It is the kind of stack you would otherwise assemble from SQLite/DuckDB + FTS + pgvector, but without a server process or a separate search/vector service; results still convert directly to Pandas, Polars, or Arrow.
 
-## Usage Guide
+## Performance At A Glance
 
-### Database Management
+Latest local snapshot: **ApexBase 1.18.0**, 200k-row tabular dataset, 200k-vector dataset, Apple arm, Python 3.12.
 
-ApexBase supports multiple isolated databases within a single root directory. Each named database lives in its own subdirectory; the default database uses the root directory.
+| Area | Snapshot |
+| --- | --- |
+| **Fair OLAP + OLTP comparison** | **38 / 38 wins** against SQLite and DuckDB in the benchmark harness |
+| **GROUP BY** | **40.0x faster** than DuckDB in the representative snapshot |
+| **FTS search** | **35.6x faster** than SQLite in the representative snapshot |
+| **Batch vector TopK cosine** | **13.9x faster** than DuckDB in the representative snapshot |
 
-```python
-# Switch to a named database (creates it if needed)
-client.use_database("analytics")
-
-# Combined: switch database + select/create a table in one call
-client.use(database="analytics", table="events")
-
-# List all databases
-dbs = client.list_databases()  # ["analytics", "default", "hr"]
-
-# Current database
-print(client.current_database)  # "analytics"
-
-# Cross-database SQL — standard db.table syntax
-client.execute("SELECT * FROM default.users")
-client.execute("SELECT u.name, e.event FROM default.users u JOIN analytics.events e ON u.id = e.user_id")
-client.execute("INSERT INTO analytics.events (name) VALUES ('click')")
-client.execute("UPDATE default.users SET age = 31 WHERE name = 'Alice'")
-client.execute("DELETE FROM default.users WHERE age < 18")
-```
-
-All SQL operations (SELECT, INSERT, UPDATE, DELETE, JOIN, CREATE TABLE, DROP TABLE, ALTER TABLE) support `database.table` qualified names, allowing cross-database queries in a single statement.
-
-### Table Management
-
-Each table is stored as a separate `.apex` file. Tables must be created before use.
-
-```python
-# Create with optional schema
-client.create_table("orders", schema={
-    "order_id": "int64",
-    "product": "string",
-    "price": "float64",
-})
-
-# Switch tables
-client.use_table("users")
-
-# List / drop
-tables = client.list_tables()
-client.drop_table("orders")
-```
-
-### Data Ingestion
-
-```python
-import pandas as pd
-import polars as pl
-import pyarrow as pa
-
-# Columnar dict (fastest for bulk data)
-client.store({
-    "name": ["D", "E", "F"],
-    "age": [22, 32, 42],
-})
-
-# From pandas / polars / PyArrow (auto-creates table when table_name given)
-client.from_pandas(pd.DataFrame({"name": ["G"], "age": [28]}), table_name="users")
-client.from_polars(pl.DataFrame({"name": ["H"], "age": [38]}), table_name="users")
-client.from_pyarrow(pa.table({"name": ["I"], "age": [48]}), table_name="users")
-```
-
-### SQL
-
-ApexBase supports a broad SQL dialect. Examples:
-
-```python
-# DDL
-client.execute("CREATE TABLE IF NOT EXISTS products")
-client.execute("ALTER TABLE products ADD COLUMN name STRING")
-client.execute("DROP TABLE IF EXISTS products")
-
-# DML
-client.execute("INSERT INTO users (name, age) VALUES ('Zoe', 29)")
-client.execute("UPDATE users SET age = 31 WHERE name = 'Alice'")
-client.execute("DELETE FROM users WHERE age < 20")
-
-# SELECT with full clause support
-client.execute("""
-    SELECT city, COUNT(*) AS cnt, AVG(age) AS avg_age
-    FROM users
-    WHERE age BETWEEN 20 AND 40
-    GROUP BY city
-    HAVING cnt > 1
-    ORDER BY avg_age DESC
-    LIMIT 10
-""")
-
-# JOINs
-client.execute("""
-    SELECT u.name, o.product
-    FROM users u
-    INNER JOIN orders o ON u._id = o.user_id
-""")
-
-# Subqueries
-client.execute("SELECT * FROM users WHERE age > (SELECT AVG(age) FROM users)")
-client.execute("SELECT * FROM users WHERE city IN (SELECT city FROM cities WHERE pop > 1000000)")
-
-# CTEs
-client.execute("""
-    WITH seniors AS (SELECT * FROM users WHERE age >= 30)
-    SELECT city, COUNT(*) FROM seniors GROUP BY city
-""")
-
-# Window functions
-client.execute("""
-    SELECT name, age,
-           ROW_NUMBER() OVER (ORDER BY age DESC) AS rank,
-           AVG(age) OVER (PARTITION BY city) AS city_avg
-    FROM users
-""")
-
-# Set operations
-client.execute("""
-    SELECT name FROM users WHERE city = 'Beijing'
-    UNION ALL
-    SELECT name FROM users WHERE city = 'Shanghai'
-""")
-client.execute("""
-    SELECT user_id FROM orders
-    INTERSECT
-    SELECT user_id FROM wishlist
-""")
-client.execute("""
-    SELECT user_id FROM orders
-    EXCEPT
-    SELECT user_id FROM support_tickets WHERE status = 'open'
-""")
-
-# Multi-statement
-client.execute("""
-    INSERT INTO users (name, age) VALUES ('New1', 20);
-    INSERT INTO users (name, age) VALUES ('New2', 21);
-    SELECT COUNT(*) FROM users
-""")
-
-# INSERT ... ON CONFLICT (upsert)
-client.execute("""
-    INSERT INTO users (name, age) VALUES ('Alice', 31)
-    ON CONFLICT (name) DO UPDATE SET age = 31
-""")
-
-# CREATE TABLE AS
-client.execute("CREATE TABLE seniors AS SELECT * FROM users WHERE age >= 30")
-
-# EXPLAIN / EXPLAIN ANALYZE
-client.execute("EXPLAIN SELECT * FROM users WHERE age > 25")
-
-# Parquet interop
-client.execute("COPY users TO '/tmp/users.parquet'")
-client.execute("COPY users FROM '/tmp/users.parquet'")
-```
-
-### File Reading Table Functions
-
-Read external files directly in a SQL `FROM` clause — no import step required. The full SQL engine runs on top: `WHERE`, `GROUP BY`, `ORDER BY`, `JOIN`, `UNION`, etc.
-
-```python
-# CSV: schema inferred automatically, parallel mmap parser
-df = client.execute("SELECT * FROM read_csv('/data/sales.csv')").to_pandas()
-
-# TSV — specify delimiter
-df = client.execute("SELECT * FROM read_csv('/data/data.tsv', delimiter='\t')").to_pandas()
-
-# No header row
-df = client.execute("SELECT * FROM read_csv('/data/raw.csv', header=false)").to_pandas()
-
-# Parquet: schema from file metadata, parallel column decode
-table = client.execute("SELECT * FROM read_parquet('/data/events.parquet')").to_arrow()
-
-# JSON / NDJSON: auto-detects format (NDJSON or pandas column-oriented)
-df = client.execute("SELECT * FROM read_json('/data/logs.ndjson')").to_pandas()
-
-# Full SQL on top of a file
-result = client.execute("""
-    SELECT city, COUNT(*) AS cnt, AVG(price)
-    FROM read_csv('/data/orders.csv')
-    WHERE price > 100
-    GROUP BY city
-    ORDER BY cnt DESC
-    LIMIT 10
-""")
-
-# JOIN a file with a stored table
-result = client.execute("""
-    SELECT u.name, f.score
-    FROM users u
-    JOIN read_csv('/data/scores.csv') f ON u.id = f.user_id
-    WHERE f.score > 90
-""")
-
-# EXCEPT using a file as a blocklist
-result = client.execute("""
-    SELECT email FROM users
-    EXCEPT
-    SELECT email FROM read_csv('/data/unsubscribed.csv')
-""")
-```
-
-| Function | Options | Description |
-|----------|---------|-------------|
-| `read_csv(path)` | `header=true`, `delimiter=','` | Read CSV/TSV; auto-infers schema |
-| `read_parquet(path)` | — | Read Parquet; schema from file metadata |
-| `read_json(path)` | — | Read NDJSON or pandas JSON; auto-detects format |
-
-See [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md#file-reading-table-functions) for full details.
-
-### Temporary Tables from Files
-
-Register CSV, JSON, or Parquet files as temporary native tables. The file is parsed once and stored in ApexBase's mmap-backed `.apex` format. Subsequent queries bypass file parsing entirely, leveraging zone maps, bloom filters, and zero-copy mmap reads — **an order of magnitude faster** than repeated `read_csv()` / `read_json()` / `read_parquet()` calls.
-
-```python
-# Register a CSV file as a temp table
-client.register_temp_table("orders", "/data/orders.csv")
-
-# Query it as a regular table — lightning fast, near-zero memory
-result = client.execute("SELECT city, COUNT(*) FROM orders GROUP BY city")
-
-# Full SQL works (WHERE, JOIN, GROUP BY, UNION, window functions, etc.)
-result = client.execute("""
-    SELECT o.city, u.name
-    FROM orders o
-    JOIN users u ON o.user_id = u._id
-    WHERE o.amount > 100
-    ORDER BY o.amount DESC
-    LIMIT 20
-""")
-
-# Drop when done (or just close the client — auto-cleanup)
-client.drop_temp_table("orders")
-```
-
-Also supports SQL syntax:
-
-```python
-client.execute("CREATE TEMP TABLE invoices AS SELECT * FROM read_csv('/data/invoices.csv')")
-```
-
-**Supported formats:**
-- CSV / TSV — auto-detected by `.csv` / `.tsv` extension
-- JSON / NDJSON — auto-detected by `.json` / `.ndjson` / `.jsonl` extension  
-- Parquet — auto-detected by `.parquet` extension
-
-**Memory & performance:**
-- Temp tables use memory-mapped I/O — data stays on disk, near-zero RAM footprint
-- Zone maps (min/max indexes) skip irrelevant row groups for filtered queries
-- Bloom filters accelerate point lookups
-- Cleaned up automatically when the client is closed or the database is dropped
-
-### Transactions
-
-```python
-client.execute("BEGIN")
-client.execute("INSERT INTO users (name, age) VALUES ('Tx1', 20)")
-client.execute("SAVEPOINT sp1")
-client.execute("INSERT INTO users (name, age) VALUES ('Tx2', 21)")
-client.execute("ROLLBACK TO sp1")   # undo Tx2 only
-client.execute("COMMIT")            # Tx1 persisted
-```
-
-Transactions use OCC validation — concurrent writes are detected at commit time.
-
-### Indexes
-
-```python
-client.execute("CREATE INDEX idx_age ON users (age)")
-client.execute("CREATE UNIQUE INDEX idx_name ON users (name)")
-
-# Queries automatically use indexes when applicable
-client.execute("SELECT * FROM users WHERE age = 30")  # index scan
-
-client.execute("DROP INDEX idx_age ON users")
-client.execute("REINDEX users")
-```
-
-### Full-Text Search
-
-ApexBase ships a native full-text search engine (NanoFTS) integrated directly into the SQL executor. FTS is available through **all interfaces** — Python API, PostgreSQL Wire, and Arrow Flight — without any Python-side middleware.
-
-#### SQL interface (recommended)
-
-```python
-# 1. Create the FTS index via SQL DDL
-client.execute("CREATE FTS INDEX ON articles (title, content)")
-
-# Optional: specify lazy loading and cache size
-client.execute("CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)")
-
-# 2. Query using MATCH() / FUZZY_MATCH() in WHERE
-results = client.execute("SELECT * FROM articles WHERE MATCH('rust programming')")
-results = client.execute("SELECT title, content FROM articles WHERE FUZZY_MATCH('pytohn')")
-
-# Combine with other predicates
-results = client.execute("""
-    SELECT * FROM articles
-    WHERE MATCH('machine learning') AND published_at > '2024-01-01'
-    ORDER BY _id DESC LIMIT 20
-""")
-
-# FTS also works in aggregations
-count = client.execute("SELECT COUNT(*) FROM articles WHERE MATCH('deep learning')")
-
-# Manage indexes
-client.execute("SHOW FTS INDEXES")           # list all FTS-enabled tables
-client.execute("ALTER FTS INDEX ON articles DISABLE")  # disable, keep files
-client.execute("DROP FTS INDEX ON articles") # remove index + delete files
-```
-
-#### Python API (alternative)
-
-```python
-# Initialize FTS for current table
-client.use_table("articles")
-client.init_fts(index_fields=["title", "content"])
-
-# Search
-ids    = client.search_text("database")
-fuzzy  = client.fuzzy_search_text("databse")   # tolerates typos
-recs   = client.search_and_retrieve("python", limit=10)
-top5   = client.search_and_retrieve_top("neural network", n=5)
-
-# Lifecycle
-client.get_fts_stats()
-client.disable_fts()   # suspend without deleting files
-client.drop_fts()      # remove index + delete files
-```
-
-> **Tip:** The SQL interface (`MATCH()` / `FUZZY_MATCH()`) works over PG Wire and Arrow Flight without any extra setup; the Python API methods are Python-process-only.
-
-### Vector Search
-
-ApexBase provides SIMD-accelerated nearest-neighbour search with a zero-copy mmap scan buffer. Supports 6 distance metrics and both single-query and batch modes.
-
-```python
-import numpy as np
-
-# Store vectors — numpy arrays are stored as FixedList columns (optimal)
-client.create_table("items")
-client.store({
-    "label": ["a", "b", "c"],
-    "vec":   [np.random.rand(128).astype(np.float32) for _ in range(3)],
-})
-
-query = np.random.rand(128).astype(np.float32)
-
-# Single-query: returns ResultView with _id and dist columns
-results = client.topk_distance('vec', query, k=10)
-df = results.to_pandas()           # columns: _id, dist
-top_ids = results.get_ids()        # numpy int64 array
-records = client.retrieve_many(top_ids.tolist())  # full records
-
-# Custom metric and column names
-results = client.topk_distance('vec', query, k=5, metric='cosine',
-                                id_col='item_id', dist_col='cosine_dist')
-
-# Batch: N queries in one Rust call (scan_buf loaded once, Rayon parallel)
-queries = np.random.rand(100, 128).astype(np.float32)
-result  = client.batch_topk_distance('vec', queries, k=10)
-# result.shape == (100, 10, 2)
-ids   = result[:, :, 0].astype(np.int64)   # (100, 10)
-dists = result[:, :, 1]                     # (100, 10)
-
-# SQL: explode_rename(topk_distance(...)) — same query, SQL form
-results = client.execute("""
-    SELECT explode_rename(topk_distance(vec, [0.1, 0.2, 0.3], 10, 'l2'), '_id', 'dist')
-    FROM items
-""")
-```
-
-**Supported metrics:** `'l2'` / `'euclidean'`, `'l2_squared'`, `'l1'` / `'manhattan'`, `'linf'` / `'chebyshev'`, `'cosine'` / `'cosine_distance'`, `'dot'` / `'inner_product'`
-
-**Latest verified benchmark snapshot**
-
-- Dataset: 200,000 vectors x dim=128, `k=10`
-- Method: 2 warmup + 3 timed iterations
-- Harness: integrated into `benchmarks/bench_vs_sqlite_duckdb.py`
-- SQLite note: stock `sqlite3` in this harness has no native vector distance/top-k functions, so ranked vector comparisons are ApexBase vs DuckDB only
-
-**Single-query TopK**
-
-| Metric | ApexBase | DuckDB | Gap |
-|--------|----------|--------|-----|
-| L2 | 3.58 ms | 26.46 ms | **7.4x faster** |
-| Cosine | 3.80 ms | 31.89 ms | **8.4x faster** |
-| Dot | 3.48 ms | 26.37 ms | **7.6x faster** |
-
-**Batch TopK (10 queries)**
-
-| Metric | ApexBase | DuckDB | Gap |
-|--------|----------|--------|-----|
-| L2 | 23.18 ms | 266.92 ms | **11.5x faster** |
-| Cosine | 23.24 ms | 322.07 ms | **13.9x faster** |
-| Dot | 21.12 ms | 268.44 ms | **12.7x faster** |
-
-**ApexBase-only metrics**
-
-| Metric | ApexBase |
-|--------|----------|
-| L2 squared | 3.56 ms |
-| L1 | 3.34 ms |
-| Linf | 3.39 ms |
-
-See [`docs/API_REFERENCE.md#vector-search`](docs/API_REFERENCE.md#vector-search) for full details.
-
-### Record-Level Operations
-
-```python
-record = client.retrieve(1)               # by internal _id
-records = client.retrieve_many([1, 2, 3])
-all_data = client.retrieve_all()
-
-client.replace(1, {"name": "Alice2", "age": 31})
-client.delete(1)
-client.delete([2, 3, 4])
-```
-
-### Column Operations
-
-```python
-client.add_column("email", "String")
-client.rename_column("email", "email_addr")
-client.drop_column("email_addr")
-client.get_column_dtype("age")    # "Int64"
-client.list_fields()              # ["name", "age", "city"]
-```
-
-### ResultView
-
-Query results are returned as `ResultView` objects with multiple output formats:
-
-```python
-results = client.execute("SELECT * FROM users")
-
-df = results.to_pandas()       # pandas DataFrame (zero-copy by default)
-pl_df = results.to_polars()    # polars DataFrame
-arrow = results.to_arrow()     # PyArrow Table
-dicts = results.to_dict()      # list of dicts
-
-results.shape                  # (rows, columns)
-results.columns                # column names
-len(results)                   # row count
-results.first()                # first row as dict
-results.scalar()               # single value (for aggregates)
-results.get_ids()              # numpy array of _id values
-```
-
-### Context Manager
-
-```python
-with ApexClient("./data") as client:
-    client.create_table("tmp")
-    client.store({"key": "value"})
-    # Automatically closed on exit
-```
-
----
-
-## Performance
-
-### Latest Verified Snapshot
-
-This section tracks the latest verified local benchmark snapshot rather than an old best-case run.
-
-- **System**: macOS 26.4.1, Apple arm (10 cores), 32 GB RAM
-- **Stack**: Python 3.12.4, ApexBase 1.18.0, SQLite 3.45.3, DuckDB 1.1.3, PyArrow 23.0.1
-- **Dataset**: 200,000 rows x 5 columns (`name`, `age`, `score`, `city`, `category`)
-- **Vector dataset**: 200,000 vectors x dim=128, `k=10`, batch size 10 queries
-- **Method**: 2 warmup iterations + 3 timed iterations
-- **Layout**: 92 named metrics total (37 OLAP, 46 OLTP, 9 vector)
-- **Fairness rule**: only the default fair OLAP/OLTP cross-engine tables count toward the `38/38` win/loss summary. The vector similarity module uses a separate vector dataset and has its own ApexBase-vs-DuckDB scoreboard; Apex-only buffered, memtable, materialization, and diagnostic paths are kept separate so semantics stay comparable.
-
-### Scoreboard
-
-| Scope | Metrics | Apex wins | Ties | Slower |
-|---|---:|---:|---:|---:|
-| Default fair (OLAP + OLTP) | 38 | 38 | 0 | 0 |
-| OLAP fair | 29 | 29 | 0 | 0 |
-| OLTP fair | 9 | 9 | 0 | 0 |
-| Vector similarity (ApexBase vs DuckDB) | 6 | 6 | 0 | 0 |
-
-Stock SQLite is not ranked in the vector table because the built-in `sqlite3` used here has no native vector distance/top-k functions in this harness.
-
-### Representative OLAP Gaps
-
-These are the easiest rows to scan if you want the shape of the result set quickly.
-
-| Metric | ApexBase | SQLite | DuckDB | Gap to best other |
-|---|---:|---:|---:|---|
-| COUNT(*) | 0.106 ms | 1.775 ms | 0.397 ms | 3.7x faster vs DuckDB |
-| SELECT * LIMIT 100 (warm cache) | 6 us | 0.107 ms | 0.236 ms | 17.8x faster vs SQLite |
-| Filtered LIMIT 100 (age>30) | 0.050 ms | 0.173 ms | 0.603 ms | 3.5x faster vs SQLite |
-| GROUP BY city (10 groups) | 0.060 ms | 60.108 ms | 2.399 ms | 40.0x faster vs DuckDB |
-| Window ROW_NUMBER PARTITION BY city | 0.622 ms | 99.086 ms | 12.809 ms | 20.6x faster vs DuckDB |
-
-### Representative OLTP Gaps
-
-| Metric | ApexBase | SQLite | DuckDB | Gap to best other |
-|---|---:|---:|---:|---|
-| Bulk Insert (N rows; default fair) | 53.948 ms | 197.464 ms | 35.84 s | 3.7x faster vs SQLite |
-| Point Lookup (SQL by ID) | 0.035 ms | 0.067 ms | 2.198 ms | 1.9x faster vs SQLite |
-| Retrieve Many (SQL, 100 IDs) | 0.175 ms | 0.317 ms | 3.942 ms | 1.8x faster vs SQLite |
-| FTS Index Build (name,city,category) | 103.738 ms | 246.588 ms | 790.703 ms | 2.4x faster vs SQLite |
-| FTS Search ('Electronics') | 0.160 ms | 5.700 ms | 14.644 ms | 35.6x faster vs SQLite |
-
-### Representative Vector Gaps
-
-SQLite is excluded here for one reason only: stock `sqlite3` in this harness has no native vector distance/top-k support.
-
-| Metric | ApexBase | DuckDB | Gap to DuckDB |
-|---|---:|---:|---|
-| TopK L2 | 3.58 ms | 26.46 ms | 7.4x faster |
-| TopK Cosine | 3.80 ms | 31.89 ms | 8.4x faster |
-| TopK Dot | 3.48 ms | 26.37 ms | 7.6x faster |
-| Batch TopK L2 (10 queries) | 23.18 ms | 266.92 ms | 11.5x faster |
-| Batch TopK Cosine (10 queries) | 23.24 ms | 322.07 ms | 13.9x faster |
-| Batch TopK Dot (10 queries) | 21.12 ms | 268.44 ms | 12.7x faster |
-
-### Throughput Snapshot
-
-Q/s uses a mixed analytical profile: `COUNT(*)`, two `GROUP BY` scans, and `Filtered LIMIT 100`, all materialized to Python rows.
-
-| Throughput metric | ApexBase | SQLite | DuckDB | Gap to best other |
-|---|---:|---:|---:|---|
-| OLAP Q/s (single thread) | 123,700.3 | 34.8 | 942.2 | 131.3x higher vs DuckDB |
-| OLAP Q/s (4 threads) | 125,196.3 | 126.6 | 2,776.8 | 45.1x higher vs DuckDB |
-
-### Hot-Path Latency Snapshot
-
-These tables are **not** part of the `38/38` fair scoreboard. They answer a different question: how fast is the already-loaded hot path, and what happens when durability or transaction semantics are made explicit?
-
-#### Default Microbenchmarks
-
-| Metric | ApexBase | SQLite | DuckDB | Gap to best other |
-|---|---:|---:|---:|---|
-| COUNT(*) (direct API) | 7.43 us | 1.243 ms | 0.132 ms | 17.8x faster vs DuckDB |
-| Point lookup (projected SQL) | 2.12 us | 2.99 us | 1.722 ms | 1.4x faster vs SQLite |
-| Retrieve 100 IDs (projected SQL) | 0.041 ms | 0.099 ms | 3.438 ms | 2.4x faster vs SQLite |
-| Insert 1 row (default fair) | 0.010 ms | 0.014 ms | 0.297 ms | 1.4x faster vs SQLite |
-| UPDATE by ID | 1.13 us | 4.23 us | 0.483 ms | 3.7x faster vs SQLite |
-| DELETE missing ID | 2.72 us | 3.81 us | 1.160 ms | 1.4x faster vs SQLite |
-
-#### Durable Fair Microbenchmarks
-
-| Metric | ApexBase | SQLite | DuckDB | Gap to best other |
-|---|---:|---:|---:|---|
-| Insert 1 row (durable fair) | 0.101 ms | 0.126 ms | 31.106 ms | 1.2x faster vs SQLite |
-| UPDATE by ID (durable fair) | 2.02 us | 6.53 us | 4.469 ms | 3.2x faster vs SQLite |
-
-#### Transaction Fair Microbenchmarks
-
-| Metric | ApexBase | SQLite | DuckDB | Gap to best other |
-|---|---:|---:|---:|---|
-| TXN empty (BEGIN+COMMIT; durable sync) | 3.29 us | 4.08 us | 0.148 ms | 1.2x faster vs SQLite |
-| TXN read COUNT(*) (COMMIT; durable sync) | 0.018 ms | 1.295 ms | 0.294 ms | 16.3x faster vs DuckDB |
-| TXN backlog string miss (COMMIT; 1500 preseed; durable sync) | 0.051 ms | 8.011 ms | 0.404 ms | 7.9x faster vs DuckDB |
-| TXN backlog COUNT(*) (COMMIT; 1500 preseed; durable sync) | 0.030 ms | 3.793 ms | 0.305 ms | 10.2x faster vs DuckDB |
-| TXN backlog INSERT+read-own-name (COMMIT; 1500 preseed; durable sync) | 0.262 ms | 8.073 ms | 33.522 ms | 30.8x faster vs SQLite |
-
-### Full Fair Tables
-
-For readability, the README keeps the competitive summary, representative gaps, and hot-path snapshots above instead of embedding all 38 fair rows inline.
-
-- Run `python benchmarks/bench_vs_sqlite_duckdb.py --rows 200000 --warmup 2 --iterations 3` to print the complete OLAP and OLTP fair tables.
-- Add `--output FILE.json` to export every raw metric, including the separate vector module, in machine-readable form.
-
-### OLTP Write Visibility
-
-ApexBase exposes two fast single-row append paths, and the benchmark keeps them out of the fair scoreboard because their visibility rules are Apex-specific:
-
-- **Memtable OLTP** is the default fast single-row path for schema-stable `store({...})` calls with `durability="fast"`. The writing client can read the row immediately, managed clients in the same Python process share the storage instance, and `flush()` / `close()` persists pending rows. A separate process sees those rows only after the writer flushes, closes, or reaches the auto-flush threshold.
-- **Buffered OLTP** is explicit: call `begin_buffered_writes()`, issue many single-row `store({...})` calls, then call `flush_buffered_writes()` or `end_buffered_writes(flush=True)`. Buffered rows are not visible until flushed.
-
-That separation is deliberate: the fair tables compare committed cross-engine behavior, while the Apex-only write modes remain visible as diagnostics instead of being mixed into the competitive summary.
-
-### Reproduce
-
-Use the same command as the snapshot above:
-
-```bash
-python benchmarks/bench_vs_sqlite_duckdb.py --rows 200000 --warmup 2 --iterations 3
-```
-
-Add `--skip-vector` if you want a tabular-only rerun without the separate vector module.
-
-For a larger stress run, increase `--rows` to `1000000`.
-
----
-
-## Server Protocols
-
-ApexBase ships two complementary server protocols for external access:
-
-| Protocol | Port | Best for | Binary / CLI |
-|----------|------|----------|--------------|
-| **PG Wire** | 5432 | DBeaver, psql, DataGrip, BI tools | `apexbase-server` |
-| **Arrow Flight** | 50051 | Python (pyarrow), Go, Java, Spark | `apexbase-flight` |
-
-### Combined Launcher (Both Servers at Once)
-
-```bash
-# Start PG Wire + Arrow Flight simultaneously
-apexbase-serve --dir /path/to/data
-
-# Custom ports
-apexbase-serve --dir /path/to/data --pg-port 5432 --flight-port 50051
-
-# Disable one server
-apexbase-serve --dir /path/to/data --no-flight   # PG Wire only
-apexbase-serve --dir /path/to/data --no-pg       # Arrow Flight only
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--dir`, `-d` | `.` | Directory containing `.apex` database files |
-| `--host` | `127.0.0.1` | Bind host for both servers |
-| `--pg-port` | `5432` | PostgreSQL Wire port |
-| `--flight-port` | `50051` | Arrow Flight gRPC port |
-| `--no-pg` | — | Disable PG Wire server |
-| `--no-flight` | — | Disable Arrow Flight server |
-
----
-
-## PostgreSQL Wire Protocol Server
-
-ApexBase includes a built-in PostgreSQL wire protocol server, allowing you to connect using **DBeaver**, **psql**, **DataGrip**, **pgAdmin**, **Navicat**, and any other tool that supports the PostgreSQL protocol.
-
-### Starting the Server
-
-**Method 1: Python CLI (after `pip install apexbase`)**
-
-```bash
-apexbase-server --dir /path/to/data --port 5432
-```
-
-Options:
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--dir`, `-d` | `.` | Directory containing `.apex` database files |
-| `--host` | `127.0.0.1` | Host to bind to (use `0.0.0.0` for remote access) |
-| `--port`, `-p` | `5432` | Port to listen on |
-
-**Method 2: Standalone Rust binary (no Python required)**
-
-```bash
-# Build
-cargo build --release --bin apexbase-server --no-default-features --features server
-
-# Run
-./target/release/apexbase-server --dir /path/to/data --port 5432
-```
-
-### Connecting with Database Tools
-
-The server emulates PostgreSQL 15.0, reports a `pg_catalog` and `information_schema` compatible metadata layer, and supports both `SimpleQuery` and `Extended Query` protocols (prepared statements; binary result format for psycopg3). No username or password is required (authentication is disabled).
-
-#### DBeaver
-
-1. **New Database Connection** → choose **PostgreSQL**
-2. Fill in connection details:
-   - **Host**: `127.0.0.1` (or the `--host` you specified)
-   - **Port**: `5432` (or the `--port` you specified)
-   - **Database**: `apexbase` (any value accepted)
-   - **Authentication**: select **No Authentication** or leave username/password empty
-3. Click **Test Connection** → **Finish**
-4. DBeaver will discover tables and columns automatically via `pg_catalog` / `information_schema`
-
-#### psql
-
-```bash
-psql -h 127.0.0.1 -p 5432 -d apexbase
-```
-
-#### DataGrip / IntelliJ IDEA
-
-1. **Database** tool window → **+** → **Data Source** → **PostgreSQL**
-2. Set **Host**, **Port**, **Database** as above; leave **User** and **Password** empty
-3. Click **Test Connection** → **OK**
-
-#### pgAdmin
-
-1. **Add New Server** → **General** tab: give it a name
-2. **Connection** tab: set **Host** and **Port**; leave **Username** as `postgres` (ignored) and **Password** empty
-3. **Save** — tables appear under **Databases > apexbase > Schemas > public > Tables**
-
-#### Navicat for PostgreSQL
-
-1. **Connection** → **PostgreSQL**
-2. Set **Host**, **Port**; leave **User** and **Password** blank
-3. **Test Connection** → **OK**
-
-#### Other Compatible Tools
-
-Any tool or library that speaks the PostgreSQL wire protocol (libpq) can connect, including:
-
-- **TablePlus**, **Beekeeper Studio**, **Heidisql**
-- **Python**: `psycopg2` / `asyncpg`
-- **Node.js**: `pg` (`node-postgres`)
-- **Go**: `pgx` / `lib/pq`
-- **Rust**: `tokio-postgres` / `sqlx`
-- **Java**: JDBC PostgreSQL driver
-
-Example with `psycopg2`:
-
-```python
-import psycopg2
-
-conn = psycopg2.connect(host="127.0.0.1", port=5432, dbname="apexbase")
-cur = conn.cursor()
-cur.execute("SELECT * FROM users LIMIT 10")
-print(cur.fetchall())
-conn.close()
-```
-
-### Supported SQL over Wire Protocol
-
-The wire protocol server passes SQL directly to the ApexBase query engine. All SQL features listed in [Usage Guide](#usage-guide) are available, including JOINs, CTEs, window functions, transactions, and DDL.
-
-### Metadata Compatibility
-
-The server implements a `pg_catalog` compatibility layer that responds to common catalog queries:
-
-| Catalog / View | Purpose |
-|----------------|---------|
-| `pg_catalog.pg_namespace` | Schema listing |
-| `pg_catalog.pg_database` | Database listing |
-| `pg_catalog.pg_class` | Table discovery |
-| `pg_catalog.pg_attribute` | Column metadata |
-| `pg_catalog.pg_type` | Type information |
-| `pg_catalog.pg_settings` | Server settings |
-| `information_schema.tables` | Standard table listing |
-| `information_schema.columns` | Standard column listing |
-| `SET` / `SHOW` statements | Client configuration probes |
-
-This enables GUI tools to browse tables, inspect columns, and display data types without modification.
-
-### Supported Protocol Features
-
-| Feature | Status |
-|---------|--------|
-| Simple Query Protocol | ✅ Fully supported |
-| Extended Query Protocol (prepared statements) | ✅ Supported — schema cached, binary format for psycopg3 |
-| Cross-database SQL (`db.table`) | ✅ Supported — `USE dbname` / `\c dbname` to switch context |
-| `pg_catalog` / `information_schema` | ✅ Compatible layer for GUI tools |
-| All ApexBase SQL (JOINs, CTEs, window functions, DDL) | ✅ Full pass-through to query engine |
-
-### Limitations
-
-- **Authentication** is not implemented — the server accepts all connections regardless of username/password
-- **SSL/TLS** is not supported — use an SSH tunnel (`ssh -L 5432:127.0.0.1:5432 user@host`) for remote access
-
----
-
-## Arrow Flight gRPC Server
-
-Arrow Flight sends Arrow IPC RecordBatch directly over gRPC (HTTP/2), bypassing per-row text serialization entirely. It is **4–7× faster than PG wire for large result sets** (10K+ rows).
-
-| Query | PG Wire | Arrow Flight | Speedup |
-|-------|---------|--------------|--------|
-| SELECT 10K rows | 5.1ms | 0.7ms | **7× faster** |
-| BETWEEN (~33K rows) | 22ms | 5.6ms | **4× faster** |
-| Single row / point lookup | ~7.5ms | ~7.9ms | equal |
-
-### Starting the Flight Server
-
-**Python CLI:**
-
-```bash
-apexbase-flight --dir /path/to/data --port 50051
-```
-
-**Standalone Rust binary:**
-
-```bash
-cargo build --release --bin apexbase-flight --no-default-features --features flight
-./target/release/apexbase-flight --dir /path/to/data --port 50051
-```
-
-### Python Client
-
-```python
-import pyarrow.flight as fl
-import pandas as pd
-
-client = fl.connect("grpc://127.0.0.1:50051")
-
-# SELECT — returns Arrow Table
-table = client.do_get(fl.Ticket(b"SELECT * FROM users LIMIT 10000")).read_all()
-df = table.to_pandas()              # zero-copy to pandas
-pl_df = pl.from_arrow(table)        # zero-copy to polars
-
-# DML / DDL
-client.do_action(fl.Action("sql", b"INSERT INTO users (name, age) VALUES ('Alice', 30)"))
-client.do_action(fl.Action("sql", b"CREATE TABLE logs (event STRING, ts INT64)"))
-
-# List available actions
-for action in client.list_actions():
-    print(action.type, "—", action.description)
-```
-
-### When to Use Arrow Flight vs PG Wire
-
-| Scenario | Recommendation |
-|----------|---------------|
-| DBeaver / Tableau / BI tools | **PG Wire** (only option) |
-| Python + small queries (<100 rows) | **Native API** (fastest, in-process) |
-| Python + large queries (10K+ rows, remote) | **Arrow Flight** (4–7× faster than PG wire) |
-| Go / Java / Spark workers | **Arrow Flight** (native Arrow support) |
-| Local Python (same machine) | **Native API** (`ApexClient.execute()`) |
-
-### PyO3 Python API
-
-Both servers are also accessible as blocking Python functions (released GIL):
-
-```python
-import threading
-from apexbase._core import start_pg_server, start_flight_server
-
-t1 = threading.Thread(target=start_pg_server,     args=("/data", "0.0.0.0", 5432),  daemon=True)
-t2 = threading.Thread(target=start_flight_server, args=("/data", "0.0.0.0", 50051), daemon=True)
-t1.start()
-t2.start()
-```
-
----
-
-## Rust Native API
-
-ApexBase can be used directly from Rust as a zero-overhead embedded database — no Python, no FFI, no server process required. The full SQL engine, Arrow-native query results, SIMD vector search, FTS, and transactions are all available from the same Rust API.
-
-### Cargo Dependency
-
-```toml
-[dependencies]
-# Local checkout
-apexbase = { path = "path/to/ApexBase", default-features = false }
-
-# Git
-apexbase = { git = "https://github.com/BirchKwok/ApexBase.git", default-features = false }
-```
-
-`default-features = false` disables PyO3/numpy and significantly reduces compile time. Add `features = ["server"]` or `features = ["flight"]` if you also need the wire protocol servers.
-
-### Rust Quick Start
-
-```rust
-use apexbase::embedded::{ApexDB, Row};
-use apexbase::data::Value;
-use apexbase::storage::DurabilityLevel;
-use apexbase::storage::on_demand::ColumnType;
-use std::collections::HashMap;
-
-fn main() -> apexbase::Result<()> {
-    // Open (or create) a database
-    let db = ApexDB::builder("./data")
-        .durability(DurabilityLevel::Fast)
-        .build()?;
-
-    // Create a table with a predefined schema
-    let users = db.create_table_with_schema("users", &[
-        ("name".to_string(),  ColumnType::String),
-        ("age".to_string(),   ColumnType::Int64),
-        ("score".to_string(), ColumnType::Float64),
-        ("city".to_string(),  ColumnType::String),
-    ])?;
-
-    // Insert rows
-    let id = users.insert([
-        ("name".to_string(),  Value::String("Alice".to_string())),
-        ("age".to_string(),   Value::Int64(30)),
-        ("score".to_string(), Value::Float64(92.5)),
-        ("city".to_string(),  Value::String("Beijing".to_string())),
-    ].into_iter().collect())?;
-
-    // Batch insert 1 000 rows
-    let bulk: Vec<Row> = (0..1_000i64).map(|i| {
-        [("name".to_string(),  Value::String(format!("user_{i}"))),
-         ("age".to_string(),   Value::Int64(20 + i % 50)),
-         ("score".to_string(), Value::Float64(50.0 + (i % 50) as f64)),
-         ("city".to_string(),  Value::String(if i % 2 == 0 { "A".to_string() } else { "B".to_string() })),
-        ].into_iter().collect()
-    }).collect();
-    users.insert_batch(&bulk)?;
-
-    // Full SQL query → Arrow RecordBatch
-    let rs = users.execute(
-        "SELECT city, COUNT(*) AS n, AVG(score) AS avg
-         FROM users GROUP BY city ORDER BY n DESC"
-    )?;
-    let batch = rs.to_record_batch()?;
-    println!("{} rows × {} columns", batch.num_rows(), batch.num_columns());
-
-    // Or Vec<HashMap<String, Value>>
-    let rows = users.execute("SELECT * FROM users WHERE age > 28 LIMIT 5")?.to_rows()?;
-    for row in &rows {
-        println!("{:?}", row.get("name"));
-    }
-
-    // Point lookup by _id
-    if let Some(row) = users.retrieve(id)? {
-        println!("Retrieved: {:?}", row.get("name"));
-    }
-
-    // O(1) row count
-    println!("Total rows: {}", users.count()?);
-
-    // Schema changes
-    users.add_column("active", apexbase::data::DataType::Bool)?;
-    println!("Columns: {:?}", users.columns()?);
-
-    Ok(())
-}
-```
-
-Run the full working example:
-
-```bash
-cargo run --example embedded --no-default-features
-```
-
-### Key Rust Types
-
-| Type | Import path | Description |
-|------|-------------|-------------|
-| `ApexDB` | `apexbase::embedded::ApexDB` | Database handle — `Clone + Send + Sync` |
-| `ApexDBBuilder` | `apexbase::embedded::ApexDB` (via `ApexDB::builder`) | Builder with durability / drop options |
-| `Table` | `apexbase::embedded::Table` | Table-scoped operations — `Clone + Send + Sync` |
-| `ResultSet` | `apexbase::embedded::ResultSet` | Query result (Arrow RecordBatch or scalar) |
-| `Row` | `apexbase::embedded::Row` | `HashMap<String, Value>` |
-| `Value` | `apexbase::data::Value` | `Int64` / `Float64` / `String` / `Bool` / `Binary` / `FixedList` / `Null` |
-| `ColumnType` | `apexbase::storage::on_demand::ColumnType` | Schema type for `create_table_with_schema` |
-| `DataType` | `apexbase::data::DataType` | Schema type for `add_column` / `schema()` |
-| `DurabilityLevel` | `apexbase::storage::DurabilityLevel` | `Fast` / `Safe` / `Max` |
-
-For the full Rust API reference — all methods, transactions, FTS, vector search, concurrency patterns, and performance notes — see [`docs/RUST_EMBEDDED_API.md`](docs/RUST_EMBEDDED_API.md).
-
----
-
-## Architecture
-
-```
-Python (ApexClient)
-  |
-  |-- Arrow IPC / columnar dict --------> ResultView (Pandas / Polars / PyArrow)
-  |
-Rust Core (PyO3 bindings)
-  |
-  +-- SQL Parser -----> Query Planner -----> Query Executor
-  |                                              |
-  |   +-- JIT Compiler (Cranelift)               |
-  |   +-- Expression Evaluator (70+ functions)   |
-  |   +-- Window Function Engine                 |
-  |                                              |
-  +-- Storage Engine                             |
-  |     +-- V4 Row Group Format (.apex)          |
-  |     +-- DeltaStore (cell-level updates)      |
-  |     +-- WAL (write-ahead log)                |
-  |     +-- Mmap on-demand reads                 |
-  |     +-- LZ4 / Zstd compression              |
-  |     +-- Dictionary encoding                  |
-  |                                              |
-  +-- Index Manager (B-Tree, Hash)               |
-  +-- TxnManager (OCC + MVCC)                    |
-  +-- NanoFTS (full-text search)                  |
-  +-- PG Wire Protocol Server (pgwire)             |
-  |   +-- DBeaver / psql / DataGrip / pgAdmin      |
-  |   +-- pg_catalog & information_schema compat    |
-  |                                                 |
-  +-- Arrow Flight gRPC Server (tonic + HTTP/2)     |
-      +-- pyarrow.flight / Go / Java / Spark        |
-      +-- Arrow IPC — zero serialization overhead   |
-```
-
-### Storage Format
-
-ApexBase uses a custom V4 Row Group format:
-
-- Each table is a single `.apex` file containing a header, row groups, and a footer
-- Row groups store columns contiguously with per-column compression (LZ4 or Zstd)
-- Low-cardinality string columns are dictionary-encoded on disk
-- Null bitmaps are stored per column per row group
-- A DeltaStore file (`.deltastore`) holds cell-level updates that are merged on read and compacted automatically
-- WAL records provide crash recovery with idempotent replay
-
-### Query Execution
-
-- The SQL parser produces an AST that the query planner analyzes for optimization strategy
-- Fast paths bypass the full executor for common patterns (COUNT(\*), SELECT \* LIMIT N, point lookups, single-column GROUP BY)
-- Arrow RecordBatch is the internal data representation; results flow to Python via Arrow IPC with zero-copy when possible
-- Repeated identical read queries are served from an in-process result cache
-
----
-
-## API Reference
-
-### ApexClient
-
-**Constructor**
-
-```python
-ApexClient(
-    dirpath="./data",           # data directory
-    drop_if_exists=False,       # clear existing data on open
-    batch_size=1000,            # batch size for operations
-    enable_cache=True,          # enable query cache
-    cache_size=10000,           # cache capacity
-    prefer_arrow_format=True,   # prefer Arrow format for results
-    durability="fast",          # "fast" | "safe" | "max"
-)
-```
-
-**Database Management**
-
-| Method | Description |
-|--------|-------------|
-| `use_database(database='default')` | Switch to a named database (creates it if needed) |
-| `use(database='default', table=None)` | Switch database and optionally select/create a table |
-| `list_databases()` | List all databases (`'default'` always included) |
-| `current_database` | Property: current database name |
-
-**Table Management**
-
-| Method | Description |
-|--------|-------------|
-| `create_table(name, schema=None)` | Create a new table, optionally with pre-defined schema |
-| `drop_table(name)` | Drop a table |
-| `use_table(name)` | Switch active table |
-| `list_tables()` | List all tables in the current database |
-| `current_table` | Property: current table name |
-
-**Temporary Tables**
-
-| Method | Description |
-|--------|-------------|
-| `register_temp_table(name, file_path)` | Parse a CSV/JSON/Parquet file and register as a native temp table |
-| `drop_temp_table(name)` | Drop a temp table |
-
-**Data Storage**
-
-| Method | Description |
-|--------|-------------|
-| `store(data)` | Store data (dict, list, DataFrame, Arrow Table) |
-| `from_pandas(df, table_name=None)` | Import from pandas DataFrame |
-| `from_polars(df, table_name=None)` | Import from polars DataFrame |
-| `from_pyarrow(table, table_name=None)` | Import from PyArrow Table |
-
-**Data Retrieval**
-
-| Method | Description |
-|--------|-------------|
-| `execute(sql)` | Execute SQL statement(s) |
-| `query(where, limit)` | Query with WHERE expression |
-| `retrieve(id)` | Get record by \_id |
-| `retrieve_many(ids)` | Get multiple records by \_id |
-| `retrieve_all()` | Get all records |
-| `count_rows(table)` | Count rows in table |
-
-**Data Modification**
-
-| Method | Description |
-|--------|-------------|
-| `replace(id, data)` | Replace a record |
-| `batch_replace({id: data})` | Batch replace records |
-| `delete(id)` or `delete([ids])` | Delete record(s) |
-
-**Column Operations**
-
-| Method | Description |
-|--------|-------------|
-| `add_column(name, type)` | Add a column |
-| `drop_column(name)` | Drop a column |
-| `rename_column(old, new)` | Rename a column |
-| `get_column_dtype(name)` | Get column data type |
-| `list_fields()` | List all fields |
-
-**Full-Text Search**
-
-| Method | Description |
-|--------|-------------|
-| `init_fts(fields, lazy_load, cache_size)` | Initialize FTS |
-| `search_text(query)` | Search documents |
-| `fuzzy_search_text(query)` | Fuzzy search |
-| `search_and_retrieve(query, limit, offset)` | Search and return records |
-| `search_and_retrieve_top(query, n)` | Top N results |
-| `get_fts_stats()` | FTS statistics |
-| `disable_fts()` / `drop_fts()` | Disable or drop FTS |
-
-**Vector Search**
-
-| Method | Description |
-|--------|-------------|
-| `topk_distance(col, query, k=10, metric='l2', id_col='_id', dist_col='dist')` | Single-query TopK: returns `ResultView` with id and distance columns |
-| `batch_topk_distance(col, queries, k=10, metric='l2')` | Batch TopK: `ndarray` of shape `(N, k, 2)` — ids and distances |
-
-**Utility**
-
-| Method | Description |
-|--------|-------------|
-| `flush()` | Flush data to disk |
-| `set_auto_flush(rows, bytes)` | Set auto-flush thresholds |
-| `get_auto_flush()` | Get auto-flush config |
-| `estimate_memory_bytes()` | Estimate memory usage |
-| `close()` | Close the client |
-
-### ResultView
-
-| Method / Property | Description |
-|-------------------|-------------|
-| `to_pandas(zero_copy=True)` | Convert to pandas DataFrame |
-| `to_polars()` | Convert to polars DataFrame |
-| `to_arrow()` | Convert to PyArrow Table |
-| `to_dict()` | Convert to list of dicts |
-| `scalar()` | Get single scalar value |
-| `first()` | Get first row as dict |
-| `get_ids(return_list=False)` | Get record IDs |
-| `shape` | (rows, columns) |
-| `columns` | Column names |
-| `__len__()` | Row count |
-| `__iter__()` | Iterate over rows |
-| `__getitem__(idx)` | Index access |
-
----
+Benchmarks are workload-sensitive. See the full reproducible setup in the [Performance documentation](https://birchkwok.github.io/ApexBase/latest/performance/).
 
 ## Documentation
 
-The documentation source lives in the `docs/` directory and is built with MkDocs Material.
+**Start here:** <https://birchkwok.github.io/ApexBase/>
 
-- Documentation site: <https://birchkwok.github.io/ApexBase/>
-- Local preview: `python -m pip install -r docs/requirements.txt && python -m mkdocs serve`
-- Deployment: versioned GitHub Pages workflow in `.github/workflows/docs.yml`
+| Goal | Page |
+| --- | --- |
+| **Get running quickly** | [Installation](https://birchkwok.github.io/ApexBase/latest/installation/) and [Quick Start](https://birchkwok.github.io/ApexBase/latest/QUICK_START/) |
+| **Understand the model** | [Core Concepts](https://birchkwok.github.io/ApexBase/latest/concepts/) |
+| **Use the Python API** | [Python Client Guide](https://birchkwok.github.io/ApexBase/latest/user-guide/python-client/) and [API Reference](https://birchkwok.github.io/ApexBase/latest/API_REFERENCE/) |
+| **Write SQL** | [SQL Guide](https://birchkwok.github.io/ApexBase/latest/user-guide/sql/) |
+| **Import files and DataFrames** | [Data Import](https://birchkwok.github.io/ApexBase/latest/user-guide/data-import/) |
+| **Use database tools or Arrow clients** | [Server Protocols](https://birchkwok.github.io/ApexBase/latest/user-guide/server-protocols/) |
+| **Search text or vectors** | [Full-Text Search](https://birchkwok.github.io/ApexBase/latest/FTS_GUIDE/) and [Float16 Vectors](https://birchkwok.github.io/ApexBase/latest/FLOAT16_VECTOR_GUIDE/) |
+| **Embed from Rust** | [Rust Embedded API](https://birchkwok.github.io/ApexBase/latest/RUST_EMBEDDED_API/) |
+
+## Interfaces
+
+```bash
+# Embedded Python
+python -c "from apexbase import ApexClient; print(ApexClient)"
+
+# PostgreSQL Wire + Arrow Flight together
+apexbase-serve --dir ./data
+
+# Individual protocol servers
+apexbase-server --dir ./data --port 5432
+apexbase-flight --dir ./data --port 50051
+```
 
 ## License
 

@@ -99,6 +99,7 @@ nav:
   - Reference:
       - Python API: API_REFERENCE.md
       - Rust Embedded API: RUST_EMBEDDED_API.md
+  - Performance: performance.md
   - Features:
       - Full-Text Search: FTS_GUIDE.md
       - Float16 Vectors: FLOAT16_VECTOR_GUIDE.md

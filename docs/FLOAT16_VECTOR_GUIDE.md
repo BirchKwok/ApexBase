@@ -53,7 +53,7 @@ Accepted type name aliases (all equivalent):
 
 ### Recommended: batch store with numpy arrays
 
-Always use a **batch call** (two or more records) so that the columnar storage path (`_store_columnar`) handles the encoding.  The fixedlist path converts numpy arrays to float32 bytes and then the storage layer applies a single f32→f16 conversion — giving correct float16 data.
+Use a **batch call** for best throughput. The fixedlist path converts source vectors to float32 bytes and then the storage layer applies a single f32→f16 conversion, giving correct float16 data.
 
 ```python
 import numpy as np
@@ -61,38 +61,26 @@ import numpy as np
 n, dim = 50_000, 128
 vecs = np.random.rand(n, dim).astype(np.float32)  # source in float32
 
-# Batch list-of-dicts — goes through _store_columnar (correct)
+# Batch list-of-dicts
 client.store([{"doc_id": str(i), "vec": vecs[i]} for i in range(n)])
 
-# Columnar dict — also correct and the fastest path
+# Columnar dict — fastest for large homogeneous batches
 client.store({
     "doc_id": [str(i) for i in range(n)],
     "vec":    [vecs[i] for i in range(n)],
 })
 ```
 
-### numpy float16 source data
+### numpy float16 and Python-list source data
 
-If your upstream model already produces float16 numpy arrays they are accepted directly:
+If your upstream model already produces float16 numpy arrays, they are accepted directly. Numeric Python lists/tuples are also accepted, including single-record writes.
 
 ```python
 vecs_f16 = np.random.rand(n, dim).astype(np.float16)
 client.store([{"doc_id": str(i), "vec": vecs_f16[i]} for i in range(n)])
-```
 
-### Important: avoid single-record stores
-
-The single-record code path (`client.store([single_dict])` with exactly one element) encodes vectors as raw float32 bytes before reaching the float16 conversion logic.  This produces incorrect data in `FLOAT16_VECTOR` columns.
-
-```python
-# ❌ Do NOT do this for FLOAT16_VECTOR columns
-client.store([{"doc_id": "a", "vec": vec}])   # single element — wrong encoding
-
-# ✅ Use batch (len >= 2) or columnar dict
-client.store([
-    {"doc_id": "a", "vec": vec_a},
-    {"doc_id": "b", "vec": vec_b},
-])
+# Single-record writes are correct too
+client.store({"doc_id": "one", "vec": [0.1, 0.2, 0.3, 0.4]})
 ```
 
 ---

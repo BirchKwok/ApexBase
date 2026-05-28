@@ -246,6 +246,23 @@ pub fn f16_bytes_to_f32_into(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// Decode raw little-endian f32 bytes into owned f32 values.
+pub fn f32_le_bytes_to_values(src: &[u8]) -> Vec<f32> {
+    src.chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+/// Decode raw little-endian f16 bytes into owned f32 values.
+pub fn f16_bytes_to_f32_values(src: &[u8]) -> Vec<f32> {
+    src.chunks_exact(2)
+        .map(|chunk| {
+            let bits = u16::from_le_bytes(chunk.try_into().unwrap());
+            f16_to_f32(bits)
+        })
+        .collect()
+}
+
 impl ColumnData {
     pub fn new(dtype: ColumnType) -> Self {
         match dtype {
@@ -1364,4 +1381,3 @@ impl ColumnData {
         }
     }
 }
-

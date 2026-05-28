@@ -1021,6 +1021,184 @@ class TestFTSSQLSync:
 
             client.close()
 
+    def test_create_fts_index_backfills_python_stored_rows(self):
+        """CREATE FTS INDEX should backfill rows written through the Python store API."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("articles")
+            client.store([
+                {
+                    "title": "Rust-powered local analytics",
+                    "body": "A columnar embedded database for fast SQL and search.",
+                    "category": "database",
+                    "views": 4200,
+                },
+                {
+                    "title": "Vector retrieval cookbook",
+                    "body": "Hybrid full-text and semantic vector search for RAG.",
+                    "category": "ai",
+                    "views": 6100,
+                },
+                {
+                    "title": "SQLite migration notes",
+                    "body": "Move local applications to an analytical embedded store.",
+                    "category": "database",
+                    "views": 2600,
+                },
+            ])
+
+            result = client.execute("CREATE FTS INDEX ON articles(title, body)")
+            status = result.to_pandas()["status"][0]
+            assert "3 rows indexed" in status
+
+            df = client.execute(
+                "SELECT title FROM articles WHERE MATCH('database')"
+            ).to_pandas()
+            assert "Rust-powered local analytics" in set(df["title"])
+
+            client.close()
+
+    def test_sql_created_fts_index_tracks_python_store(self):
+        """A SQL-created FTS index should be active for subsequent Python store() writes."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("articles")
+            client.execute("CREATE FTS INDEX ON articles(title, body)")
+
+            client.store([
+                {
+                    "title": "Embedded search with vectors",
+                    "body": "ApexBase combines SQL filters, full-text search, and vector ranking.",
+                    "category": "ai",
+                    "views": 7300,
+                },
+                {
+                    "title": "Plain metrics",
+                    "body": "Daily operational counters and dashboards.",
+                    "category": "ops",
+                    "views": 900,
+                },
+            ])
+
+            df = client.execute(
+                "SELECT title FROM articles WHERE MATCH('vector')"
+            ).to_pandas()
+            assert len(df) == 1
+            assert df.iloc[0]["title"] == "Embedded search with vectors"
+
+            client.close()
+
+    def test_hybrid_fts_sql_vector_query_from_python_store(self):
+        """README-style hybrid FTS + SQL filter + vector ranking should work."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("articles")
+            client.execute("CREATE FTS INDEX ON articles(title, body)")
+            client.store([
+                {
+                    "title": "ApexBase hybrid search",
+                    "body": "Embedded database with SQL, full-text search, and vector retrieval.",
+                    "category": "database",
+                    "views": 8000,
+                    "embedding": [0.10, 0.82, 0.20],
+                },
+                {
+                    "title": "Dashboard metrics",
+                    "body": "Fast local analytics for application counters.",
+                    "category": "database",
+                    "views": 2100,
+                    "embedding": [0.20, 0.10, 0.70],
+                },
+                {
+                    "title": "Model serving guide",
+                    "body": "Semantic retrieval pipelines for AI applications.",
+                    "category": "ai",
+                    "views": 6400,
+                    "embedding": [0.12, 0.78, 0.25],
+                },
+            ])
+
+            rows = client.execute(
+                """
+                SELECT
+                  title,
+                  views,
+                  cosine_distance(embedding, [0.12, 0.78, 0.25]) AS semantic_dist
+                FROM articles
+                WHERE MATCH('embedded database vector')
+                  AND category = 'database'
+                  AND views > 3000
+                ORDER BY semantic_dist
+                LIMIT 3
+                """
+            ).to_dict()
+
+            assert len(rows) == 1
+            assert rows[0]["title"] == "ApexBase hybrid search"
+
+            client.close()
+
+    def test_drop_if_exists_recreates_hybrid_float16_fts_table_in_process(self):
+        """drop_if_exists must evict stale Rust caches before recreating vector+FTS tables."""
+        records = [
+            {
+                "title": "Rust-powered local analytics",
+                "body": "A columnar embedded database for fast SQL and search.",
+                "category": "database",
+                "views": 4200,
+                "embedding": [0.10, 0.82, 0.20],
+            },
+            {
+                "title": "Hybrid retrieval for RAG",
+                "body": "Combine full-text recall, SQL filters, and semantic vector ranking.",
+                "category": "ai",
+                "views": 6100,
+                "embedding": [0.16, 0.74, 0.58],
+            },
+            {
+                "title": "SQLite migration notes",
+                "body": "Move local applications to an analytical embedded store.",
+                "category": "database",
+                "views": 2600,
+                "embedding": [0.80, 0.12, 0.10],
+            },
+        ]
+
+        def run_once(temp_dir):
+            with ApexClient(dirpath=temp_dir, drop_if_exists=True) as client:
+                client.execute("""
+                    CREATE TABLE articles (
+                        title TEXT,
+                        body TEXT,
+                        category TEXT,
+                        views INT,
+                        embedding FLOAT16_VECTOR
+                    )
+                """)
+                client.use_table("articles")
+                client.store(records)
+                client.execute("CREATE FTS INDEX ON articles(title, body)")
+
+                rows = client.execute("""
+                    SELECT
+                        title,
+                        category,
+                        views,
+                        cosine_distance(embedding, [0.12, 0.78, 0.25]) AS semantic_dist
+                    FROM articles
+                    WHERE MATCH('database')
+                      AND category = 'database'
+                      AND views > 3000
+                    ORDER BY semantic_dist
+                    LIMIT 5
+                """).to_dict()
+                assert len(rows) == 1
+                assert rows[0]["title"] == "Rust-powered local analytics"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_once(temp_dir)
+            run_once(temp_dir)
+
     def test_create_fts_index_on_empty_table(self):
         """CREATE FTS INDEX on an empty table should succeed with 0 rows indexed."""
         with tempfile.TemporaryDirectory() as temp_dir:

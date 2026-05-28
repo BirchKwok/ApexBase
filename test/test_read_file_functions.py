@@ -258,6 +258,10 @@ class TestReadJson:
         rv = self.c.execute(f"SELECT COUNT(*) AS cnt FROM read_json('{self.ndjson}')")
         assert rv.first()['cnt'] == 5
 
+    def test_count_star_numeric_filter(self):
+        rv = self.c.execute(f"SELECT COUNT(*) AS cnt FROM read_json('{self.ndjson}') WHERE age > 30")
+        assert rv.first()['cnt'] == 1
+
     def test_group_by(self):
         rv = self.c.execute(
             f"SELECT city, COUNT(*) AS cnt FROM read_json('{self.ndjson}') GROUP BY city ORDER BY city"

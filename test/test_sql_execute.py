@@ -697,6 +697,24 @@ class TestBasicSQLExecute:
 
             client.close()
 
+    def test_execute_point_lookup_cache_invalidates_after_replace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+
+            client.store({"name": "Alice", "age": 25})
+
+            sql = "SELECT * FROM default WHERE _id = 1"
+            assert client.execute(sql).to_dict()[0]["name"] == "Alice"
+            assert client.execute(sql).to_dict()[0]["name"] == "Alice"
+
+            assert client.replace(1, {"name": "Alicia", "age": 26})
+            row = client.execute(sql).to_dict()[0]
+            assert row["name"] == "Alicia"
+            assert row["age"] == 26
+
+            client.close()
+
     def test_execute_projected_id_in_lookup_respects_projection(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = ApexClient(dirpath=temp_dir)

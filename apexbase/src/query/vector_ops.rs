@@ -14,6 +14,7 @@
 //! per-vector kernels are written to enable LLVM AVX-2 auto-vectorisation
 //! (8×f32 per register) at opt-level=3.
 
+use std::borrow::Cow;
 use std::io;
 use std::sync::Arc;
 
@@ -67,23 +68,30 @@ fn rsqrt_positive_f32(x: f32) -> f32 {
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Reinterpret a byte slice as an f32 slice (zero-copy).
-///
-/// # Safety
-/// Requires `bytes.len() % 4 == 0` and the bytes to be valid f32 LE values.
+/// Read little-endian f32 bytes as a slice when aligned, otherwise copy safely.
 #[inline(always)]
-unsafe fn bytes_to_f32(bytes: &[u8]) -> &[f32] {
-    std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4)
+fn bytes_to_f32(bytes: &[u8]) -> Option<Cow<'_, [f32]>> {
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let len = bytes.len() / 4;
+    if bytes.as_ptr().align_offset(std::mem::align_of::<f32>()) == 0 {
+        Some(Cow::Borrowed(unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, len)
+        }))
+    } else {
+        Some(Cow::Owned(
+            bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect(),
+        ))
+    }
 }
 
 /// Parse query-vector bytes (either raw f32 LE or raw f64 LE) to a `Vec<f32>`.
 pub fn bytes_to_query_vec_f32(bytes: &[u8]) -> Option<Vec<f32>> {
-    if bytes.len() % 4 == 0 {
-        let floats = unsafe { bytes_to_f32(bytes) };
-        Some(floats.to_vec())
-    } else {
-        None
-    }
+    bytes_to_f32(bytes).map(|floats| floats.into_owned())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,6 +104,13 @@ pub fn bytes_to_query_vec_f32(bytes: &[u8]) -> Option<Vec<f32>> {
 /// (~4 cycles on NEON, ~5 on AVX2). LLVM maps each accumulator to a
 /// separate SIMD register, sustaining near-peak multiply-add throughput.
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
+pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
+    unsafe { l2_squared_neon(a, b) }
+}
+
+#[inline(always)]
+#[cfg(not(target_arch = "aarch64"))]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -250,6 +265,13 @@ pub fn linf_distance(a: &[f32], b: &[f32]) -> f32 {
 /// 4 independent accumulators hide FMA latency and enable
 /// out-of-order execution across 4 NEON/AVX2 multiply-add pipelines.
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
+pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
+    unsafe { inner_product_neon(a, b) }
+}
+
+#[inline(always)]
+#[cfg(not(target_arch = "aarch64"))]
 pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -289,6 +311,13 @@ pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
 /// batch cosine can reuse a row norm across multiple queries without falling
 /// back to iterator-heavy code.
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
+pub fn l2_norm_squared(a: &[f32]) -> f32 {
+    unsafe { l2_norm_squared_neon(a) }
+}
+
+#[inline(always)]
+#[cfg(not(target_arch = "aarch64"))]
 pub fn l2_norm_squared(a: &[f32]) -> f32 {
     let n = a.len();
     let mut s0 = 0.0f32;
@@ -744,6 +773,13 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// `sqrt + div`, saving ~11 cycles per call.
 /// `nb_recip` is pre-computed once per query by `DistanceComputer::new`.
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
+pub fn cosine_similarity_fused(a: &[f32], b: &[f32], nb_recip: f32) -> f32 {
+    unsafe { cosine_fused_neon(a, b, nb_recip) }
+}
+
+#[inline(always)]
+#[cfg(not(target_arch = "aarch64"))]
 pub fn cosine_similarity_fused(a: &[f32], b: &[f32], nb_recip: f32) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -812,6 +848,175 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 // implementations are selected at runtime via is_x86_feature_detected!, giving
 // full 256-bit SIMD throughput on Windows/Linux x86_64 with AVX2 support
 // (Intel Haswell+, AMD Excavator+).
+
+// ─────────────────────────────────────────────────────────────────────────────
+// aarch64 NEON f32 distance kernels (Apple Silicon / ARM servers)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn l2_squared_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let n = a.len().min(b.len());
+    let chunks = n / 16;
+    let (mut acc0, mut acc1, mut acc2, mut acc3) = (
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+    );
+    for i in 0..chunks {
+        let o = i * 16;
+        let a0 = vld1q_f32(a.as_ptr().add(o));
+        let a1 = vld1q_f32(a.as_ptr().add(o + 4));
+        let a2 = vld1q_f32(a.as_ptr().add(o + 8));
+        let a3 = vld1q_f32(a.as_ptr().add(o + 12));
+        let b0 = vld1q_f32(b.as_ptr().add(o));
+        let b1 = vld1q_f32(b.as_ptr().add(o + 4));
+        let b2 = vld1q_f32(b.as_ptr().add(o + 8));
+        let b3 = vld1q_f32(b.as_ptr().add(o + 12));
+        let d0 = vsubq_f32(a0, b0);
+        let d1 = vsubq_f32(a1, b1);
+        let d2 = vsubq_f32(a2, b2);
+        let d3 = vsubq_f32(a3, b3);
+        acc0 = vfmaq_f32(acc0, d0, d0);
+        acc1 = vfmaq_f32(acc1, d1, d1);
+        acc2 = vfmaq_f32(acc2, d2, d2);
+        acc3 = vfmaq_f32(acc3, d3, d3);
+    }
+    let pair0 = vaddq_f32(acc0, acc1);
+    let pair1 = vaddq_f32(acc2, acc3);
+    let mut s = vaddvq_f32(vaddq_f32(pair0, pair1));
+    for i in (chunks * 16)..n {
+        let d = *a.get_unchecked(i) - *b.get_unchecked(i);
+        s += d * d;
+    }
+    s
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn inner_product_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let n = a.len().min(b.len());
+    let chunks = n / 16;
+    let (mut acc0, mut acc1, mut acc2, mut acc3) = (
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+    );
+    for i in 0..chunks {
+        let o = i * 16;
+        let a0 = vld1q_f32(a.as_ptr().add(o));
+        let a1 = vld1q_f32(a.as_ptr().add(o + 4));
+        let a2 = vld1q_f32(a.as_ptr().add(o + 8));
+        let a3 = vld1q_f32(a.as_ptr().add(o + 12));
+        let b0 = vld1q_f32(b.as_ptr().add(o));
+        let b1 = vld1q_f32(b.as_ptr().add(o + 4));
+        let b2 = vld1q_f32(b.as_ptr().add(o + 8));
+        let b3 = vld1q_f32(b.as_ptr().add(o + 12));
+        acc0 = vfmaq_f32(acc0, a0, b0);
+        acc1 = vfmaq_f32(acc1, a1, b1);
+        acc2 = vfmaq_f32(acc2, a2, b2);
+        acc3 = vfmaq_f32(acc3, a3, b3);
+    }
+    let pair0 = vaddq_f32(acc0, acc1);
+    let pair1 = vaddq_f32(acc2, acc3);
+    let mut s = vaddvq_f32(vaddq_f32(pair0, pair1));
+    for i in (chunks * 16)..n {
+        s += *a.get_unchecked(i) * *b.get_unchecked(i);
+    }
+    s
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn l2_norm_squared_neon(a: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let chunks = n / 16;
+    let (mut acc0, mut acc1, mut acc2, mut acc3) = (
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+    );
+    for i in 0..chunks {
+        let o = i * 16;
+        let a0 = vld1q_f32(a.as_ptr().add(o));
+        let a1 = vld1q_f32(a.as_ptr().add(o + 4));
+        let a2 = vld1q_f32(a.as_ptr().add(o + 8));
+        let a3 = vld1q_f32(a.as_ptr().add(o + 12));
+        acc0 = vfmaq_f32(acc0, a0, a0);
+        acc1 = vfmaq_f32(acc1, a1, a1);
+        acc2 = vfmaq_f32(acc2, a2, a2);
+        acc3 = vfmaq_f32(acc3, a3, a3);
+    }
+    let pair0 = vaddq_f32(acc0, acc1);
+    let pair1 = vaddq_f32(acc2, acc3);
+    let mut s = vaddvq_f32(vaddq_f32(pair0, pair1));
+    for i in (chunks * 16)..n {
+        let v = *a.get_unchecked(i);
+        s += v * v;
+    }
+    s
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn cosine_fused_neon(a: &[f32], b: &[f32], nb_recip: f32) -> f32 {
+    use std::arch::aarch64::*;
+    let n = a.len().min(b.len());
+    let chunks = n / 16;
+    let (mut dot0, mut dot1, mut dot2, mut dot3) = (
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+    );
+    let (mut na0, mut na1, mut na2, mut na3) = (
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+        vdupq_n_f32(0.0),
+    );
+    for i in 0..chunks {
+        let o = i * 16;
+        let a0 = vld1q_f32(a.as_ptr().add(o));
+        let a1 = vld1q_f32(a.as_ptr().add(o + 4));
+        let a2 = vld1q_f32(a.as_ptr().add(o + 8));
+        let a3 = vld1q_f32(a.as_ptr().add(o + 12));
+        let b0 = vld1q_f32(b.as_ptr().add(o));
+        let b1 = vld1q_f32(b.as_ptr().add(o + 4));
+        let b2 = vld1q_f32(b.as_ptr().add(o + 8));
+        let b3 = vld1q_f32(b.as_ptr().add(o + 12));
+        dot0 = vfmaq_f32(dot0, a0, b0);
+        dot1 = vfmaq_f32(dot1, a1, b1);
+        dot2 = vfmaq_f32(dot2, a2, b2);
+        dot3 = vfmaq_f32(dot3, a3, b3);
+        na0 = vfmaq_f32(na0, a0, a0);
+        na1 = vfmaq_f32(na1, a1, a1);
+        na2 = vfmaq_f32(na2, a2, a2);
+        na3 = vfmaq_f32(na3, a3, a3);
+    }
+    let dot_pair0 = vaddq_f32(dot0, dot1);
+    let dot_pair1 = vaddq_f32(dot2, dot3);
+    let norm_pair0 = vaddq_f32(na0, na1);
+    let norm_pair1 = vaddq_f32(na2, na3);
+    let mut dot = vaddvq_f32(vaddq_f32(dot_pair0, dot_pair1));
+    let mut na_sq = vaddvq_f32(vaddq_f32(norm_pair0, norm_pair1));
+    for i in (chunks * 16)..n {
+        let ai = *a.get_unchecked(i);
+        let bi = *b.get_unchecked(i);
+        dot += ai * bi;
+        na_sq += ai * ai;
+    }
+    if na_sq == 0.0 || nb_recip == 0.0 {
+        return 0.0;
+    }
+    dot * rsqrt_positive_f32(na_sq) * nb_recip
+}
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
@@ -1007,6 +1212,9 @@ impl DistanceComputer {
     pub fn compute_topk_ordering(&self, a: &[f32]) -> f32 {
         match self.metric {
             DistanceMetric::L2 => l2_squared(a, &self.query),
+            DistanceMetric::InnerProduct | DistanceMetric::NegInnerProduct => {
+                -inner_product(a, &self.query)
+            }
             _ => self.compute(a),
         }
     }
@@ -1036,7 +1244,7 @@ impl DistanceComputer {
     #[inline(always)]
     pub fn compute_dot_topk_ordering_from_dot(&self, dot: f32) -> f32 {
         match self.metric {
-            DistanceMetric::InnerProduct => dot,
+            DistanceMetric::InnerProduct => -dot,
             DistanceMetric::NegInnerProduct => -dot,
             _ => unreachable!("dot helper only valid for inner-product metrics"),
         }
@@ -1135,7 +1343,9 @@ pub fn extract_query_vector(arr: &dyn Array) -> io::Result<Vec<f32>> {
             if !ba.is_null(i) {
                 let bytes = ba.value(i);
                 if bytes.len() % 4 == 0 && !bytes.is_empty() {
-                    let floats = unsafe { bytes_to_f32(bytes) };
+                    let floats = bytes_to_f32(bytes).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Invalid binary vector")
+                    })?;
                     return Ok(floats.to_vec());
                 }
             }
@@ -1222,9 +1432,8 @@ pub fn batch_distance(
                 if bytes.len() != expected_bytes {
                     return None;
                 }
-                // SAFETY: length is exactly dim*4 and aligned to 4 bytes
-                let vec = unsafe { bytes_to_f32(bytes) };
-                Some(metric.compute(vec, query) as f64)
+                let vec = bytes_to_f32(bytes)?;
+                Some(metric.compute(vec.as_ref(), query) as f64)
             })
             .collect();
         return Ok(Arc::new(Float64Array::from(distances)) as ArrayRef);
@@ -1439,12 +1648,15 @@ pub fn topk_heap_direct(
     }
     let k_capped = k.min(col.len());
     let expected_bytes = query.len() * 4;
+    let computer = DistanceComputer::new(metric, query.to_vec());
+    let signed_topk_ordering = matches!(
+        metric,
+        DistanceMetric::InnerProduct | DistanceMetric::NegInnerProduct
+    );
 
-    // Max-heap of (f32_bits, row_idx).
-    // IEEE-754 positive f32 bit patterns sort identically to the float values,
-    // so direct bit comparison is correct for non-NaN, non-negative distances.
+    // Max-heap of (ordering_key, f32_bits, row_idx).
     #[derive(Copy, Clone)]
-    struct Entry(u32, usize);
+    struct Entry(u32, u32, usize);
     impl PartialEq for Entry {
         fn eq(&self, o: &Self) -> bool {
             self.0 == o.0
@@ -1472,23 +1684,29 @@ pub fn topk_heap_direct(
         if bytes.len() != expected_bytes {
             continue;
         }
-        // SAFETY: length == query.len()*4, bytes are valid LE f32 values.
-        let vec = unsafe { bytes_to_f32(bytes) };
-        let dist = metric.compute(vec, query);
+        let Some(vec) = bytes_to_f32(bytes) else {
+            continue;
+        };
+        let dist = computer.compute_topk_ordering(vec.as_ref());
         let bits = dist.to_bits();
+        let key = if signed_topk_ordering {
+            f32_ascending_key_from_bits(bits)
+        } else {
+            bits
+        };
         if heap.len() < k_capped {
-            heap.push(Entry(bits, i));
-        } else if let Some(&Entry(top_bits, _)) = heap.peek() {
-            if bits < top_bits {
+            heap.push(Entry(key, bits, i));
+        } else if let Some(&Entry(top_key, _, _)) = heap.peek() {
+            if key < top_key {
                 heap.pop();
-                heap.push(Entry(bits, i));
+                heap.push(Entry(key, bits, i));
             }
         }
     }
 
     let mut result: Vec<(usize, f32)> = heap
         .into_iter()
-        .map(|Entry(b, i)| (i, f32::from_bits(b)))
+        .map(|Entry(_, b, i)| (i, computer.finalize_topk_distance(f32::from_bits(b))))
         .collect();
     result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     result
@@ -1499,27 +1717,47 @@ pub fn topk_heap_direct(
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone)]
-struct TopKEntry(u32, usize);
+struct TopKEntry(u32, u32, usize);
 
 #[inline(always)]
-fn insert_topk_bits(entries: &mut Vec<TopKEntry>, k: usize, bits: u32, idx: usize) {
+fn f32_ascending_key_from_bits(bits: u32) -> u32 {
+    if bits & 0x8000_0000 == 0 {
+        bits | 0x8000_0000
+    } else {
+        !bits
+    }
+}
+
+#[inline(always)]
+fn insert_topk_entry(entries: &mut Vec<TopKEntry>, k: usize, key: u32, bits: u32, idx: usize) {
     if k == 0 {
         return;
     }
-    if entries.len() == k && bits >= entries[entries.len() - 1].0 {
+    if entries.len() == k && key >= entries[entries.len() - 1].0 {
         return;
     }
 
-    entries.push(TopKEntry(bits, idx));
+    entries.push(TopKEntry(key, bits, idx));
     let mut pos = entries.len() - 1;
-    while pos > 0 && bits < entries[pos - 1].0 {
+    while pos > 0 && key < entries[pos - 1].0 {
         entries[pos] = entries[pos - 1];
         pos -= 1;
     }
-    entries[pos] = TopKEntry(bits, idx);
+    entries[pos] = TopKEntry(key, bits, idx);
     if entries.len() > k {
         entries.pop();
     }
+}
+
+#[inline(always)]
+fn insert_topk_bits(entries: &mut Vec<TopKEntry>, k: usize, bits: u32, idx: usize) {
+    insert_topk_entry(entries, k, bits, bits, idx);
+}
+
+#[inline(always)]
+fn insert_topk_score(entries: &mut Vec<TopKEntry>, k: usize, score: f32, idx: usize) {
+    let bits = score.to_bits();
+    insert_topk_entry(entries, k, f32_ascending_key_from_bits(bits), bits, idx);
 }
 
 #[inline(always)]
@@ -1529,7 +1767,7 @@ fn topk_entries_to_result(
 ) -> Vec<(usize, f32)> {
     entries
         .into_iter()
-        .map(|TopKEntry(bits, idx)| (idx, computer.finalize_topk_distance(f32::from_bits(bits))))
+        .map(|TopKEntry(_, bits, idx)| (idx, computer.finalize_topk_distance(f32::from_bits(bits))))
         .collect()
 }
 
@@ -1562,6 +1800,10 @@ pub fn topk_heap_direct_parallel(
     let offsets: &[i32] = col.offsets().as_ref(); // len = n+1
                                                   // Null bitmap: Option<&[u8]> pointing into Arrow's validity buffer.
     let null_bytes: Option<&[u8]> = col.nulls().map(|nb| nb.buffer().as_slice());
+    let signed_topk_ordering = matches!(
+        computer.metric,
+        DistanceMetric::InnerProduct | DistanceMetric::NegInnerProduct
+    );
 
     // Capture raw pointers as usize so they are Send across Rayon threads.
     // SAFETY: values, offsets, null_bytes are all derived from `col` which is
@@ -1612,10 +1854,16 @@ pub fn topk_heap_direct_parallel(
 
                 // SAFETY: off_s..off_e is within values (enforced by BinaryArray invariants).
                 let bytes = unsafe { values.get_unchecked(off_s..off_e) };
-                let vec = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, dim) };
+                let Some(vec) = bytes_to_f32(bytes) else {
+                    continue;
+                };
 
-                let score = computer.compute_topk_ordering(vec);
-                insert_topk_bits(&mut entries, k_capped, score.to_bits(), i);
+                let score = computer.compute_topk_ordering(vec.as_ref());
+                if signed_topk_ordering {
+                    insert_topk_score(&mut entries, k_capped, score, i);
+                } else {
+                    insert_topk_bits(&mut entries, k_capped, score.to_bits(), i);
+                }
             }
             entries
         })
@@ -1624,8 +1872,8 @@ pub fn topk_heap_direct_parallel(
     // Merge T small top-k lists into final top-k (T is small, e.g. 8-16).
     let mut final_entries: Vec<TopKEntry> = Vec::with_capacity(k_capped);
     for chunk in per_chunk {
-        for TopKEntry(bits, idx) in chunk {
-            insert_topk_bits(&mut final_entries, k_capped, bits, idx);
+        for TopKEntry(key, bits, idx) in chunk {
+            insert_topk_entry(&mut final_entries, k_capped, key, bits, idx);
         }
     }
     topk_entries_to_result(final_entries, computer)
@@ -1677,9 +1925,45 @@ fn topk_heap_on_floats_impl(
         return vec![];
     }
     let k_capped = k.min(n_rows);
+    let signed_topk_ordering = matches!(
+        computer.metric,
+        DistanceMetric::InnerProduct | DistanceMetric::NegInnerProduct
+    );
 
     let t = rayon::current_num_threads().max(1);
     let chunk_size = (n_rows + t - 1) / t;
+
+    if signed_topk_ordering {
+        let query = computer.query.as_slice();
+        let per_chunk: Vec<Vec<TopKEntry>> = (0..t)
+            .into_par_iter()
+            .map(|tid| {
+                let start = tid * chunk_size;
+                if start >= n_rows {
+                    return vec![];
+                }
+                let end = (start + chunk_size).min(n_rows);
+                let mut entries: Vec<TopKEntry> = Vec::with_capacity(k_capped);
+                for i in start..end {
+                    let off = i * dim;
+                    if off + dim > floats.len() {
+                        break;
+                    }
+                    let vec = unsafe { floats.get_unchecked(off..off + dim) };
+                    insert_topk_score(&mut entries, k_capped, -inner_product(vec, query), i);
+                }
+                entries
+            })
+            .collect();
+
+        let mut final_entries: Vec<TopKEntry> = Vec::with_capacity(k_capped);
+        for chunk in per_chunk {
+            for TopKEntry(key, bits, idx) in chunk {
+                insert_topk_entry(&mut final_entries, k_capped, key, bits, idx);
+            }
+        }
+        return topk_entries_to_result(final_entries, computer);
+    }
 
     let per_chunk: Vec<Vec<TopKEntry>> = (0..t)
         .into_par_iter()
@@ -1705,8 +1989,8 @@ fn topk_heap_on_floats_impl(
 
     let mut final_entries: Vec<TopKEntry> = Vec::with_capacity(k_capped);
     for chunk in per_chunk {
-        for TopKEntry(bits, idx) in chunk {
-            insert_topk_bits(&mut final_entries, k_capped, bits, idx);
+        for TopKEntry(key, bits, idx) in chunk {
+            insert_topk_entry(&mut final_entries, k_capped, key, bits, idx);
         }
     }
     topk_entries_to_result(final_entries, computer)
@@ -1741,6 +2025,22 @@ fn topk_sequential_on_floats_impl(
     k: usize,
 ) -> Vec<(usize, f32)> {
     let mut entries: Vec<TopKEntry> = Vec::with_capacity(k);
+    let signed_topk_ordering = matches!(
+        computer.metric,
+        DistanceMetric::InnerProduct | DistanceMetric::NegInnerProduct
+    );
+    if signed_topk_ordering {
+        let query = computer.query.as_slice();
+        for i in 0..n_rows {
+            let off = i * dim;
+            if off + dim > floats.len() {
+                break;
+            }
+            let vec = unsafe { floats.get_unchecked(off..off + dim) };
+            insert_topk_score(&mut entries, k, -inner_product(vec, query), i);
+        }
+        return topk_entries_to_result(entries, computer);
+    }
     for i in 0..n_rows {
         let off = i * dim;
         if off + dim > floats.len() {
@@ -1975,7 +2275,11 @@ fn batch_topk_blocked_on_floats(
                     } else {
                         unreachable!()
                     };
-                    insert_topk_bits(entries, k_capped, score.to_bits(), i);
+                    if dot_metric {
+                        insert_topk_score(entries, k_capped, score, i);
+                    } else {
+                        insert_topk_bits(entries, k_capped, score.to_bits(), i);
+                    }
                 }
             }
             entries_per_query
@@ -1988,8 +2292,8 @@ fn batch_topk_blocked_on_floats(
     for chunk in per_chunk {
         for (qi, entries) in chunk.into_iter().enumerate() {
             let final_query_entries = &mut final_entries[qi];
-            for TopKEntry(bits, idx) in entries {
-                insert_topk_bits(final_query_entries, k_capped, bits, idx);
+            for TopKEntry(key, bits, idx) in entries {
+                insert_topk_entry(final_query_entries, k_capped, key, bits, idx);
             }
         }
     }
@@ -2461,7 +2765,7 @@ fn compute_f16_row_topk_ordering(row: &[u8], c: &DistanceComputer) -> f32 {
         return match c.metric {
             DistanceMetric::L2Squared => unsafe { l2sq_f16_neon(row, q) },
             DistanceMetric::L2 => unsafe { l2sq_f16_neon(row, q) },
-            DistanceMetric::InnerProduct => unsafe { dot_f16_neon(row, q) },
+            DistanceMetric::InnerProduct => -unsafe { dot_f16_neon(row, q) },
             DistanceMetric::NegInnerProduct => -unsafe { dot_f16_neon(row, q) },
             DistanceMetric::CosineSimilarity => unsafe { cosine_f16_neon(row, q, qnr) },
             DistanceMetric::CosineDistance => 1.0 - unsafe { cosine_f16_neon(row, q, qnr) },
@@ -2473,7 +2777,7 @@ fn compute_f16_row_topk_ordering(row: &[u8], c: &DistanceComputer) -> f32 {
     return match c.metric {
         DistanceMetric::L2Squared => l2sq_f16_scalar(row, q),
         DistanceMetric::L2 => l2sq_f16_scalar(row, q),
-        DistanceMetric::InnerProduct => dot_f16_scalar(row, q),
+        DistanceMetric::InnerProduct => -dot_f16_scalar(row, q),
         DistanceMetric::NegInnerProduct => -dot_f16_scalar(row, q),
         DistanceMetric::CosineSimilarity => cosine_f16_scalar(row, q, qnr),
         DistanceMetric::CosineDistance => 1.0 - cosine_f16_scalar(row, q, qnr),
@@ -2487,7 +2791,7 @@ fn compute_f16_row_topk_ordering(row: &[u8], c: &DistanceComputer) -> f32 {
             return match c.metric {
                 DistanceMetric::L2Squared => unsafe { l2sq_f16_avx(row, q) },
                 DistanceMetric::L2 => unsafe { l2sq_f16_avx(row, q) },
-                DistanceMetric::InnerProduct => unsafe { dot_f16_avx(row, q) },
+                DistanceMetric::InnerProduct => -unsafe { dot_f16_avx(row, q) },
                 DistanceMetric::NegInnerProduct => -unsafe { dot_f16_avx(row, q) },
                 DistanceMetric::CosineSimilarity => unsafe { cosine_f16_avx(row, q, qnr) },
                 DistanceMetric::CosineDistance => 1.0 - unsafe { cosine_f16_avx(row, q, qnr) },
@@ -2498,7 +2802,7 @@ fn compute_f16_row_topk_ordering(row: &[u8], c: &DistanceComputer) -> f32 {
         match c.metric {
             DistanceMetric::L2Squared => l2sq_f16_scalar(row, q),
             DistanceMetric::L2 => l2sq_f16_scalar(row, q),
-            DistanceMetric::InnerProduct => dot_f16_scalar(row, q),
+            DistanceMetric::InnerProduct => -dot_f16_scalar(row, q),
             DistanceMetric::NegInnerProduct => -dot_f16_scalar(row, q),
             DistanceMetric::CosineSimilarity => cosine_f16_scalar(row, q, qnr),
             DistanceMetric::CosineDistance => 1.0 - cosine_f16_scalar(row, q, qnr),
@@ -2525,6 +2829,10 @@ pub fn topk_heap_on_f16_bytes(
     }
     let k_capped = k.min(n_rows);
     let row_bytes = dim * 2;
+    let signed_topk_ordering = matches!(
+        computer.metric,
+        DistanceMetric::InnerProduct | DistanceMetric::NegInnerProduct
+    );
 
     let bytes_ptr = f16_bytes.as_ptr() as usize;
     let bytes_len = f16_bytes.len();
@@ -2547,7 +2855,11 @@ pub fn topk_heap_on_f16_bytes(
                     break;
                 }
                 let score = compute_f16_row_topk_ordering(&bytes[off..off + row_bytes], computer);
-                insert_topk_bits(&mut entries, k_capped, score.to_bits(), i);
+                if signed_topk_ordering {
+                    insert_topk_score(&mut entries, k_capped, score, i);
+                } else {
+                    insert_topk_bits(&mut entries, k_capped, score.to_bits(), i);
+                }
             }
             entries
         })
@@ -2555,8 +2867,8 @@ pub fn topk_heap_on_f16_bytes(
 
     let mut final_entries: Vec<TopKEntry> = Vec::with_capacity(k_capped);
     for chunk in per_chunk {
-        for TopKEntry(bits, idx) in chunk {
-            insert_topk_bits(&mut final_entries, k_capped, bits, idx);
+        for TopKEntry(key, bits, idx) in chunk {
+            insert_topk_entry(&mut final_entries, k_capped, key, bits, idx);
         }
     }
     topk_entries_to_result(final_entries, computer)
@@ -2574,13 +2886,21 @@ fn topk_sequential_on_f16_bytes(
     let row_bytes = dim * 2;
     let bytes_len = f16_bytes.len();
     let mut entries: Vec<TopKEntry> = Vec::with_capacity(k);
+    let signed_topk_ordering = matches!(
+        computer.metric,
+        DistanceMetric::InnerProduct | DistanceMetric::NegInnerProduct
+    );
     for i in 0..n_rows {
         let off = i * row_bytes;
         if off + row_bytes > bytes_len {
             break;
         }
         let score = compute_f16_row_topk_ordering(&f16_bytes[off..off + row_bytes], computer);
-        insert_topk_bits(&mut entries, k, score.to_bits(), i);
+        if signed_topk_ordering {
+            insert_topk_score(&mut entries, k, score, i);
+        } else {
+            insert_topk_bits(&mut entries, k, score.to_bits(), i);
+        }
     }
     topk_entries_to_result(entries, computer)
 }
