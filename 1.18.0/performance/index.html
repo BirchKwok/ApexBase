@@ -12,31 +12,31 @@
         <meta name="author" content="Birch Kwok">
       
       
-        <link rel="canonical" href="https://birchkwok.github.io/ApexBase/1.18.0/user-guide/data-import/">
+        <link rel="canonical" href="https://birchkwok.github.io/ApexBase/1.18.0/performance/">
       
       
-        <link rel="prev" href="../sql/">
+        <link rel="prev" href="../RUST_EMBEDDED_API/">
       
       
-        <link rel="next" href="../server-protocols/">
+        <link rel="next" href="../FTS_GUIDE/">
       
       
         
       
       
-      <link rel="icon" href="../../img/favicon.svg">
+      <link rel="icon" href="../img/favicon.svg">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
       
-        <title>Data Import - ApexBase</title>
+        <title>Performance - ApexBase</title>
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
       
       
 
@@ -55,7 +55,7 @@
       
     
     
-    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
 
@@ -80,7 +80,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#data-import" class="md-skip">
+        <a href="#performance" class="md-skip">
           Skip to content
         </a>
       
@@ -100,9 +100,9 @@
 
 <header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
   <nav class="md-header__inner md-grid" aria-label="Header">
-    <a href="../.." title="ApexBase" class="md-header__button md-logo" aria-label="ApexBase" data-md-component="logo">
+    <a href=".." title="ApexBase" class="md-header__button md-logo" aria-label="ApexBase" data-md-component="logo">
       
-  <img src="../../img/logo.svg" alt="logo">
+  <img src="../img/logo.svg" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -119,7 +119,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Data Import
+              Performance
             
           </span>
         </div>
@@ -241,7 +241,7 @@
   
   
     <li class="md-tabs__item">
-      <a href="../.." class="md-tabs__link">
+      <a href=".." class="md-tabs__link">
         
   
   
@@ -262,7 +262,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../installation/" class="md-tabs__link">
+        <a href="../installation/" class="md-tabs__link">
           
   
   
@@ -278,13 +278,11 @@
   
   
   
-    
-  
   
     
     
-      <li class="md-tabs__item md-tabs__item--active">
-        <a href="../python-client/" class="md-tabs__link">
+      <li class="md-tabs__item">
+        <a href="../user-guide/python-client/" class="md-tabs__link">
           
   
   
@@ -304,7 +302,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../API_REFERENCE/" class="md-tabs__link">
+        <a href="../API_REFERENCE/" class="md-tabs__link">
           
   
   
@@ -320,9 +318,11 @@
   
   
   
+    
   
-    <li class="md-tabs__item">
-      <a href="../../performance/" class="md-tabs__link">
+  
+    <li class="md-tabs__item md-tabs__item--active">
+      <a href="./" class="md-tabs__link">
         
   
   
@@ -343,7 +343,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../FTS_GUIDE/" class="md-tabs__link">
+        <a href="../FTS_GUIDE/" class="md-tabs__link">
           
   
   
@@ -363,7 +363,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../STORAGE_ARCHITECTURE/" class="md-tabs__link">
+        <a href="../STORAGE_ARCHITECTURE/" class="md-tabs__link">
           
   
   
@@ -381,7 +381,7 @@
   
   
     <li class="md-tabs__item">
-      <a href="../../documentation-index/" class="md-tabs__link">
+      <a href="../documentation-index/" class="md-tabs__link">
         
   
   
@@ -424,9 +424,9 @@
 
 <nav class="md-nav md-nav--primary md-nav--lifted md-nav--integrated" aria-label="Navigation" data-md-level="0">
   <label class="md-nav__title" for="__drawer">
-    <a href="../.." title="ApexBase" class="md-nav__button md-logo" aria-label="ApexBase" data-md-component="logo">
+    <a href=".." title="ApexBase" class="md-nav__button md-logo" aria-label="ApexBase" data-md-component="logo">
       
-  <img src="../../img/logo.svg" alt="logo">
+  <img src="../img/logo.svg" alt="logo">
 
     </a>
     ApexBase
@@ -453,7 +453,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../.." class="md-nav__link">
+      <a href=".." class="md-nav__link">
         
   
   
@@ -532,7 +532,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../installation/" class="md-nav__link">
+      <a href="../installation/" class="md-nav__link">
         
   
   
@@ -560,7 +560,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../QUICK_START/" class="md-nav__link">
+      <a href="../QUICK_START/" class="md-nav__link">
         
   
   
@@ -588,7 +588,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../concepts/" class="md-nav__link">
+      <a href="../concepts/" class="md-nav__link">
         
   
   
@@ -620,31 +620,26 @@
       
   
   
-    
   
   
-  
     
     
     
     
-      
-        
-        
       
       
         
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
         
           
-          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
             
   
   
@@ -662,7 +657,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_3">
             <span class="md-nav__icon md-icon"></span>
             
@@ -680,7 +675,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../python-client/" class="md-nav__link">
+      <a href="../user-guide/python-client/" class="md-nav__link">
         
   
   
@@ -708,7 +703,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../sql/" class="md-nav__link">
+      <a href="../user-guide/sql/" class="md-nav__link">
         
   
   
@@ -733,37 +728,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Data Import
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../user-guide/data-import/" class="md-nav__link">
         
   
   
@@ -779,114 +747,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#choose-an-import-path" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Choose An Import Path
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#columnar-batches" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Columnar Batches
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#dataframes" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        DataFrames
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#query-files-directly" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Query Files Directly
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#register-temporary-tables" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Register Temporary Tables
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#join-files-with-stored-data" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Join Files With Stored Data
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#parquet-interop" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Parquet Interop
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#performance-tips" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Performance Tips
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -899,7 +759,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../server-protocols/" class="md-nav__link">
+      <a href="../user-guide/server-protocols/" class="md-nav__link">
         
   
   
@@ -927,7 +787,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../EXAMPLES/" class="md-nav__link">
+      <a href="../EXAMPLES/" class="md-nav__link">
         
   
   
@@ -1014,7 +874,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../API_REFERENCE/" class="md-nav__link">
+      <a href="../API_REFERENCE/" class="md-nav__link">
         
   
   
@@ -1042,7 +902,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../RUST_EMBEDDED_API/" class="md-nav__link">
+      <a href="../RUST_EMBEDDED_API/" class="md-nav__link">
         
   
   
@@ -1074,10 +934,37 @@
       
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../../performance/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
@@ -1093,6 +980,164 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#latest-verified-snapshot" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Latest Verified Snapshot
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#scoreboard" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scoreboard
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#representative-olap-gaps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Representative OLAP Gaps
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#representative-oltp-gaps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Representative OLTP Gaps
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#representative-vector-gaps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Representative Vector Gaps
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#throughput-snapshot" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Throughput Snapshot
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#hot-path-latency-snapshot" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Hot-Path Latency Snapshot
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Hot-Path Latency Snapshot">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#default-microbenchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Default Microbenchmarks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#durable-fair-microbenchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Durable Fair Microbenchmarks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#transaction-fair-microbenchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Transaction Fair Microbenchmarks
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#oltp-write-visibility" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        OLTP Write Visibility
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reproduce" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reproduce
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -1156,7 +1201,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../FTS_GUIDE/" class="md-nav__link">
+      <a href="../FTS_GUIDE/" class="md-nav__link">
         
   
   
@@ -1184,7 +1229,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../FLOAT16_VECTOR_GUIDE/" class="md-nav__link">
+      <a href="../FLOAT16_VECTOR_GUIDE/" class="md-nav__link">
         
   
   
@@ -1271,7 +1316,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../STORAGE_ARCHITECTURE/" class="md-nav__link">
+      <a href="../STORAGE_ARCHITECTURE/" class="md-nav__link">
         
   
   
@@ -1299,7 +1344,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../ENGINEERING_GUIDELINES/" class="md-nav__link">
+      <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
         
   
   
@@ -1327,7 +1372,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../HTAP_ROADMAP/" class="md-nav__link">
+      <a href="../HTAP_ROADMAP/" class="md-nav__link">
         
   
   
@@ -1362,7 +1407,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../documentation-index/" class="md-nav__link">
+      <a href="../documentation-index/" class="md-nav__link">
         
   
   
@@ -1400,46 +1445,6 @@
   
 
 
-  <nav class="md-path" aria-label="Navigation" >
-    <ol class="md-path__list">
-      
-        
-  
-  
-    <li class="md-path__item">
-      <a href="../.." class="md-path__link">
-        
-  <span class="md-ellipsis">
-    Home
-  </span>
-
-      </a>
-    </li>
-  
-
-      
-      
-        
-  
-  
-    
-    
-      <li class="md-path__item">
-        <a href="../python-client/" class="md-path__link">
-          
-  <span class="md-ellipsis">
-    User Guide
-  </span>
-
-        </a>
-      </li>
-    
-  
-
-      
-    </ol>
-  </nav>
-
               
               <article class="md-content__inner md-typeset">
                 
@@ -1450,122 +1455,386 @@
   
 
 
-<h1 id="data-import">Data Import<a class="headerlink" href="#data-import" title="Permanent link">&para;</a></h1>
-<p>ApexBase is designed to move data in and out of Python data tools without turning every workflow into a custom ETL job.</p>
-<h2 id="choose-an-import-path">Choose An Import Path<a class="headerlink" href="#choose-an-import-path" title="Permanent link">&para;</a></h2>
+<h1 id="performance">Performance<a class="headerlink" href="#performance" title="Permanent link">&para;</a></h1>
+<p>This page tracks the latest verified local benchmark snapshot rather than an old best-case run. Benchmarks are meant to be reproducible, not magical; always rerun them on your own workload and hardware.</p>
+<h2 id="latest-verified-snapshot">Latest Verified Snapshot<a class="headerlink" href="#latest-verified-snapshot" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>System</strong>: macOS 26.4.1, Apple arm (10 cores), 32 GB RAM</li>
+<li><strong>Stack</strong>: Python 3.12.4, ApexBase 1.18.0, SQLite 3.45.3, DuckDB 1.1.3, PyArrow 23.0.1</li>
+<li><strong>Dataset</strong>: 200,000 rows x 5 columns (<code>name</code>, <code>age</code>, <code>score</code>, <code>city</code>, <code>category</code>)</li>
+<li><strong>Vector dataset</strong>: 200,000 vectors x dim=128, <code>k=10</code>, batch size 10 queries</li>
+<li><strong>Method</strong>: 2 warmup iterations + 3 timed iterations</li>
+<li><strong>Layout</strong>: 92 named metrics total (37 OLAP, 46 OLTP, 9 vector)</li>
+<li><strong>Fairness rule</strong>: only the default fair OLAP/OLTP cross-engine tables count toward the <code>38/38</code> win/loss summary. Vector similarity uses a separate dataset and its own ApexBase-vs-DuckDB scoreboard.</li>
+</ul>
+<h2 id="scoreboard">Scoreboard<a class="headerlink" href="#scoreboard" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
 <tr>
-<th>Source</th>
-<th>Best method</th>
+<th>Scope</th>
+<th style="text-align: right;">Metrics</th>
+<th style="text-align: right;">Apex wins</th>
+<th style="text-align: right;">Ties</th>
+<th style="text-align: right;">Slower</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Python records</td>
-<td><code>client.store(dict)</code> or <code>client.store(list[dict])</code></td>
+<td>Default fair (OLAP + OLTP)</td>
+<td style="text-align: right;">38</td>
+<td style="text-align: right;">38</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
 </tr>
 <tr>
-<td>Large Python batches</td>
-<td><code>client.store(columnar_dict)</code></td>
+<td>OLAP fair</td>
+<td style="text-align: right;">29</td>
+<td style="text-align: right;">29</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
 </tr>
 <tr>
-<td>Pandas</td>
-<td><code>client.from_pandas(df, table_name=...)</code></td>
+<td>OLTP fair</td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
 </tr>
 <tr>
-<td>Polars</td>
-<td><code>client.from_polars(df, table_name=...)</code></td>
-</tr>
-<tr>
-<td>PyArrow</td>
-<td><code>client.from_pyarrow(table, table_name=...)</code></td>
-</tr>
-<tr>
-<td>CSV / JSON / Parquet one-off query</td>
-<td>SQL <code>read_csv()</code>, <code>read_json()</code>, <code>read_parquet()</code></td>
-</tr>
-<tr>
-<td>CSV / JSON / Parquet repeated queries</td>
-<td><code>register_temp_table()</code></td>
+<td>Vector similarity (ApexBase vs DuckDB)</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
 </tr>
 </tbody>
 </table>
-<h2 id="columnar-batches">Columnar Batches<a class="headerlink" href="#columnar-batches" title="Permanent link">&para;</a></h2>
-<p>Columnar dictionaries are usually the fastest pure-Python ingest format:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">client</span><span class="o">.</span><span class="n">create_table</span><span class="p">(</span><span class="s2">&quot;events&quot;</span><span class="p">)</span>
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="n">client</span><span class="o">.</span><span class="n">store</span><span class="p">({</span>
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    <span class="s2">&quot;user_id&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">],</span>
-</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>    <span class="s2">&quot;event&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;signup&quot;</span><span class="p">,</span> <span class="s2">&quot;click&quot;</span><span class="p">,</span> <span class="s2">&quot;purchase&quot;</span><span class="p">],</span>
-</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="s2">&quot;value&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mf">0.0</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">,</span> <span class="mf">29.9</span><span class="p">],</span>
-</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="p">})</span>
-</span></code></pre></div>
-<h2 id="dataframes">DataFrames<a class="headerlink" href="#dataframes" title="Permanent link">&para;</a></h2>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pandas</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pd</span>
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">polars</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pl</span>
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>
-</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="n">client</span><span class="o">.</span><span class="n">from_pandas</span><span class="p">(</span>
-</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>    <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">({</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;Alice&quot;</span><span class="p">],</span> <span class="s2">&quot;age&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mi">30</span><span class="p">]}),</span>
-</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>    <span class="n">table_name</span><span class="o">=</span><span class="s2">&quot;users&quot;</span><span class="p">,</span>
-</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="p">)</span>
-</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>
-</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="n">client</span><span class="o">.</span><span class="n">from_polars</span><span class="p">(</span>
-</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>    <span class="n">pl</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">({</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;Bob&quot;</span><span class="p">],</span> <span class="s2">&quot;age&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mi">25</span><span class="p">]}),</span>
-</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>    <span class="n">table_name</span><span class="o">=</span><span class="s2">&quot;users&quot;</span><span class="p">,</span>
-</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="p">)</span>
-</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>
-</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="n">client</span><span class="o">.</span><span class="n">from_pyarrow</span><span class="p">(</span>
-</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a>    <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">({</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;Charlie&quot;</span><span class="p">],</span> <span class="s2">&quot;age&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mi">35</span><span class="p">]}),</span>
-</span><span id="__span-1-17"><a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a>    <span class="n">table_name</span><span class="o">=</span><span class="s2">&quot;users&quot;</span><span class="p">,</span>
-</span><span id="__span-1-18"><a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="p">)</span>
-</span></code></pre></div>
-<p>When <code>table_name</code> is provided, ApexBase selects or creates that table for the import.</p>
-<h2 id="query-files-directly">Query Files Directly<a class="headerlink" href="#query-files-directly" title="Permanent link">&para;</a></h2>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">result</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="s2">    SELECT city, COUNT(*) AS rows</span>
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="s2">    FROM read_csv(&#39;events.csv&#39;)</span>
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="s2">    GROUP BY city</span>
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="s2">    ORDER BY rows DESC</span>
-</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
-</span></code></pre></div>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;SELECT * FROM read_parquet(&#39;orders.parquet&#39;) LIMIT 10&quot;</span><span class="p">)</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;SELECT * FROM read_json(&#39;events.ndjson&#39;) WHERE kind = &#39;click&#39;&quot;</span><span class="p">)</span>
-</span></code></pre></div>
-<p>Direct file functions are a good fit for ad hoc analysis and one-time joins.</p>
-<h2 id="register-temporary-tables">Register Temporary Tables<a class="headerlink" href="#register-temporary-tables" title="Permanent link">&para;</a></h2>
-<p>For repeated queries against the same file, parse it once and use a temporary table:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="n">client</span><span class="o">.</span><span class="n">register_temp_table</span><span class="p">(</span><span class="s2">&quot;events_file&quot;</span><span class="p">,</span> <span class="s2">&quot;events.csv&quot;</span><span class="p">)</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
-</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="s2">    SELECT event, COUNT(*) AS rows</span>
-</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="s2">    FROM events_file</span>
-</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="s2">    GROUP BY event</span>
-</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
-</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>
-</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="n">client</span><span class="o">.</span><span class="n">drop_temp_table</span><span class="p">(</span><span class="s2">&quot;events_file&quot;</span><span class="p">)</span>
-</span></code></pre></div>
-<p>Temporary tables are cleaned up when the client closes.</p>
-<h2 id="join-files-with-stored-data">Join Files With Stored Data<a class="headerlink" href="#join-files-with-stored-data" title="Permanent link">&para;</a></h2>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="s2">    SELECT u.name, f.event</span>
-</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="s2">    FROM users u</span>
-</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="s2">    JOIN read_csv(&#39;events.csv&#39;) f ON u.id = f.user_id</span>
-</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="s2">    WHERE f.event = &#39;purchase&#39;</span>
-</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
-</span></code></pre></div>
-<h2 id="parquet-interop">Parquet Interop<a class="headerlink" href="#parquet-interop" title="Permanent link">&para;</a></h2>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;COPY users TO &#39;users.parquet&#39; (FORMAT PARQUET)&quot;</span><span class="p">)</span>
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;COPY users FROM &#39;users.parquet&#39; (FORMAT PARQUET)&quot;</span><span class="p">)</span>
-</span></code></pre></div>
-<h2 id="performance-tips">Performance Tips<a class="headerlink" href="#performance-tips" title="Permanent link">&para;</a></h2>
+<p>Stock SQLite is not ranked in the vector table because the built-in <code>sqlite3</code> used here has no native vector distance/top-k functions in this harness.</p>
+<h2 id="representative-olap-gaps">Representative OLAP Gaps<a class="headerlink" href="#representative-olap-gaps" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite</th>
+<th style="text-align: right;">DuckDB</th>
+<th>Gap to best other</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>COUNT(*)</td>
+<td style="text-align: right;">0.106 ms</td>
+<td style="text-align: right;">1.775 ms</td>
+<td style="text-align: right;">0.397 ms</td>
+<td>3.7x faster vs DuckDB</td>
+</tr>
+<tr>
+<td>SELECT * LIMIT 100 (warm cache)</td>
+<td style="text-align: right;">6 us</td>
+<td style="text-align: right;">0.107 ms</td>
+<td style="text-align: right;">0.236 ms</td>
+<td>17.8x faster vs SQLite</td>
+</tr>
+<tr>
+<td>Filtered LIMIT 100 (age&gt;30)</td>
+<td style="text-align: right;">0.050 ms</td>
+<td style="text-align: right;">0.173 ms</td>
+<td style="text-align: right;">0.603 ms</td>
+<td>3.5x faster vs SQLite</td>
+</tr>
+<tr>
+<td>GROUP BY city (10 groups)</td>
+<td style="text-align: right;">0.060 ms</td>
+<td style="text-align: right;">60.108 ms</td>
+<td style="text-align: right;">2.399 ms</td>
+<td>40.0x faster vs DuckDB</td>
+</tr>
+<tr>
+<td>Window ROW_NUMBER PARTITION BY city</td>
+<td style="text-align: right;">0.622 ms</td>
+<td style="text-align: right;">99.086 ms</td>
+<td style="text-align: right;">12.809 ms</td>
+<td>20.6x faster vs DuckDB</td>
+</tr>
+</tbody>
+</table>
+<h2 id="representative-oltp-gaps">Representative OLTP Gaps<a class="headerlink" href="#representative-oltp-gaps" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite</th>
+<th style="text-align: right;">DuckDB</th>
+<th>Gap to best other</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Bulk Insert (N rows; default fair)</td>
+<td style="text-align: right;">53.948 ms</td>
+<td style="text-align: right;">197.464 ms</td>
+<td style="text-align: right;">35.84 s</td>
+<td>3.7x faster vs SQLite</td>
+</tr>
+<tr>
+<td>Point Lookup (SQL by ID)</td>
+<td style="text-align: right;">0.035 ms</td>
+<td style="text-align: right;">0.067 ms</td>
+<td style="text-align: right;">2.198 ms</td>
+<td>1.9x faster vs SQLite</td>
+</tr>
+<tr>
+<td>Retrieve Many (SQL, 100 IDs)</td>
+<td style="text-align: right;">0.175 ms</td>
+<td style="text-align: right;">0.317 ms</td>
+<td style="text-align: right;">3.942 ms</td>
+<td>1.8x faster vs SQLite</td>
+</tr>
+<tr>
+<td>FTS Index Build (name,city,category)</td>
+<td style="text-align: right;">103.738 ms</td>
+<td style="text-align: right;">246.588 ms</td>
+<td style="text-align: right;">790.703 ms</td>
+<td>2.4x faster vs SQLite</td>
+</tr>
+<tr>
+<td>FTS Search ('Electronics')</td>
+<td style="text-align: right;">0.160 ms</td>
+<td style="text-align: right;">5.700 ms</td>
+<td style="text-align: right;">14.644 ms</td>
+<td>35.6x faster vs SQLite</td>
+</tr>
+</tbody>
+</table>
+<h2 id="representative-vector-gaps">Representative Vector Gaps<a class="headerlink" href="#representative-vector-gaps" title="Permanent link">&para;</a></h2>
+<p>SQLite is excluded here because stock <code>sqlite3</code> in this harness has no native vector distance/top-k support.</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">DuckDB</th>
+<th>Gap to DuckDB</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TopK L2</td>
+<td style="text-align: right;">3.58 ms</td>
+<td style="text-align: right;">26.46 ms</td>
+<td>7.4x faster</td>
+</tr>
+<tr>
+<td>TopK Cosine</td>
+<td style="text-align: right;">3.80 ms</td>
+<td style="text-align: right;">31.89 ms</td>
+<td>8.4x faster</td>
+</tr>
+<tr>
+<td>TopK Dot</td>
+<td style="text-align: right;">3.48 ms</td>
+<td style="text-align: right;">26.37 ms</td>
+<td>7.6x faster</td>
+</tr>
+<tr>
+<td>Batch TopK L2 (10 queries)</td>
+<td style="text-align: right;">23.18 ms</td>
+<td style="text-align: right;">266.92 ms</td>
+<td>11.5x faster</td>
+</tr>
+<tr>
+<td>Batch TopK Cosine (10 queries)</td>
+<td style="text-align: right;">23.24 ms</td>
+<td style="text-align: right;">322.07 ms</td>
+<td>13.9x faster</td>
+</tr>
+<tr>
+<td>Batch TopK Dot (10 queries)</td>
+<td style="text-align: right;">21.12 ms</td>
+<td style="text-align: right;">268.44 ms</td>
+<td>12.7x faster</td>
+</tr>
+</tbody>
+</table>
+<h2 id="throughput-snapshot">Throughput Snapshot<a class="headerlink" href="#throughput-snapshot" title="Permanent link">&para;</a></h2>
+<p>Q/s uses a mixed analytical profile: <code>COUNT(*)</code>, two <code>GROUP BY</code> scans, and <code>Filtered LIMIT 100</code>, all materialized to Python rows.</p>
+<table>
+<thead>
+<tr>
+<th>Throughput metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite</th>
+<th style="text-align: right;">DuckDB</th>
+<th>Gap to best other</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OLAP Q/s (single thread)</td>
+<td style="text-align: right;">123,700.3</td>
+<td style="text-align: right;">34.8</td>
+<td style="text-align: right;">942.2</td>
+<td>131.3x higher vs DuckDB</td>
+</tr>
+<tr>
+<td>OLAP Q/s (4 threads)</td>
+<td style="text-align: right;">125,196.3</td>
+<td style="text-align: right;">126.6</td>
+<td style="text-align: right;">2,776.8</td>
+<td>45.1x higher vs DuckDB</td>
+</tr>
+</tbody>
+</table>
+<h2 id="hot-path-latency-snapshot">Hot-Path Latency Snapshot<a class="headerlink" href="#hot-path-latency-snapshot" title="Permanent link">&para;</a></h2>
+<p>These tables are not part of the <code>38/38</code> fair scoreboard. They answer a different question: how fast is the already-loaded hot path, and what happens when durability or transaction semantics are made explicit?</p>
+<h3 id="default-microbenchmarks">Default Microbenchmarks<a class="headerlink" href="#default-microbenchmarks" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite</th>
+<th style="text-align: right;">DuckDB</th>
+<th>Gap to best other</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>COUNT(*) (direct API)</td>
+<td style="text-align: right;">7.43 us</td>
+<td style="text-align: right;">1.243 ms</td>
+<td style="text-align: right;">0.132 ms</td>
+<td>17.8x faster vs DuckDB</td>
+</tr>
+<tr>
+<td>Point lookup (projected SQL)</td>
+<td style="text-align: right;">2.12 us</td>
+<td style="text-align: right;">2.99 us</td>
+<td style="text-align: right;">1.722 ms</td>
+<td>1.4x faster vs SQLite</td>
+</tr>
+<tr>
+<td>Retrieve 100 IDs (projected SQL)</td>
+<td style="text-align: right;">0.041 ms</td>
+<td style="text-align: right;">0.099 ms</td>
+<td style="text-align: right;">3.438 ms</td>
+<td>2.4x faster vs SQLite</td>
+</tr>
+<tr>
+<td>Insert 1 row (default fair)</td>
+<td style="text-align: right;">0.010 ms</td>
+<td style="text-align: right;">0.014 ms</td>
+<td style="text-align: right;">0.297 ms</td>
+<td>1.4x faster vs SQLite</td>
+</tr>
+<tr>
+<td>UPDATE by ID</td>
+<td style="text-align: right;">1.13 us</td>
+<td style="text-align: right;">4.23 us</td>
+<td style="text-align: right;">0.483 ms</td>
+<td>3.7x faster vs SQLite</td>
+</tr>
+<tr>
+<td>DELETE missing ID</td>
+<td style="text-align: right;">2.72 us</td>
+<td style="text-align: right;">3.81 us</td>
+<td style="text-align: right;">1.160 ms</td>
+<td>1.4x faster vs SQLite</td>
+</tr>
+</tbody>
+</table>
+<h3 id="durable-fair-microbenchmarks">Durable Fair Microbenchmarks<a class="headerlink" href="#durable-fair-microbenchmarks" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite</th>
+<th style="text-align: right;">DuckDB</th>
+<th>Gap to best other</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Insert 1 row (durable fair)</td>
+<td style="text-align: right;">0.101 ms</td>
+<td style="text-align: right;">0.126 ms</td>
+<td style="text-align: right;">31.106 ms</td>
+<td>1.2x faster vs SQLite</td>
+</tr>
+<tr>
+<td>UPDATE by ID (durable fair)</td>
+<td style="text-align: right;">2.02 us</td>
+<td style="text-align: right;">6.53 us</td>
+<td style="text-align: right;">4.469 ms</td>
+<td>3.2x faster vs SQLite</td>
+</tr>
+</tbody>
+</table>
+<h3 id="transaction-fair-microbenchmarks">Transaction Fair Microbenchmarks<a class="headerlink" href="#transaction-fair-microbenchmarks" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite</th>
+<th style="text-align: right;">DuckDB</th>
+<th>Gap to best other</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TXN empty (BEGIN+COMMIT; durable sync)</td>
+<td style="text-align: right;">3.29 us</td>
+<td style="text-align: right;">4.08 us</td>
+<td style="text-align: right;">0.148 ms</td>
+<td>1.2x faster vs SQLite</td>
+</tr>
+<tr>
+<td>TXN read COUNT(*) (COMMIT; durable sync)</td>
+<td style="text-align: right;">0.018 ms</td>
+<td style="text-align: right;">1.295 ms</td>
+<td style="text-align: right;">0.294 ms</td>
+<td>16.3x faster vs DuckDB</td>
+</tr>
+<tr>
+<td>TXN backlog string miss (COMMIT; 1500 preseed; durable sync)</td>
+<td style="text-align: right;">0.051 ms</td>
+<td style="text-align: right;">8.011 ms</td>
+<td style="text-align: right;">0.404 ms</td>
+<td>7.9x faster vs DuckDB</td>
+</tr>
+<tr>
+<td>TXN backlog COUNT(*) (COMMIT; 1500 preseed; durable sync)</td>
+<td style="text-align: right;">0.030 ms</td>
+<td style="text-align: right;">3.793 ms</td>
+<td style="text-align: right;">0.305 ms</td>
+<td>10.2x faster vs DuckDB</td>
+</tr>
+<tr>
+<td>TXN backlog INSERT+read-own-name (COMMIT; 1500 preseed; durable sync)</td>
+<td style="text-align: right;">0.262 ms</td>
+<td style="text-align: right;">8.073 ms</td>
+<td style="text-align: right;">33.522 ms</td>
+<td>30.8x faster vs SQLite</td>
+</tr>
+</tbody>
+</table>
+<h2 id="oltp-write-visibility">OLTP Write Visibility<a class="headerlink" href="#oltp-write-visibility" title="Permanent link">&para;</a></h2>
+<p>ApexBase exposes two fast single-row append paths, and the benchmark keeps them out of the fair scoreboard because their visibility rules are Apex-specific:</p>
 <ul>
-<li>Create tables with schemas for large repeated imports.</li>
-<li>Prefer columnar dictionaries or DataFrame import for bulk writes.</li>
-<li>Use <code>register_temp_table()</code> when querying the same file many times.</li>
-<li>Convert results to Arrow or Polars when downstream code is columnar.</li>
-<li>Use <code>durability="fast"</code> for scratch imports and <code>durability="safe"</code> or <code>durability="max"</code> for application data.</li>
+<li><strong>Memtable OLTP</strong> is the default fast single-row path for schema-stable <code>store({...})</code> calls with <code>durability="fast"</code>. The writing client can read the row immediately, managed clients in the same Python process share the storage instance, and <code>flush()</code> / <code>close()</code> persists pending rows.</li>
+<li><strong>Buffered OLTP</strong> is explicit: call <code>begin_buffered_writes()</code>, issue many single-row <code>store({...})</code> calls, then call <code>flush_buffered_writes()</code> or <code>end_buffered_writes(flush=True)</code>. Buffered rows are not visible until flushed.</li>
 </ul>
+<p>That separation is deliberate: the fair tables compare committed cross-engine behavior, while Apex-only write modes remain visible as diagnostics instead of being mixed into the competitive summary.</p>
+<h2 id="reproduce">Reproduce<a class="headerlink" href="#reproduce" title="Permanent link">&para;</a></h2>
+<p>Use the same command as the snapshot above:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>python<span class="w"> </span>benchmarks/bench_vs_sqlite_duckdb.py<span class="w"> </span>--rows<span class="w"> </span><span class="m">200000</span><span class="w"> </span>--warmup<span class="w"> </span><span class="m">2</span><span class="w"> </span>--iterations<span class="w"> </span><span class="m">3</span>
+</span></code></pre></div>
+<p>Add <code>--skip-vector</code> if you want a tabular-only rerun without the separate vector module.</p>
+<p>For a larger stress run, increase <code>--rows</code> to <code>1000000</code>.</p>
 
 
 
@@ -1625,10 +1894,10 @@
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.instant.progress", "navigation.top", "navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.path", "toc.integrate", "search.suggest", "search.highlight", "search.share", "content.code.copy", "content.code.select", "content.code.annotate", "content.tabs.link"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"current": "1.18.0", "default": "latest", "label": "v1.18.0", "provider": "mike"}}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.instant.progress", "navigation.top", "navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.path", "toc.integrate", "search.suggest", "search.highlight", "search.share", "content.code.copy", "content.code.select", "content.code.annotate", "content.tabs.link"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"current": "1.18.0", "default": "latest", "label": "v1.18.0", "provider": "mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
       
     
   </body>

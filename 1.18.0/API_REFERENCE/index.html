@@ -321,6 +321,25 @@
   
   
   
+    <li class="md-tabs__item">
+      <a href="../performance/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Performance
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
     
     
       <li class="md-tabs__item">
@@ -2377,6 +2396,33 @@
   
   
   
+    <li class="md-nav__item">
+      <a href="../performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
     
     
     
@@ -2391,10 +2437,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
         
           
-          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
             
   
   
@@ -2412,8 +2458,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_5">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -2506,10 +2552,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
         
           
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="0">
             
   
   
@@ -2527,8 +2573,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_6">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -3867,20 +3913,20 @@ Get internal _ids from results.</p>
 <h2 id="vector-search">Vector Search<a class="headerlink" href="#vector-search" title="Permanent link">&para;</a></h2>
 <p>ApexBase has a built-in vector similarity search engine implemented entirely in Rust with SIMD-accelerated distance kernels and an OS-level mmap scan buffer that is populated once and reused across queries. Both single-query and batch modes are available through dedicated Python methods and through a SQL extension syntax.</p>
 <h3 id="vector-column-storage">Vector column storage<a class="headerlink" href="#vector-column-storage" title="Permanent link">&para;</a></h3>
-<p>Vectors are stored as <strong>FixedList</strong> columns when inserted as numpy arrays (recommended) or as <strong>Binary</strong> columns when inserted as Python lists or tuples.</p>
+<p>Vectors are stored as <strong>FixedList</strong> columns when inserted as numpy arrays or numeric Python lists/tuples. For embedding-heavy tables, declare the column as <code>FLOAT16_VECTOR</code> to store half-precision values while keeping the same SQL distance functions.</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-134-1"><a id="__codelineno-134-1" name="__codelineno-134-1" href="#__codelineno-134-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 </span><span id="__span-134-2"><a id="__codelineno-134-2" name="__codelineno-134-2" href="#__codelineno-134-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">apexbase</span><span class="w"> </span><span class="kn">import</span> <span class="n">ApexClient</span>
 </span><span id="__span-134-3"><a id="__codelineno-134-3" name="__codelineno-134-3" href="#__codelineno-134-3"></a>
 </span><span id="__span-134-4"><a id="__codelineno-134-4" name="__codelineno-134-4" href="#__codelineno-134-4"></a><span class="n">client</span> <span class="o">=</span> <span class="n">ApexClient</span><span class="p">(</span><span class="s2">&quot;./vecdb&quot;</span><span class="p">)</span>
 </span><span id="__span-134-5"><a id="__codelineno-134-5" name="__codelineno-134-5" href="#__codelineno-134-5"></a><span class="n">client</span><span class="o">.</span><span class="n">create_table</span><span class="p">(</span><span class="s2">&quot;items&quot;</span><span class="p">)</span>
 </span><span id="__span-134-6"><a id="__codelineno-134-6" name="__codelineno-134-6" href="#__codelineno-134-6"></a>
-</span><span id="__span-134-7"><a id="__codelineno-134-7" name="__codelineno-134-7" href="#__codelineno-134-7"></a><span class="c1"># numpy arrays → FixedList column (optimal, zero-copy mmap scan)</span>
+</span><span id="__span-134-7"><a id="__codelineno-134-7" name="__codelineno-134-7" href="#__codelineno-134-7"></a><span class="c1"># numpy arrays → FixedList column</span>
 </span><span id="__span-134-8"><a id="__codelineno-134-8" name="__codelineno-134-8" href="#__codelineno-134-8"></a><span class="n">client</span><span class="o">.</span><span class="n">store</span><span class="p">({</span>
 </span><span id="__span-134-9"><a id="__codelineno-134-9" name="__codelineno-134-9" href="#__codelineno-134-9"></a>    <span class="s2">&quot;label&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;a&quot;</span><span class="p">,</span> <span class="s2">&quot;b&quot;</span><span class="p">,</span> <span class="s2">&quot;c&quot;</span><span class="p">],</span>
 </span><span id="__span-134-10"><a id="__codelineno-134-10" name="__codelineno-134-10" href="#__codelineno-134-10"></a>    <span class="s2">&quot;vec&quot;</span><span class="p">:</span>   <span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">128</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">3</span><span class="p">)],</span>
 </span><span id="__span-134-11"><a id="__codelineno-134-11" name="__codelineno-134-11" href="#__codelineno-134-11"></a><span class="p">})</span>
 </span><span id="__span-134-12"><a id="__codelineno-134-12" name="__codelineno-134-12" href="#__codelineno-134-12"></a>
-</span><span id="__span-134-13"><a id="__codelineno-134-13" name="__codelineno-134-13" href="#__codelineno-134-13"></a><span class="c1"># Python list/tuple → Binary column (also supported)</span>
+</span><span id="__span-134-13"><a id="__codelineno-134-13" name="__codelineno-134-13" href="#__codelineno-134-13"></a><span class="c1"># Python list/tuple vectors are also accepted</span>
 </span><span id="__span-134-14"><a id="__codelineno-134-14" name="__codelineno-134-14" href="#__codelineno-134-14"></a><span class="n">client</span><span class="o">.</span><span class="n">store</span><span class="p">({</span><span class="s2">&quot;label&quot;</span><span class="p">:</span> <span class="s2">&quot;d&quot;</span><span class="p">,</span> <span class="s2">&quot;vec&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mf">0.1</span><span class="p">,</span> <span class="mf">0.2</span><span class="p">,</span> <span class="mf">0.3</span><span class="p">]})</span>
 </span></code></pre></div>
 <hr />
@@ -3891,7 +3937,7 @@ Get internal _ids from results.</p>
 </span></code></pre></div>
 <p>Accepted type name aliases: <code>FLOAT16_VECTOR</code>, <code>FLOAT16VECTOR</code>, <code>F16_VECTOR</code>.</p>
 <h4 id="inserting-float16-vectors">Inserting float16 vectors<a class="headerlink" href="#inserting-float16-vectors" title="Permanent link">&para;</a></h4>
-<p>Use a <strong>batch store</strong> (two or more records in one call) for optimal encoding.  Pass vectors as <code>numpy</code> arrays — any numeric dtype is accepted; the storage layer converts to float16 automatically.</p>
+<p>Use batch store for best throughput. Pass vectors as <code>numpy</code> arrays or numeric Python lists — any numeric dtype is accepted; the storage layer converts to float16 automatically.</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-136-1"><a id="__codelineno-136-1" name="__codelineno-136-1" href="#__codelineno-136-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 </span><span id="__span-136-2"><a id="__codelineno-136-2" name="__codelineno-136-2" href="#__codelineno-136-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">apexbase</span><span class="w"> </span><span class="kn">import</span> <span class="n">ApexClient</span>
 </span><span id="__span-136-3"><a id="__codelineno-136-3" name="__codelineno-136-3" href="#__codelineno-136-3"></a>
@@ -3903,30 +3949,27 @@ Get internal _ids from results.</p>
 </span><span id="__span-136-9"><a id="__codelineno-136-9" name="__codelineno-136-9" href="#__codelineno-136-9"></a><span class="n">vecs</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="mi">128</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
 </span><span id="__span-136-10"><a id="__codelineno-136-10" name="__codelineno-136-10" href="#__codelineno-136-10"></a><span class="n">client</span><span class="o">.</span><span class="n">store</span><span class="p">([{</span><span class="s2">&quot;label&quot;</span><span class="p">:</span> <span class="nb">str</span><span class="p">(</span><span class="n">i</span><span class="p">),</span> <span class="s2">&quot;vec&quot;</span><span class="p">:</span> <span class="n">vecs</span><span class="p">[</span><span class="n">i</span><span class="p">]}</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">vecs</span><span class="p">))])</span>
 </span><span id="__span-136-11"><a id="__codelineno-136-11" name="__codelineno-136-11" href="#__codelineno-136-11"></a>
-</span><span id="__span-136-12"><a id="__codelineno-136-12" name="__codelineno-136-12" href="#__codelineno-136-12"></a><span class="c1"># float16 source data — stored directly</span>
-</span><span id="__span-136-13"><a id="__codelineno-136-13" name="__codelineno-136-13" href="#__codelineno-136-13"></a><span class="n">vecs_f16</span> <span class="o">=</span> <span class="n">vecs</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
-</span><span id="__span-136-14"><a id="__codelineno-136-14" name="__codelineno-136-14" href="#__codelineno-136-14"></a><span class="n">client</span><span class="o">.</span><span class="n">store</span><span class="p">([{</span><span class="s2">&quot;label&quot;</span><span class="p">:</span> <span class="nb">str</span><span class="p">(</span><span class="n">i</span><span class="p">),</span> <span class="s2">&quot;vec&quot;</span><span class="p">:</span> <span class="n">vecs_f16</span><span class="p">[</span><span class="n">i</span><span class="p">]}</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">vecs_f16</span><span class="p">))])</span>
+</span><span id="__span-136-12"><a id="__codelineno-136-12" name="__codelineno-136-12" href="#__codelineno-136-12"></a><span class="c1"># Python lists also work, including single-record writes</span>
+</span><span id="__span-136-13"><a id="__codelineno-136-13" name="__codelineno-136-13" href="#__codelineno-136-13"></a><span class="n">client</span><span class="o">.</span><span class="n">store</span><span class="p">({</span><span class="s2">&quot;label&quot;</span><span class="p">:</span> <span class="s2">&quot;queryable&quot;</span><span class="p">,</span> <span class="s2">&quot;vec&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mf">0.1</span><span class="p">,</span> <span class="mf">0.2</span><span class="p">,</span> <span class="mf">0.3</span><span class="p">,</span> <span class="mf">0.4</span><span class="p">]})</span>
+</span><span id="__span-136-14"><a id="__codelineno-136-14" name="__codelineno-136-14" href="#__codelineno-136-14"></a>
+</span><span id="__span-136-15"><a id="__codelineno-136-15" name="__codelineno-136-15" href="#__codelineno-136-15"></a><span class="c1"># float16 source data — stored directly</span>
+</span><span id="__span-136-16"><a id="__codelineno-136-16" name="__codelineno-136-16" href="#__codelineno-136-16"></a><span class="n">vecs_f16</span> <span class="o">=</span> <span class="n">vecs</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
+</span><span id="__span-136-17"><a id="__codelineno-136-17" name="__codelineno-136-17" href="#__codelineno-136-17"></a><span class="n">client</span><span class="o">.</span><span class="n">store</span><span class="p">([{</span><span class="s2">&quot;label&quot;</span><span class="p">:</span> <span class="nb">str</span><span class="p">(</span><span class="n">i</span><span class="p">),</span> <span class="s2">&quot;vec&quot;</span><span class="p">:</span> <span class="n">vecs_f16</span><span class="p">[</span><span class="n">i</span><span class="p">]}</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">vecs_f16</span><span class="p">))])</span>
 </span></code></pre></div>
-<blockquote>
-<p><strong>Note:</strong> Always use batch store (<code>len(data) &gt; 1</code>) for <code>FLOAT16_VECTOR</code> columns.  The single-record path converts vectors to float32 bytes before storage, which will produce incorrect distances on float16 columns.  Batch the writes or use the columnar dict API:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-137-1"><a id="__codelineno-137-1" name="__codelineno-137-1" href="#__codelineno-137-1"></a><span class="c1"># Columnar dict — also correct and fastest</span>
-</span><span id="__span-137-2"><a id="__codelineno-137-2" name="__codelineno-137-2" href="#__codelineno-137-2"></a><span class="n">client</span><span class="o">.</span><span class="n">store</span><span class="p">({</span><span class="s2">&quot;label&quot;</span><span class="p">:</span> <span class="p">[</span><span class="nb">str</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">)],</span> <span class="s2">&quot;vec&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">vecs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">)]})</span>
-</span></code></pre></div>
-</blockquote>
 <h4 id="querying-float16-vectors">Querying float16 vectors<a class="headerlink" href="#querying-float16-vectors" title="Permanent link">&para;</a></h4>
 <p>All <code>topk_distance</code>, <code>batch_topk_distance</code>, and SQL distance functions work transparently on <code>FLOAT16_VECTOR</code> columns.  The query vector is always provided in float32/float64 — no special handling needed.</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-138-1"><a id="__codelineno-138-1" name="__codelineno-138-1" href="#__codelineno-138-1"></a><span class="n">query</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">128</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
-</span><span id="__span-138-2"><a id="__codelineno-138-2" name="__codelineno-138-2" href="#__codelineno-138-2"></a>
-</span><span id="__span-138-3"><a id="__codelineno-138-3" name="__codelineno-138-3" href="#__codelineno-138-3"></a><span class="c1"># TopK search</span>
-</span><span id="__span-138-4"><a id="__codelineno-138-4" name="__codelineno-138-4" href="#__codelineno-138-4"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">topk_distance</span><span class="p">(</span><span class="s2">&quot;vec&quot;</span><span class="p">,</span> <span class="n">query</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span> <span class="n">metric</span><span class="o">=</span><span class="s2">&quot;l2&quot;</span><span class="p">)</span>
-</span><span id="__span-138-5"><a id="__codelineno-138-5" name="__codelineno-138-5" href="#__codelineno-138-5"></a>
-</span><span id="__span-138-6"><a id="__codelineno-138-6" name="__codelineno-138-6" href="#__codelineno-138-6"></a><span class="c1"># SQL distance functions also work</span>
-</span><span id="__span-138-7"><a id="__codelineno-138-7" name="__codelineno-138-7" href="#__codelineno-138-7"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
-</span><span id="__span-138-8"><a id="__codelineno-138-8" name="__codelineno-138-8" href="#__codelineno-138-8"></a><span class="s2">    SELECT label, array_distance(vec, [0.1, 0.2, 0.3, 0.4]) AS dist</span>
-</span><span id="__span-138-9"><a id="__codelineno-138-9" name="__codelineno-138-9" href="#__codelineno-138-9"></a><span class="s2">    FROM embeddings</span>
-</span><span id="__span-138-10"><a id="__codelineno-138-10" name="__codelineno-138-10" href="#__codelineno-138-10"></a><span class="s2">    ORDER BY dist</span>
-</span><span id="__span-138-11"><a id="__codelineno-138-11" name="__codelineno-138-11" href="#__codelineno-138-11"></a><span class="s2">    LIMIT 5</span>
-</span><span id="__span-138-12"><a id="__codelineno-138-12" name="__codelineno-138-12" href="#__codelineno-138-12"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-137-1"><a id="__codelineno-137-1" name="__codelineno-137-1" href="#__codelineno-137-1"></a><span class="n">query</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">128</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+</span><span id="__span-137-2"><a id="__codelineno-137-2" name="__codelineno-137-2" href="#__codelineno-137-2"></a>
+</span><span id="__span-137-3"><a id="__codelineno-137-3" name="__codelineno-137-3" href="#__codelineno-137-3"></a><span class="c1"># TopK search</span>
+</span><span id="__span-137-4"><a id="__codelineno-137-4" name="__codelineno-137-4" href="#__codelineno-137-4"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">topk_distance</span><span class="p">(</span><span class="s2">&quot;vec&quot;</span><span class="p">,</span> <span class="n">query</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span> <span class="n">metric</span><span class="o">=</span><span class="s2">&quot;l2&quot;</span><span class="p">)</span>
+</span><span id="__span-137-5"><a id="__codelineno-137-5" name="__codelineno-137-5" href="#__codelineno-137-5"></a>
+</span><span id="__span-137-6"><a id="__codelineno-137-6" name="__codelineno-137-6" href="#__codelineno-137-6"></a><span class="c1"># SQL distance functions also work</span>
+</span><span id="__span-137-7"><a id="__codelineno-137-7" name="__codelineno-137-7" href="#__codelineno-137-7"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
+</span><span id="__span-137-8"><a id="__codelineno-137-8" name="__codelineno-137-8" href="#__codelineno-137-8"></a><span class="s2">    SELECT label, array_distance(vec, [0.1, 0.2, 0.3, 0.4]) AS dist</span>
+</span><span id="__span-137-9"><a id="__codelineno-137-9" name="__codelineno-137-9" href="#__codelineno-137-9"></a><span class="s2">    FROM embeddings</span>
+</span><span id="__span-137-10"><a id="__codelineno-137-10" name="__codelineno-137-10" href="#__codelineno-137-10"></a><span class="s2">    ORDER BY dist</span>
+</span><span id="__span-137-11"><a id="__codelineno-137-11" name="__codelineno-137-11" href="#__codelineno-137-11"></a><span class="s2">    LIMIT 5</span>
+</span><span id="__span-137-12"><a id="__codelineno-137-12" name="__codelineno-137-12" href="#__codelineno-137-12"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
 </span></code></pre></div>
 <h4 id="simd-acceleration">SIMD acceleration<a class="headerlink" href="#simd-acceleration" title="Permanent link">&para;</a></h4>
 <p>Float16 distance kernels are hardware-accelerated on supported CPUs:</p>
@@ -3959,28 +4002,28 @@ Get internal _ids from results.</p>
 <p>CPU feature detection is automatic at runtime — no build flags or environment variables required.  On Apple Silicon (M1/M2/M3/M4), f16 kernels are typically <strong>≥2× faster</strong> than equivalent float32 kernels.</p>
 <h4 id="quantization-error">Quantization error<a class="headerlink" href="#quantization-error" title="Permanent link">&para;</a></h4>
 <p>Float16 has ~3 decimal digits of precision (machine epsilon ≈ 9.77 × 10⁻⁴).  For unit vectors or typical embedding ranges [−1, 1], the relative distance error is under 0.2%.</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-139-1"><a id="__codelineno-139-1" name="__codelineno-139-1" href="#__codelineno-139-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
-</span><span id="__span-139-2"><a id="__codelineno-139-2" name="__codelineno-139-2" href="#__codelineno-139-2"></a>
-</span><span id="__span-139-3"><a id="__codelineno-139-3" name="__codelineno-139-3" href="#__codelineno-139-3"></a><span class="k">def</span><span class="w"> </span><span class="nf">f16_quantize</span><span class="p">(</span><span class="n">v</span><span class="p">):</span>
-</span><span id="__span-139-4"><a id="__codelineno-139-4" name="__codelineno-139-4" href="#__codelineno-139-4"></a>    <span class="k">return</span> <span class="n">v</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
-</span><span id="__span-139-5"><a id="__codelineno-139-5" name="__codelineno-139-5" href="#__codelineno-139-5"></a>
-</span><span id="__span-139-6"><a id="__codelineno-139-6" name="__codelineno-139-6" href="#__codelineno-139-6"></a><span class="n">vec</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">128</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
-</span><span id="__span-139-7"><a id="__codelineno-139-7" name="__codelineno-139-7" href="#__codelineno-139-7"></a><span class="n">q</span>   <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">128</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
-</span><span id="__span-139-8"><a id="__codelineno-139-8" name="__codelineno-139-8" href="#__codelineno-139-8"></a>
-</span><span id="__span-139-9"><a id="__codelineno-139-9" name="__codelineno-139-9" href="#__codelineno-139-9"></a><span class="n">exact</span>    <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sum</span><span class="p">((</span><span class="n">vec</span> <span class="o">-</span> <span class="n">q</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span><span class="p">)))</span>
-</span><span id="__span-139-10"><a id="__codelineno-139-10" name="__codelineno-139-10" href="#__codelineno-139-10"></a><span class="n">f16_dist</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sum</span><span class="p">((</span><span class="n">f16_quantize</span><span class="p">(</span><span class="n">vec</span><span class="p">)</span> <span class="o">-</span> <span class="n">q</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span><span class="p">)))</span>
-</span><span id="__span-139-11"><a id="__codelineno-139-11" name="__codelineno-139-11" href="#__codelineno-139-11"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;relative error: </span><span class="si">{</span><span class="nb">abs</span><span class="p">(</span><span class="n">exact</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">f16_dist</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">exact</span><span class="si">:</span><span class="s2">.2e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>  <span class="c1"># typically &lt; 2e-3</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-138-1"><a id="__codelineno-138-1" name="__codelineno-138-1" href="#__codelineno-138-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+</span><span id="__span-138-2"><a id="__codelineno-138-2" name="__codelineno-138-2" href="#__codelineno-138-2"></a>
+</span><span id="__span-138-3"><a id="__codelineno-138-3" name="__codelineno-138-3" href="#__codelineno-138-3"></a><span class="k">def</span><span class="w"> </span><span class="nf">f16_quantize</span><span class="p">(</span><span class="n">v</span><span class="p">):</span>
+</span><span id="__span-138-4"><a id="__codelineno-138-4" name="__codelineno-138-4" href="#__codelineno-138-4"></a>    <span class="k">return</span> <span class="n">v</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+</span><span id="__span-138-5"><a id="__codelineno-138-5" name="__codelineno-138-5" href="#__codelineno-138-5"></a>
+</span><span id="__span-138-6"><a id="__codelineno-138-6" name="__codelineno-138-6" href="#__codelineno-138-6"></a><span class="n">vec</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">128</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+</span><span id="__span-138-7"><a id="__codelineno-138-7" name="__codelineno-138-7" href="#__codelineno-138-7"></a><span class="n">q</span>   <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">128</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+</span><span id="__span-138-8"><a id="__codelineno-138-8" name="__codelineno-138-8" href="#__codelineno-138-8"></a>
+</span><span id="__span-138-9"><a id="__codelineno-138-9" name="__codelineno-138-9" href="#__codelineno-138-9"></a><span class="n">exact</span>    <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sum</span><span class="p">((</span><span class="n">vec</span> <span class="o">-</span> <span class="n">q</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span><span class="p">)))</span>
+</span><span id="__span-138-10"><a id="__codelineno-138-10" name="__codelineno-138-10" href="#__codelineno-138-10"></a><span class="n">f16_dist</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sum</span><span class="p">((</span><span class="n">f16_quantize</span><span class="p">(</span><span class="n">vec</span><span class="p">)</span> <span class="o">-</span> <span class="n">q</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span><span class="p">)))</span>
+</span><span id="__span-138-11"><a id="__codelineno-138-11" name="__codelineno-138-11" href="#__codelineno-138-11"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;relative error: </span><span class="si">{</span><span class="nb">abs</span><span class="p">(</span><span class="n">exact</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">f16_dist</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">exact</span><span class="si">:</span><span class="s2">.2e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>  <span class="c1"># typically &lt; 2e-3</span>
 </span></code></pre></div>
 <hr />
 <h3 id="topk_distance">topk_distance<a class="headerlink" href="#topk_distance" title="Permanent link">&para;</a></h3>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-140-1"><a id="__codelineno-140-1" name="__codelineno-140-1" href="#__codelineno-140-1"></a><span class="n">topk_distance</span><span class="p">(</span>
-</span><span id="__span-140-2"><a id="__codelineno-140-2" name="__codelineno-140-2" href="#__codelineno-140-2"></a>    <span class="n">col</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-</span><span id="__span-140-3"><a id="__codelineno-140-3" name="__codelineno-140-3" href="#__codelineno-140-3"></a>    <span class="n">query</span><span class="p">,</span>
-</span><span id="__span-140-4"><a id="__codelineno-140-4" name="__codelineno-140-4" href="#__codelineno-140-4"></a>    <span class="n">k</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span><span class="p">,</span>
-</span><span id="__span-140-5"><a id="__codelineno-140-5" name="__codelineno-140-5" href="#__codelineno-140-5"></a>    <span class="n">metric</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;l2&#39;</span><span class="p">,</span>
-</span><span id="__span-140-6"><a id="__codelineno-140-6" name="__codelineno-140-6" href="#__codelineno-140-6"></a>    <span class="n">id_col</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;_id&#39;</span><span class="p">,</span>
-</span><span id="__span-140-7"><a id="__codelineno-140-7" name="__codelineno-140-7" href="#__codelineno-140-7"></a>    <span class="n">dist_col</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;dist&#39;</span><span class="p">,</span>
-</span><span id="__span-140-8"><a id="__codelineno-140-8" name="__codelineno-140-8" href="#__codelineno-140-8"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ResultView</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-139-1"><a id="__codelineno-139-1" name="__codelineno-139-1" href="#__codelineno-139-1"></a><span class="n">topk_distance</span><span class="p">(</span>
+</span><span id="__span-139-2"><a id="__codelineno-139-2" name="__codelineno-139-2" href="#__codelineno-139-2"></a>    <span class="n">col</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+</span><span id="__span-139-3"><a id="__codelineno-139-3" name="__codelineno-139-3" href="#__codelineno-139-3"></a>    <span class="n">query</span><span class="p">,</span>
+</span><span id="__span-139-4"><a id="__codelineno-139-4" name="__codelineno-139-4" href="#__codelineno-139-4"></a>    <span class="n">k</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span><span class="p">,</span>
+</span><span id="__span-139-5"><a id="__codelineno-139-5" name="__codelineno-139-5" href="#__codelineno-139-5"></a>    <span class="n">metric</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;l2&#39;</span><span class="p">,</span>
+</span><span id="__span-139-6"><a id="__codelineno-139-6" name="__codelineno-139-6" href="#__codelineno-139-6"></a>    <span class="n">id_col</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;_id&#39;</span><span class="p">,</span>
+</span><span id="__span-139-7"><a id="__codelineno-139-7" name="__codelineno-139-7" href="#__codelineno-139-7"></a>    <span class="n">dist_col</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;dist&#39;</span><span class="p">,</span>
+</span><span id="__span-139-8"><a id="__codelineno-139-8" name="__codelineno-139-8" href="#__codelineno-139-8"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ResultView</span>
 </span></code></pre></div>
 <p>Heap-based nearest-neighbour search: O(n log k), significantly faster than <code>ORDER BY distance LIMIT k</code> for large tables.</p>
 <p><strong>Parameters:</strong>
@@ -4034,43 +4077,43 @@ Get internal _ids from results.</p>
 </table>
 <p><strong>Returns:</strong> <code>ResultView</code> with <code>id_col</code> (Int64) and <code>dist_col</code> (Float64) columns, sorted nearest first.</p>
 <p><strong>Example:</strong></p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-141-1"><a id="__codelineno-141-1" name="__codelineno-141-1" href="#__codelineno-141-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
-</span><span id="__span-141-2"><a id="__codelineno-141-2" name="__codelineno-141-2" href="#__codelineno-141-2"></a>
-</span><span id="__span-141-3"><a id="__codelineno-141-3" name="__codelineno-141-3" href="#__codelineno-141-3"></a><span class="n">query</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">128</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
-</span><span id="__span-141-4"><a id="__codelineno-141-4" name="__codelineno-141-4" href="#__codelineno-141-4"></a>
-</span><span id="__span-141-5"><a id="__codelineno-141-5" name="__codelineno-141-5" href="#__codelineno-141-5"></a><span class="c1"># L2 (default)</span>
-</span><span id="__span-141-6"><a id="__codelineno-141-6" name="__codelineno-141-6" href="#__codelineno-141-6"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">topk_distance</span><span class="p">(</span><span class="s1">&#39;vec&#39;</span><span class="p">,</span> <span class="n">query</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
-</span><span id="__span-141-7"><a id="__codelineno-141-7" name="__codelineno-141-7" href="#__codelineno-141-7"></a><span class="n">df</span> <span class="o">=</span> <span class="n">results</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">()</span>
-</span><span id="__span-141-8"><a id="__codelineno-141-8" name="__codelineno-141-8" href="#__codelineno-141-8"></a><span class="c1"># df columns: _id (int64), dist (float64)</span>
-</span><span id="__span-141-9"><a id="__codelineno-141-9" name="__codelineno-141-9" href="#__codelineno-141-9"></a>
-</span><span id="__span-141-10"><a id="__codelineno-141-10" name="__codelineno-141-10" href="#__codelineno-141-10"></a><span class="c1"># Cosine distance, custom column names</span>
-</span><span id="__span-141-11"><a id="__codelineno-141-11" name="__codelineno-141-11" href="#__codelineno-141-11"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">topk_distance</span><span class="p">(</span><span class="s1">&#39;vec&#39;</span><span class="p">,</span> <span class="n">query</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">metric</span><span class="o">=</span><span class="s1">&#39;cosine&#39;</span><span class="p">,</span>
-</span><span id="__span-141-12"><a id="__codelineno-141-12" name="__codelineno-141-12" href="#__codelineno-141-12"></a>                                <span class="n">id_col</span><span class="o">=</span><span class="s1">&#39;item_id&#39;</span><span class="p">,</span> <span class="n">dist_col</span><span class="o">=</span><span class="s1">&#39;cosine_dist&#39;</span><span class="p">)</span>
-</span><span id="__span-141-13"><a id="__codelineno-141-13" name="__codelineno-141-13" href="#__codelineno-141-13"></a>
-</span><span id="__span-141-14"><a id="__codelineno-141-14" name="__codelineno-141-14" href="#__codelineno-141-14"></a><span class="c1"># Join back to the original table to retrieve full records</span>
-</span><span id="__span-141-15"><a id="__codelineno-141-15" name="__codelineno-141-15" href="#__codelineno-141-15"></a><span class="n">top_ids</span> <span class="o">=</span> <span class="n">results</span><span class="o">.</span><span class="n">get_ids</span><span class="p">()</span>                    <span class="c1"># numpy array of _id values</span>
-</span><span id="__span-141-16"><a id="__codelineno-141-16" name="__codelineno-141-16" href="#__codelineno-141-16"></a><span class="n">records</span>  <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">retrieve_many</span><span class="p">(</span><span class="n">top_ids</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span>
-</span><span id="__span-141-17"><a id="__codelineno-141-17" name="__codelineno-141-17" href="#__codelineno-141-17"></a>
-</span><span id="__span-141-18"><a id="__codelineno-141-18" name="__codelineno-141-18" href="#__codelineno-141-18"></a><span class="c1"># Or use a SQL subquery</span>
-</span><span id="__span-141-19"><a id="__codelineno-141-19" name="__codelineno-141-19" href="#__codelineno-141-19"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
-</span><span id="__span-141-20"><a id="__codelineno-141-20" name="__codelineno-141-20" href="#__codelineno-141-20"></a><span class="s2">    SELECT items.label, items.vec</span>
-</span><span id="__span-141-21"><a id="__codelineno-141-21" name="__codelineno-141-21" href="#__codelineno-141-21"></a><span class="s2">    FROM items</span>
-</span><span id="__span-141-22"><a id="__codelineno-141-22" name="__codelineno-141-22" href="#__codelineno-141-22"></a><span class="s2">    WHERE _id IN (</span>
-</span><span id="__span-141-23"><a id="__codelineno-141-23" name="__codelineno-141-23" href="#__codelineno-141-23"></a><span class="s2">        SELECT _id FROM (</span>
-</span><span id="__span-141-24"><a id="__codelineno-141-24" name="__codelineno-141-24" href="#__codelineno-141-24"></a><span class="s2">            SELECT explode_rename(topk_distance(vec, [0.1, 0.2, 0.3], 5, &#39;l2&#39;), &#39;_id&#39;, &#39;dist&#39;)</span>
-</span><span id="__span-141-25"><a id="__codelineno-141-25" name="__codelineno-141-25" href="#__codelineno-141-25"></a><span class="s2">            FROM items</span>
-</span><span id="__span-141-26"><a id="__codelineno-141-26" name="__codelineno-141-26" href="#__codelineno-141-26"></a><span class="s2">        )</span>
-</span><span id="__span-141-27"><a id="__codelineno-141-27" name="__codelineno-141-27" href="#__codelineno-141-27"></a><span class="s2">    )</span>
-</span><span id="__span-141-28"><a id="__codelineno-141-28" name="__codelineno-141-28" href="#__codelineno-141-28"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-140-1"><a id="__codelineno-140-1" name="__codelineno-140-1" href="#__codelineno-140-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+</span><span id="__span-140-2"><a id="__codelineno-140-2" name="__codelineno-140-2" href="#__codelineno-140-2"></a>
+</span><span id="__span-140-3"><a id="__codelineno-140-3" name="__codelineno-140-3" href="#__codelineno-140-3"></a><span class="n">query</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">128</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+</span><span id="__span-140-4"><a id="__codelineno-140-4" name="__codelineno-140-4" href="#__codelineno-140-4"></a>
+</span><span id="__span-140-5"><a id="__codelineno-140-5" name="__codelineno-140-5" href="#__codelineno-140-5"></a><span class="c1"># L2 (default)</span>
+</span><span id="__span-140-6"><a id="__codelineno-140-6" name="__codelineno-140-6" href="#__codelineno-140-6"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">topk_distance</span><span class="p">(</span><span class="s1">&#39;vec&#39;</span><span class="p">,</span> <span class="n">query</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+</span><span id="__span-140-7"><a id="__codelineno-140-7" name="__codelineno-140-7" href="#__codelineno-140-7"></a><span class="n">df</span> <span class="o">=</span> <span class="n">results</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">()</span>
+</span><span id="__span-140-8"><a id="__codelineno-140-8" name="__codelineno-140-8" href="#__codelineno-140-8"></a><span class="c1"># df columns: _id (int64), dist (float64)</span>
+</span><span id="__span-140-9"><a id="__codelineno-140-9" name="__codelineno-140-9" href="#__codelineno-140-9"></a>
+</span><span id="__span-140-10"><a id="__codelineno-140-10" name="__codelineno-140-10" href="#__codelineno-140-10"></a><span class="c1"># Cosine distance, custom column names</span>
+</span><span id="__span-140-11"><a id="__codelineno-140-11" name="__codelineno-140-11" href="#__codelineno-140-11"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">topk_distance</span><span class="p">(</span><span class="s1">&#39;vec&#39;</span><span class="p">,</span> <span class="n">query</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">metric</span><span class="o">=</span><span class="s1">&#39;cosine&#39;</span><span class="p">,</span>
+</span><span id="__span-140-12"><a id="__codelineno-140-12" name="__codelineno-140-12" href="#__codelineno-140-12"></a>                                <span class="n">id_col</span><span class="o">=</span><span class="s1">&#39;item_id&#39;</span><span class="p">,</span> <span class="n">dist_col</span><span class="o">=</span><span class="s1">&#39;cosine_dist&#39;</span><span class="p">)</span>
+</span><span id="__span-140-13"><a id="__codelineno-140-13" name="__codelineno-140-13" href="#__codelineno-140-13"></a>
+</span><span id="__span-140-14"><a id="__codelineno-140-14" name="__codelineno-140-14" href="#__codelineno-140-14"></a><span class="c1"># Join back to the original table to retrieve full records</span>
+</span><span id="__span-140-15"><a id="__codelineno-140-15" name="__codelineno-140-15" href="#__codelineno-140-15"></a><span class="n">top_ids</span> <span class="o">=</span> <span class="n">results</span><span class="o">.</span><span class="n">get_ids</span><span class="p">()</span>                    <span class="c1"># numpy array of _id values</span>
+</span><span id="__span-140-16"><a id="__codelineno-140-16" name="__codelineno-140-16" href="#__codelineno-140-16"></a><span class="n">records</span>  <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">retrieve_many</span><span class="p">(</span><span class="n">top_ids</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span>
+</span><span id="__span-140-17"><a id="__codelineno-140-17" name="__codelineno-140-17" href="#__codelineno-140-17"></a>
+</span><span id="__span-140-18"><a id="__codelineno-140-18" name="__codelineno-140-18" href="#__codelineno-140-18"></a><span class="c1"># Or use a SQL subquery</span>
+</span><span id="__span-140-19"><a id="__codelineno-140-19" name="__codelineno-140-19" href="#__codelineno-140-19"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
+</span><span id="__span-140-20"><a id="__codelineno-140-20" name="__codelineno-140-20" href="#__codelineno-140-20"></a><span class="s2">    SELECT items.label, items.vec</span>
+</span><span id="__span-140-21"><a id="__codelineno-140-21" name="__codelineno-140-21" href="#__codelineno-140-21"></a><span class="s2">    FROM items</span>
+</span><span id="__span-140-22"><a id="__codelineno-140-22" name="__codelineno-140-22" href="#__codelineno-140-22"></a><span class="s2">    WHERE _id IN (</span>
+</span><span id="__span-140-23"><a id="__codelineno-140-23" name="__codelineno-140-23" href="#__codelineno-140-23"></a><span class="s2">        SELECT _id FROM (</span>
+</span><span id="__span-140-24"><a id="__codelineno-140-24" name="__codelineno-140-24" href="#__codelineno-140-24"></a><span class="s2">            SELECT explode_rename(topk_distance(vec, [0.1, 0.2, 0.3], 5, &#39;l2&#39;), &#39;_id&#39;, &#39;dist&#39;)</span>
+</span><span id="__span-140-25"><a id="__codelineno-140-25" name="__codelineno-140-25" href="#__codelineno-140-25"></a><span class="s2">            FROM items</span>
+</span><span id="__span-140-26"><a id="__codelineno-140-26" name="__codelineno-140-26" href="#__codelineno-140-26"></a><span class="s2">        )</span>
+</span><span id="__span-140-27"><a id="__codelineno-140-27" name="__codelineno-140-27" href="#__codelineno-140-27"></a><span class="s2">    )</span>
+</span><span id="__span-140-28"><a id="__codelineno-140-28" name="__codelineno-140-28" href="#__codelineno-140-28"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
 </span></code></pre></div>
 <hr />
 <h3 id="batch_topk_distance">batch_topk_distance<a class="headerlink" href="#batch_topk_distance" title="Permanent link">&para;</a></h3>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-142-1"><a id="__codelineno-142-1" name="__codelineno-142-1" href="#__codelineno-142-1"></a><span class="n">batch_topk_distance</span><span class="p">(</span>
-</span><span id="__span-142-2"><a id="__codelineno-142-2" name="__codelineno-142-2" href="#__codelineno-142-2"></a>    <span class="n">col</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-</span><span id="__span-142-3"><a id="__codelineno-142-3" name="__codelineno-142-3" href="#__codelineno-142-3"></a>    <span class="n">queries</span><span class="p">,</span>
-</span><span id="__span-142-4"><a id="__codelineno-142-4" name="__codelineno-142-4" href="#__codelineno-142-4"></a>    <span class="n">k</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span><span class="p">,</span>
-</span><span id="__span-142-5"><a id="__codelineno-142-5" name="__codelineno-142-5" href="#__codelineno-142-5"></a>    <span class="n">metric</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;l2&#39;</span><span class="p">,</span>
-</span><span id="__span-142-6"><a id="__codelineno-142-6" name="__codelineno-142-6" href="#__codelineno-142-6"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">numpy</span><span class="o">.</span><span class="n">ndarray</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-141-1"><a id="__codelineno-141-1" name="__codelineno-141-1" href="#__codelineno-141-1"></a><span class="n">batch_topk_distance</span><span class="p">(</span>
+</span><span id="__span-141-2"><a id="__codelineno-141-2" name="__codelineno-141-2" href="#__codelineno-141-2"></a>    <span class="n">col</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+</span><span id="__span-141-3"><a id="__codelineno-141-3" name="__codelineno-141-3" href="#__codelineno-141-3"></a>    <span class="n">queries</span><span class="p">,</span>
+</span><span id="__span-141-4"><a id="__codelineno-141-4" name="__codelineno-141-4" href="#__codelineno-141-4"></a>    <span class="n">k</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span><span class="p">,</span>
+</span><span id="__span-141-5"><a id="__codelineno-141-5" name="__codelineno-141-5" href="#__codelineno-141-5"></a>    <span class="n">metric</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;l2&#39;</span><span class="p">,</span>
+</span><span id="__span-141-6"><a id="__codelineno-141-6" name="__codelineno-141-6" href="#__codelineno-141-6"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">numpy</span><span class="o">.</span><span class="n">ndarray</span>
 </span></code></pre></div>
 <p>Batch nearest-neighbour search — N query vectors in a single Rust call.</p>
 <p><strong>Why use this instead of calling <code>topk_distance</code> N times:</strong>
@@ -4088,34 +4131,34 @@ Get internal _ids from results.</p>
 - Each row is sorted ascending by distance.
 - Entries padded with <code>(-1, inf)</code> when fewer than k neighbours exist.</p>
 <p><strong>Example:</strong></p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-143-1"><a id="__codelineno-143-1" name="__codelineno-143-1" href="#__codelineno-143-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
-</span><span id="__span-143-2"><a id="__codelineno-143-2" name="__codelineno-143-2" href="#__codelineno-143-2"></a>
-</span><span id="__span-143-3"><a id="__codelineno-143-3" name="__codelineno-143-3" href="#__codelineno-143-3"></a><span class="n">N</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="mi">100</span><span class="p">,</span> <span class="mi">128</span>
-</span><span id="__span-143-4"><a id="__codelineno-143-4" name="__codelineno-143-4" href="#__codelineno-143-4"></a><span class="n">queries</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
-</span><span id="__span-143-5"><a id="__codelineno-143-5" name="__codelineno-143-5" href="#__codelineno-143-5"></a>
-</span><span id="__span-143-6"><a id="__codelineno-143-6" name="__codelineno-143-6" href="#__codelineno-143-6"></a><span class="n">result</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">batch_topk_distance</span><span class="p">(</span><span class="s1">&#39;vec&#39;</span><span class="p">,</span> <span class="n">queries</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
-</span><span id="__span-143-7"><a id="__codelineno-143-7" name="__codelineno-143-7" href="#__codelineno-143-7"></a><span class="c1"># result.shape == (100, 10, 2)</span>
-</span><span id="__span-143-8"><a id="__codelineno-143-8" name="__codelineno-143-8" href="#__codelineno-143-8"></a>
-</span><span id="__span-143-9"><a id="__codelineno-143-9" name="__codelineno-143-9" href="#__codelineno-143-9"></a><span class="n">ids</span>   <span class="o">=</span> <span class="n">result</span><span class="p">[:,</span> <span class="p">:,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>   <span class="c1"># shape (100, 10)</span>
-</span><span id="__span-143-10"><a id="__codelineno-143-10" name="__codelineno-143-10" href="#__codelineno-143-10"></a><span class="n">dists</span> <span class="o">=</span> <span class="n">result</span><span class="p">[:,</span> <span class="p">:,</span> <span class="mi">1</span><span class="p">]</span>                     <span class="c1"># shape (100, 10)</span>
-</span><span id="__span-143-11"><a id="__codelineno-143-11" name="__codelineno-143-11" href="#__codelineno-143-11"></a>
-</span><span id="__span-143-12"><a id="__codelineno-143-12" name="__codelineno-143-12" href="#__codelineno-143-12"></a><span class="c1"># Nearest neighbour for each query</span>
-</span><span id="__span-143-13"><a id="__codelineno-143-13" name="__codelineno-143-13" href="#__codelineno-143-13"></a><span class="n">nearest_id</span>   <span class="o">=</span> <span class="n">ids</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span>    <span class="c1"># shape (100,)</span>
-</span><span id="__span-143-14"><a id="__codelineno-143-14" name="__codelineno-143-14" href="#__codelineno-143-14"></a><span class="n">nearest_dist</span> <span class="o">=</span> <span class="n">dists</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span>  <span class="c1"># shape (100,)</span>
-</span><span id="__span-143-15"><a id="__codelineno-143-15" name="__codelineno-143-15" href="#__codelineno-143-15"></a>
-</span><span id="__span-143-16"><a id="__codelineno-143-16" name="__codelineno-143-16" href="#__codelineno-143-16"></a><span class="c1"># Cosine similarity batch search</span>
-</span><span id="__span-143-17"><a id="__codelineno-143-17" name="__codelineno-143-17" href="#__codelineno-143-17"></a><span class="n">result_cos</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">batch_topk_distance</span><span class="p">(</span><span class="s1">&#39;vec&#39;</span><span class="p">,</span> <span class="n">queries</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">metric</span><span class="o">=</span><span class="s1">&#39;cosine&#39;</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-142-1"><a id="__codelineno-142-1" name="__codelineno-142-1" href="#__codelineno-142-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+</span><span id="__span-142-2"><a id="__codelineno-142-2" name="__codelineno-142-2" href="#__codelineno-142-2"></a>
+</span><span id="__span-142-3"><a id="__codelineno-142-3" name="__codelineno-142-3" href="#__codelineno-142-3"></a><span class="n">N</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="mi">100</span><span class="p">,</span> <span class="mi">128</span>
+</span><span id="__span-142-4"><a id="__codelineno-142-4" name="__codelineno-142-4" href="#__codelineno-142-4"></a><span class="n">queries</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="n">N</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+</span><span id="__span-142-5"><a id="__codelineno-142-5" name="__codelineno-142-5" href="#__codelineno-142-5"></a>
+</span><span id="__span-142-6"><a id="__codelineno-142-6" name="__codelineno-142-6" href="#__codelineno-142-6"></a><span class="n">result</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">batch_topk_distance</span><span class="p">(</span><span class="s1">&#39;vec&#39;</span><span class="p">,</span> <span class="n">queries</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+</span><span id="__span-142-7"><a id="__codelineno-142-7" name="__codelineno-142-7" href="#__codelineno-142-7"></a><span class="c1"># result.shape == (100, 10, 2)</span>
+</span><span id="__span-142-8"><a id="__codelineno-142-8" name="__codelineno-142-8" href="#__codelineno-142-8"></a>
+</span><span id="__span-142-9"><a id="__codelineno-142-9" name="__codelineno-142-9" href="#__codelineno-142-9"></a><span class="n">ids</span>   <span class="o">=</span> <span class="n">result</span><span class="p">[:,</span> <span class="p">:,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>   <span class="c1"># shape (100, 10)</span>
+</span><span id="__span-142-10"><a id="__codelineno-142-10" name="__codelineno-142-10" href="#__codelineno-142-10"></a><span class="n">dists</span> <span class="o">=</span> <span class="n">result</span><span class="p">[:,</span> <span class="p">:,</span> <span class="mi">1</span><span class="p">]</span>                     <span class="c1"># shape (100, 10)</span>
+</span><span id="__span-142-11"><a id="__codelineno-142-11" name="__codelineno-142-11" href="#__codelineno-142-11"></a>
+</span><span id="__span-142-12"><a id="__codelineno-142-12" name="__codelineno-142-12" href="#__codelineno-142-12"></a><span class="c1"># Nearest neighbour for each query</span>
+</span><span id="__span-142-13"><a id="__codelineno-142-13" name="__codelineno-142-13" href="#__codelineno-142-13"></a><span class="n">nearest_id</span>   <span class="o">=</span> <span class="n">ids</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span>    <span class="c1"># shape (100,)</span>
+</span><span id="__span-142-14"><a id="__codelineno-142-14" name="__codelineno-142-14" href="#__codelineno-142-14"></a><span class="n">nearest_dist</span> <span class="o">=</span> <span class="n">dists</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span>  <span class="c1"># shape (100,)</span>
+</span><span id="__span-142-15"><a id="__codelineno-142-15" name="__codelineno-142-15" href="#__codelineno-142-15"></a>
+</span><span id="__span-142-16"><a id="__codelineno-142-16" name="__codelineno-142-16" href="#__codelineno-142-16"></a><span class="c1"># Cosine similarity batch search</span>
+</span><span id="__span-142-17"><a id="__codelineno-142-17" name="__codelineno-142-17" href="#__codelineno-142-17"></a><span class="n">result_cos</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">batch_topk_distance</span><span class="p">(</span><span class="s1">&#39;vec&#39;</span><span class="p">,</span> <span class="n">queries</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">metric</span><span class="o">=</span><span class="s1">&#39;cosine&#39;</span><span class="p">)</span>
 </span></code></pre></div>
 <hr />
 <h3 id="sql-explode_renametopk_distance">SQL: <code>explode_rename(topk_distance(...))</code><a class="headerlink" href="#sql-explode_renametopk_distance" title="Permanent link">&para;</a></h3>
 <p>Vector search is also available as a pure SQL expression. This is the form used internally by <code>topk_distance()</code> and is useful when composing larger SQL queries.</p>
 <p><strong>Syntax:</strong></p>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-144-1"><a id="__codelineno-144-1" name="__codelineno-144-1" href="#__codelineno-144-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">explode_rename</span><span class="p">(</span>
-</span><span id="__span-144-2"><a id="__codelineno-144-2" name="__codelineno-144-2" href="#__codelineno-144-2"></a><span class="w">    </span><span class="n">topk_distance</span><span class="p">(</span><span class="n">col</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="n">q1</span><span class="p">,</span><span class="w"> </span><span class="n">q2</span><span class="p">,</span><span class="w"> </span><span class="p">...,</span><span class="w"> </span><span class="n">qD</span><span class="p">],</span><span class="w"> </span><span class="n">k</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;metric&#39;</span><span class="p">),</span>
-</span><span id="__span-144-3"><a id="__codelineno-144-3" name="__codelineno-144-3" href="#__codelineno-144-3"></a><span class="w">    </span><span class="s1">&#39;id_column_name&#39;</span><span class="p">,</span>
-</span><span id="__span-144-4"><a id="__codelineno-144-4" name="__codelineno-144-4" href="#__codelineno-144-4"></a><span class="w">    </span><span class="s1">&#39;dist_column_name&#39;</span>
-</span><span id="__span-144-5"><a id="__codelineno-144-5" name="__codelineno-144-5" href="#__codelineno-144-5"></a><span class="p">)</span>
-</span><span id="__span-144-6"><a id="__codelineno-144-6" name="__codelineno-144-6" href="#__codelineno-144-6"></a><span class="k">FROM</span><span class="w"> </span><span class="k">table_name</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-143-1"><a id="__codelineno-143-1" name="__codelineno-143-1" href="#__codelineno-143-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">explode_rename</span><span class="p">(</span>
+</span><span id="__span-143-2"><a id="__codelineno-143-2" name="__codelineno-143-2" href="#__codelineno-143-2"></a><span class="w">    </span><span class="n">topk_distance</span><span class="p">(</span><span class="n">col</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="n">q1</span><span class="p">,</span><span class="w"> </span><span class="n">q2</span><span class="p">,</span><span class="w"> </span><span class="p">...,</span><span class="w"> </span><span class="n">qD</span><span class="p">],</span><span class="w"> </span><span class="n">k</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;metric&#39;</span><span class="p">),</span>
+</span><span id="__span-143-3"><a id="__codelineno-143-3" name="__codelineno-143-3" href="#__codelineno-143-3"></a><span class="w">    </span><span class="s1">&#39;id_column_name&#39;</span><span class="p">,</span>
+</span><span id="__span-143-4"><a id="__codelineno-143-4" name="__codelineno-143-4" href="#__codelineno-143-4"></a><span class="w">    </span><span class="s1">&#39;dist_column_name&#39;</span>
+</span><span id="__span-143-5"><a id="__codelineno-143-5" name="__codelineno-143-5" href="#__codelineno-143-5"></a><span class="p">)</span>
+</span><span id="__span-143-6"><a id="__codelineno-143-6" name="__codelineno-143-6" href="#__codelineno-143-6"></a><span class="k">FROM</span><span class="w"> </span><span class="k">table_name</span>
 </span></code></pre></div>
 <ul>
 <li><code>col</code> — vector column name.</li>
@@ -4126,28 +4169,28 @@ Get internal _ids from results.</p>
 </ul>
 <p><code>explode_rename</code> "explodes" the TopK pairs returned by <code>topk_distance</code> into k rows with two named columns.</p>
 <p><strong>Examples:</strong></p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-145-1"><a id="__codelineno-145-1" name="__codelineno-145-1" href="#__codelineno-145-1"></a><span class="c1"># Basic: top 10 by L2 distance</span>
-</span><span id="__span-145-2"><a id="__codelineno-145-2" name="__codelineno-145-2" href="#__codelineno-145-2"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
-</span><span id="__span-145-3"><a id="__codelineno-145-3" name="__codelineno-145-3" href="#__codelineno-145-3"></a><span class="s2">    SELECT explode_rename(topk_distance(vec, [0.1, 0.2, 0.3], 10, &#39;l2&#39;), &#39;_id&#39;, &#39;dist&#39;)</span>
-</span><span id="__span-145-4"><a id="__codelineno-145-4" name="__codelineno-145-4" href="#__codelineno-145-4"></a><span class="s2">    FROM items</span>
-</span><span id="__span-145-5"><a id="__codelineno-145-5" name="__codelineno-145-5" href="#__codelineno-145-5"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
-</span><span id="__span-145-6"><a id="__codelineno-145-6" name="__codelineno-145-6" href="#__codelineno-145-6"></a><span class="n">df</span> <span class="o">=</span> <span class="n">results</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">()</span>
-</span><span id="__span-145-7"><a id="__codelineno-145-7" name="__codelineno-145-7" href="#__codelineno-145-7"></a><span class="c1"># df: _id (int64), dist (float64), 10 rows sorted nearest first</span>
-</span><span id="__span-145-8"><a id="__codelineno-145-8" name="__codelineno-145-8" href="#__codelineno-145-8"></a>
-</span><span id="__span-145-9"><a id="__codelineno-145-9" name="__codelineno-145-9" href="#__codelineno-145-9"></a><span class="c1"># Cosine distance with custom column names</span>
-</span><span id="__span-145-10"><a id="__codelineno-145-10" name="__codelineno-145-10" href="#__codelineno-145-10"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
-</span><span id="__span-145-11"><a id="__codelineno-145-11" name="__codelineno-145-11" href="#__codelineno-145-11"></a><span class="s2">    SELECT explode_rename(</span>
-</span><span id="__span-145-12"><a id="__codelineno-145-12" name="__codelineno-145-12" href="#__codelineno-145-12"></a><span class="s2">        topk_distance(vec, [1.0, 0.0, 0.0], 5, &#39;cosine&#39;),</span>
-</span><span id="__span-145-13"><a id="__codelineno-145-13" name="__codelineno-145-13" href="#__codelineno-145-13"></a><span class="s2">        &#39;item_id&#39;, &#39;cosine_dist&#39;</span>
-</span><span id="__span-145-14"><a id="__codelineno-145-14" name="__codelineno-145-14" href="#__codelineno-145-14"></a><span class="s2">    )</span>
-</span><span id="__span-145-15"><a id="__codelineno-145-15" name="__codelineno-145-15" href="#__codelineno-145-15"></a><span class="s2">    FROM items</span>
-</span><span id="__span-145-16"><a id="__codelineno-145-16" name="__codelineno-145-16" href="#__codelineno-145-16"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
-</span><span id="__span-145-17"><a id="__codelineno-145-17" name="__codelineno-145-17" href="#__codelineno-145-17"></a>
-</span><span id="__span-145-18"><a id="__codelineno-145-18" name="__codelineno-145-18" href="#__codelineno-145-18"></a><span class="c1"># Dot product (inner product) search</span>
-</span><span id="__span-145-19"><a id="__codelineno-145-19" name="__codelineno-145-19" href="#__codelineno-145-19"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
-</span><span id="__span-145-20"><a id="__codelineno-145-20" name="__codelineno-145-20" href="#__codelineno-145-20"></a><span class="s2">    SELECT explode_rename(topk_distance(vec, [0.5, 0.5, 0.5], 20, &#39;dot&#39;), &#39;_id&#39;, &#39;score&#39;)</span>
-</span><span id="__span-145-21"><a id="__codelineno-145-21" name="__codelineno-145-21" href="#__codelineno-145-21"></a><span class="s2">    FROM embeddings</span>
-</span><span id="__span-145-22"><a id="__codelineno-145-22" name="__codelineno-145-22" href="#__codelineno-145-22"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-144-1"><a id="__codelineno-144-1" name="__codelineno-144-1" href="#__codelineno-144-1"></a><span class="c1"># Basic: top 10 by L2 distance</span>
+</span><span id="__span-144-2"><a id="__codelineno-144-2" name="__codelineno-144-2" href="#__codelineno-144-2"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
+</span><span id="__span-144-3"><a id="__codelineno-144-3" name="__codelineno-144-3" href="#__codelineno-144-3"></a><span class="s2">    SELECT explode_rename(topk_distance(vec, [0.1, 0.2, 0.3], 10, &#39;l2&#39;), &#39;_id&#39;, &#39;dist&#39;)</span>
+</span><span id="__span-144-4"><a id="__codelineno-144-4" name="__codelineno-144-4" href="#__codelineno-144-4"></a><span class="s2">    FROM items</span>
+</span><span id="__span-144-5"><a id="__codelineno-144-5" name="__codelineno-144-5" href="#__codelineno-144-5"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
+</span><span id="__span-144-6"><a id="__codelineno-144-6" name="__codelineno-144-6" href="#__codelineno-144-6"></a><span class="n">df</span> <span class="o">=</span> <span class="n">results</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">()</span>
+</span><span id="__span-144-7"><a id="__codelineno-144-7" name="__codelineno-144-7" href="#__codelineno-144-7"></a><span class="c1"># df: _id (int64), dist (float64), 10 rows sorted nearest first</span>
+</span><span id="__span-144-8"><a id="__codelineno-144-8" name="__codelineno-144-8" href="#__codelineno-144-8"></a>
+</span><span id="__span-144-9"><a id="__codelineno-144-9" name="__codelineno-144-9" href="#__codelineno-144-9"></a><span class="c1"># Cosine distance with custom column names</span>
+</span><span id="__span-144-10"><a id="__codelineno-144-10" name="__codelineno-144-10" href="#__codelineno-144-10"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
+</span><span id="__span-144-11"><a id="__codelineno-144-11" name="__codelineno-144-11" href="#__codelineno-144-11"></a><span class="s2">    SELECT explode_rename(</span>
+</span><span id="__span-144-12"><a id="__codelineno-144-12" name="__codelineno-144-12" href="#__codelineno-144-12"></a><span class="s2">        topk_distance(vec, [1.0, 0.0, 0.0], 5, &#39;cosine&#39;),</span>
+</span><span id="__span-144-13"><a id="__codelineno-144-13" name="__codelineno-144-13" href="#__codelineno-144-13"></a><span class="s2">        &#39;item_id&#39;, &#39;cosine_dist&#39;</span>
+</span><span id="__span-144-14"><a id="__codelineno-144-14" name="__codelineno-144-14" href="#__codelineno-144-14"></a><span class="s2">    )</span>
+</span><span id="__span-144-15"><a id="__codelineno-144-15" name="__codelineno-144-15" href="#__codelineno-144-15"></a><span class="s2">    FROM items</span>
+</span><span id="__span-144-16"><a id="__codelineno-144-16" name="__codelineno-144-16" href="#__codelineno-144-16"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
+</span><span id="__span-144-17"><a id="__codelineno-144-17" name="__codelineno-144-17" href="#__codelineno-144-17"></a>
+</span><span id="__span-144-18"><a id="__codelineno-144-18" name="__codelineno-144-18" href="#__codelineno-144-18"></a><span class="c1"># Dot product (inner product) search</span>
+</span><span id="__span-144-19"><a id="__codelineno-144-19" name="__codelineno-144-19" href="#__codelineno-144-19"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
+</span><span id="__span-144-20"><a id="__codelineno-144-20" name="__codelineno-144-20" href="#__codelineno-144-20"></a><span class="s2">    SELECT explode_rename(topk_distance(vec, [0.5, 0.5, 0.5], 20, &#39;dot&#39;), &#39;_id&#39;, &#39;score&#39;)</span>
+</span><span id="__span-144-21"><a id="__codelineno-144-21" name="__codelineno-144-21" href="#__codelineno-144-21"></a><span class="s2">    FROM embeddings</span>
+</span><span id="__span-144-22"><a id="__codelineno-144-22" name="__codelineno-144-22" href="#__codelineno-144-22"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
 </span></code></pre></div>
 <blockquote>
 <p><strong>Note:</strong> The SQL <code>topk_distance</code> / <code>explode_rename</code> syntax requires the array literal <code>[...]</code> form for the query vector. To use dynamic vectors from Python, use the <code>topk_distance()</code> method instead, which handles the formatting automatically.</p>
@@ -4188,29 +4231,29 @@ Get internal _ids from results.</p>
 <p>All three metrics use a single scan of the mmap float buffer; distance computation is SIMD-accelerated.</p>
 <hr />
 <h3 id="insert">INSERT<a class="headerlink" href="#insert" title="Permanent link">&para;</a></h3>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-146-1"><a id="__codelineno-146-1" name="__codelineno-146-1" href="#__codelineno-146-1"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="k">table</span><span class="w"> </span><span class="p">(</span><span class="n">col1</span><span class="p">,</span><span class="w"> </span><span class="n">col2</span><span class="p">)</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;a&#39;</span><span class="p">)</span>
-</span><span id="__span-146-2"><a id="__codelineno-146-2" name="__codelineno-146-2" href="#__codelineno-146-2"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="k">table</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;a&#39;</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">.</span><span class="mi">14</span><span class="p">)</span>
-</span><span id="__span-146-3"><a id="__codelineno-146-3" name="__codelineno-146-3" href="#__codelineno-146-3"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="k">table</span><span class="w"> </span><span class="p">(</span><span class="n">col1</span><span class="p">,</span><span class="w"> </span><span class="n">col2</span><span class="p">)</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;a&#39;</span><span class="p">),</span><span class="w"> </span><span class="p">(</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;b&#39;</span><span class="p">),</span><span class="w"> </span><span class="p">(</span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;c&#39;</span><span class="p">)</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-145-1"><a id="__codelineno-145-1" name="__codelineno-145-1" href="#__codelineno-145-1"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="k">table</span><span class="w"> </span><span class="p">(</span><span class="n">col1</span><span class="p">,</span><span class="w"> </span><span class="n">col2</span><span class="p">)</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;a&#39;</span><span class="p">)</span>
+</span><span id="__span-145-2"><a id="__codelineno-145-2" name="__codelineno-145-2" href="#__codelineno-145-2"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="k">table</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;a&#39;</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">.</span><span class="mi">14</span><span class="p">)</span>
+</span><span id="__span-145-3"><a id="__codelineno-145-3" name="__codelineno-145-3" href="#__codelineno-145-3"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="k">table</span><span class="w"> </span><span class="p">(</span><span class="n">col1</span><span class="p">,</span><span class="w"> </span><span class="n">col2</span><span class="p">)</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;a&#39;</span><span class="p">),</span><span class="w"> </span><span class="p">(</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;b&#39;</span><span class="p">),</span><span class="w"> </span><span class="p">(</span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;c&#39;</span><span class="p">)</span>
 </span></code></pre></div>
 <h3 id="ddl-data-definition-language">DDL (Data Definition Language)<a class="headerlink" href="#ddl-data-definition-language" title="Permanent link">&para;</a></h3>
 <p>ApexBase supports full SQL DDL operations.</p>
 <h4 id="create-table">CREATE TABLE<a class="headerlink" href="#create-table" title="Permanent link">&para;</a></h4>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-147-1"><a id="__codelineno-147-1" name="__codelineno-147-1" href="#__codelineno-147-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">table_name</span>
-</span><span id="__span-147-2"><a id="__codelineno-147-2" name="__codelineno-147-2" href="#__codelineno-147-2"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="k">table_name</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-146-1"><a id="__codelineno-146-1" name="__codelineno-146-1" href="#__codelineno-146-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">table_name</span>
+</span><span id="__span-146-2"><a id="__codelineno-146-2" name="__codelineno-146-2" href="#__codelineno-146-2"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="k">table_name</span>
 </span></code></pre></div>
 <h4 id="alter-table">ALTER TABLE<a class="headerlink" href="#alter-table" title="Permanent link">&para;</a></h4>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-148-1"><a id="__codelineno-148-1" name="__codelineno-148-1" href="#__codelineno-148-1"></a><span class="c1">-- Add column</span>
-</span><span id="__span-148-2"><a id="__codelineno-148-2" name="__codelineno-148-2" href="#__codelineno-148-2"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="k">ADD</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="k">column_name</span><span class="w"> </span><span class="n">DATA_TYPE</span>
-</span><span id="__span-148-3"><a id="__codelineno-148-3" name="__codelineno-148-3" href="#__codelineno-148-3"></a>
-</span><span id="__span-148-4"><a id="__codelineno-148-4" name="__codelineno-148-4" href="#__codelineno-148-4"></a><span class="c1">-- Rename column  </span>
-</span><span id="__span-148-5"><a id="__codelineno-148-5" name="__codelineno-148-5" href="#__codelineno-148-5"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="k">RENAME</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="n">old_name</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">new_name</span>
-</span><span id="__span-148-6"><a id="__codelineno-148-6" name="__codelineno-148-6" href="#__codelineno-148-6"></a>
-</span><span id="__span-148-7"><a id="__codelineno-148-7" name="__codelineno-148-7" href="#__codelineno-148-7"></a><span class="c1">-- Drop column</span>
-</span><span id="__span-148-8"><a id="__codelineno-148-8" name="__codelineno-148-8" href="#__codelineno-148-8"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="k">DROP</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="k">column_name</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-147-1"><a id="__codelineno-147-1" name="__codelineno-147-1" href="#__codelineno-147-1"></a><span class="c1">-- Add column</span>
+</span><span id="__span-147-2"><a id="__codelineno-147-2" name="__codelineno-147-2" href="#__codelineno-147-2"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="k">ADD</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="k">column_name</span><span class="w"> </span><span class="n">DATA_TYPE</span>
+</span><span id="__span-147-3"><a id="__codelineno-147-3" name="__codelineno-147-3" href="#__codelineno-147-3"></a>
+</span><span id="__span-147-4"><a id="__codelineno-147-4" name="__codelineno-147-4" href="#__codelineno-147-4"></a><span class="c1">-- Rename column  </span>
+</span><span id="__span-147-5"><a id="__codelineno-147-5" name="__codelineno-147-5" href="#__codelineno-147-5"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="k">RENAME</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="n">old_name</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">new_name</span>
+</span><span id="__span-147-6"><a id="__codelineno-147-6" name="__codelineno-147-6" href="#__codelineno-147-6"></a>
+</span><span id="__span-147-7"><a id="__codelineno-147-7" name="__codelineno-147-7" href="#__codelineno-147-7"></a><span class="c1">-- Drop column</span>
+</span><span id="__span-147-8"><a id="__codelineno-147-8" name="__codelineno-147-8" href="#__codelineno-147-8"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="k">DROP</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="k">column_name</span>
 </span></code></pre></div>
 <h4 id="drop-table">DROP TABLE<a class="headerlink" href="#drop-table" title="Permanent link">&para;</a></h4>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-149-1"><a id="__codelineno-149-1" name="__codelineno-149-1" href="#__codelineno-149-1"></a><span class="k">DROP</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">table_name</span>
-</span><span id="__span-149-2"><a id="__codelineno-149-2" name="__codelineno-149-2" href="#__codelineno-149-2"></a><span class="k">DROP</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="k">table_name</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-148-1"><a id="__codelineno-148-1" name="__codelineno-148-1" href="#__codelineno-148-1"></a><span class="k">DROP</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">table_name</span>
+</span><span id="__span-148-2"><a id="__codelineno-148-2" name="__codelineno-148-2" href="#__codelineno-148-2"></a><span class="k">DROP</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="k">table_name</span>
 </span></code></pre></div>
 <h4 id="supported-data-types">Supported Data Types<a class="headerlink" href="#supported-data-types" title="Permanent link">&para;</a></h4>
 <table>
@@ -4250,47 +4293,47 @@ Get internal _ids from results.</p>
 </tbody>
 </table>
 <h3 id="examples_1">Examples<a class="headerlink" href="#examples_1" title="Permanent link">&para;</a></h3>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-150-1"><a id="__codelineno-150-1" name="__codelineno-150-1" href="#__codelineno-150-1"></a><span class="c1"># Create table via SQL</span>
-</span><span id="__span-150-2"><a id="__codelineno-150-2" name="__codelineno-150-2" href="#__codelineno-150-2"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;CREATE TABLE IF NOT EXISTS users&quot;</span><span class="p">)</span>
-</span><span id="__span-150-3"><a id="__codelineno-150-3" name="__codelineno-150-3" href="#__codelineno-150-3"></a>
-</span><span id="__span-150-4"><a id="__codelineno-150-4" name="__codelineno-150-4" href="#__codelineno-150-4"></a><span class="c1"># Add columns via SQL</span>
-</span><span id="__span-150-5"><a id="__codelineno-150-5" name="__codelineno-150-5" href="#__codelineno-150-5"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;ALTER TABLE users ADD COLUMN name STRING&quot;</span><span class="p">)</span>
-</span><span id="__span-150-6"><a id="__codelineno-150-6" name="__codelineno-150-6" href="#__codelineno-150-6"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;ALTER TABLE users ADD COLUMN age INT&quot;</span><span class="p">)</span>
-</span><span id="__span-150-7"><a id="__codelineno-150-7" name="__codelineno-150-7" href="#__codelineno-150-7"></a>
-</span><span id="__span-150-8"><a id="__codelineno-150-8" name="__codelineno-150-8" href="#__codelineno-150-8"></a><span class="c1"># Insert data via SQL</span>
-</span><span id="__span-150-9"><a id="__codelineno-150-9" name="__codelineno-150-9" href="#__codelineno-150-9"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;INSERT INTO users (name, age) VALUES (&#39;Alice&#39;, 30)&quot;</span><span class="p">)</span>
-</span><span id="__span-150-10"><a id="__codelineno-150-10" name="__codelineno-150-10" href="#__codelineno-150-10"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;SELECT * FROM users WHERE age &gt; 25&quot;</span><span class="p">)</span>
-</span><span id="__span-150-11"><a id="__codelineno-150-11" name="__codelineno-150-11" href="#__codelineno-150-11"></a>
-</span><span id="__span-150-12"><a id="__codelineno-150-12" name="__codelineno-150-12" href="#__codelineno-150-12"></a><span class="c1"># Modify schema via SQL</span>
-</span><span id="__span-150-13"><a id="__codelineno-150-13" name="__codelineno-150-13" href="#__codelineno-150-13"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;ALTER TABLE users RENAME COLUMN name TO full_name&quot;</span><span class="p">)</span>
-</span><span id="__span-150-14"><a id="__codelineno-150-14" name="__codelineno-150-14" href="#__codelineno-150-14"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;ALTER TABLE users DROP COLUMN age&quot;</span><span class="p">)</span>
-</span><span id="__span-150-15"><a id="__codelineno-150-15" name="__codelineno-150-15" href="#__codelineno-150-15"></a>
-</span><span id="__span-150-16"><a id="__codelineno-150-16" name="__codelineno-150-16" href="#__codelineno-150-16"></a><span class="c1"># Drop table via SQL</span>
-</span><span id="__span-150-17"><a id="__codelineno-150-17" name="__codelineno-150-17" href="#__codelineno-150-17"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;DROP TABLE IF EXISTS users&quot;</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-149-1"><a id="__codelineno-149-1" name="__codelineno-149-1" href="#__codelineno-149-1"></a><span class="c1"># Create table via SQL</span>
+</span><span id="__span-149-2"><a id="__codelineno-149-2" name="__codelineno-149-2" href="#__codelineno-149-2"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;CREATE TABLE IF NOT EXISTS users&quot;</span><span class="p">)</span>
+</span><span id="__span-149-3"><a id="__codelineno-149-3" name="__codelineno-149-3" href="#__codelineno-149-3"></a>
+</span><span id="__span-149-4"><a id="__codelineno-149-4" name="__codelineno-149-4" href="#__codelineno-149-4"></a><span class="c1"># Add columns via SQL</span>
+</span><span id="__span-149-5"><a id="__codelineno-149-5" name="__codelineno-149-5" href="#__codelineno-149-5"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;ALTER TABLE users ADD COLUMN name STRING&quot;</span><span class="p">)</span>
+</span><span id="__span-149-6"><a id="__codelineno-149-6" name="__codelineno-149-6" href="#__codelineno-149-6"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;ALTER TABLE users ADD COLUMN age INT&quot;</span><span class="p">)</span>
+</span><span id="__span-149-7"><a id="__codelineno-149-7" name="__codelineno-149-7" href="#__codelineno-149-7"></a>
+</span><span id="__span-149-8"><a id="__codelineno-149-8" name="__codelineno-149-8" href="#__codelineno-149-8"></a><span class="c1"># Insert data via SQL</span>
+</span><span id="__span-149-9"><a id="__codelineno-149-9" name="__codelineno-149-9" href="#__codelineno-149-9"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;INSERT INTO users (name, age) VALUES (&#39;Alice&#39;, 30)&quot;</span><span class="p">)</span>
+</span><span id="__span-149-10"><a id="__codelineno-149-10" name="__codelineno-149-10" href="#__codelineno-149-10"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;SELECT * FROM users WHERE age &gt; 25&quot;</span><span class="p">)</span>
+</span><span id="__span-149-11"><a id="__codelineno-149-11" name="__codelineno-149-11" href="#__codelineno-149-11"></a>
+</span><span id="__span-149-12"><a id="__codelineno-149-12" name="__codelineno-149-12" href="#__codelineno-149-12"></a><span class="c1"># Modify schema via SQL</span>
+</span><span id="__span-149-13"><a id="__codelineno-149-13" name="__codelineno-149-13" href="#__codelineno-149-13"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;ALTER TABLE users RENAME COLUMN name TO full_name&quot;</span><span class="p">)</span>
+</span><span id="__span-149-14"><a id="__codelineno-149-14" name="__codelineno-149-14" href="#__codelineno-149-14"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;ALTER TABLE users DROP COLUMN age&quot;</span><span class="p">)</span>
+</span><span id="__span-149-15"><a id="__codelineno-149-15" name="__codelineno-149-15" href="#__codelineno-149-15"></a>
+</span><span id="__span-149-16"><a id="__codelineno-149-16" name="__codelineno-149-16" href="#__codelineno-149-16"></a><span class="c1"># Drop table via SQL</span>
+</span><span id="__span-149-17"><a id="__codelineno-149-17" name="__codelineno-149-17" href="#__codelineno-149-17"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;DROP TABLE IF EXISTS users&quot;</span><span class="p">)</span>
 </span></code></pre></div>
 <h4 id="multi-statement-sql">Multi-Statement SQL<a class="headerlink" href="#multi-statement-sql" title="Permanent link">&para;</a></h4>
 <p>You can execute multiple SQL statements in a single call by separating them with semicolons:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-151-1"><a id="__codelineno-151-1" name="__codelineno-151-1" href="#__codelineno-151-1"></a><span class="c1"># Execute multiple statements at once</span>
-</span><span id="__span-151-2"><a id="__codelineno-151-2" name="__codelineno-151-2" href="#__codelineno-151-2"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
-</span><span id="__span-151-3"><a id="__codelineno-151-3" name="__codelineno-151-3" href="#__codelineno-151-3"></a><span class="s2">    CREATE TABLE IF NOT EXISTS products;</span>
-</span><span id="__span-151-4"><a id="__codelineno-151-4" name="__codelineno-151-4" href="#__codelineno-151-4"></a><span class="s2">    ALTER TABLE products ADD COLUMN name STRING;</span>
-</span><span id="__span-151-5"><a id="__codelineno-151-5" name="__codelineno-151-5" href="#__codelineno-151-5"></a><span class="s2">    ALTER TABLE products ADD COLUMN price FLOAT;</span>
-</span><span id="__span-151-6"><a id="__codelineno-151-6" name="__codelineno-151-6" href="#__codelineno-151-6"></a><span class="s2">    INSERT INTO products (name, price) VALUES (&#39;Laptop&#39;, 999.99)</span>
-</span><span id="__span-151-7"><a id="__codelineno-151-7" name="__codelineno-151-7" href="#__codelineno-151-7"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
-</span><span id="__span-151-8"><a id="__codelineno-151-8" name="__codelineno-151-8" href="#__codelineno-151-8"></a>
-</span><span id="__span-151-9"><a id="__codelineno-151-9" name="__codelineno-151-9" href="#__codelineno-151-9"></a><span class="c1"># Multiple INSERT statements</span>
-</span><span id="__span-151-10"><a id="__codelineno-151-10" name="__codelineno-151-10" href="#__codelineno-151-10"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
-</span><span id="__span-151-11"><a id="__codelineno-151-11" name="__codelineno-151-11" href="#__codelineno-151-11"></a><span class="s2">    INSERT INTO products (name, price) VALUES (&#39;Mouse&#39;, 29.99);</span>
-</span><span id="__span-151-12"><a id="__codelineno-151-12" name="__codelineno-151-12" href="#__codelineno-151-12"></a><span class="s2">    INSERT INTO products (name, price) VALUES (&#39;Keyboard&#39;, 79.99);</span>
-</span><span id="__span-151-13"><a id="__codelineno-151-13" name="__codelineno-151-13" href="#__codelineno-151-13"></a><span class="s2">    INSERT INTO products (name, price) VALUES (&#39;Monitor&#39;, 299.99)</span>
-</span><span id="__span-151-14"><a id="__codelineno-151-14" name="__codelineno-151-14" href="#__codelineno-151-14"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
-</span><span id="__span-151-15"><a id="__codelineno-151-15" name="__codelineno-151-15" href="#__codelineno-151-15"></a>
-</span><span id="__span-151-16"><a id="__codelineno-151-16" name="__codelineno-151-16" href="#__codelineno-151-16"></a><span class="c1"># The result of the last statement is returned</span>
-</span><span id="__span-151-17"><a id="__codelineno-151-17" name="__codelineno-151-17" href="#__codelineno-151-17"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
-</span><span id="__span-151-18"><a id="__codelineno-151-18" name="__codelineno-151-18" href="#__codelineno-151-18"></a><span class="s2">    CREATE TABLE IF NOT EXISTS temp;</span>
-</span><span id="__span-151-19"><a id="__codelineno-151-19" name="__codelineno-151-19" href="#__codelineno-151-19"></a><span class="s2">    INSERT INTO temp (name) VALUES (&#39;test&#39;);</span>
-</span><span id="__span-151-20"><a id="__codelineno-151-20" name="__codelineno-151-20" href="#__codelineno-151-20"></a><span class="s2">    SELECT * FROM temp</span>
-</span><span id="__span-151-21"><a id="__codelineno-151-21" name="__codelineno-151-21" href="#__codelineno-151-21"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-150-1"><a id="__codelineno-150-1" name="__codelineno-150-1" href="#__codelineno-150-1"></a><span class="c1"># Execute multiple statements at once</span>
+</span><span id="__span-150-2"><a id="__codelineno-150-2" name="__codelineno-150-2" href="#__codelineno-150-2"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
+</span><span id="__span-150-3"><a id="__codelineno-150-3" name="__codelineno-150-3" href="#__codelineno-150-3"></a><span class="s2">    CREATE TABLE IF NOT EXISTS products;</span>
+</span><span id="__span-150-4"><a id="__codelineno-150-4" name="__codelineno-150-4" href="#__codelineno-150-4"></a><span class="s2">    ALTER TABLE products ADD COLUMN name STRING;</span>
+</span><span id="__span-150-5"><a id="__codelineno-150-5" name="__codelineno-150-5" href="#__codelineno-150-5"></a><span class="s2">    ALTER TABLE products ADD COLUMN price FLOAT;</span>
+</span><span id="__span-150-6"><a id="__codelineno-150-6" name="__codelineno-150-6" href="#__codelineno-150-6"></a><span class="s2">    INSERT INTO products (name, price) VALUES (&#39;Laptop&#39;, 999.99)</span>
+</span><span id="__span-150-7"><a id="__codelineno-150-7" name="__codelineno-150-7" href="#__codelineno-150-7"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
+</span><span id="__span-150-8"><a id="__codelineno-150-8" name="__codelineno-150-8" href="#__codelineno-150-8"></a>
+</span><span id="__span-150-9"><a id="__codelineno-150-9" name="__codelineno-150-9" href="#__codelineno-150-9"></a><span class="c1"># Multiple INSERT statements</span>
+</span><span id="__span-150-10"><a id="__codelineno-150-10" name="__codelineno-150-10" href="#__codelineno-150-10"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
+</span><span id="__span-150-11"><a id="__codelineno-150-11" name="__codelineno-150-11" href="#__codelineno-150-11"></a><span class="s2">    INSERT INTO products (name, price) VALUES (&#39;Mouse&#39;, 29.99);</span>
+</span><span id="__span-150-12"><a id="__codelineno-150-12" name="__codelineno-150-12" href="#__codelineno-150-12"></a><span class="s2">    INSERT INTO products (name, price) VALUES (&#39;Keyboard&#39;, 79.99);</span>
+</span><span id="__span-150-13"><a id="__codelineno-150-13" name="__codelineno-150-13" href="#__codelineno-150-13"></a><span class="s2">    INSERT INTO products (name, price) VALUES (&#39;Monitor&#39;, 299.99)</span>
+</span><span id="__span-150-14"><a id="__codelineno-150-14" name="__codelineno-150-14" href="#__codelineno-150-14"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
+</span><span id="__span-150-15"><a id="__codelineno-150-15" name="__codelineno-150-15" href="#__codelineno-150-15"></a>
+</span><span id="__span-150-16"><a id="__codelineno-150-16" name="__codelineno-150-16" href="#__codelineno-150-16"></a><span class="c1"># The result of the last statement is returned</span>
+</span><span id="__span-150-17"><a id="__codelineno-150-17" name="__codelineno-150-17" href="#__codelineno-150-17"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;&quot;&quot;</span>
+</span><span id="__span-150-18"><a id="__codelineno-150-18" name="__codelineno-150-18" href="#__codelineno-150-18"></a><span class="s2">    CREATE TABLE IF NOT EXISTS temp;</span>
+</span><span id="__span-150-19"><a id="__codelineno-150-19" name="__codelineno-150-19" href="#__codelineno-150-19"></a><span class="s2">    INSERT INTO temp (name) VALUES (&#39;test&#39;);</span>
+</span><span id="__span-150-20"><a id="__codelineno-150-20" name="__codelineno-150-20" href="#__codelineno-150-20"></a><span class="s2">    SELECT * FROM temp</span>
+</span><span id="__span-150-21"><a id="__codelineno-150-21" name="__codelineno-150-21" href="#__codelineno-150-21"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
 </span></code></pre></div>
 <p><strong>Multi-Statement SQL Rules:</strong>
 - Statements are separated by semicolons (<code>;</code>)
