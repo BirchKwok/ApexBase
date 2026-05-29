@@ -5,7 +5,7 @@ This page tracks the latest verified local benchmark snapshot rather than an old
 ## Latest Verified Snapshot
 
 - **System**: macOS 26.4.1, Apple arm (10 cores), 32 GB RAM
-- **Stack**: Python 3.12.4, ApexBase 1.18.0, SQLite 3.45.3, DuckDB 1.1.3, PyArrow 23.0.1
+- **Stack**: Python 3.12.4, ApexBase 1.19.0, SQLite 3.45.3, DuckDB 1.1.3, PyArrow 23.0.1
 - **Dataset**: 200,000 rows x 5 columns (`name`, `age`, `score`, `city`, `category`)
 - **Vector dataset**: 200,000 vectors x dim=128, `k=10`, batch size 10 queries
 - **Method**: 2 warmup iterations + 3 timed iterations

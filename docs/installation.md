@@ -80,7 +80,7 @@ https://birchkwok.github.io/ApexBase/
 For local versioned preview, use `mike` after installing the documentation requirements:
 
 ```bash
-mike deploy 1.18.0 latest
+mike deploy 1.19.0 latest
 mike serve
 ```
 
