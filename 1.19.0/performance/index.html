@@ -1464,7 +1464,7 @@
 <li><strong>Dataset</strong>: 200,000 rows x 5 columns (<code>name</code>, <code>age</code>, <code>score</code>, <code>city</code>, <code>category</code>)</li>
 <li><strong>Vector dataset</strong>: 200,000 vectors x dim=128, <code>k=10</code>, batch size 10 queries</li>
 <li><strong>Method</strong>: 2 warmup iterations + 3 timed iterations</li>
-<li><strong>Layout</strong>: 92 named metrics total (37 OLAP, 46 OLTP, 9 vector)</li>
+<li><strong>Layout</strong>: the default benchmark entrypoint tracks the README public scoreboard; extended diagnostics live in <code>benchmarks/bench_vs_sqlite_duckdb_extended.py</code>.</li>
 <li><strong>Fairness rule</strong>: only the default fair OLAP/OLTP cross-engine tables count toward the <code>38/38</code> win/loss summary. Vector similarity uses a separate dataset and its own ApexBase-vs-DuckDB scoreboard.</li>
 </ul>
 <h2 id="scoreboard">Scoreboard<a class="headerlink" href="#scoreboard" title="Permanent link">&para;</a></h2>
@@ -1833,7 +1833,8 @@
 <p>Use the same command as the snapshot above:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>python<span class="w"> </span>benchmarks/bench_vs_sqlite_duckdb.py<span class="w"> </span>--rows<span class="w"> </span><span class="m">200000</span><span class="w"> </span>--warmup<span class="w"> </span><span class="m">2</span><span class="w"> </span>--iterations<span class="w"> </span><span class="m">3</span>
 </span></code></pre></div>
-<p>Add <code>--skip-vector</code> if you want a tabular-only rerun without the separate vector module.</p>
+<p>Add <code>--skip-vector</code> if you want a tabular-only rerun without the separate vector module.
+Run <code>python benchmarks/bench_vs_sqlite_duckdb_extended.py --rows 200000 --warmup 2 --iterations 3</code> for the file-format, materialization, Q/s, microbenchmark, durable, transaction, buffered/memtable, and full vector diagnostics.</p>
 <p>For a larger stress run, increase <code>--rows</code> to <code>1000000</code>.</p>
 
 
