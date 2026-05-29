@@ -9,7 +9,7 @@ This page tracks the latest verified local benchmark snapshot rather than an old
 - **Dataset**: 200,000 rows x 5 columns (`name`, `age`, `score`, `city`, `category`)
 - **Vector dataset**: 200,000 vectors x dim=128, `k=10`, batch size 10 queries
 - **Method**: 2 warmup iterations + 3 timed iterations
-- **Layout**: 92 named metrics total (37 OLAP, 46 OLTP, 9 vector)
+- **Layout**: the default benchmark entrypoint tracks the README public scoreboard; extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`.
 - **Fairness rule**: only the default fair OLAP/OLTP cross-engine tables count toward the `38/38` win/loss summary. Vector similarity uses a separate dataset and its own ApexBase-vs-DuckDB scoreboard.
 
 ## Scoreboard
@@ -115,5 +115,6 @@ python benchmarks/bench_vs_sqlite_duckdb.py --rows 200000 --warmup 2 --iteration
 ```
 
 Add `--skip-vector` if you want a tabular-only rerun without the separate vector module.
+Run `python benchmarks/bench_vs_sqlite_duckdb_extended.py --rows 200000 --warmup 2 --iterations 3` for the file-format, materialization, Q/s, microbenchmark, durable, transaction, buffered/memtable, and full vector diagnostics.
 
 For a larger stress run, increase `--rows` to `1000000`.

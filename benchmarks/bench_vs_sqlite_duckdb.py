@@ -33,29 +33,59 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Optional imports
 # ---------------------------------------------------------------------------
-try:
-    import duckdb
-    HAS_DUCKDB = True
-except ImportError:
-    HAS_DUCKDB = False
+duckdb = None
+ApexClient = None
+pd = None
+pa = None
+HAS_DUCKDB = False
+HAS_APEXBASE = False
+HAS_PANDAS = False
+HAS_PYARROW = False
+_OPTIONAL_IMPORTS_READY = False
 
-try:
-    from apexbase import ApexClient
-    HAS_APEXBASE = True
-except ImportError:
-    HAS_APEXBASE = False
 
-try:
-    import pandas as pd
-    HAS_PANDAS = True
-except ImportError:
-    HAS_PANDAS = False
+def ensure_optional_imports():
+    """Load benchmark-only dependencies lazily so profile tests stay cheap."""
+    global duckdb, ApexClient, pd, pa
+    global HAS_DUCKDB, HAS_APEXBASE, HAS_PANDAS, HAS_PYARROW
+    global _OPTIONAL_IMPORTS_READY
 
-try:
-    import pyarrow as pa
-    HAS_PYARROW = True
-except ImportError:
-    HAS_PYARROW = False
+    if _OPTIONAL_IMPORTS_READY:
+        return
+
+    try:
+        import duckdb as _duckdb
+        duckdb = _duckdb
+        HAS_DUCKDB = True
+    except ImportError:
+        duckdb = None
+        HAS_DUCKDB = False
+
+    try:
+        from apexbase import ApexClient as _ApexClient
+        ApexClient = _ApexClient
+        HAS_APEXBASE = True
+    except ImportError:
+        ApexClient = None
+        HAS_APEXBASE = False
+
+    try:
+        import pandas as _pd
+        pd = _pd
+        HAS_PANDAS = True
+    except ImportError:
+        pd = None
+        HAS_PANDAS = False
+
+    try:
+        import pyarrow as _pa
+        pa = _pa
+        HAS_PYARROW = True
+    except ImportError:
+        pa = None
+        HAS_PYARROW = False
+
+    _OPTIONAL_IMPORTS_READY = True
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -106,6 +136,14 @@ VECTOR_SQLITE_NOTE = (
     "Stock SQLite in this harness has no native vector distance/top-k, "
     "so ranked vector comparisons are ApexBase vs DuckDB only."
 )
+PROFILE_PUBLIC = "public"
+PROFILE_EXTENDED = "extended"
+PROFILE_CHOICES = (PROFILE_PUBLIC, PROFILE_EXTENDED)
+PUBLIC_VECTOR_HEAD_TO_HEAD_METRICS = []
+PUBLIC_VECTOR_BATCH_METRICS = [
+    ("Batch TopK Cosine (10 queries)", "cosine"),
+]
+PUBLIC_VECTOR_APEX_ONLY_METRICS = []
 OLTP_ONE_ROW_DICT = {
     "name": "oltp_one",
     "age": 31,
@@ -135,6 +173,7 @@ def generate_data(n: int):
 
 def generate_benchmark_files(tmpdir, data):
     """Generate CSV, Parquet, and NDJSON test files from benchmark data."""
+    ensure_optional_imports()
     csv_path = os.path.join(tmpdir, "bench_data.csv")
     parquet_path = os.path.join(tmpdir, "bench_data.parquet")
     json_path = os.path.join(tmpdir, "bench_data.jsonl")
@@ -148,7 +187,6 @@ def generate_benchmark_files(tmpdir, data):
             writer.writerow([data[col][i] for col in columns])
 
     if HAS_PANDAS:
-        import pandas as pd
         df = pd.DataFrame(data)
         df.to_parquet(parquet_path, index=False)
     elif HAS_PYARROW:
@@ -203,11 +241,30 @@ def default_vector_rows(base_rows: int) -> int:
     return max(max(1, base_rows), VECTOR_ROWS_DEFAULT)
 
 
-def vector_metric_count():
+def normalize_profile(profile: str) -> str:
+    return profile if profile in PROFILE_CHOICES else PROFILE_PUBLIC
+
+
+def vector_metric_sets(profile: str = PROFILE_EXTENDED):
+    if normalize_profile(profile) == PROFILE_PUBLIC:
+        return (
+            PUBLIC_VECTOR_HEAD_TO_HEAD_METRICS,
+            PUBLIC_VECTOR_BATCH_METRICS,
+            PUBLIC_VECTOR_APEX_ONLY_METRICS,
+        )
     return (
-        len(VECTOR_HEAD_TO_HEAD_METRICS)
-        + len(VECTOR_BATCH_METRICS)
-        + len(VECTOR_APEX_ONLY_METRICS)
+        VECTOR_HEAD_TO_HEAD_METRICS,
+        VECTOR_BATCH_METRICS,
+        VECTOR_APEX_ONLY_METRICS,
+    )
+
+
+def vector_metric_count(profile: str = PROFILE_EXTENDED):
+    head_metrics, batch_metrics, apex_only_metrics = vector_metric_sets(profile)
+    return (
+        len(head_metrics)
+        + len(batch_metrics)
+        + len(apex_only_metrics)
     )
 
 
@@ -232,18 +289,21 @@ def build_duckdb_vector_sql(query: np.ndarray, k: int, metric: str) -> str:
 
 
 def materialize_apex_vector_result(result_view):
+    ensure_optional_imports()
     if HAS_PYARROW:
         return result_view.to_arrow()
     return result_view.to_dict()
 
 
 def materialize_duckdb_vector_result(cursor):
+    ensure_optional_imports()
     if HAS_PYARROW:
         return cursor.fetch_arrow_table()
     return cursor.fetchall()
 
 
 def setup_apex_vector_bench(base_tmpdir: str, vecs: np.ndarray):
+    ensure_optional_imports()
     vector_dir = os.path.join(base_tmpdir, "vector_apex")
     client = ApexClient(vector_dir, drop_if_exists=True)
     client.create_table("vecs")
@@ -259,6 +319,7 @@ def setup_apex_vector_bench(base_tmpdir: str, vecs: np.ndarray):
 
 
 def setup_duckdb_vector_bench(vecs: np.ndarray):
+    ensure_optional_imports()
     con = duckdb.connect(":memory:")
     dim = vecs.shape[1]
     ids = np.arange(len(vecs), dtype=np.int32)
@@ -473,6 +534,7 @@ class SQLiteBench:
         return self.conn.execute(sql, params).fetchone()[0]
 
     def _query_pandas(self, sql):
+        ensure_optional_imports()
         if HAS_PANDAS:
             return pd.read_sql(sql, self.conn)
         return self._query_all(sql)
@@ -1007,6 +1069,7 @@ class DuckDBBench:
         self._txn_backlog_ready = False
 
     def _connect(self):
+        ensure_optional_imports()
         self.conn = duckdb.connect(self.db_path)
 
     def _query_all(self, sql, params=()):
@@ -1017,6 +1080,7 @@ class DuckDBBench:
         return self.conn.execute(sql, params).fetchone()[0]
 
     def _query_pandas(self, sql):
+        ensure_optional_imports()
         if HAS_PANDAS:
             return self.conn.execute(sql).df()
         return self._query_all(sql)
@@ -1574,6 +1638,7 @@ class ApexBaseBench:
         return self.client.execute(sql).scalar()
 
     def _query_pandas(self, sql):
+        ensure_optional_imports()
         result = self.client.execute(sql, show_internal_id=True)
         if HAS_PANDAS:
             return result.to_pandas()
@@ -1583,6 +1648,7 @@ class ApexBaseBench:
         return self.client.execute(sql, show_internal_id=True).to_dict()
 
     def setup(self):
+        ensure_optional_imports()
         if self.client:
             try:
                 self.client.close()
@@ -1601,6 +1667,7 @@ class ApexBaseBench:
 
     def cold_start_setup(self):
         """Close and reopen client — clears all Python/Rust-side caches (arrow_batch_cache etc.)."""
+        ensure_optional_imports()
         if self.client:
             self.client.close()
         self.client = ApexClient(self.db_dir)
@@ -2166,7 +2233,7 @@ BENCHMARKS = [
     ("SELECT * LIMIT 10K (cold reopen)", "bench_select_limit_10k", False, True,  False, None),
     ("SELECT * LIMIT 10K (warm cache)",  "bench_select_limit_10k", False, False, True,  None),
     ("Projection full scan (3 cols)",    "bench_projected_full_scan", False, False, False, None),
-    ("Filtered LIMIT 100 (age>30)",      "bench_filtered_limit_100", False, False, False, None),
+    ("Filtered LIMIT 100 (age>30)",      "bench_filtered_limit_100", False, False, True,  None),
     ("LIMIT 100 OFFSET 10K",             "bench_limit_offset_100", False, False, True,  None),
     ("Filter (name = 'user_5000')",      "bench_filter_string",    False, False, False, None),
     ("Filter (age BETWEEN 25 AND 35)",   "bench_filter_range",     False, False, False, None),
@@ -2252,6 +2319,23 @@ OLAP_BENCHMARK_NAMES = [
     "CSV Read + ORDER BY LIMIT 100",
 ]
 
+OLAP_EXTENDED_ONLY_BENCHMARK_NAMES = {
+    "SELECT * -> pandas (full scan)",
+    "CSV Read + COUNT(*)",
+    "CSV Read + Filter + GROUP BY",
+    "CSV Read + Full Scan LIMIT 1000",
+    "JSON Read + COUNT(*)",
+    "JSON Read + Filter",
+    "Temp Table (CSV) Query (filter+agg)",
+    "JSON Read + ORDER BY LIMIT 100",
+    "CSV Read + ORDER BY LIMIT 100",
+}
+
+PUBLIC_OLAP_BENCHMARK_NAMES = [
+    name for name in OLAP_BENCHMARK_NAMES
+    if name not in OLAP_EXTENDED_ONLY_BENCHMARK_NAMES
+]
+
 OLTP_FAIR_BENCHMARK_NAMES = [
     "Bulk Insert (N rows; default fair)",
     "Point Lookup (SQL by ID)",
@@ -2280,6 +2364,35 @@ OLTP_BENCHMARK_SECTIONS = [
         [_BENCHMARK_BY_NAME[name] for name in OLTP_FAIR_BENCHMARK_NAMES],
     ),
 ]
+
+
+def olap_benchmark_names_for_profile(profile: str):
+    if normalize_profile(profile) == PROFILE_PUBLIC:
+        return PUBLIC_OLAP_BENCHMARK_NAMES
+    return OLAP_BENCHMARK_NAMES
+
+
+def benchmark_sections_for_profile(profile: str):
+    olap_names = olap_benchmark_names_for_profile(profile)
+    olap_sections = [
+        (
+            "OLAP Fair Metrics",
+            "Analytical scans, filters, grouping, ordering, windows, and full-result materialization.",
+            [_BENCHMARK_BY_NAME[name] for name in olap_names],
+        ),
+    ]
+    oltp_sections = list(OLTP_BENCHMARK_SECTIONS)
+    return olap_sections, oltp_sections
+
+
+def benchmark_specs_for_profile(profile: str):
+    olap_sections, oltp_sections = benchmark_sections_for_profile(profile)
+    selected = {spec[0] for _, _, specs in (olap_sections + oltp_sections) for spec in specs}
+    return [spec for spec in BENCHMARKS if spec[0] in selected]
+
+
+def profile_runs_extended_sections(profile: str) -> bool:
+    return normalize_profile(profile) == PROFILE_EXTENDED
 
 
 OLTP_DEFAULT_BENCHMARKS = [
@@ -2472,22 +2585,21 @@ def print_benchmark_section(title, description, benchmark_specs, results, eng_na
     return json_rows
 
 
-def module_metric_counts():
-    olap_count = (
-        sum(len(specs) for _, _, specs in OLAP_BENCHMARK_SECTIONS)
-        + len(apex_materialization_queries({"point_lookup_id": 1}))
-        + 2
-    )
-    oltp_count = (
-        sum(len(specs) for _, _, specs in OLTP_BENCHMARK_SECTIONS)
-        + len(OLTP_DEFAULT_BENCHMARKS)
-        + len(OLTP_APEX_DIAGNOSTIC_BENCHMARKS)
-        + len(OLTP_DURABLE_WRITE_BENCHMARKS)
-        + len(TXN_FAIR_BENCHMARKS)
-        + len(TXN_APEX_DIAGNOSTIC_BENCHMARKS)
-        + 2
-    )
-    vector_count = vector_metric_count()
+def module_metric_counts(profile: str = PROFILE_PUBLIC):
+    olap_sections, oltp_sections = benchmark_sections_for_profile(profile)
+    olap_count = sum(len(specs) for _, _, specs in olap_sections)
+    oltp_count = sum(len(specs) for _, _, specs in oltp_sections)
+    if profile_runs_extended_sections(profile):
+        olap_count += len(apex_materialization_queries({"point_lookup_id": 1})) + 2
+        oltp_count += (
+            len(OLTP_DEFAULT_BENCHMARKS)
+            + len(OLTP_APEX_DIAGNOSTIC_BENCHMARKS)
+            + len(OLTP_DURABLE_WRITE_BENCHMARKS)
+            + len(TXN_FAIR_BENCHMARKS)
+            + len(TXN_APEX_DIAGNOSTIC_BENCHMARKS)
+            + 2
+        )
+    vector_count = vector_metric_count(profile)
     return olap_count, oltp_count, vector_count
 
 
@@ -2499,6 +2611,7 @@ def print_module_header(title, metric_count):
 
 def reload_loaded_state(engines):
     """Recreate each engine on a fresh loaded table before a new microbench section."""
+    ensure_optional_imports()
     for _, bench in engines:
         bench.setup()
         bench.bench_insert()
@@ -2546,6 +2659,7 @@ def apex_materialization_queries(shared_inputs):
 
 def run_apex_materialization_benchmarks(tmpdir, data, shared_inputs, warmup, iterations, low_memory=False):
     """Compare ApexBase result APIs without mixing them into cross-engine rankings."""
+    ensure_optional_imports()
     if not HAS_APEXBASE:
         return []
 
@@ -2631,6 +2745,7 @@ def run_apex_materialization_benchmarks(tmpdir, data, shared_inputs, warmup, ite
 
 def run_oltp_benchmarks(engines, warmup, iterations):
     """Run short OLTP-style microbenchmarks on a fresh loaded copy of each engine."""
+    ensure_optional_imports()
     if not engines:
         return []
 
@@ -2689,6 +2804,7 @@ def run_oltp_benchmarks(engines, warmup, iterations):
 
 def run_oltp_durable_benchmarks(engines, warmup, iterations):
     """Run OLTP write microbenchmarks with explicit durable persistence per operation."""
+    ensure_optional_imports()
     if not engines:
         return []
 
@@ -2764,6 +2880,7 @@ def run_oltp_durable_benchmarks(engines, warmup, iterations):
 
 def run_txn_benchmarks(engines, warmup, iterations):
     """Run fair cross-engine transaction microbenchmarks with durable sync on COMMIT."""
+    ensure_optional_imports()
     if not engines:
         return []
 
@@ -2840,6 +2957,7 @@ def run_txn_benchmarks(engines, warmup, iterations):
 
 def run_apex_oltp_diagnostics(tmpdir, data, warmup, iterations):
     """Show Apex-only tiny-write diagnostics outside cross-engine fair rankings."""
+    ensure_optional_imports()
     if not HAS_APEXBASE or not OLTP_APEX_DIAGNOSTIC_BENCHMARKS:
         return []
 
@@ -2881,6 +2999,7 @@ def run_apex_oltp_diagnostics(tmpdir, data, warmup, iterations):
 
 def run_apex_txn_diagnostics(tmpdir, data, warmup, iterations):
     """Show Apex-only .delta transaction-path diagnostics outside fair rankings."""
+    ensure_optional_imports()
     if not HAS_APEXBASE or not TXN_APEX_DIAGNOSTIC_BENCHMARKS:
         return []
 
@@ -2932,6 +3051,7 @@ def run_apex_buffered_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
     after flush/end/close, so the durability/visibility contract is different
     from per-call SQLite INSERT+commit.
     """
+    ensure_optional_imports()
     if not HAS_APEXBASE or not hasattr(ApexClient, "begin_buffered_writes"):
         return []
 
@@ -3023,6 +3143,7 @@ def run_apex_memtable_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
     stays outside committed-write OLTP rankings unless the benchmark flushes
     each timed write.
     """
+    ensure_optional_imports()
     if not HAS_APEXBASE:
         return []
 
@@ -3105,14 +3226,17 @@ def run_apex_memtable_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
     return rows
 
 
-def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations):
+def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations, profile=PROFILE_PUBLIC):
     """Benchmark vector similarity against DuckDB on a separate vector dataset."""
+    ensure_optional_imports()
+    head_metrics, batch_metrics, apex_only_metrics = vector_metric_sets(profile)
     config = {
         "rows": rows,
         "dim": dim,
         "k": k,
         "batch_queries": VECTOR_BATCH_QUERY_COUNT,
         "sqlite_note": VECTOR_SQLITE_NOTE,
+        "profile": normalize_profile(profile),
     }
 
     reason = None
@@ -3125,7 +3249,7 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations):
     elif rows <= 0 or dim <= 0 or k <= 0:
         reason = "rows, dim, and k must all be positive."
 
-    print_module_header("Vector Similarity", vector_metric_count())
+    print_module_header("Vector Similarity", vector_metric_count(profile))
     print(f"  Dedicated vector dataset: {rows:,} rows x {dim} dims; TopK k={k}; batch queries={VECTOR_BATCH_QUERY_COUNT}.")
     print(f"  {VECTOR_SQLITE_NOTE}")
 
@@ -3155,7 +3279,8 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations):
         print("done.")
 
         head_results = {}
-        for label, metric in VECTOR_HEAD_TO_HEAD_METRICS:
+        head_rows = []
+        for label, metric in head_metrics:
             head_results[label] = {
                 "ApexBase": run_bench_gc_median(
                     lambda client=apex_client, q=query, metric=metric: bench_apex_vector_query(client, q, k, metric),
@@ -3169,17 +3294,19 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations):
                 ),
             }
 
-        head_rows = print_benchmark_section(
-            "Vector Head-to-Head (single query)",
-            "Single-query TopK similarity on the same vector table; results materialized via Arrow when available.",
-            display_only_specs([label for label, _ in VECTOR_HEAD_TO_HEAD_METRICS]),
-            head_results,
-            ["ApexBase", "DuckDB"],
-            16,
-        )
+        if head_metrics:
+            head_rows = print_benchmark_section(
+                "Vector Head-to-Head (single query)",
+                "Single-query TopK similarity on the same vector table; results materialized via Arrow when available.",
+                display_only_specs([label for label, _ in head_metrics]),
+                head_results,
+                ["ApexBase", "DuckDB"],
+                16,
+            )
 
         batch_results = {}
-        for label, metric in VECTOR_BATCH_METRICS:
+        batch_rows = []
+        for label, metric in batch_metrics:
             batch_results[label] = {
                 "ApexBase": run_bench_gc_median(
                     lambda client=apex_client, queries=batch_queries, metric=metric: bench_apex_batch_vector_query(client, queries, k, metric),
@@ -3193,36 +3320,38 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations):
                 ),
             }
 
-        batch_rows = print_benchmark_section(
-            "Vector Head-to-Head (batch queries)",
-            "Ten-query TopK workload: ApexBase batch_topk_distance() vs repeated DuckDB single-query SQL on the same batch.",
-            display_only_specs([label for label, _ in VECTOR_BATCH_METRICS]),
-            batch_results,
-            ["ApexBase", "DuckDB"],
-            16,
-        )
-
-        print("\n--- Vector Apex-only Metrics ---")
-        print("  Metrics without a native DuckDB equivalent in this harness.")
-        col_width = 16
-        name_width = max(32, *(len(label) for label, _ in VECTOR_APEX_ONLY_METRICS))
-        header = f"{'Metric':<{name_width}} | {'ApexBase':>{col_width}}"
-        print(header)
-        print("-" * len(header))
+        if batch_metrics:
+            batch_rows = print_benchmark_section(
+                "Vector Head-to-Head (batch queries)",
+                "Ten-query TopK workload: ApexBase batch_topk_distance() vs repeated DuckDB single-query SQL on the same batch.",
+                display_only_specs([label for label, _ in batch_metrics]),
+                batch_results,
+                ["ApexBase", "DuckDB"],
+                16,
+            )
 
         apex_only_rows = []
-        for label, metric in VECTOR_APEX_ONLY_METRICS:
-            ms = run_bench_gc_median(
-                lambda client=apex_client, q=query, metric=metric: bench_apex_vector_query(client, q, k, metric),
-                warmup=warmup,
-                iterations=iterations,
-            )
-            print(f"{label:<{name_width}} | {fmt_ms(ms):>{col_width}}")
-            apex_only_rows.append({
-                "category": "Vector Apex-only Metrics",
-                "query": label,
-                "ApexBase": round(ms, 3),
-            })
+        if apex_only_metrics:
+            print("\n--- Vector Apex-only Metrics ---")
+            print("  Metrics without a native DuckDB equivalent in this harness.")
+            col_width = 16
+            name_width = max(32, *(len(label) for label, _ in apex_only_metrics))
+            header = f"{'Metric':<{name_width}} | {'ApexBase':>{col_width}}"
+            print(header)
+            print("-" * len(header))
+
+            for label, metric in apex_only_metrics:
+                ms = run_bench_gc_median(
+                    lambda client=apex_client, q=query, metric=metric: bench_apex_vector_query(client, q, k, metric),
+                    warmup=warmup,
+                    iterations=iterations,
+                )
+                print(f"{label:<{name_width}} | {fmt_ms(ms):>{col_width}}")
+                apex_only_rows.append({
+                    "category": "Vector Apex-only Metrics",
+                    "query": label,
+                    "ApexBase": round(ms, 3),
+                })
 
         combined_results = {}
         combined_results.update(head_results)
@@ -3261,6 +3390,7 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations):
 
 
 def get_system_info():
+    ensure_optional_imports()
     info = {
         "platform": platform.platform(),
         "machine": platform.machine(),
@@ -3289,12 +3419,16 @@ def get_system_info():
     return info
 
 
-def main():
+def main(argv=None, default_profile=PROFILE_PUBLIC):
     parser = argparse.ArgumentParser(description="ApexBase vs SQLite vs DuckDB benchmark")
     parser.add_argument("--rows", type=int, default=1_000_000, help="Number of rows (default: 1M)")
     parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations (default: 2)")
     parser.add_argument("--iterations", type=int, default=5, help="Timed iterations (default: 5)")
     parser.add_argument("--output", type=str, default=None, help="JSON output file")
+    parser.add_argument("--profile", choices=PROFILE_CHOICES, default=default_profile,
+                        help="Benchmark profile: public README scoreboard or extended diagnostics")
+    parser.add_argument("--full", action="store_true",
+                        help="Alias for --profile extended")
     parser.add_argument("--memory", action="store_true", help="Track RSS memory delta per query")
     parser.add_argument("--low-memory", action="store_true",
                         help="Disable ApexBase arrow_batch_cache (simulate low-memory mode like SQLite/DuckDB)")
@@ -3305,7 +3439,9 @@ def main():
                         help=f"Vector dimensions for similarity module (default: {VECTOR_DIM_DEFAULT})")
     parser.add_argument("--vector-k", type=int, default=VECTOR_K_DEFAULT,
                         help=f"TopK value for vector similarity module (default: {VECTOR_K_DEFAULT})")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    profile = PROFILE_EXTENDED if args.full else normalize_profile(args.profile)
+    ensure_optional_imports()
 
     N = args.rows
     WARMUP = args.warmup
@@ -3313,6 +3449,7 @@ def main():
     VECTOR_ROWS = args.vector_rows if args.vector_rows is not None else default_vector_rows(N)
     VECTOR_DIM = args.vector_dim
     VECTOR_K = args.vector_k
+    selected_benchmarks = benchmark_specs_for_profile(profile)
 
     print("=" * 80)
     print(f" ApexBase vs SQLite vs DuckDB — Performance Benchmark")
@@ -3330,9 +3467,10 @@ def main():
         print(f"DuckDB: v{sys_info['duckdb']}")
     if HAS_PYARROW:
         print(f"PyArrow: v{sys_info['pyarrow']}")
-    olap_metric_count, oltp_metric_count, vector_metric_total = module_metric_counts()
+    olap_metric_count, oltp_metric_count, vector_metric_total = module_metric_counts(profile)
     print(f"\nDataset: {N:,} rows × 5 columns (name, age, score, city, category)")
     print(f"Warmup: {WARMUP} iterations, Timed: {ITERS} iterations (average)")
+    print(f"Profile: {profile} ({'README public scoreboard' if profile == PROFILE_PUBLIC else 'full diagnostics'})")
     print("Fairness mode: default rankings use normal engine APIs and comparable result materialization.")
     print(
         f"Layout: OLAP, OLTP, and Vector Similarity modules; "
@@ -3347,7 +3485,10 @@ def main():
             f"Vector dataset: {VECTOR_ROWS:,} rows x {VECTOR_DIM} dims (separate module), "
             f"TopK={VECTOR_K}, batch queries={VECTOR_BATCH_QUERY_COUNT}"
         )
-        print("Vector results are reported separately and do not change the 47-metric default fair scoreboard.")
+        print(
+            "Vector results are reported separately and do not change the "
+            f"{len(selected_benchmarks)}-metric default fair scoreboard."
+        )
     if args.low_memory:
         print("Mode: LOW-MEMORY (ApexBase-only cache stress mode; not a cross-engine apples-to-apples setting)")
     print()
@@ -3359,9 +3500,13 @@ def main():
 
     tmpdir = tempfile.mkdtemp(prefix="apexbase_bench_")
 
-    print("Generating benchmark files (CSV/Parquet/JSON)...", end=" ", flush=True)
-    csv_path, parquet_path, json_path = generate_benchmark_files(tmpdir, data)
-    print("done.")
+    csv_path = parquet_path = json_path = None
+    if profile_runs_extended_sections(profile):
+        print("Generating benchmark files (CSV/Parquet/JSON)...", end=" ", flush=True)
+        csv_path, parquet_path, json_path = generate_benchmark_files(tmpdir, data)
+        print("done.")
+    else:
+        print("Benchmark files: skipped for public profile.")
     results = {}
     shared_inputs = build_shared_inputs(N)
 
@@ -3384,7 +3529,7 @@ def main():
     mem_results = {}  # bench_name -> {eng_name: rss_delta_mb}
 
     # Run benchmarks
-    for bench_name, method_name, is_insert, is_cold, is_warm_nogc, setup_method in BENCHMARKS:
+    for bench_name, method_name, is_insert, is_cold, is_warm_nogc, setup_method in selected_benchmarks:
         results[bench_name] = {}
         mem_results.setdefault(bench_name, {})
         for eng_name, bench in engines:
@@ -3461,11 +3606,10 @@ def main():
     col_width = 16
 
     json_results = []
-    olap_sections = list(OLAP_BENCHMARK_SECTIONS)
-    oltp_sections = list(OLTP_BENCHMARK_SECTIONS)
+    olap_sections, oltp_sections = benchmark_sections_for_profile(profile)
     benchmark_sections = olap_sections + oltp_sections
     grouped_names = {spec[0] for _, _, specs in benchmark_sections for spec in specs}
-    ungrouped_specs = [spec for spec in BENCHMARKS if spec[0] not in grouped_names]
+    ungrouped_specs = [spec for spec in selected_benchmarks if spec[0] not in grouped_names]
     if ungrouped_specs:
         oltp_sections.append((
             "OLTP Other Fair Metrics",
@@ -3487,14 +3631,17 @@ def main():
 
     print()
 
-    materialization_results = run_apex_materialization_benchmarks(
-        tmpdir,
-        data,
-        shared_inputs,
-        warmup=WARMUP,
-        iterations=ITERS,
-        low_memory=args.low_memory,
-    )
+    if profile_runs_extended_sections(profile):
+        materialization_results = run_apex_materialization_benchmarks(
+            tmpdir,
+            data,
+            shared_inputs,
+            warmup=WARMUP,
+            iterations=ITERS,
+            low_memory=args.low_memory,
+        )
+    else:
+        materialization_results = []
 
     # ========================================================================
     # OLAP Throughput Tests (Single & Concurrent)
@@ -3695,10 +3842,18 @@ def main():
 
         return results
 
-    # Run Q/s tests — pass existing engines to avoid re-inserting data
-    existing_engines = {name: bench for name, bench in engines}
-    qps_results = run_qps_benchmark(tmpdir, data, n_threads=4, min_duration=2.0, min_iterations=50,
-                                    existing_engines=existing_engines)
+    if profile_runs_extended_sections(profile):
+        existing_engines = {name: bench for name, bench in engines}
+        qps_results = run_qps_benchmark(
+            tmpdir,
+            data,
+            n_threads=4,
+            min_duration=2.0,
+            min_iterations=50,
+            existing_engines=existing_engines,
+        )
+    else:
+        qps_results = {}
 
     print_module_header("OLTP", oltp_metric_count)
     for section_title, section_description, benchmark_specs in oltp_sections:
@@ -3733,7 +3888,7 @@ def main():
                 print(row)
 
     if "ApexBase" in [n for n, _ in engines]:
-        stats = summarize_apex_section(BENCHMARKS, results)
+        stats = summarize_apex_section(selected_benchmarks, results)
         print(
             f"\nDefault Fair Summary: ApexBase wins {stats['wins']}/{stats['total']}, "
             f"ties {stats['ties']}/{stats['total']}, slower {stats['slower']}/{stats['total']}"
@@ -3742,6 +3897,7 @@ def main():
     if args.skip_vector:
         vector_results = {
             "config": {
+                "profile": profile,
                 "rows": VECTOR_ROWS,
                 "dim": VECTOR_DIM,
                 "k": VECTOR_K,
@@ -3763,47 +3919,57 @@ def main():
             k=VECTOR_K,
             warmup=WARMUP,
             iterations=ITERS,
+            profile=profile,
         )
 
-    oltp_results = run_oltp_benchmarks(
-        engines,
-        warmup=WARMUP,
-        iterations=ITERS,
-    )
-    apex_oltp_diagnostics = run_apex_oltp_diagnostics(
-        tmpdir,
-        data,
-        warmup=WARMUP,
-        iterations=ITERS,
-    )
-    durable_oltp_results = run_oltp_durable_benchmarks(
-        engines,
-        warmup=WARMUP,
-        iterations=ITERS,
-    )
-    txn_results = run_txn_benchmarks(
-        engines,
-        warmup=WARMUP,
-        iterations=ITERS,
-    )
-    apex_txn_diagnostics = run_apex_txn_diagnostics(
-        tmpdir,
-        data,
-        warmup=WARMUP,
-        iterations=ITERS,
-    )
-    buffered_oltp_results = run_apex_buffered_oltp_benchmarks(
-        tmpdir,
-        oltp_results,
-        warmup=WARMUP,
-        iterations=ITERS,
-    )
-    memtable_oltp_results = run_apex_memtable_oltp_benchmarks(
-        tmpdir,
-        oltp_results,
-        warmup=WARMUP,
-        iterations=ITERS,
-    )
+    if profile_runs_extended_sections(profile):
+        oltp_results = run_oltp_benchmarks(
+            engines,
+            warmup=WARMUP,
+            iterations=ITERS,
+        )
+        apex_oltp_diagnostics = run_apex_oltp_diagnostics(
+            tmpdir,
+            data,
+            warmup=WARMUP,
+            iterations=ITERS,
+        )
+        durable_oltp_results = run_oltp_durable_benchmarks(
+            engines,
+            warmup=WARMUP,
+            iterations=ITERS,
+        )
+        txn_results = run_txn_benchmarks(
+            engines,
+            warmup=WARMUP,
+            iterations=ITERS,
+        )
+        apex_txn_diagnostics = run_apex_txn_diagnostics(
+            tmpdir,
+            data,
+            warmup=WARMUP,
+            iterations=ITERS,
+        )
+        buffered_oltp_results = run_apex_buffered_oltp_benchmarks(
+            tmpdir,
+            oltp_results,
+            warmup=WARMUP,
+            iterations=ITERS,
+        )
+        memtable_oltp_results = run_apex_memtable_oltp_benchmarks(
+            tmpdir,
+            oltp_results,
+            warmup=WARMUP,
+            iterations=ITERS,
+        )
+    else:
+        oltp_results = []
+        apex_oltp_diagnostics = []
+        durable_oltp_results = []
+        txn_results = []
+        apex_txn_diagnostics = []
+        buffered_oltp_results = []
+        memtable_oltp_results = []
 
     # Cleanup (after Q/s tests, engines are still open)
     for name, bench in engines:
@@ -3814,6 +3980,7 @@ def main():
         output = {
             "system": sys_info,
             "config": {
+                "profile": profile,
                 "rows": N,
                 "warmup": WARMUP,
                 "iterations": ITERS,

@@ -4924,19 +4924,37 @@ impl ApexStorageImpl {
         if id < 0 || columns.is_empty() {
             return Ok(None);
         }
-        let (table_path, table_name) = self.get_current_table_info()?;
-        let cache_key = Self::backend_cache_key(&table_path, &table_name);
+        let table_name = self.current_table.read().clone();
+        if table_name.is_empty() {
+            return Err(PyValueError::new_err(
+                "No table selected. Call create_table() or use_table() first.",
+            ));
+        }
         let backend_opt: Option<Arc<TableStorageBackend>> = self
             .cached_backends
-            .get(&cache_key)
+            .get(&table_name)
             .map(|v| Arc::clone(&v))
             .or_else(|| {
-                crate::query::get_cached_backend_pub(&table_path)
-                    .ok()
-                    .map(|b| {
+                let table_path = self.get_current_table_path().ok()?;
+                let cache_key = Self::backend_cache_key(&table_path, &table_name);
+                self.cached_backends
+                    .get(&cache_key)
+                    .map(|v| {
+                        let backend = Arc::clone(&v);
                         self.cached_backends
-                            .insert(cache_key.clone(), Arc::clone(&b));
-                        b
+                            .insert(table_name.clone(), Arc::clone(&backend));
+                        backend
+                    })
+                    .or_else(|| {
+                        crate::query::get_cached_backend_pub(&table_path)
+                            .ok()
+                            .map(|b| {
+                                self.cached_backends
+                                    .insert(cache_key.clone(), Arc::clone(&b));
+                                self.cached_backends
+                                    .insert(table_name.clone(), Arc::clone(&b));
+                                b
+                            })
                     })
             });
 
@@ -5276,16 +5294,23 @@ impl ApexStorageImpl {
         let needed = offset.saturating_add(limit);
         let cols_result = py.allow_threads(
             || -> io::Result<Option<crate::storage::on_demand::MmapBatchColumns>> {
-                let Some(indices) =
+                let Some(mut indices) =
                     backend.scan_numeric_range_mmap(&filter_column, low, high, Some(needed))?
                 else {
                     return Ok(None);
                 };
-                let final_indices: Vec<usize> =
-                    indices.into_iter().skip(offset).take(limit).collect();
-                backend
-                    .storage
-                    .extract_rows_by_indices_mmap_columns(&final_indices, None)
+                if offset == 0 {
+                    indices.truncate(limit);
+                    backend
+                        .storage
+                        .extract_rows_by_indices_mmap_columns(&indices, None)
+                } else {
+                    let final_indices: Vec<usize> =
+                        indices.into_iter().skip(offset).take(limit).collect();
+                    backend
+                        .storage
+                        .extract_rows_by_indices_mmap_columns(&final_indices, None)
+                }
             },
         );
 

@@ -4,6 +4,9 @@ ApexClient - High-performance embedded database client
 This module provides the ApexClient class that wraps ApexStorage with on-demand storage engine.
 """
 
+from __future__ import annotations
+
+import importlib.util
 import os
 import re
 import threading
@@ -20,12 +23,42 @@ import numpy as np
 from apexbase._core import ApexStorage
 from . import ResultView, _empty_result_view, _registry, DurabilityLevel
 
-import pyarrow as pa
-import pandas as pd
-import polars as pl
+pa = None
+pd = None
+pl = None
+ARROW_AVAILABLE = importlib.util.find_spec("pyarrow") is not None
+PANDAS_AVAILABLE = importlib.util.find_spec("pandas") is not None
+POLARS_AVAILABLE = importlib.util.find_spec("polars") is not None
 
-ARROW_AVAILABLE = True
-POLARS_AVAILABLE = True
+
+def _ensure_pyarrow():
+    global pa, ARROW_AVAILABLE
+    if pa is None:
+        if not ARROW_AVAILABLE:
+            raise ImportError("pyarrow not available. Install with: pip install pyarrow")
+        import pyarrow as _pa
+        pa = _pa
+    return pa
+
+
+def _ensure_pandas():
+    global pd, PANDAS_AVAILABLE
+    if pd is None:
+        if not PANDAS_AVAILABLE:
+            raise ImportError("pandas not available. Install with: pip install pandas")
+        import pandas as _pd
+        pd = _pd
+    return pd
+
+
+def _ensure_polars():
+    global pl, POLARS_AVAILABLE
+    if pl is None:
+        if not POLARS_AVAILABLE:
+            raise ImportError("polars not available. Install with: pip install polars")
+        import polars as _pl
+        pl = _pl
+    return pl
 
 import struct
 
@@ -152,6 +185,14 @@ _RE_SIMPLE_NUMERIC_RANGE_LIMIT = re.compile(
 )
 _RE_SIMPLE_NUMERIC_FILTERED_AGG = re.compile(
     r"^\s*select\s+(.+?)\s+from\s+([A-Za-z_][\w]*)\s+where\s+([A-Za-z_][\w]*)\s*(=|>=|>|<=|<)\s*(-?\d+(?:\.\d+)?)\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_RE_SIMPLE_STRING_FILTERED_AGG = re.compile(
+    r"^\s*select\s+(.+?)\s+from\s+([A-Za-z_][\w]*)\s+where\s+([A-Za-z_][\w]*)\s*=\s*'([^']*)'\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_RE_SIMPLE_GROUP_VIEW_OUTER = re.compile(
+    r"^\s*select\s+(.+?)\s+from\s+([A-Za-z_][\w]*)\s+where\s+([A-Za-z_][\w]*)\s*(>=|>)\s*([+-]?\d+(?:\.\d+)?)\s+order\s+by\s+([A-Za-z_][\w]*)\s+desc\s+limit\s+(\d+)\s*;?\s*$",
     re.IGNORECASE | re.DOTALL,
 )
 _RE_SIMPLE_POINT_PARSE = re.compile(
@@ -344,6 +385,12 @@ class ApexClient:
 
         # Persisted FTS configuration path
         self._fts_config_path = self._dirpath / "fts_config.json"
+        self._fts_config_known_present = False
+        self._fts_config_mtime_ns = None
+        self._view_catalog_path = self._dirpath / ".apex_views.json"
+        self._view_catalog_known_present = False
+        self._view_catalog_mtime_ns = None
+        self._view_catalog_views = {}
 
         # If recreating DB, clear any persisted FTS config
         if drop_if_exists:
@@ -395,21 +442,39 @@ class ApexClient:
 
     def _load_fts_config(self) -> None:
         try:
-            if not self._fts_config_path.exists():
+            try:
+                stat = self._fts_config_path.stat()
+            except FileNotFoundError:
+                self._fts_config_known_present = False
+                self._fts_config_mtime_ns = None
+                if self._fts_tables:
+                    self._fts_tables = {}
+                return
+            mtime_ns = stat.st_mtime_ns
+            if self._fts_config_known_present and self._fts_config_mtime_ns == mtime_ns:
                 return
             with open(self._fts_config_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             if isinstance(data, dict):
                 # Only accept dict[str, dict] shape
                 self._fts_tables = {str(k): v for k, v in data.items() if isinstance(v, dict)}
+            self._fts_config_known_present = True
+            self._fts_config_mtime_ns = mtime_ns
         except Exception:
             # Best-effort: if config is corrupted, ignore it
             self._fts_tables = {}
+            self._fts_config_known_present = False
+            self._fts_config_mtime_ns = None
 
     def _save_fts_config(self) -> None:
         try:
             with open(self._fts_config_path, 'w', encoding='utf-8') as f:
                 json.dump(self._fts_tables, f, ensure_ascii=False)
+            try:
+                self._fts_config_mtime_ns = self._fts_config_path.stat().st_mtime_ns
+            except FileNotFoundError:
+                self._fts_config_mtime_ns = None
+            self._fts_config_known_present = True
         except Exception:
             pass
 
@@ -569,7 +634,8 @@ class ApexClient:
             if self._current_table != table_name:
                 self._invalidate_replace_cache()
         self._current_table = table_name
-        self._sync_fts_config_from_disk()
+        if self._fts_config_known_present or self._fts_tables:
+            self._sync_fts_config_from_disk()
 
     @property
     def current_table(self) -> str:
@@ -785,9 +851,9 @@ class ApexClient:
         if text_columns:
             cols = [c for c in text_columns if c in table.column_names]
         else:
-            import pyarrow as pa
+            pa_mod = _ensure_pyarrow()
             cols = [c for c in table.column_names if c != id_column
-                    and pa.types.is_string(table.schema.field(c).type)]
+                    and pa_mod.types.is_string(table.schema.field(c).type)]
         
         if not cols:
             return 0
@@ -1052,41 +1118,50 @@ class ApexClient:
                     self._store_columnar(data)
                     return
         
+            data_module = type(data).__module__
+
             # 2. PyArrow Table - Convert to columnar dict for optimized storage
-            if ARROW_AVAILABLE and pa is not None and isinstance(data, pa.Table):
-                # Convert Arrow Table to columnar dict for zero-copy path
-                columns = {}
-                for name in data.column_names:
-                    col = data[name]
-                    # Convert to list for storage
-                    if pa.types.is_string(col.type) or pa.types.is_large_string(col.type):
-                        columns[name] = col.to_pylist()
-                    elif pa.types.is_integer(col.type):
-                        columns[name] = col.to_pylist()
-                    elif pa.types.is_floating(col.type):
-                        columns[name] = col.to_pylist()
-                    elif pa.types.is_boolean(col.type):
-                        columns[name] = col.to_pylist()
-                    else:
-                        columns[name] = col.to_pylist()
-                self._store_columnar(columns)
-                return
-        
+            if ARROW_AVAILABLE and data_module.startswith("pyarrow"):
+                pa_mod = _ensure_pyarrow()
+                if not isinstance(data, pa_mod.Table):
+                    pa_mod = None
+                else:
+                    # Convert Arrow Table to columnar dict for zero-copy path
+                    columns = {}
+                    for name in data.column_names:
+                        col = data[name]
+                        # Convert to list for storage
+                        if pa_mod.types.is_string(col.type) or pa_mod.types.is_large_string(col.type):
+                            columns[name] = col.to_pylist()
+                        elif pa_mod.types.is_integer(col.type):
+                            columns[name] = col.to_pylist()
+                        elif pa_mod.types.is_floating(col.type):
+                            columns[name] = col.to_pylist()
+                        elif pa_mod.types.is_boolean(col.type):
+                            columns[name] = col.to_pylist()
+                        else:
+                            columns[name] = col.to_pylist()
+                    self._store_columnar(columns)
+                    return
+
             # 3. Pandas DataFrame - Convert to columnar dict for optimized storage
-            if ARROW_AVAILABLE and pd is not None and isinstance(data, pd.DataFrame):
-                # Convert DataFrame to columnar dict
-                columns = {}
-                for name in data.columns:
-                    col = data[name]
-                    if col.dtype == 'object':
-                        columns[name] = col.fillna('').tolist()
-                    else:
-                        columns[name] = col.tolist()
-                self._store_columnar(columns)
-                return
-        
+            if PANDAS_AVAILABLE and data_module.startswith("pandas"):
+                pd_mod = _ensure_pandas()
+                if isinstance(data, pd_mod.DataFrame):
+                    # Convert DataFrame to columnar dict
+                    columns = {}
+                    for name in data.columns:
+                        col = data[name]
+                        if col.dtype == 'object':
+                            columns[name] = col.fillna('').tolist()
+                        else:
+                            columns[name] = col.tolist()
+                    self._store_columnar(columns)
+                    return
+
             # 4. Polars DataFrame - Convert to columnar dict for optimized storage
-            if POLARS_AVAILABLE and pl is not None and hasattr(data, 'to_arrow'):
+            if POLARS_AVAILABLE and data_module.startswith("polars") and hasattr(data, 'to_arrow'):
+                _ensure_polars()
                 # Convert to Arrow then to columnar dict
                 arrow_table = data.to_arrow()
                 columns = {}
@@ -1094,7 +1169,7 @@ class ApexClient:
                     columns[name] = arrow_table[name].to_pylist()
                 self._store_columnar(columns)
                 return
-        
+
             # 5. Single record dict
             if isinstance(data, dict):
                 if self._store_scalar_fast_unlocked(data):
@@ -1103,7 +1178,7 @@ class ApexClient:
                 self._has_writes = True
                 self._invalidate_replace_cache()
                 return
-            
+
             # 6. List[dict] - OPTIMIZED: Convert to columnar for better performance
             elif isinstance(data, list):
                 if not data:
@@ -1383,9 +1458,59 @@ class ApexClient:
 
         cached_simple = self._simple_sql_cache.get(sql)
         if cached_simple:
+            if (not getattr(self, '_in_txn', False)
+                    and not getattr(self, '_fast_txn_active', False)
+                    and cached_simple[0] in ('point', 'projected_point', 'numeric_range_limit')):
+                try:
+                    kind = cached_simple[0]
+                    table_name = cached_simple[1]
+                    current_table = self._current_table
+                    if current_table and (
+                            table_name == current_table
+                            or table_name.lower() == current_table.lower()):
+                        show_flag = bool(show_internal_id) if show_internal_id is not None else False
+                        if kind == 'point':
+                            row = self._storage.retrieve(cached_simple[2])
+                            if row is None:
+                                rv = ResultView(data=None)
+                                rv._show_internal_id = show_flag
+                                return rv
+                            if not show_flag and '_id' in row:
+                                row = {k: v for k, v in row.items() if k != '_id'}
+                            rv = ResultView(data=[row])
+                            rv._show_internal_id = show_flag
+                            return rv
+                        if kind == 'projected_point':
+                            row = self._storage.retrieve_projected_row(
+                                cached_simple[2], list(cached_simple[3])
+                            )
+                            if row is not None:
+                                rv = ResultView(data=[row])
+                                rv._show_internal_id = show_flag
+                                return rv
+                        if kind == 'numeric_range_limit':
+                            _, _, filter_col, op, value, limit_val, offset_val = cached_simple
+                            result = self._storage.retrieve_by_numeric_range_limit(
+                                filter_col, op, value, limit_val, offset_val
+                            )
+                            if isinstance(result, dict):
+                                columns_dict = result.get('columns_dict')
+                                if columns_dict is not None:
+                                    return self._result_view_from_columns_dict(sql, columns_dict, show_flag)
+                except Exception:
+                    pass
             hot_result = self._execute_cached_simple_select(sql, cached_simple, show_internal_id)
             if hot_result is not _HOT_CACHE_MISS:
                 return hot_result
+
+        if (not getattr(self, '_in_txn', False)
+                and not getattr(self, '_fast_txn_active', False)):
+            view_result = self._execute_simple_group_view_select(
+                sql,
+                bool(show_internal_id) if show_internal_id is not None else False,
+            )
+            if view_result is not _HOT_CACHE_MISS:
+                return view_result
         
         # Lock-free execution: Rust layer handles concurrent reads via RwLock.
         # Python-level _storage_lock was causing serialization of all queries.
@@ -1445,8 +1570,8 @@ class ApexClient:
             return True
 
         # Small/medium OLAP outputs are usually consumed as Python rows in execute().to_dict().
-        # Let Rust's executor fast paths (cached GROUP BY, aggregation, top-k ORDER BY, etc.)
-        # return columnar Python lists directly instead of importing Arrow then converting rows.
+        # Let Rust's executor fast paths return columnar Python lists directly instead of
+        # importing Arrow then converting rows.
         if ('GROUP' in sql_upper or 'HAVING' in sql_upper or 'DISTINCT' in sql_upper
                 or has_agg):
             return True
@@ -1476,12 +1601,24 @@ class ApexClient:
                 'point', 'projected_point', 'string_eq_limit1',
                 'projected_string_eq_limit1', 'projected_string_eq_limit',
                 'numeric_range_limit', 'numeric_filtered_agg',
+                'string_filtered_agg',
         ):
             return _HOT_CACHE_MISS
         try:
-            self._ensure_table_selected()
+            if not self._current_table:
+                self._ensure_table_selected()
             table_name = cached_simple[1]
             show_flag = bool(show_internal_id) if show_internal_id is not None else False
+            if kind == 'string_filtered_agg':
+                if not self._current_table or table_name.lower() != self._current_table.lower():
+                    return _HOT_CACHE_MISS
+                result = self._storage.execute(sql)
+                if isinstance(result, dict):
+                    columns_dict = result.get('columns_dict')
+                    if columns_dict is not None:
+                        return self._result_view_from_columns_dict(sql, columns_dict, show_flag)
+                return _HOT_CACHE_MISS
+
             if kind == 'numeric_filtered_agg':
                 _, table_name, filter_col, op, value = cached_simple
                 result = self._storage.execute_filtered_numeric_agg(
@@ -1556,6 +1693,144 @@ class ApexClient:
                     return rv
             rows = [row]
             rv = ResultView(data=rows)
+            rv._show_internal_id = show_internal_id
+            return rv
+        except Exception:
+            return _HOT_CACHE_MISS
+
+    @staticmethod
+    def _simple_identifier_list(text: str) -> Optional[List[str]]:
+        cols = []
+        for part in text.split(','):
+            col = part.strip().strip('"').strip('`')
+            if not col or not re.match(r"^[A-Za-z_]\w*$", col):
+                return None
+            cols.append(col)
+        return cols
+
+    @staticmethod
+    def _view_aggregate_sql(agg: dict) -> Optional[str]:
+        func = str(agg.get("func", "")).upper()
+        if func not in {"COUNT", "AVG", "SUM", "MIN", "MAX"}:
+            return None
+        col = agg.get("column")
+        if func == "COUNT" and col is None:
+            inner = "*"
+        elif isinstance(col, str) and re.match(r"^[A-Za-z_]\w*$", col):
+            inner = col
+        else:
+            return None
+        alias = agg.get("alias")
+        if not isinstance(alias, str) or not re.match(r"^[A-Za-z_]\w*$", alias):
+            return None
+        return f"{func}({inner}) AS {alias}"
+
+    def _execute_simple_group_view_select(self, sql: str, show_internal_id: bool):
+        sql_lower = sql.lower()
+        if (" where " not in sql_lower
+                or " order by " not in sql_lower
+                or " limit " not in sql_lower):
+            return _HOT_CACHE_MISS
+        match = _RE_SIMPLE_GROUP_VIEW_OUTER.match(sql)
+        if not match:
+            return _HOT_CACHE_MISS
+        selected = self._simple_identifier_list(match.group(1))
+        if not selected:
+            return _HOT_CACHE_MISS
+
+        view_name = match.group(2).lower()
+        where_alias = match.group(3)
+        op = match.group(4)
+        threshold = float(match.group(5))
+        order_alias = match.group(6)
+        limit = int(match.group(7))
+        if where_alias.lower() != order_alias.lower() or limit <= 0:
+            return _HOT_CACHE_MISS
+
+        view_stmt = self._load_view_catalog().get(view_name)
+        if not isinstance(view_stmt, dict):
+            return _HOT_CACHE_MISS
+
+        from_item = view_stmt.get("from")
+        table = None
+        if isinstance(from_item, dict):
+            table_item = from_item.get("Table")
+            if isinstance(table_item, dict):
+                table = table_item.get("table")
+        if not isinstance(table, str) or not re.match(r"^[A-Za-z_]\w*$", table):
+            return _HOT_CACHE_MISS
+
+        group_by = view_stmt.get("group_by")
+        if not isinstance(group_by, list) or len(group_by) != 1:
+            return _HOT_CACHE_MISS
+        group_col = group_by[0]
+        if not isinstance(group_col, str) or not re.match(r"^[A-Za-z_]\w*$", group_col):
+            return _HOT_CACHE_MISS
+
+        alias_exprs = {group_col.lower(): group_col}
+        alias_names = {group_col.lower(): group_col}
+        for col in view_stmt.get("columns", []):
+            if not isinstance(col, dict):
+                return _HOT_CACHE_MISS
+            if "Column" in col:
+                name = col["Column"]
+                if isinstance(name, str) and name == group_col:
+                    alias_exprs[name.lower()] = name
+                    alias_names[name.lower()] = name
+                else:
+                    return _HOT_CACHE_MISS
+            elif "Aggregate" in col:
+                agg = col["Aggregate"]
+                if not isinstance(agg, dict):
+                    return _HOT_CACHE_MISS
+                expr = self._view_aggregate_sql(agg)
+                alias = agg.get("alias")
+                if expr is None or not isinstance(alias, str):
+                    return _HOT_CACHE_MISS
+                alias_exprs[alias.lower()] = expr
+                alias_names[alias.lower()] = alias
+            else:
+                return _HOT_CACHE_MISS
+
+        needed_keys = []
+        for name in [*selected, where_alias, order_alias]:
+            key = name.lower()
+            if key not in alias_exprs:
+                return _HOT_CACHE_MISS
+            if key not in needed_keys:
+                needed_keys.append(key)
+
+        select_parts = []
+        for key in [group_col.lower(), *needed_keys]:
+            if key in alias_exprs and alias_exprs[key] not in select_parts:
+                select_parts.append(alias_exprs[key])
+        pruned_sql = (
+            f"SELECT {', '.join(select_parts)} FROM {table} "
+            f"GROUP BY {group_col} ORDER BY {alias_names[order_alias.lower()]} DESC LIMIT {limit}"
+        )
+
+        try:
+            result = self._storage.execute(pruned_sql)
+            if not isinstance(result, dict):
+                return _HOT_CACHE_MISS
+            columns_dict = result.get('columns_dict')
+            if columns_dict is None:
+                return _HOT_CACHE_MISS
+
+            order_col = alias_names[order_alias.lower()]
+            order_values = list(columns_dict.get(order_col, []))
+            if op == ">":
+                keep = [i for i, value in enumerate(order_values) if value > threshold]
+            else:
+                keep = [i for i, value in enumerate(order_values) if value >= threshold]
+
+            projected = {}
+            for name in selected:
+                out_name = alias_names[name.lower()]
+                values = list(columns_dict.get(out_name, []))
+                projected[out_name] = [values[i] for i in keep]
+
+            rv = ResultView(lazy_pydict=projected)
             rv._show_internal_id = show_internal_id
             return rv
         except Exception:
@@ -1720,6 +1995,18 @@ class ApexClient:
                                         )
                                     except (TypeError, ValueError):
                                         pass
+                                if not cached_simple:
+                                    string_agg = _RE_SIMPLE_STRING_FILTERED_AGG.match(sql)
+                                    if (string_agg
+                                            and string_agg.group(3).lower() != '_id'
+                                            and _RE_AGGREGATE_FUNC.search(string_agg.group(1))
+                                            and 'DISTINCT' not in sql_upper):
+                                        cached_simple = (
+                                            'string_filtered_agg',
+                                            string_agg.group(2),
+                                            string_agg.group(3),
+                                            string_agg.group(4),
+                                        )
                                 if not cached_simple:
                                     numeric_agg = _RE_SIMPLE_NUMERIC_FILTERED_AGG.match(sql)
                                     if (numeric_agg
@@ -2325,7 +2612,8 @@ class ApexClient:
                     self._current_table = self._storage.current_table()
                 if 'FTS INDEX' in sql_upper:
                     self._sync_fts_config_from_disk()
-                reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
+                pa_mod = _ensure_pyarrow()
+                reader = pa_mod.ipc.open_stream(pa_mod.BufferReader(ipc_bytes))
                 table = reader.read_all()
                 if table.num_rows == 0:
                     table = None
@@ -2358,8 +2646,9 @@ class ApexClient:
                 try:
                     schema_ptr, array_ptr = self._storage._execute_like_ffi(sql)
                     if schema_ptr != 0 and array_ptr != 0:
-                        batch = pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
-                        table = pa.Table.from_batches([batch]) if batch.num_rows > 0 else None
+                        pa_mod = _ensure_pyarrow()
+                        batch = pa_mod.RecordBatch._import_from_c(array_ptr, schema_ptr)
+                        table = pa_mod.Table.from_batches([batch]) if batch.num_rows > 0 else None
                         rv = ResultView(arrow_table=table, data=None)
                         rv._show_internal_id = show_internal_id
                         return rv
@@ -2380,14 +2669,16 @@ class ApexClient:
             try:
                 schema_ptr, array_ptr = self._storage._execute_arrow_ffi(sql)
                 if schema_ptr != 0 and array_ptr != 0:
-                    batch = pa.RecordBatch._import_from_c(array_ptr, schema_ptr)
-                    table = pa.Table.from_batches([batch]) if batch.num_rows > 0 else None
+                    pa_mod = _ensure_pyarrow()
+                    batch = pa_mod.RecordBatch._import_from_c(array_ptr, schema_ptr)
+                    table = pa_mod.Table.from_batches([batch]) if batch.num_rows > 0 else None
                 else:
                     table = None
             except Exception:
                 # Fallback: Arrow IPC
                 ipc_bytes = self._storage._execute_arrow_ipc(sql)
-                reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
+                pa_mod = _ensure_pyarrow()
+                reader = pa_mod.ipc.open_stream(pa_mod.BufferReader(ipc_bytes))
                 table = reader.read_all()
                 if table.num_rows == 0:
                     table = None
@@ -2459,7 +2750,8 @@ class ApexClient:
         results = []
         for ipc_bytes in ipc_bytes_list:
             if ipc_bytes:
-                reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
+                pa_mod = _ensure_pyarrow()
+                reader = pa_mod.ipc.open_stream(pa_mod.BufferReader(ipc_bytes))
                 table = reader.read_all()
                 if table.num_rows == 0:
                     table = None
@@ -2616,17 +2908,37 @@ class ApexClient:
         
         raise ValueError(f"Table '{m.group(1)}' not found")
 
-    def _relation_exists_as_view(self, table_name: str) -> bool:
-        view_catalog_path = os.path.join(self._dirpath, ".apex_views.json")
-        if not os.path.exists(view_catalog_path):
-            return False
+    def _load_view_catalog(self) -> Dict[str, str]:
         try:
-            with open(view_catalog_path, "r", encoding="utf-8") as f:
+            try:
+                stat = self._view_catalog_path.stat()
+            except FileNotFoundError:
+                self._view_catalog_known_present = False
+                self._view_catalog_mtime_ns = None
+                if self._view_catalog_views:
+                    self._view_catalog_views = {}
+                return {}
+            mtime_ns = stat.st_mtime_ns
+            if self._view_catalog_known_present and self._view_catalog_mtime_ns == mtime_ns:
+                return self._view_catalog_views
+            with open(self._view_catalog_path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             views = payload.get("views", {})
-            return isinstance(views, dict) and table_name.lower() in views
+            if isinstance(views, dict):
+                self._view_catalog_views = {str(k).lower(): v for k, v in views.items()}
+            else:
+                self._view_catalog_views = {}
+            self._view_catalog_known_present = True
+            self._view_catalog_mtime_ns = mtime_ns
+            return self._view_catalog_views
         except Exception:
-            return False
+            self._view_catalog_known_present = False
+            self._view_catalog_mtime_ns = None
+            self._view_catalog_views = {}
+            return {}
+
+    def _relation_exists_as_view(self, table_name: str) -> bool:
+        return table_name.lower() in self._load_view_catalog()
 
     def _references_persisted_view(self, sql: str) -> bool:
         for match in _RE_FROM_OR_JOIN_TABLE.finditer(sql):
@@ -2736,7 +3048,8 @@ class ApexClient:
         if not results:
             return _empty_result_view()
         
-        table = pa.Table.from_pylist(results)
+        pa_mod = _ensure_pyarrow()
+        table = pa_mod.Table.from_pylist(results)
         return ResultView(arrow_table=table)
 
     def list_fields(self) -> List[str]:

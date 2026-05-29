@@ -1,51 +1,4 @@
-// SELECT execution: fast paths, index scans, late materialization
-
-type CachedSingleGroupAgg = Vec<(String, Vec<(f64, i64)>)>;
-type CachedDoubleGroupAgg = Vec<((String, String), Vec<(f64, i64)>)>;
-type CachedOrderTopK = Vec<usize>;
-type CachedBetweenGroupAgg = Vec<(String, f64, i64)>;
-
-/// Warm-query cache for single-column GROUP BY aggregate states on immutable mmap tables.
-/// Keyed by (table path, group column, aggregate-column signature) and invalidated by mtime.
-static GLOBAL_SINGLE_GROUP_AGG_CACHE: once_cell::sync::Lazy<
-    parking_lot::RwLock<
-        std::collections::HashMap<
-            (std::path::PathBuf, String, String),
-            (std::time::SystemTime, Arc<CachedSingleGroupAgg>),
-        >,
-    >,
-> = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
-
-/// Warm-query cache for two-column GROUP BY aggregate states on immutable mmap tables.
-/// Keyed by (table path, group columns, aggregate-column signature) and invalidated by mtime.
-static GLOBAL_DOUBLE_GROUP_AGG_CACHE: once_cell::sync::Lazy<
-    parking_lot::RwLock<
-        std::collections::HashMap<
-            (std::path::PathBuf, String, String, String),
-            (std::time::SystemTime, Arc<CachedDoubleGroupAgg>),
-        >,
-    >,
-> = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
-
-/// Warm-query cache for ORDER BY ... LIMIT top-k row indices on immutable tables.
-static GLOBAL_ORDER_TOPK_CACHE: once_cell::sync::Lazy<
-    parking_lot::RwLock<
-        std::collections::HashMap<
-            (std::path::PathBuf, String, usize, usize),
-            (std::time::SystemTime, Arc<CachedOrderTopK>),
-        >,
-    >,
-> = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
-
-/// Warm-query cache for BETWEEN + GROUP BY aggregate states on immutable tables.
-static GLOBAL_BETWEEN_GROUP_AGG_CACHE: once_cell::sync::Lazy<
-    parking_lot::RwLock<
-        std::collections::HashMap<
-            (std::path::PathBuf, String, u64, u64, String, String),
-            (std::time::SystemTime, Arc<CachedBetweenGroupAgg>),
-        >,
-    >,
-> = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+// SELECT execution: fast paths, index scans, late materialization.
 
 /// Represents a single scannable leaf predicate from an OR decomposition.
 enum OrLeafPredicate {
@@ -56,197 +9,6 @@ enum OrLeafPredicate {
 }
 
 impl ApexExecutor {
-    fn table_mtime(path: &Path) -> std::time::SystemTime {
-        std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    }
-
-    fn single_group_agg_signature(agg_cols: &[(&str, bool)]) -> String {
-        agg_cols
-            .iter()
-            .map(|(col, is_count)| format!("{}:{}", col, if *is_count { "count" } else { "value" }))
-            .collect::<Vec<_>>()
-            .join("|")
-    }
-
-    fn order_by_signature(order_by: &[crate::query::OrderByClause]) -> String {
-        format!("{order_by:?}")
-    }
-
-    fn get_cached_single_group_agg(
-        backend: &TableStorageBackend,
-        group_col: &str,
-        agg_cols: &[(&str, bool)],
-        dict_strings: &[String],
-        group_ids: &[u16],
-    ) -> io::Result<Option<Arc<CachedSingleGroupAgg>>> {
-        let mtime = Self::table_mtime(backend.path());
-        let key = (
-            backend.path().to_path_buf(),
-            group_col.to_string(),
-            Self::single_group_agg_signature(agg_cols),
-        );
-
-        {
-            let cache = GLOBAL_SINGLE_GROUP_AGG_CACHE.read();
-            if let Some((cached_mtime, data)) = cache.get(&key) {
-                if *cached_mtime >= mtime {
-                    return Ok(Some(Arc::clone(data)));
-                }
-            }
-        }
-
-        let raw = match backend.execute_group_agg_cached(dict_strings, group_ids, agg_cols)? {
-            Some(r) if !r.is_empty() => r,
-            _ => return Ok(None),
-        };
-        let raw = Arc::new(raw);
-        let mut cache = GLOBAL_SINGLE_GROUP_AGG_CACHE.write();
-        cache.insert(key, (mtime, Arc::clone(&raw)));
-        Ok(Some(raw))
-    }
-
-    fn get_cached_double_group_agg(
-        backend: &TableStorageBackend,
-        group_col1: &str,
-        group_col2: &str,
-        agg_cols: &[(&str, bool)],
-        dict1_strings: &[String],
-        group_ids1: &[u16],
-        dict2_strings: &[String],
-        group_ids2: &[u16],
-    ) -> io::Result<Option<Arc<CachedDoubleGroupAgg>>> {
-        let mtime = Self::table_mtime(backend.path());
-        let key = (
-            backend.path().to_path_buf(),
-            group_col1.to_string(),
-            group_col2.to_string(),
-            Self::single_group_agg_signature(agg_cols),
-        );
-
-        {
-            let cache = GLOBAL_DOUBLE_GROUP_AGG_CACHE.read();
-            if let Some((cached_mtime, data)) = cache.get(&key) {
-                if *cached_mtime >= mtime {
-                    return Ok(Some(Arc::clone(data)));
-                }
-            }
-        }
-
-        let raw = match backend.execute_group_agg_2col_cached(
-            dict1_strings,
-            group_ids1,
-            dict2_strings,
-            group_ids2,
-            agg_cols,
-        )? {
-            Some(r) if !r.is_empty() => r,
-            _ => return Ok(None),
-        };
-        let raw = Arc::new(raw);
-        let mut cache = GLOBAL_DOUBLE_GROUP_AGG_CACHE.write();
-        cache.insert(key, (mtime, Arc::clone(&raw)));
-        Ok(Some(raw))
-    }
-
-    fn get_cached_order_topk_indices(
-        backend: &TableStorageBackend,
-        order_by: &[crate::query::OrderByClause],
-        limit: usize,
-        offset: usize,
-    ) -> Option<Arc<CachedOrderTopK>> {
-        let key = (
-            backend.path().to_path_buf(),
-            Self::order_by_signature(order_by),
-            limit,
-            offset,
-        );
-        let mtime = Self::table_mtime(backend.path());
-        let cache = GLOBAL_ORDER_TOPK_CACHE.read();
-        cache.get(&key).and_then(|(cached_mtime, data)| {
-            if *cached_mtime >= mtime {
-                Some(Arc::clone(data))
-            } else {
-                None
-            }
-        })
-    }
-
-    fn store_cached_order_topk_indices(
-        backend: &TableStorageBackend,
-        order_by: &[crate::query::OrderByClause],
-        limit: usize,
-        offset: usize,
-        indices: &[usize],
-    ) {
-        let key = (
-            backend.path().to_path_buf(),
-            Self::order_by_signature(order_by),
-            limit,
-            offset,
-        );
-        let mtime = Self::table_mtime(backend.path());
-        let mut cache = GLOBAL_ORDER_TOPK_CACHE.write();
-        cache.insert(key, (mtime, Arc::new(indices.to_vec())));
-    }
-
-    fn get_cached_between_group_agg(
-        backend: &TableStorageBackend,
-        filter_col: &str,
-        lo: f64,
-        hi: f64,
-        group_col: &str,
-        agg_col: Option<&str>,
-    ) -> io::Result<Option<Arc<CachedBetweenGroupAgg>>> {
-        let key = (
-            backend.path().to_path_buf(),
-            filter_col.to_string(),
-            lo.to_bits(),
-            hi.to_bits(),
-            group_col.to_string(),
-            agg_col.unwrap_or("*").to_string(),
-        );
-        let mtime = Self::table_mtime(backend.path());
-
-        {
-            let cache = GLOBAL_BETWEEN_GROUP_AGG_CACHE.read();
-            if let Some((cached_mtime, data)) = cache.get(&key) {
-                if *cached_mtime >= mtime {
-                    return Ok(Some(Arc::clone(data)));
-                }
-            }
-        }
-
-        let raw = if let Some(dict_arc) = crate::storage::backend::get_global_dict_cache(
-            backend.path(),
-            group_col,
-            &backend.storage,
-        )? {
-            backend.execute_between_group_agg_cached(
-                filter_col,
-                lo,
-                hi,
-                &dict_arc.0,
-                &dict_arc.1,
-                agg_col,
-            )?
-        } else {
-            backend
-                .storage
-                .execute_between_group_agg(filter_col, lo, hi, group_col, agg_col)?
-        };
-
-        let raw = match raw {
-            Some(r) if !r.is_empty() => r,
-            _ => return Ok(None),
-        };
-        let raw = Arc::new(raw);
-        let mut cache = GLOBAL_BETWEEN_GROUP_AGG_CACHE.write();
-        cache.insert(key, (mtime, Arc::clone(&raw)));
-        Ok(Some(raw))
-    }
-
     /// Execute SELECT statement with base_dir for proper subquery table resolution
     fn execute_select_with_base_dir(
         mut stmt: SelectStatement,
@@ -2040,10 +1802,27 @@ impl ApexExecutor {
                 }
             }
             FilterType::Between(filter_col, lo, hi) => {
-                let raw = match Self::get_cached_between_group_agg(
-                    backend, filter_col, *lo, *hi, group_col, agg_col,
+                let raw = if let Some(dict_arc) = crate::storage::backend::get_global_dict_cache(
+                    backend.path(),
+                    group_col,
+                    &backend.storage,
                 )? {
-                    Some(r) => r,
+                    backend.execute_between_group_agg_cached(
+                        filter_col,
+                        *lo,
+                        *hi,
+                        &dict_arc.0,
+                        &dict_arc.1,
+                        agg_col,
+                    )?
+                } else {
+                    backend
+                        .storage
+                        .execute_between_group_agg(filter_col, *lo, *hi, group_col, agg_col)?
+                };
+
+                let raw = match raw {
+                    Some(r) if !r.is_empty() => r,
                     _ => return Ok(None),
                 };
 
@@ -3023,14 +2802,8 @@ impl ApexExecutor {
             .map(|(col, is_count, _, _)| (*col, *is_count))
             .collect();
 
-        let raw = match Self::get_cached_single_group_agg(
-            backend,
-            group_col,
-            &agg_cols,
-            dict_strings,
-            group_ids,
-        )? {
-            Some(r) => r,
+        let raw = match backend.execute_group_agg_cached(dict_strings, group_ids, &agg_cols)? {
+            Some(r) if !r.is_empty() => r,
             _ => return Ok(None),
         };
 
@@ -3184,17 +2957,14 @@ impl ApexExecutor {
             .map(|(col, is_count, _, _)| (*col, *is_count))
             .collect();
 
-        let raw = match Self::get_cached_double_group_agg(
-            backend,
-            group_col1,
-            group_col2,
-            &agg_cols,
+        let raw = match backend.execute_group_agg_2col_cached(
             dict1_strings,
             group_ids1,
             dict2_strings,
             group_ids2,
+            &agg_cols,
         )? {
-            Some(r) => r,
+            Some(r) if !r.is_empty() => r,
             _ => return Ok(None),
         };
 
@@ -4235,17 +4005,6 @@ impl ApexExecutor {
             return Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset);
         }
 
-        if !backend.has_pending_deltas() {
-            if let Some(indices) =
-                Self::get_cached_order_topk_indices(backend, &stmt.order_by, limit, offset)
-            {
-                if indices.is_empty() {
-                    return backend.read_columns_to_arrow(None, 0, Some(0));
-                }
-                return backend.read_columns_by_indices_to_arrow(indices.as_ref(), None);
-            }
-        }
-
         // IN-MEMORY FAST PATH: 2-col ORDER BY (string, float64) — skip Arrow string conversion.
         // Uses global dict cache (u16 group_ids) + raw float64 column for typed sort keys.
         if stmt.order_by.len() == 2 && !backend.has_pending_deltas() {
@@ -4270,13 +4029,6 @@ impl ApexExecutor {
             if let Some(indices) =
                 backend.order_topk_str_float64(c0, !o0.descending, c1, !o1.descending, k, offset)?
             {
-                Self::store_cached_order_topk_indices(
-                    backend,
-                    &stmt.order_by,
-                    limit,
-                    offset,
-                    &indices,
-                );
                 if !indices.is_empty() {
                     return backend.read_columns_by_indices_to_arrow(&indices, None);
                 }
@@ -4296,13 +4048,6 @@ impl ApexExecutor {
             if let Some(heap) = backend.scan_top_k_indices_mmap(actual_col, k, clause.descending)? {
                 let final_indices: Vec<usize> =
                     heap.into_iter().skip(offset).map(|(idx, _)| idx).collect();
-                Self::store_cached_order_topk_indices(
-                    backend,
-                    &stmt.order_by,
-                    limit,
-                    offset,
-                    &final_indices,
-                );
                 if !final_indices.is_empty() {
                     return backend.read_columns_by_indices_to_arrow(&final_indices, None);
                 }
@@ -4452,26 +4197,7 @@ impl ApexExecutor {
         };
 
         if final_indices.is_empty() {
-            if !backend.has_pending_deltas() {
-                Self::store_cached_order_topk_indices(
-                    backend,
-                    &stmt.order_by,
-                    limit,
-                    offset,
-                    &final_indices,
-                );
-            }
             return backend.read_columns_to_arrow(None, 0, Some(0));
-        }
-
-        if !backend.has_pending_deltas() {
-            Self::store_cached_order_topk_indices(
-                backend,
-                &stmt.order_by,
-                limit,
-                offset,
-                &final_indices,
-            );
         }
 
         // Step 3: Read ALL columns but only for top-k row indices

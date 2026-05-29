@@ -109,10 +109,9 @@ def main():
 
         results = {}
 
-        def _clear(c): 
-            if HAS_APEX and hasattr(c, '_query_cache'):
-                c._query_cache.clear()
-            # No cache clearing needed for current ApexClient implementation
+        def _clear(c):
+            if HAS_APEX and hasattr(c, 'flush_cache'):
+                c.flush_cache()
 
         # ── CSV ─────────────────────────────────────────────────────────────
         print("── CSV ──────────────────────────────────────────────────────")

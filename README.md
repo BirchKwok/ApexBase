@@ -105,7 +105,7 @@ Latest local snapshot: **ApexBase 1.19.0**, 200k-row tabular dataset, 200k-vecto
 | **FTS search** | **35.6x faster** than SQLite in the representative snapshot |
 | **Batch vector TopK cosine** | **13.9x faster** than DuckDB in the representative snapshot |
 
-Benchmarks are workload-sensitive. See the full reproducible setup in the [Performance documentation](https://birchkwok.github.io/ApexBase/latest/performance/).
+Benchmarks are workload-sensitive. The default benchmark command tracks this public scoreboard; extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`. See the full reproducible setup in the [Performance documentation](https://birchkwok.github.io/ApexBase/latest/performance/).
 
 ## Documentation
 

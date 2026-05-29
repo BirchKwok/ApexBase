@@ -57,18 +57,18 @@ def main():
 
         sql = f"SELECT * FROM default WHERE _id = {LOOKUP_ID}"
 
-        # ── WITH cache ──────────────────────────────────────────────────────
-        print("Point Lookup  (execute, WITH cache):")
-        def lookup_cached():
+        # ── Warm backend path ───────────────────────────────────────────────
+        print("Point Lookup  (execute, warm backend):")
+        def lookup_warm():
             return client.execute(sql)
-        t_cached = bench("execute(_id=X)  warm cache", lookup_cached)
+        t_warm = bench("execute(_id=X)  warm backend", lookup_warm)
 
-        # ── WITHOUT cache: clear before every call ──────────────────────────
-        print("\nPoint Lookup  (execute, NO cache — clear before each call):")
-        def lookup_no_cache():
-            client._query_cache.clear()
+        # ── Cold backend metadata/data path: no query results are cached.
+        print("\nPoint Lookup  (execute, flush read caches before each call):")
+        def lookup_cold_read_path():
+            client.flush_cache()
             return client.execute(sql)
-        t_nocache = bench("execute(_id=X)  cold cache", lookup_no_cache)
+        t_cold = bench("execute(_id=X)  cold read path", lookup_cold_read_path)
 
         # ── retrieve() for reference ────────────────────────────────────────
         print("\nPoint Lookup  (retrieve, no SQL path):")
@@ -77,9 +77,9 @@ def main():
         t_retrieve = bench("retrieve(_id)              ", lookup_retrieve)
 
         print()
-        print(f"  cache speedup over no-cache : {t_nocache/t_cached:.1f}×")
-        print(f"  retrieve vs cached execute  : {t_cached/t_retrieve:.1f}× (execute is {'slower' if t_cached>t_retrieve else 'faster'})")
-        print(f"  retrieve vs no-cache execute: {t_nocache/t_retrieve:.1f}×")
+        print(f"  warm speedup over cold read path : {t_cold/t_warm:.1f}×")
+        print(f"  retrieve vs warm execute         : {t_warm/t_retrieve:.1f}× (execute is {'slower' if t_warm>t_retrieve else 'faster'})")
+        print(f"  retrieve vs cold read execute    : {t_cold/t_retrieve:.1f}×")
 
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

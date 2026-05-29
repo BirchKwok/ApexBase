@@ -4,7 +4,9 @@ ApexBase - High-performance embedded database based on Rust core
 Uses custom single-file storage format (.apex) to provide efficient data storage and query functionality.
 """
 
+from __future__ import annotations
 
+import importlib.util
 import weakref
 import atexit
 from typing import List, Optional, Literal
@@ -18,13 +20,43 @@ from apexbase._core import ApexStorage, __version__
 # But keep compatibility flag
 FTS_AVAILABLE = True  # Always available since integrated into Rust core
 
-# Optional data framework support
-import pyarrow as pa
-import pandas as pd
-ARROW_AVAILABLE = True
+# Optional data framework support is detected eagerly but imported lazily.
+pa = None
+pd = None
+pl = None
+ARROW_AVAILABLE = importlib.util.find_spec("pyarrow") is not None
+PANDAS_AVAILABLE = importlib.util.find_spec("pandas") is not None
+POLARS_AVAILABLE = importlib.util.find_spec("polars") is not None
 
-import polars as pl
-POLARS_AVAILABLE = True
+
+def _ensure_pyarrow():
+    global pa, ARROW_AVAILABLE
+    if pa is None:
+        if not ARROW_AVAILABLE:
+            raise ImportError("pyarrow not available. Install with: pip install pyarrow")
+        import pyarrow as _pa
+        pa = _pa
+    return pa
+
+
+def _ensure_pandas():
+    global pd, PANDAS_AVAILABLE
+    if pd is None:
+        if not PANDAS_AVAILABLE:
+            raise ImportError("pandas not available. Install with: pip install pandas")
+        import pandas as _pd
+        pd = _pd
+    return pd
+
+
+def _ensure_polars():
+    global pl, POLARS_AVAILABLE
+    if pl is None:
+        if not POLARS_AVAILABLE:
+            raise ImportError("polars not available. Install with: pip install polars")
+        import polars as _pl
+        pl = _pl
+    return pl
 
 __version__ = "1.19.0"
 
@@ -245,7 +277,8 @@ class ResultView:
     def _ensure_arrow(self):
         """Materialize Arrow table from lazy_pydict if needed"""
         if self._arrow_table is None and self._lazy_pydict is not None:
-            self._arrow_table = pa.Table.from_pydict(self._lazy_pydict)
+            pa_mod = _ensure_pyarrow()
+            self._arrow_table = pa_mod.Table.from_pydict(self._lazy_pydict)
             self._lazy_pydict = None
     
     def _ensure_data(self):
@@ -337,19 +370,20 @@ class ResultView:
             This performs better in most scenarios, but some NumPy operations may need
             type conversion first.
         """
-        if not ARROW_AVAILABLE:
+        if not PANDAS_AVAILABLE:
             raise ImportError("pandas not available. Install with: pip install pandas")
+        pd_mod = _ensure_pandas()
 
         # Fast path: if we have lazy_pydict, convert directly to pandas without Arrow conversion
         if self._lazy_pydict is not None:
             show_id = bool(getattr(self, "_show_internal_id", False))
             d = self._lazy_pydict
             if show_id:
-                return pd.DataFrame(d)
+                return pd_mod.DataFrame(d)
             else:
                 # Exclude _id column
                 filtered = {k: v for k, v in d.items() if k != '_id'}
-                return pd.DataFrame(filtered)
+                return pd_mod.DataFrame(filtered)
 
         self._ensure_arrow()
         if self._arrow_table is not None:
@@ -357,7 +391,7 @@ class ResultView:
             if zero_copy:
                 # Zero-copy mode: use ArrowDtype (pandas 2.0+)
                 try:
-                    df = self._arrow_table.to_pandas(types_mapper=pd.ArrowDtype)
+                    df = self._arrow_table.to_pandas(types_mapper=pd_mod.ArrowDtype)
                 except (TypeError, AttributeError):
                     # Fallback: pandas < 2.0 doesn't support ArrowDtype
                     df = self._arrow_table.to_pandas()
@@ -371,7 +405,7 @@ class ResultView:
             return df
         
         # Fallback
-        df = pd.DataFrame(self._ensure_data())
+        df = pd_mod.DataFrame(self._ensure_data())
         show_id = bool(getattr(self, "_show_internal_id", False))
         if not show_id and '_id' in df.columns:
             df.set_index('_id', inplace=True)
@@ -389,15 +423,21 @@ class ResultView:
         """
         if not POLARS_AVAILABLE:
             raise ImportError("polars not available. Install with: pip install polars")
+        pl_mod = _ensure_polars()
         
+        if self._lazy_pydict is not None:
+            show_id = bool(getattr(self, "_show_internal_id", False))
+            d = self._lazy_pydict if show_id else {k: v for k, v in self._lazy_pydict.items() if k != '_id'}
+            return pl_mod.DataFrame(d)
+
         self._ensure_arrow()
         if self._arrow_table is not None:
-            df = pl.from_arrow(self._arrow_table)
+            df = pl_mod.from_arrow(self._arrow_table)
             show_id = bool(getattr(self, "_show_internal_id", False))
             if not show_id and '_id' in df.columns:
                 df = df.drop('_id')
             return df
-        return pl.DataFrame(self._ensure_data())
+        return pl_mod.DataFrame(self._ensure_data())
     
     def to_arrow(self):
         """Convert results to a PyArrow Table.
@@ -410,6 +450,7 @@ class ResultView:
         """
         if not ARROW_AVAILABLE:
             raise ImportError("pyarrow not available. Install with: pip install pyarrow")
+        pa_mod = _ensure_pyarrow()
         
         self._ensure_arrow()
         if self._arrow_table is not None:
@@ -419,7 +460,7 @@ class ResultView:
                 if '_id' in self._arrow_table.column_names:
                     return self._arrow_table.drop(['_id'])
             return self._arrow_table
-        return pa.Table.from_pylist(self._ensure_data())
+        return pa_mod.Table.from_pylist(self._ensure_data())
     
     @property
     def shape(self):

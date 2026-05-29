@@ -767,7 +767,7 @@ impl TableStorageBackend {
     }
 
     #[inline]
-    fn invalidate_query_caches(&self) {
+    fn invalidate_read_caches(&self) {
         self.cached_columns.write().clear();
         self.dict_cache.write().clear();
         self.first_string_row_id_cache.write().clear();
@@ -893,7 +893,7 @@ impl TableStorageBackend {
         *self.row_count.write() += rows.len() as u64;
 
         // Invalidate cache (data changed)
-        self.invalidate_query_caches();
+        self.invalidate_read_caches();
         *self.dirty.write() = true;
 
         Ok(ids)
@@ -952,7 +952,7 @@ impl TableStorageBackend {
         *self.row_count.write() += ids.len() as u64;
 
         // Invalidate cache (data changed)
-        self.invalidate_query_caches();
+        self.invalidate_read_caches();
         *self.dirty.write() = true;
 
         Ok(ids)
@@ -1012,7 +1012,7 @@ impl TableStorageBackend {
         *self.row_count.write() += ids.len() as u64;
 
         // Invalidate cache (data changed)
-        self.invalidate_query_caches();
+        self.invalidate_read_caches();
         *self.dirty.write() = true;
 
         Ok(ids)
@@ -1074,7 +1074,7 @@ impl TableStorageBackend {
         }
 
         *self.row_count.write() += ids.len() as u64;
-        self.invalidate_query_caches();
+        self.invalidate_read_caches();
         *self.dirty.write() = true;
         Ok(ids)
     }
@@ -1087,7 +1087,7 @@ impl TableStorageBackend {
             if self.has_pending_deltas() {
                 self.storage.save_delta_store()?;
             }
-            self.invalidate_query_caches();
+            self.invalidate_read_caches();
             *self.dirty.write() = false;
             return Ok(());
         }
@@ -1124,14 +1124,14 @@ impl TableStorageBackend {
         values: &std::collections::HashMap<String, crate::data::Value>,
     ) {
         self.storage.delta_update_row(row_id, values);
-        self.invalidate_query_caches();
+        self.invalidate_read_caches();
     }
 
     /// Record a row deletion in DeltaStore without rewriting the base file.
     pub fn delta_delete_row(&self, row_id: u64) -> io::Result<bool> {
         let result = self.storage.delta_delete_row(row_id)?;
         if result {
-            self.invalidate_query_caches();
+            self.invalidate_read_caches();
             *self.dirty.write() = true;
         }
         Ok(result)
@@ -1141,7 +1141,7 @@ impl TableStorageBackend {
     pub fn delete_pending_v4_in_memory_row(&self, row_id: u64) -> bool {
         let result = self.storage.delete_pending_v4_in_memory_row(row_id);
         if result {
-            self.invalidate_query_caches();
+            self.invalidate_read_caches();
             *self.dirty.write() = true;
         }
         result
@@ -1155,7 +1155,7 @@ impl TableStorageBackend {
     ) -> io::Result<bool> {
         let result = self.storage.delta_update_existing_row(row_id, values)?;
         if result {
-            self.invalidate_query_caches();
+            self.invalidate_read_caches();
             *self.dirty.write() = true;
         }
         Ok(result)
@@ -1164,7 +1164,7 @@ impl TableStorageBackend {
     /// Batch update multiple rows in a single lock acquisition.
     pub fn delta_batch_update_rows(&self, batch: &[(u64, &str, crate::data::Value)]) {
         self.storage.delta_batch_update_rows(batch);
-        self.invalidate_query_caches();
+        self.invalidate_read_caches();
     }
 
     /// Scan a numeric column for rows in [low, high] and return matching row IDs.
@@ -1265,7 +1265,7 @@ impl TableStorageBackend {
     /// Compact deltas into the base file (merge updates, apply deletes, rewrite).
     pub fn compact_deltas(&self) -> io::Result<()> {
         self.storage.compact_deltas()?;
-        self.invalidate_query_caches();
+        self.invalidate_read_caches();
         Ok(())
     }
 
@@ -1335,7 +1335,7 @@ impl TableStorageBackend {
     pub fn delete(&self, id: u64) -> bool {
         let result = self.storage.delete(id);
         if result {
-            self.invalidate_query_caches();
+            self.invalidate_read_caches();
             *self.dirty.write() = true;
         }
         result
@@ -1345,7 +1345,7 @@ impl TableStorageBackend {
     pub fn delete_batch(&self, ids: &[u64]) -> bool {
         let result = self.storage.delete_batch(ids);
         if result {
-            self.invalidate_query_caches();
+            self.invalidate_read_caches();
             *self.dirty.write() = true;
         }
         result
@@ -1403,7 +1403,7 @@ impl TableStorageBackend {
         let result = self.storage.replace(id, &cv_data)?;
         if result {
             *self.dirty.write() = true;
-            self.invalidate_query_caches();
+            self.invalidate_read_caches();
             // Update row count
             *self.row_count.write() = self.storage.row_count();
         }
@@ -1433,7 +1433,7 @@ impl TableStorageBackend {
         // Update our schema cache
         let mut schema = self.schema.write();
         schema.push((name.to_string(), dtype));
-        self.invalidate_query_caches();
+        self.invalidate_read_caches();
         *self.dirty.write() = true;
         Ok(())
     }
@@ -1450,7 +1450,7 @@ impl TableStorageBackend {
             schema.remove(idx);
         }
 
-        self.invalidate_query_caches();
+        self.invalidate_read_caches();
         *self.dirty.write() = true;
         Ok(())
     }
@@ -1478,7 +1478,7 @@ impl TableStorageBackend {
         // Also update the underlying OnDemandStorage schema so that
         // save() and update_v4_footer_schema() persist the new name.
         self.storage.rename_column_in_schema(old_name, new_name);
-        self.invalidate_query_caches();
+        self.invalidate_read_caches();
         Ok(())
     }
 

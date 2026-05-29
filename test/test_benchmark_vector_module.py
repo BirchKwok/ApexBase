@@ -58,3 +58,23 @@ def test_build_duckdb_vector_sql_uses_expected_functions():
 
     with pytest.raises(ValueError):
         module.build_duckdb_vector_sql(query, 10, "l1")
+
+
+def test_public_profile_matches_readme_scoreboard_shape():
+    module = load_benchmark_module()
+
+    assert len(module.PUBLIC_OLAP_BENCHMARK_NAMES) == 29
+    assert len(module.OLTP_FAIR_BENCHMARK_NAMES) == 9
+    assert len(module.benchmark_specs_for_profile(module.PROFILE_PUBLIC)) == 38
+    assert module.module_metric_counts(module.PROFILE_PUBLIC) == (29, 9, 1)
+    assert module.vector_metric_sets(module.PROFILE_PUBLIC)[1] == [
+        ("Batch TopK Cosine (10 queries)", "cosine")
+    ]
+
+
+def test_extended_profile_keeps_diagnostics_available():
+    module = load_benchmark_module()
+
+    assert len(module.benchmark_specs_for_profile(module.PROFILE_EXTENDED)) == 47
+    assert module.module_metric_counts(module.PROFILE_EXTENDED) == (46, 48, 9)
+    assert module.vector_metric_count(module.PROFILE_EXTENDED) == 9
