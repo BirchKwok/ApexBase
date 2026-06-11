@@ -22,6 +22,7 @@ def _run_python_snippet(snippet: str) -> subprocess.CompletedProcess[str]:
         check=False,
         capture_output=True,
         text=True,
+        timeout=60,
         env=env,
     )
 

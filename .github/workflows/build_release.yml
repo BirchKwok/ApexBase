@@ -127,6 +127,7 @@ jobs:
         # macOS arm64 segfaults before the first ApexStorage construction.
         test_deps = [
             "pytest>=8.4,<9",
+            "pytest-timeout>=2.3,<3",
             "maturin==1.9.1",
             "numpy<2.4.4",
             "pyarrow<24",
@@ -161,8 +162,9 @@ jobs:
         PY
 
     - name: Run tests
+      timeout-minutes: 60
       run: |
-        python -m pytest --ignore=test/test_memory_vs_duckdb.py
+        python -m pytest --ignore=test/test_memory_vs_duckdb.py --timeout=120
 
   # ── Build Linux wheels (manylinux) ──
   build-wheels-linux:

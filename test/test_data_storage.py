@@ -199,6 +199,33 @@ class TestSingleRecordStorage:
             reader.close()
             writer.close()
 
+    _CROSS_PROCESS_SNAPSHOT_SCRIPT = """
+import sys
+from apexbase import ApexClient
+
+db_dir = sys.argv[1]
+client = ApexClient(db_dir)
+client.use_table("default")
+count = client.count_rows()
+row = client.retrieve(2)
+client.close()
+print(count, flush=True)
+print(row, flush=True)
+"""
+
+    def _run_cross_process_snapshot(self, db_dir: str, env: dict, timeout: float = 30):
+        result = subprocess.run(
+            [sys.executable, "-c", self._CROSS_PROCESS_SNAPSHOT_SCRIPT, db_dir],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        assert len(lines) == 2, result.stdout
+        return lines[0], lines[1]
+
     def test_memtable_visibility_cross_process_requires_flush(self, monkeypatch):
         """A separate process cannot see pending memtable rows until the writer flushes."""
         monkeypatch.delenv("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", raising=False)
@@ -212,57 +239,16 @@ class TestSingleRecordStorage:
             env = os.environ.copy()
             python_path = os.path.join(os.path.dirname(__file__), '..', 'apexbase', 'python')
             env["PYTHONPATH"] = python_path + os.pathsep + env.get("PYTHONPATH", "")
-            go_path = str(Path(temp_dir) / ".reader_go")
-            reader_script = Path(temp_dir) / "_memtable_reader.py"
-            reader_script.write_text("\n".join([
-                "import os, pathlib, sys, time",
-                "from apexbase import ApexClient",
-                "db_dir, go_path, mode = sys.argv[1:4]",
-                "def snapshot():",
-                "    client = ApexClient(db_dir)",
-                "    client.use_table('default')",
-                "    count = client.count_rows()",
-                "    row = client.retrieve(2)",
-                "    client.close()",
-                "    return count, row",
-                "if mode == 'before':",
-                "    count, row = snapshot()",
-                "    print(count, flush=True)",
-                "    print(row, flush=True)",
-                "    go = pathlib.Path(go_path)",
-                "    while not go.exists():",
-                "        time.sleep(0.005)",
-                "    os.execv(sys.executable, [sys.executable, __file__, db_dir, go_path, 'after'])",
-                "count, row = snapshot()",
-                "print(count, flush=True)",
-                "print(row, flush=True)",
-            ]), encoding="utf-8")
 
-            reader = subprocess.Popen(
-                [sys.executable, str(reader_script), temp_dir, go_path, "before"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-            )
-            try:
-                before_flush = [
-                    reader.stdout.readline().strip(),
-                    reader.stdout.readline().strip(),
-                ]
-                assert before_flush == ["1", "None"]
+            before_count, before_row = self._run_cross_process_snapshot(temp_dir, env)
+            assert before_count == "1"
+            assert before_row == "None"
 
-                writer.flush()
-                Path(go_path).write_text("go")
+            writer.flush()
 
-                after_flush, stderr = reader.communicate(timeout=5)
-            finally:
-                if reader.poll() is None:
-                    reader.kill()
-                    reader.communicate()
-            assert reader.returncode == 0, stderr
-            assert after_flush.splitlines()[0] == "2"
-            assert "pending_memtable" in after_flush
+            after_count, after_row = self._run_cross_process_snapshot(temp_dir, env)
+            assert after_count == "2"
+            assert "pending_memtable" in after_row
 
             writer.close()
 
@@ -626,8 +612,9 @@ class TestSingleRecordStorage:
                     return
 
                 last_count = 0
+                deadline = time.time() + 5
                 try:
-                    while not done.is_set():
+                    while not done.is_set() and time.time() < deadline:
                         count = client.execute(
                             "SELECT COUNT(*) AS cnt FROM default"
                         ).to_dict()[0]["cnt"]
@@ -637,18 +624,20 @@ class TestSingleRecordStorage:
                         last_count = count
                         observed_counts.append(count)
                         time.sleep(0.0005)
+                    if not done.is_set():
+                        errors.append("reader: timed out waiting for writer")
                 except Exception as exc:
                     errors.append(f"reader: {exc!r}")
 
-            reader_thread = threading.Thread(target=reader)
-            writer_thread = threading.Thread(target=writer)
+            reader_thread = threading.Thread(target=reader, daemon=True)
+            writer_thread = threading.Thread(target=writer, daemon=True)
             reader_thread.start()
             writer_thread.start()
             writer_thread.join(timeout=5)
             reader_thread.join(timeout=5)
 
-            assert not writer_thread.is_alive()
-            assert not reader_thread.is_alive()
+            if writer_thread.is_alive() or reader_thread.is_alive():
+                errors.append("threads did not finish within timeout")
             assert errors == []
             assert observed_counts
 
