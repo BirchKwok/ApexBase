@@ -216,12 +216,32 @@ jobs:
     - name: Build wheels
       uses: PyO3/maturin-action@v1
       env:
+        RUSTFLAGS: ${{ env.RUSTFLAGS }}
         PYO3_PYTHON: ${{ steps.py.outputs.python-path }}
         PYTHON_SYS_EXECUTABLE: ${{ steps.py.outputs.python-path }}
       with:
         maturin-version: v1.9.1
         command: build
         args: --release --out dist --interpreter ${{ steps.py.outputs.python-path }}
+
+    - name: Smoke test wheel (ApexStorage init)
+      if: matrix.os == 'macos-latest' && matrix.python-version == '3.12'
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install "$(ls dist/*.whl | head -1)"
+        python - <<'PY'
+        import sys
+        import tempfile
+        import os
+
+        # Import path used by repro scripts / minimal integrations.
+        from apexbase._core import ApexStorage
+
+        db_dir = tempfile.mkdtemp(prefix="apexbase_wheel_smoke_")
+        ApexStorage(os.path.join(db_dir, "apexbase.apex"))
+        print("wheel smoke test OK", sys.version.split()[0])
+        PY
 
     - name: Upload wheel artifacts
       uses: actions/upload-artifact@v4

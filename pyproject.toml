@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "apexbase"
-version = "1.19.0"
+version = "1.19.1"
 description = "High-performance HTAP embedded database with Rust core and Python API"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -27,9 +27,12 @@ classifiers = [
     "Topic :: Database",
 ]
 dependencies = [
-    "pyarrow>=10.0.0",
-    "pandas>=2.0.0",
-    "polars>=0.15.0",
+    # Pin the native-extension stack: unpinned latest releases have triggered
+    # macOS arm64 SIGSEGV when loaded before ApexStorage construction.
+    "numpy>=1.26,<2.4.4",
+    "pyarrow>=10.0.0,<24",
+    "pandas>=2.0.0,<3.0.2",
+    "polars>=0.15.0,<1.40",
 ]
 
 [project.optional-dependencies]

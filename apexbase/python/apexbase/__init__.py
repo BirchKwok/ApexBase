@@ -58,7 +58,7 @@ def _ensure_polars():
         pl = _pl
     return pl
 
-__version__ = "1.19.0"
+__version__ = "1.19.1"
 
 
 class _InstanceRegistry:
@@ -581,8 +581,20 @@ def _empty_result_view() -> ResultView:
 # Durability level type
 DurabilityLevel = Literal['fast', 'safe', 'max']
 
-# Import ApexClient from client module
-from .client import ApexClient
+
+def __getattr__(name: str):
+    """Lazy-load ApexClient so `from apexbase._core import ApexStorage` does not
+    pull pyarrow/pandas/polars into the process before the native extension is used."""
+    if name == "ApexClient":
+        from .client import ApexClient
+
+        return ApexClient
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(list(globals().keys()) + ["ApexClient"])
+
 
 # Exports
-__all__ = ['ApexClient', 'ApexStorage', 'ResultView', 'DurabilityLevel', '__version__', 'FTS_AVAILABLE', 'ARROW_AVAILABLE', 'POLARS_AVAILABLE']
+__all__ = ['ApexClient', 'ApexStorage', 'ResultView', 'DurabilityLevel', '__version__', 'FTS_AVAILABLE', 'ARROW_AVAILABLE', 'POLARS_AVAILABLE', 'PANDAS_AVAILABLE']
