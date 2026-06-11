@@ -90,7 +90,7 @@ class _InstanceRegistry:
     def _get_lock(self):
         if self._lock is None:
             import threading
-            self._lock = threading.Lock()
+            self._lock = threading.RLock()
         return self._lock
     
     def _get_client_id_lock(self):
