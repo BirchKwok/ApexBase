@@ -374,16 +374,23 @@ class ResultView:
             raise ImportError("pandas not available. Install with: pip install pandas")
         pd_mod = _ensure_pandas()
 
+        def _pydict_to_dataframe(column_data: dict):
+            # Normalize keys to plain str so pandas 3.x + pyarrow do not build
+            # column indexes from ArrowStringArray after module reloads.
+            normalized = {str(key): value for key, value in column_data.items()}
+            columns = list(normalized.keys())
+            return pd_mod.DataFrame(normalized, columns=columns)
+
         # Fast path: if we have lazy_pydict, convert directly to pandas without Arrow conversion
         if self._lazy_pydict is not None:
             show_id = bool(getattr(self, "_show_internal_id", False))
             d = self._lazy_pydict
             if show_id:
-                return pd_mod.DataFrame(d)
+                return _pydict_to_dataframe(d)
             else:
                 # Exclude _id column
                 filtered = {k: v for k, v in d.items() if k != '_id'}
-                return pd_mod.DataFrame(filtered)
+                return _pydict_to_dataframe(filtered)
 
         self._ensure_arrow()
         if self._arrow_table is not None:
@@ -392,8 +399,8 @@ class ResultView:
                 # Zero-copy mode: use ArrowDtype (pandas 2.0+)
                 try:
                     df = self._arrow_table.to_pandas(types_mapper=pd_mod.ArrowDtype)
-                except (TypeError, AttributeError):
-                    # Fallback: pandas < 2.0 doesn't support ArrowDtype
+                except (TypeError, AttributeError, AssertionError):
+                    # Fallback for older pandas or pandas 3.x/pyarrow index incompatibilities
                     df = self._arrow_table.to_pandas()
             else:
                 # Traditional mode: copy data to NumPy types
