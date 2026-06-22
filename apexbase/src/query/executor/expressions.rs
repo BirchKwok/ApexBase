@@ -1279,7 +1279,28 @@ impl ApexExecutor {
                 Self::value_to_array(val, batch.num_rows())
             }
             SqlExpr::BinaryOp { left, op, right } => {
-                Self::evaluate_arithmetic_op(batch, left, op, right)
+                if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+                    Ok(Arc::new(Self::evaluate_predicate(batch, expr)?) as ArrayRef)
+                } else if matches!(
+                    op,
+                    BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Lt
+                        | BinaryOperator::Le
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Ge
+                ) {
+                    Ok(Arc::new(Self::evaluate_comparison(batch, left, op, right)?) as ArrayRef)
+                } else {
+                    Self::evaluate_arithmetic_op(batch, left, op, right)
+                }
+            }
+            SqlExpr::Like { .. }
+            | SqlExpr::Regexp { .. }
+            | SqlExpr::In { .. }
+            | SqlExpr::Between { .. }
+            | SqlExpr::IsNull { .. } => {
+                Ok(Arc::new(Self::evaluate_predicate(batch, expr)?) as ArrayRef)
             }
             SqlExpr::Case { when_then, else_expr } => {
                 Self::evaluate_case_expr(batch, when_then, else_expr.as_deref())
@@ -1327,8 +1348,7 @@ impl ApexExecutor {
                         }
                     }
                     UnaryOperator::Not => {
-                        Err(io::Error::new(io::ErrorKind::Unsupported,
-                            "NOT operator not supported as expression"))
+                        Ok(Arc::new(Self::evaluate_predicate(batch, expr)?) as ArrayRef)
                     }
                 }
             }
@@ -1591,6 +1611,18 @@ impl ApexExecutor {
         
         let left_array = Self::evaluate_expr_to_array(batch, left)?;
         let right_array = Self::evaluate_expr_to_array(batch, right)?;
+
+        // Hive freely promotes mixed integer/DOUBLE arithmetic. Route mixed
+        // numeric operands through the shared Float64 coercion path.
+        let left_float = left_array.as_any().downcast_ref::<Float64Array>().is_some();
+        let right_float = right_array.as_any().downcast_ref::<Float64Array>().is_some();
+        let left_int = left_array.as_any().downcast_ref::<Int64Array>().is_some();
+        let right_int = right_array.as_any().downcast_ref::<Int64Array>().is_some();
+        if matches!(op, BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul | BinaryOperator::Div)
+            && ((left_float && right_int) || (left_int && right_float))
+        {
+            return Self::evaluate_arithmetic_op_arrays(&left_array, &right_array, op);
+        }
 
         // Try to cast to common numeric type
         let result: ArrayRef = match op {
@@ -2411,7 +2443,7 @@ impl ApexExecutor {
                 if args.len() < 2 { return Err(err_input("CONCAT_WS requires 2+ arguments")); }
                 let sep = Self::evaluate_expr_to_array(batch, &args[0])?.as_any().downcast_ref::<StringArray>().map_or(String::new(), |sa| if sa.len() > 0 && !sa.is_null(0) { sa.value(0).to_string() } else { String::new() });
                 let (num_rows, mut result, mut first) = (batch.num_rows(), vec![String::new(); batch.num_rows()], vec![true; batch.num_rows()]);
-                for arg in &args[1..] { if let Ok(arr) = Self::evaluate_expr_to_array(batch, arg) { if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() { for i in 0..num_rows { if !sa.is_null(i) { if !first[i] { result[i].push_str(&sep); } result[i].push_str(sa.value(i)); first[i] = false; } } } } }
+                for arg in &args[1..] { if let Ok(arr) = Self::evaluate_expr_to_array(batch, arg) { if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() { for i in 0..num_rows { if !sa.is_null(i) { for item in sa.value(i).split('\0') { if !first[i] { result[i].push_str(&sep); } result[i].push_str(item); first[i] = false; } } } } } }
                 Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_str()).collect::<Vec<_>>())))
             }
             "REPEAT" => {
@@ -2480,6 +2512,84 @@ impl ApexExecutor {
                     let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| if strs.is_null(i) || delims.is_null(i) { None } else { Some(strs.value(i).split(delims.value(i)).collect::<Vec<_>>().join("\x00")) }).collect();
                     Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
                 } else { Err(err_data("SPLIT requires string arguments")) }
+            }
+            "SORT_ARRAY" => {
+                if args.len() != 1 { return Err(err_input("SORT_ARRAY requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                if let Some(strings) = arr.as_any().downcast_ref::<StringArray>() {
+                    let result: Vec<Option<String>> = (0..strings.len()).map(|i| {
+                        if strings.is_null(i) { return None; }
+                        let mut items = strings.value(i).split('\0').collect::<Vec<_>>();
+                        items.sort_unstable();
+                        Some(items.join("\0"))
+                    }).collect();
+                    Ok(Arc::new(StringArray::from(result)))
+                } else { Err(err_data("SORT_ARRAY requires an array value")) }
+            }
+            "SLICE" => {
+                if args.len() != 3 { return Err(err_input("SLICE requires 3 arguments")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let start = Self::evaluate_expr_to_array(batch, &args[1])?;
+                let length = Self::evaluate_expr_to_array(batch, &args[2])?;
+                if let (Some(strings), Some(starts), Some(lengths)) = (
+                    arr.as_any().downcast_ref::<StringArray>(),
+                    start.as_any().downcast_ref::<Int64Array>(),
+                    length.as_any().downcast_ref::<Int64Array>(),
+                ) {
+                    let result: Vec<Option<String>> = (0..strings.len()).map(|i| {
+                        if strings.is_null(i) || starts.is_null(i) || lengths.is_null(i) { return None; }
+                        let items = strings.value(i).split('\0').collect::<Vec<_>>();
+                        let begin = if starts.value(i) > 0 {
+                            starts.value(i) as usize - 1
+                        } else {
+                            items.len().saturating_sub((-starts.value(i)) as usize)
+                        };
+                        let end = begin.saturating_add(lengths.value(i).max(0) as usize).min(items.len());
+                        Some(if begin >= items.len() { String::new() } else { items[begin..end].join("\0") })
+                    }).collect();
+                    Ok(Arc::new(StringArray::from(result)))
+                } else { Err(err_data("SLICE requires array, integer, integer")) }
+            }
+            "SIZE" => {
+                if args.len() != 1 { return Err(err_input("SIZE requires 1 argument")); }
+                let arr = Self::evaluate_expr_to_array(batch, &args[0])?;
+                if let Some(strings) = arr.as_any().downcast_ref::<StringArray>() {
+                    let result: Vec<Option<i64>> = (0..strings.len()).map(|i| {
+                        if strings.is_null(i) { None } else if strings.value(i).is_empty() { Some(0) }
+                        else { Some(strings.value(i).split('\0').count() as i64) }
+                    }).collect();
+                    Ok(Arc::new(Int64Array::from(result)))
+                } else { Err(err_data("SIZE requires an array or map value")) }
+            }
+            "STR_TO_MAP" => {
+                if args.is_empty() || args.len() > 3 { return Err(err_input("STR_TO_MAP requires 1-3 arguments")); }
+                // ApexBase stores Hive map values as their deterministic textual form.
+                Self::evaluate_expr_to_array(batch, &args[0])
+            }
+            "GET_JSON_OBJECT" => {
+                if args.len() != 2 { return Err(err_input("GET_JSON_OBJECT requires 2 arguments")); }
+                let json = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let path = Self::evaluate_expr_to_array(batch, &args[1])?;
+                if let (Some(jsons), Some(paths)) = (
+                    json.as_any().downcast_ref::<StringArray>(),
+                    path.as_any().downcast_ref::<StringArray>(),
+                ) {
+                    let result: Vec<Option<String>> = (0..jsons.len()).map(|i| {
+                        if jsons.is_null(i) || paths.is_null(i) { return None; }
+                        let owned = serde_json::from_str::<serde_json::Value>(jsons.value(i)).ok()?;
+                        let mut value = &owned;
+                        for key in paths.value(i).trim_start_matches("$.").split('.') {
+                            if key.is_empty() { continue; }
+                            value = value.get(key)?;
+                        }
+                        Some(match value {
+                            serde_json::Value::String(s) => s.clone(),
+                            serde_json::Value::Null => return None,
+                            other => other.to_string(),
+                        })
+                    }).collect();
+                    Ok(Arc::new(StringArray::from(result)))
+                } else { Err(err_data("GET_JSON_OBJECT requires string arguments")) }
             }
             // ============== Hive Math Functions ==============
             "POWER" | "POW" => {
@@ -2592,6 +2702,23 @@ impl ApexExecutor {
                     Ok(Arc::new(Int64Array::from(result)))
                 } else { Err(err_data( "DATEDIFF type error")) }
             }
+            "MONTHS_BETWEEN" => {
+                if args.len() != 2 { return Err(err_input("MONTHS_BETWEEN requires 2 arguments")); }
+                let d1 = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let d2 = Self::evaluate_expr_to_array(batch, &args[1])?;
+                if let (Some(a), Some(b)) = (d1.as_any().downcast_ref::<StringArray>(), d2.as_any().downcast_ref::<StringArray>()) {
+                    use chrono::Datelike;
+                    let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| {
+                        if a.is_null(i) || b.is_null(i) { return None; }
+                        let parse = |s: &str| chrono::NaiveDate::parse_from_str(&s[..10.min(s.len())], "%Y-%m-%d").ok();
+                        let x = parse(a.value(i))?;
+                        let y = parse(b.value(i))?;
+                        Some(((x.year() - y.year()) * 12 + x.month() as i32 - y.month() as i32) as f64
+                            + (x.day() as f64 - y.day() as f64) / 31.0)
+                    }).collect();
+                    Ok(Arc::new(Float64Array::from(result)))
+                } else { Err(err_data("MONTHS_BETWEEN requires date strings")) }
+            }
             "DATE_FORMAT" => {
                 if args.len() != 2 { return Err(err_input( "DATE_FORMAT requires 2 arguments")); }
                 let date_arr = Self::evaluate_expr_to_array(batch, &args[0])?;
@@ -2640,6 +2767,15 @@ impl ApexExecutor {
                 if then_arr.as_any().downcast_ref::<StringArray>().is_some() || else_arr.as_any().downcast_ref::<StringArray>().is_some() {
                     let result: Vec<Option<String>> = (0..batch.num_rows()).map(|i| { let src = if get_cond(i) { &then_arr } else { &else_arr }; src.as_any().downcast_ref::<StringArray>().and_then(|sa| if sa.is_null(i) { None } else { Some(sa.value(i).to_string()) }) }).collect();
                     Ok(Arc::new(StringArray::from(result.iter().map(|s| s.as_deref()).collect::<Vec<_>>())))
+                } else if then_arr.as_any().downcast_ref::<Float64Array>().is_some() || else_arr.as_any().downcast_ref::<Float64Array>().is_some() {
+                    let result: Vec<Option<f64>> = (0..batch.num_rows()).map(|i| {
+                        let src = if get_cond(i) { &then_arr } else { &else_arr };
+                        src.as_any().downcast_ref::<Float64Array>()
+                            .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+                            .or_else(|| src.as_any().downcast_ref::<Int64Array>()
+                                .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i) as f64) }))
+                    }).collect();
+                    Ok(Arc::new(Float64Array::from(result)))
                 } else {
                     let result: Vec<Option<i64>> = (0..batch.num_rows()).map(|i| { let src = if get_cond(i) { &then_arr } else { &else_arr }; src.as_any().downcast_ref::<Int64Array>().and_then(|ia| if ia.is_null(i) { None } else { Some(ia.value(i)) }) }).collect();
                     Ok(Arc::new(Int64Array::from(result)))
@@ -3705,7 +3841,28 @@ impl ApexExecutor {
             };
         }
 
-        // Generic path for numeric IN values (vectorized eq + or)
+        // Fast path for integer columns: one hash-set build plus one O(N) scan.
+        // Large FTS result sets are rewritten to `_id IN (...)`; evaluating one
+        // Arrow equality kernel per id turns hybrid search into O(N * K).
+        if let Some(int_arr) = target.as_any().downcast_ref::<Int64Array>() {
+            if let Some(int_set) = values
+                .iter()
+                .map(Value::as_i64)
+                .collect::<Option<AHashSet<i64>>>()
+            {
+                let result: BooleanArray = int_arr
+                    .iter()
+                    .map(|value| value.map(|value| int_set.contains(&value)))
+                    .collect();
+                return if negated {
+                    compute::not(&result).map_err(|e| err_data(e.to_string()))
+                } else {
+                    Ok(result)
+                };
+            }
+        }
+
+        // Generic path for other numeric IN values (vectorized eq + or)
         let mut result = BooleanArray::from(vec![false; num_rows]);
         for val in values {
             let val_array = Self::value_to_array(val, num_rows)?;

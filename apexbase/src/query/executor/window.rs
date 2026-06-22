@@ -457,14 +457,14 @@ impl ApexExecutor {
 
         for (spec_idx, (func_name, func_args, partition_by, order_by, _)) in window_specs.iter().enumerate() {
             let src_col_name = func_args.get(0).map(|s| s.trim_matches('"').to_string());
-            let is_float_src = src_col_name.as_deref().and_then(|cn| batch.column_by_name(cn))
+            let is_float_src = src_col_name.as_deref().and_then(|cn| Self::get_column_by_name(batch, cn))
                 .map_or(false, |c| c.as_any().downcast_ref::<Float64Array>().is_some());
             use_float[spec_idx] = is_float_src || matches!(func_name.as_str(), "AVG" | "PERCENT_RANK" | "CUME_DIST");
 
             // Build partition groups
             let mut groups: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(num_rows / 10 + 1);
             let part_cols: Vec<Option<&ArrayRef>> = partition_by.iter()
-                .map(|cn| batch.column_by_name(cn.trim_matches('"')))
+                .map(|cn| Self::get_column_by_name(batch, cn.trim_matches('"')))
                 .collect();
             for row_idx in 0..num_rows {
                 let mut hasher = AHasher::default();
@@ -482,7 +482,7 @@ impl ApexExecutor {
                 let order_col: Option<ArrayRef> = if !order_by.is_empty() {
                     let ocn = order_by[0].column.trim_matches('"');
                     let desc = order_by[0].descending;
-                    batch.column_by_name(ocn).map(|c| {
+                    Self::get_column_by_name(batch, ocn).map(|c| {
                         indices.sort_by(|&a, &b| {
                             let cmp = Self::compare_array_values(c, a, b);
                             if desc { cmp.reverse() } else { cmp }
@@ -563,7 +563,7 @@ impl ApexExecutor {
                     "LAG" => {
                         let offset = func_args.get(1).and_then(|s| s.trim_start_matches("Int64(").trim_end_matches(')').parse().ok()).unwrap_or(1usize);
                         let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                        if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(src_col) = Self::get_column_by_name(batch, col_name) {
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 for (pos, &ri) in indices.iter().enumerate() {
                                     per_flt[spec_idx][ri] = if pos >= offset {
@@ -585,7 +585,7 @@ impl ApexExecutor {
                         let offset = func_args.get(1).and_then(|s| s.trim_start_matches("Int64(").trim_end_matches(')').parse().ok()).unwrap_or(1usize);
                         let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
                         let len = indices.len();
-                        if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(src_col) = Self::get_column_by_name(batch, col_name) {
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 for (pos, &ri) in indices.iter().enumerate() {
                                     per_flt[spec_idx][ri] = if pos + offset < len {
@@ -605,7 +605,7 @@ impl ApexExecutor {
                     }
                     "FIRST_VALUE" => {
                         let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                        if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(src_col) = Self::get_column_by_name(batch, col_name) {
                             let fr = indices[0];
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let v = if fa.is_null(fr) { None } else { Some(fa.value(fr)) };
@@ -618,7 +618,7 @@ impl ApexExecutor {
                     }
                     "LAST_VALUE" => {
                         let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                        if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(src_col) = Self::get_column_by_name(batch, col_name) {
                             let lr = indices[indices.len() - 1];
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let v = if fa.is_null(lr) { None } else { Some(fa.value(lr)) };
@@ -631,7 +631,7 @@ impl ApexExecutor {
                     }
                     "SUM" => {
                         let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                        if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(src_col) = Self::get_column_by_name(batch, col_name) {
                             if !order_by.is_empty() {
                                 // Running (cumulative) sum when ORDER BY is present
                                 if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
@@ -661,7 +661,7 @@ impl ApexExecutor {
                     }
                     "RUNNING_SUM" => {
                         let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                        if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(src_col) = Self::get_column_by_name(batch, col_name) {
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let mut running = 0.0f64;
                                 for &ri in &indices { if !fa.is_null(ri) { running += fa.value(ri); } per_flt[spec_idx][ri] = Some(running); }
@@ -673,7 +673,7 @@ impl ApexExecutor {
                     }
                     "AVG" => {
                         let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                        if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(src_col) = Self::get_column_by_name(batch, col_name) {
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let vals: Vec<f64> = indices.iter().filter_map(|&i| if fa.is_null(i) { None } else { Some(fa.value(i)) }).collect();
                                 let avg = if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 };
@@ -691,7 +691,7 @@ impl ApexExecutor {
                     }
                     "MIN" => {
                         let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                        if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(src_col) = Self::get_column_by_name(batch, col_name) {
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let mv = indices.iter().filter_map(|&i| if fa.is_null(i) { None } else { Some(fa.value(i)) }).fold(f64::INFINITY, f64::min);
                                 let mv = if mv == f64::INFINITY { None } else { Some(mv) };
@@ -704,7 +704,7 @@ impl ApexExecutor {
                     }
                     "MAX" => {
                         let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
-                        if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(src_col) = Self::get_column_by_name(batch, col_name) {
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let mv = indices.iter().filter_map(|&i| if fa.is_null(i) { None } else { Some(fa.value(i)) }).fold(f64::NEG_INFINITY, f64::max);
                                 let mv = if mv == f64::NEG_INFINITY { None } else { Some(mv) };
@@ -718,7 +718,7 @@ impl ApexExecutor {
                     "NTH_VALUE" => {
                         let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
                         let n = func_args.get(1).and_then(|s| s.trim_start_matches("Int64(").trim_end_matches(')').parse::<usize>().ok()).unwrap_or(1);
-                        if let Some(src_col) = batch.column_by_name(col_name) {
+                        if let Some(src_col) = Self::get_column_by_name(batch, col_name) {
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let v = if n > 0 && n <= indices.len() {
                                     let nr = indices[n-1]; if fa.is_null(nr) { None } else { Some(fa.value(nr)) }
@@ -746,14 +746,18 @@ impl ApexExecutor {
             match col {
                 SelectColumn::Column(name) => {
                     let col_name = name.trim_matches('"');
-                    if let Some(arr) = batch.column_by_name(col_name) {
-                        result_fields.push(Field::new(col_name, arr.data_type().clone(), true));
+                    if let Some(arr) = Self::get_column_by_name(batch, col_name) {
+                        result_fields.push(Field::new(
+                            Self::strip_table_prefix(col_name),
+                            arr.data_type().clone(),
+                            true,
+                        ));
                         result_arrays.push(arr.clone());
                     }
                 }
                 SelectColumn::ColumnAlias { column, alias } => {
                     let col_name = column.trim_matches('"');
-                    if let Some(arr) = batch.column_by_name(col_name) {
+                    if let Some(arr) = Self::get_column_by_name(batch, col_name) {
                         result_fields.push(Field::new(alias, arr.data_type().clone(), true));
                         result_arrays.push(arr.clone());
                     }

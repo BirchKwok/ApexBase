@@ -205,3 +205,25 @@ class TestCTE:
         """)
         result = db_with_data.execute("SELECT COUNT(*) FROM users")
         assert get_scalar(result) == 5  # Original data unchanged
+
+    def test_shared_cte_reaches_non_adjacent_consumers(self, db_with_data):
+        """A shared CTE remains visible through all later chained CTEs."""
+        result = db_with_data.execute("""
+            WITH base AS (
+                SELECT name, age, city FROM users
+            ),
+            seniors AS (
+                SELECT COUNT(*) AS senior_cnt
+                FROM base WHERE age >= 30
+            ),
+            young AS (
+                SELECT COUNT(*) AS young_cnt
+                FROM base WHERE age < 30
+            )
+            SELECT s.senior_cnt, y.young_cnt
+            FROM seniors s
+            CROSS JOIN young y
+        """)
+
+        assert get_col_values(result, 'senior_cnt') == [3]
+        assert get_col_values(result, 'young_cnt') == [2]

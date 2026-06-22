@@ -1,6 +1,271 @@
 // Sorting, aggregation, GROUP BY execution
 
+#[derive(Clone, Copy)]
+enum JsonProjectionTransform {
+    Scalar,
+    StringArray,
+}
+
 impl ApexExecutor {
+
+    /// Recognize projection expressions that can share one JSON parse per row.
+    /// Hive ETL commonly extracts many paths from the same JSON column; parsing
+    /// the document once for every GET_JSON_OBJECT call is needlessly O(paths).
+    fn json_projection_spec(expr: &SqlExpr) -> Option<(String, String, JsonProjectionTransform)> {
+        match expr {
+            SqlExpr::Function { name, args }
+                if name.eq_ignore_ascii_case("GET_JSON_OBJECT") && args.len() == 2 =>
+            {
+                let column = match &args[0] {
+                    SqlExpr::Column(column) => column
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(column)
+                        .trim_matches('"')
+                        .to_string(),
+                    _ => return None,
+                };
+                let path = match &args[1] {
+                    SqlExpr::Literal(Value::String(path)) => path.clone(),
+                    _ => return None,
+                };
+                Some((column, path, JsonProjectionTransform::Scalar))
+            }
+            SqlExpr::Function { name, args }
+                if name.eq_ignore_ascii_case("SPLIT") && args.len() == 2 =>
+            {
+                // SPLIT(REGEXP_REPLACE(...GET_JSON_OBJECT(array path)...), ',')
+                // is the standard Hive representation used before EXPLODE.
+                fn find_json(expr: &SqlExpr) -> Option<(String, String)> {
+                    match expr {
+                        SqlExpr::Function { name, args }
+                            if name.eq_ignore_ascii_case("GET_JSON_OBJECT") && args.len() == 2 =>
+                        {
+                            let column = match &args[0] {
+                                SqlExpr::Column(column) => column
+                                    .rsplit('.')
+                                    .next()
+                                    .unwrap_or(column)
+                                    .trim_matches('"')
+                                    .to_string(),
+                                _ => return None,
+                            };
+                            let path = match &args[1] {
+                                SqlExpr::Literal(Value::String(path)) => path.clone(),
+                                _ => return None,
+                            };
+                            Some((column, path))
+                        }
+                        SqlExpr::Function { name, args }
+                            if name.eq_ignore_ascii_case("REGEXP_REPLACE")
+                                && args.len() == 3
+                                && matches!(&args[2], SqlExpr::Literal(Value::String(value)) if value.is_empty())
+                                && matches!(&args[1], SqlExpr::Literal(Value::String(pattern))
+                                    if pattern.contains("\\s")
+                                        || (pattern.contains("\\[")
+                                            && pattern.contains("\\]")
+                                            && pattern.contains('"'))) =>
+                        {
+                            find_json(&args[0])
+                        }
+                        _ => None,
+                    }
+                }
+                let delimiter_is_comma = matches!(
+                    &args[1],
+                    SqlExpr::Literal(Value::String(delimiter)) if delimiter == ","
+                );
+                if !delimiter_is_comma {
+                    return None;
+                }
+                find_json(&args[0]).map(|(column, path)| {
+                    (column, path, JsonProjectionTransform::StringArray)
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn fused_json_projection_arrays(
+        batch: &RecordBatch,
+        columns: &[SelectColumn],
+    ) -> io::Result<HashMap<usize, ArrayRef>> {
+        use serde_json::value::RawValue;
+
+        let mut by_source: HashMap<String, Vec<(usize, Vec<String>, JsonProjectionTransform)>> =
+            HashMap::new();
+        for (index, column) in columns.iter().enumerate() {
+            if let SelectColumn::Expression { expr, .. } = column {
+                if let Some((source, path, transform)) = Self::json_projection_spec(expr) {
+                    by_source.entry(source).or_default().push((
+                        index,
+                        path.trim_start_matches("$.")
+                            .split('.')
+                            .filter(|key| !key.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                        transform,
+                    ));
+                }
+            }
+        }
+
+        let mut output = HashMap::new();
+        for (source, specs) in by_source {
+            // A single extraction is already optimal in the normal expression
+            // evaluator. Fusion matters only when the JSON parse is shared.
+            if specs.len() < 2 {
+                continue;
+            }
+            let Some(jsons) = batch
+                .column_by_name(&source)
+                .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            else {
+                continue;
+            };
+            let build_chunk = |start: usize, end: usize| -> Vec<ArrayRef> {
+                let rows = end - start;
+                let mut builders: Vec<arrow::array::StringBuilder> = specs
+                    .iter()
+                    .map(|_| arrow::array::StringBuilder::with_capacity(rows, rows * 8))
+                    .collect();
+                for row in start..end {
+                    let root: Option<HashMap<&str, &RawValue>> = if jsons.is_null(row) {
+                        None
+                    } else {
+                        serde_json::from_str(jsons.value(row)).ok()
+                    };
+                    let mut nested_cache: Option<(&str, HashMap<&str, &RawValue>)> = None;
+                    for (builder, (_, keys, transform)) in builders.iter_mut().zip(specs.iter()) {
+                        let Some(root) = root.as_ref() else {
+                            builder.append_null();
+                            continue;
+                        };
+                        let Some(first_key) = keys.first() else {
+                            builder.append_null();
+                            continue;
+                        };
+                        let Some(mut value) = root.get(first_key.as_str()).copied() else {
+                            builder.append_null();
+                            continue;
+                        };
+                        let mut found = true;
+                        if keys.len() == 2 {
+                            let cache_matches = nested_cache
+                                .as_ref()
+                                .is_some_and(|(key, _)| *key == first_key.as_str());
+                            if !cache_matches {
+                                nested_cache = serde_json::from_str(value.get())
+                                    .ok()
+                                    .map(|nested| (first_key.as_str(), nested));
+                            }
+                            if let Some(next) = nested_cache
+                                .as_ref()
+                                .and_then(|(_, nested)| nested.get(keys[1].as_str()))
+                                .copied()
+                            {
+                                value = next;
+                            } else {
+                                found = false;
+                            }
+                        } else {
+                            for key in &keys[1..] {
+                                let nested: HashMap<&str, &RawValue> =
+                                    match serde_json::from_str(value.get()) {
+                                        Ok(nested) => nested,
+                                        Err(_) => {
+                                            found = false;
+                                            break;
+                                        }
+                                    };
+                                if let Some(next) = nested.get(key.as_str()).copied() {
+                                    value = next;
+                                } else {
+                                    found = false;
+                                    break;
+                                }
+                            }
+                        }
+                        let raw = value.get();
+                        if !found || raw == "null" {
+                            builder.append_null();
+                            continue;
+                        }
+                        match transform {
+                            JsonProjectionTransform::StringArray => {
+                                if let Ok(values) = serde_json::from_str::<Vec<&str>>(raw) {
+                                    builder.append_value(values.join("\0"));
+                                } else if let Ok(values) =
+                                    serde_json::from_str::<Vec<serde_json::Value>>(raw)
+                                {
+                                    let mut joined = String::new();
+                                    for (index, item) in values.iter().enumerate() {
+                                        if index > 0 {
+                                            joined.push('\0');
+                                        }
+                                        if let Some(text) = item.as_str() {
+                                            joined.push_str(text);
+                                        } else if !item.is_null() {
+                                            joined.push_str(&item.to_string());
+                                        }
+                                    }
+                                    builder.append_value(&joined);
+                                } else {
+                                    builder.append_null();
+                                }
+                            }
+                            JsonProjectionTransform::Scalar => {
+                                if raw.starts_with('"') {
+                                    if let Ok(text) = serde_json::from_str::<&str>(raw) {
+                                        builder.append_value(text);
+                                    } else if let Ok(text) = serde_json::from_str::<String>(raw) {
+                                        builder.append_value(text);
+                                    } else {
+                                        builder.append_null();
+                                    }
+                                } else {
+                                    builder.append_value(raw);
+                                }
+                            }
+                        }
+                    }
+                }
+                builders
+                    .into_iter()
+                    .map(|mut builder| Arc::new(builder.finish()) as ArrayRef)
+                    .collect()
+            };
+
+            let arrays = if batch.num_rows() >= 100_000 && rayon::current_num_threads() > 1 {
+                use rayon::prelude::*;
+                let partitions = rayon::current_num_threads().min(batch.num_rows());
+                let chunk_rows = batch.num_rows().div_ceil(partitions);
+                let chunks: Vec<Vec<ArrayRef>> = (0..partitions)
+                    .into_par_iter()
+                    .map(|partition| {
+                        let start = partition * chunk_rows;
+                        let end = (start + chunk_rows).min(batch.num_rows());
+                        build_chunk(start, end)
+                    })
+                    .collect();
+                (0..specs.len())
+                    .map(|column| {
+                        let refs: Vec<&dyn Array> = chunks
+                            .iter()
+                            .map(|chunk| chunk[column].as_ref())
+                            .collect();
+                        compute::concat(&refs).map_err(|error| err_data(error.to_string()))
+                    })
+                    .collect::<io::Result<Vec<_>>>()?
+            } else {
+                build_chunk(0, batch.num_rows())
+            };
+            for ((index, _, _), array) in specs.into_iter().zip(arrays) {
+                output.insert(index, array);
+            }
+        }
+        Ok(output)
+    }
 
     /// Resolve ORDER BY column names against SELECT list aliases.
     /// Maps expressions like `SUM(amount)` to their output column name (e.g. `total`)
@@ -659,8 +924,23 @@ impl ApexExecutor {
             }
         }
 
+        let json_candidates = columns
+            .iter()
+            .filter(|column| matches!(
+                column,
+                SelectColumn::Expression { expr, .. }
+                    if Self::json_projection_spec(expr).is_some()
+            ))
+            .take(2)
+            .count();
+        let mut fused_json = if json_candidates >= 2 {
+            Self::fused_json_projection_arrays(batch, columns)?
+        } else {
+            HashMap::new()
+        };
+
         // Process columns in order - preserving user-specified order
-        for col in columns {
+        for (column_index, col) in columns.iter().enumerate() {
             match col {
                 SelectColumn::Column(name) => {
                     let col_name = name.trim_matches('"');
@@ -703,7 +983,9 @@ impl ApexExecutor {
                 }
                 SelectColumn::Expression { expr, alias } => {
                     // Use storage-aware evaluation for expressions that may contain scalar subqueries
-                    let array = if let Some(path) = storage_path {
+                    let array = if let Some(array) = fused_json.remove(&column_index) {
+                        array
+                    } else if let Some(path) = storage_path {
                         Self::evaluate_expr_to_array_with_storage(batch, expr, path)?
                     } else {
                         Self::evaluate_expr_to_array(batch, expr)?
@@ -801,12 +1083,31 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         let mut fields: Vec<Field> = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
+        let mut aggregate_cache: AHashMap<String, ArrayRef> = AHashMap::new();
 
         for col in &stmt.columns {
-            if let SelectColumn::Aggregate { func, column, distinct, alias } = col {
-                let (field, array) = Self::compute_aggregate(batch, func, column, *distinct, alias)?;
-                fields.push(field);
-                arrays.push(array);
+            match col {
+                SelectColumn::Aggregate { func, column, distinct, alias } => {
+                    let (field, array) = Self::compute_aggregate(batch, func, column, *distinct, alias)?;
+                    fields.push(field);
+                    arrays.push(array);
+                }
+                SelectColumn::Expression { expr, alias }
+                    if Self::expr_contains_aggregate(expr) =>
+                {
+                    let all_rows = vec![(0..batch.num_rows()).collect::<Vec<_>>()];
+                    let (field, array) =
+                        Self::evaluate_expr_for_groups(
+                            batch,
+                            expr,
+                            alias.as_deref(),
+                            &all_rows,
+                            &mut aggregate_cache,
+                        )?;
+                    fields.push(field);
+                    arrays.push(array);
+                }
+                _ => {}
             }
         }
 
@@ -1520,6 +1821,26 @@ impl ApexExecutor {
         }
         // HAVING with aggregates is OK, but complex expressions aren't
         true
+    }
+
+    fn group_output_name(stmt: &SelectStatement, group_column: &str) -> String {
+        let clean = group_column.trim_matches('"');
+        stmt.columns
+            .iter()
+            .find_map(|column| {
+                if let SelectColumn::ColumnAlias { column, alias } = column {
+                    let source = column
+                        .trim_matches('"')
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(column);
+                    if source == clean.rsplit('.').next().unwrap_or(clean) {
+                        return Some(alias.clone());
+                    }
+                }
+                None
+            })
+            .unwrap_or_else(|| clean.rsplit('.').next().unwrap_or(clean).to_string())
     }
     
     /// Ultra-fast GROUP BY for string columns using direct dictionary indexing
@@ -2329,9 +2650,9 @@ impl ApexExecutor {
                         use crate::query::AggregateFunc;
                         let mut result_fields: Vec<Field> = Vec::new();
                         let mut result_arrays: Vec<ArrayRef> = Vec::new();
-                        result_fields.push(Field::new(group_cols[0].trim_matches('"'), ArrowDataType::Utf8, false));
+                        result_fields.push(Field::new(Self::group_output_name(stmt, &group_cols[0]), ArrowDataType::Utf8, false));
                         result_arrays.push(Arc::new(StringArray::from(result_col1)));
-                        result_fields.push(Field::new(group_cols[1].trim_matches('"'), ArrowDataType::Utf8, false));
+                        result_fields.push(Field::new(Self::group_output_name(stmt, &group_cols[1]), ArrowDataType::Utf8, false));
                         result_arrays.push(Arc::new(StringArray::from(result_col2)));
                         let has_int_agg = agg_col_int.is_some();
                         for col in &stmt.columns {
@@ -2593,9 +2914,9 @@ impl ApexExecutor {
                         let mut result_fields: Vec<Field> = Vec::new();
                         let mut result_arrays: Vec<ArrayRef> = Vec::new();
                         
-                        result_fields.push(Field::new(group_cols[0].trim_matches('"'), ArrowDataType::Utf8, false));
+                        result_fields.push(Field::new(Self::group_output_name(stmt, &group_cols[0]), ArrowDataType::Utf8, false));
                         result_arrays.push(Arc::new(StringArray::from(result_col1)));
-                        result_fields.push(Field::new(group_cols[1].trim_matches('"'), ArrowDataType::Int64, false));
+                        result_fields.push(Field::new(Self::group_output_name(stmt, &group_cols[1]), ArrowDataType::Int64, false));
                         result_arrays.push(Arc::new(Int64Array::from(result_col2)));
                         
                         let has_int_agg = agg_col_int.is_some();
@@ -3132,6 +3453,7 @@ impl ApexExecutor {
         
         let num_groups = groups.len();
         let group_indices: Vec<Vec<usize>> = groups.into_values().collect();
+        let mut aggregate_cache: AHashMap<String, ArrayRef> = AHashMap::new();
 
         for col in &stmt.columns {
             match col {
@@ -3171,7 +3493,13 @@ impl ApexExecutor {
                 SelectColumn::Expression { expr, alias } => {
                     // For expressions containing aggregates (like CASE WHEN SUM(x) > 100 THEN ...),
                     // we need to evaluate the expression for each group
-                    let (field, array) = Self::evaluate_expr_for_groups(batch, expr, alias.as_deref(), &group_indices)?;
+                    let (field, array) = Self::evaluate_expr_for_groups(
+                        batch,
+                        expr,
+                        alias.as_deref(),
+                        &group_indices,
+                        &mut aggregate_cache,
+                    )?;
                     result_fields.push(field);
                     result_arrays.push(array);
                 }
@@ -3203,123 +3531,241 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result))
     }
 
-    /// Evaluate expression for groups (handles CASE with aggregates)
+    /// Evaluate an expression once per group. Aggregate subexpressions are first
+    /// lowered to hidden Arrow columns, then the ordinary vectorized expression
+    /// evaluator handles CASE/arithmetic/scalar functions over the group batch.
     fn evaluate_expr_for_groups(
         batch: &RecordBatch,
         expr: &SqlExpr,
         alias: Option<&str>,
         group_indices: &[Vec<usize>],
+        aggregate_cache: &mut AHashMap<String, ArrayRef>,
     ) -> io::Result<(Field, ArrayRef)> {
         let output_name = alias.unwrap_or("expr");
-        let num_groups = group_indices.len();
-        
-        // For CASE expressions with aggregates, we need to:
-        // 1. For each group, compute the aggregate values
-        // 2. Evaluate the CASE condition using those aggregates
-        // 3. Return the CASE result for each group
-        
+        let representatives = if batch.num_rows() == 0 {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("__dummy", ArrowDataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(vec![0])) as ArrayRef],
+            )
+            .map_err(|e| err_data(e.to_string()))?
+        } else {
+            let first_indices = arrow::array::UInt64Array::from(
+                group_indices.iter().map(|g| g[0] as u64).collect::<Vec<_>>(),
+            );
+            compute::take_record_batch(batch, &first_indices)
+                .map_err(|e| err_data(e.to_string()))?
+        };
+        let mut aggregate_fields = Vec::new();
+        let mut aggregate_arrays = Vec::new();
+        let lowered = Self::lower_group_aggregates(
+            batch,
+            expr,
+            group_indices,
+            &mut aggregate_fields,
+            &mut aggregate_arrays,
+            aggregate_cache,
+        )?;
+        let eval_batch = if aggregate_fields.is_empty() {
+            representatives
+        } else {
+            let mut fields = representatives
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect::<Vec<_>>();
+            fields.extend(aggregate_fields);
+            let mut arrays = representatives.columns().to_vec();
+            arrays.extend(aggregate_arrays);
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                .map_err(|e| err_data(e.to_string()))?
+        };
+        let array = Self::evaluate_expr_to_array(&eval_batch, &lowered)?;
+        Ok((Field::new(output_name, array.data_type().clone(), true), array))
+    }
+
+    fn is_group_aggregate_name(name: &str) -> bool {
+        matches!(
+            name.to_ascii_uppercase().as_str(),
+            "SUM" | "COUNT" | "COUNT_DISTINCT" | "AVG" | "MIN" | "MAX"
+                | "COLLECT_SET" | "COLLECT_LIST" | "PERCENTILE_APPROX"
+        )
+    }
+
+    fn lower_group_aggregates(
+        batch: &RecordBatch,
+        expr: &SqlExpr,
+        groups: &[Vec<usize>],
+        fields: &mut Vec<Field>,
+        arrays: &mut Vec<ArrayRef>,
+        cache: &mut AHashMap<String, ArrayRef>,
+    ) -> io::Result<SqlExpr> {
         match expr {
-            SqlExpr::Case { when_then, else_expr } => {
-                // Evaluate CASE for each group
-                let mut string_results: Vec<Option<String>> = Vec::with_capacity(num_groups);
-                let mut int_results: Vec<Option<i64>> = Vec::with_capacity(num_groups);
-                let mut is_string = false;
-                
-                // Determine result type from first THEN expression
-                if let Some((_, then_expr)) = when_then.first() {
-                    if matches!(then_expr, SqlExpr::Literal(Value::String(_))) {
-                        is_string = true;
+            SqlExpr::Function { name, args } if Self::is_group_aggregate_name(name) => {
+                let hidden = format!("__apex_agg_{}", arrays.len());
+                let key = format!("{:?}", expr);
+                let array = if let Some(cached) = cache.get(&key) {
+                    cached.clone()
+                } else {
+                    let computed = Self::compute_expression_aggregate(batch, name, args, groups)?;
+                    cache.insert(key, computed.clone());
+                    computed
+                };
+                fields.push(Field::new(&hidden, array.data_type().clone(), true));
+                arrays.push(array);
+                Ok(SqlExpr::Column(hidden))
+            }
+            SqlExpr::Function { name, args } => Ok(SqlExpr::Function {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| Self::lower_group_aggregates(batch, arg, groups, fields, arrays, cache))
+                    .collect::<io::Result<Vec<_>>>()?,
+            }),
+            SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+                left: Box::new(Self::lower_group_aggregates(batch, left, groups, fields, arrays, cache)?),
+                op: op.clone(),
+                right: Box::new(Self::lower_group_aggregates(batch, right, groups, fields, arrays, cache)?),
+            }),
+            SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
+                op: op.clone(),
+                expr: Box::new(Self::lower_group_aggregates(batch, expr, groups, fields, arrays, cache)?),
+            }),
+            SqlExpr::Case { when_then, else_expr } => Ok(SqlExpr::Case {
+                when_then: when_then
+                    .iter()
+                    .map(|(when, then)| Ok((
+                        Self::lower_group_aggregates(batch, when, groups, fields, arrays, cache)?,
+                        Self::lower_group_aggregates(batch, then, groups, fields, arrays, cache)?,
+                    )))
+                    .collect::<io::Result<Vec<_>>>()?,
+                else_expr: else_expr
+                    .as_ref()
+                    .map(|e| Self::lower_group_aggregates(batch, e, groups, fields, arrays, cache).map(Box::new))
+                    .transpose()?,
+            }),
+            SqlExpr::Cast { expr, data_type } => Ok(SqlExpr::Cast {
+                expr: Box::new(Self::lower_group_aggregates(batch, expr, groups, fields, arrays, cache)?),
+                data_type: data_type.clone(),
+            }),
+            SqlExpr::Paren(expr) => Ok(SqlExpr::Paren(Box::new(Self::lower_group_aggregates(
+                batch, expr, groups, fields, arrays, cache,
+            )?))),
+            SqlExpr::ArrayIndex { array, index } => Ok(SqlExpr::ArrayIndex {
+                array: Box::new(Self::lower_group_aggregates(batch, array, groups, fields, arrays, cache)?),
+                index: Box::new(Self::lower_group_aggregates(batch, index, groups, fields, arrays, cache)?),
+            }),
+            _ => Ok(expr.clone()),
+        }
+    }
+
+    fn compute_expression_aggregate(
+        batch: &RecordBatch,
+        name: &str,
+        args: &[SqlExpr],
+        groups: &[Vec<usize>],
+    ) -> io::Result<ArrayRef> {
+        let upper = name.to_ascii_uppercase();
+        if upper == "COUNT" && args.is_empty() {
+            return Ok(Arc::new(Int64Array::from(
+                groups.iter().map(|g| g.len() as i64).collect::<Vec<_>>(),
+            )));
+        }
+        let arg = args.first().ok_or_else(|| err_input(format!("{} requires an argument", name)))?;
+        let values = Self::evaluate_expr_to_array(batch, arg)?;
+        match upper.as_str() {
+            "COUNT" => Ok(Arc::new(Int64Array::from(
+                groups
+                    .iter()
+                    .map(|g| g.iter().filter(|&&i| !values.is_null(i)).count() as i64)
+                    .collect::<Vec<_>>(),
+            ))),
+            "COUNT_DISTINCT" => Ok(Arc::new(Int64Array::from(
+                groups
+                    .iter()
+                    .map(|g| {
+                        let mut set = ahash::AHashSet::with_capacity(g.len());
+                        for &i in g {
+                            if !values.is_null(i) {
+                                set.insert(Self::hash_array_value_fast(&values, i));
+                            }
+                        }
+                        set.len() as i64
+                    })
+                    .collect::<Vec<_>>(),
+            ))),
+            "SUM" | "AVG" | "MIN" | "MAX" | "PERCENTILE_APPROX" => {
+                if matches!(upper.as_str(), "MIN" | "MAX") {
+                    if let Some(strings) = values.as_any().downcast_ref::<StringArray>() {
+                        let result: Vec<Option<String>> = groups.iter().map(|group| {
+                            group.iter().filter_map(|&i| {
+                                if strings.is_null(i) { None } else { Some(strings.value(i)) }
+                            }).reduce(|a, b| if (upper == "MIN" && a <= b) || (upper == "MAX" && a >= b) { a } else { b })
+                            .map(str::to_string)
+                        }).collect();
+                        return Ok(Arc::new(StringArray::from(result)));
                     }
                 }
-                
-                for indices in group_indices {
-                    // Create a sub-batch for this group
-                    let group_batch = Self::create_group_batch(batch, indices)?;
-                    
-                    // For each WHEN clause, check if condition is true for this group
-                    let mut matched = false;
-                    for (cond_expr, then_expr) in when_then {
-                        // Evaluate condition - if it contains aggregates, compute them
-                        let cond_result = Self::evaluate_aggregate_condition(&group_batch, cond_expr)?;
-                        
-                        if cond_result {
-                            // Evaluate THEN expression
-                            if is_string {
-                                if let SqlExpr::Literal(Value::String(s)) = then_expr {
-                                    string_results.push(Some(s.clone()));
-                                } else {
-                                    string_results.push(None);
-                                }
-                            } else {
-                                let then_arr = Self::evaluate_expr_to_array(&group_batch, then_expr)?;
-                                if let Some(int_arr) = then_arr.as_any().downcast_ref::<Int64Array>() {
-                                    int_results.push(if int_arr.len() > 0 && !int_arr.is_null(0) { Some(int_arr.value(0)) } else { None });
-                                } else {
-                                    int_results.push(None);
-                                }
-                            }
-                            matched = true;
-                            break;
+                let percentile = args.get(1).and_then(|e| match e {
+                    SqlExpr::Literal(Value::Float64(v)) => Some(*v),
+                    SqlExpr::Literal(Value::Int64(v)) => Some(*v as f64),
+                    _ => None,
+                }).unwrap_or(0.5).clamp(0.0, 1.0);
+                let mut out = Vec::with_capacity(groups.len());
+                for group in groups {
+                    let mut nums = Vec::with_capacity(group.len());
+                    for &i in group {
+                        if values.is_null(i) { continue; }
+                        if let Some(a) = values.as_any().downcast_ref::<Int64Array>() {
+                            nums.push(a.value(i) as f64);
+                        } else if let Some(a) = values.as_any().downcast_ref::<UInt64Array>() {
+                            nums.push(a.value(i) as f64);
+                        } else if let Some(a) = values.as_any().downcast_ref::<Float64Array>() {
+                            nums.push(a.value(i));
                         }
                     }
-                    
-                    if !matched {
-                        // Use ELSE value
-                        if let Some(else_e) = else_expr {
-                            if is_string {
-                                if let SqlExpr::Literal(Value::String(s)) = else_e.as_ref() {
-                                    string_results.push(Some(s.clone()));
-                                } else {
-                                    string_results.push(None);
-                                }
-                            } else {
-                                let else_arr = Self::evaluate_expr_to_array(&group_batch, else_e)?;
-                                if let Some(int_arr) = else_arr.as_any().downcast_ref::<Int64Array>() {
-                                    int_results.push(if int_arr.len() > 0 && !int_arr.is_null(0) { Some(int_arr.value(0)) } else { None });
-                                } else {
-                                    int_results.push(None);
-                                }
+                    let value = if nums.is_empty() {
+                        None
+                    } else {
+                        Some(match upper.as_str() {
+                            "SUM" => nums.iter().sum(),
+                            "AVG" => nums.iter().sum::<f64>() / nums.len() as f64,
+                            "MIN" => nums.iter().copied().fold(f64::INFINITY, f64::min),
+                            "MAX" => nums.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                            _ => {
+                                nums.sort_unstable_by(|a, b| a.total_cmp(b));
+                                nums[((nums.len() - 1) as f64 * percentile).round() as usize]
                             }
-                        } else {
-                            if is_string {
-                                string_results.push(None);
-                            } else {
-                                int_results.push(None);
-                            }
+                        })
+                    };
+                    out.push(value);
+                }
+                Ok(Arc::new(Float64Array::from(out)))
+            }
+            "COLLECT_SET" | "COLLECT_LIST" => {
+                let distinct = upper == "COLLECT_SET";
+                let mut out = Vec::with_capacity(groups.len());
+                for group in groups {
+                    let mut items = Vec::with_capacity(group.len());
+                    let mut seen = ahash::AHashSet::with_capacity(group.len());
+                    for &i in group {
+                        if values.is_null(i) { continue; }
+                        let text = match Self::arrow_value_at_col(&values, i) {
+                            Value::String(v) => v,
+                            Value::Int64(v) => v.to_string(),
+                            Value::Float64(v) => v.to_string(),
+                            Value::Bool(v) => v.to_string(),
+                            _ => continue,
+                        };
+                        if !distinct || seen.insert(text.clone()) {
+                            items.push(text);
                         }
                     }
+                    out.push(Some(items.join("\0")));
                 }
-                
-                if is_string {
-                    let array = Arc::new(StringArray::from(string_results)) as ArrayRef;
-                    Ok((Field::new(output_name, arrow::datatypes::DataType::Utf8, true), array))
-                } else {
-                    let array = Arc::new(Int64Array::from(int_results)) as ArrayRef;
-                    Ok((Field::new(output_name, arrow::datatypes::DataType::Int64, true), array))
-                }
+                Ok(Arc::new(StringArray::from(out)))
             }
-            _ => {
-                // For non-CASE expressions, evaluate normally on first row of each group
-                let first_indices: Vec<usize> = group_indices.iter().map(|g| g[0]).collect();
-                let array = Self::evaluate_expr_to_array(batch, expr)?;
-                
-                // Take values at first indices
-                if let Some(str_arr) = array.as_any().downcast_ref::<StringArray>() {
-                    let values: Vec<Option<String>> = first_indices.iter().map(|&i| {
-                        if str_arr.is_null(i) { None } else { Some(str_arr.value(i).to_string()) }
-                    }).collect();
-                    let result = Arc::new(StringArray::from(values)) as ArrayRef;
-                    Ok((Field::new(output_name, arrow::datatypes::DataType::Utf8, true), result))
-                } else if let Some(int_arr) = array.as_any().downcast_ref::<Int64Array>() {
-                    let values: Vec<Option<i64>> = first_indices.iter().map(|&i| {
-                        if int_arr.is_null(i) { None } else { Some(int_arr.value(i)) }
-                    }).collect();
-                    let result = Arc::new(Int64Array::from(values)) as ArrayRef;
-                    Ok((Field::new(output_name, arrow::datatypes::DataType::Int64, true), result))
-                } else {
-                    Err(err_data( "Unsupported expression type"))
-                }
-            }
+            _ => Err(err_input(format!("Unsupported aggregate function {}", name))),
         }
     }
 
@@ -3728,7 +4174,7 @@ impl ApexExecutor {
     /// Check if an expression contains an aggregate function (SUM, COUNT, AVG, MIN, MAX)
     fn expr_contains_aggregate(expr: &SqlExpr) -> bool {
         match expr {
-            SqlExpr::Function { name, args } => name.eq_ignore_ascii_case("SUM") || name.eq_ignore_ascii_case("COUNT") || name.eq_ignore_ascii_case("AVG") || name.eq_ignore_ascii_case("MIN") || name.eq_ignore_ascii_case("MAX") || args.iter().any(Self::expr_contains_aggregate),
+            SqlExpr::Function { name, args } => Self::is_group_aggregate_name(name) || args.iter().any(Self::expr_contains_aggregate),
             SqlExpr::Case { when_then, else_expr } => when_then.iter().any(|(c, t)| Self::expr_contains_aggregate(c) || Self::expr_contains_aggregate(t)) || else_expr.as_ref().map_or(false, |e| Self::expr_contains_aggregate(e)),
             SqlExpr::BinaryOp { left, right, .. } => Self::expr_contains_aggregate(left) || Self::expr_contains_aggregate(right),
             SqlExpr::UnaryOp { expr, .. } | SqlExpr::Paren(expr) | SqlExpr::Cast { expr, .. } => Self::expr_contains_aggregate(expr),
@@ -3980,6 +4426,12 @@ impl ApexExecutor {
                         g.iter().filter_map(|&i| if float_array.is_null(i) { None } else { Some(float_array.value(i)) }).reduce(f64::min)
                     }).collect();
                     Ok((Field::new(&output_name, ArrowDataType::Float64, true), Arc::new(Float64Array::from(mins))))
+                } else if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+                    let mins: Vec<Option<String>> = group_indices.iter().map(|g| {
+                        g.iter().filter_map(|&i| if string_array.is_null(i) { None } else { Some(string_array.value(i)) })
+                            .min().map(str::to_string)
+                    }).collect();
+                    Ok((Field::new(&output_name, ArrowDataType::Utf8, true), Arc::new(StringArray::from(mins))))
                 } else {
                     Err(err_data( "MIN requires numeric column"))
                 }
@@ -3998,6 +4450,12 @@ impl ApexExecutor {
                         g.iter().filter_map(|&i| if float_array.is_null(i) { None } else { Some(float_array.value(i)) }).reduce(f64::max)
                     }).collect();
                     Ok((Field::new(&output_name, ArrowDataType::Float64, true), Arc::new(Float64Array::from(maxs))))
+                } else if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+                    let maxs: Vec<Option<String>> = group_indices.iter().map(|g| {
+                        g.iter().filter_map(|&i| if string_array.is_null(i) { None } else { Some(string_array.value(i)) })
+                            .max().map(str::to_string)
+                    }).collect();
+                    Ok((Field::new(&output_name, ArrowDataType::Utf8, true), Arc::new(StringArray::from(maxs))))
                 } else {
                     Err(err_data( "MAX requires numeric column"))
                 }

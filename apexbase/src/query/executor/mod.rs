@@ -56,6 +56,16 @@ use std::hash::{Hash, Hasher};
 static SQL_PARSE_CACHE: Lazy<RwLock<AHashMap<String, Vec<SqlStatement>>>> =
     Lazy::new(|| RwLock::new(AHashMap::new()));
 
+// Shared CTEs are immutable within one statement. Keep their Arrow batch in
+// memory for the statement lifetime instead of serializing multi-million-row
+// EXPLODE results to a temporary Apex file and reading them back repeatedly.
+static CTE_BATCH_CACHE: Lazy<DashMap<PathBuf, RecordBatch>> = Lazy::new(DashMap::new);
+static CTE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn get_cached_cte_batch(path: &Path) -> Option<RecordBatch> {
+    CTE_BATCH_CACHE.get(path).map(|entry| entry.value().clone())
+}
+
 // ============================================================================
 // Thread-local root directory for multi-database cross-db table resolution
 // Set by Python bindings before calling execute_with_base_dir when a named
@@ -825,7 +835,12 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     }
 
     // Open the file once — gives us both existence check and metadata without a separate stat()
-    let file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to open table '{}': {}", path.display(), error),
+        )
+    })?;
     let metadata = file.metadata()?;
     let file_len = metadata.len();
     let modified = metadata
@@ -1098,6 +1113,15 @@ impl ApexExecutor {
             } => SqlStatement::InsertSelect {
                 table,
                 columns,
+                query: Box::new(Self::rewrite_statement_views(*query, views)),
+            },
+            SqlStatement::InsertOverwrite {
+                table,
+                partition,
+                query,
+            } => SqlStatement::InsertOverwrite {
+                table,
+                partition,
                 query: Box::new(Self::rewrite_statement_views(*query, views)),
             },
             SqlStatement::CreateTableAs {
@@ -1937,6 +1961,17 @@ impl ApexExecutor {
                     )
                 })
             }
+            SqlStatement::InsertOverwrite { partition, query, .. } => {
+                with_table_write_lock(storage_path, || {
+                    Self::execute_insert_overwrite(
+                        storage_path,
+                        &partition,
+                        *query,
+                        storage_path.parent().unwrap_or(Path::new(".")),
+                        storage_path,
+                    )
+                })
+            }
             SqlStatement::Delete { where_clause, .. } => {
                 with_table_write_lock(storage_path, || {
                     Self::execute_delete(storage_path, where_clause.as_ref())
@@ -2116,6 +2151,22 @@ impl ApexExecutor {
                     Self::execute_insert_select(
                         &table_path,
                         columns.as_deref(),
+                        *query,
+                        base_dir,
+                        default_table_path,
+                    )
+                })
+            }
+            SqlStatement::InsertOverwrite {
+                table,
+                partition,
+                query,
+            } => {
+                let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                with_table_write_lock(&table_path, || {
+                    Self::execute_insert_overwrite(
+                        &table_path,
+                        &partition,
                         *query,
                         base_dir,
                         default_table_path,
@@ -2309,6 +2360,7 @@ impl ApexExecutor {
                 SqlStatement::Insert { .. }
                     | SqlStatement::InsertOnConflict { .. }
                     | SqlStatement::InsertSelect { .. }
+                    | SqlStatement::InsertOverwrite { .. }
                     | SqlStatement::Delete { .. }
                     | SqlStatement::Update { .. }
                     | SqlStatement::TruncateTable { .. }

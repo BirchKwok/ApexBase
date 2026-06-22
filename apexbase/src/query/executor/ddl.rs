@@ -309,6 +309,9 @@ impl ApexExecutor {
                             let alias_str = alias.as_ref().map(|a| format!(" AS {}", a)).unwrap_or_default();
                             plan_lines.push(format!("  DirectFile: '{}'{}", file, alias_str));
                         }
+                        FromItem::LateralExplode { .. } | FromItem::LateralStack { .. } => {
+                            plan_lines.push("  Scan: lateral view".to_string());
+                        }
                     }
                 }
                 // JOINs
@@ -326,6 +329,8 @@ impl ApexExecutor {
                         FromItem::TableFunction { func, file, .. } => format!("{}('{}')", func, file),
                         FromItem::TopkDistance { col, k, metric, .. } => format!("topk_distance({}, k={}, metric='{}')", col, k, metric),
                         FromItem::DirectFile { file, .. } => format!("'{}'", file),
+                        FromItem::LateralExplode { table_alias, .. } => format!("LATERAL VIEW EXPLODE AS {}", table_alias),
+                        FromItem::LateralStack { table_alias, .. } => format!("LATERAL VIEW STACK AS {}", table_alias),
                     };
                     plan_lines.push(format!("  {}: {}", jt, table_name));
                 }
@@ -434,8 +439,13 @@ impl ApexExecutor {
     /// Execute CTE (WITH name AS (...) main_query)
     /// Materializes the CTE body into a temp table and rewrites the main query to reference it.
     /// For recursive CTEs, implements iterative fixpoint: anchor UNION ALL recursive until no new rows.
-    fn execute_cte(name: &str, column_aliases: &[String], body: SqlStatement, main: SqlStatement, recursive: bool, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
-        let temp_path = base_dir.join(format!("__cte_{}_{}.apex", name, std::process::id()));
+    fn execute_cte(name: &str, column_aliases: &[String], body: SqlStatement, mut main: SqlStatement, recursive: bool, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+        let temp_path = base_dir.join(format!(
+            "__cte_{}_{}_{}.apex",
+            name,
+            std::process::id(),
+            CTE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         
         // Helper: materialize a RecordBatch into a temp table (create or append)
         let materialize_batch = |batch: &RecordBatch, path: &Path, create: bool| -> io::Result<()> {
@@ -547,17 +557,28 @@ impl ApexExecutor {
             Self::cleanup_temp_table(&temp_path);
             result
         } else {
-            // Non-recursive CTE: materialize body, execute main
+            // A single-use CTE does not need a row-wise round trip through a
+            // temporary Apex file. Keep shared CTEs materialized so repeated
+            // references still execute the body only once.
+            if column_aliases.is_empty()
+                && matches!(&body, SqlStatement::Select(_) | SqlStatement::Union(_))
+                && Self::visit_cte_references_in_statement(&mut main, name, None, None) == 1
+            {
+                Self::visit_cte_references_in_statement(&mut main, name, Some(&body), None);
+                return Self::execute_parsed_multi(main, base_dir, default_table_path);
+            }
+
+            // Shared non-recursive CTE: retain one immutable Arrow batch and let
+            // every consumer clone its buffers at zero copy.
             let cte_result = Self::execute_parsed_multi(body, base_dir, default_table_path)?;
             let mut cte_batch = cte_result.to_record_batch()
                 .map_err(|e| err_data(format!("CTE body must return a result set: {}", e)))?;
             if !column_aliases.is_empty() {
                 cte_batch = Self::remap_batch_columns(&cte_batch, column_aliases)?;
             }
-            materialize_batch(&cte_batch, &temp_path, true)?;
-
+            CTE_BATCH_CACHE.insert(temp_path.clone(), cte_batch);
             let result = Self::execute_main_with_cte(name, main, base_dir, default_table_path, &temp_path)?;
-            Self::cleanup_temp_table(&temp_path);
+            CTE_BATCH_CACHE.remove(&temp_path);
             result
         }
     }
@@ -565,17 +586,25 @@ impl ApexExecutor {
     /// Helper: insert a RecordBatch into a TableStorageBackend
     fn insert_batch_into_backend(backend: &TableStorageBackend, batch: &RecordBatch) -> io::Result<()> {
         let schema = batch.schema();
-        let mut rows: Vec<std::collections::HashMap<String, crate::data::Value>> = Vec::with_capacity(batch.num_rows());
-        for row_idx in 0..batch.num_rows() {
-            let mut row = std::collections::HashMap::new();
-            for (col_idx, field) in schema.fields().iter().enumerate() {
-                let col = batch.column(col_idx);
-                let val = Self::arrow_value_at_col(col, row_idx);
-                row.insert(field.name().clone(), val);
+        // Keep shared-CTE materialization memory bounded. A Hive EXPLODE can turn
+        // one million source rows into several million intermediate rows; building
+        // one HashMap vector for the entire batch would otherwise dominate memory.
+        const CHUNK_ROWS: usize = 8192;
+        for start in (0..batch.num_rows()).step_by(CHUNK_ROWS) {
+            let end = (start + CHUNK_ROWS).min(batch.num_rows());
+            let mut rows: Vec<std::collections::HashMap<String, crate::data::Value>> =
+                Vec::with_capacity(end - start);
+            for row_idx in start..end {
+                let mut row = std::collections::HashMap::with_capacity(schema.fields().len());
+                for (col_idx, field) in schema.fields().iter().enumerate() {
+                    let col = batch.column(col_idx);
+                    let val = Self::arrow_value_at_col(col, row_idx);
+                    row.insert(field.name().clone(), val);
+                }
+                rows.push(row);
             }
-            rows.push(row);
+            backend.insert_rows(&rows)?;
         }
-        backend.insert_rows(&rows)?;
         Ok(())
     }
     
@@ -584,44 +613,335 @@ impl ApexExecutor {
         let temp_table_name = temp_path.file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        
-        match main {
-            SqlStatement::Cte { name: inner_name, column_aliases: inner_aliases, body: mut inner_body, main: inner_main, recursive: inner_recursive } => {
-                // Rewrite outer CTE references inside inner CTE's body (chained CTEs)
-                if let SqlStatement::Select(ref mut sel) = *inner_body {
-                    Self::rewrite_cte_references_in_select(sel, name, &temp_table_name);
+
+        let mut rewritten = main;
+        Self::visit_cte_references_in_statement(
+            &mut rewritten,
+            name,
+            None,
+            Some(&temp_table_name),
+        );
+        Ok(Self::execute_parsed_multi(rewritten, base_dir, default_table_path))
+    }
+
+    /// Visit every visible CTE relation reference. With no replacement this
+    /// only counts references; otherwise it rewrites them in the same pass.
+    fn visit_cte_references_in_statement(
+        stmt: &mut SqlStatement,
+        cte_name: &str,
+        inline_body: Option<&SqlStatement>,
+        temp_table_name: Option<&str>,
+    ) -> usize {
+        match stmt {
+            SqlStatement::Select(select) => Self::visit_cte_references_in_select(
+                select,
+                cte_name,
+                inline_body,
+                temp_table_name,
+            ),
+            SqlStatement::Union(union) => {
+                Self::visit_cte_references_in_statement(
+                    &mut union.left,
+                    cte_name,
+                    inline_body,
+                    temp_table_name,
+                ) + Self::visit_cte_references_in_statement(
+                    &mut union.right,
+                    cte_name,
+                    inline_body,
+                    temp_table_name,
+                )
+            }
+            SqlStatement::Cte { name, body, main, .. } => {
+                if name.eq_ignore_ascii_case(cte_name) {
+                    0
+                } else {
+                    Self::visit_cte_references_in_statement(
+                        body,
+                        cte_name,
+                        inline_body,
+                        temp_table_name,
+                    ) + Self::visit_cte_references_in_statement(
+                        main,
+                        cte_name,
+                        inline_body,
+                        temp_table_name,
+                    )
                 }
-                Ok(Self::execute_cte(&inner_name, &inner_aliases, *inner_body, *inner_main, inner_recursive, base_dir, temp_path))
             }
-            SqlStatement::Select(mut select) => {
-                Self::rewrite_cte_references_in_select(&mut select, name, &temp_table_name);
-                Ok(Self::execute_parsed_multi(SqlStatement::Select(select), base_dir, default_table_path))
+            SqlStatement::InsertSelect { query, .. }
+            | SqlStatement::InsertOverwrite { query, .. }
+            | SqlStatement::CreateTableAs { query, .. }
+            | SqlStatement::Explain { stmt: query, .. } => {
+                Self::visit_cte_references_in_statement(
+                    query,
+                    cte_name,
+                    inline_body,
+                    temp_table_name,
+                )
             }
-            other => Ok(Self::execute_parsed_multi(other, base_dir, default_table_path)),
+            SqlStatement::CreateView { stmt, .. } => Self::visit_cte_references_in_select(
+                stmt,
+                cte_name,
+                inline_body,
+                temp_table_name,
+            ),
+            SqlStatement::Delete { where_clause, .. } => where_clause.as_mut().map_or(0, |expr| {
+                Self::visit_cte_references_in_expr(
+                    expr,
+                    cte_name,
+                    inline_body,
+                    temp_table_name,
+                )
+            }),
+            SqlStatement::Update { assignments, where_clause, .. } => {
+                assignments
+                    .iter_mut()
+                    .map(|(_, expr)| {
+                        Self::visit_cte_references_in_expr(
+                            expr,
+                            cte_name,
+                            inline_body,
+                            temp_table_name,
+                        )
+                    })
+                    .sum::<usize>()
+                    + where_clause.as_mut().map_or(0, |expr| {
+                        Self::visit_cte_references_in_expr(
+                            expr,
+                            cte_name,
+                            inline_body,
+                            temp_table_name,
+                        )
+                    })
+            }
+            SqlStatement::InsertOnConflict { do_update, .. } => do_update.as_mut().map_or(0, |items| {
+                items
+                    .iter_mut()
+                    .map(|(_, expr)| {
+                        Self::visit_cte_references_in_expr(
+                            expr,
+                            cte_name,
+                            inline_body,
+                            temp_table_name,
+                        )
+                    })
+                    .sum()
+            }),
+            _ => 0,
         }
     }
-    
-    /// Helper: rewrite FROM/JOIN references to CTE name → temp table name
-    fn rewrite_cte_references_in_select(select: &mut SelectStatement, cte_name: &str, temp_table_name: &str) {
-        if let Some(ref from) = select.from {
-            if let FromItem::Table { table, .. } = from {
-                if table.eq_ignore_ascii_case(cte_name) {
-                    select.from = Some(FromItem::Table { table: temp_table_name.to_string(), alias: Some(cte_name.to_string()) });
+
+    fn visit_cte_references_in_select(
+        select: &mut SelectStatement,
+        cte_name: &str,
+        inline_body: Option<&SqlStatement>,
+        temp_table_name: Option<&str>,
+    ) -> usize {
+        let mut count = select.from.as_mut().map_or(0, |from| {
+            Self::visit_cte_references_in_from(
+                from,
+                cte_name,
+                inline_body,
+                temp_table_name,
+            )
+        });
+        for join in &mut select.joins {
+            count += Self::visit_cte_references_in_from(
+                &mut join.right,
+                cte_name,
+                inline_body,
+                temp_table_name,
+            );
+            count += Self::visit_cte_references_in_expr(
+                &mut join.on,
+                cte_name,
+                inline_body,
+                temp_table_name,
+            );
+        }
+        for column in &mut select.columns {
+            match column {
+                SelectColumn::Expression { expr, .. } => {
+                    count += Self::visit_cte_references_in_expr(
+                        expr,
+                        cte_name,
+                        inline_body,
+                        temp_table_name,
+                    );
                 }
+                SelectColumn::AllReplace(items) => {
+                    for (expr, _) in items {
+                        count += Self::visit_cte_references_in_expr(
+                            expr,
+                            cte_name,
+                            inline_body,
+                            temp_table_name,
+                        );
+                    }
+                }
+                _ => {}
             }
         }
-        for join in &mut select.joins {
-            if let FromItem::Table { table, alias } = &join.right {
-                if table.eq_ignore_ascii_case(cte_name) {
-                    join.right = FromItem::Table {
-                        table: temp_table_name.to_string(),
-                        alias: Some(alias.clone().unwrap_or_else(|| cte_name.to_string())),
+        for expr in select.group_by_exprs.iter_mut().flatten() {
+            count += Self::visit_cte_references_in_expr(
+                expr,
+                cte_name,
+                inline_body,
+                temp_table_name,
+            );
+        }
+        for expr in [&mut select.where_clause, &mut select.having]
+            .into_iter()
+            .flatten()
+        {
+            count += Self::visit_cte_references_in_expr(
+                expr,
+                cte_name,
+                inline_body,
+                temp_table_name,
+            );
+        }
+        for order in &mut select.order_by {
+            if let Some(expr) = &mut order.expr {
+                count += Self::visit_cte_references_in_expr(
+                    expr,
+                    cte_name,
+                    inline_body,
+                    temp_table_name,
+                );
+            }
+        }
+        count
+    }
+
+    fn visit_cte_references_in_from(
+        from: &mut FromItem,
+        cte_name: &str,
+        inline_body: Option<&SqlStatement>,
+        temp_table_name: Option<&str>,
+    ) -> usize {
+        match from {
+            FromItem::Table { table, alias } if table.eq_ignore_ascii_case(cte_name) => {
+                if inline_body.is_some() || temp_table_name.is_some() {
+                    let alias = alias.clone().unwrap_or_else(|| cte_name.to_string());
+                    *from = if let Some(body) = inline_body {
+                        FromItem::Subquery {
+                            stmt: Box::new(body.clone()),
+                            alias,
+                        }
+                    } else {
+                        FromItem::Table {
+                            table: temp_table_name.unwrap().to_string(),
+                            alias: Some(alias),
+                        }
                     };
                 }
+                1
             }
+            FromItem::Subquery { stmt, .. } => Self::visit_cte_references_in_statement(
+                stmt,
+                cte_name,
+                inline_body,
+                temp_table_name,
+            ),
+            _ => 0,
         }
     }
-    
+
+    fn visit_cte_references_in_expr(
+        expr: &mut SqlExpr,
+        cte_name: &str,
+        inline_body: Option<&SqlStatement>,
+        temp_table_name: Option<&str>,
+    ) -> usize {
+        match expr {
+            SqlExpr::BinaryOp { left, right, .. } => {
+                Self::visit_cte_references_in_expr(
+                    left,
+                    cte_name,
+                    inline_body,
+                    temp_table_name,
+                ) + Self::visit_cte_references_in_expr(
+                    right,
+                    cte_name,
+                    inline_body,
+                    temp_table_name,
+                )
+            }
+            SqlExpr::UnaryOp { expr, .. }
+            | SqlExpr::Cast { expr, .. }
+            | SqlExpr::Paren(expr)
+            | SqlExpr::ExplodeRename { inner: expr, .. } => Self::visit_cte_references_in_expr(
+                expr,
+                cte_name,
+                inline_body,
+                temp_table_name,
+            ),
+            SqlExpr::InSubquery { stmt, .. }
+            | SqlExpr::ExistsSubquery { stmt }
+            | SqlExpr::ScalarSubquery { stmt } => Self::visit_cte_references_in_select(
+                stmt,
+                cte_name,
+                inline_body,
+                temp_table_name,
+            ),
+            SqlExpr::Case { when_then, else_expr } => {
+                let branches = when_then
+                    .iter_mut()
+                    .map(|(when, then)| {
+                        Self::visit_cte_references_in_expr(
+                            when,
+                            cte_name,
+                            inline_body,
+                            temp_table_name,
+                        ) + Self::visit_cte_references_in_expr(
+                            then,
+                            cte_name,
+                            inline_body,
+                            temp_table_name,
+                        )
+                    })
+                    .sum::<usize>();
+                branches
+                    + else_expr.as_mut().map_or(0, |expr| {
+                        Self::visit_cte_references_in_expr(
+                            expr,
+                            cte_name,
+                            inline_body,
+                            temp_table_name,
+                        )
+                    })
+            }
+            SqlExpr::Between { low, high, .. }
+            | SqlExpr::ArrayIndex { array: low, index: high } => {
+                Self::visit_cte_references_in_expr(
+                    low,
+                    cte_name,
+                    inline_body,
+                    temp_table_name,
+                ) + Self::visit_cte_references_in_expr(
+                    high,
+                    cte_name,
+                    inline_body,
+                    temp_table_name,
+                )
+            }
+            SqlExpr::Function { args, .. } => args
+                .iter_mut()
+                .map(|expr| {
+                    Self::visit_cte_references_in_expr(
+                        expr,
+                        cte_name,
+                        inline_body,
+                        temp_table_name,
+                    )
+                })
+                .sum(),
+            _ => 0,
+        }
+    }
+
     /// Helper: remap a RecordBatch's column names by position to match target names.
     /// Used in recursive CTEs where the recursive part may have different column names than the anchor.
     fn remap_batch_columns(batch: &RecordBatch, target_names: &[String]) -> io::Result<RecordBatch> {
@@ -641,6 +961,7 @@ impl ApexExecutor {
     
     /// Helper: clean up temp CTE files
     fn cleanup_temp_table(path: &Path) {
+        CTE_BATCH_CACHE.remove(path);
         let delta_path = Self::delta_path_for_table(path);
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path.with_extension("apex.wal"));
@@ -722,6 +1043,100 @@ impl ApexExecutor {
         };
 
         Self::execute_insert(target_path, col_names.as_deref(), &values)
+    }
+
+    /// Hive-compatible `INSERT OVERWRITE TABLE ... PARTITION (...) SELECT ...`.
+    /// A static partition is replaced atomically under the caller's table lock;
+    /// without PARTITION the whole table is replaced.
+    fn execute_insert_overwrite(
+        target_path: &Path,
+        partition: &[(String, Value)],
+        query: SqlStatement,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<ApexResult> {
+        let select_result = Self::execute_parsed_multi(query, base_dir, default_table_path)?;
+        let select_batch = select_result
+            .to_record_batch()
+            .map_err(|e| err_data(format!("INSERT OVERWRITE query must return rows: {}", e)))?;
+
+        if !target_path.exists() {
+            if let Some(parent) = target_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let backend = TableStorageBackend::create(target_path)?;
+            for field in select_batch.schema().fields() {
+                if field.name() == "_id" {
+                    continue;
+                }
+                let ty = match field.data_type() {
+                    ArrowDataType::Int64 | ArrowDataType::UInt64 => DataType::Int64,
+                    ArrowDataType::Float64 => DataType::Float64,
+                    ArrowDataType::Boolean => DataType::Bool,
+                    _ => DataType::String,
+                };
+                backend.add_column(field.name(), ty)?;
+            }
+            for (name, value) in partition {
+                let ty = match value {
+                    Value::Int64(_) => DataType::Int64,
+                    Value::Float64(_) => DataType::Float64,
+                    Value::Bool(_) => DataType::Bool,
+                    _ => DataType::String,
+                };
+                backend.add_column(name, ty)?;
+            }
+            backend.save()?;
+            invalidate_storage_cache(target_path);
+        }
+
+        if partition.is_empty() {
+            Self::execute_truncate(target_path)?;
+        } else {
+            let predicate = partition.iter().fold(None, |acc, (column, value)| {
+                let equality = SqlExpr::BinaryOp {
+                    left: Box::new(SqlExpr::Column(column.clone())),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(SqlExpr::Literal(value.clone())),
+                };
+                Some(match acc {
+                    None => equality,
+                    Some(left) => SqlExpr::BinaryOp {
+                        left: Box::new(left),
+                        op: BinaryOperator::And,
+                        right: Box::new(equality),
+                    },
+                })
+            });
+            Self::execute_delete(target_path, predicate.as_ref())?;
+        }
+
+        if select_batch.num_rows() == 0 {
+            return Ok(ApexResult::Scalar(0));
+        }
+        let data_columns: Vec<(usize, String)> = select_batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.name() != "_id")
+            .map(|(i, f)| (i, f.name().clone()))
+            .collect();
+        let mut column_names: Vec<String> = data_columns.iter().map(|(_, n)| n.clone()).collect();
+        column_names.extend(partition.iter().map(|(n, _)| n.clone()));
+        let mut rows = Vec::with_capacity(select_batch.num_rows());
+        for row_index in 0..select_batch.num_rows() {
+            let mut row = Vec::with_capacity(column_names.len());
+            for (column_index, _) in &data_columns {
+                row.push(Self::arrow_value_at_col(
+                    select_batch.column(*column_index),
+                    row_index,
+                ));
+            }
+            row.extend(partition.iter().map(|(_, v)| v.clone()));
+            rows.push(row);
+        }
+        Self::execute_insert(target_path, Some(&column_names), &rows)
     }
 
     /// Execute CREATE TABLE ... AS SELECT statement

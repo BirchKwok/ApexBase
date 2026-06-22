@@ -351,6 +351,9 @@ pub fn classify(sql: &str) -> QuerySignature {
     {
         return QuerySignature::Complex;
     }
+    if su.contains("LATERAL VIEW") || su.contains("DISTRIBUTE BY") || su.contains("SORT BY") {
+        return QuerySignature::Complex;
+    }
 
     // Guard flags for modifier keywords
     let has_where = su.contains("WHERE");

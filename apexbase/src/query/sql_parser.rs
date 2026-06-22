@@ -109,6 +109,11 @@ pub enum SqlStatement {
         columns: Option<Vec<String>>,
         query: Box<SqlStatement>,
     },
+    InsertOverwrite {
+        table: String,
+        partition: Vec<(String, Value)>,
+        query: Box<SqlStatement>,
+    },
     CreateTableAs {
         table: String,
         query: Box<SqlStatement>,
@@ -251,6 +256,20 @@ pub enum FromItem {
     },
     /// DuckDB-style direct file reading: `SELECT * FROM 'path/file.parquet'`
     DirectFile { file: String, alias: Option<String> },
+    /// Hive `LATERAL VIEW [OUTER] explode(expr) alias AS column`.
+    LateralExplode {
+        expr: SqlExpr,
+        table_alias: String,
+        column_alias: String,
+        outer: bool,
+    },
+    /// Hive `LATERAL VIEW stack(n, ...) alias AS col1, ...`.
+    LateralStack {
+        rows: usize,
+        values: Vec<SqlExpr>,
+        table_alias: String,
+        column_aliases: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -555,10 +574,11 @@ impl SelectStatement {
                     }
                 }
                 SelectColumn::ColumnAlias { column, .. } => {
-                    if column == "_id" {
+                    let actual_name = column.rsplit('.').next().unwrap_or(column);
+                    if actual_name == "_id" {
                         has_explicit_id = true;
                     } else {
-                        columns.push(column.clone());
+                        columns.push(actual_name.to_string());
                     }
                 }
                 SelectColumn::Aggregate { column, .. } => {
@@ -589,17 +609,17 @@ impl SelectStatement {
                     // Add columns from args (for LAG/LEAD)
                     for arg in args {
                         if !arg.starts_with("Int") && !arg.starts_with("Float") && arg != "_id" {
-                            columns.push(arg.clone());
+                            columns.push(arg.rsplit('.').next().unwrap_or(arg).to_string());
                         }
                     }
                     for col in partition_by {
                         if col != "_id" {
-                            columns.push(col.clone());
+                            columns.push(col.rsplit('.').next().unwrap_or(col).to_string());
                         }
                     }
                     for ob in order_by {
                         if ob.column != "_id" {
-                            columns.push(ob.column.clone());
+                            columns.push(ob.column.rsplit('.').next().unwrap_or(&ob.column).to_string());
                         }
                     }
                 }
@@ -902,11 +922,108 @@ enum Token {
 }
 
 impl SqlParser {
+    fn split_hive_csv(input: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut start = 0;
+        let mut depth = 0i32;
+        let mut quote = None;
+        let bytes = input.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let ch = bytes[i] as char;
+            if let Some(q) = quote {
+                if ch == q {
+                    if i + 1 < bytes.len() && bytes[i + 1] as char == q {
+                        i += 1;
+                    } else {
+                        quote = None;
+                    }
+                } else if ch == '\\' {
+                    i += 1;
+                }
+            } else {
+                match ch {
+                    '\'' | '"' => quote = Some(ch),
+                    '(' | '[' => depth += 1,
+                    ')' | ']' => depth -= 1,
+                    ',' if depth == 0 => {
+                        parts.push(input[start..i].trim().to_string());
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        parts.push(input[start..].trim().to_string());
+        parts
+    }
+
+    /// Lower Hive's virtual-table form `SELECT stack(...) AS (c1, ...)`
+    /// into an equivalent UNION ALL before tokenization. LATERAL VIEW stack
+    /// remains a physical relation operator and is parsed separately.
+    fn rewrite_hive_stack_selects(sql: &str) -> Result<String, ApexError> {
+        // Nearly every ordinary query has no STACK. Avoid compiling the Hive-only
+        // regex on the hot parser path (notably thousands of short OLTP queries).
+        if !sql
+            .as_bytes()
+            .windows(5)
+            .any(|window| window.eq_ignore_ascii_case(b"stack"))
+        {
+            return Ok(sql.to_string());
+        }
+        let re = regex::Regex::new(
+            r"(?is)\bSELECT\s+stack\s*\(\s*(\d+)\s*,(.*?)\)\s+AS\s*\(([^)]*)\)",
+        )
+        .map_err(|e| ApexError::QueryParseError(e.to_string()))?;
+        let mut out = String::with_capacity(sql.len());
+        let mut last = 0;
+        for caps in re.captures_iter(sql) {
+            let whole = caps.get(0).unwrap();
+            out.push_str(&sql[last..whole.start()]);
+            let rows: usize = caps[1].parse().map_err(|_| {
+                ApexError::QueryParseError("STACK row count must be positive".to_string())
+            })?;
+            let values = Self::split_hive_csv(&caps[2]);
+            let aliases = Self::split_hive_csv(&caps[3]);
+            if rows == 0 || aliases.is_empty() || values.len() != rows * aliases.len() {
+                return Err(ApexError::QueryParseError(format!(
+                    "STACK expected {} values for {} rows and {} columns, got {}",
+                    rows * aliases.len(),
+                    rows,
+                    aliases.len(),
+                    values.len()
+                )));
+            }
+            for row in 0..rows {
+                if row > 0 {
+                    out.push_str(" UNION ALL ");
+                }
+                out.push_str("SELECT ");
+                for (col, alias) in aliases.iter().enumerate() {
+                    if col > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&values[row * aliases.len() + col]);
+                    out.push_str(" AS ");
+                    out.push_str(alias);
+                }
+            }
+            last = whole.end();
+        }
+        if last == 0 {
+            return Ok(sql.to_string());
+        }
+        out.push_str(&sql[last..]);
+        Ok(out)
+    }
+
     /// Parse a SQL statement
     pub fn parse(sql: &str) -> Result<SqlStatement, ApexError> {
-        let tokens = Self::tokenize(sql)?;
+        let rewritten = Self::rewrite_hive_stack_selects(sql)?;
+        let tokens = Self::tokenize(&rewritten)?;
         let mut parser = SqlParser {
-            sql_raw: sql.to_owned(),
+            sql_raw: rewritten,
             sql_chars: None,
             tokens,
             pos: 0,
@@ -930,9 +1047,10 @@ impl SqlParser {
 
     /// Parse multiple SQL statements separated by semicolons.
     pub fn parse_multi(sql: &str) -> Result<Vec<SqlStatement>, ApexError> {
-        let tokens = Self::tokenize(sql)?;
+        let rewritten = Self::rewrite_hive_stack_selects(sql)?;
+        let tokens = Self::tokenize(&rewritten)?;
         let mut parser = SqlParser {
-            sql_raw: sql.to_owned(),
+            sql_raw: rewritten,
             sql_chars: None,
             tokens,
             pos: 0,
@@ -2204,6 +2322,41 @@ impl SqlParser {
             }
             Token::Insert => {
                 self.advance();
+                if matches!(self.current(), Token::Identifier(s) if s.eq_ignore_ascii_case("OVERWRITE")) {
+                    self.advance();
+                    if matches!(self.current(), Token::Table) {
+                        self.advance();
+                    }
+                    let table = self.parse_table_name()?;
+                    let mut partition = Vec::new();
+                    if matches!(self.current(), Token::Partition) {
+                        self.advance();
+                        self.expect(Token::LParen)?;
+                        loop {
+                            let column = self.parse_identifier()?;
+                            self.expect(Token::Eq)?;
+                            let value = self.parse_literal_value()?;
+                            partition.push((column, value));
+                            if matches!(self.current(), Token::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        self.expect(Token::RParen)?;
+                    }
+                    if !matches!(self.current(), Token::Select | Token::With) {
+                        return Err(ApexError::QueryParseError(
+                            "INSERT OVERWRITE requires SELECT or WITH query".to_string(),
+                        ));
+                    }
+                    let query = self.parse_statement()?;
+                    return Ok(SqlStatement::InsertOverwrite {
+                        table,
+                        partition,
+                        query: Box::new(query),
+                    });
+                }
                 self.expect(Token::Into)?;
                 let table = self.parse_table_name()?;
                 // Optional column list
@@ -2782,7 +2935,11 @@ impl SqlParser {
                         // Only consume an identifier as alias if it doesn't look like
                         // a misspelled keyword (e.g., "joinn" should NOT be an alias).
                         let alias = if let Token::Identifier(a) = self.current().clone() {
-                            if a.len() >= 4 && self.is_likely_misspelled_keyword(&a) {
+                            if a.eq_ignore_ascii_case("DISTRIBUTE")
+                                || a.eq_ignore_ascii_case("SORT")
+                                || a.eq_ignore_ascii_case("LATERAL")
+                                || (a.len() >= 4 && self.is_likely_misspelled_keyword(&a))
+                            {
                                 None
                             } else {
                                 self.advance();
@@ -3079,6 +3236,88 @@ impl SqlParser {
             });
         }
 
+        // Hive row-generating relations:
+        //   LATERAL VIEW [OUTER] explode(expr) t AS col
+        //   LATERAL VIEW stack(n, ...) t AS col1, col2
+        while matches!(self.current(), Token::Identifier(s) if s.eq_ignore_ascii_case("LATERAL")) {
+            self.advance();
+            self.expect(Token::View)?;
+            let outer = if matches!(self.current(), Token::Outer) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            let function = self.parse_identifier()?.to_uppercase();
+            self.expect(Token::LParen)?;
+            let right = match function.as_str() {
+                "EXPLODE" => {
+                    let expr = self.parse_expr()?;
+                    self.expect(Token::RParen)?;
+                    let table_alias = self.parse_identifier()?;
+                    self.expect(Token::As)?;
+                    let column_alias = self.parse_identifier()?;
+                    FromItem::LateralExplode {
+                        expr,
+                        table_alias,
+                        column_alias,
+                        outer,
+                    }
+                }
+                "STACK" => {
+                    let rows = match self.current().clone() {
+                        Token::IntLit(n) if n > 0 => {
+                            self.advance();
+                            n as usize
+                        }
+                        other => {
+                            return Err(ApexError::QueryParseError(format!(
+                                "STACK requires a positive row count, got {:?}",
+                                other
+                            )))
+                        }
+                    };
+                    let mut values = Vec::new();
+                    while matches!(self.current(), Token::Comma) {
+                        self.advance();
+                        values.push(self.parse_expr()?);
+                    }
+                    self.expect(Token::RParen)?;
+                    let table_alias = self.parse_identifier()?;
+                    self.expect(Token::As)?;
+                    let mut column_aliases = vec![self.parse_identifier()?];
+                    while matches!(self.current(), Token::Comma) {
+                        self.advance();
+                        column_aliases.push(self.parse_identifier()?);
+                    }
+                    if values.len() != rows * column_aliases.len() {
+                        return Err(ApexError::QueryParseError(format!(
+                            "STACK expected {} values, got {}",
+                            rows * column_aliases.len(),
+                            values.len()
+                        )));
+                    }
+                    FromItem::LateralStack {
+                        rows,
+                        values,
+                        table_alias,
+                        column_aliases,
+                    }
+                }
+                _ => {
+                    return Err(ApexError::QueryParseError(format!(
+                        "Unsupported LATERAL VIEW function {}",
+                        function
+                    )))
+                }
+            };
+            joins.push(JoinClause {
+                join_type: JoinType::Cross,
+                right,
+                on: SqlExpr::Literal(Value::Bool(true)),
+            });
+        }
+
         // WHERE
         let where_clause = if matches!(self.current(), Token::Where) {
             self.advance();
@@ -3104,8 +3343,21 @@ impl SqlParser {
             None
         };
 
-        // ORDER BY / LIMIT / OFFSET
-        let order_by = if parse_tail && matches!(self.current(), Token::Order) {
+        // Hive DISTRIBUTE BY controls reducer partitioning. In the embedded
+        // engine there is one local pipeline, so consume it as a planning hint.
+        if matches!(self.current(), Token::Identifier(s) if s.eq_ignore_ascii_case("DISTRIBUTE")) {
+            self.advance();
+            self.expect(Token::By)?;
+            let _ = self.parse_column_list()?;
+        }
+
+        // Hive SORT BY maps to the local ORDER BY implementation. Unlike SQL
+        // ORDER BY it is valid inside derived tables, hence it ignores parse_tail.
+        let order_by = if matches!(self.current(), Token::Identifier(s) if s.eq_ignore_ascii_case("SORT")) {
+            self.advance();
+            self.expect(Token::By)?;
+            self.parse_order_by()?
+        } else if parse_tail && matches!(self.current(), Token::Order) {
             self.advance();
             self.expect(Token::By)?;
             self.parse_order_by()?
@@ -3324,6 +3576,7 @@ impl SqlParser {
                     false
                 };
 
+                let mut complex_arg = None;
                 let column = if matches!(self.current(), Token::Star) {
                     if distinct {
                         let (start, _) = self.current_span();
@@ -3334,15 +3587,9 @@ impl SqlParser {
                     }
                     self.advance();
                     None
-                } else if matches!(self.current(), Token::Identifier(_)) {
-                    if distinct && func != AggregateFunc::Count {
-                        let (start, _) = self.current_span();
-                        return Err(self.syntax_error(
-                            start,
-                            "DISTINCT is only supported for COUNT".to_string(),
-                        ));
-                    }
-                    Some(self.parse_column_ref()?)
+                } else if func == AggregateFunc::Count && matches!(self.current(), Token::RParen) {
+                    // COUNT() OVER (...) is accepted as the window-count spelling.
+                    None
                 } else if func == AggregateFunc::Count
                     && matches!(
                         self.current(),
@@ -3368,10 +3615,59 @@ impl SqlParser {
                     self.advance();
                     Some(arg)
                 } else {
-                    None
+                    if distinct && func != AggregateFunc::Count {
+                        let (start, _) = self.current_span();
+                        return Err(self.syntax_error(
+                            start,
+                            "DISTINCT is only supported for COUNT".to_string(),
+                        ));
+                    }
+                    let arg = self.parse_expr()?;
+                    if let SqlExpr::Column(column) = arg {
+                        Some(column)
+                    } else {
+                        complex_arg = Some(arg);
+                        None
+                    }
                 };
 
                 self.expect(Token::RParen)?;
+
+                // Hive makes heavy use of conditional aggregates such as
+                // SUM(IF(...)) and COUNT(DISTINCT IF(...)). Keep the established
+                // fast aggregate node for simple columns, and represent complex
+                // arguments as expression aggregates for the grouped evaluator.
+                if let Some(arg) = complex_arg {
+                    if matches!(self.current(), Token::Over) {
+                        return Err(ApexError::QueryParseError(
+                            "Complex aggregate arguments in window functions are not supported"
+                                .to_string(),
+                        ));
+                    }
+                    let alias = if matches!(self.current(), Token::As) {
+                        self.advance();
+                        self.parse_alias_identifier()
+                    } else {
+                        self.parse_alias_identifier()
+                    };
+                    let name = if distinct && func == AggregateFunc::Count {
+                        "COUNT_DISTINCT".to_string()
+                    } else {
+                        func.to_string()
+                    };
+                    columns.push(SelectColumn::Expression {
+                        expr: SqlExpr::Function {
+                            name,
+                            args: vec![arg],
+                        },
+                        alias,
+                    });
+                    if matches!(self.current(), Token::Comma) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
 
                 // Check if this is a window function (has OVER clause)
                 if matches!(self.current(), Token::Over) {
@@ -3457,7 +3753,7 @@ impl SqlParser {
                     // Parse function call.
                     // If it is followed by OVER, treat it as a window function.
                     // Otherwise, treat it as a scalar expression in the SELECT list.
-                    let func_expr = self.parse_function_call_from_name(name.clone())?;
+                    let mut func_expr = self.parse_function_call_from_name(name.clone())?;
 
                     if matches!(self.current(), Token::Over) {
                         // Window function: func(args...) OVER (PARTITION BY ... ORDER BY ...)
@@ -3517,6 +3813,26 @@ impl SqlParser {
                             alias,
                         });
                     } else {
+                        while matches!(
+                            self.current(),
+                            Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent
+                        ) {
+                            let op = match self.current() {
+                                Token::Plus => BinaryOperator::Add,
+                                Token::Minus => BinaryOperator::Sub,
+                                Token::Star => BinaryOperator::Mul,
+                                Token::Slash => BinaryOperator::Div,
+                                Token::Percent => BinaryOperator::Mod,
+                                _ => unreachable!(),
+                            };
+                            self.advance();
+                            let right = self.parse_unary()?;
+                            func_expr = SqlExpr::BinaryOp {
+                                left: Box::new(func_expr),
+                                op,
+                                right: Box::new(right),
+                            };
+                        }
                         let alias = if matches!(self.current(), Token::As) {
                             self.advance();
                             self.parse_alias_identifier()
@@ -4112,6 +4428,7 @@ impl SqlParser {
     fn parse_function_call_from_name(&mut self, name: String) -> Result<SqlExpr, ApexError> {
         self.expect(Token::LParen)?;
         let upper = name.to_uppercase();
+        let mut result_name = name.clone();
 
         // topk_distance(col, [q1,q2,...], k, 'metric')
         if upper == "TOPK_DISTANCE" {
@@ -4202,6 +4519,16 @@ impl SqlParser {
             return Ok(SqlExpr::Function { name, args });
         }
 
+        if matches!(self.current(), Token::Distinct) {
+            if !name.eq_ignore_ascii_case("count") {
+                return Err(ApexError::QueryParseError(
+                    "DISTINCT in expression aggregates is only supported for COUNT".to_string(),
+                ));
+            }
+            self.advance();
+            result_name = "COUNT_DISTINCT".to_string();
+        }
+
         if !matches!(self.current(), Token::RParen) {
             loop {
                 args.push(self.parse_expr()?);
@@ -4213,7 +4540,7 @@ impl SqlParser {
             }
         }
         self.expect(Token::RParen)?;
-        let mut result = SqlExpr::Function { name, args };
+        let mut result = SqlExpr::Function { name: result_name, args };
 
         // Check for array indexing: func(...)[index]
         result = self.parse_array_index(result)?;
@@ -4378,18 +4705,32 @@ impl SqlParser {
         }
 
         if matches!(self.current(), Token::Between) {
-            let column = left_col.ok_or_else(|| {
-                ApexError::QueryParseError("BETWEEN requires column on left side".to_string())
-            })?;
             self.advance();
             let low = Box::new(self.parse_add_sub()?);
             self.expect(Token::And)?;
             let high = Box::new(self.parse_add_sub()?);
-            return Ok(SqlExpr::Between {
-                column,
-                low,
-                high,
-                negated,
+            if let Some(column) = left_col {
+                return Ok(SqlExpr::Between {
+                    column,
+                    low,
+                    high,
+                    negated,
+                });
+            }
+            let lower = SqlExpr::BinaryOp {
+                left: Box::new(left.clone()),
+                op: if negated { BinaryOperator::Lt } else { BinaryOperator::Ge },
+                right: low,
+            };
+            let upper = SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op: if negated { BinaryOperator::Gt } else { BinaryOperator::Le },
+                right: high,
+            };
+            return Ok(SqlExpr::BinaryOp {
+                left: Box::new(lower),
+                op: if negated { BinaryOperator::Or } else { BinaryOperator::And },
+                right: Box::new(upper),
             });
         }
 
@@ -4551,15 +4892,24 @@ impl SqlParser {
 
                 let mut when_then: Vec<(SqlExpr, SqlExpr)> = Vec::new();
                 let mut else_expr: Option<Box<SqlExpr>> = None;
-
-                if !matches!(self.current(), Token::When) {
-                    let (start, _) = self.current_span();
-                    return Err(self.syntax_error(start, "CASE must start with WHEN".to_string()));
-                }
+                let case_operand = if matches!(self.current(), Token::When) {
+                    None
+                } else {
+                    Some(self.parse_expr()?)
+                };
 
                 while matches!(self.current(), Token::When) {
                     self.advance();
-                    let cond = self.parse_expr()?;
+                    let candidate = self.parse_expr()?;
+                    let cond = if let Some(operand) = &case_operand {
+                        SqlExpr::BinaryOp {
+                            left: Box::new(operand.clone()),
+                            op: BinaryOperator::Eq,
+                            right: Box::new(candidate),
+                        }
+                    } else {
+                        candidate
+                    };
                     self.expect(Token::Then)?;
                     let val = self.parse_expr()?;
                     when_then.push((cond, val));
@@ -4704,6 +5054,10 @@ impl SqlParser {
             Token::Max => {
                 self.advance();
                 self.parse_function_call_from_name("max".to_string())
+            }
+            Token::If => {
+                self.advance();
+                self.parse_function_call_from_name("if".to_string())
             }
             _ => Err(ApexError::QueryParseError(format!(
                 "Unexpected token in expression: {:?}",
@@ -5665,5 +6019,28 @@ mod tests {
         let err = SqlParser::parse("SELECT `order FROM t").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Unterminated backtick-quoted identifier"));
+    }
+
+    #[test]
+    fn test_hive_lateral_view_and_stack_parse() {
+        let stmt = SqlParser::parse(
+            "SELECT b.user_id, x FROM events b \
+             LATERAL VIEW OUTER explode(split(b.items, ',')) e AS x",
+        )
+        .unwrap();
+        let SqlStatement::Select(select) = stmt else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(select.joins.len(), 1);
+        assert!(matches!(
+            select.joins[0].right,
+            FromItem::LateralExplode { outer: true, .. }
+        ));
+
+        let stmt = SqlParser::parse(
+            "SELECT stack(2, 'A', 1, 'B', 2) AS (code, value)",
+        )
+        .unwrap();
+        assert!(matches!(stmt, SqlStatement::Union(_)));
     }
 }

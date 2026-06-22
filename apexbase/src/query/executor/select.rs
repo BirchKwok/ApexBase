@@ -46,7 +46,9 @@ impl ApexExecutor {
                 | Some(FromItem::DirectFile { .. })
         );
         if !from_is_table_fn && Self::is_pure_count_star(&stmt) {
-            if !storage_path.exists() {
+            let count = if let Some(batch) = get_cached_cte_batch(storage_path) {
+                batch.num_rows() as i64
+            } else if !storage_path.exists() {
                 let tbl = storage_path
                     .file_stem()
                     .unwrap_or_default()
@@ -55,9 +57,10 @@ impl ApexExecutor {
                     io::ErrorKind::NotFound,
                     format!("Table '{}' does not exist", tbl),
                 ));
-            }
-            let backend = get_cached_backend(storage_path)?;
-            let count = backend.active_row_count() as i64;
+            } else {
+                let backend = get_cached_backend(storage_path)?;
+                backend.active_row_count() as i64
+            };
 
             let output_name =
                 if let Some(SelectColumn::Aggregate { alias, .. }) = stmt.columns.first() {
@@ -77,7 +80,15 @@ impl ApexExecutor {
         }
 
         // Check for derived table (FROM subquery) - resolve table path from subquery's FROM clause
-        let batch = match &stmt.from {
+        let cached_cte_batch = if matches!(&stmt.from, Some(FromItem::Table { .. })) {
+            get_cached_cte_batch(storage_path)
+        } else {
+            None
+        };
+        let batch = if let Some(batch) = cached_cte_batch {
+            batch
+        } else {
+            match &stmt.from {
             Some(FromItem::TopkDistance {
                 col,
                 query,
@@ -103,15 +114,26 @@ impl ApexExecutor {
                 Self::read_table_function(func, file, &opts)?
             },
             Some(FromItem::DirectFile { file, .. }) => Self::read_direct_file(file)?,
+            Some(FromItem::LateralExplode { .. } | FromItem::LateralStack { .. }) => {
+                return Err(err_input("LATERAL VIEW requires a base FROM source"));
+            }
             Some(FromItem::Subquery { stmt: sub_stmt, .. }) => match sub_stmt.as_ref() {
                 crate::query::SqlStatement::Select(sel) => {
                     let sub_path = Self::resolve_from_table_path(sel, base_dir, default_table_path);
-                    Self::execute_select_with_base_dir(
-                        sel.clone(),
-                        &sub_path,
-                        base_dir,
-                        default_table_path,
-                    )?
+                    (if sel.joins.is_empty() {
+                        Self::execute_select_with_base_dir(
+                            sel.clone(),
+                            &sub_path,
+                            base_dir,
+                            default_table_path,
+                        )
+                    } else {
+                        Self::execute_select_with_joins(
+                            sel.clone(),
+                            base_dir,
+                            default_table_path,
+                        )
+                    })?
                     .to_record_batch()?
                 }
                 crate::query::SqlStatement::Union(u) => {
@@ -769,6 +791,7 @@ impl ApexExecutor {
                     }
                 }
             }
+            }
         };
 
         // Determine row limit for early termination
@@ -811,6 +834,62 @@ impl ApexExecutor {
             .columns
             .iter()
             .any(|col| matches!(col, SelectColumn::WindowFunction { .. }));
+        if has_window && has_aggregation {
+            let grouped = if stmt.group_by.is_empty() {
+                Self::execute_aggregation(&filtered, &stmt)?
+            } else {
+                Self::execute_group_by(&filtered, &stmt)?
+            }
+            .to_record_batch()?;
+            let mut window_stmt = stmt.clone();
+            let mut window_columns = vec![SelectColumn::All];
+            for column in &stmt.columns {
+                if let SelectColumn::WindowFunction {
+                    name,
+                    args,
+                    partition_by,
+                    order_by,
+                    alias,
+                } = column
+                {
+                    let mut resolved_order = order_by.clone();
+                    for clause in &mut resolved_order {
+                        let clean = clause.column.trim_matches('"');
+                        if grouped.column_by_name(clean).is_some() {
+                            continue;
+                        }
+                        let aggregate_name = clean.split('(').next().unwrap_or(clean);
+                        if let Some(resolved) = stmt.columns.iter().find_map(|candidate| {
+                            if let SelectColumn::Expression {
+                                expr: SqlExpr::Function { name, .. },
+                                alias: Some(alias),
+                            } = candidate
+                            {
+                                if name.eq_ignore_ascii_case(aggregate_name)
+                                    || (name.eq_ignore_ascii_case("COUNT_DISTINCT")
+                                        && aggregate_name.eq_ignore_ascii_case("COUNT"))
+                                {
+                                    return Some(alias.clone());
+                                }
+                            }
+                            None
+                        }) {
+                            clause.column = resolved;
+                            clause.expr = None;
+                        }
+                    }
+                    window_columns.push(SelectColumn::WindowFunction {
+                        name: name.clone(),
+                        args: args.clone(),
+                        partition_by: partition_by.clone(),
+                        order_by: resolved_order,
+                        alias: alias.clone(),
+                    });
+                }
+            }
+            window_stmt.columns = window_columns;
+            return Self::execute_window_function(&grouped, &window_stmt);
+        }
         if has_window {
             return Self::execute_window_function(&filtered, &stmt);
         }
@@ -1965,7 +2044,11 @@ impl ApexExecutor {
         let num_groups = raw.len();
         let group_values: Vec<&str> = raw.iter().map(|(k, _)| k.as_str()).collect();
 
-        let mut fields: Vec<Field> = vec![Field::new(group_col, ArrowDataType::Utf8, false)];
+        let mut fields: Vec<Field> = vec![Field::new(
+            Self::group_output_name(stmt, group_col),
+            ArrowDataType::Utf8,
+            false,
+        )];
         let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(group_values))];
 
         for (ai, (_, _, func, alias)) in agg_info.iter().enumerate() {
@@ -2973,8 +3056,8 @@ impl ApexExecutor {
         let col2_vals: Vec<&str> = raw.iter().map(|((_, k2), _)| k2.as_str()).collect();
 
         let mut fields: Vec<Field> = vec![
-            Field::new(group_col1, ArrowDataType::Utf8, false),
-            Field::new(group_col2, ArrowDataType::Utf8, false),
+            Field::new(Self::group_output_name(stmt, group_col1), ArrowDataType::Utf8, false),
+            Field::new(Self::group_output_name(stmt, group_col2), ArrowDataType::Utf8, false),
         ];
         let mut arrays: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(col1_vals)),
