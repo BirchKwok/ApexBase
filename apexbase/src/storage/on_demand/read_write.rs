@@ -3974,7 +3974,12 @@ impl OnDemandStorage {
 
                     // Dict-encode low-cardinality string columns for disk
                     let dict_encoded;
-                    let processed: &ColumnData = if Self::should_dict_encode(chunk_col_ref) {
+                    let use_dictionary = if rg_metas.is_empty() {
+                        Self::should_dict_encode(chunk_col_ref)
+                    } else {
+                        matches!(actual_col_types.get(col_idx), Some(ColumnType::StringDict))
+                    };
+                    let processed: &ColumnData = if use_dictionary {
                         dict_encoded = chunk_col_ref
                             .to_dict_encoded()
                             .unwrap_or_else(|| chunk_col_ref.clone());

@@ -454,6 +454,11 @@ impl ApexExecutor {
         let mut per_int: Vec<Vec<Option<i64>>> = vec![vec![None; num_rows]; num_specs];
         let mut per_flt: Vec<Vec<Option<f64>>> = vec![vec![None; num_rows]; num_specs];
         let mut use_float: Vec<bool> = vec![false; num_specs];
+        // Multiple window functions in analytics SQL usually share an identical
+        // PARTITION BY / ORDER BY clause.  Hashing and sorting the million-row
+        // input independently for every ROW_NUMBER/LAG/LEAD is pure duplicate
+        // work, so retain the ordered row groups for the duration of this SELECT.
+        let mut ordered_group_cache: AHashMap<String, Vec<Vec<usize>>> = AHashMap::new();
 
         for (spec_idx, (func_name, func_args, partition_by, order_by, _)) in window_specs.iter().enumerate() {
             let src_col_name = func_args.get(0).map(|s| s.trim_matches('"').to_string());
@@ -461,36 +466,47 @@ impl ApexExecutor {
                 .map_or(false, |c| c.as_any().downcast_ref::<Float64Array>().is_some());
             use_float[spec_idx] = is_float_src || matches!(func_name.as_str(), "AVG" | "PERCENT_RANK" | "CUME_DIST");
 
-            // Build partition groups
-            let mut groups: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(num_rows / 10 + 1);
-            let part_cols: Vec<Option<&ArrayRef>> = partition_by.iter()
-                .map(|cn| Self::get_column_by_name(batch, cn.trim_matches('"')))
-                .collect();
-            for row_idx in 0..num_rows {
-                let mut hasher = AHasher::default();
-                for col_opt in &part_cols {
-                    if let Some(col) = col_opt {
-                        hasher.write_u64(Self::hash_array_value_fast(col, row_idx));
+            let cache_key = format!("{:?}|{:?}", partition_by, order_by);
+            let groups = if let Some(cached) = ordered_group_cache.get(&cache_key) {
+                cached.clone()
+            } else {
+                let mut grouped: AHashMap<u64, Vec<usize>> =
+                    AHashMap::with_capacity(num_rows / 10 + 1);
+                let part_cols: Vec<Option<&ArrayRef>> = partition_by.iter()
+                    .map(|cn| Self::get_column_by_name(batch, cn.trim_matches('"')))
+                    .collect();
+                for row_idx in 0..num_rows {
+                    let mut hasher = AHasher::default();
+                    for col_opt in &part_cols {
+                        if let Some(col) = col_opt {
+                            hasher.write_u64(Self::hash_array_value_fast(col, row_idx));
+                        }
+                    }
+                    let key = if partition_by.is_empty() { 0 } else { hasher.finish() };
+                    grouped.entry(key).or_insert_with(|| Vec::with_capacity(16)).push(row_idx);
+                }
+                let mut ordered = grouped.into_values().collect::<Vec<_>>();
+                if let Some(order) = order_by.first() {
+                    if let Some(column) =
+                        Self::get_column_by_name(batch, order.column.trim_matches('"'))
+                    {
+                        for indices in &mut ordered {
+                            indices.sort_by(|&a, &b| {
+                                let cmp = Self::compare_array_values(column, a, b);
+                                if order.descending { cmp.reverse() } else { cmp }
+                            });
+                        }
                     }
                 }
-                let key = if partition_by.is_empty() { 0 } else { hasher.finish() };
-                groups.entry(key).or_insert_with(|| Vec::with_capacity(16)).push(row_idx);
-            }
+                ordered_group_cache.insert(cache_key, ordered.clone());
+                ordered
+            };
 
-            for (_, mut indices) in groups {
-                // Sort within partition by ORDER BY
-                let order_col: Option<ArrayRef> = if !order_by.is_empty() {
-                    let ocn = order_by[0].column.trim_matches('"');
-                    let desc = order_by[0].descending;
-                    Self::get_column_by_name(batch, ocn).map(|c| {
-                        indices.sort_by(|&a, &b| {
-                            let cmp = Self::compare_array_values(c, a, b);
-                            if desc { cmp.reverse() } else { cmp }
-                        });
-                        c.clone()
-                    })
-                } else { None };
+            let order_col: Option<ArrayRef> = order_by.first().and_then(|order| {
+                Self::get_column_by_name(batch, order.column.trim_matches('"')).cloned()
+            });
 
+            for indices in groups {
                 match func_name.as_str() {
                     "ROW_NUMBER" => {
                         for (pos, &row_idx) in indices.iter().enumerate() {
@@ -767,6 +783,12 @@ impl ApexExecutor {
                         result_fields.push(field.as_ref().clone());
                         result_arrays.push(batch.column(i).clone());
                     }
+                }
+                SelectColumn::Expression { expr, alias } => {
+                    let array = Self::evaluate_expr_to_array(batch, expr)?;
+                    let name = alias.clone().unwrap_or_else(|| "expression".to_string());
+                    result_fields.push(Field::new(&name, array.data_type().clone(), true));
+                    result_arrays.push(array);
                 }
                 SelectColumn::WindowFunction { name, alias, .. } => {
                     let out_name = alias.clone().unwrap_or_else(|| name.to_lowercase());

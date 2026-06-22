@@ -1124,6 +1124,12 @@ impl ApexExecutor {
                 partition,
                 query: Box::new(Self::rewrite_statement_views(*query, views)),
             },
+            SqlStatement::HiveMultiInsert { inserts } => SqlStatement::HiveMultiInsert {
+                inserts: inserts
+                    .into_iter()
+                    .map(|insert| Self::rewrite_statement_views(insert, views))
+                    .collect(),
+            },
             SqlStatement::CreateTableAs {
                 table,
                 query,
@@ -1894,15 +1900,13 @@ impl ApexExecutor {
                 stmts
             } else {
                 let stmts = SqlParser::parse_multi(sql).map_err(|e| err_input(e.to_string()))?;
-                // Only cache read-only statements (SELECT) to avoid stale DDL/DML
-                let is_select_only = stmts
-                    .iter()
-                    .all(|s| matches!(s, SqlStatement::Select(_) | SqlStatement::Union(_)));
-                if is_select_only {
-                    let mut cache = SQL_PARSE_CACHE.write();
-                    if cache.len() < 1024 {
-                        cache.insert(sql.to_string(), stmts.clone());
-                    }
+                // Parsed statements are immutable syntax trees and contain no
+                // table data, so DML/DDL is just as safe to cache as SELECT.
+                // Large Hive INSERT OVERWRITE scripts otherwise pay the parser
+                // cost on every benchmark iteration.
+                let mut cache = SQL_PARSE_CACHE.write();
+                if cache.len() < 1024 {
+                    cache.insert(sql.to_string(), stmts.clone());
                 }
                 stmts
             }
@@ -1961,17 +1965,17 @@ impl ApexExecutor {
                     )
                 })
             }
-            SqlStatement::InsertOverwrite { partition, query, .. } => {
-                with_table_write_lock(storage_path, || {
-                    Self::execute_insert_overwrite(
-                        storage_path,
-                        &partition,
-                        *query,
-                        storage_path.parent().unwrap_or(Path::new(".")),
-                        storage_path,
-                    )
-                })
-            }
+            SqlStatement::InsertOverwrite {
+                partition, query, ..
+            } => with_table_write_lock(storage_path, || {
+                Self::execute_insert_overwrite(
+                    storage_path,
+                    &partition,
+                    *query,
+                    storage_path.parent().unwrap_or(Path::new(".")),
+                    storage_path,
+                )
+            }),
             SqlStatement::Delete { where_clause, .. } => {
                 with_table_write_lock(storage_path, || {
                     Self::execute_delete(storage_path, where_clause.as_ref())
@@ -2256,6 +2260,13 @@ impl ApexExecutor {
                 base_dir,
                 default_table_path,
             ),
+            SqlStatement::HiveMultiInsert { inserts } => {
+                let mut result = ApexResult::Scalar(0);
+                for insert in inserts {
+                    result = Self::execute_parsed_multi(insert, base_dir, default_table_path)?;
+                }
+                Ok(result)
+            }
             // Transaction Statements
             SqlStatement::BeginTransaction { read_only } => Self::execute_begin(read_only),
             SqlStatement::Commit => Err(err_input(
@@ -2361,6 +2372,7 @@ impl ApexExecutor {
                     | SqlStatement::InsertOnConflict { .. }
                     | SqlStatement::InsertSelect { .. }
                     | SqlStatement::InsertOverwrite { .. }
+                    | SqlStatement::HiveMultiInsert { .. }
                     | SqlStatement::Delete { .. }
                     | SqlStatement::Update { .. }
                     | SqlStatement::TruncateTable { .. }

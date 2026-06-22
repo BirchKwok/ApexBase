@@ -2,10 +2,14 @@
 
 import tempfile
 
-from apexbase import ApexStorage
+from apexbase import ApexClient, ApexStorage
 
 
 def _rows(result):
+    if hasattr(result, "to_dict"):
+        records = result.to_dict()
+        if isinstance(records, list):
+            return [tuple(record.values()) for record in records]
     columns = result.get("columns_dict", {})
     names = list(columns)
     if not names:
@@ -129,7 +133,8 @@ def test_hive_fuses_multiple_json_paths_without_changing_nested_semantics():
             "get_json_object(payload, '$.id') AS top_id, "
             "get_json_object(payload, '$.outer.id') AS nested_id, "
             "split(regexp_replace(regexp_replace("
-            "get_json_object(payload, '$.items'), '\\\\[|\\\\]|\"', ''), "
+            "coalesce(get_json_object(payload, '$.items'), '[]'), "
+            "'\\\\[|\\\\]|\"', ''), "
             "'\\\\s+', ''), ',') AS items FROM hive_json) "
             "SELECT top_id, nested_id, item FROM parsed "
             "LATERAL VIEW explode(items) e AS item ORDER BY item"
@@ -138,4 +143,107 @@ def test_hive_fuses_multiple_json_paths_without_changing_nested_semantics():
             ("top", "nested", "a"),
             ("top", "nested", "b"),
         ]
+        db.close()
+
+
+def test_empty_join_cte_keeps_projected_marker_schema():
+    with tempfile.TemporaryDirectory(prefix="apex_hive_empty_cte_") as path:
+        db = ApexStorage(path)
+        db.execute("CREATE TABLE IF NOT EXISTS hive_left (user_id TEXT)")
+        db.execute("CREATE TABLE IF NOT EXISTS hive_right (user_id TEXT, score BIGINT)")
+        db.execute("TRUNCATE TABLE hive_left")
+        db.execute("TRUNCATE TABLE hive_right")
+        db.execute("INSERT INTO hive_left VALUES ('u1')")
+        db.execute("INSERT INTO hive_right VALUES ('u1', 1)")
+        result = db.execute(
+            "WITH empty_candidate AS ("
+            "SELECT l.user_id, 1 AS candidate_marker FROM hive_left l "
+            "JOIN hive_right r ON l.user_id=r.user_id WHERE r.score > 10"
+            ") SELECT l.user_id, coalesce(c.candidate_marker, 0) AS marker "
+            "FROM hive_left l LEFT JOIN empty_candidate c ON l.user_id=c.user_id"
+        )
+        assert _rows(result) == [("u1", 0)]
+        db.close()
+
+
+def test_fused_conditional_counts_and_shared_percentiles():
+    with tempfile.TemporaryDirectory(prefix="apex_hive_fused_agg_") as path:
+        db = ApexStorage(path)
+        db.execute("CREATE TABLE IF NOT EXISTS hive_fused_agg (user_id TEXT, kind TEXT, value BIGINT)")
+        db.execute("TRUNCATE TABLE hive_fused_agg")
+        db.execute(
+            "INSERT INTO hive_fused_agg VALUES "
+            "('u1','a',1),('u1','b',2),('u1','a',3),('u1','c',4)"
+        )
+        result = db.execute(
+            "SELECT user_id, "
+            "sum(if(kind='a',1,0)) AS a_cnt, "
+            "sum(if(kind='b',1,0)) AS b_cnt, "
+            "round(sum(if(kind='a',1,0)) / greatest(sum(if(kind='b',1,0)),1), 2) AS ratio, "
+            "percentile_approx(value,0.25) AS p25, "
+            "percentile_approx(value,0.75) AS p75 "
+            "FROM hive_fused_agg GROUP BY user_id"
+        )
+        assert _rows(result) == [("u1", 2.0, 1.0, 2.0, 2.0, 3.0)]
+        db.close()
+
+
+def test_hive_advanced_row_generators_joins_and_multi_insert():
+    with tempfile.TemporaryDirectory(prefix="apex_hive_advanced_") as path:
+        db = ApexClient(path)
+        db.create_table("hive_users_adv", {"user_id": "string", "channel": "string", "prefs": "string"})
+        db.create_table("events", {"user_id": "string", "items": "string", "score": "int"})
+        db.create_table("active_out", {"user_id": "string", "pos": "int", "item": "string", "dt": "string"})
+        db.create_table("inactive_out", {"user_id": "string", "dt": "string"})
+        db.execute(
+            "INSERT INTO hive_users_adv VALUES "
+            "('u1','douyin','color:red,size:m'),"
+            "('u2','email','color:blue'),"
+            "('u3','store','size:l')"
+        )
+        db.execute(
+            "INSERT INTO events VALUES ('u1','a,b',2),('u2','c',0)"
+        )
+
+        rows = db.execute(
+            "SELECT u.user_id, pos, item, pref_key, pref_value "
+            "FROM hive_users_adv u JOIN events e "
+            "ON u.user_id=e.user_id AND e.score > 0 "
+            "LATERAL VIEW OUTER posexplode(split(e.items, ',')) px AS pos, item "
+            "LATERAL VIEW OUTER explode(split(u.prefs, ',')) p AS pref_pair "
+            "LATERAL VIEW OUTER inline(array(named_struct("
+            "'pref_key', split(pref_pair, ':')[0], "
+            "'pref_value', split(pref_pair, ':')[1]))) kv AS pref_key, pref_value "
+            "WHERE upper(u.channel) RLIKE 'DOUYIN|EMAIL' ORDER BY pos, pref_key"
+        )
+        assert _rows(rows) == [
+            ("u1", 0, "a", "color", "red"),
+            ("u1", 0, "a", "size", "m"),
+            ("u1", 1, "b", "color", "red"),
+            ("u1", 1, "b", "size", "m"),
+        ]
+        assert _rows(db.execute(
+            "SELECT u.user_id FROM hive_users_adv u LEFT SEMI JOIN events e "
+            "ON u.user_id=e.user_id AND e.score > 0"
+        )) == [("u1",)]
+
+        db.execute(
+            "WITH active AS ("
+            "SELECT e.user_id, pos, item FROM events e "
+            "LATERAL VIEW posexplode(split(e.items, ',')) p AS pos, item "
+            "WHERE e.score > 0"
+            ") FROM active a "
+            "INSERT OVERWRITE TABLE active_out PARTITION (dt='2026-06-20') "
+            "SELECT * WHERE a.user_id IS NOT NULL "
+            "INSERT OVERWRITE TABLE inactive_out PARTITION (dt='2026-06-20') "
+            "SELECT user_id WHERE pos = 0"
+        )
+        assert _rows(db.execute("SELECT user_id, pos, item FROM active_out ORDER BY pos")) == [
+            ("u1", 0, "a"),
+            ("u1", 1, "b"),
+        ]
+        assert _rows(db.execute("SELECT user_id FROM inactive_out")) == [("u1",)]
+        assert _rows(db.execute(
+            "SELECT u.user_id FROM hive_users_adv u LEFT ANTI JOIN events e ON u.user_id=e.user_id"
+        )) == [("u3",)]
         db.close()

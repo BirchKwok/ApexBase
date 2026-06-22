@@ -89,290 +89,326 @@ impl ApexExecutor {
             batch
         } else {
             match &stmt.from {
-            Some(FromItem::TopkDistance {
-                col,
-                query,
-                k,
-                metric,
-                ..
-            }) => Self::execute_topk_distance(storage_path, col, query, *k, metric)?,
-            Some(FromItem::TableFunction {
-                func,
-                file,
-                options,
-                ..
-            }) => {
-                if let Some(count_batch) = Self::try_fast_json_count_table_function(&stmt, func, file)? {
-                    return Ok(ApexResult::Data(count_batch));
-                }
-                let mut opts = options.clone();
-                if let Some(ref wc) = stmt.where_clause {
-                    if let Some(pushdown) = Self::try_extract_filter_for_pushdown(wc) {
-                        opts.push(("filter".to_string(), pushdown));
+                Some(FromItem::TopkDistance {
+                    col,
+                    query,
+                    k,
+                    metric,
+                    ..
+                }) => Self::execute_topk_distance(storage_path, col, query, *k, metric)?,
+                Some(FromItem::TableFunction {
+                    func,
+                    file,
+                    options,
+                    ..
+                }) => {
+                    if let Some(count_batch) =
+                        Self::try_fast_json_count_table_function(&stmt, func, file)?
+                    {
+                        return Ok(ApexResult::Data(count_batch));
                     }
-                }
-                Self::read_table_function(func, file, &opts)?
-            },
-            Some(FromItem::DirectFile { file, .. }) => Self::read_direct_file(file)?,
-            Some(FromItem::LateralExplode { .. } | FromItem::LateralStack { .. }) => {
-                return Err(err_input("LATERAL VIEW requires a base FROM source"));
-            }
-            Some(FromItem::Subquery { stmt: sub_stmt, .. }) => match sub_stmt.as_ref() {
-                crate::query::SqlStatement::Select(sel) => {
-                    let sub_path = Self::resolve_from_table_path(sel, base_dir, default_table_path);
-                    (if sel.joins.is_empty() {
-                        Self::execute_select_with_base_dir(
-                            sel.clone(),
-                            &sub_path,
-                            base_dir,
-                            default_table_path,
-                        )
-                    } else {
-                        Self::execute_select_with_joins(
-                            sel.clone(),
-                            base_dir,
-                            default_table_path,
-                        )
-                    })?
-                    .to_record_batch()?
-                }
-                crate::query::SqlStatement::Union(u) => {
-                    Self::execute_union(u.clone(), base_dir, default_table_path)?
-                        .to_record_batch()?
-                }
-                _ => return Err(err_input("Subquery must be SELECT or set operation")),
-            },
-            None => {
-                // No FROM clause (e.g., SELECT 1, 1) — create a single-row virtual batch
-                let schema = Arc::new(Schema::new(vec![Field::new(
-                    "_dummy",
-                    ArrowDataType::Int64,
-                    false,
-                )]));
-                RecordBatch::try_new(
-                    schema,
-                    vec![Arc::new(Int64Array::from(vec![0i64])) as ArrayRef],
-                )
-                .map_err(|e| err_data(e.to_string()))?
-            }
-            Some(FromItem::Table { .. }) => {
-                // Normal table - read from storage
-                if !storage_path.exists() {
-                    let tbl = storage_path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy();
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("Table '{}' does not exist", tbl),
-                    ));
-                } else {
-                    let backend = get_cached_backend(storage_path)?;
-
-                    // Check if any SELECT column contains a scalar subquery
-                    // Scalar subqueries may reference arbitrary columns, so read all
-                    let has_scalar_subquery = stmt.columns.iter().any(|col| {
-                        if let SelectColumn::Expression { expr, .. } = col {
-                            Self::expr_contains_scalar_subquery(expr)
-                        } else {
-                            false
+                    let mut opts = options.clone();
+                    if let Some(ref wc) = stmt.where_clause {
+                        if let Some(pushdown) = Self::try_extract_filter_for_pushdown(wc) {
+                            opts.push(("filter".to_string(), pushdown));
                         }
-                    });
-
-                    if backend.pending_v4_in_memory_rows() > 0 {
-                        let col_refs = if has_scalar_subquery
-                            || stmt.where_clause.is_some()
-                            || backend.has_pending_deltas()
-                            || backend.has_delta()
-                        {
-                            None
+                    }
+                    Self::read_table_function(func, file, &opts)?
+                }
+                Some(FromItem::DirectFile { file, .. }) => Self::read_direct_file(file)?,
+                Some(
+                    FromItem::LateralExplode { .. }
+                    | FromItem::LateralPosExplode { .. }
+                    | FromItem::LateralStack { .. },
+                ) => {
+                    return Err(err_input("LATERAL VIEW requires a base FROM source"));
+                }
+                Some(FromItem::Subquery { stmt: sub_stmt, .. }) => match sub_stmt.as_ref() {
+                    crate::query::SqlStatement::Select(sel) => {
+                        let sub_path =
+                            Self::resolve_from_table_path(sel, base_dir, default_table_path);
+                        (if sel.joins.is_empty() {
+                            Self::execute_select_with_base_dir(
+                                sel.clone(),
+                                &sub_path,
+                                base_dir,
+                                default_table_path,
+                            )
                         } else {
-                            Self::get_col_refs(&stmt)
-                        };
-                        backend.read_columns_to_arrow(
-                            col_refs
-                                .as_ref()
-                                .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                                .as_deref(),
-                            0,
-                            None,
-                        )?
-                    } else if has_scalar_subquery {
-                        let col_refs = Self::get_col_refs(&stmt);
-                        backend.read_columns_to_arrow(
-                            col_refs
-                                .as_ref()
-                                .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                                .as_deref(),
-                            0,
-                            None,
-                        )?
+                            Self::execute_select_with_joins(
+                                sel.clone(),
+                                base_dir,
+                                default_table_path,
+                            )
+                        })?
+                        .to_record_batch()?
+                    }
+                    crate::query::SqlStatement::Union(u) => {
+                        Self::execute_union(u.clone(), base_dir, default_table_path)?
+                            .to_record_batch()?
+                    }
+                    _ => return Err(err_input("Subquery must be SELECT or set operation")),
+                },
+                None => {
+                    // No FROM clause (e.g., SELECT 1, 1) — create a single-row virtual batch
+                    let schema = Arc::new(Schema::new(vec![Field::new(
+                        "_dummy",
+                        ArrowDataType::Int64,
+                        false,
+                    )]));
+                    RecordBatch::try_new(
+                        schema,
+                        vec![Arc::new(Int64Array::from(vec![0i64])) as ArrayRef],
+                    )
+                    .map_err(|e| err_data(e.to_string()))?
+                }
+                Some(FromItem::Table { .. }) => {
+                    // Normal table - read from storage
+                    if !storage_path.exists() {
+                        let tbl = storage_path
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy();
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("Table '{}' does not exist", tbl),
+                        ));
                     } else {
-                        // Check conditions for late materialization optimization
-                        let has_aggregation_check = stmt.columns.iter().any(|col| {
+                        let backend = get_cached_backend(storage_path)?;
+
+                        // Check if any SELECT column contains a scalar subquery
+                        // Scalar subqueries may reference arbitrary columns, so read all
+                        let has_scalar_subquery = stmt.columns.iter().any(|col| {
+                            if let SelectColumn::Expression { expr, .. } = col {
+                                Self::expr_contains_scalar_subquery(expr)
+                            } else {
+                                false
+                            }
+                        });
+
+                        if backend.pending_v4_in_memory_rows() > 0 {
+                            let col_refs = if has_scalar_subquery
+                                || stmt.where_clause.is_some()
+                                || backend.has_pending_deltas()
+                                || backend.has_delta()
+                            {
+                                None
+                            } else {
+                                Self::get_col_refs(&stmt)
+                            };
+                            backend.read_columns_to_arrow(
+                                col_refs
+                                    .as_ref()
+                                    .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                                    .as_deref(),
+                                0,
+                                None,
+                            )?
+                        } else if has_scalar_subquery {
+                            let col_refs = Self::get_col_refs(&stmt);
+                            backend.read_columns_to_arrow(
+                                col_refs
+                                    .as_ref()
+                                    .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                                    .as_deref(),
+                                0,
+                                None,
+                            )?
+                        } else {
+                            // Check conditions for late materialization optimization
+                            let has_aggregation_check = stmt.columns.iter().any(|col| {
                             matches!(col, SelectColumn::Aggregate { .. })
                                 || matches!(col, SelectColumn::Expression { expr, .. } if Self::expr_contains_aggregate(expr))
                         });
 
-                        // FAST PATH: Direct aggregation for simple numeric aggregates
-                        // Compute COUNT/SUM/AVG/MIN/MAX directly from V4 columns (mmap or in-memory)
-                        if has_aggregation_check
-                            && stmt.where_clause.is_none()
-                            && stmt.group_by.is_empty()
-                            && stmt.joins.is_empty()
-                            && !backend.has_pending_deltas()
-                            && !backend.has_delta()
-                        {
-                            if let Some(result) = Self::try_mmap_aggregation(&backend, &stmt)? {
-                                return Ok(result);
-                            }
-                        }
-
-                        // FAST PATH: Filtered aggregation with string equality
-                        // SELECT COUNT(*), AVG(col), MAX(col) FROM table WHERE str_col = 'val'
-                        if has_aggregation_check
-                            && stmt.where_clause.is_some()
-                            && stmt.group_by.is_empty()
-                            && stmt.joins.is_empty()
-                            && stmt.limit.is_none()
-                            && stmt.order_by.is_empty()
-                            && !backend.has_pending_deltas()
-                            && !backend.has_delta()
-                        {
-                            if let Some(result) =
-                                Self::try_fast_filtered_string_agg(&backend, &stmt)?
+                            // FAST PATH: Direct aggregation for simple numeric aggregates
+                            // Compute COUNT/SUM/AVG/MIN/MAX directly from V4 columns (mmap or in-memory)
+                            if has_aggregation_check
+                                && stmt.where_clause.is_none()
+                                && stmt.group_by.is_empty()
+                                && stmt.joins.is_empty()
+                                && !backend.has_pending_deltas()
+                                && !backend.has_delta()
                             {
-                                return Ok(result);
-                            }
-                            if let Some(result) =
-                                Self::try_fast_filtered_numeric_agg(&backend, &stmt)?
-                            {
-                                return Ok(result);
-                            }
-                        }
-
-                        // Correctness fallback for filtered aggregates when delta-backed
-                        // rows are present. The generic full-batch path can miss string
-                        // overlay state, but the string-filter reader already merges it.
-                        if has_aggregation_check
-                            && stmt.where_clause.is_some()
-                            && stmt.group_by.is_empty()
-                            && stmt.joins.is_empty()
-                            && stmt.limit.is_none()
-                            && stmt.order_by.is_empty()
-                        {
-                            if let Some(filtered) =
-                                Self::try_fast_string_filter_no_limit(&backend, &stmt)?
-                            {
-                                return Self::execute_aggregation(&filtered, &stmt);
-                            }
-                        }
-
-                        // Late Materialization for WHERE: with WHERE (no ORDER BY)
-                        // Works for both SELECT * and projected column queries.
-                        let where_cols = stmt.where_columns();
-                        let has_window_func = stmt
-                            .columns
-                            .iter()
-                            .any(|col| matches!(col, SelectColumn::WindowFunction { .. }));
-                        let can_late_materialize_where = stmt.where_clause.is_some()
-                            && stmt.order_by.is_empty()
-                            && stmt.group_by.is_empty()
-                            && !has_aggregation_check
-                            && !has_window_func
-                            && !where_cols.is_empty();
-
-                        // Late Materialization for ORDER BY: SELECT * with ORDER BY + LIMIT (no WHERE)
-                        let order_cols: Vec<String> = stmt
-                            .order_by
-                            .iter()
-                            .map(|o| o.column.trim_matches('"').to_string())
-                            .collect();
-                        let can_late_materialize_order = stmt.is_select_star()
-                            && stmt.where_clause.is_none()
-                            && !stmt.order_by.is_empty()
-                            && stmt.limit.is_some()
-                            && stmt.group_by.is_empty()
-                            && !has_aggregation_check;
-
-                        // EARLY FAST PATH: _id = X point lookup — skip CBO entirely
-                        if !has_scalar_subquery
-                            && stmt.group_by.is_empty()
-                            && !has_aggregation_check
-                            && !backend.has_pending_deltas()
-                            && !backend.has_delta()
-                        {
-                            if let Some(ref where_clause) = stmt.where_clause {
-                                if let Some(id) = Self::extract_id_equality_filter(where_clause) {
-                                    if let Some(row_batch) = backend.read_row_by_id_to_arrow(id)? {
-                                        let projected = Self::apply_projection_with_storage(
-                                            &row_batch,
-                                            &stmt.columns,
-                                            Some(storage_path),
-                                        )?;
-                                        return Ok(ApexResult::Data(projected));
-                                    }
-                                }
-                            }
-                        }
-
-                        // CBO: Use plan_select_pub() to decide execution strategy.
-                        // Skip expensive index checks when CBO recommends full scan or aggregation.
-                        // Also skip CBO entirely for: (a) no WHERE clause, (b) table has no indexes.
-                        let cbo_skip_index = if stmt.where_clause.is_none() {
-                            true
-                        } else {
-                            let (bd, tname) = base_dir_and_table(storage_path);
-                            let idx_mgr_arc = get_index_manager(&bd, &tname);
-                            let idx_mgr = idx_mgr_arc.lock();
-                            // Fast exit: if table has no indexes, CBO can only say full/filtered scan
-                            if idx_mgr.catalog_is_empty() {
-                                true
-                            } else {
-                                let table_key = storage_path.to_string_lossy();
-                                let cbo_strategy = QueryPlanner::plan_select_pub(
-                                    &stmt,
-                                    Some(&*idx_mgr),
-                                    &table_key,
-                                );
-                                matches!(
-                                    cbo_strategy,
-                                    ExecutionStrategy::OlapFullScan
-                                        | ExecutionStrategy::OlapAggregation
-                                        | ExecutionStrategy::OlapFilteredScan
-                                )
-                            }
-                        };
-
-                        // FAST PATH INDEX: Check if WHERE clause can use a secondary index
-                        // (skipped when CBO says full scan/aggregation is cheaper)
-                        if !cbo_skip_index {
-                            if let Some(ref where_clause) = stmt.where_clause {
-                                if let Some(result) = Self::try_index_accelerated_read(
-                                    &backend,
-                                    &stmt,
-                                    where_clause,
-                                    base_dir,
-                                    storage_path,
-                                )? {
+                                if let Some(result) = Self::try_mmap_aggregation(&backend, &stmt)? {
                                     return Ok(result);
                                 }
                             }
-                        }
 
-                        // FAST PATH 0: Check for _id = X pattern (O(1) lookup)
-                        if let Some(where_clause) = &stmt.where_clause {
-                            if let Some(id) = Self::extract_id_equality_filter(where_clause) {
-                                if !backend.has_pending_deltas() && !backend.has_delta() {
-                                    if let Some(batch) = backend.read_row_by_id_to_arrow(id)? {
-                                        batch
+                            // FAST PATH: Filtered aggregation with string equality
+                            // SELECT COUNT(*), AVG(col), MAX(col) FROM table WHERE str_col = 'val'
+                            if has_aggregation_check
+                                && stmt.where_clause.is_some()
+                                && stmt.group_by.is_empty()
+                                && stmt.joins.is_empty()
+                                && stmt.limit.is_none()
+                                && stmt.order_by.is_empty()
+                                && !backend.has_pending_deltas()
+                                && !backend.has_delta()
+                            {
+                                if let Some(result) =
+                                    Self::try_fast_filtered_string_agg(&backend, &stmt)?
+                                {
+                                    return Ok(result);
+                                }
+                                if let Some(result) =
+                                    Self::try_fast_filtered_numeric_agg(&backend, &stmt)?
+                                {
+                                    return Ok(result);
+                                }
+                            }
+
+                            // Correctness fallback for filtered aggregates when delta-backed
+                            // rows are present. The generic full-batch path can miss string
+                            // overlay state, but the string-filter reader already merges it.
+                            if has_aggregation_check
+                                && stmt.where_clause.is_some()
+                                && stmt.group_by.is_empty()
+                                && stmt.joins.is_empty()
+                                && stmt.limit.is_none()
+                                && stmt.order_by.is_empty()
+                            {
+                                if let Some(filtered) =
+                                    Self::try_fast_string_filter_no_limit(&backend, &stmt)?
+                                {
+                                    return Self::execute_aggregation(&filtered, &stmt);
+                                }
+                            }
+
+                            // Late Materialization for WHERE: with WHERE (no ORDER BY)
+                            // Works for both SELECT * and projected column queries.
+                            let where_cols = stmt.where_columns();
+                            let has_window_func = stmt
+                                .columns
+                                .iter()
+                                .any(|col| matches!(col, SelectColumn::WindowFunction { .. }));
+                            let can_late_materialize_where = stmt.where_clause.is_some()
+                                && stmt.order_by.is_empty()
+                                && stmt.group_by.is_empty()
+                                && !has_aggregation_check
+                                && !has_window_func
+                                && !where_cols.is_empty();
+
+                            // Late Materialization for ORDER BY: SELECT * with ORDER BY + LIMIT (no WHERE)
+                            let order_cols: Vec<String> = stmt
+                                .order_by
+                                .iter()
+                                .map(|o| o.column.trim_matches('"').to_string())
+                                .collect();
+                            let can_late_materialize_order = stmt.is_select_star()
+                                && stmt.where_clause.is_none()
+                                && !stmt.order_by.is_empty()
+                                && stmt.limit.is_some()
+                                && stmt.group_by.is_empty()
+                                && !has_aggregation_check;
+
+                            // EARLY FAST PATH: _id = X point lookup — skip CBO entirely
+                            if !has_scalar_subquery
+                                && stmt.group_by.is_empty()
+                                && !has_aggregation_check
+                                && !backend.has_pending_deltas()
+                                && !backend.has_delta()
+                            {
+                                if let Some(ref where_clause) = stmt.where_clause {
+                                    if let Some(id) = Self::extract_id_equality_filter(where_clause)
+                                    {
+                                        if let Some(row_batch) =
+                                            backend.read_row_by_id_to_arrow(id)?
+                                        {
+                                            let projected = Self::apply_projection_with_storage(
+                                                &row_batch,
+                                                &stmt.columns,
+                                                Some(storage_path),
+                                            )?;
+                                            return Ok(ApexResult::Data(projected));
+                                        }
+                                    }
+                                }
+                            }
+
+                            // CBO: Use plan_select_pub() to decide execution strategy.
+                            // Skip expensive index checks when CBO recommends full scan or aggregation.
+                            // Also skip CBO entirely for: (a) no WHERE clause, (b) table has no indexes.
+                            let cbo_skip_index = if stmt.where_clause.is_none() {
+                                true
+                            } else {
+                                let (bd, tname) = base_dir_and_table(storage_path);
+                                let idx_mgr_arc = get_index_manager(&bd, &tname);
+                                let idx_mgr = idx_mgr_arc.lock();
+                                // Fast exit: if table has no indexes, CBO can only say full/filtered scan
+                                if idx_mgr.catalog_is_empty() {
+                                    true
+                                } else {
+                                    let table_key = storage_path.to_string_lossy();
+                                    let cbo_strategy = QueryPlanner::plan_select_pub(
+                                        &stmt,
+                                        Some(&*idx_mgr),
+                                        &table_key,
+                                    );
+                                    matches!(
+                                        cbo_strategy,
+                                        ExecutionStrategy::OlapFullScan
+                                            | ExecutionStrategy::OlapAggregation
+                                            | ExecutionStrategy::OlapFilteredScan
+                                    )
+                                }
+                            };
+
+                            // FAST PATH INDEX: Check if WHERE clause can use a secondary index
+                            // (skipped when CBO says full scan/aggregation is cheaper)
+                            if !cbo_skip_index {
+                                if let Some(ref where_clause) = stmt.where_clause {
+                                    if let Some(result) = Self::try_index_accelerated_read(
+                                        &backend,
+                                        &stmt,
+                                        where_clause,
+                                        base_dir,
+                                        storage_path,
+                                    )? {
+                                        return Ok(result);
+                                    }
+                                }
+                            }
+
+                            // FAST PATH 0: Check for _id = X pattern (O(1) lookup)
+                            if let Some(where_clause) = &stmt.where_clause {
+                                if let Some(id) = Self::extract_id_equality_filter(where_clause) {
+                                    if !backend.has_pending_deltas() && !backend.has_delta() {
+                                        if let Some(batch) = backend.read_row_by_id_to_arrow(id)? {
+                                            batch
+                                        } else {
+                                            // Not in memory — fall through to general mmap → Arrow → WHERE filter path
+                                            let batch =
+                                                backend.read_columns_to_arrow(None, 0, None)?;
+                                            if batch.num_rows() == 0 {
+                                                backend.read_columns_to_arrow(None, 0, Some(0))?
+                                            } else {
+                                                // Apply WHERE filter on the mmap-read batch
+                                                let filtered = Self::apply_filter_with_storage(
+                                                    &batch,
+                                                    where_clause,
+                                                    storage_path,
+                                                )?;
+                                                if filtered.num_rows() == 0 {
+                                                    return Ok(ApexResult::Empty(
+                                                        filtered.schema(),
+                                                    ));
+                                                }
+                                                return Ok(ApexResult::Data(
+                                                    Self::apply_projection_with_storage(
+                                                        &filtered,
+                                                        &stmt.columns,
+                                                        Some(storage_path),
+                                                    )?,
+                                                ));
+                                            }
+                                        }
                                     } else {
-                                        // Not in memory — fall through to general mmap → Arrow → WHERE filter path
+                                        // Pending DeltaStore updates must be merged through the full scan path.
                                         let batch = backend.read_columns_to_arrow(None, 0, None)?;
                                         if batch.num_rows() == 0 {
                                             backend.read_columns_to_arrow(None, 0, Some(0))?
                                         } else {
-                                            // Apply WHERE filter on the mmap-read batch
                                             let filtered = Self::apply_filter_with_storage(
                                                 &batch,
                                                 where_clause,
@@ -390,65 +426,313 @@ impl ApexExecutor {
                                             ));
                                         }
                                     }
-                                } else {
-                                    // Pending DeltaStore updates must be merged through the full scan path.
-                                    let batch = backend.read_columns_to_arrow(None, 0, None)?;
-                                    if batch.num_rows() == 0 {
-                                        backend.read_columns_to_arrow(None, 0, Some(0))?
-                                    } else {
-                                        let filtered = Self::apply_filter_with_storage(
-                                            &batch,
-                                            where_clause,
+                                } else if let Some(result) =
+                                    Self::try_fast_filter_group_order(&backend, &stmt)?
+                                {
+                                    // FAST PATH for Complex (Filter+Group+Order) - biggest optimization
+                                    return Ok(result);
+                                } else if can_late_materialize_where {
+                                    // FAST PATH 1: Try dictionary-based filter for simple string equality (with LIMIT)
+                                    if let Some(result) =
+                                        Self::try_fast_string_filter(&backend, &stmt)?
+                                    {
+                                        result
+                                    // FAST PATH 1b: String equality without LIMIT - storage-level scan
+                                    } else if let Some(result) =
+                                        Self::try_fast_string_filter_no_limit(&backend, &stmt)?
+                                    {
+                                        if !stmt.is_pure_star() {
+                                            let projected = Self::apply_projection_with_storage(
+                                                &result,
+                                                &stmt.columns,
+                                                Some(storage_path),
+                                            )?;
+                                            return Ok(ApexResult::Data(projected));
+                                        }
+                                        return Ok(ApexResult::Data(result));
+                                    // FAST PATH 1c: LIKE pattern scan (prefix/suffix/contains)
+                                    } else if let Some(result) =
+                                        Self::try_fast_like_filter(&backend, &stmt)?
+                                    {
+                                        if !stmt.is_pure_star() {
+                                            let projected = Self::apply_projection_with_storage(
+                                                &result,
+                                                &stmt.columns,
+                                                Some(storage_path),
+                                            )?;
+                                            return Ok(ApexResult::Data(projected));
+                                        }
+                                        return Ok(ApexResult::Data(result));
+                                    // FAST PATH 2: Try numeric range filter for BETWEEN
+                                    } else if let Some(result) =
+                                        Self::try_fast_numeric_range_filter(&backend, &stmt)?
+                                    {
+                                        result
+                                    // FAST PATH 3: Try combined string + numeric filter for multi-condition
+                                    } else if let Some(result) =
+                                        Self::try_fast_multi_condition_filter(&backend, &stmt)?
+                                    {
+                                        result
+                                    // FAST PATH 4: Mmap multi-condition AND on two different numeric columns
+                                    } else if let Some(result) =
+                                        Self::try_fast_mmap_multi_condition(
+                                            &backend,
+                                            &stmt,
+                                            storage_path,
+                                        )?
+                                    {
+                                        return Ok(result);
+                                    // FAST PATH 5: Mmap IN filter on string column
+                                    } else if let Some(result) = Self::try_fast_mmap_in_filter(
+                                        &backend,
+                                        &stmt,
+                                        storage_path,
+                                    )? {
+                                        return Ok(result);
+                                    } else if backend.is_mmap_only()
+                                        && !backend.has_pending_deltas()
+                                        && !backend.has_delta()
+                                    {
+                                        // MMAP FAST PATH: byte-level scan + point lookups
+                                        if let Some(where_clause) = &stmt.where_clause {
+                                            let _limit_with_off =
+                                                stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+                                            let (matching_indices, prefer_index_materialization) =
+                                                if let Some((col, val)) =
+                                                    Self::extract_string_equality(where_clause)
+                                                {
+                                                    (
+                                                        backend.scan_string_filter_mmap(
+                                                            &col,
+                                                            &val,
+                                                            _limit_with_off,
+                                                        )?,
+                                                        false,
+                                                    )
+                                                } else if let Some((col, low, high)) =
+                                                    Self::extract_between_range(where_clause)
+                                                {
+                                                    (
+                                                        backend.scan_numeric_range_mmap(
+                                                            &col,
+                                                            low,
+                                                            high,
+                                                            _limit_with_off,
+                                                        )?,
+                                                        false,
+                                                    )
+                                                } else if let Some((col, low, high)) =
+                                                    Self::extract_two_sided_same_col_range(
+                                                        where_clause,
+                                                    )
+                                                {
+                                                    // col >= N AND col <= M — logically equivalent to BETWEEN
+                                                    (
+                                                        backend.scan_numeric_range_mmap(
+                                                            &col,
+                                                            low,
+                                                            high,
+                                                            _limit_with_off,
+                                                        )?,
+                                                        false,
+                                                    )
+                                                } else if let Some((col, low, high)) =
+                                                    Self::extract_single_comparison_as_range(
+                                                        where_clause,
+                                                    )
+                                                {
+                                                    (
+                                                        backend.scan_numeric_range_mmap(
+                                                            &col,
+                                                            low,
+                                                            high,
+                                                            _limit_with_off,
+                                                        )?,
+                                                        false,
+                                                    )
+                                                } else if let Some((col, values)) =
+                                                    Self::extract_in_string_filter(where_clause)
+                                                {
+                                                    (
+                                                        backend.scan_string_in_mmap(
+                                                            &col,
+                                                            &values,
+                                                            _limit_with_off,
+                                                        )?,
+                                                        true,
+                                                    )
+                                                } else if let Some((col, nums)) =
+                                                    Self::extract_in_numeric_filter(where_clause)
+                                                        .or_else(|| {
+                                                            Self::extract_or_numeric_equalities(
+                                                                where_clause,
+                                                            )
+                                                        })
+                                                {
+                                                    // Numeric IN or OR-of-equalities: single-pass mmap scan
+                                                    (
+                                                        backend.scan_numeric_in_mmap(
+                                                            &col,
+                                                            &nums,
+                                                            _limit_with_off,
+                                                        )?,
+                                                        true,
+                                                    )
+                                                } else if let Some(leaves) =
+                                                    Self::extract_or_leaf_predicates(where_clause)
+                                                {
+                                                    // General OR decomposition: scan each leaf, union indices
+                                                    match Self::scan_or_leaves_mmap(
+                                                        &backend,
+                                                        &leaves,
+                                                        _limit_with_off,
+                                                    )? {
+                                                        Some(v) if !v.is_empty() => (Some(v), true),
+                                                        Some(_) => (None, true), // empty result
+                                                        None => (None, true),
+                                                    }
+                                                } else {
+                                                    (None, false)
+                                                };
+                                            if let Some(indices) = matching_indices {
+                                                if indices.is_empty() {
+                                                    return Ok(ApexResult::Empty(Arc::new(
+                                                        Schema::empty(),
+                                                    )));
+                                                }
+                                                let batch = if prefer_index_materialization {
+                                                    Self::read_matching_rows_by_indices(
+                                                        &backend, &stmt, &indices,
+                                                    )?
+                                                } else {
+                                                    Self::read_matching_rows_adaptive(
+                                                        &backend, &stmt, &indices,
+                                                    )?
+                                                };
+
+                                                // Apply ORDER BY with LIMIT if needed
+                                                if !stmt.order_by.is_empty() {
+                                                    let k = stmt
+                                                        .limit
+                                                        .map(|l| l + stmt.offset.unwrap_or(0));
+                                                    let sort_batch =
+                                                        Self::augment_batch_for_order_by(
+                                                            &batch,
+                                                            &stmt.columns,
+                                                            &stmt.order_by,
+                                                        )?;
+                                                    let sorted = Self::apply_order_by_topk(
+                                                        &sort_batch,
+                                                        &stmt.order_by,
+                                                        k,
+                                                    )?;
+                                                    let limited = Self::apply_limit_offset(
+                                                        &sorted,
+                                                        stmt.limit,
+                                                        stmt.offset,
+                                                    )?;
+                                                    let projected =
+                                                        Self::apply_projection_with_storage(
+                                                            &limited,
+                                                            &stmt.columns,
+                                                            Some(storage_path),
+                                                        )?;
+                                                    return Ok(ApexResult::Data(projected));
+                                                }
+
+                                                if !stmt.is_pure_star() {
+                                                    let projected =
+                                                        Self::apply_projection_with_storage(
+                                                            &batch,
+                                                            &stmt.columns,
+                                                            Some(storage_path),
+                                                        )?;
+                                                    return Ok(ApexResult::Data(projected));
+                                                }
+                                                return Ok(ApexResult::Data(batch));
+                                            }
+                                        }
+                                        let filtered = Self::execute_with_late_materialization(
+                                            &backend,
+                                            &stmt,
                                             storage_path,
                                         )?;
                                         if filtered.num_rows() == 0 {
                                             return Ok(ApexResult::Empty(filtered.schema()));
                                         }
-                                        return Ok(ApexResult::Data(
-                                            Self::apply_projection_with_storage(
+                                        if !stmt.is_pure_star() {
+                                            let projected = Self::apply_projection_with_storage(
                                                 &filtered,
                                                 &stmt.columns,
                                                 Some(storage_path),
-                                            )?,
-                                        ));
+                                            )?;
+                                            return Ok(ApexResult::Data(projected));
+                                        }
+                                        return Ok(ApexResult::Data(filtered));
+                                    } else {
+                                        // Late materialization for WHERE path
+                                        // Return directly to avoid applying WHERE filter twice
+                                        let filtered = Self::execute_with_late_materialization(
+                                            &backend,
+                                            &stmt,
+                                            storage_path,
+                                        )?;
+                                        if filtered.num_rows() == 0 {
+                                            return Ok(ApexResult::Empty(filtered.schema()));
+                                        }
+                                        if !stmt.is_pure_star() {
+                                            let projected = Self::apply_projection_with_storage(
+                                                &filtered,
+                                                &stmt.columns,
+                                                Some(storage_path),
+                                            )?;
+                                            return Ok(ApexResult::Data(projected));
+                                        }
+                                        return Ok(ApexResult::Data(filtered));
                                     }
+                                } else if !stmt.group_by.is_empty() {
+                                    // GROUP BY with WHERE: use dict-encoded path for faster string aggregation
+                                    let col_refs = Self::get_col_refs(&stmt);
+                                    backend.read_columns_to_arrow_dict(
+                                        col_refs
+                                            .as_ref()
+                                            .map(|v| {
+                                                v.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+                                            })
+                                            .as_deref(),
+                                    )?
+                                } else if let Some(batch) =
+                                    Self::try_numeric_predicate_pushdown(&backend, &stmt)?
+                                {
+                                    batch
+                                } else {
+                                    let col_refs = Self::get_col_refs(&stmt);
+                                    backend.read_columns_to_arrow(
+                                        col_refs
+                                            .as_ref()
+                                            .map(|v| {
+                                                v.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+                                            })
+                                            .as_deref(),
+                                        0,
+                                        None,
+                                    )?
                                 }
-                            } else if let Some(result) =
-                                Self::try_fast_filter_group_order(&backend, &stmt)?
-                            {
-                                // FAST PATH for Complex (Filter+Group+Order) - biggest optimization
-                                return Ok(result);
                             } else if can_late_materialize_where {
-                                // FAST PATH 1: Try dictionary-based filter for simple string equality (with LIMIT)
+                                // FAST PATH 1: Try dictionary-based filter for simple string equality
                                 if let Some(result) = Self::try_fast_string_filter(&backend, &stmt)?
                                 {
                                     result
-                                // FAST PATH 1b: String equality without LIMIT - storage-level scan
+                                // FAST PATH 1b: No-LIMIT string filter (uses mmap scan + late materialization)
                                 } else if let Some(result) =
                                     Self::try_fast_string_filter_no_limit(&backend, &stmt)?
                                 {
-                                    if !stmt.is_pure_star() {
-                                        let projected = Self::apply_projection_with_storage(
-                                            &result,
-                                            &stmt.columns,
-                                            Some(storage_path),
-                                        )?;
-                                        return Ok(ApexResult::Data(projected));
-                                    }
-                                    return Ok(ApexResult::Data(result));
+                                    result
                                 // FAST PATH 1c: LIKE pattern scan (prefix/suffix/contains)
                                 } else if let Some(result) =
                                     Self::try_fast_like_filter(&backend, &stmt)?
                                 {
-                                    if !stmt.is_pure_star() {
-                                        let projected = Self::apply_projection_with_storage(
-                                            &result,
-                                            &stmt.columns,
-                                            Some(storage_path),
-                                        )?;
-                                        return Ok(ApexResult::Data(projected));
-                                    }
-                                    return Ok(ApexResult::Data(result));
+                                    result
                                 // FAST PATH 2: Try numeric range filter for BETWEEN
                                 } else if let Some(result) =
                                     Self::try_fast_numeric_range_filter(&backend, &stmt)?
@@ -459,338 +743,82 @@ impl ApexExecutor {
                                     Self::try_fast_multi_condition_filter(&backend, &stmt)?
                                 {
                                     result
-                                // FAST PATH 4: Mmap multi-condition AND on two different numeric columns
-                                } else if let Some(result) = Self::try_fast_mmap_multi_condition(
-                                    &backend,
-                                    &stmt,
-                                    storage_path,
-                                )? {
-                                    return Ok(result);
-                                // FAST PATH 5: Mmap IN filter on string column
-                                } else if let Some(result) =
-                                    Self::try_fast_mmap_in_filter(&backend, &stmt, storage_path)?
-                                {
-                                    return Ok(result);
-                                } else if backend.is_mmap_only()
-                                    && !backend.has_pending_deltas()
-                                    && !backend.has_delta()
-                                {
-                                    // MMAP FAST PATH: byte-level scan + point lookups
-                                    if let Some(where_clause) = &stmt.where_clause {
-                                        let _limit_with_off =
-                                            stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
-                                        let (matching_indices, prefer_index_materialization) =
-                                            if let Some((col, val)) =
-                                                Self::extract_string_equality(where_clause)
-                                            {
-                                                (
-                                                    backend.scan_string_filter_mmap(
-                                                        &col,
-                                                        &val,
-                                                        _limit_with_off,
-                                                    )?,
-                                                    false,
-                                                )
-                                            } else if let Some((col, low, high)) =
-                                                Self::extract_between_range(where_clause)
-                                            {
-                                                (
-                                                    backend.scan_numeric_range_mmap(
-                                                        &col,
-                                                        low,
-                                                        high,
-                                                        _limit_with_off,
-                                                    )?,
-                                                    false,
-                                                )
-                                            } else if let Some((col, low, high)) =
-                                                Self::extract_two_sided_same_col_range(where_clause)
-                                            {
-                                                // col >= N AND col <= M — logically equivalent to BETWEEN
-                                                (
-                                                    backend.scan_numeric_range_mmap(
-                                                        &col,
-                                                        low,
-                                                        high,
-                                                        _limit_with_off,
-                                                    )?,
-                                                    false,
-                                                )
-                                            } else if let Some((col, low, high)) =
-                                                Self::extract_single_comparison_as_range(
-                                                    where_clause,
-                                                )
-                                            {
-                                                (
-                                                    backend.scan_numeric_range_mmap(
-                                                        &col,
-                                                        low,
-                                                        high,
-                                                        _limit_with_off,
-                                                    )?,
-                                                    false,
-                                                )
-                                            } else if let Some((col, values)) =
-                                                Self::extract_in_string_filter(where_clause)
-                                            {
-                                                (
-                                                    backend.scan_string_in_mmap(
-                                                        &col,
-                                                        &values,
-                                                        _limit_with_off,
-                                                    )?,
-                                                    true,
-                                                )
-                                            } else if let Some((col, nums)) =
-                                                Self::extract_in_numeric_filter(where_clause)
-                                                    .or_else(|| {
-                                                        Self::extract_or_numeric_equalities(
-                                                            where_clause,
-                                                        )
-                                                    })
-                                            {
-                                                // Numeric IN or OR-of-equalities: single-pass mmap scan
-                                                (
-                                                    backend.scan_numeric_in_mmap(
-                                                        &col,
-                                                        &nums,
-                                                        _limit_with_off,
-                                                    )?,
-                                                    true,
-                                                )
-                                            } else if let Some(leaves) =
-                                                Self::extract_or_leaf_predicates(where_clause)
-                                            {
-                                                // General OR decomposition: scan each leaf, union indices
-                                                match Self::scan_or_leaves_mmap(
-                                                    &backend,
-                                                    &leaves,
-                                                    _limit_with_off,
-                                                )? {
-                                                    Some(v) if !v.is_empty() => (Some(v), true),
-                                                    Some(_) => (None, true), // empty result
-                                                    None => (None, true),
-                                                }
-                                            } else {
-                                                (None, false)
-                                            };
-                                        if let Some(indices) = matching_indices {
-                                            if indices.is_empty() {
-                                                return Ok(ApexResult::Empty(Arc::new(
-                                                    Schema::empty(),
-                                                )));
-                                            }
-                                            let batch = if prefer_index_materialization {
-                                                Self::read_matching_rows_by_indices(
-                                                    &backend, &stmt, &indices,
-                                                )?
-                                            } else {
-                                                Self::read_matching_rows_adaptive(
-                                                    &backend, &stmt, &indices,
-                                                )?
-                                            };
-
-                                            // Apply ORDER BY with LIMIT if needed
-                                            if !stmt.order_by.is_empty() {
-                                                let k = stmt
-                                                    .limit
-                                                    .map(|l| l + stmt.offset.unwrap_or(0));
-                                                let sort_batch = Self::augment_batch_for_order_by(
-                                                    &batch,
-                                                    &stmt.columns,
-                                                    &stmt.order_by,
-                                                )?;
-                                                let sorted = Self::apply_order_by_topk(
-                                                    &sort_batch,
-                                                    &stmt.order_by,
-                                                    k,
-                                                )?;
-                                                let limited = Self::apply_limit_offset(
-                                                    &sorted,
-                                                    stmt.limit,
-                                                    stmt.offset,
-                                                )?;
-                                                let projected =
-                                                    Self::apply_projection_with_storage(
-                                                        &limited,
-                                                        &stmt.columns,
-                                                        Some(storage_path),
-                                                    )?;
-                                                return Ok(ApexResult::Data(projected));
-                                            }
-
-                                            if !stmt.is_pure_star() {
-                                                let projected =
-                                                    Self::apply_projection_with_storage(
-                                                        &batch,
-                                                        &stmt.columns,
-                                                        Some(storage_path),
-                                                    )?;
-                                                return Ok(ApexResult::Data(projected));
-                                            }
-                                            return Ok(ApexResult::Data(batch));
-                                        }
-                                    }
-                                    let filtered = Self::execute_with_late_materialization(
-                                        &backend,
-                                        &stmt,
-                                        storage_path,
-                                    )?;
-                                    if filtered.num_rows() == 0 {
-                                        return Ok(ApexResult::Empty(filtered.schema()));
-                                    }
-                                    if !stmt.is_pure_star() {
-                                        let projected = Self::apply_projection_with_storage(
-                                            &filtered,
-                                            &stmt.columns,
-                                            Some(storage_path),
-                                        )?;
-                                        return Ok(ApexResult::Data(projected));
-                                    }
-                                    return Ok(ApexResult::Data(filtered));
                                 } else {
-                                    // Late materialization for WHERE path
-                                    // Return directly to avoid applying WHERE filter twice
-                                    let filtered = Self::execute_with_late_materialization(
+                                    // Late materialization for SELECT * WHERE path
+                                    Self::execute_with_late_materialization(
                                         &backend,
                                         &stmt,
                                         storage_path,
-                                    )?;
-                                    if filtered.num_rows() == 0 {
-                                        return Ok(ApexResult::Empty(filtered.schema()));
-                                    }
-                                    if !stmt.is_pure_star() {
-                                        let projected = Self::apply_projection_with_storage(
-                                            &filtered,
-                                            &stmt.columns,
-                                            Some(storage_path),
-                                        )?;
-                                        return Ok(ApexResult::Data(projected));
-                                    }
-                                    return Ok(ApexResult::Data(filtered));
+                                    )?
                                 }
-                            } else if !stmt.group_by.is_empty() {
-                                // GROUP BY with WHERE: use dict-encoded path for faster string aggregation
-                                let col_refs = Self::get_col_refs(&stmt);
-                                backend.read_columns_to_arrow_dict(
-                                    col_refs
-                                        .as_ref()
-                                        .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                                        .as_deref(),
-                                )?
-                            } else if let Some(batch) =
-                                Self::try_numeric_predicate_pushdown(&backend, &stmt)?
-                            {
-                                batch
-                            } else {
-                                let col_refs = Self::get_col_refs(&stmt);
-                                backend.read_columns_to_arrow(
-                                    col_refs
-                                        .as_ref()
-                                        .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                                        .as_deref(),
-                                    0,
-                                    None,
-                                )?
-                            }
-                        } else if can_late_materialize_where {
-                            // FAST PATH 1: Try dictionary-based filter for simple string equality
-                            if let Some(result) = Self::try_fast_string_filter(&backend, &stmt)? {
-                                result
-                            // FAST PATH 1b: No-LIMIT string filter (uses mmap scan + late materialization)
-                            } else if let Some(result) =
-                                Self::try_fast_string_filter_no_limit(&backend, &stmt)?
-                            {
-                                result
-                            // FAST PATH 1c: LIKE pattern scan (prefix/suffix/contains)
-                            } else if let Some(result) =
-                                Self::try_fast_like_filter(&backend, &stmt)?
-                            {
-                                result
-                            // FAST PATH 2: Try numeric range filter for BETWEEN
-                            } else if let Some(result) =
-                                Self::try_fast_numeric_range_filter(&backend, &stmt)?
-                            {
-                                result
-                            // FAST PATH 3: Try combined string + numeric filter for multi-condition
-                            } else if let Some(result) =
-                                Self::try_fast_multi_condition_filter(&backend, &stmt)?
-                            {
-                                result
-                            } else {
-                                // Late materialization for SELECT * WHERE path
-                                Self::execute_with_late_materialization(
-                                    &backend,
-                                    &stmt,
-                                    storage_path,
-                                )?
-                            }
-                        } else if stmt.where_clause.is_some() && stmt.limit.is_none() {
-                            // FAST PATH: String filter without LIMIT (uses dictionary scan)
-                            if let Some(result) =
-                                Self::try_fast_string_filter_no_limit(&backend, &stmt)?
-                            {
-                                result
-                            // FAST PATH: LIKE pattern scan (prefix/suffix/contains)
-                            } else if let Some(result) =
-                                Self::try_fast_like_filter(&backend, &stmt)?
-                            {
-                                result
-                            } else if let Some(batch) =
-                                Self::try_numeric_predicate_pushdown(&backend, &stmt)?
-                            {
-                                batch
-                            } else {
-                                let col_refs = Self::get_col_refs(&stmt);
-                                backend.read_columns_to_arrow(
-                                    col_refs
-                                        .as_ref()
-                                        .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                                        .as_deref(),
-                                    0,
-                                    None,
-                                )?
-                            }
-                        } else if can_late_materialize_order {
-                            // Late materialization for ORDER BY + LIMIT path
-                            Self::execute_with_order_late_materialization(&backend, &stmt)?
-                        } else {
-                            let col_refs = Self::get_col_refs(&stmt);
-                            let col_refs_vec: Option<Vec<&str>> = col_refs
-                                .as_ref()
-                                .map(|v| v.iter().map(|s| s.as_str()).collect());
-                            let can_pushdown_limit = stmt.where_clause.is_none()
-                                && stmt.order_by.is_empty()
-                                && stmt.group_by.is_empty()
-                                && !has_aggregation_check;
-
-                            // Note: V4 fast agg disabled - Arrow clone+SIMD outperforms due to cache warming
-
-                            if !stmt.group_by.is_empty() {
-                                // V4 FAST PATH: Cached GROUP BY
+                            } else if stmt.where_clause.is_some() && stmt.limit.is_none() {
+                                // FAST PATH: String filter without LIMIT (uses dictionary scan)
                                 if let Some(result) =
-                                    Self::try_fast_cached_group_by(&backend, &stmt)?
+                                    Self::try_fast_string_filter_no_limit(&backend, &stmt)?
                                 {
-                                    return Ok(result);
-                                }
-                                // Fallback: dict-encoded Arrow path
-                                backend.read_columns_to_arrow_dict(col_refs_vec.as_deref())?
-                            } else {
-                                let _row_limit = if can_pushdown_limit {
-                                    stmt.limit.map(|l| l + stmt.offset.unwrap_or(0))
+                                    result
+                                // FAST PATH: LIKE pattern scan (prefix/suffix/contains)
+                                } else if let Some(result) =
+                                    Self::try_fast_like_filter(&backend, &stmt)?
+                                {
+                                    result
+                                } else if let Some(batch) =
+                                    Self::try_numeric_predicate_pushdown(&backend, &stmt)?
+                                {
+                                    batch
                                 } else {
-                                    None
-                                };
-                                backend.read_columns_to_arrow(
-                                    col_refs_vec.as_deref(),
-                                    0,
-                                    _row_limit,
-                                )?
+                                    let col_refs = Self::get_col_refs(&stmt);
+                                    backend.read_columns_to_arrow(
+                                        col_refs
+                                            .as_ref()
+                                            .map(|v| {
+                                                v.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+                                            })
+                                            .as_deref(),
+                                        0,
+                                        None,
+                                    )?
+                                }
+                            } else if can_late_materialize_order {
+                                // Late materialization for ORDER BY + LIMIT path
+                                Self::execute_with_order_late_materialization(&backend, &stmt)?
+                            } else {
+                                let col_refs = Self::get_col_refs(&stmt);
+                                let col_refs_vec: Option<Vec<&str>> = col_refs
+                                    .as_ref()
+                                    .map(|v| v.iter().map(|s| s.as_str()).collect());
+                                let can_pushdown_limit = stmt.where_clause.is_none()
+                                    && stmt.order_by.is_empty()
+                                    && stmt.group_by.is_empty()
+                                    && !has_aggregation_check;
+
+                                // Note: V4 fast agg disabled - Arrow clone+SIMD outperforms due to cache warming
+
+                                if !stmt.group_by.is_empty() {
+                                    // V4 FAST PATH: Cached GROUP BY
+                                    if let Some(result) =
+                                        Self::try_fast_cached_group_by(&backend, &stmt)?
+                                    {
+                                        return Ok(result);
+                                    }
+                                    // Fallback: dict-encoded Arrow path
+                                    backend.read_columns_to_arrow_dict(col_refs_vec.as_deref())?
+                                } else {
+                                    let _row_limit = if can_pushdown_limit {
+                                        stmt.limit.map(|l| l + stmt.offset.unwrap_or(0))
+                                    } else {
+                                        None
+                                    };
+                                    backend.read_columns_to_arrow(
+                                        col_refs_vec.as_deref(),
+                                        0,
+                                        _row_limit,
+                                    )?
+                                }
                             }
                         }
                     }
                 }
-            }
             }
         };
 
@@ -811,7 +839,15 @@ impl ApexExecutor {
             if has_aggregation && stmt.group_by.is_empty() {
                 return Self::execute_aggregation(&batch, &stmt);
             }
-            return Ok(ApexResult::Empty(batch.schema()));
+            // Empty relations still have the SELECT-list schema.  Returning the
+            // input schema here drops literal/expression aliases from an empty
+            // CTE and makes a later LEFT JOIN unable to resolve those columns.
+            let projected = if stmt.is_pure_star() {
+                batch
+            } else {
+                Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?
+            };
+            return Ok(ApexResult::Empty(projected.schema()));
         }
 
         // Apply WHERE filter (with storage path for subquery support)
@@ -826,7 +862,12 @@ impl ApexExecutor {
             if has_aggregation && stmt.group_by.is_empty() {
                 return Self::execute_aggregation(&filtered, &stmt);
             }
-            return Ok(ApexResult::Empty(filtered.schema()));
+            let projected = if stmt.is_pure_star() {
+                filtered
+            } else {
+                Self::apply_projection_with_storage(&filtered, &stmt.columns, Some(storage_path))?
+            };
+            return Ok(ApexResult::Empty(projected.schema()));
         }
 
         // Check for window functions
@@ -916,11 +957,19 @@ impl ApexExecutor {
             if let Some(ref on_cols) = stmt.distinct_on {
                 // DISTINCT ON: deduplicate by ON columns, then project + limit/offset
                 let deduped = Self::deduplicate_batch_on(&sorted, on_cols)?;
-                let projected = Self::apply_projection_with_storage(&deduped, &stmt.columns, Some(storage_path))?;
+                let projected = Self::apply_projection_with_storage(
+                    &deduped,
+                    &stmt.columns,
+                    Some(storage_path),
+                )?;
                 Self::apply_limit_offset(&projected, stmt.limit, stmt.offset)?
             } else {
                 // Regular DISTINCT: project, deduplicate all columns, then limit
-                let projected = Self::apply_projection_with_storage(&sorted, &stmt.columns, Some(storage_path))?;
+                let projected = Self::apply_projection_with_storage(
+                    &sorted,
+                    &stmt.columns,
+                    Some(storage_path),
+                )?;
                 let deduped = Self::deduplicate_batch(&projected)?;
                 Self::apply_limit_offset(&deduped, stmt.limit, stmt.offset)?
             }
@@ -2128,7 +2177,11 @@ impl ApexExecutor {
         if let SqlExpr::BinaryOp { left, op, right } = expr {
             if let (SqlExpr::Column(col), SqlExpr::Literal(val)) = (left.as_ref(), right.as_ref()) {
                 let col_name = col.trim_matches('"');
-                let col_name = if let Some(d) = col_name.rfind('.') { &col_name[d + 1..] } else { col_name };
+                let col_name = if let Some(d) = col_name.rfind('.') {
+                    &col_name[d + 1..]
+                } else {
+                    col_name
+                };
                 let op_str = match op {
                     BinaryOperator::Gt => ">",
                     BinaryOperator::Lt => "<",
@@ -2246,8 +2299,8 @@ impl ApexExecutor {
                 if name == "_id" {
                     return Ok(None);
                 } // _id stored separately
-                   // COUNT(col) and AVG(col) must exclude NULLs: check zone maps first.
-                   // If the column has no NULLs, the storage fast path is safe.
+                  // COUNT(col) and AVG(col) must exclude NULLs: check zone maps first.
+                  // If the column has no NULLs, the storage fast path is safe.
                 let is_star_or_const = name == "*"
                     || name
                         .chars()
@@ -2364,7 +2417,9 @@ impl ApexExecutor {
     ) -> io::Result<Option<ApexResult>> {
         use crate::query::AggregateFunc;
 
-        if backend.pending_v4_in_memory_rows() > 0 || backend.has_pending_deltas() || backend.has_delta()
+        if backend.pending_v4_in_memory_rows() > 0
+            || backend.has_pending_deltas()
+            || backend.has_delta()
         {
             return Ok(None);
         }
@@ -2422,14 +2477,11 @@ impl ApexExecutor {
 
         // Single-pass: scan string filter + aggregate in one sequential pass
         use std::collections::HashMap;
-        let agg_results = match backend.execute_filtered_string_agg_mmap(
-            &filter_col,
-            &filter_val,
-            &col_refs,
-        )? {
-            Some(r) => r,
-            None => return Ok(None),
-        };
+        let agg_results =
+            match backend.execute_filtered_string_agg_mmap(&filter_col, &filter_val, &col_refs)? {
+                Some(r) => r,
+                None => return Ok(None),
+            };
 
         // Build stat lookup: column name -> (count, sum, min, max, is_int)
         let mut stat_map: HashMap<&str, (i64, f64, f64, f64, bool)> = HashMap::new();
@@ -2592,7 +2644,9 @@ impl ApexExecutor {
     ) -> io::Result<Option<ApexResult>> {
         use crate::query::AggregateFunc;
 
-        if backend.pending_v4_in_memory_rows() > 0 || backend.has_pending_deltas() || backend.has_delta()
+        if backend.pending_v4_in_memory_rows() > 0
+            || backend.has_pending_deltas()
+            || backend.has_delta()
         {
             return Ok(None);
         }
@@ -2651,7 +2705,7 @@ impl ApexExecutor {
             match backend.execute_filtered_numeric_agg_mmap(&filter_col, low, high, &col_refs)? {
                 Some(r) => r,
                 None => return Ok(None),
-        };
+            };
 
         use std::collections::HashMap;
         let mut stat_map: HashMap<&str, (i64, f64, f64, f64, bool)> = HashMap::new();
@@ -3056,8 +3110,16 @@ impl ApexExecutor {
         let col2_vals: Vec<&str> = raw.iter().map(|((_, k2), _)| k2.as_str()).collect();
 
         let mut fields: Vec<Field> = vec![
-            Field::new(Self::group_output_name(stmt, group_col1), ArrowDataType::Utf8, false),
-            Field::new(Self::group_output_name(stmt, group_col2), ArrowDataType::Utf8, false),
+            Field::new(
+                Self::group_output_name(stmt, group_col1),
+                ArrowDataType::Utf8,
+                false,
+            ),
+            Field::new(
+                Self::group_output_name(stmt, group_col2),
+                ArrowDataType::Utf8,
+                false,
+            ),
         ];
         let mut arrays: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(col1_vals)),

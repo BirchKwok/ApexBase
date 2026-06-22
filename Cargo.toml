@@ -1,6 +1,6 @@
 [package]
 name = "apexbase"
-version = "1.19.1"
+version = "1.20.0"
 edition = "2021"
 authors = ["Birch Kwok <birchkwok@gmail.com>"]
 description = "High-performance HTAP embedded database with Rust core"
@@ -69,6 +69,7 @@ rand = "0.8"
 
 # Regex for query parsing
 regex = "1.10"
+md5 = "0.7"
 
 # Fast substring search
 memchr = "2.7"

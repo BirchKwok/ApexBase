@@ -2,7 +2,11 @@
 
 impl ApexExecutor {
     /// Execute SELECT statement with JOINs
-    fn execute_select_with_joins(stmt: SelectStatement, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
+    fn execute_select_with_joins(
+        stmt: SelectStatement,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<ApexResult> {
         // CBO: Reorder INNER JOINs by ascending right-table size (star join optimization).
         // Only when ALL joins are INNER and each ON condition references only the FROM table
         // and its own right table (no cross-JOIN column dependencies).
@@ -19,30 +23,51 @@ impl ApexExecutor {
                     left_backend.read_columns_to_arrow(None, 0, None)?
                 }
             }
-            Some(FromItem::Subquery { stmt: sub_stmt, .. }) => {
-                match sub_stmt.as_ref() {
-                    crate::query::SqlStatement::Select(sel) => {
-                        let sub_path = Self::resolve_from_table_path(sel, base_dir, default_table_path);
-                        (if sel.joins.is_empty() {
-                            Self::execute_select_with_base_dir(sel.clone(), &sub_path, base_dir, default_table_path)
-                        } else {
-                            Self::execute_select_with_joins(sel.clone(), base_dir, default_table_path)
-                        })?.to_record_batch()?
-                    }
-                    crate::query::SqlStatement::Union(u) => {
-                        Self::execute_union(u.clone(), base_dir, default_table_path)?.to_record_batch()?
-                    }
-                    _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Subquery must be SELECT or set operation")),
+            Some(FromItem::Subquery { stmt: sub_stmt, .. }) => match sub_stmt.as_ref() {
+                crate::query::SqlStatement::Select(sel) => {
+                    let sub_path = Self::resolve_from_table_path(sel, base_dir, default_table_path);
+                    (if sel.joins.is_empty() {
+                        Self::execute_select_with_base_dir(
+                            sel.clone(),
+                            &sub_path,
+                            base_dir,
+                            default_table_path,
+                        )
+                    } else {
+                        Self::execute_select_with_joins(sel.clone(), base_dir, default_table_path)
+                    })?
+                    .to_record_batch()?
                 }
-            }
-            Some(FromItem::TableFunction { func, file, options, .. }) => {
-                Self::read_table_function(func, file, options)?
-            }
-            Some(FromItem::TopkDistance { col, query, k, metric, .. }) => {
-                Self::execute_topk_distance(default_table_path, col, query, *k, metric)?
-            }
+                crate::query::SqlStatement::Union(u) => {
+                    Self::execute_union(u.clone(), base_dir, default_table_path)?
+                        .to_record_batch()?
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Subquery must be SELECT or set operation",
+                    ))
+                }
+            },
+            Some(FromItem::TableFunction {
+                func,
+                file,
+                options,
+                ..
+            }) => Self::read_table_function(func, file, options)?,
+            Some(FromItem::TopkDistance {
+                col,
+                query,
+                k,
+                metric,
+                ..
+            }) => Self::execute_topk_distance(default_table_path, col, query, *k, metric)?,
             Some(FromItem::DirectFile { file, .. }) => Self::read_direct_file(file)?,
-            Some(FromItem::LateralExplode { .. } | FromItem::LateralStack { .. }) => {
+            Some(
+                FromItem::LateralExplode { .. }
+                | FromItem::LateralPosExplode { .. }
+                | FromItem::LateralStack { .. },
+            ) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "LATERAL VIEW requires a base FROM source",
@@ -63,9 +88,21 @@ impl ApexExecutor {
                     outer,
                     ..
                 } => {
-                    result_batch = Self::apply_lateral_explode(
+                    result_batch =
+                        Self::apply_lateral_explode(&result_batch, expr, column_alias, *outer)?;
+                    continue;
+                }
+                FromItem::LateralPosExplode {
+                    expr,
+                    position_alias,
+                    column_alias,
+                    outer,
+                    ..
+                } => {
+                    result_batch = Self::apply_lateral_posexplode(
                         &result_batch,
                         expr,
+                        position_alias,
                         column_alias,
                         *outer,
                     )?;
@@ -77,12 +114,8 @@ impl ApexExecutor {
                     column_aliases,
                     ..
                 } => {
-                    result_batch = Self::apply_lateral_stack(
-                        &result_batch,
-                        *rows,
-                        values,
-                        column_aliases,
-                    )?;
+                    result_batch =
+                        Self::apply_lateral_stack(&result_batch, *rows, values, column_aliases)?;
                     continue;
                 }
                 _ => {}
@@ -97,31 +130,73 @@ impl ApexExecutor {
                         right_backend.read_columns_to_arrow(None, 0, None)?
                     }
                 }
-                FromItem::Subquery { stmt: sub_stmt, .. } => {
-                    match sub_stmt.as_ref() {
-                        crate::query::SqlStatement::Select(sel) => {
-                            let sub_path = Self::resolve_from_table_path(sel, base_dir, default_table_path);
-                            (if sel.joins.is_empty() {
-                                Self::execute_select_with_base_dir(sel.clone(), &sub_path, base_dir, default_table_path)
-                            } else {
-                                Self::execute_select_with_joins(sel.clone(), base_dir, default_table_path)
-                            })?.to_record_batch()?
-                        }
-                        crate::query::SqlStatement::Union(u) => {
-                            Self::execute_union(u.clone(), base_dir, default_table_path)?.to_record_batch()?
-                        }
-                        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Subquery must be SELECT or set operation")),
+                FromItem::Subquery { stmt: sub_stmt, .. } => match sub_stmt.as_ref() {
+                    crate::query::SqlStatement::Select(sel) => {
+                        let sub_path =
+                            Self::resolve_from_table_path(sel, base_dir, default_table_path);
+                        (if sel.joins.is_empty() {
+                            Self::execute_select_with_base_dir(
+                                sel.clone(),
+                                &sub_path,
+                                base_dir,
+                                default_table_path,
+                            )
+                        } else {
+                            Self::execute_select_with_joins(
+                                sel.clone(),
+                                base_dir,
+                                default_table_path,
+                            )
+                        })?
+                        .to_record_batch()?
                     }
-                }
-                FromItem::TableFunction { func, file, options, .. } => {
-                    Self::read_table_function(func, file, options)?
-                }
-                FromItem::TopkDistance { col, query, k, metric, .. } => {
-                    Self::execute_topk_distance(default_table_path, col, query, *k, metric)?
-                }
+                    crate::query::SqlStatement::Union(u) => {
+                        Self::execute_union(u.clone(), base_dir, default_table_path)?
+                            .to_record_batch()?
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Subquery must be SELECT or set operation",
+                        ))
+                    }
+                },
+                FromItem::TableFunction {
+                    func,
+                    file,
+                    options,
+                    ..
+                } => Self::read_table_function(func, file, options)?,
+                FromItem::TopkDistance {
+                    col,
+                    query,
+                    k,
+                    metric,
+                    ..
+                } => Self::execute_topk_distance(default_table_path, col, query, *k, metric)?,
                 FromItem::DirectFile { file, .. } => Self::read_direct_file(file)?,
-                FromItem::LateralExplode { .. } | FromItem::LateralStack { .. } => unreachable!(),
+                FromItem::LateralExplode { .. }
+                | FromItem::LateralPosExplode { .. }
+                | FromItem::LateralStack { .. } => unreachable!(),
             };
+
+            if matches!(join_clause.join_type, JoinType::Semi | JoinType::Anti) {
+                let (left_key, right_key, _, _, extra_filter) =
+                    Self::extract_join_keys_with_filter(&join_clause.on)?;
+                let filtered_right = if let Some(filter) = extra_filter {
+                    Self::apply_filter_with_storage(&right_batch, &filter, default_table_path)?
+                } else {
+                    right_batch
+                };
+                result_batch = Self::hash_semi_anti_join(
+                    &result_batch,
+                    &filtered_right,
+                    &left_key,
+                    &right_key,
+                    join_clause.join_type == JoinType::Anti,
+                )?;
+                continue;
+            }
 
             // CROSS JOIN has no ON clause — use cartesian product directly
             if join_clause.join_type == JoinType::Cross {
@@ -135,8 +210,13 @@ impl ApexExecutor {
                     _ => None,
                 };
                 // Extract join keys from ON condition (supports AND with extra filter)
-                let Ok((left_key, right_key, left_key_qualifier, right_key_qualifier, extra_filter)) =
-                    Self::extract_join_keys_with_filter(&join_clause.on)
+                let Ok((
+                    left_key,
+                    right_key,
+                    left_key_qualifier,
+                    right_key_qualifier,
+                    extra_filter,
+                )) = Self::extract_join_keys_with_filter(&join_clause.on)
                 else {
                     result_batch = Self::nested_loop_join_on(
                         &result_batch,
@@ -163,13 +243,33 @@ impl ApexExecutor {
 
                 // Apply extra ON predicates (non-equality conditions from AND)
                 if let Some(filter) = extra_filter {
-                    result_batch = Self::apply_filter_with_storage(&result_batch, &filter, default_table_path)?;
+                    result_batch = Self::apply_filter_with_storage(
+                        &result_batch,
+                        &filter,
+                        default_table_path,
+                    )?;
                 }
             }
         }
 
+        // Determine this before the empty checks: COUNT over an empty join must
+        // still produce a row, while ordinary projections must retain aliases.
+        let has_aggregation = stmt.columns.iter().any(|col| match col {
+            SelectColumn::Aggregate { .. } => true,
+            SelectColumn::Expression { expr, .. } => Self::expr_contains_aggregate(expr),
+            _ => false,
+        });
+
         if result_batch.num_rows() == 0 {
-            return Ok(ApexResult::Empty(result_batch.schema()));
+            if has_aggregation && stmt.group_by.is_empty() {
+                return Self::execute_aggregation(&result_batch, &stmt);
+            }
+            let projected = Self::apply_projection_with_storage(
+                &result_batch,
+                &stmt.columns,
+                Some(default_table_path),
+            )?;
+            return Ok(ApexResult::Empty(projected.schema()));
         }
 
         // Apply WHERE filter (with storage path for subquery support)
@@ -180,15 +280,16 @@ impl ApexExecutor {
         };
 
         if filtered.num_rows() == 0 {
-            return Ok(ApexResult::Empty(filtered.schema()));
+            if has_aggregation && stmt.group_by.is_empty() {
+                return Self::execute_aggregation(&filtered, &stmt);
+            }
+            let projected = Self::apply_projection_with_storage(
+                &filtered,
+                &stmt.columns,
+                Some(default_table_path),
+            )?;
+            return Ok(ApexResult::Empty(projected.schema()));
         }
-
-        // Check for aggregation
-        let has_aggregation = stmt.columns.iter().any(|col| match col {
-            SelectColumn::Aggregate { .. } => true,
-            SelectColumn::Expression { expr, .. } => Self::expr_contains_aggregate(expr),
-            _ => false,
-        });
 
         let has_window = stmt
             .columns
@@ -214,10 +315,14 @@ impl ApexExecutor {
                 {
                     let mut resolved_order = order_by.clone();
                     for clause in &mut resolved_order {
-                        if grouped.column_by_name(clause.column.trim_matches('"')).is_some() {
+                        if grouped
+                            .column_by_name(clause.column.trim_matches('"'))
+                            .is_some()
+                        {
                             continue;
                         }
-                        let aggregate_name = clause.column.split('(').next().unwrap_or(&clause.column);
+                        let aggregate_name =
+                            clause.column.split('(').next().unwrap_or(&clause.column);
                         if let Some(output) = stmt.columns.iter().find_map(|candidate| {
                             if let SelectColumn::Expression {
                                 expr: SqlExpr::Function { name, .. },
@@ -273,7 +378,8 @@ impl ApexExecutor {
         let limited = Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset)?;
 
         // Apply projection - pass default_table_path for scalar subqueries
-        let projected = Self::apply_projection_with_storage(&limited, &stmt.columns, Some(default_table_path))?;
+        let projected =
+            Self::apply_projection_with_storage(&limited, &stmt.columns, Some(default_table_path))?;
 
         // Apply DISTINCT if specified
         let result = if stmt.distinct {
@@ -337,6 +443,63 @@ impl ApexExecutor {
             .map_err(|e| err_data(e.to_string()))
     }
 
+    fn apply_lateral_posexplode(
+        batch: &RecordBatch,
+        expr: &SqlExpr,
+        position_alias: &str,
+        column_alias: &str,
+        outer: bool,
+    ) -> io::Result<RecordBatch> {
+        let array = Self::evaluate_expr_to_array(batch, expr)?;
+        let strings = array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| err_data("POSEXPLODE currently requires a string or SPLIT result"))?;
+        let estimated_rows = batch.num_rows().saturating_mul(2);
+        let mut indices = Vec::with_capacity(estimated_rows);
+        let mut positions = Vec::with_capacity(estimated_rows);
+        let mut values = arrow::array::StringBuilder::with_capacity(
+            estimated_rows,
+            batch.num_rows().saturating_mul(8),
+        );
+        for row in 0..batch.num_rows() {
+            if strings.is_null(row) {
+                if outer {
+                    indices.push(row as u32);
+                    positions.push(None);
+                    values.append_null();
+                }
+                continue;
+            }
+            for (position, item) in strings.value(row).split('\0').enumerate() {
+                indices.push(row as u32);
+                positions.push(Some(position as i64));
+                values.append_value(item);
+            }
+        }
+        let take = arrow::array::UInt32Array::from(indices);
+        let mut fields: Vec<Field> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        use rayon::prelude::*;
+        let mut columns: Vec<ArrayRef> = batch
+            .columns()
+            .par_iter()
+            .map(|col| {
+                compute::take(col.as_ref(), &take, None).map_err(|e| err_data(e.to_string()))
+            })
+            .collect::<io::Result<_>>()?;
+        fields.push(Field::new(position_alias, ArrowDataType::Int64, true));
+        columns.push(Arc::new(Int64Array::from(positions)) as ArrayRef);
+        fields.push(Field::new(column_alias, ArrowDataType::Utf8, true));
+        columns.push(Arc::new(values.finish()) as ArrayRef);
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map_err(|e| err_data(e.to_string()))
+    }
+
     fn apply_lateral_stack(
         batch: &RecordBatch,
         rows: usize,
@@ -373,12 +536,18 @@ impl ApexExecutor {
             let sources: Vec<&ArrayRef> = (0..rows)
                 .map(|row| &evaluated[row * column_aliases.len() + col_idx])
                 .collect();
-            let has_string = sources
-                .iter()
-                .any(|array| matches!(array.data_type(), ArrowDataType::Utf8 | ArrowDataType::LargeUtf8));
-            let has_float = sources
-                .iter()
-                .any(|array| matches!(array.data_type(), ArrowDataType::Float32 | ArrowDataType::Float64));
+            let has_string = sources.iter().any(|array| {
+                matches!(
+                    array.data_type(),
+                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8
+                )
+            });
+            let has_float = sources.iter().any(|array| {
+                matches!(
+                    array.data_type(),
+                    ArrowDataType::Float32 | ArrowDataType::Float64
+                )
+            });
             if has_string {
                 let mut output = Vec::with_capacity(batch.num_rows() * rows);
                 for source in sources {
@@ -415,7 +584,11 @@ impl ApexExecutor {
 
     /// Resolve table path from FROM clause.
     /// Delegates to resolve_table_path so that db.table qualified names are handled uniformly.
-    fn resolve_from_table_path(stmt: &SelectStatement, base_dir: &Path, default_table_path: &Path) -> std::path::PathBuf {
+    fn resolve_from_table_path(
+        stmt: &SelectStatement,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> std::path::PathBuf {
         if let Some(FromItem::Table { table, .. }) = &stmt.from {
             let table_name = table.trim_matches('"');
             // Check if table matches the default table's file stem (unqualified fast path)
@@ -436,14 +609,29 @@ impl ApexExecutor {
     /// Supports qualified `database.table` syntax for cross-database queries.
     /// The root directory (parent of all databases) is retrieved from the
     /// thread-local QUERY_ROOT_DIR set by Python bindings before execution.
-    fn resolve_table_path(table_name: &str, base_dir: &Path, default_table_path: &Path) -> std::path::PathBuf {
+    fn resolve_table_path(
+        table_name: &str,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> std::path::PathBuf {
         let clean_name = table_name.trim_matches('"').trim_matches('`');
 
         // Check temp dir first: temp tables shadow persistent tables
-        let safe_check: String = clean_name.chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        let safe_check: String = clean_name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
-        let truncated_check = if safe_check.len() > 200 { &safe_check[..200] } else { &safe_check };
+        let truncated_check = if safe_check.len() > 200 {
+            &safe_check[..200]
+        } else {
+            &safe_check
+        };
         if let Some(temp_dir) = crate::query::executor::get_temp_dir() {
             let temp_path = temp_dir.join(format!("{}.apex", truncated_check));
             if temp_path.exists() {
@@ -455,10 +643,21 @@ impl ApexExecutor {
         if let Some(dot_pos) = clean_name.find('.') {
             let db_name = clean_name[..dot_pos].trim();
             let tbl_name = clean_name[dot_pos + 1..].trim();
-            let safe_tbl: String = tbl_name.chars()
-                .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            let safe_tbl: String = tbl_name
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
                 .collect();
-            let safe_tbl = if safe_tbl.len() > 200 { &safe_tbl[..200] } else { &safe_tbl };
+            let safe_tbl = if safe_tbl.len() > 200 {
+                &safe_tbl[..200]
+            } else {
+                &safe_tbl
+            };
 
             // Determine root_dir: from thread-local if available, else base_dir.parent()
             let root_dir = crate::query::executor::get_query_root_dir()
@@ -479,26 +678,45 @@ impl ApexExecutor {
                 default_table_path.to_path_buf()
             }
         } else {
-            let safe_name: String = clean_name.chars()
-                .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            let safe_name: String = clean_name
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
                 .collect();
-            let truncated_name = if safe_name.len() > 200 { &safe_name[..200] } else { &safe_name };
+            let truncated_name = if safe_name.len() > 200 {
+                &safe_name[..200]
+            } else {
+                &safe_name
+            };
             base_dir.join(format!("{}.apex", truncated_name))
         }
     }
 
     /// Resolve the table path for a point-lookup query by extracting the FROM clause table name.
     /// Used by the QuerySignature::PointLookup pre-parse fast path.
-    fn resolve_point_lookup_table_path(sql: &str, base_dir: &Path, default_table_path: &Path) -> std::path::PathBuf {
+    fn resolve_point_lookup_table_path(
+        sql: &str,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> std::path::PathBuf {
         let su = sql.trim().to_ascii_uppercase();
         if let Some(fp) = su.find(" FROM ") {
             let after_from = su[fp + 6..].trim_start();
-            let tn_end = after_from.find(|c: char| c == ' ' || c == '\t' || c == '\n' || c == ';')
+            let tn_end = after_from
+                .find(|c: char| c == ' ' || c == '\t' || c == '\n' || c == ';')
                 .unwrap_or(after_from.len());
             let tname = after_from[..tn_end].trim_matches('"').to_lowercase();
             if !tname.is_empty() {
-                let default_stem = default_table_path.file_stem()
-                    .and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                let default_stem = default_table_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
                 if tname == default_stem {
                     return default_table_path.to_path_buf();
                 }
@@ -548,7 +766,7 @@ impl ApexExecutor {
         // Sort by ascending row count (smallest tables joined first)
         indexed.sort_by_key(|&(_, rows)| rows);
         let reordered: Vec<JoinClause> = indexed.iter().map(|&(i, _)| joins[i].clone()).collect();
-        
+
         // Validate column dependencies: each JOIN's ON clause left key must reference
         // a column available from the FROM table or a previously-joined right table.
         // If reordering breaks this (e.g., ON a.col = p.col where 'a' hasn't been joined yet),
@@ -563,14 +781,15 @@ impl ApexExecutor {
                 if let Some(dot_pos) = left_key_full.rfind('.') {
                     let table_prefix = &left_key_full[..dot_pos];
                     // Check if this table prefix matches any RIGHT table that comes AFTER this join
-                    let is_forward_ref = reordered[idx + 1..].iter().any(|future_j| {
-                        match &future_j.right {
-                            FromItem::Table { table, alias, .. } => {
-                                alias.as_deref().unwrap_or(table) == table_prefix
-                            }
-                            _ => false,
-                        }
-                    });
+                    let is_forward_ref =
+                        reordered[idx + 1..]
+                            .iter()
+                            .any(|future_j| match &future_j.right {
+                                FromItem::Table { table, alias, .. } => {
+                                    alias.as_deref().unwrap_or(table) == table_prefix
+                                }
+                                _ => false,
+                            });
                     if is_forward_ref {
                         // Reordering broke column dependency — fall back to original order
                         return joins.to_vec();
@@ -582,7 +801,7 @@ impl ApexExecutor {
                 available_tables.push(alias.clone().unwrap_or_else(|| table.clone()));
             }
         }
-        
+
         reordered
     }
 
@@ -590,18 +809,35 @@ impl ApexExecutor {
     fn extract_join_keys_qualified(on_expr: &SqlExpr) -> io::Result<(String, String)> {
         use crate::query::sql_parser::BinaryOperator;
         match on_expr {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => {
                 let left_col = match left.as_ref() {
                     SqlExpr::Column(name) => name.clone(),
-                    _ => return Err(io::Error::new(io::ErrorKind::Unsupported, "JOIN key must be a column reference")),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "JOIN key must be a column reference",
+                        ))
+                    }
                 };
                 let right_col = match right.as_ref() {
                     SqlExpr::Column(name) => name.clone(),
-                    _ => return Err(io::Error::new(io::ErrorKind::Unsupported, "JOIN key must be a column reference")),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "JOIN key must be a column reference",
+                        ))
+                    }
                 };
                 Ok((left_col, right_col))
             }
-            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "JOIN ON clause must be a simple equality")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "JOIN ON clause must be a simple equality",
+            )),
         }
     }
 
@@ -612,15 +848,24 @@ impl ApexExecutor {
     }
 
     /// Extract join key references from ON condition, preserving optional table qualifiers.
-    fn extract_join_key_refs(on_expr: &SqlExpr) -> io::Result<(String, String, Option<String>, Option<String>)> {
+    fn extract_join_key_refs(
+        on_expr: &SqlExpr,
+    ) -> io::Result<(String, String, Option<String>, Option<String>)> {
         use crate::query::sql_parser::BinaryOperator;
         match on_expr {
-            SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => {
                 let (left_col, left_qualifier) = Self::extract_column_reference(left)?;
                 let (right_col, right_qualifier) = Self::extract_column_reference(right)?;
                 Ok((left_col, right_col, left_qualifier, right_qualifier))
             }
-            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "JOIN ON clause must be a simple equality")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "JOIN ON clause must be a simple equality",
+            )),
         }
     }
 
@@ -628,27 +873,55 @@ impl ApexExecutor {
     /// Supports compound AND: ON a.id=b.id AND a.x<b.x → key=(id,id), filter=a.x<b.x
     fn extract_join_keys_with_filter(
         on_expr: &SqlExpr,
-    ) -> io::Result<(String, String, Option<String>, Option<String>, Option<SqlExpr>)> {
+    ) -> io::Result<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<SqlExpr>,
+    )> {
         use crate::query::sql_parser::BinaryOperator;
-        match on_expr {
-            SqlExpr::BinaryOp { .. } if matches!(on_expr, SqlExpr::BinaryOp { op: BinaryOperator::Eq, .. }) => {
-                let (left_col, right_col, left_qualifier, right_qualifier) =
-                    Self::extract_join_key_refs(on_expr)?;
-                Ok((left_col, right_col, left_qualifier, right_qualifier, None))
+        fn flatten_and(expr: &SqlExpr, out: &mut Vec<SqlExpr>) {
+            if let SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } = expr
+            {
+                flatten_and(left, out);
+                flatten_and(right, out);
+            } else {
+                out.push(expr.clone());
             }
-            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
-                // Try left as equality predicate, right as extra filter
-                if let Ok((lk, rk, lq, rq)) = Self::extract_join_key_refs(left) {
-                    return Ok((lk, rk, lq, rq, Some(*right.clone())));
-                }
-                // Try right as equality predicate, left as extra filter
-                if let Ok((lk, rk, lq, rq)) = Self::extract_join_key_refs(right) {
-                    return Ok((lk, rk, lq, rq, Some(*left.clone())));
-                }
-                Err(io::Error::new(io::ErrorKind::Unsupported, "No equijoin condition found in AND ON clause"))
-            }
-            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "JOIN ON clause must be a simple equality (e.g., a.id = b.id)")),
         }
+        let mut predicates = Vec::new();
+        flatten_and(on_expr, &mut predicates);
+        let key_index = predicates
+            .iter()
+            .position(|predicate| Self::extract_join_key_refs(predicate).is_ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "No equijoin condition found in JOIN ON clause",
+                )
+            })?;
+        let (left_col, right_col, left_qualifier, right_qualifier) =
+            Self::extract_join_key_refs(&predicates[key_index])?;
+        predicates.remove(key_index);
+        let extra_filter = predicates
+            .into_iter()
+            .reduce(|left, right| SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOperator::And,
+                right: Box::new(right),
+            });
+        Ok((
+            left_col,
+            right_col,
+            left_qualifier,
+            right_qualifier,
+            extra_filter,
+        ))
     }
 
     /// Wrapper around hash_join that supports an optional right-table alias for column naming.
@@ -666,13 +939,16 @@ impl ApexExecutor {
         let preserve_qualified_left_key =
             *join_type == JoinType::Right && left_key_qualifier.is_some();
         let preserve_qualified_right_key =
-            matches!(join_type, JoinType::Right | JoinType::Full)
-                && right_key_qualifier.is_some();
+            matches!(join_type, JoinType::Right | JoinType::Full) && right_key_qualifier.is_some();
         if right_alias.is_none() && !preserve_qualified_left_key && !preserve_qualified_right_key {
             return Self::hash_join(left, right, left_key, right_key, join_type);
         }
         let prepared_left = if preserve_qualified_left_key {
-            Some(Self::append_qualified_join_key(left, left_key, left_key_qualifier)?)
+            Some(Self::append_qualified_join_key(
+                left,
+                left_key,
+                left_key_qualifier,
+            )?)
         } else {
             None
         };
@@ -707,9 +983,14 @@ impl ApexExecutor {
         conflict_alias: Option<&str>,
         qualified_join_key: Option<&str>,
     ) -> io::Result<RecordBatch> {
-        let left_name_vec: Vec<String> = left.schema().fields()
-            .iter().map(|f| f.name().clone()).collect();
-        let left_names: std::collections::HashSet<&str> = left_name_vec.iter().map(|s| s.as_str()).collect();
+        let left_name_vec: Vec<String> = left
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let left_names: std::collections::HashSet<&str> =
+            left_name_vec.iter().map(|s| s.as_str()).collect();
         let mut fields: Vec<arrow::datatypes::Field> = Vec::new();
         let mut arrays: Vec<arrow::array::ArrayRef> = Vec::new();
         for (i, field) in right.schema().fields().iter().enumerate() {
@@ -723,7 +1004,11 @@ impl ApexExecutor {
             } else {
                 name.clone()
             };
-            fields.push(arrow::datatypes::Field::new(&new_name, field.data_type().clone(), field.is_nullable()));
+            fields.push(arrow::datatypes::Field::new(
+                &new_name,
+                field.data_type().clone(),
+                field.is_nullable(),
+            ));
             arrays.push(right.column(i).clone());
 
             if name == join_key {
@@ -775,24 +1060,15 @@ impl ApexExecutor {
             .collect();
         let mut left_columns = left.columns().to_vec();
         left_fields.push(Field::new(ROW_ID, ArrowDataType::UInt64, false));
-        left_columns.push(Arc::new(UInt64Array::from_iter_values(
-            0..left.num_rows() as u64,
-        )) as ArrayRef);
-        let tagged_left = RecordBatch::try_new(
-            Arc::new(Schema::new(left_fields)),
-            left_columns,
-        )
-        .map_err(|e| err_data(e.to_string()))?;
+        left_columns
+            .push(Arc::new(UInt64Array::from_iter_values(0..left.num_rows() as u64)) as ArrayRef);
+        let tagged_left = RecordBatch::try_new(Arc::new(Schema::new(left_fields)), left_columns)
+            .map_err(|e| err_data(e.to_string()))?;
 
         // Rename conflicting right columns to alias-qualified names so predicates
         // such as `p.dt = ...` remain unambiguous after the Cartesian expansion.
-        let prepared_right = Self::prepare_right_join_columns(
-            right,
-            &tagged_left,
-            "",
-            right_alias,
-            None,
-        )?;
+        let prepared_right =
+            Self::prepare_right_join_columns(right, &tagged_left, "", right_alias, None)?;
         let crossed = Self::cross_join(&tagged_left, &prepared_right)?;
         let matched = Self::apply_filter_with_storage(&crossed, on, storage_path)?;
 
@@ -826,10 +1102,7 @@ impl ApexExecutor {
                 }
                 let extra_rows = indices.len();
                 for field in prepared_right.schema().fields() {
-                    extra_columns.push(arrow::array::new_null_array(
-                        field.data_type(),
-                        extra_rows,
-                    ));
+                    extra_columns.push(arrow::array::new_null_array(field.data_type(), extra_rows));
                 }
                 let nullable_schema = Arc::new(Schema::new(
                     crossed
@@ -839,11 +1112,9 @@ impl ApexExecutor {
                         .map(|f| Field::new(f.name(), f.data_type().clone(), true))
                         .collect::<Vec<_>>(),
                 ));
-                let matched = RecordBatch::try_new(
-                    nullable_schema.clone(),
-                    matched.columns().to_vec(),
-                )
-                .map_err(|e| err_data(e.to_string()))?;
+                let matched =
+                    RecordBatch::try_new(nullable_schema.clone(), matched.columns().to_vec())
+                        .map_err(|e| err_data(e.to_string()))?;
                 let extra = RecordBatch::try_new(nullable_schema.clone(), extra_columns)
                     .map_err(|e| err_data(e.to_string()))?;
                 arrow::compute::concat_batches(&nullable_schema, &[matched, extra])
@@ -891,12 +1162,17 @@ impl ApexExecutor {
             return Ok(batch.clone());
         }
 
-        let join_key_idx = batch.schema().fields().iter()
+        let join_key_idx = batch
+            .schema()
+            .fields()
+            .iter()
             .position(|field| field.name() == join_key)
-            .ok_or_else(|| io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Join key '{}' not found", join_key),
-            ))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Join key '{}' not found", join_key),
+                )
+            })?;
 
         let mut fields: Vec<arrow::datatypes::Field> = Vec::with_capacity(batch.num_columns() + 1);
         let mut arrays: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns() + 1);
@@ -962,6 +1238,15 @@ impl ApexExecutor {
         right_key: &str,
         join_type: &JoinType,
     ) -> io::Result<RecordBatch> {
+        if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+            return Self::hash_semi_anti_join(
+                left,
+                right,
+                left_key,
+                right_key,
+                *join_type == JoinType::Anti,
+            );
+        }
         // RIGHT JOIN → LEFT JOIN with swapped tables, then reorder columns
         if *join_type == JoinType::Right {
             let swapped = Self::hash_join(right, left, right_key, left_key, &JoinType::Left)?;
@@ -979,76 +1264,112 @@ impl ApexExecutor {
         }
 
         // Get key columns
-        let left_key_col = left.column_by_name(left_key)
-            .ok_or_else(|| io::Error::new(
+        let left_key_col = left.column_by_name(left_key).ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Left join key '{}' not found", left_key),
-            ))?;
-        let right_key_col = right.column_by_name(right_key)
-            .ok_or_else(|| io::Error::new(
+            )
+        })?;
+        let right_key_col = right.column_by_name(right_key).ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Right join key '{}' not found", right_key),
-            ))?;
+            )
+        })?;
 
         // For INNER JOIN, swap tables if right is larger (build from smaller table)
-        let should_swap = !matches!(join_type, JoinType::Left) && right.num_rows() > left.num_rows() * 2;
-        
-        let (build_batch, probe_batch, build_key_col, probe_key_col, build_key, probe_key, swapped) = if should_swap {
-            (left, right, left_key_col, right_key_col, left_key, right_key, true)
-        } else {
-            (right, left, right_key_col, left_key_col, right_key, left_key, false)
-        };
+        let should_swap =
+            !matches!(join_type, JoinType::Left) && right.num_rows() > left.num_rows() * 2;
+
+        let (build_batch, probe_batch, build_key_col, probe_key_col, build_key, probe_key, swapped) =
+            if should_swap {
+                (
+                    left,
+                    right,
+                    left_key_col,
+                    right_key_col,
+                    left_key,
+                    right_key,
+                    true,
+                )
+            } else {
+                (
+                    right,
+                    left,
+                    right_key_col,
+                    left_key_col,
+                    right_key,
+                    left_key,
+                    false,
+                )
+            };
 
         // Build hash table from build side (smaller table for INNER JOIN)
         let build_rows = build_batch.num_rows();
-        
+
         // For Int64 keys, use optimized direct hash building
-        let hash_table: AHashMap<u64, Vec<usize>> = if let Some(build_int_arr) = build_key_col.as_any().downcast_ref::<Int64Array>() {
-            let mut table: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(build_rows);
-            for i in 0..build_rows {
-                if !build_int_arr.is_null(i) {
-                    let val = build_int_arr.value(i);
-                    let hash = {
-                        let mut h = AHasher::default();
-                        val.hash(&mut h);
-                        h.finish()
-                    };
-                    table.entry(hash).or_insert_with(|| Vec::with_capacity(2)).push(i);
+        let hash_table: AHashMap<u64, Vec<usize>> =
+            if let Some(build_int_arr) = build_key_col.as_any().downcast_ref::<Int64Array>() {
+                let mut table: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(build_rows);
+                for i in 0..build_rows {
+                    if !build_int_arr.is_null(i) {
+                        let val = build_int_arr.value(i);
+                        let hash = {
+                            let mut h = AHasher::default();
+                            val.hash(&mut h);
+                            h.finish()
+                        };
+                        table
+                            .entry(hash)
+                            .or_insert_with(|| Vec::with_capacity(2))
+                            .push(i);
+                    }
                 }
-            }
-            table
-        } else {
-            let mut table: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(build_rows);
-            for i in 0..build_rows {
-                let hash = Self::hash_array_value_fast(build_key_col, i);
-                table.entry(hash).or_insert_with(|| Vec::with_capacity(4)).push(i);
-            }
-            table
-        };
-        
+                table
+            } else {
+                let mut table: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(build_rows);
+                for i in 0..build_rows {
+                    let hash = Self::hash_array_value_fast(build_key_col, i);
+                    table
+                        .entry(hash)
+                        .or_insert_with(|| Vec::with_capacity(4))
+                        .push(i);
+                }
+                table
+            };
+
         let right_rows = right.num_rows();
 
         // Probe phase - use probe_batch (which may be swapped)
         let probe_rows = probe_batch.num_rows();
         let is_left_join = matches!(join_type, JoinType::Left);
-        
+
         // Check if key columns are Int64 (most common case) - can skip equality check
-        let is_int64_key = probe_key_col.as_any().downcast_ref::<Int64Array>().is_some() 
-            && build_key_col.as_any().downcast_ref::<Int64Array>().is_some();
+        let is_int64_key = probe_key_col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .is_some()
+            && build_key_col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .is_some();
 
         // For INNER JOIN with Int64 keys, use optimized path without Option overhead
         let is_inner_join_fast_path = is_int64_key && (!is_left_join || swapped);
-        
+
         // Collect probe_idx -> build_idx mappings
-        let (probe_indices, build_indices_u32, build_indices_opt): (Vec<u32>, Vec<u32>, Vec<Option<u32>>) = 
-        if is_inner_join_fast_path {
+        let (probe_indices, build_indices_u32, build_indices_opt): (
+            Vec<u32>,
+            Vec<u32>,
+            Vec<Option<u32>>,
+        ) = if is_inner_join_fast_path {
             // Ultra-fast INNER JOIN path with direct u32 vectors - no Option overhead
             let probe_int_arr = probe_key_col.as_any().downcast_ref::<Int64Array>().unwrap();
-            
+
             let est_matches = probe_rows;
             let mut probe_idx_vec: Vec<u32> = Vec::with_capacity(est_matches);
             let mut build_idx_vec: Vec<u32> = Vec::with_capacity(est_matches);
-            
+
             for probe_idx in 0..probe_rows {
                 let probe_val = probe_int_arr.value(probe_idx);
                 let probe_hash = {
@@ -1056,7 +1377,7 @@ impl ApexExecutor {
                     probe_val.hash(&mut h);
                     h.finish()
                 };
-                
+
                 if let Some(build_matches) = hash_table.get(&probe_hash) {
                     for &build_idx in build_matches {
                         probe_idx_vec.push(probe_idx as u32);
@@ -1068,11 +1389,11 @@ impl ApexExecutor {
         } else if is_int64_key {
             // LEFT JOIN with Int64 keys - needs Option for NULL handling
             let probe_int_arr = probe_key_col.as_any().downcast_ref::<Int64Array>().unwrap();
-            
+
             let est_matches = probe_rows;
             let mut probe_idx_vec: Vec<u32> = Vec::with_capacity(est_matches);
             let mut build_idx_vec: Vec<Option<u32>> = Vec::with_capacity(est_matches);
-            
+
             for probe_idx in 0..probe_rows {
                 let probe_val = probe_int_arr.value(probe_idx);
                 let probe_hash = {
@@ -1080,7 +1401,7 @@ impl ApexExecutor {
                     probe_val.hash(&mut h);
                     h.finish()
                 };
-                
+
                 if let Some(build_matches) = hash_table.get(&probe_hash) {
                     for &build_idx in build_matches {
                         probe_idx_vec.push(probe_idx as u32);
@@ -1095,22 +1416,27 @@ impl ApexExecutor {
         } else {
             let mut probe_idx_vec: Vec<u32> = Vec::with_capacity(probe_rows);
             let mut build_idx_vec: Vec<Option<u32>> = Vec::with_capacity(probe_rows);
-            
+
             if is_left_join && !swapped {
                 for probe_idx in 0..probe_rows {
                     let probe_hash = Self::hash_array_value_fast(probe_key_col, probe_idx);
                     let mut found_match = false;
-                    
+
                     if let Some(build_matches) = hash_table.get(&probe_hash) {
                         for &build_idx in build_matches {
-                            if Self::arrays_equal_at(probe_key_col, probe_idx, build_key_col, build_idx) {
+                            if Self::arrays_equal_at(
+                                probe_key_col,
+                                probe_idx,
+                                build_key_col,
+                                build_idx,
+                            ) {
                                 probe_idx_vec.push(probe_idx as u32);
                                 build_idx_vec.push(Some(build_idx as u32));
                                 found_match = true;
                             }
                         }
                     }
-                    
+
                     if !found_match {
                         probe_idx_vec.push(probe_idx as u32);
                         build_idx_vec.push(None);
@@ -1119,10 +1445,15 @@ impl ApexExecutor {
             } else {
                 for probe_idx in 0..probe_rows {
                     let probe_hash = Self::hash_array_value_fast(probe_key_col, probe_idx);
-                    
+
                     if let Some(build_matches) = hash_table.get(&probe_hash) {
                         for &build_idx in build_matches {
-                            if Self::arrays_equal_at(probe_key_col, probe_idx, build_key_col, build_idx) {
+                            if Self::arrays_equal_at(
+                                probe_key_col,
+                                probe_idx,
+                                build_key_col,
+                                build_idx,
+                            ) {
                                 probe_idx_vec.push(probe_idx as u32);
                                 build_idx_vec.push(Some(build_idx as u32));
                             }
@@ -1132,28 +1463,38 @@ impl ApexExecutor {
             }
             (probe_idx_vec, Vec::new(), build_idx_vec)
         };
-        
+
         // Convert back to left/right indices based on whether we swapped
         // For INNER JOIN fast path, use direct u32 indices
-        let (left_indices, right_indices_u32, right_indices_opt): (Vec<u32>, Vec<u32>, Vec<Option<u32>>) = 
-        if is_inner_join_fast_path {
+        let (left_indices, right_indices_u32, right_indices_opt): (
+            Vec<u32>,
+            Vec<u32>,
+            Vec<Option<u32>>,
+        ) = if is_inner_join_fast_path {
             if swapped {
                 (build_indices_u32.clone(), probe_indices.clone(), Vec::new())
             } else {
                 (probe_indices, build_indices_u32, Vec::new())
             }
         } else if swapped {
-            (build_indices_opt.iter().map(|x| x.unwrap_or(0)).collect(), 
-             Vec::new(),
-             probe_indices.iter().map(|x| Some(*x)).collect())
+            (
+                build_indices_opt.iter().map(|x| x.unwrap_or(0)).collect(),
+                Vec::new(),
+                probe_indices.iter().map(|x| Some(*x)).collect(),
+            )
         } else {
             (probe_indices, Vec::new(), build_indices_opt)
         };
-        
+
         let left_rows = left.num_rows();
 
         // Build result schema (combine left and right, avoiding duplicate key column)
-        let mut fields: Vec<Field> = left.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut fields: Vec<Field> = left
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
         for field in right.schema().fields() {
             if field.name() != right_key {
                 let new_name = if fields.iter().any(|f| f.name() == field.name()) {
@@ -1167,14 +1508,28 @@ impl ApexExecutor {
         let result_schema = Arc::new(Schema::new(fields));
 
         // Build result columns - pre-allocate for all columns
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(left.num_columns() + right.num_columns());
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(left.num_columns() + right.num_columns());
 
-        // Take from left - avoid clone by creating array directly
-        let left_indices_array = arrow::array::UInt32Array::from(left_indices);
-        for col in left.columns() {
-            let taken = compute::take(col.as_ref(), &left_indices_array, None)
-                .map_err(|e| err_data( e.to_string()))?;
-            columns.push(taken);
+        // Star-schema LEFT JOINs normally preserve every left row exactly once
+        // and in order.  Re-running Arrow `take` for all accumulated left-side
+        // columns at every join makes very wide queries quadratic in column
+        // count.  In that common identity-mapping case the immutable arrays can
+        // be shared directly; only newly joined right columns need gathering.
+        let left_is_identity = left_indices.len() == left_rows
+            && left_indices
+                .iter()
+                .enumerate()
+                .all(|(index, &row)| row as usize == index);
+        if left_is_identity {
+            columns.extend(left.columns().iter().cloned());
+        } else {
+            let left_indices_array = arrow::array::UInt32Array::from(left_indices);
+            for col in left.columns() {
+                let taken = compute::take(col.as_ref(), &left_indices_array, None)
+                    .map_err(|e| err_data(e.to_string()))?;
+                columns.push(taken);
+            }
         }
 
         // Take from right (excluding join key to avoid duplication)
@@ -1185,7 +1540,7 @@ impl ApexExecutor {
                 if field.name() != right_key {
                     let right_col = right.column(col_idx);
                     let taken = compute::take(right_col.as_ref(), &right_indices_array, None)
-                        .map_err(|e| err_data( e.to_string()))?;
+                        .map_err(|e| err_data(e.to_string()))?;
                     columns.push(taken);
                 }
             }
@@ -1200,8 +1555,57 @@ impl ApexExecutor {
             }
         }
 
-        RecordBatch::try_new(result_schema, columns)
-            .map_err(|e| err_data( e.to_string()))
+        RecordBatch::try_new(result_schema, columns).map_err(|e| err_data(e.to_string()))
+    }
+
+    fn hash_semi_anti_join(
+        left: &RecordBatch,
+        right: &RecordBatch,
+        left_key: &str,
+        right_key: &str,
+        anti: bool,
+    ) -> io::Result<RecordBatch> {
+        let left_col = left
+            .column_by_name(left_key)
+            .ok_or_else(|| err_data(format!("Left join key '{}' not found", left_key)))?;
+        let right_col = right
+            .column_by_name(right_key)
+            .ok_or_else(|| err_data(format!("Right join key '{}' not found", right_key)))?;
+        let mut right_hashes: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(right.num_rows());
+        for row in 0..right.num_rows() {
+            if !right_col.is_null(row) {
+                right_hashes
+                    .entry(Self::hash_array_value_fast(right_col, row))
+                    .or_default()
+                    .push(row);
+            }
+        }
+        let mut indices = Vec::with_capacity(left.num_rows());
+        for row in 0..left.num_rows() {
+            let matched = if left_col.is_null(row) {
+                false
+            } else {
+                right_hashes
+                    .get(&Self::hash_array_value_fast(left_col, row))
+                    .is_some_and(|candidates| {
+                        candidates.iter().any(|candidate| {
+                            Self::arrays_equal_at(left_col, row, right_col, *candidate)
+                        })
+                    })
+            };
+            if matched != anti {
+                indices.push(row as u32);
+            }
+        }
+        let take = arrow::array::UInt32Array::from(indices);
+        let columns = left
+            .columns()
+            .iter()
+            .map(|column| {
+                compute::take(column.as_ref(), &take, None).map_err(|e| err_data(e.to_string()))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        RecordBatch::try_new(left.schema(), columns).map_err(|e| err_data(e.to_string()))
     }
 
     /// Reorder columns from a swapped LEFT JOIN back to original left→right order.
@@ -1235,7 +1639,9 @@ impl ApexExecutor {
         let swapped_schema = swapped_result.schema();
         for i in 0..right_cols_in_result {
             let field = swapped_schema.field(i);
-            if field.name() == right_key { continue; }
+            if field.name() == right_key {
+                continue;
+            }
             let new_name = if fields.iter().any(|f| f.name() == field.name()) {
                 format!("{}_right", field.name())
             } else {
@@ -1246,8 +1652,7 @@ impl ApexExecutor {
         }
 
         let schema = Arc::new(Schema::new(fields));
-        RecordBatch::try_new(schema, arrays)
-            .map_err(|e| err_data(e.to_string()))
+        RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))
     }
 
     /// FULL OUTER JOIN: LEFT JOIN + append unmatched right rows with NULL left columns
@@ -1261,13 +1666,16 @@ impl ApexExecutor {
         let left_result = Self::hash_join(left, right, left_key, right_key, &JoinType::Left)?;
 
         // Step 2: Find unmatched right rows
-        let left_key_col = left.column_by_name(left_key)
+        let left_key_col = left
+            .column_by_name(left_key)
             .ok_or_else(|| err_data(format!("Left join key '{}' not found", left_key)))?;
-        let right_key_col = right.column_by_name(right_key)
+        let right_key_col = right
+            .column_by_name(right_key)
             .ok_or_else(|| err_data(format!("Right join key '{}' not found", right_key)))?;
 
         // Build hash set of left keys
-        let mut left_key_hashes: ahash::AHashSet<u64> = ahash::AHashSet::with_capacity(left.num_rows());
+        let mut left_key_hashes: ahash::AHashSet<u64> =
+            ahash::AHashSet::with_capacity(left.num_rows());
         for i in 0..left.num_rows() {
             left_key_hashes.insert(Self::hash_array_value_fast(left_key_col, i));
         }
@@ -1299,14 +1707,18 @@ impl ApexExecutor {
 
         // Step 3: Build rows for unmatched right: NULL left cols + right values
         // Make all fields nullable for FULL OUTER JOIN (left side can be NULL for unmatched right rows)
-        let nullable_fields: Vec<Field> = left_result.schema().fields().iter()
+        let nullable_fields: Vec<Field> = left_result
+            .schema()
+            .fields()
+            .iter()
             .map(|f| Field::new(f.name(), f.data_type().clone(), true))
             .collect();
         let nullable_schema = Arc::new(Schema::new(nullable_fields));
 
         // Re-wrap left_result columns with nullable schema
-        let left_result = RecordBatch::try_new(nullable_schema.clone(), left_result.columns().to_vec())
-            .map_err(|e| err_data(e.to_string()))?;
+        let left_result =
+            RecordBatch::try_new(nullable_schema.clone(), left_result.columns().to_vec())
+                .map_err(|e| err_data(e.to_string()))?;
 
         let left_ncols = left.num_columns();
         let n_unmatched = unmatched_right_indices.len();
@@ -1322,7 +1734,9 @@ impl ApexExecutor {
 
         // Right columns (excluding join key) → take from right batch
         for (col_idx, field) in right.schema().fields().iter().enumerate() {
-            if field.name() == right_key { continue; }
+            if field.name() == right_key {
+                continue;
+            }
             let taken = compute::take(right.column(col_idx).as_ref(), &right_take, None)
                 .map_err(|e| err_data(e.to_string()))?;
             extra_columns.push(taken);
@@ -1344,7 +1758,12 @@ impl ApexExecutor {
 
         if total == 0 {
             // Build empty schema
-            let mut fields: Vec<Field> = left.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+            let mut fields: Vec<Field> = left
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect();
             for field in right.schema().fields() {
                 let new_name = if fields.iter().any(|f| f.name() == field.name()) {
                     format!("{}_right", field.name())
@@ -1354,9 +1773,12 @@ impl ApexExecutor {
                 fields.push(Field::new(&new_name, field.data_type().clone(), true));
             }
             let schema = Arc::new(Schema::new(fields));
-            let empty_cols: Vec<ArrayRef> = schema.fields().iter().map(|f| arrow::array::new_null_array(f.data_type(), 0) as ArrayRef).collect();
-            return RecordBatch::try_new(schema, empty_cols)
-                .map_err(|e| err_data(e.to_string()));
+            let empty_cols: Vec<ArrayRef> = schema
+                .fields()
+                .iter()
+                .map(|f| arrow::array::new_null_array(f.data_type(), 0) as ArrayRef)
+                .collect();
+            return RecordBatch::try_new(schema, empty_cols).map_err(|e| err_data(e.to_string()));
         }
 
         // Build index arrays: left[0,0,...,1,1,...] right[0,1,2,...,0,1,2,...]
@@ -1372,8 +1794,14 @@ impl ApexExecutor {
         let left_take = arrow::array::UInt32Array::from(left_idx);
         let right_take = arrow::array::UInt32Array::from(right_idx);
 
-        let mut fields: Vec<Field> = left.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(left.num_columns() + right.num_columns());
+        let mut fields: Vec<Field> = left
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(left.num_columns() + right.num_columns());
 
         for col in left.columns() {
             let taken = compute::take(col.as_ref(), &left_take, None)
@@ -1396,8 +1824,7 @@ impl ApexExecutor {
         }
 
         let schema = Arc::new(Schema::new(fields));
-        RecordBatch::try_new(schema, columns)
-            .map_err(|e| err_data(e.to_string()))
+        RecordBatch::try_new(schema, columns).map_err(|e| err_data(e.to_string()))
     }
 
     /// Hash a value at given index in an array (legacy, uses DefaultHasher)
@@ -1409,7 +1836,7 @@ impl ApexExecutor {
     #[inline]
     fn hash_array_value_fast(array: &ArrayRef, idx: usize) -> u64 {
         let mut hasher = AHasher::default();
-        
+
         if array.is_null(idx) {
             0u64.hash(&mut hasher);
         } else if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
@@ -1423,7 +1850,7 @@ impl ApexExecutor {
         } else {
             idx.hash(&mut hasher);
         }
-        
+
         hasher.finish()
     }
 
@@ -1435,7 +1862,7 @@ impl ApexExecutor {
             col_name
         }
     }
-    
+
     /// Get column from batch, stripping table prefix if needed
     fn get_column_by_name<'a>(batch: &'a RecordBatch, col_name: &str) -> Option<&'a ArrayRef> {
         let clean_name = col_name.trim_matches('"');
@@ -1449,7 +1876,12 @@ impl ApexExecutor {
     }
 
     /// Check if two array values are equal at given indices
-    fn arrays_equal_at(left: &ArrayRef, left_idx: usize, right: &ArrayRef, right_idx: usize) -> bool {
+    fn arrays_equal_at(
+        left: &ArrayRef,
+        left_idx: usize,
+        right: &ArrayRef,
+        right_idx: usize,
+    ) -> bool {
         if left.is_null(left_idx) && right.is_null(right_idx) {
             return true;
         }
@@ -1475,46 +1907,49 @@ impl ApexExecutor {
         ) {
             return (l.value(left_idx) - r.value(right_idx)).abs() < f64::EPSILON;
         }
-        
+
         false
     }
 
     /// Take values from array with optional null indices (for LEFT JOIN)
     fn take_with_nulls(array: &ArrayRef, indices: &[Option<u32>]) -> io::Result<ArrayRef> {
         use arrow::array::*;
-        
+
         let len = indices.len();
-        
+
         if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
-            let values: Vec<Option<i64>> = indices.iter().map(|opt_idx| {
-                opt_idx.map(|idx| arr.value(idx as usize))
-            }).collect();
+            let values: Vec<Option<i64>> = indices
+                .iter()
+                .map(|opt_idx| opt_idx.map(|idx| arr.value(idx as usize)))
+                .collect();
             return Ok(Arc::new(Int64Array::from(values)));
         }
-        
+
         if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
-            let values: Vec<Option<f64>> = indices.iter().map(|opt_idx| {
-                opt_idx.map(|idx| arr.value(idx as usize))
-            }).collect();
+            let values: Vec<Option<f64>> = indices
+                .iter()
+                .map(|opt_idx| opt_idx.map(|idx| arr.value(idx as usize)))
+                .collect();
             return Ok(Arc::new(Float64Array::from(values)));
         }
-        
+
         if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-            let values: Vec<Option<&str>> = indices.iter().map(|opt_idx| {
-                opt_idx.map(|idx| arr.value(idx as usize))
-            }).collect();
+            let values: Vec<Option<&str>> = indices
+                .iter()
+                .map(|opt_idx| opt_idx.map(|idx| arr.value(idx as usize)))
+                .collect();
             return Ok(Arc::new(StringArray::from(values)));
         }
-        
+
         if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
-            let values: Vec<Option<bool>> = indices.iter().map(|opt_idx| {
-                opt_idx.map(|idx| arr.value(idx as usize))
-            }).collect();
+            let values: Vec<Option<bool>> = indices
+                .iter()
+                .map(|opt_idx| opt_idx.map(|idx| arr.value(idx as usize)))
+                .collect();
             return Ok(Arc::new(BooleanArray::from(values)));
         }
 
         // Fallback: create null array
         Ok(arrow::array::new_null_array(array.data_type(), len))
     }
-
 }

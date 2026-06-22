@@ -309,7 +309,9 @@ impl ApexExecutor {
                             let alias_str = alias.as_ref().map(|a| format!(" AS {}", a)).unwrap_or_default();
                             plan_lines.push(format!("  DirectFile: '{}'{}", file, alias_str));
                         }
-                        FromItem::LateralExplode { .. } | FromItem::LateralStack { .. } => {
+                        FromItem::LateralExplode { .. }
+                        | FromItem::LateralPosExplode { .. }
+                        | FromItem::LateralStack { .. } => {
                             plan_lines.push("  Scan: lateral view".to_string());
                         }
                     }
@@ -322,6 +324,8 @@ impl ApexExecutor {
                         JoinType::Right => "RIGHT JOIN",
                         JoinType::Full => "FULL OUTER JOIN",
                         JoinType::Cross => "CROSS JOIN",
+                        JoinType::Semi => "LEFT SEMI JOIN",
+                        JoinType::Anti => "LEFT ANTI JOIN",
                     };
                     let table_name = match &join.right {
                         FromItem::Table { table, .. } => table.clone(),
@@ -330,6 +334,7 @@ impl ApexExecutor {
                         FromItem::TopkDistance { col, k, metric, .. } => format!("topk_distance({}, k={}, metric='{}')", col, k, metric),
                         FromItem::DirectFile { file, .. } => format!("'{}'", file),
                         FromItem::LateralExplode { table_alias, .. } => format!("LATERAL VIEW EXPLODE AS {}", table_alias),
+                        FromItem::LateralPosExplode { table_alias, .. } => format!("LATERAL VIEW POSEXPLODE AS {}", table_alias),
                         FromItem::LateralStack { table_alias, .. } => format!("LATERAL VIEW STACK AS {}", table_alias),
                     };
                     plan_lines.push(format!("  {}: {}", jt, table_name));
@@ -557,12 +562,17 @@ impl ApexExecutor {
             Self::cleanup_temp_table(&temp_path);
             result
         } else {
+            let references =
+                Self::visit_cte_references_in_statement(&mut main, name, None, None);
+            if references == 0 {
+                return Self::execute_parsed_multi(main, base_dir, default_table_path);
+            }
             // A single-use CTE does not need a row-wise round trip through a
             // temporary Apex file. Keep shared CTEs materialized so repeated
             // references still execute the body only once.
             if column_aliases.is_empty()
                 && matches!(&body, SqlStatement::Select(_) | SqlStatement::Union(_))
-                && Self::visit_cte_references_in_statement(&mut main, name, None, None) == 1
+                && references == 1
             {
                 Self::visit_cte_references_in_statement(&mut main, name, Some(&body), None);
                 return Self::execute_parsed_multi(main, base_dir, default_table_path);
@@ -680,6 +690,17 @@ impl ApexExecutor {
                     temp_table_name,
                 )
             }
+            SqlStatement::HiveMultiInsert { inserts } => inserts
+                .iter_mut()
+                .map(|insert| {
+                    Self::visit_cte_references_in_statement(
+                        insert,
+                        cte_name,
+                        inline_body,
+                        temp_table_name,
+                    )
+                })
+                .sum(),
             SqlStatement::CreateView { stmt, .. } => Self::visit_cte_references_in_select(
                 stmt,
                 cte_name,
@@ -1114,6 +1135,9 @@ impl ApexExecutor {
         if select_batch.num_rows() == 0 {
             return Ok(ApexResult::Scalar(0));
         }
+        if select_batch.num_columns() >= 64 {
+            return Self::insert_overwrite_batch_columnar(target_path, &select_batch, partition);
+        }
         let data_columns: Vec<(usize, String)> = select_batch
             .schema()
             .fields()
@@ -1137,6 +1161,93 @@ impl ApexExecutor {
             rows.push(row);
         }
         Self::execute_insert(target_path, Some(&column_names), &rows)
+    }
+
+    /// Columnar fast path for very wide INSERT OVERWRITE results. Avoid the
+    /// Arrow -> Vec<Vec<Value>> -> HashMap-per-row -> column-store round trip.
+    fn insert_overwrite_batch_columnar(
+        target_path: &Path,
+        batch: &RecordBatch,
+        partition: &[(String, Value)],
+    ) -> io::Result<ApexResult> {
+        use arrow::array::{LargeStringArray, UInt64Array};
+        use std::collections::HashMap;
+
+        let rows = batch.num_rows();
+        let mut ints: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut floats: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut strings: HashMap<String, Vec<String>> = HashMap::new();
+        let binaries: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut bools: HashMap<String, Vec<bool>> = HashMap::new();
+        let mut nulls: HashMap<String, Vec<bool>> = HashMap::new();
+
+        for (index, field) in batch.schema().fields().iter().enumerate() {
+            if field.name() == "_id" { continue; }
+            let name = field.name().clone();
+            let array = batch.column(index);
+            let null_bitmap = (0..rows).map(|row| array.is_null(row)).collect::<Vec<_>>();
+            match field.data_type() {
+                ArrowDataType::Int64 => {
+                    let values = array.as_any().downcast_ref::<Int64Array>()
+                        .ok_or_else(|| err_data(format!("Invalid Int64 column {}", name)))?;
+                    ints.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { 0 } else { values.value(row) }).collect());
+                }
+                ArrowDataType::UInt64 => {
+                    let values = array.as_any().downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| err_data(format!("Invalid UInt64 column {}", name)))?;
+                    ints.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { 0 } else { values.value(row) as i64 }).collect());
+                }
+                ArrowDataType::Float64 => {
+                    let values = array.as_any().downcast_ref::<Float64Array>()
+                        .ok_or_else(|| err_data(format!("Invalid Float64 column {}", name)))?;
+                    floats.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { 0.0 } else { values.value(row) }).collect());
+                }
+                ArrowDataType::Boolean => {
+                    let values = array.as_any().downcast_ref::<BooleanArray>()
+                        .ok_or_else(|| err_data(format!("Invalid Boolean column {}", name)))?;
+                    bools.insert(name.clone(), (0..rows).map(|row| !values.is_null(row) && values.value(row)).collect());
+                }
+                ArrowDataType::Utf8 => {
+                    let values = array.as_any().downcast_ref::<StringArray>()
+                        .ok_or_else(|| err_data(format!("Invalid Utf8 column {}", name)))?;
+                    strings.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { String::new() } else { values.value(row).to_string() }).collect());
+                }
+                ArrowDataType::LargeUtf8 => {
+                    let values = array.as_any().downcast_ref::<LargeStringArray>()
+                        .ok_or_else(|| err_data(format!("Invalid LargeUtf8 column {}", name)))?;
+                    strings.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { String::new() } else { values.value(row).to_string() }).collect());
+                }
+                _ => {
+                    strings.insert(name.clone(), (0..rows).map(|row| {
+                        if array.is_null(row) { String::new() }
+                        else { Self::arrow_value_at_col(array, row).as_str().unwrap_or_default().to_string() }
+                    }).collect());
+                }
+            }
+            nulls.insert(name, null_bitmap);
+        }
+
+        for (name, value) in partition {
+            let null_bitmap = vec![matches!(value, Value::Null); rows];
+            match value {
+                Value::Int64(value) => { ints.insert(name.clone(), vec![*value; rows]); }
+                Value::Float64(value) => { floats.insert(name.clone(), vec![*value; rows]); }
+                Value::Bool(value) => { bools.insert(name.clone(), vec![*value; rows]); }
+                Value::String(value) => { strings.insert(name.clone(), vec![value.clone(); rows]); }
+                Value::Null => { strings.insert(name.clone(), vec![String::new(); rows]); }
+                other => { strings.insert(name.clone(), vec![format!("{:?}", other); rows]); }
+            }
+            nulls.insert(name.clone(), null_bitmap);
+        }
+
+        let backend = TableStorageBackend::open_for_write(target_path)?;
+        let inserted = backend.insert_typed_with_nulls(
+            ints, floats, strings, binaries, bools, nulls,
+        )?.len();
+        backend.save_full()?;
+        invalidate_storage_cache(target_path);
+        crate::storage::engine::engine().invalidate(target_path);
+        Ok(ApexResult::Scalar(inserted as i64))
     }
 
     /// Execute CREATE TABLE ... AS SELECT statement
