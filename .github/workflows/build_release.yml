@@ -448,10 +448,10 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.resolve-release.outputs.tag_name }}
     steps:
-    - uses: actions/checkout@v3
+    - name: Checkout release notes from the default branch
+      uses: actions/checkout@v4
       with:
-        fetch-depth: 0
-        ref: ${{ github.event.inputs.tag || github.ref }}
+        ref: ${{ github.event.repository.default_branch }}
 
     - name: Download all artifacts
       uses: actions/download-artifact@v4
@@ -465,12 +465,49 @@ jobs:
         echo "Release assets prepared:"
         ls -lh release-assets/
 
+    - name: Extract release notes for tag
+      env:
+        RELEASE_NOTES_FILE: docs/release-notes.md
+      run: |
+        python - <<'PY'
+        import os
+        import re
+        import sys
+        from pathlib import Path
+
+        tag = os.environ["RELEASE_TAG"]
+        source = Path(os.environ["RELEASE_NOTES_FILE"])
+        if not source.exists():
+            sys.exit(f"Release notes file not found: {source}")
+
+        text = source.read_text(encoding="utf-8")
+        heading = re.compile(
+            rf"^##\s+(?:\[{re.escape(tag)}\]\([^)]+\)|{re.escape(tag)})\s*$",
+            re.MULTILINE,
+        )
+        match = heading.search(text)
+        if not match:
+            sys.exit(f"No release notes section found for {tag} in {source}.")
+
+        next_heading = re.search(r"^##\s+", text[match.end():], re.MULTILINE)
+        end = match.end() + next_heading.start() if next_heading else len(text)
+        body = text[match.end():end].strip()
+        body = re.sub(r"\n---\s*$", "", body).strip()
+        if not body:
+            sys.exit(f"Release notes section for {tag} is empty.")
+
+        Path("release-body.md").write_text(body + "\n", encoding="utf-8")
+        print(f"Extracted release notes for {tag} from {source}")
+        PY
+
     - name: Create GitHub Release with assets
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ env.RELEASE_TAG }}
+        name: ApexBase ${{ env.RELEASE_TAG }}
+        body_path: release-body.md
         files: release-assets/*
-        generate_release_notes: true
+        fail_on_unmatched_files: true
         draft: false
         prerelease: ${{ contains(env.RELEASE_TAG, 'alpha') || contains(env.RELEASE_TAG, 'beta') || contains(env.RELEASE_TAG, 'rc') }}
       env:
