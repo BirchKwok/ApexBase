@@ -27,21 +27,24 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| CI/CD | 1 |
-| Project Config | 2 |
-| Documentation | 2 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Python Bindings | 1 |
-| Query Engine | 1 |
-| Storage Engine | 1 |
-| Benchmarks | 4 |
-| Other | 1 |
-| Tests | 3 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>1</td></tr>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>2</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>1</td></tr>
+<tr><td>Storage Engine</td><td>1</td></tr>
+<tr><td>Benchmarks</td><td>4</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Tests</td><td>3</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -62,20 +65,23 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| CI/CD | 1 |
-| Other | 1 |
-| Project Config | 2 |
-| Documentation | 23 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Python Bindings | 1 |
-| Query Engine | 6 |
-| Storage Engine | 5 |
-| Tests | 4 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>1</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>23</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>6</td></tr>
+<tr><td>Storage Engine</td><td>5</td></tr>
+<tr><td>Tests</td><td>4</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -94,20 +100,23 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 1 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Rust Embedded API | 1 |
-| Python Bindings | 1 |
-| Query Engine | 4 |
-| Storage Engine | 2 |
-| Other | 1 |
-| Tests | 2 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Rust Embedded API</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>4</td></tr>
+<tr><td>Storage Engine</td><td>2</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Tests</td><td>2</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -126,20 +135,23 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 4 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Rust Embedded API | 1 |
-| Python Bindings | 1 |
-| Query Engine | 10 |
-| Storage Engine | 1 |
-| Benchmarks | 1 |
-| Tests | 2 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>4</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Rust Embedded API</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>10</td></tr>
+<tr><td>Storage Engine</td><td>1</td></tr>
+<tr><td>Benchmarks</td><td>1</td></tr>
+<tr><td>Tests</td><td>2</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -157,17 +169,20 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 1 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Query Engine | 6 |
-| Benchmarks | 1 |
-| Tests | 7 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>6</td></tr>
+<tr><td>Benchmarks</td><td>1</td></tr>
+<tr><td>Tests</td><td>7</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -189,31 +204,34 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| CI/CD | 1 |
-| Other | 5 |
-| Project Config | 2 |
-| Documentation | 4 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Data Layer | 5 |
-| Rust Embedded API | 1 |
-| Arrow Flight gRPC | 2 |
-| Full-Text Search | 1 |
-| Library Core | 1 |
-| Python Bindings | 4 |
-| Query Engine | 18 |
-| Scaling & Sharding | 5 |
-| PostgreSQL Wire Protocol | 3 |
-| Storage Engine | 24 |
-| Table Catalog | 5 |
-| Transaction Manager | 4 |
-| Benchmarks | 1 |
-| Build System | 1 |
-| Tests | 20 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>1</td></tr>
+<tr><td>Other</td><td>5</td></tr>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>4</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Data Layer</td><td>5</td></tr>
+<tr><td>Rust Embedded API</td><td>1</td></tr>
+<tr><td>Arrow Flight gRPC</td><td>2</td></tr>
+<tr><td>Full-Text Search</td><td>1</td></tr>
+<tr><td>Library Core</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>4</td></tr>
+<tr><td>Query Engine</td><td>18</td></tr>
+<tr><td>Scaling & Sharding</td><td>5</td></tr>
+<tr><td>PostgreSQL Wire Protocol</td><td>3</td></tr>
+<tr><td>Storage Engine</td><td>24</td></tr>
+<tr><td>Table Catalog</td><td>5</td></tr>
+<tr><td>Transaction Manager</td><td>4</td></tr>
+<tr><td>Benchmarks</td><td>1</td></tr>
+<tr><td>Build System</td><td>1</td></tr>
+<tr><td>Tests</td><td>20</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -232,16 +250,19 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 1 |
-| Python Package | 1 |
-| Query Engine | 2 |
-| Storage Engine | 3 |
-| Benchmarks | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>2</td></tr>
+<tr><td>Storage Engine</td><td>3</td></tr>
+<tr><td>Benchmarks</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -255,14 +276,17 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 1 |
-| Python Package | 1 |
-| Python Client | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -278,14 +302,17 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 4 |
-| Python Package | 1 |
-| Query Engine | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>4</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -303,16 +330,19 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 1 |
-| Python Package | 1 |
-| Query Engine | 1 |
-| Storage Engine | 3 |
-| Benchmarks | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>1</td></tr>
+<tr><td>Storage Engine</td><td>3</td></tr>
+<tr><td>Benchmarks</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -330,18 +360,21 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 1 |
-| Python Package | 1 |
-| Python Bindings | 1 |
-| Query Engine | 4 |
-| Storage Engine | 11 |
-| Other | 1 |
-| Benchmarks | 2 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>4</td></tr>
+<tr><td>Storage Engine</td><td>11</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Benchmarks</td><td>2</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -364,25 +397,28 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| CI/CD | 1 |
-| Other | 4 |
-| Project Config | 2 |
-| Documentation | 6 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Data Layer | 1 |
-| Rust Embedded API | 1 |
-| Library Core | 1 |
-| Python Bindings | 1 |
-| Query Engine | 14 |
-| PostgreSQL Wire Protocol | 1 |
-| Storage Engine | 14 |
-| Benchmarks | 13 |
-| Tests | 5 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>1</td></tr>
+<tr><td>Other</td><td>4</td></tr>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>6</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Data Layer</td><td>1</td></tr>
+<tr><td>Rust Embedded API</td><td>1</td></tr>
+<tr><td>Library Core</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>14</td></tr>
+<tr><td>PostgreSQL Wire Protocol</td><td>1</td></tr>
+<tr><td>Storage Engine</td><td>14</td></tr>
+<tr><td>Benchmarks</td><td>13</td></tr>
+<tr><td>Tests</td><td>5</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -405,22 +441,25 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Other | 2 |
-| Project Config | 2 |
-| Documentation | 3 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Data Layer | 2 |
-| Python Bindings | 1 |
-| Query Engine | 12 |
-| PostgreSQL Wire Protocol | 1 |
-| Storage Engine | 12 |
-| Benchmarks | 5 |
-| Tests | 5 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Other</td><td>2</td></tr>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>3</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Data Layer</td><td>2</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>12</td></tr>
+<tr><td>PostgreSQL Wire Protocol</td><td>1</td></tr>
+<tr><td>Storage Engine</td><td>12</td></tr>
+<tr><td>Benchmarks</td><td>5</td></tr>
+<tr><td>Tests</td><td>5</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -442,22 +481,25 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 1 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Full-Text Search | 1 |
-| Python Bindings | 1 |
-| Query Engine | 11 |
-| PostgreSQL Wire Protocol | 1 |
-| Storage Engine | 8 |
-| Benchmarks | 1 |
-| Other | 1 |
-| Tests | 4 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Full-Text Search</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>11</td></tr>
+<tr><td>PostgreSQL Wire Protocol</td><td>1</td></tr>
+<tr><td>Storage Engine</td><td>8</td></tr>
+<tr><td>Benchmarks</td><td>1</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Tests</td><td>4</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -477,17 +519,20 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 1 |
-| Python Package | 1 |
-| Query Engine | 2 |
-| PostgreSQL Wire Protocol | 1 |
-| Storage Engine | 6 |
-| Benchmarks | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>2</td></tr>
+<tr><td>PostgreSQL Wire Protocol</td><td>1</td></tr>
+<tr><td>Storage Engine</td><td>6</td></tr>
+<tr><td>Benchmarks</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -507,19 +552,22 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 1 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Python Bindings | 1 |
-| Query Engine | 1 |
-| PostgreSQL Wire Protocol | 1 |
-| Storage Engine | 3 |
-| Benchmarks | 2 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>1</td></tr>
+<tr><td>PostgreSQL Wire Protocol</td><td>1</td></tr>
+<tr><td>Storage Engine</td><td>3</td></tr>
+<tr><td>Benchmarks</td><td>2</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -538,16 +586,19 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 7 |
-| Python Package | 1 |
-| Query Engine | 4 |
-| PostgreSQL Wire Protocol | 1 |
-| Tests | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>7</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>4</td></tr>
+<tr><td>PostgreSQL Wire Protocol</td><td>1</td></tr>
+<tr><td>Tests</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -565,18 +616,21 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 5 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Full-Text Search | 1 |
-| Python Bindings | 1 |
-| Query Engine | 4 |
-| PostgreSQL Wire Protocol | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>5</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Full-Text Search</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>4</td></tr>
+<tr><td>PostgreSQL Wire Protocol</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -596,23 +650,26 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 3 |
-| Python Package | 3 |
-| Python Client | 1 |
-| Other | 1 |
-| Arrow Flight gRPC | 2 |
-| Library Core | 1 |
-| Python Bindings | 3 |
-| Query Engine | 7 |
-| PostgreSQL Wire Protocol | 4 |
-| Storage Engine | 8 |
-| Benchmarks | 5 |
-| Tests | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>3</td></tr>
+<tr><td>Python Package</td><td>3</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Arrow Flight gRPC</td><td>2</td></tr>
+<tr><td>Library Core</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>3</td></tr>
+<tr><td>Query Engine</td><td>7</td></tr>
+<tr><td>PostgreSQL Wire Protocol</td><td>4</td></tr>
+<tr><td>Storage Engine</td><td>8</td></tr>
+<tr><td>Benchmarks</td><td>5</td></tr>
+<tr><td>Tests</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -631,16 +688,19 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 1 |
-| Python Package | 1 |
-| Python Bindings | 1 |
-| Query Engine | 3 |
-| PostgreSQL Wire Protocol | 3 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>3</td></tr>
+<tr><td>PostgreSQL Wire Protocol</td><td>3</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -658,18 +718,21 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 1 |
-| Python Package | 2 |
-| Other | 1 |
-| Library Core | 1 |
-| Python Bindings | 2 |
-| Query Engine | 1 |
-| PostgreSQL Wire Protocol | 4 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Python Package</td><td>2</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Library Core</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>2</td></tr>
+<tr><td>Query Engine</td><td>1</td></tr>
+<tr><td>PostgreSQL Wire Protocol</td><td>4</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -687,23 +750,26 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| CI/CD | 1 |
-| Project Config | 2 |
-| Documentation | 3 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Data Layer | 1 |
-| Python Bindings | 1 |
-| Query Engine | 13 |
-| Storage Engine | 18 |
-| Transaction Manager | 2 |
-| Benchmarks | 1 |
-| Other | 1 |
-| Tests | 9 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>1</td></tr>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>3</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Data Layer</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>13</td></tr>
+<tr><td>Storage Engine</td><td>18</td></tr>
+<tr><td>Transaction Manager</td><td>2</td></tr>
+<tr><td>Benchmarks</td><td>1</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Tests</td><td>9</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -724,23 +790,26 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 8 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Library Core | 1 |
-| Python Bindings | 1 |
-| Query Engine | 5 |
-| Scaling & Sharding | 5 |
-| Storage Engine | 17 |
-| Transaction Manager | 4 |
-| Other | 1 |
-| Benchmarks | 1 |
-| Tests | 23 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>8</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Library Core</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>5</td></tr>
+<tr><td>Scaling & Sharding</td><td>5</td></tr>
+<tr><td>Storage Engine</td><td>17</td></tr>
+<tr><td>Transaction Manager</td><td>4</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Benchmarks</td><td>1</td></tr>
+<tr><td>Tests</td><td>23</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -757,17 +826,20 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 1 |
-| Other | 13 |
-| Python Package | 1 |
-| Python Bindings | 2 |
-| Query Engine | 2 |
-| Storage Engine | 4 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Other</td><td>13</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>2</td></tr>
+<tr><td>Query Engine</td><td>2</td></tr>
+<tr><td>Storage Engine</td><td>4</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -784,17 +856,20 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Documentation | 5 |
-| Python Client | 1 |
-| Python Bindings | 1 |
-| Query Engine | 2 |
-| Storage Engine | 2 |
-| Other | 6 |
-| Tests | 3 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Documentation</td><td>5</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>2</td></tr>
+<tr><td>Storage Engine</td><td>2</td></tr>
+<tr><td>Other</td><td>6</td></tr>
+<tr><td>Tests</td><td>3</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -812,18 +887,21 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 2 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Python Bindings | 2 |
-| Query Engine | 5 |
-| Storage Engine | 2 |
-| Tests | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>2</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>2</td></tr>
+<tr><td>Query Engine</td><td>5</td></tr>
+<tr><td>Storage Engine</td><td>2</td></tr>
+<tr><td>Tests</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -841,19 +919,22 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Project Config | 2 |
-| Documentation | 2 |
-| Other | 1 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Python Bindings | 1 |
-| Query Engine | 4 |
-| Storage Engine | 4 |
-| Tests | 2 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>2</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>4</td></tr>
+<tr><td>Storage Engine</td><td>4</td></tr>
+<tr><td>Tests</td><td>2</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -868,14 +949,17 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| CI/CD | 1 |
-| Project Config | 2 |
-| Documentation | 2 |
-| Python Package | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>1</td></tr>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>2</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -891,14 +975,17 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| CI/CD | 1 |
-| Project Config | 2 |
-| Documentation | 5 |
-| Python Package | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>1</td></tr>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>5</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -912,13 +999,16 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| CI/CD | 1 |
-| Project Config | 2 |
-| Python Package | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>1</td></tr>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -937,24 +1027,27 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| CI/CD | 1 |
-| Other | 17 |
-| Project Config | 2 |
-| Documentation | 5 |
-| Python Package | 1 |
-| Python Client | 1 |
-| Data Layer | 5 |
-| Full-Text Search | 1 |
-| Library Core | 1 |
-| Python Bindings | 2 |
-| Query Engine | 7 |
-| Storage Engine | 4 |
-| Table Catalog | 5 |
-| Tests | 17 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>1</td></tr>
+<tr><td>Other</td><td>17</td></tr>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>5</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Data Layer</td><td>5</td></tr>
+<tr><td>Full-Text Search</td><td>1</td></tr>
+<tr><td>Library Core</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>2</td></tr>
+<tr><td>Query Engine</td><td>7</td></tr>
+<tr><td>Storage Engine</td><td>4</td></tr>
+<tr><td>Table Catalog</td><td>5</td></tr>
+<tr><td>Tests</td><td>17</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -972,14 +1065,17 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| Other | 14 |
-| Documentation | 1 |
-| Project Config | 1 |
-| Tests | 4 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Other</td><td>14</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Project Config</td><td>1</td></tr>
+<tr><td>Tests</td><td>4</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -994,13 +1090,16 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| CI/CD | 1 |
-| Other | 1 |
-| Project Config | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>1</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Project Config</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -1017,11 +1116,14 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 <details>
 <summary><b>Changed files by module</b></summary>
 
-| Module | Files changed |
-|--------|--------------:|
-| CI/CD | 1 |
-
-</details>
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>1</td></tr>
+</tbody>
+</table></details>
 
 ---
 
