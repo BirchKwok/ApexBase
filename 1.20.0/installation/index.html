@@ -649,28 +649,6 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#install-documentation-tools" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Install Documentation Tools
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#github-pages-deployment" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        GitHub Pages Deployment
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#upgrade" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1527,34 +1505,11 @@
 </span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>maturin<span class="w"> </span>develop<span class="w"> </span>--release
 </span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>python<span class="w"> </span>-m<span class="w"> </span>pytest<span class="w"> </span>test/<span class="w"> </span>-q
 </span></code></pre></div>
-<h2 id="install-documentation-tools">Install Documentation Tools<a class="headerlink" href="#install-documentation-tools" title="Permanent link">&para;</a></h2>
-<p>The documentation site is built with MkDocs Material.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>docs/requirements.txt
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>python<span class="w"> </span>-m<span class="w"> </span>mkdocs<span class="w"> </span>serve
-</span></code></pre></div>
-<p>Open the local URL printed by MkDocs. To verify the production build:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>python<span class="w"> </span>-m<span class="w"> </span>mkdocs<span class="w"> </span>build<span class="w"> </span>--strict
-</span></code></pre></div>
-<h2 id="github-pages-deployment">GitHub Pages Deployment<a class="headerlink" href="#github-pages-deployment" title="Permanent link">&para;</a></h2>
-<p>The repository includes <code>.github/workflows/docs.yml</code>. It uses <code>mike</code> so users can switch between historical documentation versions from the header.</p>
-<ul>
-<li>Builds the MkDocs Material site on pull requests.</li>
-<li>Deploys <code>pyproject.toml</code>'s current version on pushes to <code>main</code>.</li>
-<li>Deploys the tag version on <code>v*</code> tags.</li>
-<li>Updates the <code>latest</code> alias and keeps older version directories on the <code>gh-pages</code> branch.</li>
-</ul>
-<p>In the GitHub repository settings, set <strong>Pages -&gt; Build and deployment -&gt; Source</strong> to <strong>Deploy from a branch</strong>, then choose <strong><code>gh-pages</code></strong> and <strong><code>/(root)</code></strong>. After the next successful deployment, the site is published at:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>https://birchkwok.github.io/ApexBase/
-</span></code></pre></div>
-<p>For local versioned preview, use <code>mike</code> after installing the documentation requirements:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>mike<span class="w"> </span>deploy<span class="w"> </span><span class="m">1</span>.19.0<span class="w"> </span>latest
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>mike<span class="w"> </span>serve
-</span></code></pre></div>
 <h2 id="upgrade">Upgrade<a class="headerlink" href="#upgrade" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--upgrade<span class="w"> </span>apexbase
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--upgrade<span class="w"> </span>apexbase
 </span></code></pre></div>
 <p>When developing from source, rebuild the extension after Rust or Python binding changes:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>maturin<span class="w"> </span>develop<span class="w"> </span>--release
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>maturin<span class="w"> </span>develop<span class="w"> </span>--release
 </span></code></pre></div>
 
 
