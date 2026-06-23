@@ -47,43 +47,6 @@ maturin develop --release
 python -m pytest test/ -q
 ```
 
-## Install Documentation Tools
-
-The documentation site is built with MkDocs Material.
-
-```bash
-python -m pip install -r docs/requirements.txt
-python -m mkdocs serve
-```
-
-Open the local URL printed by MkDocs. To verify the production build:
-
-```bash
-python -m mkdocs build --strict
-```
-
-## GitHub Pages Deployment
-
-The repository includes `.github/workflows/docs.yml`. It uses `mike` so users can switch between historical documentation versions from the header.
-
-- Builds the MkDocs Material site on pull requests.
-- Deploys `pyproject.toml`'s current version on pushes to `main`.
-- Deploys the tag version on `v*` tags.
-- Updates the `latest` alias and keeps older version directories on the `gh-pages` branch.
-
-In the GitHub repository settings, set **Pages -> Build and deployment -> Source** to **Deploy from a branch**, then choose **`gh-pages`** and **`/(root)`**. After the next successful deployment, the site is published at:
-
-```text
-https://birchkwok.github.io/ApexBase/
-```
-
-For local versioned preview, use `mike` after installing the documentation requirements:
-
-```bash
-mike deploy 1.19.0 latest
-mike serve
-```
-
 ## Upgrade
 
 ```bash

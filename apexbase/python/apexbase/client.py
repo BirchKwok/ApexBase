@@ -168,6 +168,10 @@ _RE_SIMPLE_PROJECTED_POINT_LOOKUP = re.compile(
     r"^\s*select\s+(.+?)\s+from\s+([A-Za-z_][\w]*)\s+where\s+_id\s*=\s*(\d+)\s*;?\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+_RE_SIMPLE_SCAN_SHAPE = re.compile(
+    r"^\s*select\s+(.+?)\s+from\s+([A-Za-z_][\w]*)(?:\s+limit\s+(\d+)(?:\s+offset\s+(\d+))?)?\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 _RE_SIMPLE_SELECT_FROM = re.compile(r"^\s*select\s+(.*?)\s+from\s+", re.IGNORECASE | re.DOTALL)
 _RE_SIMPLE_FROM_TABLE = re.compile(r"\bfrom\s+([A-Za-z_][\w]*)\b", re.IGNORECASE)
 _RE_SIMPLE_ID_IN = re.compile(r"\bwhere\s+_id\s+in\s*\(([^)]*)\)\s*;?\s*$", re.IGNORECASE)
@@ -194,10 +198,6 @@ _RE_SIMPLE_STRING_FILTERED_AGG = re.compile(
 _RE_SIMPLE_GROUP_VIEW_OUTER = re.compile(
     r"^\s*select\s+(.+?)\s+from\s+([A-Za-z_][\w]*)\s+where\s+([A-Za-z_][\w]*)\s*(>=|>)\s*([+-]?\d+(?:\.\d+)?)\s+order\s+by\s+([A-Za-z_][\w]*)\s+desc\s+limit\s+(\d+)\s*;?\s*$",
     re.IGNORECASE | re.DOTALL,
-)
-_RE_SIMPLE_POINT_PARSE = re.compile(
-    r"^\s*select\s+\*\s+from\s+([A-Za-z_][\w]*)\s+where\s+_id\s*=\s*(\d+)\s*;?\s*$",
-    re.IGNORECASE,
 )
 _RE_SIMPLE_NUMERIC_UPDATE_BY_ID = re.compile(
     r"^\s*update\s+([A-Za-z_][\w]*)\s+set\s+([A-Za-z_][\w]*)\s*=\s*(-?\d+(?:\.\d+)?)\s+where\s+_id\s*=\s*(\d+)\s*;?\s*$",
@@ -1598,7 +1598,10 @@ class ApexClient:
             return _HOT_CACHE_MISS
         kind = cached_simple[0]
         if kind not in (
-                'point', 'projected_point', 'string_eq_limit1',
+                'count', 'point', 'projected_point', 'batch', 'projected_batch',
+                'scan_limit', 'projected_scan_limit',
+                'projected_full_scan', 'string_eq', 'projected_string_eq',
+                'columnar_select', 'string_eq_limit1',
                 'projected_string_eq_limit1', 'projected_string_eq_limit',
                 'numeric_range_limit', 'numeric_filtered_agg',
                 'string_filtered_agg',
@@ -1632,6 +1635,40 @@ class ApexClient:
 
             if not self._current_table or table_name.lower() != self._current_table.lower():
                 return _HOT_CACHE_MISS
+
+            if kind == 'count':
+                rv = ResultView(lazy_pydict={
+                    cached_simple[2] or 'COUNT(*)': [self._storage.fast_row_count()]
+                })
+                rv._show_internal_id = False
+                return rv
+
+            if kind in ('batch', 'projected_batch'):
+                ids = list(cached_simple[2])
+                result = (self._storage.retrieve_many(ids) if kind == 'batch'
+                          else self._storage.retrieve_many_projected(ids, list(cached_simple[3])))
+                if isinstance(result, dict):
+                    columns_dict = result.get('columns_dict')
+                    if columns_dict is not None:
+                        return self._result_view_from_columns_dict(sql, columns_dict, show_flag)
+                return _HOT_CACHE_MISS
+
+            if kind in (
+                    'scan_limit', 'projected_scan_limit',
+                    'projected_full_scan', 'string_eq', 'projected_string_eq',
+                    'columnar_select',
+            ):
+                result = self._storage.execute(sql)
+                if isinstance(result, dict):
+                    columns_dict = result.get('columns_dict')
+                    if columns_dict is not None:
+                        if not next(iter(columns_dict.values()), []):
+                            rv = ResultView(data=None)
+                            rv._show_internal_id = show_flag
+                            return rv
+                        return self._result_view_from_columns_dict(sql, columns_dict, show_flag)
+                return _HOT_CACHE_MISS
+
             if kind == 'numeric_range_limit':
                 _, _, filter_col, op, value, limit_val, offset_val = cached_simple
                 result = self._storage.retrieve_by_numeric_range_limit(
@@ -1904,11 +1941,25 @@ class ApexClient:
             cached_simple = self._simple_sql_cache.get(sql)
             if cached_simple is None:
                 cached_simple = False
-                point_match = _RE_SIMPLE_POINT_PARSE.match(sql)
+                cacheable_select = (
+                    sql_upper.startswith('SELECT')
+                    and ';' not in sql.strip().rstrip(';')
+                )
+                count_match = _RE_SIMPLE_COUNT_STAR.match(sql) if cacheable_select else None
+                if count_match:
+                    cached_simple = ('count', count_match.group(2), count_match.group(1))
+
+                point_match = (
+                    _RE_SIMPLE_POINT_LOOKUP.match(sql)
+                    if cacheable_select and not cached_simple else None
+                )
                 if point_match:
                     cached_simple = ('point', point_match.group(1), int(point_match.group(2)), None)
                 else:
-                    projected_point = _RE_SIMPLE_PROJECTED_POINT_LOOKUP.match(sql)
+                    projected_point = (
+                        _RE_SIMPLE_PROJECTED_POINT_LOOKUP.match(sql)
+                        if cacheable_select else None
+                    )
                     if projected_point:
                         columns = _projection_columns_from_text(projected_point.group(1).strip())
                         if columns:
@@ -1918,7 +1969,7 @@ class ApexClient:
                                 int(projected_point.group(3)),
                                 tuple(columns),
                             )
-                    else:
+                    elif cacheable_select:
                         table_name = _simple_from_table(sql)
                         ids = _simple_id_list(sql) if table_name else None
                         columns = _simple_projection_columns(sql)
@@ -1927,7 +1978,41 @@ class ApexClient:
                         elif columns and ids and table_name:
                             cached_simple = ('projected_batch', table_name, tuple(ids), tuple(columns))
                         else:
-                            string_limit = _RE_SIMPLE_STRING_EQ_LIMIT.search(sql)
+                            scan_match = (
+                                _RE_SIMPLE_SCAN_SHAPE.match(sql)
+                                if (table_name and not ids and not cached_simple
+                                    and (columns or sql_upper.startswith('SELECT *')))
+                                else None
+                            )
+                            if scan_match:
+                                projection = scan_match.group(1).strip()
+                                limit_text = scan_match.group(3)
+                                offset_val = int(scan_match.group(4) or 0)
+                                if projection == '*' and limit_text is not None:
+                                    cached_simple = (
+                                        'scan_limit', table_name, int(limit_text), offset_val
+                                    )
+                                elif columns:
+                                    cached_simple = (('projected_scan_limit', table_name,
+                                                      int(limit_text), offset_val, tuple(columns))
+                                                     if limit_text is not None
+                                                     else ('projected_full_scan', table_name, tuple(columns)))
+
+                            string_limit = (None if cached_simple
+                                            else _RE_SIMPLE_STRING_EQ_LIMIT.search(sql))
+                            string_eq = (None if cached_simple or string_limit
+                                         else _RE_SIMPLE_STRING_EQ.search(sql))
+                            if string_eq and table_name:
+                                if columns:
+                                    cached_simple = (
+                                        'projected_string_eq', table_name, tuple(columns),
+                                        string_eq.group(1), string_eq.group(2),
+                                    )
+                                elif sql_upper.startswith('SELECT *'):
+                                    cached_simple = (
+                                        'string_eq', table_name,
+                                        string_eq.group(1), string_eq.group(2),
+                                    )
                             string_limit_table = _simple_from_table(sql) if string_limit else None
                             if string_limit and string_limit_table:
                                 try:
@@ -2139,45 +2224,6 @@ class ApexClient:
                                     columns_dict,
                                     show_flag,
                                 )
-                except Exception:
-                    pass  # fall through to the general SQL executor
-
-            point_match = _RE_SIMPLE_POINT_LOOKUP.match(sql)
-            if point_match:
-                table_name = point_match.group(1)
-                try:
-                    point_id = int(point_match.group(2))
-                    self._ensure_table_selected()
-                    if self._current_table and table_name.lower() == self._current_table.lower():
-                        if show_internal_id is None:
-                            show_internal_id = False
-                        row = self._storage.retrieve(point_id)
-                        if row is None:
-                            rv = ResultView(data=None)
-                            rv._show_internal_id = show_internal_id
-                            return rv
-                        if not show_internal_id and '_id' in row:
-                            row = {k: v for k, v in row.items() if k != '_id'}
-                        rv = ResultView(data=[row])
-                        rv._show_internal_id = show_internal_id
-                        return rv
-                except Exception:
-                    pass  # fall through to the general SQL executor
-
-            projected_point = _RE_SIMPLE_PROJECTED_POINT_LOOKUP.match(sql)
-            if projected_point:
-                try:
-                    columns = _projection_columns_from_text(projected_point.group(1).strip())
-                    table_name = projected_point.group(2)
-                    point_id = int(projected_point.group(3))
-                    self._ensure_table_selected()
-                    if (columns and self._current_table
-                            and table_name.lower() == self._current_table.lower()):
-                        row = self._storage.retrieve_projected_row(point_id, columns)
-                        if row is not None:
-                            rv = ResultView(data=[row])
-                            rv._show_internal_id = show_internal_id if show_internal_id is not None else False
-                            return rv
                 except Exception:
                     pass  # fall through to the general SQL executor
 
@@ -2628,6 +2674,12 @@ class ApexClient:
                     if isinstance(result, dict):
                         columns_dict = result.get('columns_dict')
                         if columns_dict is not None:
+                            table_name = _simple_from_table(sql)
+                            if (table_name and self._current_table
+                                    and table_name.lower() == self._current_table.lower()):
+                                if len(self._simple_sql_cache) >= 256:
+                                    self._simple_sql_cache.clear()
+                                self._simple_sql_cache[sql] = ('columnar_select', table_name)
                             row_count = len(next(iter(columns_dict.values()), []))
                             if row_count == 0:
                                 rv = ResultView(data=None)
