@@ -25,6 +25,7 @@ jobs:
     outputs:
       tag_name: ${{ steps.inspect.outputs.tag_name }}
       package_kind: ${{ steps.inspect.outputs.package_kind }}
+      rust_features: ${{ steps.inspect.outputs.rust_features }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -42,6 +43,7 @@ jobs:
         git rev-parse "refs/tags/$RELEASE_TAG^{commit}" >/dev/null
         git checkout --detach "refs/tags/$RELEASE_TAG"
         python - <<'PY'
+        import json
         import os
         import sys
         import tomllib
@@ -57,9 +59,19 @@ jobs:
         if version != tag.removeprefix("v"):
             sys.exit(f"Package version {version!r} does not match tag {tag!r}.")
         package_kind = "maturin" if "maturin" in backend else "legacy"
+        rust_features = [""]
+        cargo_file = Path("Cargo.toml")
+        if package_kind == "maturin" and cargo_file.exists():
+            cargo = tomllib.loads(cargo_file.read_text(encoding="utf-8"))
+            available_features = cargo.get("features", {})
+            rust_features.extend(
+                feature for feature in ("server", "flight")
+                if feature in available_features
+            )
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
             print(f"tag_name={tag}", file=output)
             print(f"package_kind={package_kind}", file=output)
+            print(f"rust_features={json.dumps(rust_features)}", file=output)
         PY
 
   # ── Rust tests (core lib without PyO3, plus server/flight features) ──
@@ -70,10 +82,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        features:
-          - ""                  # core only (--no-default-features)
-          - "server"            # PG wire protocol
-          - "flight"            # Arrow Flight gRPC
+        features: ${{ fromJSON(needs.resolve-release.outputs.rust_features) }}
         rust: [stable]
       fail-fast: false
 
@@ -109,9 +118,16 @@ jobs:
       run: |
         choco install protoc -y
 
-    - name: cargo test (no-default-features ${{ matrix.features && format('+ {0}', matrix.features) || '— core only' }})
+    - name: Validate Rust (${{ matrix.features && format('{0} feature', matrix.features) || 'core only' }})
+      shell: bash
       run: |
-        cargo test --no-default-features ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --release
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          # Historical release backfills must validate the publishable library,
+          # not recompile old test targets with today's Rust/dependency graph.
+          cargo check --lib --no-default-features ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --release
+        else
+          cargo test --no-default-features ${{ matrix.features && format('--features {0}', matrix.features) || '' }} --release
+        fi
       env:
         RUST_BACKTRACE: 1
 
