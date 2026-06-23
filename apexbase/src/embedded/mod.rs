@@ -421,7 +421,8 @@ impl ApexDB {
         let base_dir = self.inner.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.inner.root_dir);
         crate::query::executor::set_temp_dir(&self.inner.temp_dir);
-        let result = ApexExecutor::execute_with_base_dir(sql, &base_dir, &base_dir);
+        let result =
+            ApexExecutor::execute_classified_with_base_dir(sql, &sig, &base_dir, &base_dir);
         crate::query::executor::clear_temp_dir();
         crate::query::executor::clear_query_root_dir();
         let result = result?;
@@ -640,7 +641,8 @@ impl Table {
 
         let base_dir = self.inner.current_base_dir();
         crate::query::executor::set_query_root_dir(&self.inner.root_dir);
-        let result = ApexExecutor::execute_with_base_dir(sql, &base_dir, &self.path);
+        let result =
+            ApexExecutor::execute_classified_with_base_dir(sql, &sig, &base_dir, &self.path);
         crate::query::executor::clear_query_root_dir();
         Ok(ResultSet { inner: result? })
     }

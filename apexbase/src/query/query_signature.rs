@@ -171,7 +171,219 @@ pub enum QuerySignature {
     Complex,
 }
 
+/// Normalized projection used by the signature execution engine.
+///
+/// The classifier keeps specific public variants for compatibility, while the
+/// executor consumes this compact view so projection/predicate/limit do not
+/// multiply into a separate branch for every combination.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ReadProjection<'a> {
+    All,
+    Columns(&'a [String]),
+}
+
+impl<'a> ReadProjection<'a> {
+    #[inline]
+    pub(crate) fn columns(self) -> Option<&'a [String]> {
+        match self {
+            Self::All => None,
+            Self::Columns(columns) => Some(columns),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ReadPredicate<'a> {
+    All,
+    Id(u64),
+    Ids(&'a [u64]),
+    StringEq {
+        column: &'a str,
+        value: &'a str,
+    },
+    NumericRange {
+        column: &'a str,
+        low: f64,
+        high: f64,
+    },
+    Like {
+        column: &'a str,
+        pattern: &'a str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ReadSignature<'a> {
+    pub(crate) table: Option<&'a str>,
+    pub(crate) projection: ReadProjection<'a>,
+    pub(crate) predicate: ReadPredicate<'a>,
+    pub(crate) limit: Option<(usize, usize)>,
+}
+
 impl QuerySignature {
+    /// Collapse combinatorial read variants into one executor-facing shape.
+    #[inline]
+    pub(crate) fn read_signature(&self) -> Option<ReadSignature<'_>> {
+        use QuerySignature::*;
+
+        let all = ReadProjection::All;
+        match self {
+            PointLookup { id, table } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: all,
+                predicate: ReadPredicate::Id(*id),
+                limit: None,
+            }),
+            ProjectedPointLookup { id, table, columns } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: ReadProjection::Columns(columns),
+                predicate: ReadPredicate::Id(*id),
+                limit: None,
+            }),
+            IdBatchLookup { ids, table } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: all,
+                predicate: ReadPredicate::Ids(ids),
+                limit: None,
+            }),
+            ProjectedIdBatchLookup {
+                ids,
+                table,
+                columns,
+            } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: ReadProjection::Columns(columns),
+                predicate: ReadPredicate::Ids(ids),
+                limit: None,
+            }),
+            FullScan { table } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: all,
+                predicate: ReadPredicate::All,
+                limit: None,
+            }),
+            ProjectedFullScan { table, columns } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: ReadProjection::Columns(columns),
+                predicate: ReadPredicate::All,
+                limit: None,
+            }),
+            SimpleScanLimit {
+                limit,
+                offset,
+                table,
+            } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: all,
+                predicate: ReadPredicate::All,
+                limit: Some((*limit, *offset)),
+            }),
+            ProjectedScanLimit {
+                limit,
+                offset,
+                table,
+                columns,
+            } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: ReadProjection::Columns(columns),
+                predicate: ReadPredicate::All,
+                limit: Some((*limit, *offset)),
+            }),
+            StringEqualityFilter {
+                table,
+                column,
+                value,
+            } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: all,
+                predicate: ReadPredicate::StringEq { column, value },
+                limit: None,
+            }),
+            StringEqualityFilterLimit {
+                table,
+                column,
+                value,
+                limit,
+                offset,
+            } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: all,
+                predicate: ReadPredicate::StringEq { column, value },
+                limit: Some((*limit, *offset)),
+            }),
+            ProjectedStringEqualityFilter {
+                table,
+                columns,
+                column,
+                value,
+            } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: ReadProjection::Columns(columns),
+                predicate: ReadPredicate::StringEq { column, value },
+                limit: None,
+            }),
+            ProjectedStringEqualityFilterLimit {
+                table,
+                columns,
+                column,
+                value,
+                limit,
+                offset,
+            } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: ReadProjection::Columns(columns),
+                predicate: ReadPredicate::StringEq { column, value },
+                limit: Some((*limit, *offset)),
+            }),
+            NumericRangeFilterLimit {
+                table,
+                column,
+                low,
+                high,
+                limit,
+                offset,
+            } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: all,
+                predicate: ReadPredicate::NumericRange {
+                    column,
+                    low: *low,
+                    high: *high,
+                },
+                limit: Some((*limit, *offset)),
+            }),
+            ProjectedNumericRangeFilterLimit {
+                table,
+                columns,
+                column,
+                low,
+                high,
+                limit,
+                offset,
+            } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: ReadProjection::Columns(columns),
+                predicate: ReadPredicate::NumericRange {
+                    column,
+                    low: *low,
+                    high: *high,
+                },
+                limit: Some((*limit, *offset)),
+            }),
+            LikeFilter {
+                table,
+                column,
+                pattern,
+            } => Some(ReadSignature {
+                table: table.as_deref(),
+                projection: all,
+                predicate: ReadPredicate::Like { column, pattern },
+                limit: None,
+            }),
+            _ => None,
+        }
+    }
+
     /// Returns true if this signature represents a read-only query.
     #[inline]
     pub fn is_read_only(&self) -> bool {
@@ -1412,5 +1624,31 @@ mod tests {
     fn test_session_command() {
         assert_eq!(classify("SET x = 1"), QuerySignature::SessionCommand);
         assert_eq!(classify("RESET x"), QuerySignature::SessionCommand);
+    }
+
+    #[test]
+    fn test_normalized_read_signature() {
+        let signature = classify("SELECT name, age FROM users WHERE city = 'BJ' LIMIT 5 OFFSET 2");
+        let read = signature.read_signature().expect("simple read signature");
+        assert_eq!(read.table, Some("users"));
+        assert_eq!(read.limit, Some((5, 2)));
+        assert_eq!(
+            read.projection,
+            ReadProjection::Columns(&["name".to_string(), "age".to_string()])
+        );
+        assert_eq!(
+            read.predicate,
+            ReadPredicate::StringEq {
+                column: "city",
+                value: "BJ",
+            }
+        );
+
+        assert!(classify("SELECT COUNT(*) FROM users")
+            .read_signature()
+            .is_none());
+        assert!(classify("SELECT * FROM users ORDER BY age")
+            .read_signature()
+            .is_none());
     }
 }

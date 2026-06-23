@@ -3555,8 +3555,13 @@ impl ApexStorageImpl {
 
         let exec_out = py.allow_threads(|| -> PyResult<ExecOut> {
             if is_begin {
-                let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let result = ApexExecutor::execute_classified_with_base_dir(
+                    &sql,
+                    &sig,
+                    &base_dir,
+                    &table_path,
+                )
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 if let ApexResult::Scalar(txn_id) = &result {
                     return Ok(ExecOut::Scalar("txn_id".to_string(), *txn_id));
                 }
@@ -3658,8 +3663,9 @@ impl ApexStorageImpl {
             }
 
             // Normal execution (non-transaction writes, DDL, and fallback reads)
-            let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let result =
+                ApexExecutor::execute_classified_with_base_dir(&sql, &sig, &base_dir, &table_path)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             if let ApexResult::Scalar(n) = &result {
                 return Ok(ExecOut::Scalar("rows_affected".to_string(), *n));
             }
@@ -3820,8 +3826,9 @@ impl ApexStorageImpl {
 
         // Execute query in Rust thread pool
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
-            let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let result =
+                ApexExecutor::execute_classified_with_base_dir(&sql, &sig, &base_dir, &table_path)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             result
                 .to_record_batch()
@@ -4042,8 +4049,13 @@ impl ApexStorageImpl {
             })?
         } else {
             let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
-                let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let result = ApexExecutor::execute_classified_with_base_dir(
+                    &sql,
+                    &sig,
+                    &base_dir,
+                    &table_path,
+                )
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 result
                     .to_record_batch()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
