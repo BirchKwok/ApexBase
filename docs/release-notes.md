@@ -5,7 +5,47 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 
 ## Unreleased
 
-- Add comprehensive tests for Hive complex SQL features and establish coding agent prerequisites
+---
+
+## [v1.20.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.20.0)
+*2026-06-23*
+
+[Compare with v1.19.1](https://github.com/BirchKwok/ApexBase/compare/v1.19.1...v1.20.0)
+
+- Add broad Hive complex SQL support across parser and executor for CTE-heavy ETL workloads, `INSERT OVERWRITE ... PARTITION`, Hive-style `LATERAL VIEW`, `EXPLODE`/`POSEXPLODE`, `STACK`, and richer expression handling
+- Add optimized JSON projection fusion for repeated `GET_JSON_OBJECT` extraction and Hive array-splitting patterns
+- Extend query signature detection and fast paths for complex Hive-style query shapes
+- Improve aggregation, joins, SELECT, DDL, window execution, Python client, embedded API, and bindings to handle the new SQL coverage
+- Add reproducible Hive complex SQL benchmark suite comparing ApexBase and DuckDB, including three large reference SQL workloads
+- Add comprehensive Hive complex SQL, CTE/EXPLAIN/INSERT SELECT, and storage architecture regression tests
+- Add coding-agent prerequisite documentation in `precondition.md`
+- Update version metadata to 1.20.0
+- Enhance build and release workflows with tag-driven scheduled/manual builds, GitHub Release generation, release-note extraction by tag, historical pure-Python version releases, and Rust historical release backfills
+- Simplify docs publishing/release-note generation flow and remove generated comments from release notes
+- Simplify installation docs by removing Tool installation and GitHub Pages deployment sections
+
+<details>
+<summary><b>Changed files by module</b></summary>
+
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>2</td></tr>
+<tr><td>Project Config</td><td>3</td></tr>
+<tr><td>Documentation</td><td>3</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Rust Embedded API</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>9</td></tr>
+<tr><td>Storage Engine</td><td>1</td></tr>
+<tr><td>Benchmarks</td><td>4</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Tests</td><td>3</td></tr>
+</tbody>
+</table></details>
 
 ---
 
@@ -1125,4 +1165,3 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 </table></details>
 
 ---
-
