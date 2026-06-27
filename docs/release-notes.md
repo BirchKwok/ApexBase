@@ -3,10 +3,6 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
-## Unreleased
-
----
-
 ## [v1.20.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.20.0)
 *2026-06-23*
 
