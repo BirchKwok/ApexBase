@@ -1312,6 +1312,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v1200" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v1.20.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v1191" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1751,9 +1762,46 @@
 <h1 id="release-notes">Release Notes<a class="headerlink" href="#release-notes" title="Permanent link">&para;</a></h1>
 <p>This page summarizes the changes introduced in each ApexBase release, grouped by functional area.</p>
 <h2 id="unreleased">Unreleased<a class="headerlink" href="#unreleased" title="Permanent link">&para;</a></h2>
+<hr />
+<h2 id="v1200"><a href="https://github.com/BirchKwok/ApexBase/releases/tag/v1.20.0">v1.20.0</a><a class="headerlink" href="#v1200" title="Permanent link">&para;</a></h2>
+<p><em>2026-06-23</em></p>
+<p><a href="https://github.com/BirchKwok/ApexBase/compare/v1.19.1...v1.20.0">Compare with v1.19.1</a></p>
 <ul>
-<li>Add comprehensive tests for Hive complex SQL features and establish coding agent prerequisites</li>
+<li>Add broad Hive complex SQL support across parser and executor for CTE-heavy ETL workloads, <code>INSERT OVERWRITE ... PARTITION</code>, Hive-style <code>LATERAL VIEW</code>, <code>EXPLODE</code>/<code>POSEXPLODE</code>, <code>STACK</code>, and richer expression handling</li>
+<li>Add optimized JSON projection fusion for repeated <code>GET_JSON_OBJECT</code> extraction and Hive array-splitting patterns</li>
+<li>Extend query signature detection and fast paths for complex Hive-style query shapes</li>
+<li>Improve aggregation, joins, SELECT, DDL, window execution, Python client, embedded API, and bindings to handle the new SQL coverage</li>
+<li>Add reproducible Hive complex SQL benchmark suite comparing ApexBase and DuckDB, including three large reference SQL workloads</li>
+<li>Add comprehensive Hive complex SQL, CTE/EXPLAIN/INSERT SELECT, and storage architecture regression tests</li>
+<li>Add coding-agent prerequisite documentation in <code>precondition.md</code></li>
+<li>Update version metadata to 1.20.0</li>
+<li>Enhance build and release workflows with tag-driven scheduled/manual builds, GitHub Release generation, release-note extraction by tag, historical pure-Python version releases, and Rust historical release backfills</li>
+<li>Simplify docs publishing/release-note generation flow and remove generated comments from release notes</li>
+<li>Simplify installation docs by removing Tool installation and GitHub Pages deployment sections</li>
 </ul>
+<details>
+<summary><b>Changed files by module</b></summary>
+
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>CI/CD</td><td>2</td></tr>
+<tr><td>Project Config</td><td>3</td></tr>
+<tr><td>Documentation</td><td>3</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Python Client</td><td>1</td></tr>
+<tr><td>Rust Embedded API</td><td>1</td></tr>
+<tr><td>Python Bindings</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>9</td></tr>
+<tr><td>Storage Engine</td><td>1</td></tr>
+<tr><td>Benchmarks</td><td>4</td></tr>
+<tr><td>Other</td><td>1</td></tr>
+<tr><td>Tests</td><td>3</td></tr>
+</tbody>
+</table></details>
+
 <hr />
 <h2 id="v1191"><a href="https://github.com/BirchKwok/ApexBase/releases/tag/v1.19.1">v1.19.1</a><a class="headerlink" href="#v1191" title="Permanent link">&para;</a></h2>
 <p><em>2026-06-11</em></p>
