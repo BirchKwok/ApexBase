@@ -4622,7 +4622,7 @@ impl ApexStorageImpl {
     ///
     /// For 'safe' and 'max' durability levels, save() automatically calls fsync.
     /// For 'fast' durability, call this method explicitly when you need durability guarantees.
-    fn flush(&self) -> PyResult<()> {
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
         let table_path = self.get_current_table_path()?;
         let table_name = self.current_table.read().clone();
         let mut backends: Vec<Arc<TableStorageBackend>> = Vec::new();
@@ -4660,35 +4660,37 @@ impl ApexStorageImpl {
         }
 
         let any_needs_save = actions.iter().any(|(_, needs_save)| *needs_save);
-        let lock_file = if any_needs_save {
-            Some(
-                Self::acquire_read_lock(&table_path)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
-            )
-        } else {
-            None
-        };
+        py.allow_threads(|| -> PyResult<()> {
+            let lock_file = if any_needs_save {
+                Some(
+                    Self::acquire_read_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
+                )
+            } else {
+                None
+            };
 
-        let result: PyResult<()> = (|| {
-            for (backend, needs_save) in actions {
-                if needs_save {
-                    backend
-                        .save()
-                        .and_then(|_| backend.sync())
-                        .map_err(|e| PyIOError::new_err(format!("Failed to flush: {}", e)))?;
-                } else {
-                    backend
-                        .sync()
-                        .map_err(|e| PyIOError::new_err(format!("Failed to flush: {}", e)))?;
+            let result: PyResult<()> = (|| {
+                for (backend, needs_save) in actions {
+                    if needs_save {
+                        backend
+                            .save()
+                            .and_then(|_| backend.sync())
+                            .map_err(|e| PyIOError::new_err(format!("Failed to flush: {}", e)))?;
+                    } else {
+                        backend
+                            .sync()
+                            .map_err(|e| PyIOError::new_err(format!("Failed to flush: {}", e)))?;
+                    }
                 }
-            }
-            Ok(())
-        })();
+                Ok(())
+            })();
 
-        if let Some(lock_file) = lock_file {
-            Self::release_lock(lock_file);
-        }
-        result?;
+            if let Some(lock_file) = lock_file {
+                Self::release_lock(lock_file);
+            }
+            result
+        })?;
 
         if any_needs_save {
             crate::storage::engine::engine().invalidate(&table_path);
@@ -4799,14 +4801,34 @@ impl ApexStorageImpl {
     }
 
     /// Close storage
-    fn close(&self) -> PyResult<()> {
-        crate::query::executor::wait_fts_backfills_for_dir(&self.current_base_dir());
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let base_dir = self.current_base_dir();
+        let pending_backends: Vec<Arc<TableStorageBackend>> = self
+            .cached_backends
+            .iter()
+            .filter_map(|entry| {
+                let backend = entry.value();
+                if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+                    Some(Arc::clone(backend))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let has_fts_backfills = crate::query::executor::has_fts_backfills_for_dir(&base_dir);
 
-        for entry in self.cached_backends.iter() {
-            let backend = entry.value();
-            if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
-                let _ = backend.save();
-            }
+        if !pending_backends.is_empty() || has_fts_backfills {
+            py.allow_threads(|| {
+                if has_fts_backfills {
+                    crate::query::executor::wait_fts_backfills_for_dir(&base_dir);
+                }
+
+                for backend in pending_backends {
+                    if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+                        let _ = backend.save();
+                    }
+                }
+            });
         }
 
         // Clear per-instance cached backends (releases per-instance references)

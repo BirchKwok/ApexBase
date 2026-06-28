@@ -570,6 +570,13 @@ pub fn wait_fts_backfills_for_dir(base_dir: &Path) {
     }
 }
 
+pub fn has_fts_backfills_for_dir(base_dir: &Path) -> bool {
+    FTS_BACKFILL_TASKS
+        .read()
+        .keys()
+        .any(|(dir, _)| dir == base_dir)
+}
+
 /// Remove the FTS manager registered for a base_dir.
 ///
 /// Used when a database directory is recreated in-process, so a later
