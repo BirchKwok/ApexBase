@@ -1996,15 +1996,18 @@ impl OnDemandStorage {
             return Ok(false);
         }
 
-        let footer_guard = self.v4_footer.read();
-        let Some(footer) = footer_guard.as_ref() else {
-            return Ok(false);
+        let (on_disk_rows, footer_schema_columns) = {
+            let footer_guard = self.v4_footer.read();
+            let Some(footer) = footer_guard.as_ref() else {
+                return Ok(false);
+            };
+            let rows = footer
+                .row_groups
+                .iter()
+                .map(|rg| rg.row_count as usize)
+                .sum();
+            (rows, footer.schema.columns.clone())
         };
-        let on_disk_rows: usize = footer
-            .row_groups
-            .iter()
-            .map(|rg| rg.row_count as usize)
-            .sum();
         if on_disk_rows == 0 {
             // New/empty tables must write the initial base file so schema/footer metadata
             // is persisted together with the first rows.
@@ -2046,7 +2049,7 @@ impl OnDemandStorage {
                 let schema = self.schema.read();
                 let columns = self.columns.read();
                 let nulls = self.nulls.read();
-                if schema.columns != footer.schema.columns {
+                if schema.columns != footer_schema_columns {
                     return Ok(false);
                 }
                 if columns.len() < schema.column_count() {
@@ -2199,7 +2202,7 @@ impl OnDemandStorage {
         let schema = self.schema.read();
         let columns = self.columns.read();
         let nulls = self.nulls.read();
-        if schema.columns != footer.schema.columns {
+        if schema.columns != footer_schema_columns {
             // Schema evolution must go through the normal save path so the base footer and
             // column layout stay in sync with what readers expect on reopen.
             return Ok(false);
