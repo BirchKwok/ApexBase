@@ -317,6 +317,8 @@ pub struct SelectStatement {
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    #[serde(default)]
+    pub window_row_number_limit: Option<(String, usize)>,
 }
 
 /// Column selection in SELECT clause
@@ -3653,6 +3655,7 @@ impl SqlParser {
             order_by,
             limit,
             offset,
+            window_row_number_limit: None,
         })
     }
 

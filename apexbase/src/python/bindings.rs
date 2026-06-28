@@ -488,6 +488,9 @@ pub struct ApexStorageImpl {
     update_by_id_cell_cache: DashMap<String, NumericUpdateCellCache>,
     /// Exact full-row payloads for repeated idempotent `replace(id, row)` calls.
     replace_exact_row_cache: DashMap<String, HashMap<String, Value>>,
+    /// Tables written since the last flush; flush preopens their read backend
+    /// so the first post-load SELECT does not pay mmap/footer open cost.
+    flush_prewarm_tables: DashMap<String, PathBuf>,
     /// Current table name
     current_table: RwLock<String>,
     /// FTS Manager (optional) — Arc so it can be shared with the global SQL executor registry
@@ -1139,6 +1142,26 @@ impl ApexStorageImpl {
             .retain(|key, _| !key.contains(&replace_cache_marker));
     }
 
+    fn mark_flush_prewarm(&self, table_path: &Path, table_name: &str) {
+        self.flush_prewarm_tables.insert(
+            Self::backend_cache_key(table_path, table_name),
+            table_path.to_path_buf(),
+        );
+    }
+
+    fn prewarm_flushed_backend(&self, table_path: &Path, table_name: &str) {
+        let cache_key = Self::backend_cache_key(table_path, table_name);
+        if self.flush_prewarm_tables.remove(&cache_key).is_none() || !table_path.exists() {
+            return;
+        }
+        if let Ok(backend) = TableStorageBackend::open_with_durability(table_path, self.durability) {
+            let backend = Arc::new(backend);
+            self.cached_backends
+                .insert(cache_key, Arc::clone(&backend));
+            crate::query::executor::cache_backend_pub(table_path, backend);
+        }
+    }
+
     /// Return current base directory (root_dir for default db, root_dir/db for named db)
     #[inline]
     fn current_base_dir(&self) -> PathBuf {
@@ -1216,6 +1239,7 @@ impl ApexStorageImpl {
             update_by_id_numeric_cache: DashMap::new(),
             update_by_id_cell_cache: DashMap::new(),
             replace_exact_row_cache: DashMap::new(),
+            flush_prewarm_tables: DashMap::new(),
             current_table: RwLock::new(String::new()),
             fts_manager: RwLock::new(None::<Arc<FtsManager>>),
             fts_index_fields: RwLock::new(HashMap::new()),
@@ -1259,10 +1283,11 @@ impl ApexStorageImpl {
             Self::release_lock(lf);
         }
 
+        let id = result?;
+
         // Invalidate local backend cache (StorageEngine handles its own cache)
         self.invalidate_backend(&table_name);
-
-        let id = result?;
+        self.mark_flush_prewarm(&table_path, &table_name);
 
         // Index in FTS if enabled
         self.index_for_fts(id, data)?;
@@ -1312,10 +1337,11 @@ impl ApexStorageImpl {
             Self::release_lock(lf);
         }
 
+        let ids = result?;
+
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
-
-        let ids = result?;
+        self.mark_flush_prewarm(&table_path, &table_name);
 
         // Index in FTS if enabled (batch operation - only if FTS manager exists)
         // OPTIMIZED: Use add_documents_arrow_str (🥈 ~3.3M docs/s, zero-copy &str path)
@@ -2223,15 +2249,16 @@ impl ApexStorageImpl {
             Self::release_lock(lf);
         }
 
+        let ids = result?;
+
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
+        self.mark_flush_prewarm(&table_path, &table_name);
         // On Windows, engine.insert_cache holds a mmap'd backend after write_typed.
         // Clearing it ensures set_len() in subsequent transaction-commit delete paths succeeds
         // (ERROR_USER_MAPPED_FILE / os error 1224 is triggered when any mmap is open).
         #[cfg(target_os = "windows")]
         crate::storage::engine::engine().invalidate(&table_path);
-
-        let ids = result?;
 
         // Index in FTS if enabled - OPTIMIZED: Use add_documents_arrow_str (🥈 zero-copy &str path)
         {
@@ -4612,6 +4639,7 @@ impl ApexStorageImpl {
         }
 
         if backends.is_empty() {
+            self.prewarm_flushed_backend(&table_path, &table_name);
             return Ok(());
         }
 
@@ -4627,6 +4655,7 @@ impl ApexStorageImpl {
         }
 
         if actions.is_empty() {
+            self.prewarm_flushed_backend(&table_path, &table_name);
             return Ok(());
         }
 
@@ -4667,6 +4696,7 @@ impl ApexStorageImpl {
             crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
             self.invalidate_backend(&table_name);
         }
+        self.prewarm_flushed_backend(&table_path, &table_name);
         Ok(())
     }
 
@@ -4784,6 +4814,7 @@ impl ApexStorageImpl {
         self.update_by_id_numeric_cache.clear();
         self.update_by_id_cell_cache.clear();
         self.replace_exact_row_cache.clear();
+        self.flush_prewarm_tables.clear();
 
         // Clean up temp tables
         let _ = fs::remove_dir_all(&self.temp_dir);

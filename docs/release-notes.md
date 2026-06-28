@@ -13,6 +13,7 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 - Extend query signature detection and fast paths for complex Hive-style query shapes
 - Improve aggregation, joins, SELECT, DDL, window execution, Python client, embedded API, and bindings to handle the new SQL coverage
 - Add reproducible Hive complex SQL benchmark suite comparing ApexBase and DuckDB, including three large reference SQL workloads
+- Add SQLite-equivalent SQL benchmark coverage for the same three Hive workload shapes, with ApexBase, DuckDB, and SQLite result-set equality checks across 100K, 500K, and 1M behavior rows
 - Add comprehensive Hive complex SQL, CTE/EXPLAIN/INSERT SELECT, and storage architecture regression tests
 - Add coding-agent prerequisite documentation in `precondition.md`
 - Update version metadata to 1.20.0

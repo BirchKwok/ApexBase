@@ -1476,6 +1476,12 @@ impl ApexExecutor {
             owned_stmt = stmt.clone(); // unused but required for lifetime
         }
 
+        if let Some(result) =
+            Self::try_execute_single_key_streaming_group_by(&batch, effective_stmt, &group_cols)?
+        {
+            return Ok(result);
+        }
+
         // Check if we can use fast path: only simple aggregates (COUNT, SUM, AVG, MIN, MAX)
         // without DISTINCT, expressions, or HAVING that needs row access
         let can_use_incremental = Self::can_use_incremental_aggregation(effective_stmt);
@@ -1517,6 +1523,571 @@ impl ApexExecutor {
         }
 
         Ok(result)
+    }
+
+    fn try_execute_single_key_streaming_group_by(
+        batch: &RecordBatch,
+        stmt: &SelectStatement,
+        group_cols: &[String],
+    ) -> io::Result<Option<ApexResult>> {
+        if group_cols.len() != 1
+            || stmt.having.is_some()
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+        {
+            return Ok(None);
+        }
+
+        fn clean_name(name: &str) -> &str {
+            let trimmed = name.trim_matches('"');
+            trimmed
+                .rsplit('.')
+                .next()
+                .unwrap_or(trimmed)
+                .trim_matches('"')
+        }
+
+        fn numeric_value(array: &ArrayRef, row: usize) -> Option<f64> {
+            if array.is_null(row) {
+                return None;
+            }
+            if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+                Some(values.value(row))
+            } else if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+                Some(values.value(row) as f64)
+            } else if let Some(values) = array.as_any().downcast_ref::<UInt64Array>() {
+                Some(values.value(row) as f64)
+            } else if let Some(values) = array.as_any().downcast_ref::<BooleanArray>() {
+                Some(if values.value(row) { 1.0 } else { 0.0 })
+            } else {
+                None
+            }
+        }
+
+        fn numeric_literal(expr: &SqlExpr) -> Option<f64> {
+            match expr {
+                SqlExpr::Literal(Value::Int64(value)) => Some(*value as f64),
+                SqlExpr::Literal(Value::Float64(value)) => Some(*value),
+                _ => None,
+            }
+        }
+
+        fn output_name(
+            func: &AggregateFunc,
+            column: Option<&String>,
+            alias: &Option<String>,
+        ) -> String {
+            if let Some(alias) = alias {
+                return alias.clone();
+            }
+            match (func, column) {
+                (AggregateFunc::Count, None) => "COUNT(*)".to_string(),
+                (AggregateFunc::Count, Some(column)) => format!("COUNT({})", clean_name(column)),
+                (AggregateFunc::Sum, Some(column)) => format!("SUM({})", clean_name(column)),
+                (AggregateFunc::Avg, Some(column)) => format!("AVG({})", clean_name(column)),
+                (AggregateFunc::Min, Some(column)) => format!("MIN({})", clean_name(column)),
+                (AggregateFunc::Max, Some(column)) => format!("MAX({})", clean_name(column)),
+                _ => "aggregate".to_string(),
+            }
+        }
+
+        fn case_counter(expr: &SqlExpr) -> Option<(String, Vec<String>)> {
+            let SqlExpr::Function { name, args } = expr else { return None };
+            if !name.eq_ignore_ascii_case("SUM") || args.len() != 1 {
+                return None;
+            }
+            let SqlExpr::Case { when_then, else_expr } = &args[0] else {
+                return None;
+            };
+            if when_then.len() != 1
+                || numeric_literal(&when_then[0].1) != Some(1.0)
+                || else_expr.as_deref().and_then(numeric_literal) != Some(0.0)
+            {
+                return None;
+            }
+            match &when_then[0].0 {
+                SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                    match (left.as_ref(), right.as_ref()) {
+                        (SqlExpr::Column(column), SqlExpr::Literal(Value::String(value)))
+                        | (SqlExpr::Literal(Value::String(value)), SqlExpr::Column(column)) => {
+                            Some((clean_name(column).to_string(), vec![value.clone()]))
+                        }
+                        _ => None,
+                    }
+                }
+                SqlExpr::In { column, values, negated: false } => {
+                    let mut literals = Vec::with_capacity(values.len());
+                    for value in values {
+                        match value {
+                            Value::String(value) => literals.push(value.clone()),
+                            _ => return None,
+                        }
+                    }
+                    Some((clean_name(column).to_string(), literals))
+                }
+                _ => None,
+            }
+        }
+
+        fn sum_binary(expr: &SqlExpr) -> Option<(String, String, BinaryOperator)> {
+            let SqlExpr::Function { name, args } = expr else { return None };
+            if !name.eq_ignore_ascii_case("SUM") || args.len() != 1 {
+                return None;
+            }
+            let SqlExpr::BinaryOp { left, op, right } = &args[0] else {
+                return None;
+            };
+            if !matches!(op, BinaryOperator::Add | BinaryOperator::Sub) {
+                return None;
+            }
+            let (SqlExpr::Column(left), SqlExpr::Column(right)) =
+                (left.as_ref(), right.as_ref())
+            else {
+                return None;
+            };
+            Some((
+                clean_name(left).to_string(),
+                clean_name(right).to_string(),
+                op.clone(),
+            ))
+        }
+
+        #[inline]
+        fn string_fingerprint(value: &str) -> u64 {
+            let bytes = value.as_bytes();
+            let mut split = 0usize;
+            while split < bytes.len() && !bytes[split].is_ascii_digit() {
+                split += 1;
+            }
+            if split > 0 && split < bytes.len() {
+                let mut number = 0u64;
+                let mut valid = true;
+                for &byte in &bytes[split..] {
+                    if !byte.is_ascii_digit() {
+                        valid = false;
+                        break;
+                    }
+                    number = number
+                        .saturating_mul(10)
+                        .saturating_add((byte - b'0') as u64);
+                }
+                if valid {
+                    let mut prefix = 0u64;
+                    for &byte in &bytes[..split.min(8)] {
+                        prefix = (prefix << 8) | byte as u64;
+                    }
+                    return 0xA5A5_5A5A_D3C3_B4B4u64
+                        ^ number
+                        ^ prefix.rotate_left(27)
+                        ^ ((split as u64) << 56);
+                }
+            }
+
+            let mut hasher = AHasher::default();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        enum Output {
+            Key(String),
+            Count { name: String, slot: usize },
+            Distinct { name: String, slot: usize },
+            Sum { name: String, slot: usize },
+            Avg { name: String, sum_slot: usize, count_slot: usize },
+        }
+
+        enum RowOp<'a> {
+            Count { slot: usize },
+            CountNonNull { slot: usize, array: &'a ArrayRef },
+            DistinctString { slot: usize, array: &'a StringArray },
+            DistinctGeneric { slot: usize, array: &'a ArrayRef },
+            SumColumn { slot: usize, array: &'a ArrayRef },
+            SumBinary {
+                slot: usize,
+                left: &'a ArrayRef,
+                right: &'a ArrayRef,
+                op: BinaryOperator,
+            },
+            SumCases {
+                array: &'a StringArray,
+                cases: Vec<(usize, Vec<String>)>,
+            },
+            AvgColumn {
+                sum_slot: usize,
+                count_slot: usize,
+                array: &'a ArrayRef,
+            },
+        }
+
+        struct State {
+            key: String,
+            counts: Vec<i64>,
+            sums: Vec<f64>,
+            sum_counts: Vec<i64>,
+            avg_counts: Vec<i64>,
+            distinct: Vec<Vec<u64>>,
+        }
+
+        let group_col = clean_name(&group_cols[0]);
+        let Some(group_values) = batch
+            .column_by_name(group_col)
+            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+        else {
+            return Ok(None);
+        };
+        if group_values.null_count() > 0 {
+            return Ok(None);
+        }
+
+        let mut outputs = Vec::with_capacity(stmt.columns.len());
+        let mut row_ops = Vec::new();
+        let mut count_slots = 0usize;
+        let mut sum_slots = 0usize;
+        let mut avg_count_slots = 0usize;
+        let mut distinct_slots = 0usize;
+
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Column(name) => {
+                    if clean_name(name) != group_col {
+                        return Ok(None);
+                    }
+                    outputs.push(Output::Key(clean_name(name).to_string()));
+                }
+                SelectColumn::ColumnAlias { column, alias } => {
+                    if clean_name(column) != group_col {
+                        return Ok(None);
+                    }
+                    outputs.push(Output::Key(alias.clone()));
+                }
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    distinct,
+                    alias,
+                } => match (func, column, distinct) {
+                    (AggregateFunc::Count, None, false) => {
+                        let slot = count_slots;
+                        count_slots += 1;
+                        row_ops.push(RowOp::Count { slot });
+                        outputs.push(Output::Count {
+                            name: output_name(func, column.as_ref(), alias),
+                            slot,
+                        });
+                    }
+                    (AggregateFunc::Count, Some(column), false) => {
+                        let actual = clean_name(column);
+                        let Some(array) = batch.column_by_name(actual) else {
+                            return Ok(None);
+                        };
+                        let slot = count_slots;
+                        count_slots += 1;
+                        row_ops.push(RowOp::CountNonNull { slot, array });
+                        outputs.push(Output::Count {
+                            name: output_name(func, Some(column), alias),
+                            slot,
+                        });
+                    }
+                    (AggregateFunc::Count, Some(column), true) => {
+                        let actual = clean_name(column);
+                        let Some(array) = batch.column_by_name(actual) else {
+                            return Ok(None);
+                        };
+                        let slot = distinct_slots;
+                        distinct_slots += 1;
+                        if let Some(strings) = array.as_any().downcast_ref::<StringArray>() {
+                            row_ops.push(RowOp::DistinctString {
+                                slot,
+                                array: strings,
+                            });
+                        } else {
+                            row_ops.push(RowOp::DistinctGeneric { slot, array });
+                        }
+                        outputs.push(Output::Distinct {
+                            name: alias
+                                .clone()
+                                .unwrap_or_else(|| format!("COUNT(DISTINCT {})", actual)),
+                            slot,
+                        });
+                    }
+                    (AggregateFunc::Sum, Some(column), false) => {
+                        let actual = clean_name(column);
+                        let Some(array) = batch.column_by_name(actual) else {
+                            return Ok(None);
+                        };
+                        let slot = sum_slots;
+                        sum_slots += 1;
+                        row_ops.push(RowOp::SumColumn { slot, array });
+                        outputs.push(Output::Sum {
+                            name: output_name(func, Some(column), alias),
+                            slot,
+                        });
+                    }
+                    (AggregateFunc::Avg, Some(column), false) => {
+                        let actual = clean_name(column);
+                        let Some(array) = batch.column_by_name(actual) else {
+                            return Ok(None);
+                        };
+                        let sum_slot = sum_slots;
+                        let count_slot = avg_count_slots;
+                        sum_slots += 1;
+                        avg_count_slots += 1;
+                        row_ops.push(RowOp::AvgColumn {
+                            sum_slot,
+                            count_slot,
+                            array,
+                        });
+                        outputs.push(Output::Avg {
+                            name: output_name(func, Some(column), alias),
+                            sum_slot,
+                            count_slot,
+                        });
+                    }
+                    _ => return Ok(None),
+                },
+                SelectColumn::Expression { expr, alias } => {
+                    let Some(alias) = alias.clone() else {
+                        return Ok(None);
+                    };
+                    if let Some((column, literals)) = case_counter(expr) {
+                        let Some(array) = batch
+                            .column_by_name(&column)
+                            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+                        else {
+                            return Ok(None);
+                        };
+                        let slot = sum_slots;
+                        sum_slots += 1;
+                        let mut merged = false;
+                        for op in &mut row_ops {
+                            if let RowOp::SumCases {
+                                array: existing,
+                                cases,
+                            } = op
+                            {
+                                if std::ptr::eq(*existing, array) {
+                                    cases.push((slot, literals.clone()));
+                                    merged = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !merged {
+                            row_ops.push(RowOp::SumCases {
+                                array,
+                                cases: vec![(slot, literals)],
+                            });
+                        }
+                        outputs.push(Output::Sum { name: alias, slot });
+                    } else if let Some((left, right, op)) = sum_binary(expr) {
+                        let Some(left_array) = batch.column_by_name(&left) else {
+                            return Ok(None);
+                        };
+                        let Some(right_array) = batch.column_by_name(&right) else {
+                            return Ok(None);
+                        };
+                        let slot = sum_slots;
+                        sum_slots += 1;
+                        row_ops.push(RowOp::SumBinary {
+                            slot,
+                            left: left_array,
+                            right: right_array,
+                            op,
+                        });
+                        outputs.push(Output::Sum { name: alias, slot });
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        if row_ops.is_empty() {
+            return Ok(None);
+        }
+        if distinct_slots == 0 {
+            return Ok(None);
+        }
+
+        let mut apply_row_ops = |row: usize, state: &mut State| {
+            for op in &row_ops {
+                match op {
+                    RowOp::Count { slot } => {
+                        state.counts[*slot] += 1;
+                    }
+                    RowOp::CountNonNull { slot, array } => {
+                        if !array.is_null(row) {
+                            state.counts[*slot] += 1;
+                        }
+                    }
+                    RowOp::DistinctString { slot, array } => {
+                        if !array.is_null(row) {
+                            let value = string_fingerprint(array.value(row));
+                            let seen = &mut state.distinct[*slot];
+                            if !seen.contains(&value) {
+                                seen.push(value);
+                            }
+                        }
+                    }
+                    RowOp::DistinctGeneric { slot, array } => {
+                        if !array.is_null(row) {
+                            let value = Self::hash_array_value_fast(array, row);
+                            let seen = &mut state.distinct[*slot];
+                            if !seen.contains(&value) {
+                                seen.push(value);
+                            }
+                        }
+                    }
+                    RowOp::SumColumn { slot, array } => {
+                        if let Some(value) = numeric_value(array, row) {
+                            state.sums[*slot] += value;
+                            state.sum_counts[*slot] += 1;
+                        }
+                    }
+                    RowOp::SumBinary {
+                        slot,
+                        left,
+                        right,
+                        op,
+                    } => {
+                        if let (Some(left), Some(right)) =
+                            (numeric_value(left, row), numeric_value(right, row))
+                        {
+                            state.sums[*slot] += match op {
+                                BinaryOperator::Add => left + right,
+                                BinaryOperator::Sub => left - right,
+                                _ => unreachable!(),
+                            };
+                            state.sum_counts[*slot] += 1;
+                        }
+                    }
+                    RowOp::SumCases {
+                        array,
+                        cases,
+                    } => {
+                        if !array.is_null(row) {
+                            let value = array.value(row);
+                            for (slot, literals) in cases {
+                                if literals.iter().any(|literal| literal == value) {
+                                    state.sums[*slot] += 1.0;
+                                }
+                            }
+                        }
+                        for (slot, _) in cases {
+                            state.sum_counts[*slot] += 1;
+                        }
+                    }
+                    RowOp::AvgColumn {
+                        sum_slot,
+                        count_slot,
+                        array,
+                    } => {
+                        if let Some(value) = numeric_value(array, row) {
+                            state.sums[*sum_slot] += value;
+                            state.avg_counts[*count_slot] += 1;
+                        }
+                    }
+                }
+            }
+        };
+
+        let estimated_groups = (batch.num_rows() / 100).clamp(16, batch.num_rows().max(16));
+        let mut states = Vec::with_capacity(estimated_groups);
+        let mut group_index: AHashMap<&str, usize> = AHashMap::with_capacity(estimated_groups);
+        for row in 0..batch.num_rows() {
+            let key = group_values.value(row);
+            let group = if let Some(group) = group_index.get(key) {
+                *group
+            } else {
+                let group = states.len();
+                group_index.insert(key, group);
+                states.push(State {
+                    key: key.to_string(),
+                    counts: vec![0; count_slots],
+                    sums: vec![0.0; sum_slots],
+                    sum_counts: vec![0; sum_slots],
+                    avg_counts: vec![0; avg_count_slots],
+                    distinct: (0..distinct_slots)
+                        .map(|_| Vec::with_capacity(4))
+                        .collect(),
+                });
+                group
+            };
+            let state = unsafe { states.get_unchecked_mut(group) };
+            apply_row_ops(row, state);
+        }
+
+        let mut fields = Vec::with_capacity(outputs.len());
+        let mut arrays = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            match output {
+                Output::Key(name) => {
+                    fields.push(Field::new(&name, ArrowDataType::Utf8, false));
+                    arrays.push(Arc::new(StringArray::from(
+                        states.iter().map(|state| state.key.as_str()).collect::<Vec<_>>(),
+                    )) as ArrayRef);
+                }
+                Output::Count { name, slot } => {
+                    fields.push(Field::new(&name, ArrowDataType::Int64, false));
+                    arrays.push(Arc::new(Int64Array::from(
+                        states
+                            .iter()
+                            .map(|state| state.counts[slot])
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef);
+                }
+                Output::Distinct { name, slot } => {
+                    fields.push(Field::new(&name, ArrowDataType::Int64, false));
+                    arrays.push(Arc::new(Int64Array::from(
+                        states
+                            .iter()
+                            .map(|state| state.distinct[slot].len() as i64)
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef);
+                }
+                Output::Sum { name, slot } => {
+                    fields.push(Field::new(&name, ArrowDataType::Float64, true));
+                    arrays.push(Arc::new(Float64Array::from(
+                        states
+                            .iter()
+                            .map(|state| {
+                                if state.sum_counts[slot] == 0 {
+                                    None
+                                } else {
+                                    Some(state.sums[slot])
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef);
+                }
+                Output::Avg {
+                    name,
+                    sum_slot,
+                    count_slot,
+                } => {
+                    fields.push(Field::new(&name, ArrowDataType::Float64, true));
+                    arrays.push(Arc::new(Float64Array::from(
+                        states
+                            .iter()
+                            .map(|state| {
+                                let count = state.avg_counts[count_slot];
+                                if count == 0 {
+                                    None
+                                } else {
+                                    Some(state.sums[sum_slot] / count as f64)
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef);
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(Some(ApexResult::Data(batch)))
     }
 
     /// Collect aggregate functions referenced in a HAVING expression that are NOT
@@ -4390,14 +4961,28 @@ impl ApexExecutor {
             if !name.eq_ignore_ascii_case("SUM") || args.len() != 1 {
                 return None;
             }
-            let SqlExpr::Function { name, args } = &args[0] else { return None };
-            if !name.eq_ignore_ascii_case("IF") || args.len() != 3
-                || numeric_literal(&args[1]) != Some(1.0)
-                || numeric_literal(&args[2]) != Some(0.0)
-            {
-                return None;
-            }
-            let SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } = &args[0] else {
+            let condition = match &args[0] {
+                SqlExpr::Function { name, args }
+                    if name.eq_ignore_ascii_case("IF")
+                        && args.len() == 3
+                        && numeric_literal(&args[1]) == Some(1.0)
+                        && numeric_literal(&args[2]) == Some(0.0) =>
+                {
+                    &args[0]
+                }
+                SqlExpr::Case { when_then, else_expr }
+                    if when_then.len() == 1
+                        && numeric_literal(&when_then[0].1) == Some(1.0)
+                        && else_expr
+                            .as_deref()
+                            .and_then(numeric_literal)
+                            == Some(0.0) =>
+                {
+                    &when_then[0].0
+                }
+                _ => return None,
+            };
+            let SqlExpr::BinaryOp { left, op: BinaryOperator::Eq, right } = condition else {
                 return None;
             };
             let pair = match (left.as_ref(), right.as_ref()) {

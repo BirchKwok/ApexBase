@@ -127,16 +127,22 @@ impl ApexExecutor {
                     crate::query::SqlStatement::Select(sel) => {
                         let sub_path =
                             Self::resolve_from_table_path(sel, base_dir, default_table_path);
+                        let mut sub_select = sel.clone();
+                        if let Some(limit) =
+                            Self::extract_outer_row_number_limit(&stmt.where_clause, &sub_select)
+                        {
+                            sub_select.window_row_number_limit = Some(limit);
+                        }
                         (if sel.joins.is_empty() {
                             Self::execute_select_with_base_dir(
-                                sel.clone(),
+                                sub_select,
                                 &sub_path,
                                 base_dir,
                                 default_table_path,
                             )
                         } else {
                             Self::execute_select_with_joins(
-                                sel.clone(),
+                                sub_select,
                                 base_dir,
                                 default_table_path,
                             )
@@ -272,6 +278,94 @@ impl ApexExecutor {
                                     Self::try_fast_string_filter_no_limit(&backend, &stmt)?
                                 {
                                     return Self::execute_aggregation(&filtered, &stmt);
+                                }
+                            }
+
+                            // If a dictionary string filter is provably true for every active
+                            // row (common partition column shape), skip materializing/filtering it.
+                            if has_aggregation_check
+                                && stmt.where_clause.is_some()
+                                && !stmt.group_by.is_empty()
+                                && stmt.joins.is_empty()
+                                && stmt.having.is_none()
+                                && stmt.limit.is_none()
+                                && stmt.offset.is_none()
+                                && stmt.order_by.is_empty()
+                                && !backend.has_pending_deltas()
+                                && !backend.has_delta()
+                            {
+                                if let Some(where_clause) = &stmt.where_clause {
+                                    if let Some((filter_col, filter_value)) =
+                                        Self::extract_string_equality(where_clause)
+                                    {
+                                        if backend.string_eq_matches_all(&filter_col, &filter_value)?
+                                        {
+                                            let mut grouped_stmt = stmt.clone();
+                                            grouped_stmt.where_clause = None;
+                                            if let Some(result) =
+                                                Self::try_fast_native_string_group_by(
+                                                    &backend,
+                                                    &grouped_stmt,
+                                                )?
+                                            {
+                                                return Ok(result);
+                                            }
+                                            let col_refs = Self::get_col_refs(&grouped_stmt);
+                                            let col_refs_vec: Option<Vec<&str>> = col_refs
+                                                .as_ref()
+                                                .map(|v| v.iter().map(|s| s.as_str()).collect());
+                                            let batch = backend.read_columns_to_arrow(
+                                                col_refs_vec.as_deref(),
+                                                0,
+                                                None,
+                                            )?;
+                                            return Self::execute_group_by(&batch, &grouped_stmt);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // GROUP BY + simple string equality can filter at the storage layer
+                            // and aggregate immediately, avoiding materializing the filter column
+                            // only to apply the same WHERE mask again in Arrow.
+                            if has_aggregation_check
+                                && stmt.where_clause.is_some()
+                                && !stmt.group_by.is_empty()
+                                && stmt.joins.is_empty()
+                                && stmt.having.is_none()
+                                && stmt.limit.is_none()
+                                && stmt.offset.is_none()
+                                && stmt.order_by.is_empty()
+                                && !backend.has_pending_deltas()
+                                && !backend.has_delta()
+                                && !stmt.columns.iter().any(|column| {
+                                    matches!(
+                                        column,
+                                        SelectColumn::Aggregate {
+                                            distinct: true,
+                                            ..
+                                        }
+                                    )
+                                })
+                            {
+                                if let Some(where_clause) = &stmt.where_clause {
+                                    if let Some((filter_col, filter_value)) =
+                                        Self::extract_string_equality(where_clause)
+                                    {
+                                        let mut grouped_stmt = stmt.clone();
+                                        grouped_stmt.where_clause = None;
+                                        let col_refs = Self::get_col_refs(&grouped_stmt);
+                                        let col_refs_vec: Option<Vec<&str>> = col_refs
+                                            .as_ref()
+                                            .map(|v| v.iter().map(|s| s.as_str()).collect());
+                                        let filtered = backend.read_columns_filtered_string_to_arrow(
+                                            col_refs_vec.as_deref(),
+                                            &filter_col,
+                                            &filter_value,
+                                            true,
+                                        )?;
+                                        return Self::execute_group_by(&filtered, &grouped_stmt);
+                                    }
                                 }
                             }
 
@@ -990,6 +1084,95 @@ impl ApexExecutor {
         };
 
         Ok(ApexResult::Data(result))
+    }
+
+    fn extract_outer_row_number_limit(
+        where_clause: &Option<SqlExpr>,
+        subquery: &SelectStatement,
+    ) -> Option<(String, usize)> {
+        let aliases: Vec<String> = subquery
+            .columns
+            .iter()
+            .filter_map(|column| {
+                if let SelectColumn::WindowFunction { name, alias, .. } = column {
+                    if name.eq_ignore_ascii_case("ROW_NUMBER") {
+                        return Some(
+                            alias
+                                .clone()
+                                .unwrap_or_else(|| "row_number".to_string())
+                                .to_ascii_lowercase(),
+                        );
+                    }
+                }
+                None
+            })
+            .collect();
+        if aliases.is_empty() {
+            return None;
+        }
+
+        fn clean_column(name: &str) -> String {
+            let trimmed = name.trim_matches('"');
+            trimmed
+                .rsplit('.')
+                .next()
+                .unwrap_or(trimmed)
+                .trim_matches('"')
+                .to_ascii_lowercase()
+        }
+
+        fn literal_usize(expr: &SqlExpr) -> Option<usize> {
+            match expr {
+                SqlExpr::Literal(Value::Int64(value)) if *value >= 0 => Some(*value as usize),
+                SqlExpr::Literal(Value::UInt64(value)) => Some(*value as usize),
+                _ => None,
+            }
+        }
+
+        fn visit(expr: &SqlExpr, aliases: &[String]) -> Option<(String, usize)> {
+            match expr {
+                SqlExpr::BinaryOp {
+                    left,
+                    op: BinaryOperator::And,
+                    right,
+                } => visit(left, aliases).or_else(|| visit(right, aliases)),
+                SqlExpr::BinaryOp { left, op, right } => {
+                    if let SqlExpr::Column(column) = left.as_ref() {
+                        let alias = clean_column(column);
+                        if aliases.iter().any(|known| known == &alias) {
+                            if let Some(value) = literal_usize(right) {
+                                return match op {
+                                    BinaryOperator::Le => Some((alias, value)),
+                                    BinaryOperator::Lt => {
+                                        value.checked_sub(1).map(|limit| (alias, limit))
+                                    }
+                                    _ => None,
+                                };
+                            }
+                        }
+                    }
+                    if let SqlExpr::Column(column) = right.as_ref() {
+                        let alias = clean_column(column);
+                        if aliases.iter().any(|known| known == &alias) {
+                            if let Some(value) = literal_usize(left) {
+                                return match op {
+                                    BinaryOperator::Ge => Some((alias, value)),
+                                    BinaryOperator::Gt => {
+                                        value.checked_sub(1).map(|limit| (alias, limit))
+                                    }
+                                    _ => None,
+                                };
+                            }
+                        }
+                    }
+                    None
+                }
+                SqlExpr::Paren(inner) => visit(inner, aliases),
+                _ => None,
+            }
+        }
+
+        where_clause.as_ref().and_then(|expr| visit(expr, &aliases))
     }
 
     /// Try to use a secondary index to accelerate a SELECT query.
@@ -2856,6 +3039,264 @@ impl ApexExecutor {
         let schema = Arc::new(Schema::new(fields));
         let result = RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
         Ok(Some(ApexResult::Data(result)))
+    }
+
+    /// Mmap-native GROUP BY for the portable Hive behavior aggregates.
+    fn try_fast_native_string_group_by(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        if backend.pending_v4_in_memory_rows() > 0
+            || backend.has_pending_deltas()
+            || backend.has_delta()
+            || stmt.group_by.len() != 1
+            || stmt.where_clause.is_some()
+            || !stmt.joins.is_empty()
+            || stmt.having.is_some()
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+        {
+            return Ok(None);
+        }
+
+        fn clean_name(name: &str) -> &str {
+            let trimmed = name.trim_matches('"');
+            trimmed
+                .rsplit('.')
+                .next()
+                .unwrap_or(trimmed)
+                .trim_matches('"')
+        }
+
+        fn numeric_literal(expr: &SqlExpr) -> Option<f64> {
+            match expr {
+                SqlExpr::Literal(Value::Int64(value)) => Some(*value as f64),
+                SqlExpr::Literal(Value::Int32(value)) => Some(*value as f64),
+                SqlExpr::Literal(Value::Float64(value)) => Some(*value),
+                SqlExpr::Literal(Value::Float32(value)) => Some(*value as f64),
+                _ => None,
+            }
+        }
+
+        fn case_counter(expr: &SqlExpr) -> Option<(String, Vec<String>)> {
+            let SqlExpr::Function { name, args } = expr else {
+                return None;
+            };
+            if !name.eq_ignore_ascii_case("SUM") || args.len() != 1 {
+                return None;
+            }
+            let SqlExpr::Case {
+                when_then,
+                else_expr,
+            } = &args[0]
+            else {
+                return None;
+            };
+            if when_then.len() != 1
+                || numeric_literal(&when_then[0].1) != Some(1.0)
+                || else_expr.as_deref().and_then(numeric_literal) != Some(0.0)
+            {
+                return None;
+            }
+            match &when_then[0].0 {
+                SqlExpr::BinaryOp {
+                    left,
+                    op: BinaryOperator::Eq,
+                    right,
+                } => match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(column), SqlExpr::Literal(Value::String(value)))
+                    | (SqlExpr::Literal(Value::String(value)), SqlExpr::Column(column)) => {
+                        Some((clean_name(column).to_string(), vec![value.clone()]))
+                    }
+                    _ => None,
+                },
+                SqlExpr::In {
+                    column,
+                    values,
+                    negated: false,
+                } => {
+                    let mut literals = Vec::with_capacity(values.len());
+                    for value in values {
+                        match value {
+                            Value::String(value) => literals.push(value.clone()),
+                            _ => return None,
+                        }
+                    }
+                    Some((clean_name(column).to_string(), literals))
+                }
+                _ => None,
+            }
+        }
+
+        fn aggregate_output_name(
+            func: &AggregateFunc,
+            column: Option<&String>,
+            alias: &Option<String>,
+        ) -> String {
+            if let Some(alias) = alias {
+                return alias.clone();
+            }
+            match (func, column) {
+                (AggregateFunc::Count, None) => "COUNT(*)".to_string(),
+                (AggregateFunc::Count, Some(column)) => format!("COUNT({})", clean_name(column)),
+                (AggregateFunc::Max, Some(column)) => format!("MAX({})", clean_name(column)),
+                _ => "aggregate".to_string(),
+            }
+        }
+
+        enum NativeOutput {
+            Key(String),
+            Count(String),
+            Distinct(String, usize),
+            CaseCount(String, usize),
+            MaxString(String, usize),
+        }
+
+        let group_col = clean_name(&stmt.group_by[0]);
+        let mut outputs = Vec::with_capacity(stmt.columns.len());
+        let mut distinct_cols: Vec<String> = Vec::new();
+        let mut case_specs: Vec<(String, Vec<String>)> = Vec::new();
+        let mut max_cols: Vec<String> = Vec::new();
+
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Column(name) => {
+                    if clean_name(name) != group_col {
+                        return Ok(None);
+                    }
+                    outputs.push(NativeOutput::Key(clean_name(name).to_string()));
+                }
+                SelectColumn::ColumnAlias { column, alias } => {
+                    if clean_name(column) != group_col {
+                        return Ok(None);
+                    }
+                    outputs.push(NativeOutput::Key(alias.clone()));
+                }
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    distinct,
+                    alias,
+                } => match (func, column, distinct) {
+                    (AggregateFunc::Count, None, false) => {
+                        outputs.push(NativeOutput::Count(aggregate_output_name(
+                            func,
+                            column.as_ref(),
+                            alias,
+                        )));
+                    }
+                    (AggregateFunc::Count, Some(column), false)
+                        if column == "*" || column.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) =>
+                    {
+                        outputs.push(NativeOutput::Count(aggregate_output_name(
+                            func,
+                            None,
+                            alias,
+                        )));
+                    }
+                    (AggregateFunc::Count, Some(column), true) => {
+                        let slot = distinct_cols.len();
+                        let actual = clean_name(column).to_string();
+                        distinct_cols.push(actual.clone());
+                        outputs.push(NativeOutput::Distinct(
+                            alias
+                                .clone()
+                                .unwrap_or_else(|| format!("COUNT(DISTINCT {})", actual)),
+                            slot,
+                        ));
+                    }
+                    (AggregateFunc::Max, Some(column), false) => {
+                        let slot = max_cols.len();
+                        max_cols.push(clean_name(column).to_string());
+                        outputs.push(NativeOutput::MaxString(
+                            aggregate_output_name(func, Some(column), alias),
+                            slot,
+                        ));
+                    }
+                    _ => return Ok(None),
+                },
+                SelectColumn::Expression { expr, alias } => {
+                    let Some(alias) = alias.clone() else {
+                        return Ok(None);
+                    };
+                    let Some((case_col, literals)) = case_counter(expr) else {
+                        return Ok(None);
+                    };
+                    let slot = case_specs.len();
+                    case_specs.push((case_col, literals));
+                    outputs.push(NativeOutput::CaseCount(alias, slot));
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        if outputs.is_empty() {
+            return Ok(None);
+        }
+
+        let distinct_refs: Vec<&str> = distinct_cols.iter().map(|s| s.as_str()).collect();
+        let max_refs: Vec<&str> = max_cols.iter().map(|s| s.as_str()).collect();
+        let case_refs: Vec<(&str, Vec<String>)> = case_specs
+            .iter()
+            .map(|(col, literals)| (col.as_str(), literals.clone()))
+            .collect();
+        let raw = match backend.execute_string_group_distinct_case_agg(
+            group_col,
+            &distinct_refs,
+            &case_refs,
+            &max_refs,
+        )? {
+            Some(raw) if !raw.is_empty() => raw,
+            _ => return Ok(None),
+        };
+
+        let mut fields = Vec::with_capacity(outputs.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            match output {
+                NativeOutput::Key(name) => {
+                    fields.push(Field::new(&name, ArrowDataType::Utf8, false));
+                    arrays.push(Arc::new(StringArray::from(
+                        raw.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+                    )) as ArrayRef);
+                }
+                NativeOutput::Count(name) => {
+                    fields.push(Field::new(&name, ArrowDataType::Int64, false));
+                    arrays.push(Arc::new(Int64Array::from(
+                        raw.iter().map(|row| row.count).collect::<Vec<_>>(),
+                    )) as ArrayRef);
+                }
+                NativeOutput::Distinct(name, slot) => {
+                    fields.push(Field::new(&name, ArrowDataType::Int64, false));
+                    arrays.push(Arc::new(Int64Array::from(
+                        raw.iter()
+                            .map(|row| row.distinct_counts[slot])
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef);
+                }
+                NativeOutput::CaseCount(name, slot) => {
+                    fields.push(Field::new(&name, ArrowDataType::Float64, true));
+                    arrays.push(Arc::new(Float64Array::from(
+                        raw.iter()
+                            .map(|row| Some(row.case_counts[slot] as f64))
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef);
+                }
+                NativeOutput::MaxString(name, slot) => {
+                    fields.push(Field::new(&name, ArrowDataType::Utf8, true));
+                    arrays.push(Arc::new(StringArray::from(
+                        raw.iter()
+                            .map(|row| row.max_values[slot].clone())
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef);
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(Some(ApexResult::Data(batch)))
     }
 
     /// V4 FAST PATH: Cached GROUP BY (builds dict cache on first call, reuses on subsequent calls)

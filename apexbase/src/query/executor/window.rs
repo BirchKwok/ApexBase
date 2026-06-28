@@ -753,6 +753,30 @@ impl ApexExecutor {
             } // end groups loop
         } // end spec loop
 
+        let row_number_keep: Option<Vec<u32>> =
+            stmt.window_row_number_limit.as_ref().and_then(|(limit_alias, limit)| {
+                let spec_idx = window_specs.iter().position(|(func_name, _, _, _, out_name)| {
+                    func_name == "ROW_NUMBER" && out_name.eq_ignore_ascii_case(limit_alias)
+                })?;
+                let keep = per_int[spec_idx]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row_idx, rank)| {
+                        rank.and_then(|rank| {
+                            if rank >= 1 && (rank as usize) <= *limit {
+                                Some(row_idx as u32)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Some(keep)
+            });
+        let row_number_take: Option<arrow::array::UInt32Array> = row_number_keep
+            .as_ref()
+            .map(|indices: &Vec<u32>| arrow::array::UInt32Array::from(indices.clone()));
+
         // Build result with original columns + window function result columns
         let mut result_fields: Vec<Field> = Vec::new();
         let mut result_arrays: Vec<ArrayRef> = Vec::new();
@@ -768,36 +792,80 @@ impl ApexExecutor {
                             arr.data_type().clone(),
                             true,
                         ));
-                        result_arrays.push(arr.clone());
+                        if let Some(indices) = &row_number_take {
+                            result_arrays.push(
+                                compute::take(arr.as_ref(), indices, None)
+                                    .map_err(|e| err_data(e.to_string()))?,
+                            );
+                        } else {
+                            result_arrays.push(arr.clone());
+                        }
                     }
                 }
                 SelectColumn::ColumnAlias { column, alias } => {
                     let col_name = column.trim_matches('"');
                     if let Some(arr) = Self::get_column_by_name(batch, col_name) {
                         result_fields.push(Field::new(alias, arr.data_type().clone(), true));
-                        result_arrays.push(arr.clone());
+                        if let Some(indices) = &row_number_take {
+                            result_arrays.push(
+                                compute::take(arr.as_ref(), indices, None)
+                                    .map_err(|e| err_data(e.to_string()))?,
+                            );
+                        } else {
+                            result_arrays.push(arr.clone());
+                        }
                     }
                 }
                 SelectColumn::All => {
                     for (i, field) in batch.schema().fields().iter().enumerate() {
                         result_fields.push(field.as_ref().clone());
-                        result_arrays.push(batch.column(i).clone());
+                        if let Some(indices) = &row_number_take {
+                            result_arrays.push(
+                                compute::take(batch.column(i).as_ref(), indices, None)
+                                    .map_err(|e| err_data(e.to_string()))?,
+                            );
+                        } else {
+                            result_arrays.push(batch.column(i).clone());
+                        }
                     }
                 }
                 SelectColumn::Expression { expr, alias } => {
                     let array = Self::evaluate_expr_to_array(batch, expr)?;
                     let name = alias.clone().unwrap_or_else(|| "expression".to_string());
                     result_fields.push(Field::new(&name, array.data_type().clone(), true));
-                    result_arrays.push(array);
+                    if let Some(indices) = &row_number_take {
+                        result_arrays.push(
+                            compute::take(array.as_ref(), indices, None)
+                                .map_err(|e| err_data(e.to_string()))?,
+                        );
+                    } else {
+                        result_arrays.push(array);
+                    }
                 }
                 SelectColumn::WindowFunction { name, alias, .. } => {
                     let out_name = alias.clone().unwrap_or_else(|| name.to_lowercase());
                     if use_float[spec_idx] {
                         result_fields.push(Field::new(&out_name, ArrowDataType::Float64, true));
-                        result_arrays.push(Arc::new(Float64Array::from(per_flt[spec_idx].clone())));
+                        let values: Vec<Option<f64>> = if let Some(indices) = &row_number_keep {
+                            indices
+                                .iter()
+                                .map(|&row| per_flt[spec_idx][row as usize])
+                                .collect()
+                        } else {
+                            per_flt[spec_idx].clone()
+                        };
+                        result_arrays.push(Arc::new(Float64Array::from(values)));
                     } else {
                         result_fields.push(Field::new(&out_name, ArrowDataType::Int64, true));
-                        result_arrays.push(Arc::new(Int64Array::from(per_int[spec_idx].clone())));
+                        let values: Vec<Option<i64>> = if let Some(indices) = &row_number_keep {
+                            indices
+                                .iter()
+                                .map(|&row| per_int[spec_idx][row as usize])
+                                .collect()
+                        } else {
+                            per_int[spec_idx].clone()
+                        };
+                        result_arrays.push(Arc::new(Int64Array::from(values)));
                     }
                     spec_idx += 1;
                 }

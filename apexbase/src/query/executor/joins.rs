@@ -1277,6 +1277,19 @@ impl ApexExecutor {
             )
         })?;
 
+        if *join_type == JoinType::Left {
+            if let Some(joined) = Self::try_unique_string_left_join(
+                left,
+                right,
+                left_key,
+                right_key,
+                left_key_col,
+                right_key_col,
+            )? {
+                return Ok(joined);
+            }
+        }
+
         // For INNER JOIN, swap tables if right is larger (build from smaller table)
         let should_swap =
             !matches!(join_type, JoinType::Left) && right.num_rows() > left.num_rows() * 2;
@@ -1556,6 +1569,71 @@ impl ApexExecutor {
         }
 
         RecordBatch::try_new(result_schema, columns).map_err(|e| err_data(e.to_string()))
+    }
+
+    fn try_unique_string_left_join(
+        left: &RecordBatch,
+        right: &RecordBatch,
+        _left_key: &str,
+        right_key: &str,
+        left_key_col: &ArrayRef,
+        right_key_col: &ArrayRef,
+    ) -> io::Result<Option<RecordBatch>> {
+        let Some(left_keys) = left_key_col.as_any().downcast_ref::<StringArray>() else {
+            return Ok(None);
+        };
+        let Some(right_keys) = right_key_col.as_any().downcast_ref::<StringArray>() else {
+            return Ok(None);
+        };
+        if left_keys.null_count() > 0 || right_keys.null_count() > 0 {
+            return Ok(None);
+        }
+
+        let mut right_index: AHashMap<&str, u32> = AHashMap::with_capacity(right.num_rows());
+        for row in 0..right.num_rows() {
+            if right_index
+                .insert(right_keys.value(row), row as u32)
+                .is_some()
+            {
+                return Ok(None);
+            }
+        }
+
+        let mut right_indices = Vec::with_capacity(left.num_rows());
+        for row in 0..left.num_rows() {
+            right_indices.push(right_index.get(left_keys.value(row)).copied());
+        }
+
+        let mut fields: Vec<Field> = left
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect();
+        for field in right.schema().fields() {
+            if field.name() != right_key {
+                let new_name = if fields.iter().any(|left_field| left_field.name() == field.name())
+                {
+                    format!("{}_{}", field.name(), "right")
+                } else {
+                    field.name().clone()
+                };
+                fields.push(Field::new(&new_name, field.data_type().clone(), true));
+            }
+        }
+
+        let mut columns = Vec::with_capacity(left.num_columns() + right.num_columns());
+        columns.extend(left.columns().iter().cloned());
+        for (col_idx, field) in right.schema().fields().iter().enumerate() {
+            if field.name() != right_key {
+                let taken = Self::take_with_nulls(right.column(col_idx), &right_indices)?;
+                columns.push(taken);
+            }
+        }
+
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map(Some)
+            .map_err(|e| err_data(e.to_string()))
     }
 
     fn hash_semi_anti_join(

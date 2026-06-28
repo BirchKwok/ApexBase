@@ -1,5 +1,14 @@
 // Aggregation fast paths, WAL/durability, accessors, insert_rows, flush, close, Drop
 
+#[derive(Debug, Clone)]
+pub struct NativeStringGroupAgg {
+    pub key: String,
+    pub count: i64,
+    pub distinct_counts: Vec<i64>,
+    pub case_counts: Vec<i64>,
+    pub max_values: Vec<Option<String>>,
+}
+
 impl OnDemandStorage {
     /// Execute simple aggregation (no GROUP BY, no WHERE) directly on V4 columns.
     /// Supports both in-memory and mmap-only paths.
@@ -2750,6 +2759,497 @@ impl OnDemandStorage {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Execute a narrow mmap-native GROUP BY for string keys with COUNT(*),
+    /// optional COUNT(DISTINCT string_col), SUM(CASE string_col IN (...) THEN 1 ELSE 0 END),
+    /// and MAX(string_col). It computes the result from column bytes for this call.
+    pub fn execute_string_group_distinct_case_agg(
+        &self,
+        group_col: &str,
+        distinct_cols: &[&str],
+        case_specs: &[(&str, Vec<String>)],
+        max_cols: &[&str],
+    ) -> io::Result<Option<Vec<NativeStringGroupAgg>>> {
+        if self.has_v4_in_memory_data() || self.column_has_nulls(group_col) {
+            return Ok(None);
+        }
+
+        struct RawStringCol<'a> {
+            kind: RawStringKind<'a>,
+            nulls: &'a [u8],
+        }
+
+        enum RawStringKind<'a> {
+            Dict {
+                indices: std::borrow::Cow<'a, [u32]>,
+                offsets: std::borrow::Cow<'a, [u32]>,
+                data: &'a [u8],
+                rows: usize,
+            },
+            Plain {
+                offsets: std::borrow::Cow<'a, [u32]>,
+                data: &'a [u8],
+                rows: usize,
+            },
+        }
+
+        impl<'a> RawStringCol<'a> {
+            #[inline(always)]
+            fn is_null(&self, row: usize) -> bool {
+                !self.nulls.is_empty()
+                    && row / 8 < self.nulls.len()
+                    && ((self.nulls[row / 8] >> (row % 8)) & 1) != 0
+            }
+
+            #[inline(always)]
+            fn value(&self, row: usize) -> Option<&'a [u8]> {
+                if self.is_null(row) {
+                    return None;
+                }
+                match &self.kind {
+                    RawStringKind::Dict {
+                        indices,
+                        offsets,
+                        data,
+                        rows,
+                    } => {
+                        if row >= *rows || row >= indices.len() {
+                            return None;
+                        }
+                        let idx = indices[row];
+                        if idx == 0 {
+                            return None;
+                        }
+                        let di = (idx - 1) as usize;
+                        if di >= offsets.len() {
+                            return None;
+                        }
+                        let start = offsets[di] as usize;
+                        let end = if di + 1 < offsets.len() {
+                            offsets[di + 1] as usize
+                        } else {
+                            data.len()
+                        };
+                        if start <= end && end <= data.len() {
+                            Some(&data[start..end])
+                        } else {
+                            None
+                        }
+                    }
+                    RawStringKind::Plain {
+                        offsets,
+                        data,
+                        rows,
+                    } => {
+                        if row >= *rows || row + 1 >= offsets.len() {
+                            return None;
+                        }
+                        let start = offsets[row] as usize;
+                        let end = offsets[row + 1] as usize;
+                        if start <= end && end <= data.len() {
+                            Some(&data[start..end])
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+        }
+
+        fn parse_raw_string_col<'a>(
+            body: &'a [u8],
+            rcix: &[u32],
+            col_idx: usize,
+            col_type: ColumnType,
+            rg_rows: usize,
+            null_bitmap_len: usize,
+        ) -> Option<RawStringCol<'a>> {
+            if col_idx >= rcix.len() {
+                return None;
+            }
+            let col_off = rcix[col_idx] as usize;
+            if col_off + null_bitmap_len + 1 > body.len() {
+                return None;
+            }
+            let nulls = &body[col_off..col_off + null_bitmap_len];
+            let encoded = &body[col_off + null_bitmap_len..];
+            if encoded.first().copied()? != COL_ENCODING_PLAIN {
+                return None;
+            }
+            let data = &encoded[1..];
+            match col_type {
+                ColumnType::StringDict => {
+                    if data.len() < 16 {
+                        return None;
+                    }
+                    let rows = u64::from_le_bytes(data[0..8].try_into().ok()?) as usize;
+                    let dict_size = u64::from_le_bytes(data[8..16].try_into().ok()?) as usize;
+                    let rows = rows.min(rg_rows);
+                    let indices_start = 16usize;
+                    let indices_len = rows.checked_mul(4)?;
+                    let stored_indices_len = (u64::from_le_bytes(
+                        data[0..8].try_into().ok()?,
+                    ) as usize)
+                        .checked_mul(4)?;
+                    let dict_off_start = indices_start.checked_add(stored_indices_len)?;
+                    let dict_offsets_len = dict_size.checked_mul(4)?;
+                    let dict_data_len_off = dict_off_start.checked_add(dict_offsets_len)?;
+                    if indices_start + indices_len > data.len()
+                        || dict_data_len_off + 8 > data.len()
+                    {
+                        return None;
+                    }
+                    let dict_data_len = u64::from_le_bytes(
+                        data[dict_data_len_off..dict_data_len_off + 8]
+                            .try_into()
+                            .ok()?,
+                    ) as usize;
+                    let dict_data_start = dict_data_len_off + 8;
+                    if dict_data_start + dict_data_len > data.len() {
+                        return None;
+                    }
+                    let indices = bytes_as_u32_slice(&data[indices_start..], rows);
+                    let offsets = bytes_as_u32_slice(&data[dict_off_start..], dict_size);
+                    Some(RawStringCol {
+                        kind: RawStringKind::Dict {
+                            indices,
+                            offsets,
+                            data: &data[dict_data_start..dict_data_start + dict_data_len],
+                            rows,
+                        },
+                        nulls,
+                    })
+                }
+                ColumnType::String => {
+                    if data.len() < 8 {
+                        return None;
+                    }
+                    let stored_rows = u64::from_le_bytes(data[0..8].try_into().ok()?) as usize;
+                    let rows = stored_rows.min(rg_rows);
+                    let offsets_len = stored_rows.checked_add(1)?.checked_mul(4)?;
+                    let data_len_off = 8usize.checked_add(offsets_len)?;
+                    if data_len_off + 8 > data.len() {
+                        return None;
+                    }
+                    let string_data_len = u64::from_le_bytes(
+                        data[data_len_off..data_len_off + 8].try_into().ok()?,
+                    ) as usize;
+                    let string_data_start = data_len_off + 8;
+                    if string_data_start + string_data_len > data.len() {
+                        return None;
+                    }
+                    let offsets = bytes_as_u32_slice(&data[8..], stored_rows + 1);
+                    Some(RawStringCol {
+                        kind: RawStringKind::Plain {
+                            offsets,
+                            data: &data[string_data_start..string_data_start + string_data_len],
+                            rows,
+                        },
+                        nulls,
+                    })
+                }
+                _ => None,
+            }
+        }
+
+        #[inline(always)]
+        fn fingerprint_bytes(bytes: &[u8]) -> u64 {
+            let mut split = 0usize;
+            while split < bytes.len() && !bytes[split].is_ascii_digit() {
+                split += 1;
+            }
+            if split > 0 && split < bytes.len() {
+                let mut number = 0u64;
+                let mut valid = true;
+                for &byte in &bytes[split..] {
+                    if !byte.is_ascii_digit() {
+                        valid = false;
+                        break;
+                    }
+                    number = number
+                        .saturating_mul(10)
+                        .saturating_add((byte - b'0') as u64);
+                }
+                if valid {
+                    let mut prefix = 0u64;
+                    for &byte in &bytes[..split.min(8)] {
+                        prefix = (prefix << 8) | byte as u64;
+                    }
+                    return 0xA5A5_5A5A_D3C3_B4B4u64
+                        ^ number
+                        ^ prefix.rotate_left(27)
+                        ^ ((split as u64) << 56);
+                }
+            }
+
+            use std::hash::Hasher;
+            let mut hasher = ahash::AHasher::default();
+            hasher.write(bytes);
+            hasher.finish()
+        }
+
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        if footer.row_groups.iter().any(|rg| rg.deletion_count > 0) {
+            return Ok(None);
+        }
+
+        let schema = &footer.schema;
+        let group_idx = match schema.get_index(group_col) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        if !matches!(schema.columns[group_idx].1, ColumnType::String | ColumnType::StringDict) {
+            return Ok(None);
+        }
+
+        let mut distinct_indices = Vec::with_capacity(distinct_cols.len());
+        for col in distinct_cols {
+            let Some(idx) = schema.get_index(col) else {
+                return Ok(None);
+            };
+            if !matches!(schema.columns[idx].1, ColumnType::String | ColumnType::StringDict) {
+                return Ok(None);
+            }
+            distinct_indices.push(idx);
+        }
+
+        let mut case_indices = Vec::with_capacity(case_specs.len());
+        let mut case_slots = Vec::with_capacity(case_specs.len());
+        for (col, _) in case_specs {
+            let Some(idx) = schema.get_index(col) else {
+                return Ok(None);
+            };
+            if !matches!(schema.columns[idx].1, ColumnType::String | ColumnType::StringDict) {
+                return Ok(None);
+            }
+            if let Some(slot) = case_indices.iter().position(|&existing| existing == idx) {
+                case_slots.push(slot);
+            } else {
+                let slot = case_indices.len();
+                case_indices.push(idx);
+                case_slots.push(slot);
+            }
+        }
+
+        let mut max_indices = Vec::with_capacity(max_cols.len());
+        for col in max_cols {
+            let Some(idx) = schema.get_index(col) else {
+                return Ok(None);
+            };
+            if !matches!(schema.columns[idx].1, ColumnType::String | ColumnType::StringDict) {
+                return Ok(None);
+            }
+            max_indices.push(idx);
+        }
+
+        let max_col_idx = std::iter::once(group_idx)
+            .chain(distinct_indices.iter().copied())
+            .chain(case_indices.iter().copied())
+            .chain(max_indices.iter().copied())
+            .max()
+            .unwrap_or(group_idx);
+        let all_rcix = footer.row_groups.iter().enumerate().all(|(rg_i, rg_meta)| {
+            rg_meta.row_count == 0
+                || footer
+                    .col_offsets
+                    .get(rg_i)
+                    .map_or(false, |v| v.len() > max_col_idx)
+        });
+        if !all_rcix {
+            return Ok(None);
+        }
+
+        let (dict_strings, group_ids) = match self.build_string_dict_cache(group_col)? {
+            Some(pair) if !pair.0.is_empty() => pair,
+            _ => return Ok(None),
+        };
+        let num_groups = dict_strings.len();
+        let distinct_len = distinct_indices.len();
+        let case_len = case_specs.len();
+        let max_len = max_indices.len();
+
+        let mut counts = vec![0i64; num_groups];
+        let mut distinct_seen: Vec<Vec<u64>> = (0..num_groups * distinct_len)
+            .map(|_| Vec::with_capacity(4))
+            .collect();
+        let mut case_counts = vec![0i64; num_groups * case_len];
+        let mut max_values: Vec<Option<Vec<u8>>> = (0..num_groups * max_len)
+            .map(|_| None)
+            .collect();
+
+        let case_literals: Vec<Vec<&[u8]>> = case_specs
+            .iter()
+            .map(|(_, literals)| literals.iter().map(|s| s.as_bytes()).collect())
+            .collect();
+        let mut case_specs_by_col = vec![Vec::new(); case_indices.len()];
+        for (case_idx, &slot) in case_slots.iter().enumerate() {
+            case_specs_by_col[slot].push(case_idx);
+        }
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for native string group aggregation"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        let mut rg_row_offset = 0usize;
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 {
+                rg_row_offset += rg_rows;
+                continue;
+            }
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return Err(err_data("native string group aggregation RG past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            if rg_bytes.len() < 32
+                || rg_bytes[28] != RG_COMPRESS_NONE
+                || rg_bytes[29] < 1
+            {
+                return Ok(None);
+            }
+
+            let body = &rg_bytes[32..];
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let rcix = &footer.col_offsets[rg_i];
+            let gids_slice = match group_ids.get(rg_row_offset..(rg_row_offset + rg_rows).min(group_ids.len())) {
+                Some(slice) if slice.len() == rg_rows => slice,
+                _ => return Ok(None),
+            };
+
+            let distinct_cols_raw: Option<Vec<_>> = distinct_indices
+                .iter()
+                .map(|&idx| {
+                    parse_raw_string_col(
+                        body,
+                        rcix,
+                        idx,
+                        schema.columns[idx].1,
+                        rg_rows,
+                        null_bitmap_len,
+                    )
+                })
+                .collect();
+            let Some(distinct_cols_raw) = distinct_cols_raw else {
+                return Ok(None);
+            };
+
+            let case_cols_raw: Option<Vec<_>> = case_indices
+                .iter()
+                .map(|&idx| {
+                    parse_raw_string_col(
+                        body,
+                        rcix,
+                        idx,
+                        schema.columns[idx].1,
+                        rg_rows,
+                        null_bitmap_len,
+                    )
+                })
+                .collect();
+            let Some(case_cols_raw) = case_cols_raw else {
+                return Ok(None);
+            };
+
+            let max_cols_raw: Option<Vec<_>> = max_indices
+                .iter()
+                .map(|&idx| {
+                    parse_raw_string_col(
+                        body,
+                        rcix,
+                        idx,
+                        schema.columns[idx].1,
+                        rg_rows,
+                        null_bitmap_len,
+                    )
+                })
+                .collect();
+            let Some(max_cols_raw) = max_cols_raw else {
+                return Ok(None);
+            };
+
+            for row in 0..rg_rows {
+                let gid = unsafe { *gids_slice.get_unchecked(row) } as usize;
+                if gid >= num_groups {
+                    continue;
+                }
+                unsafe { *counts.get_unchecked_mut(gid) += 1; }
+
+                for (di, col) in distinct_cols_raw.iter().enumerate() {
+                    if let Some(value) = col.value(row) {
+                        let fp = fingerprint_bytes(value);
+                        let slot = gid * distinct_len + di;
+                        let seen = unsafe { distinct_seen.get_unchecked_mut(slot) };
+                        if !seen.contains(&fp) {
+                            seen.push(fp);
+                        }
+                    }
+                }
+
+                for (case_col_slot, col) in case_cols_raw.iter().enumerate() {
+                    if let Some(value) = col.value(row) {
+                        for &ci in unsafe { case_specs_by_col.get_unchecked(case_col_slot) } {
+                            if case_literals[ci].iter().any(|literal| *literal == value) {
+                                unsafe {
+                                    *case_counts.get_unchecked_mut(gid * case_len + ci) += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (mi, col) in max_cols_raw.iter().enumerate() {
+                    if let Some(value) = col.value(row) {
+                        let slot = gid * max_len + mi;
+                        let current = unsafe { max_values.get_unchecked_mut(slot) };
+                        if current
+                            .as_ref()
+                            .map_or(true, |existing| value > existing.as_slice())
+                        {
+                            *current = Some(value.to_vec());
+                        }
+                    }
+                }
+            }
+
+            rg_row_offset += rg_rows;
+        }
+
+        let mut results = Vec::with_capacity(num_groups);
+        for gid in 0..num_groups {
+            if counts[gid] == 0 {
+                continue;
+            }
+            let distinct_counts = (0..distinct_len)
+                .map(|di| distinct_seen[gid * distinct_len + di].len() as i64)
+                .collect();
+            let group_case_counts = (0..case_len)
+                .map(|ci| case_counts[gid * case_len + ci])
+                .collect();
+            let group_max_values = (0..max_len)
+                .map(|mi| {
+                    max_values[gid * max_len + mi]
+                        .as_ref()
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                })
+                .collect();
+            results.push(NativeStringGroupAgg {
+                key: dict_strings[gid].clone(),
+                count: counts[gid],
+                distinct_counts,
+                case_counts: group_case_counts,
+                max_values: group_max_values,
+            });
+        }
+
+        Ok(Some(results))
     }
 
     /// Execute GROUP BY + aggregate using pre-built dict cache.

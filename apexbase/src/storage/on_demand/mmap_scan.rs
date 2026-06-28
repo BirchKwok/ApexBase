@@ -3178,6 +3178,129 @@ impl OnDemandStorage {
         Ok(Some(matches))
     }
 
+    /// Return Some(true) when mmap metadata proves `col_name = target` keeps every active row.
+    /// The check is intentionally narrow: uncompressed RCIX StringDict row groups, no deletes,
+    /// no nulls, and every row index pointing at the target dictionary value.
+    /// Uncertain cases return None and use the normal filter path.
+    pub fn string_eq_matches_all_mmap(
+        &self,
+        col_name: &str,
+        target: &str,
+    ) -> io::Result<Option<bool>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        if !matches!(schema.columns[col_idx].1, ColumnType::StringDict) {
+            return Ok(None);
+        }
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for string metadata scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        let target_bytes = target.as_bytes();
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 {
+                continue;
+            }
+            if rg_meta.deletion_count > 0 {
+                return Ok(None);
+            }
+            let rg_start = rg_meta.offset as usize;
+            let rg_end = rg_start + rg_meta.data_size as usize;
+            if rg_end > mmap_ref.len() || rg_end < rg_start + 32 {
+                return Err(err_data("RG extends past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_start..rg_end];
+            let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
+            let encoding_version = rg_bytes.get(29).copied().unwrap_or(0);
+            if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
+                return Ok(None);
+            }
+            let Some(rcix) = footer.col_offsets.get(rg_i).filter(|v| v.len() > col_idx) else {
+                return Ok(None);
+            };
+            let body = &rg_bytes[32..];
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let col_off = rcix[col_idx] as usize;
+            if col_off + null_bitmap_len > body.len() {
+                return Ok(None);
+            }
+            let null_bytes = &body[col_off..col_off + null_bitmap_len];
+            if null_bytes.iter().any(|&byte| byte != 0) {
+                return Ok(None);
+            }
+            let col_bytes = &body[col_off + null_bitmap_len..];
+            if col_bytes.first().copied() != Some(COL_ENCODING_PLAIN) {
+                return Ok(None);
+            }
+            let data = &col_bytes[1..];
+            if data.len() < 16 {
+                return Ok(None);
+            }
+            let row_count = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+            let dict_size = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+            if row_count < rg_rows || dict_size == 0 {
+                return Ok(None);
+            }
+            let indices_start = 16usize;
+            let indices_len = row_count * 4;
+            let dict_off_start = indices_start + row_count * 4;
+            let dict_data_len_off = dict_off_start + dict_size * 4;
+            if indices_start + indices_len > data.len() || dict_data_len_off + 8 > data.len() {
+                return Ok(None);
+            }
+            let dict_data_len = u64::from_le_bytes(
+                data[dict_data_len_off..dict_data_len_off + 8]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let dict_data_start = dict_data_len_off + 8;
+            if dict_data_start + dict_data_len > data.len() {
+                return Ok(None);
+            }
+            let dict_offsets = bytes_as_u32_slice(&data[dict_off_start..], dict_size);
+            let mut target_dict_idx: Option<u32> = None;
+            for di in 0..dict_size {
+                let ds = dict_offsets[di] as usize;
+                let de = if di + 1 < dict_size {
+                    dict_offsets[di + 1] as usize
+                } else {
+                    dict_data_len
+                };
+                if de >= ds
+                    && de - ds == target_bytes.len()
+                    && dict_data_start + de <= data.len()
+                    && &data[dict_data_start + ds..dict_data_start + de] == target_bytes
+                {
+                    target_dict_idx = Some((di + 1) as u32);
+                    break;
+                }
+            }
+            let Some(target_dict_idx) = target_dict_idx else {
+                return Ok(Some(false));
+            };
+            let indices = bytes_as_u32_slice(&data[indices_start..], row_count);
+            for &idx in &indices[..rg_rows] {
+                if idx != target_dict_idx {
+                    return Ok(Some(false));
+                }
+            }
+        }
+
+        Ok(Some(true))
+    }
+
     /// Mmap-level string IN scan: find rows where col_name IN (v1, v2, ...).
     /// Uses a single pass over the target column when all RGs are uncompressed+RCIX.
     /// Falls back to repeated equality scans for correctness on unsupported layouts.

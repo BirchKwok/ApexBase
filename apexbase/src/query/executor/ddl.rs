@@ -574,12 +574,18 @@ impl ApexExecutor {
                 && matches!(&body, SqlStatement::Select(_) | SqlStatement::Union(_))
                 && references == 1
             {
+                let body = Self::prune_cte_body_for_references(name, body, &main);
                 Self::visit_cte_references_in_statement(&mut main, name, Some(&body), None);
                 return Self::execute_parsed_multi(main, base_dir, default_table_path);
             }
 
             // Shared non-recursive CTE: retain one immutable Arrow batch and let
             // every consumer clone its buffers at zero copy.
+            let body = if column_aliases.is_empty() {
+                Self::prune_cte_body_for_references(name, body, &main)
+            } else {
+                body
+            };
             let cte_result = Self::execute_parsed_multi(body, base_dir, default_table_path)?;
             let mut cte_batch = cte_result.to_record_batch()
                 .map_err(|e| err_data(format!("CTE body must return a result set: {}", e)))?;
@@ -590,6 +596,647 @@ impl ApexExecutor {
             let result = Self::execute_main_with_cte(name, main, base_dir, default_table_path, &temp_path)?;
             CTE_BATCH_CACHE.remove(&temp_path);
             result
+        }
+    }
+
+    fn prune_cte_body_for_references(
+        cte_name: &str,
+        body: SqlStatement,
+        main: &SqlStatement,
+    ) -> SqlStatement {
+        let Some(needed) = Self::collect_cte_referenced_columns(main, cte_name) else {
+            return body;
+        };
+        if needed.is_empty() {
+            return body;
+        }
+
+        match body {
+            SqlStatement::Select(mut select) => {
+                if select.distinct || select.distinct_on.is_some() {
+                    return SqlStatement::Select(select);
+                }
+                if select.columns.iter().any(|column| {
+                    matches!(
+                        column,
+                        SelectColumn::All
+                            | SelectColumn::AllExclude(_)
+                            | SelectColumn::AllReplace(_)
+                            | SelectColumn::Columns(_)
+                    )
+                }) {
+                    return SqlStatement::Select(select);
+                }
+
+                let original_len = select.columns.len();
+                let pruned_columns: Vec<SelectColumn> = select
+                    .columns
+                    .iter()
+                    .filter(|column| {
+                        Self::select_column_output_name(column)
+                            .map(|name| needed.contains(&name.to_ascii_lowercase()))
+                            .unwrap_or(true)
+                    })
+                    .cloned()
+                    .collect();
+                if pruned_columns.is_empty() || pruned_columns.len() == original_len {
+                    return SqlStatement::Select(select);
+                }
+                select.columns = pruned_columns;
+                SqlStatement::Select(select)
+            }
+            other => other,
+        }
+    }
+
+    fn select_column_output_name(column: &SelectColumn) -> Option<String> {
+        match column {
+            SelectColumn::Column(name) => Some(Self::unqualified_name(name).to_string()),
+            SelectColumn::ColumnAlias { alias, .. } => Some(alias.trim_matches('"').to_string()),
+            SelectColumn::Aggregate {
+                func,
+                column,
+                alias,
+                ..
+            } => alias.clone().or_else(|| {
+                let inner = column.as_deref().unwrap_or("*");
+                Some(format!("{}({})", func, inner))
+            }),
+            SelectColumn::Expression { alias, .. } => alias.clone(),
+            SelectColumn::WindowFunction { alias, .. } => alias.clone(),
+            _ => None,
+        }
+    }
+
+    fn unqualified_name(name: &str) -> &str {
+        let trimmed = name.trim_matches('"');
+        trimmed
+            .rsplit('.')
+            .next()
+            .unwrap_or(trimmed)
+            .trim_matches('"')
+    }
+
+    fn collect_cte_referenced_columns(
+        stmt: &SqlStatement,
+        cte_name: &str,
+    ) -> Option<HashSet<String>> {
+        let mut aliases = HashSet::new();
+        Self::collect_cte_aliases_in_statement(stmt, cte_name, &mut aliases);
+        if aliases.is_empty() {
+            return Some(HashSet::new());
+        }
+
+        let mut columns = HashSet::new();
+        let mut requires_all = false;
+        Self::collect_cte_columns_in_statement(stmt, &aliases, &mut columns, &mut requires_all);
+        if requires_all {
+            None
+        } else {
+            Some(columns)
+        }
+    }
+
+    fn collect_cte_aliases_in_statement(
+        stmt: &SqlStatement,
+        cte_name: &str,
+        aliases: &mut HashSet<String>,
+    ) {
+        match stmt {
+            SqlStatement::Select(select) => {
+                Self::collect_cte_aliases_in_select(select, cte_name, aliases)
+            }
+            SqlStatement::Union(union) => {
+                Self::collect_cte_aliases_in_statement(&union.left, cte_name, aliases);
+                Self::collect_cte_aliases_in_statement(&union.right, cte_name, aliases);
+            }
+            SqlStatement::Cte { name, body, main, .. } => {
+                if !name.eq_ignore_ascii_case(cte_name) {
+                    Self::collect_cte_aliases_in_statement(body, cte_name, aliases);
+                    Self::collect_cte_aliases_in_statement(main, cte_name, aliases);
+                }
+            }
+            SqlStatement::InsertSelect { query, .. }
+            | SqlStatement::InsertOverwrite { query, .. }
+            | SqlStatement::CreateTableAs { query, .. }
+            | SqlStatement::Explain { stmt: query, .. } => {
+                Self::collect_cte_aliases_in_statement(query, cte_name, aliases);
+            }
+            SqlStatement::HiveMultiInsert { inserts } => {
+                for insert in inserts {
+                    Self::collect_cte_aliases_in_statement(insert, cte_name, aliases);
+                }
+            }
+            SqlStatement::CreateView { stmt, .. } => {
+                Self::collect_cte_aliases_in_select(stmt, cte_name, aliases);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_cte_aliases_in_select(
+        select: &SelectStatement,
+        cte_name: &str,
+        aliases: &mut HashSet<String>,
+    ) {
+        if let Some(from) = &select.from {
+            Self::collect_cte_aliases_in_from(from, cte_name, aliases);
+        }
+        for join in &select.joins {
+            Self::collect_cte_aliases_in_from(&join.right, cte_name, aliases);
+        }
+    }
+
+    fn collect_cte_aliases_in_from(
+        from: &FromItem,
+        cte_name: &str,
+        aliases: &mut HashSet<String>,
+    ) {
+        match from {
+            FromItem::Table { table, alias } if table.eq_ignore_ascii_case(cte_name) => {
+                aliases.insert(
+                    alias
+                        .as_deref()
+                        .unwrap_or(table)
+                        .trim_matches('"')
+                        .to_ascii_lowercase(),
+                );
+                aliases.insert(cte_name.to_ascii_lowercase());
+            }
+            FromItem::Subquery { stmt, .. } => {
+                Self::collect_cte_aliases_in_statement(stmt, cte_name, aliases);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_cte_columns_in_statement(
+        stmt: &SqlStatement,
+        aliases: &HashSet<String>,
+        columns: &mut HashSet<String>,
+        requires_all: &mut bool,
+    ) {
+        match stmt {
+            SqlStatement::Select(select) => {
+                Self::collect_cte_columns_in_select(select, aliases, columns, requires_all)
+            }
+            SqlStatement::Union(union) => {
+                Self::collect_cte_columns_in_statement(
+                    &union.left,
+                    aliases,
+                    columns,
+                    requires_all,
+                );
+                Self::collect_cte_columns_in_statement(
+                    &union.right,
+                    aliases,
+                    columns,
+                    requires_all,
+                );
+            }
+            SqlStatement::Cte { body, main, .. } => {
+                Self::collect_cte_columns_in_statement(body, aliases, columns, requires_all);
+                Self::collect_cte_columns_in_statement(main, aliases, columns, requires_all);
+            }
+            SqlStatement::InsertSelect { query, .. }
+            | SqlStatement::InsertOverwrite { query, .. }
+            | SqlStatement::CreateTableAs { query, .. }
+            | SqlStatement::Explain { stmt: query, .. } => {
+                Self::collect_cte_columns_in_statement(query, aliases, columns, requires_all);
+            }
+            SqlStatement::HiveMultiInsert { inserts } => {
+                for insert in inserts {
+                    Self::collect_cte_columns_in_statement(insert, aliases, columns, requires_all);
+                }
+            }
+            SqlStatement::CreateView { stmt, .. } => {
+                Self::collect_cte_columns_in_select(stmt, aliases, columns, requires_all);
+            }
+            SqlStatement::Delete { where_clause, .. } => {
+                if let Some(expr) = where_clause {
+                    Self::collect_cte_columns_in_expr(expr, aliases, columns, requires_all, true);
+                }
+            }
+            SqlStatement::Update {
+                assignments,
+                where_clause,
+                ..
+            } => {
+                for (_, expr) in assignments {
+                    Self::collect_cte_columns_in_expr(expr, aliases, columns, requires_all, true);
+                }
+                if let Some(expr) = where_clause {
+                    Self::collect_cte_columns_in_expr(expr, aliases, columns, requires_all, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_cte_columns_in_select(
+        select: &SelectStatement,
+        aliases: &HashSet<String>,
+        columns: &mut HashSet<String>,
+        requires_all: &mut bool,
+    ) {
+        let unqualified_requires_all = Self::select_references_cte_alias(select, aliases);
+        for column in &select.columns {
+            match column {
+                SelectColumn::All | SelectColumn::AllExclude(_) | SelectColumn::AllReplace(_) => {
+                    if unqualified_requires_all {
+                        *requires_all = true;
+                    }
+                }
+                SelectColumn::Column(name) => {
+                    Self::collect_cte_column_ref(
+                        name,
+                        aliases,
+                        columns,
+                        requires_all,
+                        unqualified_requires_all,
+                    );
+                }
+                SelectColumn::ColumnAlias { column, .. } => {
+                    Self::collect_cte_column_ref(
+                        column,
+                        aliases,
+                        columns,
+                        requires_all,
+                        unqualified_requires_all,
+                    );
+                }
+                SelectColumn::Expression { expr, .. } => {
+                    Self::collect_cte_columns_in_expr(
+                        expr,
+                        aliases,
+                        columns,
+                        requires_all,
+                        unqualified_requires_all,
+                    );
+                }
+                SelectColumn::WindowFunction {
+                    args,
+                    partition_by,
+                    order_by,
+                    ..
+                } => {
+                    for arg in args {
+                        Self::collect_cte_column_ref(
+                            arg,
+                            aliases,
+                            columns,
+                            requires_all,
+                            unqualified_requires_all,
+                        );
+                    }
+                    for partition in partition_by {
+                        Self::collect_cte_column_ref(
+                            partition,
+                            aliases,
+                            columns,
+                            requires_all,
+                            unqualified_requires_all,
+                        );
+                    }
+                    for order in order_by {
+                        Self::collect_cte_column_ref(
+                            &order.column,
+                            aliases,
+                            columns,
+                            requires_all,
+                            unqualified_requires_all,
+                        );
+                        if let Some(expr) = &order.expr {
+                            Self::collect_cte_columns_in_expr(
+                                expr,
+                                aliases,
+                                columns,
+                                requires_all,
+                                unqualified_requires_all,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(expr) = &select.where_clause {
+            Self::collect_cte_columns_in_expr(
+                expr,
+                aliases,
+                columns,
+                requires_all,
+                unqualified_requires_all,
+            );
+        }
+        if let Some(expr) = &select.having {
+            Self::collect_cte_columns_in_expr(
+                expr,
+                aliases,
+                columns,
+                requires_all,
+                unqualified_requires_all,
+            );
+        }
+        for expr in select.group_by_exprs.iter().flatten() {
+            Self::collect_cte_columns_in_expr(
+                expr,
+                aliases,
+                columns,
+                requires_all,
+                unqualified_requires_all,
+            );
+        }
+        for group in &select.group_by {
+            Self::collect_cte_column_ref(
+                group,
+                aliases,
+                columns,
+                requires_all,
+                unqualified_requires_all,
+            );
+        }
+        for order in &select.order_by {
+            Self::collect_cte_column_ref(
+                &order.column,
+                aliases,
+                columns,
+                requires_all,
+                unqualified_requires_all,
+            );
+            if let Some(expr) = &order.expr {
+                Self::collect_cte_columns_in_expr(
+                    expr,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                );
+            }
+        }
+        for join in &select.joins {
+            Self::collect_cte_columns_in_from(
+                &join.right,
+                aliases,
+                columns,
+                requires_all,
+                unqualified_requires_all,
+            );
+            Self::collect_cte_columns_in_expr(
+                &join.on,
+                aliases,
+                columns,
+                requires_all,
+                unqualified_requires_all,
+            );
+        }
+        if let Some(from) = &select.from {
+            Self::collect_cte_columns_in_from(
+                from,
+                aliases,
+                columns,
+                requires_all,
+                unqualified_requires_all,
+            );
+        }
+    }
+
+    fn select_references_cte_alias(
+        select: &SelectStatement,
+        aliases: &HashSet<String>,
+    ) -> bool {
+        select
+            .from
+            .as_ref()
+            .is_some_and(|from| Self::from_item_references_cte_alias(from, aliases))
+            || select
+                .joins
+                .iter()
+                .any(|join| Self::from_item_references_cte_alias(&join.right, aliases))
+    }
+
+    fn from_item_references_cte_alias(
+        from: &FromItem,
+        aliases: &HashSet<String>,
+    ) -> bool {
+        match from {
+            FromItem::Table { table, .. } => {
+                aliases.contains(&table.trim_matches('"').to_ascii_lowercase())
+            }
+            _ => false,
+        }
+    }
+
+    fn collect_cte_columns_in_from(
+        from: &FromItem,
+        aliases: &HashSet<String>,
+        columns: &mut HashSet<String>,
+        requires_all: &mut bool,
+        unqualified_requires_all: bool,
+    ) {
+        match from {
+            FromItem::Subquery { stmt, .. } => {
+                Self::collect_cte_columns_in_statement(stmt, aliases, columns, requires_all);
+            }
+            FromItem::LateralExplode { expr, .. }
+            | FromItem::LateralPosExplode { expr, .. } => {
+                Self::collect_cte_columns_in_expr(
+                    expr,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                );
+            }
+            FromItem::LateralStack { values, .. } => {
+                for expr in values {
+                    Self::collect_cte_columns_in_expr(
+                        expr,
+                        aliases,
+                        columns,
+                        requires_all,
+                        unqualified_requires_all,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_cte_columns_in_expr(
+        expr: &SqlExpr,
+        aliases: &HashSet<String>,
+        columns: &mut HashSet<String>,
+        requires_all: &mut bool,
+        unqualified_requires_all: bool,
+    ) {
+        match expr {
+            SqlExpr::Column(name) => {
+                Self::collect_cte_column_ref(
+                    name,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                )
+            }
+            SqlExpr::BinaryOp { left, right, .. } => {
+                Self::collect_cte_columns_in_expr(
+                    left,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                );
+                Self::collect_cte_columns_in_expr(
+                    right,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                );
+            }
+            SqlExpr::UnaryOp { expr, .. }
+            | SqlExpr::Cast { expr, .. }
+            | SqlExpr::Paren(expr)
+            | SqlExpr::ExplodeRename { inner: expr, .. } => {
+                Self::collect_cte_columns_in_expr(
+                    expr,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                );
+            }
+            SqlExpr::InSubquery { column, stmt, .. } => {
+                Self::collect_cte_column_ref(
+                    column,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                );
+                Self::collect_cte_columns_in_select(stmt, aliases, columns, requires_all);
+            }
+            SqlExpr::ExistsSubquery { stmt } | SqlExpr::ScalarSubquery { stmt } => {
+                Self::collect_cte_columns_in_select(stmt, aliases, columns, requires_all);
+            }
+            SqlExpr::Case {
+                when_then,
+                else_expr,
+            } => {
+                for (when, then) in when_then {
+                    Self::collect_cte_columns_in_expr(
+                        when,
+                        aliases,
+                        columns,
+                        requires_all,
+                        unqualified_requires_all,
+                    );
+                    Self::collect_cte_columns_in_expr(
+                        then,
+                        aliases,
+                        columns,
+                        requires_all,
+                        unqualified_requires_all,
+                    );
+                }
+                if let Some(expr) = else_expr {
+                    Self::collect_cte_columns_in_expr(
+                        expr,
+                        aliases,
+                        columns,
+                        requires_all,
+                        unqualified_requires_all,
+                    );
+                }
+            }
+            SqlExpr::Between {
+                column, low, high, ..
+            } => {
+                Self::collect_cte_column_ref(
+                    column,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                );
+                Self::collect_cte_columns_in_expr(
+                    low,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                );
+                Self::collect_cte_columns_in_expr(
+                    high,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                );
+            }
+            SqlExpr::Like { column, .. }
+            | SqlExpr::Regexp { column, .. }
+            | SqlExpr::In { column, .. }
+            | SqlExpr::IsNull { column, .. } => {
+                Self::collect_cte_column_ref(
+                    column,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                );
+            }
+            SqlExpr::Function { args, .. } => {
+                for arg in args {
+                    Self::collect_cte_columns_in_expr(
+                        arg,
+                        aliases,
+                        columns,
+                        requires_all,
+                        unqualified_requires_all,
+                    );
+                }
+            }
+            SqlExpr::ArrayIndex { array, index } => {
+                Self::collect_cte_columns_in_expr(
+                    array,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                );
+                Self::collect_cte_columns_in_expr(
+                    index,
+                    aliases,
+                    columns,
+                    requires_all,
+                    unqualified_requires_all,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_cte_column_ref(
+        reference: &str,
+        aliases: &HashSet<String>,
+        columns: &mut HashSet<String>,
+        requires_all: &mut bool,
+        unqualified_requires_all: bool,
+    ) {
+        let trimmed = reference.trim_matches('"');
+        let Some((qualifier, column)) = trimmed.rsplit_once('.') else {
+            if unqualified_requires_all {
+                *requires_all = true;
+            }
+            return;
+        };
+        let qualifier = qualifier.trim_matches('"').to_ascii_lowercase();
+        if aliases.contains(&qualifier) {
+            columns.insert(Self::unqualified_name(column).to_ascii_lowercase());
         }
     }
     

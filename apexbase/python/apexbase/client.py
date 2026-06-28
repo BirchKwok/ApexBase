@@ -1542,12 +1542,22 @@ class ApexClient:
         """Prefer Rust-side columnar Python conversion for to_dict-friendly result sets."""
         if sig not in ('like', 'complex', 'projected_full_scan'):
             return False
-        if not sql_upper.startswith('SELECT'):
+        is_cte_query = sql_upper.startswith('WITH ')
+        if not (sql_upper.startswith('SELECT') or is_cte_query):
             return False
-        if any(token in sql_upper for token in (
-            'JOIN', 'UNION', 'INTERSECT', 'EXCEPT', 'WITH ',
-        )):
+        if any(token in sql_upper for token in ('UNION', 'INTERSECT', 'EXCEPT')):
             return False
+        if not is_cte_query and 'JOIN' in sql_upper:
+            return False
+
+        # Analytic CTEs usually return compact derived result sets that execute()
+        # callers immediately consume as Python rows. Building column lists in
+        # Rust avoids Arrow import + Table.to_pylist() overhead on repeated runs.
+        if is_cte_query:
+            return any(token in sql_upper for token in (
+                'GROUP', 'HAVING', 'DISTINCT', 'ORDER', ' OVER ', 'JOIN',
+                'COUNT(', 'SUM(', 'AVG(', 'MIN(', 'MAX(',
+            ))
 
         # Projected full scan: SELECT col1, col2 FROM table (no WHERE/LIMIT/etc.)
         if (sig == 'projected_full_scan'):

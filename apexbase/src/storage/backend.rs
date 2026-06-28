@@ -618,6 +618,17 @@ impl TableStorageBackend {
         self.storage.has_delta()
     }
 
+    /// True only when storage metadata proves a string equality predicate keeps all rows.
+    pub fn string_eq_matches_all(&self, column: &str, value: &str) -> io::Result<bool> {
+        if self.has_delta() || self.has_pending_deltas() || self.pending_v4_in_memory_rows() > 0 {
+            return Ok(false);
+        }
+        Ok(self
+            .storage
+            .string_eq_matches_all_mmap(column, value)?
+            .unwrap_or(false))
+    }
+
     /// Compact delta into base file
     pub fn compact(&self) -> io::Result<()> {
         self.storage.compact()
@@ -4106,6 +4117,23 @@ impl TableStorageBackend {
         agg_cols: &[(&str, bool)],
     ) -> io::Result<Option<Vec<(String, Vec<(f64, i64)>)>>> {
         self.storage.execute_group_agg(group_col, agg_cols)
+    }
+
+    /// Execute mmap-native string GROUP BY with distinct counts, CASE counters,
+    /// and string MAX. The values are computed for the current call only.
+    pub fn execute_string_group_distinct_case_agg(
+        &self,
+        group_col: &str,
+        distinct_cols: &[&str],
+        case_specs: &[(&str, Vec<String>)],
+        max_cols: &[&str],
+    ) -> io::Result<Option<Vec<crate::storage::on_demand::NativeStringGroupAgg>>> {
+        self.storage.execute_string_group_distinct_case_agg(
+            group_col,
+            distinct_cols,
+            case_specs,
+            max_cols,
+        )
     }
 
     /// Execute Complex (Filter+Group+Order) query with single-pass optimization
