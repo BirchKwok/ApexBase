@@ -1259,31 +1259,30 @@ impl ApexStorageImpl {
         let durability = self.durability;
         self.persist_pending_overlay_for_table(&table_path, &table_name)?;
 
-        // Skip file lock for 'fast' durability — StorageEngine handles thread safety
-        // internally via parking_lot::RwLock. File locks only needed for cross-process safety.
-        let lock_file = if durability != DurabilityLevel::Fast {
-            Some(
-                Self::acquire_write_lock(&table_path)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
-            )
-        } else {
-            None
-        };
+        let id = py.allow_threads(|| -> PyResult<i64> {
+            // Skip file lock for 'fast' durability. StorageEngine handles thread safety
+            // internally via parking_lot::RwLock; file locks are for cross-process safety.
+            let lock_file = if durability != DurabilityLevel::Fast {
+                Some(
+                    Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
+                )
+            } else {
+                None
+            };
 
-        // Use StorageEngine for smart write routing
-        let result = py.allow_threads(|| {
             let engine = crate::storage::engine::engine();
-            let ids = engine
+            let result = engine
                 .write(&table_path, &[fields], durability)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            Ok::<i64, PyErr>(ids.first().copied().unwrap_or(0) as i64)
-        });
+                .map(|ids| ids.first().copied().unwrap_or(0) as i64)
+                .map_err(|e| PyIOError::new_err(e.to_string()));
 
-        if let Some(lf) = lock_file {
-            Self::release_lock(lf);
-        }
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
 
-        let id = result?;
+            result
+        })?;
 
         // Invalidate local backend cache (StorageEngine handles its own cache)
         self.invalidate_backend(&table_name);
@@ -1315,29 +1314,28 @@ impl ApexStorageImpl {
         let durability = self.durability;
         self.persist_pending_overlay_for_table(&table_path, &table_name)?;
 
-        // Skip file lock for 'fast' durability
-        let lock_file = if durability != DurabilityLevel::Fast {
-            Some(
-                Self::acquire_write_lock(&table_path)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
-            )
-        } else {
-            None
-        };
+        let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
+            // Skip file lock for 'fast' durability
+            let lock_file = if durability != DurabilityLevel::Fast {
+                Some(
+                    Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
+                )
+            } else {
+                None
+            };
 
-        // Use StorageEngine for smart write routing
-        let result = py.allow_threads(|| {
             let engine = crate::storage::engine::engine();
-            engine
+            let result = engine
                 .write(&table_path, &rows, durability)
-                .map_err(|e| PyIOError::new_err(e.to_string()))
-        });
+                .map_err(|e| PyIOError::new_err(e.to_string()));
 
-        if let Some(lf) = lock_file {
-            Self::release_lock(lf);
-        }
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
 
-        let ids = result?;
+            result
+        })?;
 
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
@@ -1765,26 +1763,26 @@ impl ApexStorageImpl {
         }
 
         let durability = self.durability;
-        let lock_file = if durability != DurabilityLevel::Fast {
-            Some(
-                Self::acquire_write_lock(&table_path)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
-            )
-        } else {
-            None
-        };
+        let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
+            let lock_file = if durability != DurabilityLevel::Fast {
+                Some(
+                    Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
+                )
+            } else {
+                None
+            };
 
-        let result = py.allow_threads(|| {
-            backend
+            let result = backend
                 .insert_column_rows_to_delta(&[fields])
-                .map_err(|e| PyIOError::new_err(e.to_string()))
-        });
+                .map_err(|e| PyIOError::new_err(e.to_string()));
 
-        if let Some(lf) = lock_file {
-            Self::release_lock(lf);
-        }
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
 
-        let ids = result?;
+            result
+        })?;
         // Keep the insert backend warm so repeated OLTP appends don't reopen
         // and rescan the delta file. Read/query caches must still be invalidated.
         self.cached_backends
@@ -1858,26 +1856,26 @@ impl ApexStorageImpl {
         }
 
         let durability = self.durability;
-        let lock_file = if durability != DurabilityLevel::Fast {
-            Some(
-                Self::acquire_write_lock(&table_path)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
-            )
-        } else {
-            None
-        };
+        let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
+            let lock_file = if durability != DurabilityLevel::Fast {
+                Some(
+                    Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
+                )
+            } else {
+                None
+            };
 
-        let result = py.allow_threads(|| {
-            backend
+            let result = backend
                 .insert_column_rows_to_delta(&all_fields)
-                .map_err(|e| PyIOError::new_err(e.to_string()))
-        });
+                .map_err(|e| PyIOError::new_err(e.to_string()));
 
-        if let Some(lf) = lock_file {
-            Self::release_lock(lf);
-        }
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
 
-        let ids = result?;
+            result
+        })?;
         self.cached_backends
             .remove(&Self::backend_cache_key(&table_path, &table_name));
         crate::query::executor::invalidate_storage_cache(&table_path);
@@ -2214,23 +2212,22 @@ impl ApexStorageImpl {
         let durability = self.durability;
         self.persist_pending_overlay_for_table(&table_path, &table_name)?;
 
-        // Skip file lock for 'fast' durability
-        let lock_file = if durability != DurabilityLevel::Fast {
-            Some(
-                Self::acquire_write_lock(&table_path)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
-            )
-        } else {
-            None
-        };
-
         // Save a copy of string_columns for FTS indexing (before insert_typed consumes it)
         let string_columns_for_fts = string_columns.clone();
 
-        // Use StorageEngine for unified write
-        let result = py.allow_threads(|| {
+        let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
+            // Skip file lock for 'fast' durability
+            let lock_file = if durability != DurabilityLevel::Fast {
+                Some(
+                    Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
+                )
+            } else {
+                None
+            };
+
             let engine = crate::storage::engine::engine();
-            engine
+            let result = engine
                 .write_typed(
                     &table_path,
                     int_columns,
@@ -2242,14 +2239,14 @@ impl ApexStorageImpl {
                     null_positions,
                     durability,
                 )
-                .map_err(|e| PyIOError::new_err(e.to_string()))
-        });
+                .map_err(|e| PyIOError::new_err(e.to_string()));
 
-        if let Some(lf) = lock_file {
-            Self::release_lock(lf);
-        }
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
 
-        let ids = result?;
+            result
+        })?;
 
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
@@ -2364,7 +2361,7 @@ impl ApexStorageImpl {
     }
 
     /// Delete a record by ID using StorageEngine
-    fn delete(&self, id: i64) -> PyResult<bool> {
+    fn delete(&self, py: Python<'_>, id: i64) -> PyResult<bool> {
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
 
@@ -2379,16 +2376,18 @@ impl ApexStorageImpl {
         {
             let backend = self.get_backend_for_overlay(&table_path, &table_name)?;
             if !backend.storage.has_constraints() {
-                if backend.delete_pending_v4_in_memory_row(id as u64) {
+                if py.allow_threads(|| backend.delete_pending_v4_in_memory_row(id as u64)) {
                     self.replace_exact_row_cache.remove(&replace_cache_key);
                     crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
                     crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
                     return Ok(true);
                 }
 
-                let result = backend
-                    .delta_delete_row(id as u64)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                let result = py.allow_threads(|| {
+                    backend
+                        .delta_delete_row(id as u64)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))
+                })?;
                 if result {
                     self.replace_exact_row_cache.remove(&replace_cache_key);
                     crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
@@ -2398,25 +2397,29 @@ impl ApexStorageImpl {
             }
         }
 
-        // Skip file lock for 'fast' durability
-        let lock_file = if durability != DurabilityLevel::Fast {
-            Some(
-                Self::acquire_write_lock(&table_path)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
-            )
-        } else {
-            None
-        };
+        let result = py.allow_threads(|| -> PyResult<bool> {
+            // Skip file lock for 'fast' durability
+            let lock_file = if durability != DurabilityLevel::Fast {
+                Some(
+                    Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
+                )
+            } else {
+                None
+            };
 
-        // Use StorageEngine for unified delete
-        let engine = crate::storage::engine::engine();
-        let result = engine
-            .delete_one(&table_path, id as u64, durability)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            // Use StorageEngine for unified delete
+            let engine = crate::storage::engine::engine();
+            let result = engine
+                .delete_one(&table_path, id as u64, durability)
+                .map_err(|e| PyIOError::new_err(e.to_string()));
 
-        if let Some(lf) = lock_file {
-            Self::release_lock(lf);
-        }
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
+
+            result
+        })?;
 
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
@@ -2425,7 +2428,7 @@ impl ApexStorageImpl {
     }
 
     /// Delete multiple records by IDs using StorageEngine
-    fn delete_batch(&self, ids: Vec<i64>) -> PyResult<bool> {
+    fn delete_batch(&self, py: Python<'_>, ids: Vec<i64>) -> PyResult<bool> {
         // Empty list is a successful no-op
         if ids.is_empty() {
             return Ok(true);
@@ -2439,62 +2442,62 @@ impl ApexStorageImpl {
         {
             let backend = self.get_backend_for_overlay(&table_path, &table_name)?;
             if !backend.storage.has_constraints() {
-                let mut deleted = 0usize;
-                for id in &ids {
-                    if *id < 0 {
-                        continue;
+                let deleted_ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
+                    let mut deleted_ids = Vec::new();
+                    for id in &ids {
+                        if *id < 0 {
+                            continue;
+                        }
+                        let row_id = *id as u64;
+                        if backend.delete_pending_v4_in_memory_row(row_id)
+                            || backend
+                                .delta_delete_row(row_id)
+                                .map_err(|e| PyIOError::new_err(e.to_string()))?
+                        {
+                            deleted_ids.push(row_id);
+                        }
                     }
-                    if backend.delete_pending_v4_in_memory_row(*id as u64) {
-                        self.replace_exact_row_cache
-                            .remove(&Self::replace_row_cache_key(
-                                &table_path,
-                                &table_name,
-                                *id as u64,
-                            ));
-                        deleted += 1;
-                        continue;
-                    }
-                    if backend
-                        .delta_delete_row(*id as u64)
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?
-                    {
-                        self.replace_exact_row_cache
-                            .remove(&Self::replace_row_cache_key(
-                                &table_path,
-                                &table_name,
-                                *id as u64,
-                            ));
-                        deleted += 1;
-                    }
+                    Ok(deleted_ids)
+                })?;
+                for row_id in &deleted_ids {
+                    self.replace_exact_row_cache.remove(&Self::replace_row_cache_key(
+                        &table_path,
+                        &table_name,
+                        *row_id,
+                    ));
                 }
-                if deleted > 0 {
+                if !deleted_ids.is_empty() {
                     crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
                     crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
                 }
-                return Ok(deleted > 0);
+                return Ok(!deleted_ids.is_empty());
             }
         }
 
-        // Skip file lock for 'fast' durability
-        let lock_file = if durability != DurabilityLevel::Fast {
-            Some(
-                Self::acquire_write_lock(&table_path)
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?,
-            )
-        } else {
-            None
-        };
-
-        // Use StorageEngine for unified delete
-        let engine = crate::storage::engine::engine();
         let ids_u64: Vec<u64> = ids.into_iter().map(|id| id as u64).collect();
-        let deleted = engine
-            .delete(&table_path, &ids_u64, durability)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let deleted = py.allow_threads(|| -> PyResult<usize> {
+            // Skip file lock for 'fast' durability
+            let lock_file = if durability != DurabilityLevel::Fast {
+                Some(
+                    Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
+                )
+            } else {
+                None
+            };
 
-        if let Some(lf) = lock_file {
-            Self::release_lock(lf);
-        }
+            // Use StorageEngine for unified delete
+            let engine = crate::storage::engine::engine();
+            let deleted = engine
+                .delete(&table_path, &ids_u64, durability)
+                .map_err(|e| PyIOError::new_err(e.to_string()));
+
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
+
+            deleted
+        })?;
 
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
@@ -2504,7 +2507,7 @@ impl ApexStorageImpl {
 
     /// Delete records matching a WHERE clause
     /// Returns the number of deleted rows
-    fn delete_where(&self, where_clause: &str) -> PyResult<i64> {
+    fn delete_where(&self, py: Python<'_>, where_clause: &str) -> PyResult<i64> {
         let (table_path, table_name) = self.get_current_table_info()?;
 
         // Build DELETE SQL statement
@@ -2512,9 +2515,13 @@ impl ApexStorageImpl {
 
         // Execute using ApexExecutor
         let base_dir = self.current_base_dir();
-        crate::query::executor::set_query_root_dir(&self.root_dir);
-        let exec_result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path);
-        crate::query::executor::clear_query_root_dir();
+        let root_dir = self.root_dir.clone();
+        let exec_result = py.allow_threads(|| {
+            crate::query::executor::set_query_root_dir(&root_dir);
+            let exec_result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path);
+            crate::query::executor::clear_query_root_dir();
+            exec_result
+        });
         let result = exec_result.map_err(|e| PyIOError::new_err(e.to_string()))?;
 
         // Invalidate cached backend since data changed
@@ -2531,7 +2538,7 @@ impl ApexStorageImpl {
 
     /// Delete all records (no WHERE clause)
     /// Returns the number of deleted rows
-    fn delete_all(&self) -> PyResult<i64> {
+    fn delete_all(&self, py: Python<'_>) -> PyResult<i64> {
         let (table_path, table_name) = self.get_current_table_info()?;
 
         // Build DELETE SQL statement without WHERE
@@ -2539,9 +2546,13 @@ impl ApexStorageImpl {
 
         // Execute using ApexExecutor
         let base_dir = self.current_base_dir();
-        crate::query::executor::set_query_root_dir(&self.root_dir);
-        let exec_result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path);
-        crate::query::executor::clear_query_root_dir();
+        let root_dir = self.root_dir.clone();
+        let exec_result = py.allow_threads(|| {
+            crate::query::executor::set_query_root_dir(&root_dir);
+            let exec_result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path);
+            crate::query::executor::clear_query_root_dir();
+            exec_result
+        });
         let result = exec_result.map_err(|e| PyIOError::new_err(e.to_string()))?;
 
         // Invalidate cached backend since data changed
@@ -4934,36 +4945,40 @@ impl ApexStorageImpl {
             }
         }
 
-        // FALLBACK: File lock + Arrow path for edge cases
-        let lock_file =
-            Self::acquire_read_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
-
         let base_dir = self.current_base_dir();
-        crate::query::executor::set_query_root_dir(&self.root_dir);
+        let root_dir = self.root_dir.clone();
         let table_name = self.current_table.read().clone();
 
         let result = py.allow_threads(|| -> PyResult<Option<HashMap<String, Value>>> {
-            let sql = format!("SELECT * FROM \"{}\" WHERE _id = {}", table_name, id);
-            let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // FALLBACK: File lock + Arrow path for edge cases
+            let lock_file = Self::acquire_read_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
-            let batch = result
-                .to_record_batch()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            crate::query::executor::set_query_root_dir(&root_dir);
+            let result: PyResult<Option<HashMap<String, Value>>> = (|| {
+                let sql = format!("SELECT * FROM \"{}\" WHERE _id = {}", table_name, id);
+                let result = ApexExecutor::execute_with_base_dir(&sql, &base_dir, &table_path)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            if batch.num_rows() == 0 {
-                return Ok(None);
-            }
+                let batch = result
+                    .to_record_batch()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            let mut row_data = HashMap::new();
-            for (col_idx, field) in batch.schema().fields().iter().enumerate() {
-                let val = arrow_value_at(batch.column(col_idx), 0);
-                row_data.insert(field.name().clone(), val);
-            }
-            Ok(Some(row_data))
+                if batch.num_rows() == 0 {
+                    return Ok(None);
+                }
+
+                let mut row_data = HashMap::new();
+                for (col_idx, field) in batch.schema().fields().iter().enumerate() {
+                    let val = arrow_value_at(batch.column(col_idx), 0);
+                    row_data.insert(field.name().clone(), val);
+                }
+                Ok(Some(row_data))
+            })();
+            crate::query::executor::clear_query_root_dir();
+            Self::release_lock(lock_file);
+            result
         });
-
-        Self::release_lock(lock_file);
 
         let result = result?;
 
@@ -6216,19 +6231,17 @@ impl ApexStorageImpl {
             }
         }
 
-        // Acquire exclusive write lock
-        let lock_file =
-            Self::acquire_write_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
-
         // Use StorageEngine for unified replace
-        let result = py.allow_threads(|| {
+        let result = py.allow_threads(|| -> PyResult<bool> {
+            let lock_file = Self::acquire_write_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
             let engine = crate::storage::engine::engine();
-            engine
+            let result = engine
                 .replace(&table_path, id as u64, &fields, durability)
-                .map_err(|e| PyIOError::new_err(e.to_string()))
+                .map_err(|e| PyIOError::new_err(e.to_string()));
+            Self::release_lock(lock_file);
+            result
         });
-
-        Self::release_lock(lock_file);
 
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
@@ -6243,7 +6256,7 @@ impl ApexStorageImpl {
     // ========== Schema Operations ==========
 
     /// Add a column to current table using StorageEngine
-    fn add_column(&self, column_name: &str, column_type: &str) -> PyResult<()> {
+    fn add_column(&self, py: Python<'_>, column_name: &str, column_type: &str) -> PyResult<()> {
         let dtype = match column_type.to_lowercase().as_str() {
             "int" | "int64" | "i64" | "integer" => crate::data::DataType::Int64,
             "float" | "float64" | "f64" | "double" => crate::data::DataType::Float64,
@@ -6265,17 +6278,21 @@ impl ApexStorageImpl {
         // Invalidate local backend cache before operation
         self.invalidate_backend(&table_name);
 
-        // Acquire exclusive write lock
-        let lock_file =
-            Self::acquire_write_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let column_name = column_name.to_string();
+        let result = py.allow_threads(|| -> PyResult<()> {
+            // Acquire exclusive write lock
+            let lock_file = Self::acquire_write_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
-        // Use StorageEngine for unified add_column
-        let engine = crate::storage::engine::engine();
-        let result = engine
-            .add_column(&table_path, column_name, dtype, durability)
-            .map_err(|e| PyIOError::new_err(e.to_string()));
+            // Use StorageEngine for unified add_column
+            let engine = crate::storage::engine::engine();
+            let result = engine
+                .add_column(&table_path, &column_name, dtype, durability)
+                .map_err(|e| PyIOError::new_err(e.to_string()));
 
-        Self::release_lock(lock_file);
+            Self::release_lock(lock_file);
+            result
+        });
 
         // Invalidate local backend cache after operation
         self.invalidate_backend(&table_name);
@@ -6284,7 +6301,7 @@ impl ApexStorageImpl {
     }
 
     /// Drop a column from current table using StorageEngine
-    fn drop_column(&self, column_name: &str) -> PyResult<()> {
+    fn drop_column(&self, py: Python<'_>, column_name: &str) -> PyResult<()> {
         let table_path = self.get_current_table_path()?;
         let table_name = self.current_table.read().clone();
         let durability = self.durability;
@@ -6292,17 +6309,21 @@ impl ApexStorageImpl {
         // Invalidate local backend cache before operation
         self.invalidate_backend(&table_name);
 
-        // Acquire exclusive write lock
-        let lock_file =
-            Self::acquire_write_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let column_name = column_name.to_string();
+        let result = py.allow_threads(|| -> PyResult<()> {
+            // Acquire exclusive write lock
+            let lock_file = Self::acquire_write_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
-        // Use StorageEngine for unified drop_column
-        let engine = crate::storage::engine::engine();
-        let result = engine
-            .drop_column(&table_path, column_name, durability)
-            .map_err(|e| PyIOError::new_err(e.to_string()));
+            // Use StorageEngine for unified drop_column
+            let engine = crate::storage::engine::engine();
+            let result = engine
+                .drop_column(&table_path, &column_name, durability)
+                .map_err(|e| PyIOError::new_err(e.to_string()));
 
-        Self::release_lock(lock_file);
+            Self::release_lock(lock_file);
+            result
+        });
 
         // Invalidate local backend cache after operation
         self.invalidate_backend(&table_name);
@@ -6311,22 +6332,27 @@ impl ApexStorageImpl {
     }
 
     /// Rename a column using StorageEngine
-    fn rename_column(&self, old_name: &str, new_name: &str) -> PyResult<()> {
+    fn rename_column(&self, py: Python<'_>, old_name: &str, new_name: &str) -> PyResult<()> {
         let table_path = self.get_current_table_path()?;
         let table_name = self.current_table.read().clone();
         let durability = self.durability;
 
-        // Acquire exclusive write lock
-        let lock_file =
-            Self::acquire_write_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let old_name = old_name.to_string();
+        let new_name = new_name.to_string();
+        let result = py.allow_threads(|| -> PyResult<()> {
+            // Acquire exclusive write lock
+            let lock_file = Self::acquire_write_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
-        // Use StorageEngine for unified rename_column
-        let engine = crate::storage::engine::engine();
-        let result = engine
-            .rename_column(&table_path, old_name, new_name, durability)
-            .map_err(|e| PyIOError::new_err(e.to_string()));
+            // Use StorageEngine for unified rename_column
+            let engine = crate::storage::engine::engine();
+            let result = engine
+                .rename_column(&table_path, &old_name, &new_name, durability)
+                .map_err(|e| PyIOError::new_err(e.to_string()));
 
-        Self::release_lock(lock_file);
+            Self::release_lock(lock_file);
+            result
+        });
 
         // Invalidate local backend cache
         self.invalidate_backend(&table_name);
@@ -6335,40 +6361,45 @@ impl ApexStorageImpl {
     }
 
     /// List fields (columns) in current table using StorageEngine
-    fn list_fields(&self) -> PyResult<Vec<String>> {
+    fn list_fields(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let table_path = self.get_current_table_path()?;
 
-        // Acquire shared read lock
-        let lock_file =
-            Self::acquire_read_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        py.allow_threads(|| -> PyResult<Vec<String>> {
+            // Acquire shared read lock
+            let lock_file = Self::acquire_read_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
-        // Use StorageEngine for unified list_columns
-        let engine = crate::storage::engine::engine();
-        let columns = engine
-            .list_columns(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            // Use StorageEngine for unified list_columns
+            let engine = crate::storage::engine::engine();
+            let result = engine
+                .list_columns(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()));
 
-        Self::release_lock(lock_file);
-        Ok(columns)
+            Self::release_lock(lock_file);
+            result
+        })
     }
 
     /// Get column data type using StorageEngine
-    fn get_column_dtype(&self, column_name: &str) -> PyResult<Option<String>> {
+    fn get_column_dtype(&self, py: Python<'_>, column_name: &str) -> PyResult<Option<String>> {
         let table_path = self.get_current_table_path()?;
 
-        // Acquire shared read lock
-        let lock_file =
-            Self::acquire_read_lock(&table_path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let column_name = column_name.to_string();
+        py.allow_threads(|| -> PyResult<Option<String>> {
+            // Acquire shared read lock
+            let lock_file = Self::acquire_read_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
-        // Use StorageEngine for unified get_column_type
-        let engine = crate::storage::engine::engine();
-        let dtype = engine
-            .get_column_type(&table_path, column_name)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?
-            .map(|dt| format!("{:?}", dt));
+            // Use StorageEngine for unified get_column_type
+            let engine = crate::storage::engine::engine();
+            let result = engine
+                .get_column_type(&table_path, &column_name)
+                .map(|dtype| dtype.map(|dt| format!("{:?}", dt)))
+                .map_err(|e| PyIOError::new_err(e.to_string()));
 
-        Self::release_lock(lock_file);
-        Ok(dtype)
+            Self::release_lock(lock_file);
+            result
+        })
     }
 
     // ========== FTS Operations ==========
