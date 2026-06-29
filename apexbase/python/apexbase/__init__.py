@@ -180,7 +180,7 @@ class _InstanceRegistry:
                         self._instances.pop(db_path, None)
     
     def unregister(self, db_path: str, client_id: int = None):
-        """Unregister a client"""
+        """Unregister a client and return storage when this was the last client."""
         lock = self._get_lock()
         with lock:
             if db_path in self._instances:
@@ -191,10 +191,13 @@ class _InstanceRegistry:
                     
                     # If no more clients, the storage will be closed by the client's close() method
                     if entry['count'] <= 0:
-                        self._instances.pop(db_path, None)
+                        removed = self._instances.pop(db_path, None)
+                        return removed.get('storage') if removed else None
                 elif not client_id:
                     # Remove all clients for this path
-                    self._instances.pop(db_path, None)
+                    removed = self._instances.pop(db_path, None)
+                    return removed.get('storage') if removed else None
+            return None
     
     def get_storage(self, db_path: str):
         """Get the shared storage for a database path"""
@@ -215,6 +218,7 @@ class _InstanceRegistry:
     def close_all(self):
         """Close all instances (called at program exit)"""
         lock = self._get_lock()
+        storages = []
         with lock:
             # First, mark all clients as closed
             for db_path, entry in list(self._instances.items()):
@@ -226,15 +230,16 @@ class _InstanceRegistry:
                             client._storage = None
                         except Exception:
                             pass
-            # Then close the storage
             for db_path, entry in list(self._instances.items()):
                 storage = entry.get('storage')
                 if storage is not None:
-                    try:
-                        storage.close()
-                    except Exception:
-                        pass
+                    storages.append(storage)
             self._instances.clear()
+        for storage in storages:
+            try:
+                storage.close()
+            except Exception:
+                pass
 
 
 _registry = _InstanceRegistry()

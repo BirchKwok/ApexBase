@@ -780,7 +780,7 @@ impl ApexStorageImpl {
     /// Get backend for INSERT operations - memory efficient!
     /// Uses open_for_insert which doesn't load existing column data.
     /// Data is written to delta file and merged on read.
-    fn get_backend_for_insert(&self) -> PyResult<Arc<TableStorageBackend>> {
+    fn get_backend_for_insert(&self, py: Python<'_>) -> PyResult<Arc<TableStorageBackend>> {
         let table_name = self.current_table.read().clone();
         let table_path = self.get_current_table_path()?;
         let cache_key = Self::insert_backend_cache_key(&table_path, &table_name);
@@ -791,13 +791,18 @@ impl ApexStorageImpl {
         }
 
         // Create new backend with open_for_insert (memory efficient)
-        let backend = if table_path.exists() {
-            TableStorageBackend::open_for_insert_with_durability(&table_path, self.durability)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?
-        } else {
-            TableStorageBackend::create_with_durability(&table_path, self.durability)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?
-        };
+        let backend = py
+            .allow_threads(|| {
+                if table_path.exists() {
+                    TableStorageBackend::open_for_insert_with_durability(
+                        &table_path,
+                        self.durability,
+                    )
+                } else {
+                    TableStorageBackend::create_with_durability(&table_path, self.durability)
+                }
+            })
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
         let backend = Arc::new(backend);
         self.cached_backends.insert(cache_key, backend.clone());
@@ -808,6 +813,7 @@ impl ApexStorageImpl {
     /// Get a mmap/read backend suitable for fast overlay writes.
     fn get_backend_for_overlay(
         &self,
+        py: Python<'_>,
         table_path: &Path,
         table_name: &str,
     ) -> PyResult<Arc<TableStorageBackend>> {
@@ -816,28 +822,37 @@ impl ApexStorageImpl {
             return Ok(entry.clone());
         }
 
-        if let Ok(backend) = crate::query::get_cached_backend_pub(table_path) {
+        if let Ok(backend) = py.allow_threads(|| crate::query::get_cached_backend_pub(table_path)) {
             self.cached_backends.insert(cache_key, Arc::clone(&backend));
             return Ok(backend);
         }
 
         let backend = Arc::new(
-            TableStorageBackend::open_with_durability(table_path, self.durability)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?,
+            py.allow_threads(|| {
+                TableStorageBackend::open_with_durability(table_path, self.durability)
+            })
+            .map_err(|e| PyIOError::new_err(e.to_string()))?,
         );
         self.cached_backends.insert(cache_key, Arc::clone(&backend));
         crate::query::executor::cache_backend_pub(table_path, Arc::clone(&backend));
         Ok(backend)
     }
 
-    fn table_has_secondary_indexes(&self, table_path: &Path, table_name: &str) -> bool {
+    fn table_has_secondary_indexes(
+        &self,
+        py: Python<'_>,
+        table_path: &Path,
+        table_name: &str,
+    ) -> bool {
         let base_dir = table_path
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
-        crate::storage::index::IndexManager::load(table_name, &base_dir)
-            .map(|mgr| !mgr.catalog_is_empty())
-            .unwrap_or(false)
+        py.allow_threads(|| {
+            crate::storage::index::IndexManager::load(table_name, &base_dir)
+                .map(|mgr| !mgr.catalog_is_empty())
+                .unwrap_or(false)
+        })
     }
 
     #[inline]
@@ -1065,6 +1080,7 @@ impl ApexStorageImpl {
 
     fn persist_pending_overlay_for_table(
         &self,
+        py: Python<'_>,
         table_path: &Path,
         table_name: &str,
     ) -> PyResult<()> {
@@ -1080,15 +1096,20 @@ impl ApexStorageImpl {
                 backends.push(backend);
             }
         }
-        for backend in backends {
-            if backend.has_pending_deltas() {
+        backends.retain(|backend| backend.has_pending_deltas());
+        if backends.is_empty() {
+            return Ok(());
+        }
+
+        py.allow_threads(|| -> PyResult<()> {
+            for backend in backends {
                 backend
                     .save_delta_store()
                     .map_err(|e| PyIOError::new_err(e.to_string()))?;
             }
-        }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Get backend for UPDATE/DELETE operations - loads all data into memory.
@@ -1154,10 +1175,10 @@ impl ApexStorageImpl {
         if self.flush_prewarm_tables.remove(&cache_key).is_none() || !table_path.exists() {
             return;
         }
-        if let Ok(backend) = TableStorageBackend::open_with_durability(table_path, self.durability) {
+        if let Ok(backend) = TableStorageBackend::open_with_durability(table_path, self.durability)
+        {
             let backend = Arc::new(backend);
-            self.cached_backends
-                .insert(cache_key, Arc::clone(&backend));
+            self.cached_backends.insert(cache_key, Arc::clone(&backend));
             crate::query::executor::cache_backend_pub(table_path, backend);
         }
     }
@@ -1257,7 +1278,7 @@ impl ApexStorageImpl {
         let fields = dict_to_values(data)?;
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
-        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
+        self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
 
         let id = py.allow_threads(|| -> PyResult<i64> {
             // Skip file lock for 'fast' durability. StorageEngine handles thread safety
@@ -1289,7 +1310,7 @@ impl ApexStorageImpl {
         self.mark_flush_prewarm(&table_path, &table_name);
 
         // Index in FTS if enabled
-        self.index_for_fts(id, data)?;
+        self.index_for_fts(py, id, data)?;
 
         Ok(id)
     }
@@ -1312,7 +1333,7 @@ impl ApexStorageImpl {
 
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
-        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
+        self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
 
         let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
             // Skip file lock for 'fast' durability
@@ -1508,7 +1529,7 @@ impl ApexStorageImpl {
 
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
-        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
+        self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
         let result = py.allow_threads(|| {
             crate::storage::engine::engine()
                 .write_typed(
@@ -1547,19 +1568,12 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
-        let base_dir = table_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
-
-        if let Ok(index_mgr) = crate::storage::index::IndexManager::load(&table_name, &base_dir) {
-            if !index_mgr.catalog_is_empty() {
-                return Ok(None);
-            }
+        if self.table_has_secondary_indexes(py, &table_path, &table_name) {
+            return Ok(None);
         }
 
-        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
-        let backend = self.get_backend_for_insert()?;
+        self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
+        let backend = self.get_backend_for_insert(py)?;
         if !backend.storage.is_v4_format() || backend.storage.has_constraints() {
             return Ok(None);
         }
@@ -1729,21 +1743,14 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
-        let base_dir = table_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
-
         // Keep indexed tables on the existing path until index maintenance for
         // delta-only rows is fully covered.
-        if let Ok(index_mgr) = crate::storage::index::IndexManager::load(&table_name, &base_dir) {
-            if !index_mgr.catalog_is_empty() {
-                return Ok(None);
-            }
+        if self.table_has_secondary_indexes(py, &table_path, &table_name) {
+            return Ok(None);
         }
 
-        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
-        let backend = self.get_backend_for_insert()?;
+        self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
+        let backend = self.get_backend_for_insert(py)?;
 
         if !backend.storage.is_v4_format() || backend.storage.has_constraints() {
             return Ok(None);
@@ -1822,19 +1829,12 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
-        let base_dir = table_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
-
-        if let Ok(index_mgr) = crate::storage::index::IndexManager::load(&table_name, &base_dir) {
-            if !index_mgr.catalog_is_empty() {
-                return Ok(None);
-            }
+        if self.table_has_secondary_indexes(py, &table_path, &table_name) {
+            return Ok(None);
         }
 
-        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
-        let backend = self.get_backend_for_insert()?;
+        self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
+        let backend = self.get_backend_for_insert(py)?;
 
         if !backend.storage.is_v4_format() || backend.storage.has_constraints() {
             return Ok(None);
@@ -1910,19 +1910,12 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
-        let base_dir = table_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
-
-        if let Ok(index_mgr) = crate::storage::index::IndexManager::load(&table_name, &base_dir) {
-            if !index_mgr.catalog_is_empty() {
-                return Ok(None);
-            }
+        if self.table_has_secondary_indexes(py, &table_path, &table_name) {
+            return Ok(None);
         }
 
-        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
-        let backend = self.get_backend_for_insert()?;
+        self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
+        let backend = self.get_backend_for_insert(py)?;
 
         if !backend.storage.is_v4_format() || backend.storage.has_constraints() {
             return Ok(None);
@@ -2210,7 +2203,7 @@ impl ApexStorageImpl {
 
         let (table_path, table_name) = self.get_current_table_info()?;
         let durability = self.durability;
-        self.persist_pending_overlay_for_table(&table_path, &table_name)?;
+        self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
 
         // Save a copy of string_columns for FTS indexing (before insert_typed consumes it)
         let string_columns_for_fts = string_columns.clone();
@@ -2311,9 +2304,9 @@ impl ApexStorageImpl {
     }
 
     /// Helper to index a document for FTS (single document - uses slower path)
-    fn index_for_fts(&self, id: i64, data: &Bound<'_, PyDict>) -> PyResult<()> {
+    fn index_for_fts(&self, py: Python<'_>, id: i64, data: &Bound<'_, PyDict>) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
-        let mgr = self.fts_manager.read();
+        let mgr = self.fts_manager.read().clone();
 
         if mgr.is_none() {
             return Ok(());
@@ -2347,14 +2340,17 @@ impl ApexStorageImpl {
             return Ok(());
         }
 
-        // 🥇 Index the document via add_documents_arrow_texts (pre-joined text, zero-copy &str)
-        if let Some(m) = mgr.as_ref() {
-            if let Ok(engine) = m.get_engine(&table_name) {
-                // Pre-join all field values into a single text (fastest path for single doc)
-                let joined = fields.values().cloned().collect::<Vec<_>>().join(" ");
-                let doc_id = id as u32;
-                let _ = engine.add_documents_arrow_texts(&[doc_id], &[joined.as_str()]);
-            }
+        // Index the document via add_documents_arrow_texts (pre-joined text, zero-copy &str)
+        if let Some(m) = mgr {
+            let joined = fields.values().cloned().collect::<Vec<_>>().join(" ");
+            let doc_id = id as u32;
+            py.allow_threads(|| {
+                if let Ok(engine) = m.get_engine(&table_name) {
+                    let doc_ids = [doc_id];
+                    let texts = [joined.as_str()];
+                    let _ = engine.add_documents_arrow_texts(&doc_ids, &texts);
+                }
+            });
         }
 
         Ok(())
@@ -2372,9 +2368,9 @@ impl ApexStorageImpl {
         let replace_cache_key = Self::replace_row_cache_key(&table_path, &table_name, id as u64);
 
         if durability == DurabilityLevel::Fast
-            && !self.table_has_secondary_indexes(&table_path, &table_name)
+            && !self.table_has_secondary_indexes(py, &table_path, &table_name)
         {
-            let backend = self.get_backend_for_overlay(&table_path, &table_name)?;
+            let backend = self.get_backend_for_overlay(py, &table_path, &table_name)?;
             if !backend.storage.has_constraints() {
                 if py.allow_threads(|| backend.delete_pending_v4_in_memory_row(id as u64)) {
                     self.replace_exact_row_cache.remove(&replace_cache_key);
@@ -2438,9 +2434,9 @@ impl ApexStorageImpl {
         let durability = self.durability;
 
         if durability == DurabilityLevel::Fast
-            && !self.table_has_secondary_indexes(&table_path, &table_name)
+            && !self.table_has_secondary_indexes(py, &table_path, &table_name)
         {
-            let backend = self.get_backend_for_overlay(&table_path, &table_name)?;
+            let backend = self.get_backend_for_overlay(py, &table_path, &table_name)?;
             if !backend.storage.has_constraints() {
                 let deleted_ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
                     let mut deleted_ids = Vec::new();
@@ -2460,11 +2456,12 @@ impl ApexStorageImpl {
                     Ok(deleted_ids)
                 })?;
                 for row_id in &deleted_ids {
-                    self.replace_exact_row_cache.remove(&Self::replace_row_cache_key(
-                        &table_path,
-                        &table_name,
-                        *row_id,
-                    ));
+                    self.replace_exact_row_cache
+                        .remove(&Self::replace_row_cache_key(
+                            &table_path,
+                            &table_name,
+                            *row_id,
+                        ));
                 }
                 if !deleted_ids.is_empty() {
                     crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
@@ -4227,7 +4224,7 @@ impl ApexStorageImpl {
     // ========== Table Management ==========
 
     /// Use a table
-    fn use_table(&self, name: &str) -> PyResult<()> {
+    fn use_table(&self, py: Python<'_>, name: &str) -> PyResult<()> {
         // First check cache
         {
             let paths = self.table_paths.read();
@@ -4240,7 +4237,7 @@ impl ApexStorageImpl {
 
         // Table not in cache - check if it exists on disk (lazy discovery)
         let table_path = self.current_base_dir().join(format!("{}.apex", name));
-        if table_path.exists() {
+        if py.allow_threads(|| table_path.exists()) {
             // Add to cache
             self.table_paths
                 .write()
@@ -4260,55 +4257,71 @@ impl ApexStorageImpl {
     /// Create a new table, optionally with a pre-defined schema dict {col_name: type_str}.
     /// Pre-defining schema avoids type inference on the first insert.
     #[pyo3(signature = (name, schema=None))]
-    fn create_table(&self, name: &str, schema: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
-        let mut paths = self.table_paths.write();
-        if paths.contains_key(name) {
-            // Verify the file actually exists on disk (table_paths may be stale after SQL DROP TABLE)
-            let existing_path = self.current_base_dir().join(format!("{}.apex", name));
-            if existing_path.exists() {
-                return Err(PyValueError::new_err(format!(
-                    "Table already exists: {}",
-                    name
-                )));
+    fn create_table(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        schema: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        {
+            let mut paths = self.table_paths.write();
+            if paths.contains_key(name) {
+                // Verify the file actually exists on disk (table_paths may be stale after SQL DROP TABLE)
+                let existing_path = self.current_base_dir().join(format!("{}.apex", name));
+                if py.allow_threads(|| existing_path.exists()) {
+                    return Err(PyValueError::new_err(format!(
+                        "Table already exists: {}",
+                        name
+                    )));
+                }
+                // Stale entry: remove it and proceed with creation
+                paths.remove(name);
             }
-            // Stale entry — remove it and proceed with creation
-            paths.remove(name);
         }
 
         let table_path = self.current_base_dir().join(format!("{}.apex", name));
         let engine = crate::storage::engine::engine();
-
-        if let Some(schema_dict) = schema {
-            let schema_cols = Self::parse_schema_dict(schema_dict)?;
-            engine
-                .create_table_with_schema(&table_path, self.durability, &schema_cols)
-                .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))?;
+        let schema_cols = if let Some(schema_dict) = schema {
+            Some(Self::parse_schema_dict(schema_dict)?)
         } else {
-            engine
-                .create_table(&table_path, self.durability)
-                .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))?;
-        }
+            None
+        };
 
-        paths.insert(name.to_string(), table_path);
-        drop(paths);
+        py.allow_threads(|| {
+            if let Some(schema_cols) = schema_cols.as_ref() {
+                engine
+                    .create_table_with_schema(&table_path, self.durability, schema_cols)
+                    .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))
+            } else {
+                engine
+                    .create_table(&table_path, self.durability)
+                    .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))
+            }
+        })?;
+
+        self.table_paths
+            .write()
+            .insert(name.to_string(), table_path);
 
         *self.current_table.write() = name.to_string();
         Ok(())
     }
 
     /// Drop a table
-    fn drop_table(&self, name: &str) -> PyResult<()> {
+    fn drop_table(&self, py: Python<'_>, name: &str) -> PyResult<()> {
         // Invalidate cached backend first (releases file lock)
         self.invalidate_backend(name);
 
-        let mut paths = self.table_paths.write();
-        if let Some(path) = paths.remove(name) {
+        let path = self
+            .table_paths
+            .write()
+            .remove(name)
+            .ok_or_else(|| PyValueError::new_err(format!("Table not found: {}", name)))?;
+
+        py.allow_threads(|| {
             fs::remove_file(&path)
-                .map_err(|e| PyIOError::new_err(format!("Failed to delete table file: {}", e)))?;
-        } else {
-            return Err(PyValueError::new_err(format!("Table not found: {}", name)));
-        }
-        drop(paths);
+                .map_err(|e| PyIOError::new_err(format!("Failed to delete table file: {}", e)))
+        })?;
 
         if *self.current_table.read() == name {
             *self.current_table.write() = String::new();
@@ -4323,13 +4336,14 @@ impl ApexStorageImpl {
     /// zone maps, and bloom filters — an order of magnitude faster than repeated
     /// read_csv/read_json/read_parquet calls. The temp table is cleaned up when
     /// the ApexStorage is dropped or the client is closed.
-    fn register_temp_table(&self, name: &str, file_path: &str) -> PyResult<()> {
+    fn register_temp_table(&self, py: Python<'_>, name: &str, file_path: &str) -> PyResult<()> {
         use crate::query::executor::ApexExecutor;
 
         let temp_path = self.temp_dir.join(format!("{}.apex", name));
-        let _ = fs::create_dir_all(&self.temp_dir);
+        let temp_dir = self.temp_dir.clone();
+        let _ = py.allow_threads(|| fs::create_dir_all(&temp_dir));
 
-        if temp_path.exists() {
+        if py.allow_threads(|| temp_path.exists()) {
             return Err(PyValueError::new_err(format!(
                 "Temp table '{}' already exists. Use drop_temp_table() first.",
                 name
@@ -4352,15 +4366,17 @@ impl ApexStorageImpl {
 
         crate::query::executor::set_temp_dir(&self.temp_dir);
         let base_dir = self.current_base_dir();
-        let result = ApexExecutor::execute_copy_import(
-            &temp_path,
-            name,
-            file_path,
-            fmt,
-            &[],
-            &base_dir,
-            &base_dir,
-        );
+        let result = py.allow_threads(|| {
+            ApexExecutor::execute_copy_import(
+                &temp_path,
+                name,
+                file_path,
+                fmt,
+                &[],
+                &base_dir,
+                &base_dir,
+            )
+        });
         crate::query::executor::clear_temp_dir();
 
         match result {
@@ -4369,7 +4385,7 @@ impl ApexStorageImpl {
                 Ok(())
             }
             Err(e) => {
-                let _ = fs::remove_file(&temp_path);
+                let _ = py.allow_threads(|| fs::remove_file(&temp_path));
                 Err(PyIOError::new_err(format!(
                     "Failed to register temp table: {}",
                     e
@@ -4379,37 +4395,41 @@ impl ApexStorageImpl {
     }
 
     /// Drop a previously registered temporary table.
-    fn drop_temp_table(&self, name: &str) -> PyResult<()> {
+    fn drop_temp_table(&self, py: Python<'_>, name: &str) -> PyResult<()> {
         if let Some(path) = self.table_paths.write().remove(name) {
-            let _ = fs::remove_file(&path);
-            let _ = fs::remove_file(path.with_extension("apex.wal"));
-            crate::storage::engine::engine().invalidate(&path);
+            py.allow_threads(|| {
+                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(path.with_extension("apex.wal"));
+                crate::storage::engine::engine().invalidate(&path);
+            });
         }
         Ok(())
     }
 
     /// List all tables
-    fn list_tables(&self) -> Vec<String> {
+    fn list_tables(&self, py: Python<'_>) -> Vec<String> {
         // Scan directory for .apex files to ensure we catch tables created via SQL
-        let mut tables = Vec::new();
         let base_dir = self.current_base_dir();
-        if let Ok(entries) = fs::read_dir(&base_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|s| s == "apex")
-                    .unwrap_or(false)
-                {
-                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                        tables.push(stem.to_string());
+        py.allow_threads(|| {
+            let mut tables = Vec::new();
+            if let Ok(entries) = fs::read_dir(&base_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|s| s == "apex")
+                        .unwrap_or(false)
+                    {
+                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                            tables.push(stem.to_string());
+                        }
                     }
                 }
             }
-        }
-        tables.sort();
-        tables.dedup();
-        tables
+            tables.sort();
+            tables.dedup();
+            tables
+        })
     }
 
     // ========== Multi-Database Operations ==========
@@ -4417,13 +4437,15 @@ impl ApexStorageImpl {
     /// Switch to a named database (creates its subdirectory if needed).
     /// "default" or "" means the root directory (backward-compatible default).
     #[pyo3(name = "use_database_")]
-    fn use_database_(&self, db_name: &str) -> PyResult<()> {
+    fn use_database_(&self, py: Python<'_>, db_name: &str) -> PyResult<()> {
         let new_base_dir = if db_name.is_empty() || db_name.eq_ignore_ascii_case("default") {
             self.root_dir.clone()
         } else {
             let db_dir = self.root_dir.join(db_name);
-            fs::create_dir_all(&db_dir).map_err(|e| {
-                PyIOError::new_err(format!("Cannot create database '{}': {}", db_name, e))
+            py.allow_threads(|| {
+                fs::create_dir_all(&db_dir).map_err(|e| {
+                    PyIOError::new_err(format!("Cannot create database '{}': {}", db_name, e))
+                })
             })?;
             db_dir
         };
@@ -4452,32 +4474,35 @@ impl ApexStorageImpl {
     /// List all available databases (named subdirectories of root_dir).
     /// "default" is always included to represent the root-level tables.
     #[pyo3(name = "list_databases_")]
-    fn list_databases_(&self) -> Vec<String> {
-        let mut dbs = vec!["default".to_string()];
-        if let Ok(entries) = fs::read_dir(&self.root_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                        // Skip hidden dirs and internal dirs
-                        if !name.starts_with('.') && name != "fts_indexes" {
-                            dbs.push(name.to_string());
+    fn list_databases_(&self, py: Python<'_>) -> Vec<String> {
+        let root_dir = self.root_dir.clone();
+        py.allow_threads(|| {
+            let mut dbs = vec!["default".to_string()];
+            if let Ok(entries) = fs::read_dir(&root_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                            // Skip hidden dirs and internal dirs
+                            if !name.starts_with('.') && name != "fts_indexes" {
+                                dbs.push(name.to_string());
+                            }
                         }
                     }
                 }
             }
-        }
-        dbs.sort();
-        dbs.dedup();
-        dbs
+            dbs.sort();
+            dbs.dedup();
+            dbs
+        })
     }
 
     /// Get row count for current table (excluding deleted rows) using StorageEngine.
     /// LOCK-FREE: active_count is an AtomicU64 — no file lock needed for this metadata read.
-    fn row_count(&self) -> PyResult<u64> {
+    fn row_count(&self, py: Python<'_>) -> PyResult<u64> {
         let table_path = self.get_current_table_path()?;
         // If file doesn't exist (e.g., after drop_if_exists), return 0
-        if !table_path.exists() {
+        if !py.allow_threads(|| table_path.exists()) {
             return Ok(0);
         }
 
@@ -4489,16 +4514,18 @@ impl ApexStorageImpl {
 
         // No file lock needed — active_count is atomic and always consistent
         let engine = crate::storage::engine::engine();
-        let count = engine
-            .active_row_count(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let count = py.allow_threads(|| {
+            engine
+                .active_row_count(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))
+        })?;
 
         Ok(count)
     }
 
     /// Alias for row_count (compatibility)
-    fn count_rows(&self) -> PyResult<u64> {
-        self.row_count()
+    fn count_rows(&self, py: Python<'_>) -> PyResult<u64> {
+        self.row_count(py)
     }
 
     /// Whether the current table has V4 rows buffered in memory but not yet
@@ -4587,7 +4614,7 @@ impl ApexStorageImpl {
     }
 
     /// Ultra-fast row count for ANY table (resolves path, uses per-instance cache)
-    fn fast_row_count_for(&self, table_name: &str) -> PyResult<u64> {
+    fn fast_row_count_for(&self, py: Python<'_>, table_name: &str) -> PyResult<u64> {
         let table_path = self.resolve_table_path_for_count(table_name)?;
         let cache_key = Self::backend_cache_key(&table_path, table_name);
 
@@ -4598,7 +4625,8 @@ impl ApexStorageImpl {
         }
 
         // Global cache fallback
-        if let Ok(backend) = crate::query::get_cached_backend_pub(&table_path) {
+        if let Ok(backend) = py.allow_threads(|| crate::query::get_cached_backend_pub(&table_path))
+        {
             self.cached_backends
                 .insert(cache_key.clone(), Arc::clone(&backend));
             return Ok(backend.active_row_count());
@@ -4606,21 +4634,23 @@ impl ApexStorageImpl {
 
         // Engine fallback
         let engine = crate::storage::engine::engine();
-        let count = engine
-            .active_row_count(&table_path)
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let count = py.allow_threads(|| {
+            engine
+                .active_row_count(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))
+        })?;
         Ok(count)
     }
 
     /// Ultra-fast row count for the CURRENT table
-    fn fast_row_count(&self) -> PyResult<u64> {
+    fn fast_row_count(&self, py: Python<'_>) -> PyResult<u64> {
         let table_name = self.current_table.read().clone();
         if table_name.is_empty() {
             return Err(PyValueError::new_err(
                 "No table selected. Call create_table() or use_table() first.",
             ));
         }
-        self.fast_row_count_for(&table_name)
+        self.fast_row_count_for(py, &table_name)
     }
 
     /// Save current table
@@ -4749,7 +4779,7 @@ impl ApexStorageImpl {
     }
 
     /// Get estimated memory usage in bytes
-    fn estimate_memory_bytes(&self) -> PyResult<u64> {
+    fn estimate_memory_bytes(&self, py: Python<'_>) -> PyResult<u64> {
         let table_name = self.current_table.read().clone();
         let table_path = self.get_current_table_path()?;
         let cache_key = Self::backend_cache_key(&table_path, &table_name);
@@ -4760,7 +4790,7 @@ impl ApexStorageImpl {
             }
         }
         // No in-memory data (flushed to disk): estimate from file size
-        if let Ok(meta) = std::fs::metadata(&table_path) {
+        if let Ok(meta) = py.allow_threads(|| std::fs::metadata(&table_path)) {
             return Ok(meta.len());
         }
         Ok(0)
@@ -4775,7 +4805,7 @@ impl ApexStorageImpl {
     ///
     /// Returns:
     ///     True if applied, False if table is non-empty (no-op)
-    fn set_compression(&self, compression: &str) -> PyResult<bool> {
+    fn set_compression(&self, py: Python<'_>, compression: &str) -> PyResult<bool> {
         use crate::storage::on_demand::{CompressionType, OnDemandStorage};
         let comp = CompressionType::from_str_opt(compression).ok_or_else(|| {
             PyValueError::new_err(format!(
@@ -4784,31 +4814,35 @@ impl ApexStorageImpl {
             ))
         })?;
         let table_path = self.get_current_table_path()?;
-        let storage = if table_path.exists() {
-            OnDemandStorage::open_with_durability(&table_path, self.durability)
-        } else {
-            OnDemandStorage::create_with_durability(&table_path, self.durability)
-        }
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        storage
-            .set_compression(comp)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        py.allow_threads(|| {
+            let storage = if table_path.exists() {
+                OnDemandStorage::open_with_durability(&table_path, self.durability)
+            } else {
+                OnDemandStorage::create_with_durability(&table_path, self.durability)
+            }
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            storage
+                .set_compression(comp)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
     }
 
     /// Get the current compression type for the current table.
     ///
     /// Returns:
     ///     "none", "lz4", or "zstd"
-    fn get_compression(&self) -> PyResult<String> {
+    fn get_compression(&self, py: Python<'_>) -> PyResult<String> {
         use crate::storage::on_demand::OnDemandStorage;
         let table_path = self.get_current_table_path()?;
-        if table_path.exists() {
-            let storage = OnDemandStorage::open_with_durability(&table_path, self.durability)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Ok(storage.compression().as_str().to_string())
-        } else {
-            Ok("none".to_string())
-        }
+        py.allow_threads(|| {
+            if table_path.exists() {
+                let storage = OnDemandStorage::open_with_durability(&table_path, self.durability)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                Ok(storage.compression().as_str().to_string())
+            } else {
+                Ok("none".to_string())
+            }
+        })
     }
 
     /// Close storage
@@ -6167,7 +6201,7 @@ impl ApexStorageImpl {
             }
         }
 
-        if let Ok(backend) = self.get_backend_for_overlay(&table_path, &table_name) {
+        if let Ok(backend) = self.get_backend_for_overlay(py, &table_path, &table_name) {
             if let Some(true) = self.row_matches_exact_py_dict(&backend, id as u64, data)? {
                 return Ok(true);
             }
@@ -6176,7 +6210,7 @@ impl ApexStorageImpl {
         let fields = dict_to_values(data)?;
 
         if !fields.is_empty() {
-            if let Ok(backend) = self.get_backend_for_overlay(&table_path, &table_name) {
+            if let Ok(backend) = self.get_backend_for_overlay(py, &table_path, &table_name) {
                 if let Some(true) = self.row_matches_exact_fields(&backend, id as u64, &fields)? {
                     return Ok(true);
                 }
@@ -6185,9 +6219,9 @@ impl ApexStorageImpl {
 
         if durability == DurabilityLevel::Fast
             && !fields.is_empty()
-            && !self.table_has_secondary_indexes(&table_path, &table_name)
+            && !self.table_has_secondary_indexes(py, &table_path, &table_name)
         {
-            let backend = self.get_backend_for_overlay(&table_path, &table_name)?;
+            let backend = self.get_backend_for_overlay(py, &table_path, &table_name)?;
             if !backend.storage.has_constraints() {
                 let schema = backend.storage.get_schema();
                 let schema_cols: std::collections::HashSet<&str> =
@@ -6409,6 +6443,7 @@ impl ApexStorageImpl {
     #[pyo3(signature = (index_fields=None, lazy_load=false, cache_size=10000))]
     fn init_fts(
         &self,
+        py: Python<'_>,
         index_fields: Option<Vec<String>>,
         lazy_load: bool,
         cache_size: usize,
@@ -6427,33 +6462,40 @@ impl ApexStorageImpl {
         // does not replace a freshly backfilled FTS index with an empty one.
         if self.fts_manager.read().is_none() {
             let base_dir = self.current_base_dir();
-            let manager = if let Some(existing) = crate::query::executor::get_fts_manager(&base_dir)
-            {
-                existing
-            } else {
-                let fts_dir = base_dir.join("fts_indexes");
-                let config = FtsConfig {
-                    lazy_load,
-                    cache_size,
-                    ..FtsConfig::default()
-                };
-                Arc::new(FtsManager::new(&fts_dir, config))
-            };
-            // Register with the global SQL executor registry (enables MATCH() in PG Wire / Arrow Flight)
-            crate::query::executor::register_fts_manager(&base_dir, manager.clone());
+            let manager = py.allow_threads(|| {
+                if let Some(existing) = crate::query::executor::get_fts_manager(&base_dir) {
+                    existing
+                } else {
+                    let fts_dir = base_dir.join("fts_indexes");
+                    let config = FtsConfig {
+                        lazy_load,
+                        cache_size,
+                        ..FtsConfig::default()
+                    };
+                    Arc::new(FtsManager::new(&fts_dir, config))
+                }
+            });
+            py.allow_threads(|| {
+                crate::query::executor::register_fts_manager(&base_dir, manager.clone());
+            });
             *self.fts_manager.write() = Some(manager);
         } else {
             // Already initialized — ensure global registry is up to date
             let mgr_arc = self.fts_manager.read().clone();
             if let Some(m) = mgr_arc {
-                crate::query::executor::register_fts_manager(&self.current_base_dir(), m);
+                let base_dir = self.current_base_dir();
+                py.allow_threads(|| {
+                    crate::query::executor::register_fts_manager(&base_dir, m);
+                });
             }
         }
 
         // Touch/create engine for current table
-        let mgr = self.fts_manager.read();
-        if let Some(m) = mgr.as_ref() {
-            let _ = m.get_engine(&table_name);
+        let mgr = self.fts_manager.read().clone();
+        if let Some(m) = mgr {
+            py.allow_threads(|| {
+                let _ = m.get_engine(&table_name);
+            });
         }
 
         Ok(())
@@ -6507,19 +6549,20 @@ impl ApexStorageImpl {
     #[pyo3(signature = (delete_files=false))]
     fn fts_remove_engine(&self, py: Python<'_>, delete_files: bool) -> PyResult<()> {
         let table_name = self.current_table.read().clone();
-        crate::query::executor::wait_fts_backfill(&self.current_base_dir(), &table_name);
+        let base_dir = self.current_base_dir();
 
         // Remove any cached index field configuration for this table
         self.fts_index_fields.write().remove(&table_name);
 
-        let mut mgr = self.fts_manager.write();
-        if let Some(m) = mgr.as_ref() {
-            // Release GIL during engine removal (I/O operation)
-            py.allow_threads(|| {
+        let mgr = self.fts_manager.read().clone();
+        py.allow_threads(|| -> PyResult<()> {
+            crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
+            if let Some(m) = mgr {
                 m.remove_engine(&table_name, delete_files)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-            })?;
-        }
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            }
+            Ok(())
+        })?;
 
         Ok(())
     }
@@ -7054,19 +7097,21 @@ impl ApexStorageImpl {
     }
 
     /// Get FTS stats
-    fn get_fts_stats(&self) -> PyResult<Option<(usize, usize)>> {
+    fn get_fts_stats(&self, py: Python<'_>) -> PyResult<Option<(usize, usize)>> {
         let table_name = self.current_table.read().clone();
-        let mgr = self.fts_manager.read();
+        let mgr = self.fts_manager.read().clone();
 
-        if let Some(m) = mgr.as_ref() {
-            if let Ok(engine) = m.get_engine(&table_name) {
-                let stats = engine.stats();
-                let doc_count = stats.get("doc_count").copied().unwrap_or(0) as usize;
-                let term_count = stats.get("term_count").copied().unwrap_or(0) as usize;
-                Ok(Some((doc_count, term_count)))
-            } else {
-                Ok(None)
-            }
+        if let Some(m) = mgr {
+            Ok(py.allow_threads(|| {
+                if let Ok(engine) = m.get_engine(&table_name) {
+                    let stats = engine.stats();
+                    let doc_count = stats.get("doc_count").copied().unwrap_or(0) as usize;
+                    let term_count = stats.get("term_count").copied().unwrap_or(0) as usize;
+                    Some((doc_count, term_count))
+                } else {
+                    None
+                }
+            }))
         } else {
             Ok(None)
         }

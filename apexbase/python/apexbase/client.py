@@ -349,26 +349,40 @@ class ApexClient:
         # Register to global registry (this may set _shared_storage for sharing)
         if self._auto_manage:
             _registry.register(self, str(self._db_path))
+        self._storage_lock = None
+        if self._auto_manage:
+            self._storage_lock = _registry.get_storage_lock(str(self._db_path))
         
         # Validate durability parameter
         if durability not in ('fast', 'safe', 'max'):
             raise ValueError(f"durability must be 'fast', 'safe', or 'max', got '{durability}'")
         self._durability = durability
         
-        # Initialize storage: use shared if available, otherwise create new
-        # When drop_if_exists=True, always create fresh storage (ignore shared)
-        if self._shared_storage is not None and not drop_if_exists:
-            # Use shared storage from another client
-            self._storage = self._shared_storage
-        else:
-            # First client - create new storage
-            try:
-                self._storage = ApexStorage(str(self._db_path), drop_if_exists=drop_if_exists, durability=durability)
-            except TypeError:
-                self._storage = ApexStorage(str(self._db_path), drop_if_exists=drop_if_exists)
-            # Register storage with registry for sharing
-            if self._auto_manage:
-                _registry.set_storage(str(self._db_path), self._storage)
+        # Initialize storage: use shared if available, otherwise create new.
+        # The per-path lock serializes concurrent constructors for the same DB.
+        storage_context = self._storage_lock if self._storage_lock is not None else _NULL_CONTEXT
+        with storage_context:
+            shared_storage = self._shared_storage
+            if shared_storage is None and self._auto_manage and not drop_if_exists:
+                shared_storage = _registry.get_storage(str(self._db_path))
+                if shared_storage is not None:
+                    self._is_shared_client = True
+
+            # When drop_if_exists=True, always create fresh storage (ignore shared)
+            if shared_storage is not None and not drop_if_exists:
+                self._storage = shared_storage
+            else:
+                try:
+                    self._storage = ApexStorage(
+                        str(self._db_path),
+                        drop_if_exists=drop_if_exists,
+                        durability=durability,
+                    )
+                except TypeError:
+                    self._storage = ApexStorage(str(self._db_path), drop_if_exists=drop_if_exists)
+                self._is_shared_client = False
+                if self._auto_manage:
+                    _registry.set_storage(str(self._db_path), self._storage)
         
         self._connected = True
         self._lock = threading.RLock()
@@ -434,11 +448,6 @@ class ApexClient:
         self._store_one_memtable = getattr(self._storage, "store_one_memtable", None)
         self._store_one_delta = getattr(self._storage, "store_one_delta", None)
         self._store_one_delta_durable = getattr(self._storage, "store_one_delta_durable", None)
-
-        # Get the storage lock for thread-safe concurrent access
-        self._storage_lock = None
-        if self._auto_manage:
-            self._storage_lock = _registry.get_storage_lock(str(self._db_path))
 
     def _load_fts_config(self) -> None:
         try:
@@ -622,17 +631,20 @@ class ApexClient:
 
     def use_table(self, table_name: str):
         self._check_connection()
-        with self._lock:
-            switching_tables = (
-                self._current_table is not None
-                and self._current_table != table_name
-            )
-            if switching_tables:
-                self._flush_pending_memtable_rows_for_read()
-                self.flush_buffered_writes()
-            self._storage.use_table(table_name)
-            if self._current_table != table_name:
-                self._invalidate_replace_cache()
+        storage_lock = getattr(self, '_storage_lock', None)
+        storage_context = storage_lock if storage_lock is not None else _NULL_CONTEXT
+        with storage_context:
+            with self._lock:
+                switching_tables = (
+                    self._current_table is not None
+                    and self._current_table != table_name
+                )
+                if switching_tables:
+                    self._flush_pending_memtable_rows_for_read()
+                    self.flush_buffered_writes()
+                self._storage.use_table(table_name)
+                if self._current_table != table_name:
+                    self._invalidate_replace_cache()
         self._current_table = table_name
         if self._fts_config_known_present or self._fts_tables:
             self._sync_fts_config_from_disk()
@@ -655,25 +667,31 @@ class ApexClient:
                     Example: {"name": "string", "age": "int64", "score": "float64"}
         """
         self._check_connection()
-        with self._lock:
-            self._flush_pending_memtable_rows_for_read()
-            self.flush_buffered_writes()
-            try:
-                self._storage.create_table(table_name, schema)
-            except OSError as e:
-                raise ValueError(str(e)) from e
-            self._invalidate_replace_cache()
+        storage_lock = getattr(self, '_storage_lock', None)
+        storage_context = storage_lock if storage_lock is not None else _NULL_CONTEXT
+        with storage_context:
+            with self._lock:
+                self._flush_pending_memtable_rows_for_read()
+                self.flush_buffered_writes()
+                try:
+                    self._storage.create_table(table_name, schema)
+                except OSError as e:
+                    raise ValueError(str(e)) from e
+                self._invalidate_replace_cache()
         self._current_table = table_name
 
     def drop_table(self, table_name: str):
         self._check_connection()
-        with self._lock:
-            self.flush_buffered_writes()
-            try:
-                self._storage.drop_table(table_name)
-            except (ValueError, RuntimeError):
-                pass
-            self._invalidate_replace_cache()
+        storage_lock = getattr(self, '_storage_lock', None)
+        storage_context = storage_lock if storage_lock is not None else _NULL_CONTEXT
+        with storage_context:
+            with self._lock:
+                self.flush_buffered_writes()
+                try:
+                    self._storage.drop_table(table_name)
+                except (ValueError, RuntimeError):
+                    pass
+                self._invalidate_replace_cache()
         
         if table_name in self._fts_tables:
             self._fts_tables.pop(table_name, None)
@@ -3503,44 +3521,56 @@ class ApexClient:
 
     def _force_close(self):
         try:
-            if hasattr(self, '_storage') and self._storage is not None:
-                self._storage.close()
-                self._storage = None
+            self.close()
         except Exception:
-            pass
-        self._is_closed = True
+            try:
+                if hasattr(self, '_storage') and self._storage is not None:
+                    self._storage = None
+            except Exception:
+                pass
+            self._is_closed = True
 
     def close(self):
         if self._is_closed:
             return
-        
-        try:
-            if hasattr(self, '_storage') and self._storage is not None:
-                try:
-                    self.flush_buffered_writes()
-                except Exception:
-                    pass
-                try:
-                    self._flush_pending_memtable_rows_for_read()
-                except Exception:
-                    pass
-                # Best-effort: ensure FTS index is persisted across reopen
-                try:
-                    if any((isinstance(v, dict) and v.get('enabled', False)) for v in self._fts_tables.values()):
-                        self._storage._fts_flush()
-                except Exception:
-                    pass
-                # Only close storage if this is the first client (not shared)
-                # Shared clients should not close the storage
-                if not self._is_shared_client:
-                    self._storage.close()
+
+        storage_lock = getattr(self, '_storage_lock', None)
+        storage_context = storage_lock if storage_lock is not None else _NULL_CONTEXT
+        storage_to_close = None
+        with storage_context:
+            if self._is_closed:
+                return
+            try:
+                if hasattr(self, '_storage') and self._storage is not None:
+                    try:
+                        self.flush_buffered_writes()
+                    except Exception:
+                        pass
+                    try:
+                        self._flush_pending_memtable_rows_for_read()
+                    except Exception:
+                        pass
+                    # Best-effort: ensure FTS index is persisted across reopen
+                    try:
+                        if any((isinstance(v, dict) and v.get('enabled', False)) for v in self._fts_tables.values()):
+                            self._storage._fts_flush()
+                    except Exception:
+                        pass
+            finally:
+                self._is_closed = True
+                current_storage = getattr(self, '_storage', None)
                 self._storage = None
-        finally:
-            self._is_closed = True
-            if self._auto_manage:
-                # Pass client_id for proper reference counting
-                client_id = getattr(self, '_client_id', None)
-                _registry.unregister(str(self._db_path), client_id)
+                if self._auto_manage:
+                    client_id = getattr(self, '_client_id', None)
+                    storage_to_close = _registry.unregister(str(self._db_path), client_id)
+                else:
+                    storage_to_close = current_storage
+
+        if storage_to_close is not None:
+            try:
+                storage_to_close.close()
+            except Exception:
+                pass
 
     @classmethod
     def create_clean(cls, dirpath=None, **kwargs):
