@@ -194,16 +194,17 @@ jobs:
         env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
 
         subprocess.check_call([str(python), "-m", "pip", "install", "--upgrade", "pip"])
-        # Keep the native-extension test stack bounded; PyPI latest has hit
-        # macOS arm64 segfaults before the first ApexStorage construction.
+        # Keep the native-extension test stack pinned. The pytest suite loads
+        # ApexBase, NumPy, PyArrow, pandas, and Polars in the same process; using
+        # floating latest wheels has produced macOS native hangs during pytest.
         test_deps = [
-            "pytest>=8.4,<9",
-            "pytest-timeout>=2.3,<3",
+            "pytest==8.4.2",
+            "pytest-timeout==2.4.0",
             "maturin==1.9.1",
-            "numpy<2.4.4",
-            "pyarrow<24",
-            "pandas<3.0.2",
-            "polars<1.40",
+            "numpy==2.1.3",
+            "pyarrow==23.0.1",
+            "pandas==3.0.1",
+            "polars==1.39.3",
         ]
         subprocess.check_call([str(python), "-m", "pip", "install", *test_deps])
         subprocess.check_call([str(python), "-m", "maturin", "develop", "--release", "--skip-install"], env=env)
@@ -233,9 +234,38 @@ jobs:
         PY
 
     - name: Run tests
-      timeout-minutes: 60
+      timeout-minutes: 10
       run: |
-        python -m pytest --ignore=test/test_memory_vs_duckdb.py --timeout=120
+        python - <<'PY'
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path("apexbase/python").resolve()))
+
+        import apexbase
+        import apexbase._core as core
+        import numpy
+        import pandas
+        import polars
+        import pyarrow
+        import pytest
+
+        print(f"python={sys.version}")
+        print(f"apexbase={apexbase.__file__}")
+        print(f"apexbase_core={core.__file__}")
+        print(f"pytest={pytest.__version__}")
+        print(f"numpy={numpy.__version__}")
+        print(f"pyarrow={pyarrow.__version__}")
+        print(f"pandas={pandas.__version__}")
+        print(f"polars={polars.__version__}")
+        PY
+        python -X faulthandler -m pytest \
+          --ignore=test/test_memory_vs_duckdb.py \
+          --timeout=30 \
+          --durations=40
+      env:
+        PYTHONFAULTHANDLER: "1"
+        RUST_BACKTRACE: "1"
 
   # ── Build Linux wheels (manylinux) ──
   build-wheels-linux:
