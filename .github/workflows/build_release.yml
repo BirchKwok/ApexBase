@@ -259,6 +259,7 @@ jobs:
 
     - name: Run tests
       timeout-minutes: 10
+      shell: bash
       run: |
         python - <<'PY'
         import sys
