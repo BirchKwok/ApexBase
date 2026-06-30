@@ -4822,7 +4822,15 @@ impl OnDemandStorage {
     /// Check if any column has constraints defined
     pub fn has_constraints(&self) -> bool {
         let schema = self.schema.read();
-        schema.constraints.iter().any(|c| c.not_null || c.primary_key || c.unique || c.check_expr_sql.is_some() || c.foreign_key.is_some())
+        schema.constraints.iter().any(|c| {
+            c.not_null
+                || c.primary_key
+                || c.unique
+                || c.default_value.is_some()
+                || c.check_expr_sql.is_some()
+                || c.foreign_key.is_some()
+                || c.autoincrement
+        })
     }
 
     /// Set constraints for a column by name

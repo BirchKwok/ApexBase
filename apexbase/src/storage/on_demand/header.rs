@@ -512,6 +512,8 @@ pub enum DefaultValue {
     CurrentDate,
     CurrentTimestamp,
     UnixTimestamp,
+    Date(i32),
+    Timestamp(i64),
 }
 
 /// Per-column constraint flags stored in schema
@@ -666,6 +668,14 @@ impl OnDemandSchema {
                         Some(DefaultValue::UnixTimestamp) => {
                             buf.push(8);
                         }
+                        Some(DefaultValue::Date(v)) => {
+                            buf.push(9);
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
+                        Some(DefaultValue::Timestamp(v)) => {
+                            buf.push(10);
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
                         None => {
                             buf.push(0); // no default
                         }
@@ -817,6 +827,18 @@ impl OnDemandSchema {
                         6 => Some(DefaultValue::CurrentDate),
                         7 => Some(DefaultValue::CurrentTimestamp),
                         8 => Some(DefaultValue::UnixTimestamp),
+                        9 => {
+                            if pos + 4 > bytes.len() { break; }
+                            let v = i32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+                            pos += 4;
+                            Some(DefaultValue::Date(v))
+                        }
+                        10 => {
+                            if pos + 8 > bytes.len() { break; }
+                            let v = i64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
+                            pos += 8;
+                            Some(DefaultValue::Timestamp(v))
+                        }
                         _ => None, // 0 = no default
                     };
                     if i < schema.constraints.len() {
@@ -871,4 +893,3 @@ impl OnDemandSchema {
         Ok(schema)
     }
 }
-

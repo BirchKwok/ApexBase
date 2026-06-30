@@ -1343,6 +1343,70 @@ fn test_constraint_default_time_functions() {
 }
 
 #[test]
+fn test_constraint_default_expressions_and_insert_default() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    exec_multi(
+        "CREATE TABLE t_default_expr (
+            id INT DEFAULT 7,
+            ttl INT DEFAULT (60 * 60),
+            status TEXT DEFAULT LOWER('ACTIVE'),
+            created TEXT DEFAULT CAST('2026-01-02' AS DATE)
+        )",
+        base,
+    )
+    .unwrap();
+    exec_multi("INSERT INTO t_default_expr DEFAULT VALUES", base).unwrap();
+    exec_multi(
+        "INSERT INTO t_default_expr (id, ttl, status, created) VALUES (8, DEFAULT, DEFAULT, DEFAULT)",
+        base,
+    )
+    .unwrap();
+    let result = exec_multi(
+        "SELECT id, ttl, status, created FROM t_default_expr ORDER BY id",
+        base,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let id = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let ttl = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let status = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let created = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(id.value(0), 7);
+    assert_eq!(id.value(1), 8);
+    assert_eq!(ttl.value(0), 3600);
+    assert_eq!(ttl.value(1), 3600);
+    assert_eq!(status.value(0), "active");
+    assert_eq!(status.value(1), "active");
+    assert_eq!(created.value(0), "2026-01-02");
+    assert_eq!(created.value(1), "2026-01-02");
+    assert_err_contains(
+        exec_multi(
+            "CREATE TABLE t_bad_default (a INT, b INT DEFAULT a + 1)",
+            base,
+        ),
+        "cannot reference column",
+    );
+}
+
+#[test]
 fn test_constraint_update_not_null_reject() {
     let dir = tempdir().unwrap();
     let base = dir.path();

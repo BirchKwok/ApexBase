@@ -51,6 +51,19 @@ impl DefaultValueFunction {
     }
 }
 
+/// A value item in an INSERT ... VALUES row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InsertValue {
+    Value(Value),
+    Default,
+}
+
+impl From<Value> for InsertValue {
+    fn from(value: Value) -> Self {
+        Self::Value(value)
+    }
+}
+
 /// Column definition for CREATE TABLE
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnDef {
@@ -115,12 +128,12 @@ pub enum SqlStatement {
     Insert {
         table: String,
         columns: Option<Vec<String>>,
-        values: Vec<Vec<Value>>,
+        values: Vec<Vec<InsertValue>>,
     },
     InsertOnConflict {
         table: String,
         columns: Option<Vec<String>>,
-        values: Vec<Vec<Value>>,
+        values: Vec<Vec<InsertValue>>,
         conflict_columns: Vec<String>,
         do_update: Option<Vec<(String, SqlExpr)>>,
     },
@@ -2434,7 +2447,7 @@ impl SqlParser {
                 } else {
                     None
                 };
-                // INSERT ... SELECT or INSERT ... VALUES
+                // INSERT ... SELECT, INSERT ... DEFAULT VALUES, or INSERT ... VALUES
                 if matches!(self.current(), Token::Select) || matches!(self.current(), Token::With)
                 {
                     let query = self.parse_statement()?;
@@ -2442,6 +2455,22 @@ impl SqlParser {
                         table,
                         columns,
                         query: Box::new(query),
+                    })
+                } else if matches!(self.current(), Token::Identifier(ref s) if s.eq_ignore_ascii_case("DEFAULT"))
+                {
+                    if columns.is_some() {
+                        let (start, _) = self.current_span();
+                        return Err(self.syntax_error(
+                            start,
+                            "INSERT DEFAULT VALUES cannot use a column list".to_string(),
+                        ));
+                    }
+                    self.advance();
+                    self.expect(Token::Values)?;
+                    Ok(SqlStatement::Insert {
+                        table,
+                        columns: Some(Vec::new()),
+                        values: vec![Vec::new()],
                     })
                 } else {
                     self.expect(Token::Values)?;
@@ -5603,58 +5632,7 @@ impl SqlParser {
                 }
                 Token::Identifier(s) if s.to_uppercase() == "DEFAULT" => {
                     self.advance();
-                    // Parse default value (literal or no-argument time function)
-                    let constraint = match self.current().clone() {
-                        Token::IntLit(n) => {
-                            self.advance();
-                            ColumnConstraintKind::Default(Value::Int64(n))
-                        }
-                        Token::FloatLit(f) => {
-                            self.advance();
-                            ColumnConstraintKind::Default(Value::Float64(f))
-                        }
-                        Token::StringLit(s) => {
-                            self.advance();
-                            ColumnConstraintKind::Default(Value::String(s))
-                        }
-                        Token::True => {
-                            self.advance();
-                            ColumnConstraintKind::Default(Value::Bool(true))
-                        }
-                        Token::False => {
-                            self.advance();
-                            ColumnConstraintKind::Default(Value::Bool(false))
-                        }
-                        Token::Null => {
-                            self.advance();
-                            ColumnConstraintKind::Default(Value::Null)
-                        }
-                        Token::Identifier(name) => {
-                            let func = DefaultValueFunction::from_name(&name).ok_or_else(|| {
-                                let (start, _) = self.current_span();
-                                self.syntax_error(
-                                    start,
-                                    "Expected literal value or supported time function after DEFAULT"
-                                        .to_string(),
-                                )
-                            })?;
-                            self.advance();
-                            if matches!(self.current(), Token::LParen) {
-                                self.advance();
-                                self.expect(Token::RParen)?;
-                            }
-                            ColumnConstraintKind::DefaultFunction(func)
-                        }
-                        _ => {
-                            let (start, _) = self.current_span();
-                            return Err(self.syntax_error(
-                                start,
-                                "Expected literal value or supported time function after DEFAULT"
-                                    .to_string(),
-                            ));
-                        }
-                    };
-                    constraints.push(constraint);
+                    constraints.push(self.parse_default_constraint()?);
                 }
                 Token::Identifier(s)
                     if s.to_uppercase() == "AUTOINCREMENT"
@@ -5667,6 +5645,270 @@ impl SqlParser {
             }
         }
         Ok(constraints)
+    }
+
+    fn parse_default_constraint(&mut self) -> Result<ColumnConstraintKind, ApexError> {
+        if let Token::Identifier(name) = self.current().clone() {
+            if let Some(func) = DefaultValueFunction::from_name(&name) {
+                let next = self.tokens.get(self.pos + 1).map(|t| &t.token);
+                let next2 = self.tokens.get(self.pos + 2).map(|t| &t.token);
+                if !matches!(next, Some(Token::LParen)) {
+                    self.advance();
+                    return Ok(ColumnConstraintKind::DefaultFunction(func));
+                }
+                if matches!(next2, Some(Token::RParen)) {
+                    self.advance();
+                    self.expect(Token::LParen)?;
+                    self.expect(Token::RParen)?;
+                    return Ok(ColumnConstraintKind::DefaultFunction(func));
+                }
+            }
+        }
+
+        let expr = self.parse_expr()?;
+        if let Some(func) = Self::default_function_from_expr(&expr) {
+            return Ok(ColumnConstraintKind::DefaultFunction(func));
+        }
+        let value = Self::eval_default_constant_expr(&expr)?;
+        Ok(ColumnConstraintKind::Default(value))
+    }
+
+    fn default_function_from_expr(expr: &SqlExpr) -> Option<DefaultValueFunction> {
+        match expr {
+            SqlExpr::Column(name) => DefaultValueFunction::from_name(name),
+            SqlExpr::Function { name, args } if args.is_empty() => {
+                DefaultValueFunction::from_name(name)
+            }
+            SqlExpr::Paren(inner) => Self::default_function_from_expr(inner),
+            _ => None,
+        }
+    }
+
+    fn eval_default_constant_expr(expr: &SqlExpr) -> Result<Value, ApexError> {
+        match expr {
+            SqlExpr::Literal(v) => Ok(v.clone()),
+            SqlExpr::Paren(inner) => Self::eval_default_constant_expr(inner),
+            SqlExpr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => match Self::eval_default_constant_expr(expr)? {
+                Value::Int64(v) => Ok(Value::Int64(-v)),
+                Value::Float64(v) => Ok(Value::Float64(-v)),
+                other => Err(ApexError::QueryParseError(format!(
+                    "DEFAULT unary minus requires numeric literal, got {:?}",
+                    other
+                ))),
+            },
+            SqlExpr::BinaryOp { left, op, right } => {
+                let l = Self::eval_default_constant_expr(left)?;
+                let r = Self::eval_default_constant_expr(right)?;
+                Self::eval_default_binary(&l, op, &r)
+            }
+            SqlExpr::Cast { expr, data_type } => {
+                let value = Self::eval_default_constant_expr(expr)?;
+                Self::cast_default_value(value, *data_type)
+            }
+            SqlExpr::Function { name, args } => Self::eval_default_function(name, args),
+            SqlExpr::Column(name) => Err(ApexError::QueryParseError(format!(
+                "DEFAULT expression cannot reference column '{}'",
+                name
+            ))),
+            SqlExpr::ScalarSubquery { .. }
+            | SqlExpr::ExistsSubquery { .. }
+            | SqlExpr::InSubquery { .. } => Err(ApexError::QueryParseError(
+                "DEFAULT expression cannot contain subqueries".to_string(),
+            )),
+            _ => Err(ApexError::QueryParseError(
+                "Unsupported DEFAULT expression; only row-independent constant expressions are allowed"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn eval_default_binary(
+        left: &Value,
+        op: &BinaryOperator,
+        right: &Value,
+    ) -> Result<Value, ApexError> {
+        let li = match left {
+            Value::Int64(v) => Some(*v),
+            _ => None,
+        };
+        let ri = match right {
+            Value::Int64(v) => Some(*v),
+            _ => None,
+        };
+        let lf = left.as_f64().ok_or_else(|| {
+            ApexError::QueryParseError("DEFAULT binary expression requires numeric operands".into())
+        })?;
+        let rf = right.as_f64().ok_or_else(|| {
+            ApexError::QueryParseError("DEFAULT binary expression requires numeric operands".into())
+        })?;
+
+        match op {
+            BinaryOperator::Add => {
+                if let (Some(a), Some(b)) = (li, ri) {
+                    Ok(Value::Int64(a + b))
+                } else {
+                    Ok(Value::Float64(lf + rf))
+                }
+            }
+            BinaryOperator::Sub => {
+                if let (Some(a), Some(b)) = (li, ri) {
+                    Ok(Value::Int64(a - b))
+                } else {
+                    Ok(Value::Float64(lf - rf))
+                }
+            }
+            BinaryOperator::Mul => {
+                if let (Some(a), Some(b)) = (li, ri) {
+                    Ok(Value::Int64(a * b))
+                } else {
+                    Ok(Value::Float64(lf * rf))
+                }
+            }
+            BinaryOperator::Div => {
+                if rf == 0.0 {
+                    return Err(ApexError::QueryParseError(
+                        "DEFAULT expression division by zero".to_string(),
+                    ));
+                }
+                Ok(Value::Float64(lf / rf))
+            }
+            BinaryOperator::Mod => {
+                if let (Some(a), Some(b)) = (li, ri) {
+                    if b == 0 {
+                        return Err(ApexError::QueryParseError(
+                            "DEFAULT expression modulo by zero".to_string(),
+                        ));
+                    }
+                    Ok(Value::Int64(a % b))
+                } else {
+                    Err(ApexError::QueryParseError(
+                        "DEFAULT modulo requires integer operands".to_string(),
+                    ))
+                }
+            }
+            _ => Err(ApexError::QueryParseError(
+                "DEFAULT expression only supports arithmetic operators".to_string(),
+            )),
+        }
+    }
+
+    fn eval_default_function(name: &str, args: &[SqlExpr]) -> Result<Value, ApexError> {
+        let upper = name.to_ascii_uppercase();
+        let values: Vec<Value> = args
+            .iter()
+            .map(Self::eval_default_constant_expr)
+            .collect::<Result<_, _>>()?;
+
+        match upper.as_str() {
+            "LOWER" | "LCASE" if values.len() == 1 => Ok(Value::String(
+                values[0].to_string_value().to_ascii_lowercase(),
+            )),
+            "UPPER" | "UCASE" if values.len() == 1 => Ok(Value::String(
+                values[0].to_string_value().to_ascii_uppercase(),
+            )),
+            "CONCAT" => Ok(Value::String(
+                values
+                    .iter()
+                    .map(Value::to_string_value)
+                    .collect::<Vec<_>>()
+                    .join(""),
+            )),
+            "ABS" if values.len() == 1 => match values[0] {
+                Value::Int64(v) => Ok(Value::Int64(v.abs())),
+                Value::Float64(v) => Ok(Value::Float64(v.abs())),
+                _ => Err(ApexError::QueryParseError(
+                    "ABS() in DEFAULT requires numeric argument".to_string(),
+                )),
+            },
+            "UNIX_TIMESTAMP" if values.len() == 1 => {
+                if let Value::String(ref s) = values[0] {
+                    Ok(Value::Int64(Self::parse_default_timestamp_seconds(s)?))
+                } else {
+                    Err(ApexError::QueryParseError(
+                        "UNIX_TIMESTAMP() in DEFAULT requires a string argument".to_string(),
+                    ))
+                }
+            }
+            _ => Err(ApexError::QueryParseError(format!(
+                "Unsupported function '{}' in DEFAULT expression",
+                name
+            ))),
+        }
+    }
+
+    fn cast_default_value(value: Value, data_type: DataType) -> Result<Value, ApexError> {
+        match data_type {
+            DataType::String => Ok(Value::String(value.to_string_value())),
+            DataType::Bool => match value {
+                Value::Bool(v) => Ok(Value::Bool(v)),
+                Value::String(s) => Ok(Value::Bool(matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "true" | "t" | "1" | "yes"
+                ))),
+                _ => Ok(Value::Bool(value.as_i64().unwrap_or(0) != 0)),
+            },
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+                .map(Value::Int64)
+                .ok_or_else(|| ApexError::QueryParseError("Invalid DEFAULT integer cast".into())),
+            DataType::Float32 | DataType::Float64 => value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|s| s.parse::<f64>().ok()))
+                .map(Value::Float64)
+                .ok_or_else(|| ApexError::QueryParseError("Invalid DEFAULT float cast".into())),
+            DataType::Date => match value {
+                Value::Date(v) => Ok(Value::Date(v)),
+                Value::String(s) => Self::parse_default_date_days(&s).map(Value::Date),
+                _ => value
+                    .as_i64()
+                    .map(|v| Value::Date(v as i32))
+                    .ok_or_else(|| ApexError::QueryParseError("Invalid DEFAULT DATE cast".into())),
+            },
+            DataType::Timestamp => match value {
+                Value::Timestamp(v) => Ok(Value::Timestamp(v)),
+                Value::String(s) => Self::parse_default_timestamp_micros(&s).map(Value::Timestamp),
+                _ => value.as_i64().map(Value::Timestamp).ok_or_else(|| {
+                    ApexError::QueryParseError("Invalid DEFAULT TIMESTAMP cast".into())
+                }),
+            },
+            _ => Err(ApexError::QueryParseError(format!(
+                "Unsupported DEFAULT cast target: {}",
+                data_type
+            ))),
+        }
+    }
+
+    fn parse_default_date_days(s: &str) -> Result<i32, ApexError> {
+        let d = chrono::NaiveDate::parse_from_str(&s[..10.min(s.len())], "%Y-%m-%d")
+            .map_err(|_| ApexError::QueryParseError("Invalid DEFAULT DATE literal".into()))?;
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        Ok((d - epoch).num_days() as i32)
+    }
+
+    fn parse_default_timestamp_micros(s: &str) -> Result<i64, ApexError> {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+            return Ok(dt.and_utc().timestamp_micros());
+        }
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+            return Ok(dt.and_utc().timestamp_micros());
+        }
+        let days = Self::parse_default_date_days(s)?;
+        Ok(days as i64 * 86_400_000_000)
+    }
+
+    fn parse_default_timestamp_seconds(s: &str) -> Result<i64, ApexError> {
+        Ok(Self::parse_default_timestamp_micros(s)? / 1_000_000)
     }
 
     /// Parse data type for column definition
@@ -5849,7 +6091,7 @@ impl SqlParser {
     }
 
     /// Parse VALUES clause for INSERT
-    fn parse_values_list(&mut self) -> Result<Vec<Vec<Value>>, ApexError> {
+    fn parse_values_list(&mut self) -> Result<Vec<Vec<InsertValue>>, ApexError> {
         let mut rows = Vec::new();
 
         loop {
@@ -5857,7 +6099,13 @@ impl SqlParser {
             let mut row = Vec::new();
 
             loop {
-                let value = self.parse_literal_value()?;
+                let value = if matches!(self.current(), Token::Identifier(ref s) if s.eq_ignore_ascii_case("DEFAULT"))
+                {
+                    self.advance();
+                    InsertValue::Default
+                } else {
+                    InsertValue::Value(self.parse_literal_value()?)
+                };
                 row.push(value);
 
                 if matches!(self.current(), Token::Comma) {

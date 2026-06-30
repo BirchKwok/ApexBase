@@ -16,6 +16,18 @@ struct JsonNumericFilter {
     val_f64: f64,
 }
 
+struct DefaultEvalContext {
+    now: chrono::DateTime<chrono::Utc>,
+}
+
+impl DefaultEvalContext {
+    fn new() -> Self {
+        Self {
+            now: chrono::Utc::now(),
+        }
+    }
+}
+
 fn parse_pushdown_filter(
     filter_str: &str,
     schema: &arrow::datatypes::Schema,
@@ -519,18 +531,30 @@ impl ApexExecutor {
                 };
                 let remember_base_id = cached_base_id.is_none();
                 let base_id = base_root + existing_inserts;
-                let col_names: Vec<String> = if let Some(cols) = &columns {
-                    cols.clone()
-                } else {
-                    let opened = match storage.take() {
-                        Some(opened) => opened,
-                        None => TableStorageBackend::open_for_insert(&table_path)?,
+                let (col_names, resolved_values) =
+                    if Self::is_insert_default_values(columns.as_deref(), &values) {
+                        drop(storage.take());
+                        Self::resolve_default_values_insert_for_path(&table_path)?
+                    } else {
+                        let col_names: Vec<String> = if let Some(cols) = &columns {
+                            cols.clone()
+                        } else {
+                            let opened = match storage.take() {
+                                Some(opened) => opened,
+                                None => TableStorageBackend::open_for_insert(&table_path)?,
+                            };
+                            let schema = opened.get_schema();
+                            schema.iter().map(|(n, _)| n.clone()).collect()
+                        };
+                        let resolved_values = Self::resolve_insert_values_for_path(
+                            &table_path,
+                            columns.as_deref(),
+                            &values,
+                        )?;
+                        (col_names, resolved_values)
                     };
-                    let schema = opened.get_schema();
-                    schema.iter().map(|(n, _)| n.clone()).collect()
-                };
                 let mut pending_rows = Vec::with_capacity(values.len());
-                for (ri, row_values) in values.iter().enumerate() {
+                for (ri, row_values) in resolved_values.iter().enumerate() {
                     let row_id = base_id + ri as u64;
                     let mut data = std::collections::HashMap::new();
                     for (i, val) in row_values.iter().enumerate() {
@@ -1604,17 +1628,62 @@ impl ApexExecutor {
     fn default_value_to_value(
         default: &crate::storage::on_demand::DefaultValue,
         col_type: Option<crate::storage::on_demand::ColumnType>,
+        ctx: &DefaultEvalContext,
     ) -> Value {
         use crate::storage::on_demand::{ColumnType, DefaultValue};
 
         match default {
-            DefaultValue::Int64(v) => Value::Int64(*v),
-            DefaultValue::Float64(v) => Value::Float64(*v),
-            DefaultValue::String(v) => Value::String(v.clone()),
+            DefaultValue::Int64(v) => match col_type {
+                Some(ColumnType::Date) => Value::Date(*v as i32),
+                Some(ColumnType::Timestamp) => Value::Timestamp(*v),
+                Some(ColumnType::Float32) | Some(ColumnType::Float64) => Value::Float64(*v as f64),
+                _ => Value::Int64(*v),
+            },
+            DefaultValue::Float64(v) => match col_type {
+                Some(ColumnType::Int8)
+                | Some(ColumnType::Int16)
+                | Some(ColumnType::Int32)
+                | Some(ColumnType::Int64)
+                | Some(ColumnType::UInt8)
+                | Some(ColumnType::UInt16)
+                | Some(ColumnType::UInt32)
+                | Some(ColumnType::UInt64) => Value::Int64(*v as i64),
+                _ => Value::Float64(*v),
+            },
+            DefaultValue::String(v) => match col_type {
+                Some(ColumnType::Date) => Value::Date(Self::parse_date_string(v) as i32),
+                Some(ColumnType::Timestamp) => Value::Timestamp(Self::parse_timestamp_string(v)),
+                Some(ColumnType::Binary) => Self::try_parse_vector_string(v)
+                    .map(Value::Binary)
+                    .unwrap_or_else(|| Value::String(v.clone())),
+                _ => Value::String(v.clone()),
+            },
             DefaultValue::Bool(v) => Value::Bool(*v),
             DefaultValue::Null => Value::Null,
+            DefaultValue::Date(days) => match col_type {
+                Some(ColumnType::String) | Some(ColumnType::StringDict) => {
+                    Value::String(Self::date_string_from_days(*days))
+                }
+                Some(ColumnType::Timestamp) => {
+                    Value::Timestamp(*days as i64 * 86_400_000_000)
+                }
+                Some(ColumnType::Float32) | Some(ColumnType::Float64) => {
+                    Value::Float64(*days as f64)
+                }
+                _ => Value::Date(*days),
+            },
+            DefaultValue::Timestamp(micros) => match col_type {
+                Some(ColumnType::String) | Some(ColumnType::StringDict) => {
+                    Value::String(Self::timestamp_string_from_micros(*micros))
+                }
+                Some(ColumnType::Date) => Value::Date((*micros / 86_400_000_000) as i32),
+                Some(ColumnType::Float32) | Some(ColumnType::Float64) => {
+                    Value::Float64(*micros as f64)
+                }
+                _ => Value::Timestamp(*micros),
+            },
             DefaultValue::CurrentDate => {
-                let today = chrono::Utc::now().date_naive();
+                let today = ctx.now.date_naive();
                 let days = Self::epoch_days(today);
                 match col_type {
                     Some(ColumnType::Date) => Value::Date(days),
@@ -1632,14 +1701,13 @@ impl ApexExecutor {
                 }
             }
             DefaultValue::CurrentTimestamp => {
-                let now = chrono::Utc::now();
-                let today = now.date_naive();
-                let seconds = now.timestamp();
+                let today = ctx.now.date_naive();
+                let seconds = ctx.now.timestamp();
                 match col_type {
-                    Some(ColumnType::Timestamp) => Value::Timestamp(now.timestamp_micros()),
+                    Some(ColumnType::Timestamp) => Value::Timestamp(ctx.now.timestamp_micros()),
                     Some(ColumnType::Date) => Value::Date(Self::epoch_days(today)),
                     Some(ColumnType::String) | Some(ColumnType::StringDict) => {
-                        Value::String(now.format("%Y-%m-%d %H:%M:%S").to_string())
+                        Value::String(ctx.now.format("%Y-%m-%d %H:%M:%S").to_string())
                     }
                     Some(ColumnType::Float32) | Some(ColumnType::Float64) => {
                         Value::Float64(seconds as f64)
@@ -1648,11 +1716,10 @@ impl ApexExecutor {
                 }
             }
             DefaultValue::UnixTimestamp => {
-                let now = chrono::Utc::now();
-                let seconds = now.timestamp();
+                let seconds = ctx.now.timestamp();
                 match col_type {
                     Some(ColumnType::Timestamp) => Value::Timestamp(seconds * 1_000_000),
-                    Some(ColumnType::Date) => Value::Date(Self::epoch_days(now.date_naive())),
+                    Some(ColumnType::Date) => Value::Date(Self::epoch_days(ctx.now.date_naive())),
                     Some(ColumnType::String) | Some(ColumnType::StringDict) => {
                         Value::String(seconds.to_string())
                     }
@@ -1663,6 +1730,162 @@ impl ApexExecutor {
                 }
             }
         }
+    }
+
+    fn date_string_from_days(days: i32) -> String {
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        (epoch + chrono::Duration::days(days as i64))
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    fn timestamp_string_from_micros(micros: i64) -> String {
+        chrono::DateTime::from_timestamp_micros(micros)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| micros.to_string())
+    }
+
+    fn resolve_insert_values_for_path(
+        storage_path: &Path,
+        columns: Option<&[String]>,
+        values: &[Vec<InsertValue>],
+    ) -> io::Result<Vec<Vec<Value>>> {
+        let has_default = values
+            .iter()
+            .any(|row| row.iter().any(|v| matches!(v, InsertValue::Default)));
+
+        if !has_default {
+            return Ok(values
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|v| match v {
+                            InsertValue::Value(value) => value.clone(),
+                            InsertValue::Default => Value::Null,
+                        })
+                        .collect()
+                })
+                .collect());
+        }
+
+        if !storage_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Table does not exist",
+            ));
+        }
+
+        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        let col_names: Vec<String> = if let Some(cols) = columns {
+            cols.to_vec()
+        } else {
+            storage.get_schema().iter().map(|(n, _)| n.clone()).collect()
+        };
+        let schema_types: std::collections::HashMap<
+            String,
+            crate::storage::on_demand::ColumnType,
+        > = storage
+            .get_schema()
+            .iter()
+            .map(|(name, dt)| {
+                (
+                    name.clone(),
+                    crate::storage::backend::datatype_to_column_type(dt),
+                )
+            })
+            .collect();
+        let ctx = DefaultEvalContext::new();
+
+        Ok(values
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .filter_map(|(i, item)| {
+                        let col_name = col_names.get(i)?;
+                        let value = match item {
+                            InsertValue::Value(value) => value.clone(),
+                            InsertValue::Default => {
+                                let cons = storage.storage.get_column_constraints(col_name);
+                                cons.default_value
+                                    .as_ref()
+                                    .map(|dv| {
+                                        let col_schema_type = schema_types.get(col_name).copied();
+                                        Self::default_value_to_value(dv, col_schema_type, &ctx)
+                                    })
+                                    .unwrap_or(Value::Null)
+                            }
+                        };
+                        Some(value)
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+
+    fn is_insert_default_values(columns: Option<&[String]>, values: &[Vec<InsertValue>]) -> bool {
+        columns.is_some_and(|cols| cols.is_empty())
+            && values.len() == 1
+            && values.first().is_some_and(|row| row.is_empty())
+    }
+
+    fn resolve_default_values_insert_for_path(
+        storage_path: &Path,
+    ) -> io::Result<(Vec<String>, Vec<Vec<Value>>)> {
+        if !storage_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Table does not exist",
+            ));
+        }
+
+        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        let schema = storage.get_schema();
+        let schema_types: std::collections::HashMap<
+            String,
+            crate::storage::on_demand::ColumnType,
+        > = schema
+            .iter()
+            .map(|(name, dt)| {
+                (
+                    name.clone(),
+                    crate::storage::backend::datatype_to_column_type(dt),
+                )
+            })
+            .collect();
+        let ctx = DefaultEvalContext::new();
+        let mut columns = Vec::with_capacity(schema.len());
+        let mut row = Vec::with_capacity(schema.len());
+
+        for (col_name, _) in &schema {
+            columns.push(col_name.clone());
+            let cons = storage.storage.get_column_constraints(col_name);
+            let value = cons
+                .default_value
+                .as_ref()
+                .map(|dv| {
+                    let col_schema_type = schema_types.get(col_name).copied();
+                    Self::default_value_to_value(dv, col_schema_type, &ctx)
+                })
+                .unwrap_or(Value::Null);
+            row.push(value);
+        }
+
+        Ok((columns, vec![row]))
+    }
+
+    fn execute_insert_items(
+        storage_path: &Path,
+        columns: Option<&[String]>,
+        values: &[Vec<InsertValue>],
+    ) -> io::Result<ApexResult> {
+        if Self::is_insert_default_values(columns, values) {
+            let (columns, resolved) = Self::resolve_default_values_insert_for_path(storage_path)?;
+            return Self::execute_insert(storage_path, Some(&columns), &resolved);
+        }
+
+        let resolved = Self::resolve_insert_values_for_path(storage_path, columns, values)?;
+        Self::execute_insert(storage_path, columns, &resolved)
     }
 
     /// Execute INSERT statement
@@ -1782,12 +2005,14 @@ impl ApexExecutor {
         // Fill in DEFAULT values for missing columns into row maps
         if storage.storage.has_constraints() {
             let schema = storage.get_schema();
+            let default_ctx = DefaultEvalContext::new();
             for (schema_col, _) in &schema {
                 if !col_names.iter().any(|c| c == schema_col) {
                     let cons = storage.storage.get_column_constraints(schema_col);
                     if let Some(ref dv) = cons.default_value {
                         let col_schema_type = schema_types.get(schema_col).copied();
-                        let default_val = Self::default_value_to_value(dv, col_schema_type);
+                        let default_val =
+                            Self::default_value_to_value(dv, col_schema_type, &default_ctx);
                         for row in rows.iter_mut() {
                             row.entry(schema_col.clone())
                                 .or_insert_with(|| default_val.clone());
@@ -2768,7 +2993,7 @@ impl ApexExecutor {
     fn execute_insert_on_conflict(
         storage_path: &Path,
         columns: Option<&[String]>,
-        values: &[Vec<Value>],
+        values: &[Vec<InsertValue>],
         conflict_columns: &[String],
         do_update: Option<&[(String, SqlExpr)]>,
     ) -> io::Result<ApexResult> {
@@ -2790,6 +3015,8 @@ impl ApexExecutor {
         } else {
             schema.iter().map(|(n, _)| n.clone()).collect()
         };
+        let resolved_values = Self::resolve_insert_values_for_path(storage_path, columns, values)?;
+        let values = resolved_values.as_slice();
 
         // Read existing data for conflict detection
         let conflict_refs: Vec<&str> = conflict_columns.iter().map(|s| s.as_str()).collect();

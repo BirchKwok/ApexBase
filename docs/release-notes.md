@@ -3,6 +3,37 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.20.1](https://github.com/BirchKwok/ApexBase/releases/tag/v1.20.1)
+*2026-06-30*
+
+[Compare with v1.20.0](https://github.com/BirchKwok/ApexBase/compare/v1.20.0...v1.20.1)
+
+- Add dynamic time-based column defaults in `CREATE TABLE`, including `DEFAULT CURRENT_DATE`, `DEFAULT CURRENT_TIMESTAMP`, `DEFAULT NOW`, and `DEFAULT UNIX_TIMESTAMP()`
+- Apply dynamic defaults during `INSERT` when omitted columns need to be filled, with type-aware output for DATE, TIMESTAMP, string, integer, and floating-point columns
+- Persist dynamic default definitions in on-demand table schemas so constraints survive save/reopen cycles
+- Store SQL DATE and TIMESTAMP expression values through table and incremental storage paths by mapping them to their numeric backing representation
+- Add Rust and Python regression coverage for dynamic DEFAULT functions, including UTC date formatting and UNIX timestamp bounds
+- Update Rust crate and Python package version metadata to 1.20.1
+
+<details>
+<summary><b>Changed files by module</b></summary>
+
+<table>
+<thead>
+<tr><th>Module</th><th>Files changed</th></tr>
+</thead>
+<tbody>
+<tr><td>Project Config</td><td>2</td></tr>
+<tr><td>Documentation</td><td>1</td></tr>
+<tr><td>Python Package</td><td>1</td></tr>
+<tr><td>Query Engine</td><td>4</td></tr>
+<tr><td>Storage Engine</td><td>2</td></tr>
+<tr><td>Tests</td><td>1</td></tr>
+</tbody>
+</table></details>
+
+---
+
 ## [v1.20.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.20.0)
 *2026-06-23*
 

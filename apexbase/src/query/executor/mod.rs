@@ -33,6 +33,7 @@ use crate::query::planner::{
 };
 use crate::query::sql_parser::BinaryOperator;
 use crate::query::sql_parser::FromItem;
+use crate::query::sql_parser::InsertValue;
 use crate::query::{
     AggregateFunc, JoinClause, JoinType, SelectColumn, SelectStatement, SqlExpr, SqlParser,
     SqlStatement, UnionStatement,
@@ -1506,7 +1507,7 @@ impl ApexExecutor {
             SqlStatement::Insert {
                 values, columns, ..
             } => with_table_write_lock(storage_path, || {
-                Self::execute_insert(storage_path, columns.as_deref(), &values)
+                Self::execute_insert_items(storage_path, columns.as_deref(), &values)
             }),
             SqlStatement::InsertOnConflict {
                 values,
@@ -1664,7 +1665,7 @@ impl ApexExecutor {
             } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
                 with_table_write_lock(&table_path, || {
-                    Self::execute_insert(&table_path, columns.as_deref(), &values)
+                    Self::execute_insert_items(&table_path, columns.as_deref(), &values)
                 })
             }
             SqlStatement::InsertOnConflict {

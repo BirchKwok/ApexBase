@@ -162,6 +162,48 @@ class TestDefaultConstraint:
         df = db.execute("SELECT ts FROM t19 WHERE id = 1").to_pandas()
         assert before <= df.iloc[0, 0] <= after
 
+    def test_default_constant_expression_fill(self, db):
+        """Row-independent constant expressions should be accepted in DEFAULT."""
+        db.execute(
+            "CREATE TABLE t20 (id INT NOT NULL, ttl INT DEFAULT (60 * 60), status TEXT DEFAULT LOWER('ACTIVE'))"
+        )
+        db.execute("INSERT INTO t20 (id) VALUES (1)")
+        row = db.execute("SELECT ttl, status FROM t20 WHERE id = 1").to_dict()[0]
+        assert row["ttl"] == 3600
+        assert row["status"] == "active"
+
+    def test_default_cast_expression_fill(self, db):
+        """CAST constant expressions should be folded and stored as typed DEFAULT values."""
+        db.execute(
+            "CREATE TABLE t21 (id INT NOT NULL, created TEXT DEFAULT CAST('2026-01-02' AS DATE))"
+        )
+        db.execute("INSERT INTO t21 (id) VALUES (1)")
+        row = db.execute("SELECT created FROM t21 WHERE id = 1").to_dict()[0]
+        assert row["created"] == "2026-01-02"
+
+    def test_insert_default_values(self, db):
+        """INSERT DEFAULT VALUES should create one row populated from column defaults."""
+        db.execute("CREATE TABLE t22 (id INT DEFAULT 7, status TEXT DEFAULT 'new')")
+        db.execute("INSERT INTO t22 DEFAULT VALUES")
+        row = db.execute("SELECT id, status FROM t22").to_dict()[0]
+        assert row["id"] == 7
+        assert row["status"] == "new"
+
+    def test_insert_values_default_keyword(self, db):
+        """VALUES(DEFAULT, ...) should use the target column's declared default."""
+        db.execute(
+            "CREATE TABLE t23 (id INT NOT NULL, score INT DEFAULT 50, status TEXT DEFAULT 'ready')"
+        )
+        db.execute("INSERT INTO t23 (id, score, status) VALUES (1, DEFAULT, DEFAULT)")
+        row = db.execute("SELECT score, status FROM t23 WHERE id = 1").to_dict()[0]
+        assert row["score"] == 50
+        assert row["status"] == "ready"
+
+    def test_default_expression_rejects_column_reference(self, db):
+        """DEFAULT expressions must be row-independent."""
+        with pytest.raises(Exception, match="cannot reference column"):
+            db.execute("CREATE TABLE t_bad_default (a INT, b INT DEFAULT a + 1)")
+
 
 class TestConstraintPersistence:
     """Constraints should survive save/reopen cycles."""

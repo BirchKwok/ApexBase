@@ -110,6 +110,8 @@ impl ApexExecutor {
                                 Value::Float64(f) => DefaultValue::Float64(*f),
                                 Value::String(s) => DefaultValue::String(s.clone()),
                                 Value::Bool(b) => DefaultValue::Bool(*b),
+                                Value::Date(d) => DefaultValue::Date(*d),
+                                Value::Timestamp(t) => DefaultValue::Timestamp(*t),
                                 _ => DefaultValue::Null,
                             }),
                             ColumnConstraintKind::DefaultFunction(func) => Some(match func {
