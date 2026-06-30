@@ -58,7 +58,7 @@ def _ensure_polars():
         pl = _pl
     return pl
 
-__version__ = "1.20.0"
+__version__ = "1.20.1"
 
 
 class _InstanceRegistry:

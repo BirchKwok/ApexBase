@@ -3,6 +3,7 @@ import pytest
 import tempfile
 import shutil
 import os
+from datetime import datetime, timezone
 
 from apexbase import ApexClient
 
@@ -142,6 +143,24 @@ class TestDefaultConstraint:
         db.execute("INSERT INTO t17 (id) VALUES (2)")
         df = db.execute("SELECT SUM(score) FROM t17").to_pandas()
         assert df.iloc[0, 0] == 100
+
+    def test_default_current_date_function(self, db):
+        """CURRENT_DATE should be usable as a dynamic DEFAULT value."""
+        before = datetime.now(timezone.utc).date().isoformat()
+        db.execute("CREATE TABLE t18 (id INT NOT NULL, created TEXT DEFAULT CURRENT_DATE)")
+        db.execute("INSERT INTO t18 (id) VALUES (1)")
+        after = datetime.now(timezone.utc).date().isoformat()
+        df = db.execute("SELECT created FROM t18 WHERE id = 1").to_pandas()
+        assert df.iloc[0, 0] in {before, after}
+
+    def test_default_unix_timestamp_function(self, db):
+        """UNIX_TIMESTAMP() should be usable as a dynamic DEFAULT value."""
+        before = int(datetime.now(timezone.utc).timestamp())
+        db.execute("CREATE TABLE t19 (id INT NOT NULL, ts BIGINT DEFAULT UNIX_TIMESTAMP())")
+        db.execute("INSERT INTO t19 (id) VALUES (1)")
+        after = int(datetime.now(timezone.utc).timestamp())
+        df = db.execute("SELECT ts FROM t19 WHERE id = 1").to_pandas()
+        assert before <= df.iloc[0, 0] <= after
 
 
 class TestConstraintPersistence:

@@ -1305,6 +1305,44 @@ fn test_constraint_default_value_fill() {
 }
 
 #[test]
+fn test_constraint_default_time_functions() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    exec_multi(
+        "CREATE TABLE t_time (id INT NOT NULL, created TEXT DEFAULT CURRENT_DATE, ts BIGINT DEFAULT UNIX_TIMESTAMP())",
+        base,
+    )
+    .unwrap();
+    exec_multi("INSERT INTO t_time (id) VALUES (1)", base).unwrap();
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let result = exec_multi("SELECT created, ts FROM t_time WHERE id = 1", base).unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let created = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+    let ts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(created.len(), 10);
+    assert_eq!(&created[4..5], "-");
+    assert_eq!(&created[7..8], "-");
+    assert!(before <= ts && ts <= after);
+}
+
+#[test]
 fn test_constraint_update_not_null_reject() {
     let dir = tempdir().unwrap();
     let base = dir.path();

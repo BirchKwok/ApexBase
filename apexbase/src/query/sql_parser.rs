@@ -23,12 +23,32 @@ pub enum ColumnConstraintKind {
     PrimaryKey,
     Unique,
     Default(Value),
+    DefaultFunction(DefaultValueFunction),
     Check(String),
     ForeignKey {
         ref_table: String,
         ref_column: String,
     },
     Autoincrement,
+}
+
+/// Supported non-deterministic value functions in column DEFAULT clauses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DefaultValueFunction {
+    CurrentDate,
+    CurrentTimestamp,
+    UnixTimestamp,
+}
+
+impl DefaultValueFunction {
+    fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "CURRENT_DATE" => Some(Self::CurrentDate),
+            "CURRENT_TIMESTAMP" | "NOW" => Some(Self::CurrentTimestamp),
+            "UNIX_TIMESTAMP" => Some(Self::UnixTimestamp),
+            _ => None,
+        }
+    }
 }
 
 /// Column definition for CREATE TABLE
@@ -5583,41 +5603,58 @@ impl SqlParser {
                 }
                 Token::Identifier(s) if s.to_uppercase() == "DEFAULT" => {
                     self.advance();
-                    // Parse default value (literal)
-                    let val = match self.current().clone() {
+                    // Parse default value (literal or no-argument time function)
+                    let constraint = match self.current().clone() {
                         Token::IntLit(n) => {
                             self.advance();
-                            Value::Int64(n)
+                            ColumnConstraintKind::Default(Value::Int64(n))
                         }
                         Token::FloatLit(f) => {
                             self.advance();
-                            Value::Float64(f)
+                            ColumnConstraintKind::Default(Value::Float64(f))
                         }
                         Token::StringLit(s) => {
                             self.advance();
-                            Value::String(s)
+                            ColumnConstraintKind::Default(Value::String(s))
                         }
                         Token::True => {
                             self.advance();
-                            Value::Bool(true)
+                            ColumnConstraintKind::Default(Value::Bool(true))
                         }
                         Token::False => {
                             self.advance();
-                            Value::Bool(false)
+                            ColumnConstraintKind::Default(Value::Bool(false))
                         }
                         Token::Null => {
                             self.advance();
-                            Value::Null
+                            ColumnConstraintKind::Default(Value::Null)
+                        }
+                        Token::Identifier(name) => {
+                            let func = DefaultValueFunction::from_name(&name).ok_or_else(|| {
+                                let (start, _) = self.current_span();
+                                self.syntax_error(
+                                    start,
+                                    "Expected literal value or supported time function after DEFAULT"
+                                        .to_string(),
+                                )
+                            })?;
+                            self.advance();
+                            if matches!(self.current(), Token::LParen) {
+                                self.advance();
+                                self.expect(Token::RParen)?;
+                            }
+                            ColumnConstraintKind::DefaultFunction(func)
                         }
                         _ => {
                             let (start, _) = self.current_span();
                             return Err(self.syntax_error(
                                 start,
-                                "Expected literal value after DEFAULT".to_string(),
+                                "Expected literal value or supported time function after DEFAULT"
+                                    .to_string(),
                             ));
                         }
                     };
-                    constraints.push(ColumnConstraintKind::Default(val));
+                    constraints.push(constraint);
                 }
                 Token::Identifier(s)
                     if s.to_uppercase() == "AUTOINCREMENT"

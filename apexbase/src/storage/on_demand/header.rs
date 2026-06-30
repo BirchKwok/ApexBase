@@ -509,6 +509,9 @@ pub enum DefaultValue {
     String(String),
     Bool(bool),
     Null,
+    CurrentDate,
+    CurrentTimestamp,
+    UnixTimestamp,
 }
 
 /// Per-column constraint flags stored in schema
@@ -653,6 +656,15 @@ impl OnDemandSchema {
                         }
                         Some(DefaultValue::Null) => {
                             buf.push(5);
+                        }
+                        Some(DefaultValue::CurrentDate) => {
+                            buf.push(6);
+                        }
+                        Some(DefaultValue::CurrentTimestamp) => {
+                            buf.push(7);
+                        }
+                        Some(DefaultValue::UnixTimestamp) => {
+                            buf.push(8);
                         }
                         None => {
                             buf.push(0); // no default
@@ -802,6 +814,9 @@ impl OnDemandSchema {
                             Some(DefaultValue::Bool(v))
                         }
                         5 => Some(DefaultValue::Null),
+                        6 => Some(DefaultValue::CurrentDate),
+                        7 => Some(DefaultValue::CurrentTimestamp),
+                        8 => Some(DefaultValue::UnixTimestamp),
                         _ => None, // 0 = no default
                     };
                     if i < schema.constraints.len() {
@@ -856,5 +871,4 @@ impl OnDemandSchema {
         Ok(schema)
     }
 }
-
 

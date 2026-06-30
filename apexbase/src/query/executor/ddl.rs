@@ -98,21 +98,29 @@ impl ApexExecutor {
         
         // Set constraints on the underlying schema
         {
-            use crate::query::sql_parser::ColumnConstraintKind;
+            use crate::query::sql_parser::{ColumnConstraintKind, DefaultValueFunction};
             use crate::storage::on_demand::ColumnConstraints;
             for col_def in columns {
                 if !col_def.constraints.is_empty() {
                     let default_val = col_def.constraints.iter().find_map(|c| {
-                        if let ColumnConstraintKind::Default(v) = c {
-                            use crate::storage::on_demand::DefaultValue;
-                            Some(match v {
+                        use crate::storage::on_demand::DefaultValue;
+                        match c {
+                            ColumnConstraintKind::Default(v) => Some(match v {
                                 Value::Int64(n) => DefaultValue::Int64(*n),
                                 Value::Float64(f) => DefaultValue::Float64(*f),
                                 Value::String(s) => DefaultValue::String(s.clone()),
                                 Value::Bool(b) => DefaultValue::Bool(*b),
                                 _ => DefaultValue::Null,
-                            })
-                        } else { None }
+                            }),
+                            ColumnConstraintKind::DefaultFunction(func) => Some(match func {
+                                DefaultValueFunction::CurrentDate => DefaultValue::CurrentDate,
+                                DefaultValueFunction::CurrentTimestamp => {
+                                    DefaultValue::CurrentTimestamp
+                                }
+                                DefaultValueFunction::UnixTimestamp => DefaultValue::UnixTimestamp,
+                            }),
+                            _ => None,
+                        }
                     });
                     let check_sql = col_def.constraints.iter().find_map(|c| {
                         if let ColumnConstraintKind::Check(sql) = c {

@@ -563,6 +563,8 @@ impl TableStorageBackend {
                     .map(|(k, v)| {
                         let cv = match v {
                             Value::Int64(i) => ColumnValue::Int64(*i),
+                            Value::Timestamp(t) => ColumnValue::Int64(*t),
+                            Value::Date(d) => ColumnValue::Int64(*d as i64),
                             Value::Float64(f) => ColumnValue::Float64(*f),
                             Value::String(s) => ColumnValue::String(s.clone()),
                             Value::Bool(b) => ColumnValue::Bool(*b),
@@ -843,6 +845,8 @@ impl TableStorageBackend {
                             let cv = match v {
                                 Value::Int64(i) => ColumnValue::Int64(*i),
                                 Value::Int32(i) => ColumnValue::Int64(*i as i64),
+                                Value::Timestamp(t) => ColumnValue::Int64(*t),
+                                Value::Date(d) => ColumnValue::Int64(*d as i64),
                                 Value::Float64(f) => ColumnValue::Float64(*f),
                                 Value::Float32(f) => ColumnValue::Float64(*f as f64),
                                 Value::String(s) => ColumnValue::String(s.clone()),
@@ -867,6 +871,8 @@ impl TableStorageBackend {
                             let cv = match v {
                                 Value::Int64(i) => ColumnValue::Int64(*i),
                                 Value::Int32(i) => ColumnValue::Int64(*i as i64),
+                                Value::Timestamp(t) => ColumnValue::Int64(*t),
+                                Value::Date(d) => ColumnValue::Int64(*d as i64),
                                 Value::Float64(f) => ColumnValue::Float64(*f),
                                 Value::Float32(f) => ColumnValue::Float64(*f as f64),
                                 Value::String(s) => ColumnValue::String(s.clone()),
@@ -1399,6 +1405,8 @@ impl TableStorageBackend {
                 let cv = match v {
                     Value::Int64(i) => ColumnValue::Int64(*i),
                     Value::Int32(i) => ColumnValue::Int64(*i as i64),
+                    Value::Timestamp(t) => ColumnValue::Int64(*t),
+                    Value::Date(d) => ColumnValue::Int64(*d as i64),
                     Value::Float64(f) => ColumnValue::Float64(*f),
                     Value::Float32(f) => ColumnValue::Float64(*f as f64),
                     Value::String(s) => ColumnValue::String(s.clone()),
@@ -4262,6 +4270,8 @@ impl IncrementalStorageBackend {
                         let cv = match v {
                             Value::Int64(i) => OnDemandColumnValue::Int64(*i),
                             Value::Int32(i) => OnDemandColumnValue::Int64(*i as i64),
+                            Value::Timestamp(t) => OnDemandColumnValue::Int64(*t),
+                            Value::Date(d) => OnDemandColumnValue::Int64(*d as i64),
                             Value::Float64(f) => OnDemandColumnValue::Float64(*f),
                             Value::Float32(f) => OnDemandColumnValue::Float64(*f as f64),
                             Value::String(s) => OnDemandColumnValue::String(s.clone()),

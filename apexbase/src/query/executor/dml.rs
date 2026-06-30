@@ -1595,6 +1595,76 @@ impl ApexExecutor {
 
     // ========== DML Execution Methods ==========
 
+    #[inline]
+    fn epoch_days(date: chrono::NaiveDate) -> i32 {
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        (date - epoch).num_days() as i32
+    }
+
+    fn default_value_to_value(
+        default: &crate::storage::on_demand::DefaultValue,
+        col_type: Option<crate::storage::on_demand::ColumnType>,
+    ) -> Value {
+        use crate::storage::on_demand::{ColumnType, DefaultValue};
+
+        match default {
+            DefaultValue::Int64(v) => Value::Int64(*v),
+            DefaultValue::Float64(v) => Value::Float64(*v),
+            DefaultValue::String(v) => Value::String(v.clone()),
+            DefaultValue::Bool(v) => Value::Bool(*v),
+            DefaultValue::Null => Value::Null,
+            DefaultValue::CurrentDate => {
+                let today = chrono::Utc::now().date_naive();
+                let days = Self::epoch_days(today);
+                match col_type {
+                    Some(ColumnType::Date) => Value::Date(days),
+                    Some(ColumnType::Timestamp) => {
+                        let dt = today.and_hms_opt(0, 0, 0).unwrap();
+                        Value::Timestamp(dt.and_utc().timestamp_micros())
+                    }
+                    Some(ColumnType::String) | Some(ColumnType::StringDict) => {
+                        Value::String(today.format("%Y-%m-%d").to_string())
+                    }
+                    Some(ColumnType::Float32) | Some(ColumnType::Float64) => {
+                        Value::Float64(days as f64)
+                    }
+                    _ => Value::Int64(days as i64),
+                }
+            }
+            DefaultValue::CurrentTimestamp => {
+                let now = chrono::Utc::now();
+                let today = now.date_naive();
+                let seconds = now.timestamp();
+                match col_type {
+                    Some(ColumnType::Timestamp) => Value::Timestamp(now.timestamp_micros()),
+                    Some(ColumnType::Date) => Value::Date(Self::epoch_days(today)),
+                    Some(ColumnType::String) | Some(ColumnType::StringDict) => {
+                        Value::String(now.format("%Y-%m-%d %H:%M:%S").to_string())
+                    }
+                    Some(ColumnType::Float32) | Some(ColumnType::Float64) => {
+                        Value::Float64(seconds as f64)
+                    }
+                    _ => Value::Int64(seconds),
+                }
+            }
+            DefaultValue::UnixTimestamp => {
+                let now = chrono::Utc::now();
+                let seconds = now.timestamp();
+                match col_type {
+                    Some(ColumnType::Timestamp) => Value::Timestamp(seconds * 1_000_000),
+                    Some(ColumnType::Date) => Value::Date(Self::epoch_days(now.date_naive())),
+                    Some(ColumnType::String) | Some(ColumnType::StringDict) => {
+                        Value::String(seconds.to_string())
+                    }
+                    Some(ColumnType::Float32) | Some(ColumnType::Float64) => {
+                        Value::Float64(seconds as f64)
+                    }
+                    _ => Value::Int64(seconds),
+                }
+            }
+        }
+    }
+
     /// Execute INSERT statement
     fn execute_insert(
         storage_path: &Path,
@@ -1716,14 +1786,8 @@ impl ApexExecutor {
                 if !col_names.iter().any(|c| c == schema_col) {
                     let cons = storage.storage.get_column_constraints(schema_col);
                     if let Some(ref dv) = cons.default_value {
-                        use crate::storage::on_demand::DefaultValue;
-                        let default_val = match dv {
-                            DefaultValue::Int64(v) => Value::Int64(*v),
-                            DefaultValue::Float64(v) => Value::Float64(*v),
-                            DefaultValue::String(v) => Value::String(v.clone()),
-                            DefaultValue::Bool(v) => Value::Bool(*v),
-                            DefaultValue::Null => Value::Null,
-                        };
+                        let col_schema_type = schema_types.get(schema_col).copied();
+                        let default_val = Self::default_value_to_value(dv, col_schema_type);
                         for row in rows.iter_mut() {
                             row.entry(schema_col.clone())
                                 .or_insert_with(|| default_val.clone());
