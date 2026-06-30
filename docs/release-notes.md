@@ -9,10 +9,13 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 [Compare with v1.20.0](https://github.com/BirchKwok/ApexBase/compare/v1.20.0...v1.20.1)
 
 - Add dynamic time-based column defaults in `CREATE TABLE`, including `DEFAULT CURRENT_DATE`, `DEFAULT CURRENT_TIMESTAMP`, `DEFAULT NOW`, and `DEFAULT UNIX_TIMESTAMP()`
-- Apply dynamic defaults during `INSERT` when omitted columns need to be filled, with type-aware output for DATE, TIMESTAMP, string, integer, and floating-point columns
-- Persist dynamic default definitions in on-demand table schemas so constraints survive save/reopen cycles
+- Add row-independent DEFAULT expressions, including arithmetic such as `DEFAULT (60 * 60)`, scalar functions such as `DEFAULT LOWER('ACTIVE')`, and typed casts such as `DEFAULT CAST('2026-01-02' AS DATE)`
+- Add `INSERT DEFAULT VALUES` and `VALUES(DEFAULT, ...)` support so rows can explicitly use declared column defaults
+- Apply defaults during `INSERT` for omitted columns and explicit `DEFAULT` values, with type-aware output for DATE, TIMESTAMP, string, integer, and floating-point columns
+- Persist literal, expression-folded, and dynamic default definitions in on-demand table schemas so constraints survive save/reopen cycles
 - Store SQL DATE and TIMESTAMP expression values through table and incremental storage paths by mapping them to their numeric backing representation
-- Add Rust and Python regression coverage for dynamic DEFAULT functions, including UTC date formatting and UNIX timestamp bounds
+- Reject DEFAULT expressions that reference table columns or subqueries, keeping defaults row-independent and deterministic except for the supported time functions
+- Add Rust and Python regression coverage for dynamic DEFAULT functions, constant-expression folding, cast defaults, `INSERT DEFAULT VALUES`, `VALUES(DEFAULT, ...)`, and invalid column-reference defaults
 - Update Rust crate and Python package version metadata to 1.20.1
 
 <details>
