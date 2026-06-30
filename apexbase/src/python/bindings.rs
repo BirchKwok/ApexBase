@@ -4530,7 +4530,7 @@ impl ApexStorageImpl {
 
     /// Whether the current table has V4 rows buffered in memory but not yet
     /// saved as an on-disk row group.
-    fn has_pending_memtable_rows(&self) -> PyResult<bool> {
+    fn has_pending_memtable_rows(&self, py: Python<'_>) -> PyResult<bool> {
         let table_name = self.current_table.read().clone();
         if table_name.is_empty() {
             return Ok(false);
@@ -4548,15 +4548,17 @@ impl ApexStorageImpl {
                 }
             }
         }
-        Ok(backends
-            .iter()
-            .any(|backend| backend.pending_v4_in_memory_rows() > 0))
+        Ok(py.allow_threads(|| {
+            backends
+                .iter()
+                .any(|backend| backend.pending_v4_in_memory_rows() > 0)
+        }))
     }
 
     /// Whether the current table has any same-client overlay state that should
     /// be flushed before handing control to a write SQL executor that reopens
     /// storage from disk.
-    fn has_pending_overlay_writes(&self) -> PyResult<bool> {
+    fn has_pending_overlay_writes(&self, py: Python<'_>) -> PyResult<bool> {
         let table_name = self.current_table.read().clone();
         if table_name.is_empty() {
             return Ok(false);
@@ -4576,10 +4578,12 @@ impl ApexStorageImpl {
             }
         }
 
-        Ok(backends.iter().any(|backend| {
-            backend.is_dirty()
-                || backend.has_pending_deltas()
-                || backend.pending_v4_in_memory_rows() > 0
+        Ok(py.allow_threads(|| {
+            backends.iter().any(|backend| {
+                backend.is_dirty()
+                    || backend.has_pending_deltas()
+                    || backend.pending_v4_in_memory_rows() > 0
+            })
         }))
     }
 
@@ -4684,24 +4688,23 @@ impl ApexStorageImpl {
             return Ok(());
         }
 
-        let mut actions: Vec<(Arc<TableStorageBackend>, bool)> = Vec::new();
-        for backend in backends {
-            let needs_save = backend.is_dirty()
-                || backend.has_pending_deltas()
-                || backend.pending_v4_in_memory_rows() > 0;
-            let needs_sync = backend.storage.sync_pending();
-            if needs_save || needs_sync {
-                actions.push((backend, needs_save));
+        let any_needs_save = py.allow_threads(|| -> PyResult<bool> {
+            let mut actions: Vec<(Arc<TableStorageBackend>, bool)> = Vec::new();
+            for backend in backends {
+                let needs_save = backend.is_dirty()
+                    || backend.has_pending_deltas()
+                    || backend.pending_v4_in_memory_rows() > 0;
+                let needs_sync = backend.storage.sync_pending();
+                if needs_save || needs_sync {
+                    actions.push((backend, needs_save));
+                }
             }
-        }
 
-        if actions.is_empty() {
-            self.prewarm_flushed_backend(&table_path, &table_name);
-            return Ok(());
-        }
+            if actions.is_empty() {
+                return Ok(false);
+            }
 
-        let any_needs_save = actions.iter().any(|(_, needs_save)| *needs_save);
-        py.allow_threads(|| -> PyResult<()> {
+            let any_needs_save = actions.iter().any(|(_, needs_save)| *needs_save);
             let lock_file = if any_needs_save {
                 Some(
                     Self::acquire_read_lock(&table_path)
@@ -4730,7 +4733,7 @@ impl ApexStorageImpl {
             if let Some(lock_file) = lock_file {
                 Self::release_lock(lock_file);
             }
-            result
+            result.map(|_| any_needs_save)
         })?;
 
         if any_needs_save {
