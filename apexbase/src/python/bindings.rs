@@ -5047,22 +5047,23 @@ impl ApexStorageImpl {
                 "No table selected. Call create_table() or use_table() first.",
             ));
         }
-        let backend_opt: Option<Arc<TableStorageBackend>> = self
-            .cached_backends
-            .get(&table_name)
-            .map(|v| Arc::clone(&v))
-            .or_else(|| {
-                let table_path = self.get_current_table_path().ok()?;
-                let cache_key = Self::backend_cache_key(&table_path, &table_name);
-                self.cached_backends
-                    .get(&cache_key)
-                    .map(|v| {
-                        let backend = Arc::clone(&v);
+        let backend_opt: Option<Arc<TableStorageBackend>> = {
+            let legacy_cached = self
+                .cached_backends
+                .get(&table_name)
+                .map(|v| Arc::clone(&v));
+            if legacy_cached.is_some() {
+                legacy_cached
+            } else {
+                let table_path = self.get_current_table_path().ok();
+                if let Some(table_path) = table_path {
+                    let cache_key = Self::backend_cache_key(&table_path, &table_name);
+                    let keyed_cached = self.cached_backends.get(&cache_key).map(|v| Arc::clone(&v));
+                    if let Some(backend) = keyed_cached {
                         self.cached_backends
                             .insert(table_name.clone(), Arc::clone(&backend));
-                        backend
-                    })
-                    .or_else(|| {
+                        Some(backend)
+                    } else {
                         crate::query::get_cached_backend_pub(&table_path)
                             .ok()
                             .map(|b| {
@@ -5072,8 +5073,12 @@ impl ApexStorageImpl {
                                     .insert(table_name.clone(), Arc::clone(&b));
                                 b
                             })
-                    })
-            });
+                    }
+                } else {
+                    None
+                }
+            }
+        };
 
         let Some(backend) = backend_opt else {
             return Ok(None);
