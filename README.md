@@ -1,19 +1,9 @@
-<table>
-  <tr>
-    <td>
-      <pre>
-  _   ___ _____  __ ___   _   ___ ___
- /_\ | _ \ __\ \/ /| _ ) /_\ / __| __|
-/ _ \|  _/ _| >  < | _ \/ _ \\__ \ _|
-/_/ \_\_| |___/_/\_\|___/_/ \_\___/___|
-      </pre>
-    </td>
-    <td>
-      <h1>ApexBase</h1>
-      <p><strong>High-performance embedded HTAP database with a Rust core and a Python-first API.</strong></p>
-    </td>
-  </tr>
-</table>
+<p>
+  <img align="left" src="docs/img/apexbase-wordmark.svg" width="360" alt="ApexBase">
+  <br>
+  <strong>High-performance embedded HTAP database with a Rust core and a Python-first API.</strong>
+</p>
+<br clear="left">
 
 [![PyPI](https://img.shields.io/pypi/v/apexbase.svg)](https://pypi.org/project/apexbase/)
 [![Python](https://img.shields.io/pypi/pyversions/apexbase.svg)](https://pypi.org/project/apexbase/)
