@@ -239,8 +239,19 @@ each self-contained with IDs, deletion vector, and per-column data.
 **Key design decisions:**
 - String columns are dict-encoded on disk for low-cardinality data (transparent to read path)
 - In-memory state always uses plain `String` columns (dict encoding is disk-only)
+- `Blob` columns store compact descriptors in the `.apex` column data and materialize bytes lazily from sidecar files only when the blob column is projected
 - `save_v4()` pre-filters deleted rows, writes clean data, sets in-memory state directly (no disk reload)
 - Legacy V3 files are auto-detected and read correctly; first save converts to V4
+
+### Blob Sidecar Storage
+
+`Blob` columns follow a Lance-like layout. The main table stores only a descriptor, so scans that do not project the blob column avoid loading large payloads.
+
+- Inline blobs up to 64KB are embedded directly in the descriptor.
+- Packed blobs from 64KB to 4MB are appended to `<table>.blobs/packed.blob`.
+- Dedicated blobs larger than 4MB are written as separate files under `<table>.blobs/objects/`.
+- Descriptors include length and checksum metadata. Point reads can fetch descriptor metadata, full bytes, or byte ranges without forcing unrelated columns to load.
+- Projected blob reads return Arrow `LargeBinary`; scans that omit blob columns keep using descriptor-only column data.
 
 ### Delta File (.apex.delta)
 

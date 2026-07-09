@@ -121,6 +121,11 @@ impl WalRecord {
                 buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 buf.extend_from_slice(v);
             }
+            ColumnValue::Blob(v) => {
+                buf.push(6);
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                buf.extend_from_slice(v);
+            }
             ColumnValue::FixedList(v) => {
                 buf.push(5); // same wire encoding as Binary
                 buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
@@ -298,6 +303,14 @@ impl WalRecord {
                             pos += len;
                             ColumnValue::Binary(b)
                         }
+                        6 => {
+                            let len =
+                                u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                            pos += 4;
+                            let b = data[pos..pos + len].to_vec();
+                            pos += len;
+                            ColumnValue::Blob(b)
+                        }
                         _ => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -445,6 +458,14 @@ impl WalRecord {
                                 let b = data[pos..pos + len].to_vec();
                                 pos += len;
                                 ColumnValue::Binary(b)
+                            }
+                            6 => {
+                                let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap())
+                                    as usize;
+                                pos += 4;
+                                let b = data[pos..pos + len].to_vec();
+                                pos += len;
+                                ColumnValue::Blob(b)
                             }
                             _ => {
                                 return Err(io::Error::new(
@@ -658,6 +679,11 @@ impl WalWriter {
                 }
                 ColumnValue::Binary(v) => {
                     data_buf.push(5);
+                    data_buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    data_buf.extend_from_slice(v);
+                }
+                ColumnValue::Blob(v) => {
+                    data_buf.push(6);
                     data_buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
                     data_buf.extend_from_slice(v);
                 }
@@ -899,6 +925,7 @@ impl IncrementalStorage {
                                     ColumnValue::Float64(_) => ColumnData::new(ColumnType::Float64),
                                     ColumnValue::String(_) => ColumnData::new(ColumnType::String),
                                     ColumnValue::Binary(_) => ColumnData::new(ColumnType::Binary),
+                                    ColumnValue::Blob(_) => ColumnData::new(ColumnType::Blob),
                                     ColumnValue::FixedList(_) => ColumnData::FixedList {
                                         data: Vec::new(),
                                         dim: 0,
@@ -913,6 +940,9 @@ impl IncrementalStorage {
                                 col.push_string(val)
                             }
                             (col @ ColumnData::Binary { .. }, ColumnValue::Binary(val)) => {
+                                col.push_bytes(val)
+                            }
+                            (col @ ColumnData::Binary { .. }, ColumnValue::Blob(val)) => {
                                 col.push_bytes(val)
                             }
                             (col @ ColumnData::FixedList { .. }, ColumnValue::FixedList(val)) => {
@@ -1015,6 +1045,7 @@ impl IncrementalStorage {
                                     ColumnValue::Float64(_) => ColumnData::new(ColumnType::Float64),
                                     ColumnValue::String(_) => ColumnData::new(ColumnType::String),
                                     ColumnValue::Binary(_) => ColumnData::new(ColumnType::Binary),
+                                    ColumnValue::Blob(_) => ColumnData::new(ColumnType::Blob),
                                     ColumnValue::FixedList(_) => ColumnData::FixedList {
                                         data: Vec::new(),
                                         dim: 0,
@@ -1029,6 +1060,9 @@ impl IncrementalStorage {
                                 col.push_string(val)
                             }
                             (col @ ColumnData::Binary { .. }, ColumnValue::Binary(val)) => {
+                                col.push_bytes(val)
+                            }
+                            (col @ ColumnData::Binary { .. }, ColumnValue::Blob(val)) => {
                                 col.push_bytes(val)
                             }
                             (col @ ColumnData::FixedList { .. }, ColumnValue::FixedList(val)) => {

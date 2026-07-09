@@ -398,8 +398,41 @@ impl OnDemandStorage {
                     }
                 }
                 Some(ColumnData::Binary { offsets, data }) => {
-                    use arrow::array::BinaryArray;
+                    use arrow::array::{BinaryArray, LargeBinaryArray};
                     let count = offsets.len().saturating_sub(1);
+                    if schema_col_type == ColumnType::Blob {
+                        let row_iter: Vec<usize> = if let Some(ref indices) = active_indices {
+                            indices.clone()
+                        } else {
+                            (0..count.min(active_count)).collect()
+                        };
+                        let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(row_iter.len());
+                        for i in row_iter {
+                            if i >= count {
+                                values.push(None);
+                                continue;
+                            }
+                            if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                                let ob = i / 8;
+                                let obit = i % 8;
+                                if ob < nulls[col_idx].len()
+                                    && (nulls[col_idx][ob] >> obit) & 1 == 1
+                                {
+                                    values.push(None);
+                                    continue;
+                                }
+                            }
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            values.push(Some(self.read_blob_value(&data[start..end])?));
+                        }
+                        let refs: Vec<Option<&[u8]>> =
+                            values.iter().map(|v| v.as_deref()).collect();
+                        return Ok((
+                            Field::new(col_name, ArrowDataType::LargeBinary, true),
+                            Arc::new(LargeBinaryArray::from(refs)) as ArrayRef,
+                        ));
+                    }
                     let binary_data: Vec<Option<&[u8]>> = if let Some(ref indices) = active_indices {
                         indices.iter().map(|&i| {
                             if i < count {
@@ -716,6 +749,26 @@ impl OnDemandStorage {
                     (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
                 }
                 Some(ColumnData::Binary { offsets, data }) => {
+                    if schema_col_type == ColumnType::Blob {
+                        use arrow::array::LargeBinaryArray;
+                        let count = offsets.len().saturating_sub(1);
+                        let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(row_count);
+                        for i in 0..row_count {
+                            if is_null(col_idx, i) || i >= count {
+                                values.push(None);
+                                continue;
+                            }
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            values.push(Some(self.read_blob_value(&data[start..end])?));
+                        }
+                        let refs: Vec<Option<&[u8]>> =
+                            values.iter().map(|v| v.as_deref()).collect();
+                        (
+                            ArrowDataType::LargeBinary,
+                            Arc::new(LargeBinaryArray::from(refs)) as ArrayRef,
+                        )
+                    } else {
                     let count = offsets.len().saturating_sub(1);
                     let binary_data: Vec<Option<&[u8]>> = (0..row_count)
                         .map(|i| {
@@ -728,6 +781,7 @@ impl OnDemandStorage {
                         })
                         .collect();
                     (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    }
                 }
                 Some(ColumnData::StringDict { indices, dict_offsets, dict_data }) => {
                     let strings: Vec<Option<&str>> = (0..row_count)
@@ -1104,8 +1158,38 @@ impl OnDemandStorage {
                     (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
                 }
                 Some(ColumnData::Binary { offsets, data }) => {
-                    use arrow::array::BinaryArray;
+                    use arrow::array::{BinaryArray, LargeBinaryArray};
                     let count = offsets.len().saturating_sub(1);
+                    if schema_col_type == ColumnType::Blob {
+                        let row_iter: Vec<usize> = if let Some(ref indices) = row_indices {
+                            indices.clone()
+                        } else {
+                            (0..actual_limit.min(count)).collect()
+                        };
+                        let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(row_iter.len());
+                        for i in row_iter {
+                            if i >= count {
+                                values.push(None);
+                                continue;
+                            }
+                            if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                                let ob = i / 8;
+                                let obit = i % 8;
+                                if ob < nulls[col_idx].len()
+                                    && (nulls[col_idx][ob] >> obit) & 1 == 1
+                                {
+                                    values.push(None);
+                                    continue;
+                                }
+                            }
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            values.push(Some(self.read_blob_value(&data[start..end])?));
+                        }
+                        let refs: Vec<Option<&[u8]>> =
+                            values.iter().map(|v| v.as_deref()).collect();
+                        (ArrowDataType::LargeBinary, Arc::new(LargeBinaryArray::from(refs)))
+                    } else {
                     let binary_data: Vec<Option<&[u8]>> = if let Some(ref indices) = row_indices {
                         indices.iter().map(|&i| {
                             if i < count {
@@ -1122,6 +1206,7 @@ impl OnDemandStorage {
                         }).collect()
                     };
                     (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    }
                 }
                 _ => {
                     (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![0i64; actual_limit])))

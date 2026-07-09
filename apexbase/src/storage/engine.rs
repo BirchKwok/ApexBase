@@ -850,7 +850,7 @@ impl StorageEngine {
         int_columns: HashMap<String, Vec<i64>>,
         float_columns: HashMap<String, Vec<f64>>,
         string_columns: HashMap<String, Vec<String>>,
-        binary_columns: HashMap<String, Vec<Vec<u8>>>,
+        mut binary_columns: HashMap<String, Vec<Vec<u8>>>,
         fixedlist_columns: HashMap<String, Vec<Vec<u8>>>,
         bool_columns: HashMap<String, Vec<bool>>,
         null_positions: HashMap<String, Vec<bool>>,
@@ -1004,15 +1004,22 @@ impl StorageEngine {
                                                 });
                                             }
                                         }
-                                        ColumnType::Binary => {
+                                        ColumnType::Binary | ColumnType::Blob => {
                                             if let Some(vals) = binary_columns.get(col_name) {
                                                 let mut offsets =
                                                     Vec::with_capacity(vals.len() + 1);
                                                 let mut data = Vec::new();
                                                 offsets.push(0u32);
-                                                for b in vals {
-                                                    data.extend_from_slice(b);
-                                                    offsets.push(data.len() as u32);
+                                                if *col_type == ColumnType::Blob {
+                                                    for desc in storage.write_blob_values(vals)? {
+                                                        data.extend_from_slice(&desc);
+                                                        offsets.push(data.len() as u32);
+                                                    }
+                                                } else {
+                                                    for b in vals {
+                                                        data.extend_from_slice(b);
+                                                        offsets.push(data.len() as u32);
+                                                    }
                                                 }
                                                 new_columns
                                                     .push(ColumnData::Binary { offsets, data });
@@ -1103,12 +1110,21 @@ impl StorageEngine {
         // SLOW PATH: Full write (for new tables, schema changes, etc.)
         self.invalidate(table_path);
         let backend = self.get_write_backend(table_path, durability)?;
-        let ids = backend.insert_typed_with_nulls_full(
+        let mut blob_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        for (name, col_type) in backend.storage.get_schema() {
+            if col_type == ColumnType::Blob {
+                if let Some(values) = binary_columns.remove(&name) {
+                    blob_columns.insert(name, backend.storage.write_blob_values(&values)?);
+                }
+            }
+        }
+        let ids = backend.insert_typed_with_nulls_full_with_blobs(
             int_columns,
             float_columns,
             string_columns,
             binary_columns,
             fixedlist_columns,
+            blob_columns,
             bool_columns,
             null_positions,
         )?;

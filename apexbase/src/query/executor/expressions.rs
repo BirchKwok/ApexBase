@@ -1870,6 +1870,10 @@ impl ApexExecutor {
                 use arrow::array::BinaryArray;
                 Arc::new(BinaryArray::from(vec![Some(b.as_slice()); num_rows]))
             }
+            Value::Blob(b) => {
+                use arrow::array::LargeBinaryArray;
+                Arc::new(LargeBinaryArray::from(vec![Some(b.as_slice()); num_rows]))
+            }
             Value::FixedList(b) => {
                 use arrow::array::BinaryArray;
                 Arc::new(BinaryArray::from(vec![Some(b.as_slice()); num_rows]))

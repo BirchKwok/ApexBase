@@ -4,7 +4,8 @@ use super::{Row, Value};
 use crate::table::column_table::{BitVec, TypedColumn};
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Float64Array, Float64Builder,
-    Int64Array, Int64Builder, StringArray, StringBuilder, UInt64Array, UInt64Builder,
+    Int64Array, Int64Builder, LargeBinaryArray, StringArray, StringBuilder, UInt64Array,
+    UInt64Builder,
 };
 use arrow::buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
@@ -137,6 +138,7 @@ fn value_to_arrow_type(value: &Value) -> ArrowDataType {
         Value::String(_) | Value::Json(_) | Value::Binary(_) | Value::FixedList(_) => {
             ArrowDataType::Utf8
         }
+        Value::Blob(_) => ArrowDataType::LargeBinary,
         Value::Timestamp(_) => ArrowDataType::Int64,
         Value::Date(_) => ArrowDataType::Int64,
         Value::Array(_) => ArrowDataType::Utf8, // Serialize arrays as JSON strings
@@ -208,6 +210,16 @@ fn build_column_array(
                 }
             }
             Ok(Arc::new(builder.finish()))
+        }
+        ArrowDataType::LargeBinary => {
+            let values: Vec<Option<&[u8]>> = rows
+                .iter()
+                .map(|row| match row.get(col_name) {
+                    Some(Value::Blob(b)) | Some(Value::Binary(b)) => Some(b.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(LargeBinaryArray::from(values)))
         }
         ArrowDataType::Utf8 | _ => {
             let mut builder = StringBuilder::with_capacity(rows.len(), rows.len() * 32);

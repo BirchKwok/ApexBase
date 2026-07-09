@@ -938,7 +938,7 @@ pub fn arrow_value_at(arr: &ArrayRef, row: usize) -> Value {
                 .value(row)
                 .to_vec(),
         ),
-        ArrowDataType::LargeBinary => Value::Binary(
+        ArrowDataType::LargeBinary => Value::Blob(
             arr.as_any()
                 .downcast_ref::<LargeBinaryArray>()
                 .unwrap()

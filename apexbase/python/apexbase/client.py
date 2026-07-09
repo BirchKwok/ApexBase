@@ -663,7 +663,7 @@ class ApexClient:
                     Pre-defining schema avoids type inference on the first insert,
                     providing a performance benefit for bulk loading.
                     Supported types: int8, int16, int32, int64, uint8, uint16,
-                    uint32, uint64, float32, float64, bool, string, binary.
+                    uint32, uint64, float32, float64, bool, string, binary, blob.
                     Example: {"name": "string", "age": "int64", "score": "float64"}
         """
         self._check_connection()
@@ -3106,6 +3106,60 @@ class ApexClient:
         self._check_connection()
         self._ensure_table_selected()
         return self._storage.retrieve(id_)
+
+    def read_blob(self, column: str, id_: int) -> Optional[bytes]:
+        """Read a BLOB payload by column name and `_id`."""
+        self._check_connection()
+        self._ensure_table_selected()
+        return self._storage.read_blob(column, id_)
+
+    def read_blobs(self, column: str, ids: List[int]) -> List[Optional[bytes]]:
+        """Read multiple BLOB payloads by column name and `_id` values."""
+        self._check_connection()
+        self._ensure_table_selected()
+        return self._storage.read_blobs(column, ids)
+
+    def read_blob_range(
+        self,
+        column: str,
+        id_: int,
+        offset: int = 0,
+        length: Optional[int] = None,
+    ) -> Optional[bytes]:
+        """Read a byte range from a BLOB payload without materializing the whole value."""
+        self._check_connection()
+        self._ensure_table_selected()
+        return self._storage.read_blob_range(column, id_, offset, length)
+
+    def read_blob_ranges(
+        self,
+        column: str,
+        ids: List[int],
+        offsets: List[int],
+        length: Optional[int] = None,
+    ) -> List[Optional[bytes]]:
+        """Read byte ranges from multiple BLOB payloads."""
+        self._check_connection()
+        self._ensure_table_selected()
+        return self._storage.read_blob_ranges(column, ids, offsets, length)
+
+    def read_blob_descriptor(self, column: str, id_: int) -> Optional[bytes]:
+        """Read the raw BLOB descriptor stored in the main `.apex` file."""
+        self._check_connection()
+        self._ensure_table_selected()
+        return self._storage.read_blob_descriptor(column, id_)
+
+    def read_blob_info(self, column: str, id_: int) -> Optional[dict]:
+        """Read BLOB descriptor metadata without materializing the payload."""
+        self._check_connection()
+        self._ensure_table_selected()
+        return self._storage.read_blob_info(column, id_)
+
+    def read_blob_infos(self, column: str, ids: List[int]) -> List[Optional[dict]]:
+        """Read BLOB descriptor metadata for multiple `_id` values."""
+        self._check_connection()
+        self._ensure_table_selected()
+        return self._storage.read_blob_infos(column, ids)
 
     def retrieve_many(self, ids: List[int]) -> 'ResultView':
         self._check_connection()

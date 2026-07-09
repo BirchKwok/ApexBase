@@ -3,6 +3,16 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## Unreleased
+
+- Add Lance-like `BLOB` / `LARGE_BINARY` column support with descriptor-backed storage for inline, packed sidecar, and dedicated sidecar blob payloads
+- Keep blob payloads lazy by storing descriptors in `.apex` column data and materializing Arrow `LargeBinary` only when blob columns are projected
+- Add single and batch Python blob helpers: `read_blob`, `read_blobs`, `read_blob_range`, `read_blob_ranges`, `read_blob_descriptor`, `read_blob_info`, and `read_blob_infos`
+- Add Rust, SQL parser, Arrow conversion, Python binding, WAL, mmap, and on-demand storage paths for `Blob` values
+- Add `benchmarks/bench_blob_lance.py` to compare ApexBase blob write/read/projection behavior against Lance Blob API
+
+---
+
 ## [v1.20.1](https://github.com/BirchKwok/ApexBase/releases/tag/v1.20.1)
 *2026-06-30*
 

@@ -187,7 +187,7 @@ Create a new table, optionally with a pre-defined schema.
 - `table_name`: Name of the table to create.
 - `schema`: Optional dict mapping column names to type strings. Pre-defining schema avoids type inference on the first insert, providing a performance benefit for bulk loading.
 
-**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`
+**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`, `blob`, `large_binary`
 
 **Examples:**
 ```python
@@ -390,6 +390,27 @@ Get a single record by its internal _id.
 ```python
 record = client.retrieve(1)
 print(record)  # {'_id': 1, 'name': 'Alice', 'age': 30}
+```
+
+#### Blob helpers
+```python
+read_blob(column: str, id_: int) -> Optional[bytes]
+read_blobs(column: str, ids: List[int]) -> List[Optional[bytes]]
+read_blob_range(column: str, id_: int, offset: int = 0, length: int = None) -> Optional[bytes]
+read_blob_ranges(column: str, ids: List[int], offsets: List[int], length: int = None) -> List[Optional[bytes]]
+read_blob_descriptor(column: str, id_: int) -> Optional[bytes]
+read_blob_info(column: str, id_: int) -> Optional[dict]
+read_blob_infos(column: str, ids: List[int]) -> List[Optional[dict]]
+```
+
+`blob` / `large_binary` columns store compact descriptors in the main table and keep payload bytes in inline, packed sidecar, or dedicated sidecar storage. Use these helpers for point reads, metadata reads, and range reads without projecting the whole blob column through SQL.
+
+**Example:**
+```python
+client.create_table("files", {"name": "string", "payload": "blob"})
+client.store({"name": "clip.bin", "payload": b"...large bytes..."})
+info = client.read_blob_info("payload", 1)
+chunk = client.read_blob_range("payload", 1, offset=1024, length=4096)
 ```
 
 #### retrieve_many

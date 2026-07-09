@@ -117,4 +117,12 @@ python benchmarks/bench_vs_sqlite_duckdb.py --rows 200000 --warmup 2 --iteration
 Add `--skip-vector` if you want a tabular-only rerun without the separate vector module.
 Run `python benchmarks/bench_vs_sqlite_duckdb_extended.py --rows 200000 --warmup 2 --iterations 3` for the file-format, materialization, Q/s, microbenchmark, durable, transaction, buffered/memtable, and full vector diagnostics.
 
+Blob storage has a focused Lance comparison harness:
+
+```bash
+python benchmarks/bench_blob_lance.py --rows 200 --reads 200 --iterations 3
+```
+
+The script measures write throughput, non-blob projection scans, descriptor metadata reads, random full blob reads, random range reads, and projected blob materialization. It uses Lance Blob helpers when the installed Lance package exposes them, and reports unavailable or fallback modes explicitly.
+
 For a larger stress run, increase `--rows` to `1000000`.

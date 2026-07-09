@@ -1695,7 +1695,7 @@ impl OnDemandStorage {
                 ColumnType::String | ColumnType::StringDict => {
                     string_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
-                ColumnType::Binary => {
+                ColumnType::Binary | ColumnType::Blob => {
                     binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
                 ColumnType::FixedList | ColumnType::Float16List => {
@@ -1761,10 +1761,10 @@ impl OnDemandStorage {
                             .unwrap_or_default();
                         string_columns.get_mut(col_name).unwrap().push(v);
                     }
-                    ColumnType::Binary => {
+                    ColumnType::Binary | ColumnType::Blob => {
                         let v = val
                             .and_then(|v| {
-                                if let ColumnValue::Binary(b) = v {
+                                if let ColumnValue::Binary(b) | ColumnValue::Blob(b) = v {
                                     Some(b.clone())
                                 } else {
                                     None
@@ -2313,7 +2313,10 @@ impl OnDemandStorage {
                     }
                     bool_columns.insert(col_name.clone(), values);
                 }
-                ColumnType::Binary | ColumnType::FixedList | ColumnType::Float16List => {
+                ColumnType::Binary
+                | ColumnType::Blob
+                | ColumnType::FixedList
+                | ColumnType::Float16List => {
                     return Ok(false);
                 }
             }
@@ -2450,7 +2453,7 @@ impl OnDemandStorage {
                 offsets: vec![0u32; count + 1],
                 data: Vec::new(),
             },
-            ColumnType::Binary => ColumnData::Binary {
+            ColumnType::Binary | ColumnType::Blob => ColumnData::Binary {
                 offsets: vec![0u32; count + 1],
                 data: Vec::new(),
             },

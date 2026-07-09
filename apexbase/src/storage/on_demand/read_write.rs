@@ -596,6 +596,29 @@ impl OnDemandStorage {
         bool_columns: HashMap<String, Vec<bool>>,
         null_positions: HashMap<String, Vec<bool>>,
     ) -> io::Result<Vec<u64>> {
+        self.insert_typed_with_nulls_full_with_blobs(
+            int_columns,
+            float_columns,
+            string_columns,
+            binary_columns,
+            fixedlist_columns,
+            HashMap::new(),
+            bool_columns,
+            null_positions,
+        )
+    }
+
+    pub fn insert_typed_with_nulls_full_with_blobs(
+        &self,
+        int_columns: HashMap<String, Vec<i64>>,
+        float_columns: HashMap<String, Vec<f64>>,
+        string_columns: HashMap<String, Vec<String>>,
+        binary_columns: HashMap<String, Vec<Vec<u8>>>,
+        fixedlist_columns: HashMap<String, Vec<Vec<u8>>>,
+        blob_columns: HashMap<String, Vec<Vec<u8>>>,
+        bool_columns: HashMap<String, Vec<bool>>,
+        null_positions: HashMap<String, Vec<bool>>,
+    ) -> io::Result<Vec<u64>> {
         // Determine row count as maximum across all columns
         let row_count = int_columns
             .values()
@@ -612,6 +635,7 @@ impl OnDemandStorage {
                     .max()
                     .unwrap_or(0),
             )
+            .max(blob_columns.values().map(|v| v.len()).max().unwrap_or(0))
             .max(bool_columns.values().map(|v| v.len()).max().unwrap_or(0));
 
         if row_count == 0 {
@@ -709,6 +733,20 @@ impl OnDemandStorage {
                     nulls.push(Vec::new());
                 }
             }
+            for name in blob_columns.keys() {
+                let idx = schema.add_column(name, ColumnType::Blob);
+                col_name_to_idx.insert(name.clone(), idx);
+                while columns.len() <= idx {
+                    let mut col = ColumnData::new(ColumnType::Blob);
+                    if let ColumnData::Binary { offsets, .. } = &mut col {
+                        for _ in 0..existing_row_count {
+                            offsets.push(0);
+                        }
+                    }
+                    columns.push(col);
+                    nulls.push(Vec::new());
+                }
+            }
             for name in bool_columns.keys() {
                 let idx = schema.add_column(name, ColumnType::Bool);
                 col_name_to_idx.insert(name.clone(), idx);
@@ -769,6 +807,13 @@ impl OnDemandStorage {
                         } else {
                             columns[idx].push_fixed_list(v);
                         }
+                    }
+                }
+            }
+            for (name, values) in blob_columns {
+                if let Some(idx) = schema.get_index(&name) {
+                    for v in &values {
+                        columns[idx].push_bytes(v);
                     }
                 }
             }
@@ -1339,7 +1384,7 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (dd_start + s) as u64, &mut str_buf)?;
                     Value::String(std::str::from_utf8(&str_buf).unwrap_or("").to_string())
                 }
-                (COL_ENCODING_PLAIN, ColumnType::Binary) => {
+                (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob) => {
                     let mut count_buf = [0u8; 8];
                     self.read_cached_bytes(data_base, &mut count_buf)?;
                     let count = u64::from_le_bytes(count_buf) as usize;
@@ -1358,7 +1403,11 @@ impl OnDemandStorage {
                     let dd_start = 8 + (count + 1) * 4 + 8;
                     let mut bin_buf = vec![0u8; e - s];
                     self.read_cached_bytes(data_base + (dd_start + s) as u64, &mut bin_buf)?;
-                    Value::Binary(bin_buf)
+                    if col_type == ColumnType::Blob {
+                        Value::Blob(self.read_blob_value(&bin_buf)?)
+                    } else {
+                        Value::Binary(bin_buf)
+                    }
                 }
                 (COL_ENCODING_PLAIN, ColumnType::StringDict) => {
                     let mut hdr = [0u8; 16];
@@ -1679,7 +1728,7 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (dd_start + s) as u64, &mut str_buf)?;
                     Value::String(std::str::from_utf8(&str_buf).unwrap_or("").to_string())
                 }
-                (COL_ENCODING_PLAIN, ColumnType::Binary) => {
+                (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob) => {
                     let mut count_buf = [0u8; 8];
                     self.read_cached_bytes(data_base, &mut count_buf)?;
                     let count = u64::from_le_bytes(count_buf) as usize;
@@ -1698,7 +1747,11 @@ impl OnDemandStorage {
                     let dd_start = 8 + (count + 1) * 4 + 8;
                     let mut bin_buf = vec![0u8; e - s];
                     self.read_cached_bytes(data_base + (dd_start + s) as u64, &mut bin_buf)?;
-                    Value::Binary(bin_buf)
+                    if col_type == ColumnType::Blob {
+                        Value::Blob(self.read_blob_value(&bin_buf)?)
+                    } else {
+                        Value::Binary(bin_buf)
+                    }
                 }
                 (COL_ENCODING_PLAIN, ColumnType::StringDict) => {
                     let mut hdr = [0u8; 16];
@@ -2252,7 +2305,7 @@ impl OnDemandStorage {
         let mut result = Vec::with_capacity(schema.column_count() + 1);
         result.push(("_id".to_string(), Value::Int64(id as i64)));
 
-        for (col_idx, (col_name, _)) in schema.columns.iter().enumerate() {
+        for (col_idx, (col_name, col_type)) in schema.columns.iter().enumerate() {
             // Check null
             if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
                 let b = row_idx / 8;
@@ -2311,7 +2364,12 @@ impl OnDemandStorage {
                     if row_idx < count {
                         let s = offsets[row_idx] as usize;
                         let e = offsets[row_idx + 1] as usize;
-                        Value::Binary(data[s..e].to_vec())
+                        let bytes = data[s..e].to_vec();
+                        if *col_type == ColumnType::Blob {
+                            Value::Blob(self.read_blob_value(&bytes)?)
+                        } else {
+                            Value::Binary(bytes)
+                        }
                     } else {
                         Value::Null
                     }
@@ -2555,7 +2613,7 @@ impl OnDemandStorage {
                                 Value::Null
                             }
                         }
-                        (COL_ENCODING_PLAIN, ColumnType::Binary) => {
+                        (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob) => {
                             // Plain Binary: same layout as String: [count:u64][offsets:(count+1)*4][data_len:u64][data]
                             if data_bytes.len() >= 8 {
                                 let count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap())
@@ -2574,9 +2632,13 @@ impl OnDemandStorage {
                                     if data_len_off + 8 <= data_bytes.len() {
                                         let data_start = data_len_off + 8;
                                         if data_start + e <= data_bytes.len() {
-                                            Value::Binary(
-                                                data_bytes[data_start + s..data_start + e].to_vec(),
-                                            )
+                                            let bytes =
+                                                data_bytes[data_start + s..data_start + e].to_vec();
+                                            if col_type == ColumnType::Blob {
+                                                Value::Blob(self.read_blob_value(&bytes)?)
+                                            } else {
+                                                Value::Binary(bytes)
+                                            }
                                         } else {
                                             Value::Null
                                         }
@@ -3273,6 +3335,7 @@ impl OnDemandStorage {
             DataType::String => ColumnType::String,
             DataType::Bool => ColumnType::Bool,
             DataType::Binary => ColumnType::Binary,
+            DataType::Blob => ColumnType::Blob,
             DataType::Timestamp => ColumnType::Timestamp,
             DataType::Date => ColumnType::Date,
             DataType::Float16Vector => ColumnType::Float16List,
@@ -3351,6 +3414,7 @@ impl OnDemandStorage {
         let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
         let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
         let mut binary_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut blob_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
 
         for (name, val) in data {
@@ -3366,6 +3430,9 @@ impl OnDemandStorage {
                 }
                 ColumnValue::Binary(v) => {
                     binary_columns.insert(name.clone(), vec![v.clone()]);
+                }
+                ColumnValue::Blob(v) => {
+                    blob_columns.insert(name.clone(), vec![self.write_blob_value(v)?]);
                 }
                 ColumnValue::FixedList(v) => {
                     binary_columns.insert(name.clone(), vec![v.clone()]);
@@ -3443,6 +3510,19 @@ impl OnDemandStorage {
                     nulls.push(Vec::new());
                 }
             }
+            for name in blob_columns.keys() {
+                let idx = schema.add_column(name, ColumnType::Blob);
+                while columns.len() <= idx {
+                    let mut col = ColumnData::new(ColumnType::Blob);
+                    if let ColumnData::Binary { offsets, .. } = &mut col {
+                        for _ in 0..existing_row_count {
+                            offsets.push(0);
+                        }
+                    }
+                    columns.push(col);
+                    nulls.push(Vec::new());
+                }
+            }
             for name in bool_columns.keys() {
                 let idx = schema.add_column(name, ColumnType::Bool);
                 while columns.len() <= idx {
@@ -3482,6 +3562,13 @@ impl OnDemandStorage {
                 }
             }
             for (name, values) in binary_columns {
+                if let Some(idx) = schema.get_index(&name) {
+                    for v in &values {
+                        columns[idx].push_bytes(v);
+                    }
+                }
+            }
+            for (name, values) in blob_columns {
                 if let Some(idx) = schema.get_index(&name) {
                     for v in &values {
                         columns[idx].push_bytes(v);

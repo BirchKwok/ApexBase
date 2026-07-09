@@ -840,3 +840,196 @@ fn test_constraint_persisted_through_save_v4() {
         );
     }
 }
+
+#[test]
+fn test_blob_storage_modes_roundtrip() {
+    use arrow::array::{Array, LargeBinaryArray};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("blob_modes.apex");
+    let small = b"small-blob".to_vec();
+    let packed = vec![7u8; 70 * 1024];
+    let dedicated = vec![9u8; 4 * 1024 * 1024 + 123];
+    let empty = Vec::new();
+
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            super::super::DurabilityLevel::Fast,
+            &[("payload".to_string(), ColumnType::Blob)],
+        )
+        .unwrap();
+
+        let rows = vec![
+            HashMap::from([("payload".to_string(), ColumnValue::Blob(small.clone()))]),
+            HashMap::from([("payload".to_string(), ColumnValue::Blob(packed.clone()))]),
+            HashMap::from([("payload".to_string(), ColumnValue::Blob(dedicated.clone()))]),
+            HashMap::from([("payload".to_string(), ColumnValue::Null)]),
+            HashMap::from([("payload".to_string(), ColumnValue::Blob(empty.clone()))]),
+        ];
+        storage.insert_rows(&rows).unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let descriptors = storage.read_columns(Some(&["payload"]), 0, None).unwrap();
+    let ColumnData::Binary { offsets, data } = &descriptors["payload"] else {
+        panic!("expected blob descriptor column");
+    };
+    assert_eq!(
+        OnDemandStorage::blob_descriptor_mode(&data[offsets[0] as usize..offsets[1] as usize]),
+        Some(BlobStorageMode::Inline)
+    );
+    assert_eq!(
+        OnDemandStorage::blob_descriptor_mode(&data[offsets[1] as usize..offsets[2] as usize]),
+        Some(BlobStorageMode::Packed)
+    );
+    assert_eq!(
+        OnDemandStorage::blob_descriptor_mode(&data[offsets[2] as usize..offsets[3] as usize]),
+        Some(BlobStorageMode::Dedicated)
+    );
+    assert_eq!(
+        OnDemandStorage::blob_descriptor_mode(&data[offsets[3] as usize..offsets[4] as usize]),
+        None
+    );
+    assert_eq!(
+        OnDemandStorage::blob_descriptor_mode(&data[offsets[4] as usize..offsets[5] as usize]),
+        Some(BlobStorageMode::Inline)
+    );
+    assert!(
+        OnDemandStorage::blob_descriptor_info(&data[offsets[0] as usize..offsets[1] as usize])
+            .is_some()
+    );
+
+    let batch = storage.to_arrow_batch(Some(&["payload"]), false).unwrap();
+    let array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .unwrap();
+    assert_eq!(array.value(0), small.as_slice());
+    assert_eq!(array.value(1), packed.as_slice());
+    assert_eq!(array.value(2), dedicated.as_slice());
+    assert!(array.is_null(3));
+    assert_eq!(array.value(4), empty.as_slice());
+
+    assert_eq!(
+        storage.read_blob_by_id("payload", 1).unwrap().as_deref(),
+        Some(small.as_slice())
+    );
+    assert_eq!(
+        storage.read_blob_by_id("payload", 2).unwrap().as_deref(),
+        Some(packed.as_slice())
+    );
+    assert_eq!(
+        storage.read_blob_by_id("payload", 3).unwrap().as_deref(),
+        Some(dedicated.as_slice())
+    );
+    assert!(storage.read_blob_by_id("payload", 4).unwrap().is_none());
+    assert_eq!(
+        storage.read_blob_by_id("payload", 5).unwrap().as_deref(),
+        Some(empty.as_slice())
+    );
+    let batch_blobs = storage
+        .read_blobs_by_ids("payload", &[1, 2, 3, 4, 5, 99])
+        .unwrap();
+    assert_eq!(batch_blobs[0].as_deref(), Some(small.as_slice()));
+    assert_eq!(batch_blobs[1].as_deref(), Some(packed.as_slice()));
+    assert_eq!(batch_blobs[2].as_deref(), Some(dedicated.as_slice()));
+    assert!(batch_blobs[3].is_none());
+    assert_eq!(batch_blobs[4].as_deref(), Some(empty.as_slice()));
+    assert!(batch_blobs[5].is_none());
+
+    let packed_range = storage
+        .read_blob_range_by_id("payload", 2, 1024, Some(4096))
+        .unwrap()
+        .unwrap();
+    assert_eq!(packed_range, packed[1024..1024 + 4096]);
+    let dedicated_range = storage
+        .read_blob_range_by_id("payload", 3, 4 * 1024 * 1024, Some(64))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        dedicated_range,
+        dedicated[4 * 1024 * 1024..4 * 1024 * 1024 + 64]
+    );
+    assert_eq!(
+        storage
+            .read_blob_range_by_id("payload", 3, dedicated.len() as u64 + 1, Some(64))
+            .unwrap()
+            .unwrap(),
+        Vec::<u8>::new()
+    );
+    assert!(storage
+        .read_blob_range_by_id("payload", 4, 0, Some(8))
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        storage
+            .read_blob_range_by_id("payload", 5, 0, Some(8))
+            .unwrap()
+            .unwrap(),
+        Vec::<u8>::new()
+    );
+    let batch_ranges = storage
+        .read_blob_ranges_by_ids(
+            "payload",
+            &[1, 2, 3, 4, 5],
+            &[2, 1024, 4 * 1024 * 1024, 0, 0],
+            Some(8),
+        )
+        .unwrap();
+    assert_eq!(batch_ranges[0].as_deref(), Some(&small[2..small.len()]));
+    assert_eq!(batch_ranges[1].as_deref(), Some(&packed[1024..1024 + 8]));
+    assert_eq!(
+        batch_ranges[2].as_deref(),
+        Some(&dedicated[4 * 1024 * 1024..4 * 1024 * 1024 + 8])
+    );
+    assert!(batch_ranges[3].is_none());
+    assert_eq!(batch_ranges[4].as_deref(), Some(empty.as_slice()));
+
+    let small_info = storage
+        .read_blob_descriptor_info_by_id("payload", 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(small_info.mode, BlobStorageMode::Inline);
+    assert_eq!(small_info.len, small.len() as u64);
+    let packed_info = storage
+        .read_blob_descriptor_info_by_id("payload", 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(packed_info.mode, BlobStorageMode::Packed);
+    assert_eq!(packed_info.len, packed.len() as u64);
+    let dedicated_info = storage
+        .read_blob_descriptor_info_by_id("payload", 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(dedicated_info.mode, BlobStorageMode::Dedicated);
+    assert_eq!(dedicated_info.len, dedicated.len() as u64);
+    let batch_infos = storage
+        .read_blob_descriptor_infos_by_ids("payload", &[1, 2, 3, 4, 5])
+        .unwrap();
+    assert_eq!(
+        batch_infos[0].as_ref().unwrap().mode,
+        BlobStorageMode::Inline
+    );
+    assert_eq!(
+        batch_infos[1].as_ref().unwrap().mode,
+        BlobStorageMode::Packed
+    );
+    assert_eq!(
+        batch_infos[2].as_ref().unwrap().mode,
+        BlobStorageMode::Dedicated
+    );
+    assert!(batch_infos[3].is_none());
+    assert_eq!(
+        batch_infos[4].as_ref().unwrap().mode,
+        BlobStorageMode::Inline
+    );
+    assert_eq!(batch_infos[4].as_ref().unwrap().len, 0);
+    assert!(storage.read_blob_by_id("payload", 99).unwrap().is_none());
+    assert!(storage.read_blob_by_id("missing", 1).unwrap().is_none());
+
+    assert!(storage.blob_sidecar_dir().join("packed.blob").exists());
+    assert!(storage.blob_sidecar_dir().join("objects").exists());
+}

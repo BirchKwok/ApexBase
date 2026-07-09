@@ -5051,6 +5051,7 @@ impl OnDemandStorage {
         let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
         let mut binary_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut fixedlist_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut blob_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
         let mut null_positions: HashMap<String, Vec<bool>> = HashMap::new();
 
@@ -5074,6 +5075,9 @@ impl OnDemandStorage {
                     ColumnType::Binary => {
                         binary_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
+                    ColumnType::Blob => {
+                        blob_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
+                    }
                     ColumnType::FixedList | ColumnType::Float16List => {
                         fixedlist_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
@@ -5091,6 +5095,7 @@ impl OnDemandStorage {
             for (key, val) in row {
                 if int_columns.contains_key(key) || float_columns.contains_key(key) 
                     || string_columns.contains_key(key) || binary_columns.contains_key(key)
+                    || blob_columns.contains_key(key)
                     || bool_columns.contains_key(key) {
                     continue;
                 }
@@ -5099,6 +5104,7 @@ impl OnDemandStorage {
                     ColumnValue::Float64(_) => { float_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     ColumnValue::String(_) => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     ColumnValue::Binary(_) => { binary_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValue::Blob(_) => { blob_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     ColumnValue::FixedList(_) => { fixedlist_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     ColumnValue::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     ColumnValue::Null => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
@@ -5117,12 +5123,14 @@ impl OnDemandStorage {
             for (key, val) in row {
                 if !int_columns.contains_key(key) && !float_columns.contains_key(key) 
                     && !string_columns.contains_key(key) && !binary_columns.contains_key(key)
+                    && !blob_columns.contains_key(key)
                     && !fixedlist_columns.contains_key(key) && !bool_columns.contains_key(key) {
                     match val {
                         ColumnValue::Int64(_) => { int_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                         ColumnValue::Float64(_) => { float_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                         ColumnValue::String(_) => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                         ColumnValue::Binary(_) => { binary_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValue::Blob(_) => { blob_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                         ColumnValue::FixedList(_) => { fixedlist_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                         ColumnValue::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                         ColumnValue::Null => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
@@ -5169,6 +5177,17 @@ impl OnDemandStorage {
                 col.push(val);
                 null_positions.entry(key.clone()).or_default().push(is_null);
             }
+            for (key, col) in blob_columns.iter_mut() {
+                let (val, is_null) = match row.get(key) {
+                    Some(ColumnValue::Blob(v)) | Some(ColumnValue::Binary(v)) => {
+                        (self.write_blob_value(v)?, false)
+                    }
+                    Some(ColumnValue::Null) | None => (Vec::new(), true),
+                    _ => (Vec::new(), true),
+                };
+                col.push(val);
+                null_positions.entry(key.clone()).or_default().push(is_null);
+            }
             for (key, col) in fixedlist_columns.iter_mut() {
                 let (val, is_null) = match row.get(key) {
                     Some(ColumnValue::FixedList(v)) => (v.clone(), false),
@@ -5189,7 +5208,16 @@ impl OnDemandStorage {
             }
         }
 
-        let result = self.insert_typed_with_nulls_full(int_columns, float_columns, string_columns, binary_columns, fixedlist_columns, bool_columns, null_positions)?;
+        let result = self.insert_typed_with_nulls_full_with_blobs(
+            int_columns,
+            float_columns,
+            string_columns,
+            binary_columns,
+            fixedlist_columns,
+            blob_columns,
+            bool_columns,
+            null_positions,
+        )?;
         
         // Update pending rows counter and check auto-flush
         self.pending_rows.fetch_add(result.len() as u64, Ordering::Relaxed);

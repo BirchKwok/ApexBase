@@ -27,6 +27,9 @@ pub enum ColumnType {
     /// Fixed-size list of f16 — stored as contiguous raw bytes (dim * 2 per row, no offset array).
     /// Half the storage of FixedList; decoded to f32 on read/distance computation.
     Float16List = TYPE_FLOAT16_LIST,
+    /// Blob descriptor column. Small payloads may be inline; larger payloads
+    /// live in table sidecar files and are resolved only when projected.
+    Blob = TYPE_BLOB,
 }
 
 impl ColumnType {
@@ -51,6 +54,7 @@ impl ColumnType {
             TYPE_DATE => Some(ColumnType::Date),
             TYPE_FIXED_LIST => Some(ColumnType::FixedList),
             TYPE_FLOAT16_LIST => Some(ColumnType::Float16List),
+            TYPE_BLOB => Some(ColumnType::Blob),
             _ => None,
         }
     }
@@ -64,12 +68,25 @@ impl ColumnType {
             ColumnType::Int16 | ColumnType::UInt16 => 2,
             ColumnType::Int32 | ColumnType::UInt32 | ColumnType::Float32 => 4,
             ColumnType::Int64 | ColumnType::UInt64 | ColumnType::Float64 | ColumnType::Timestamp | ColumnType::Date => 8,
-            ColumnType::String | ColumnType::Binary | ColumnType::StringDict | ColumnType::FixedList | ColumnType::Float16List => 0,
+            ColumnType::String
+            | ColumnType::Binary
+            | ColumnType::StringDict
+            | ColumnType::FixedList
+            | ColumnType::Float16List
+            | ColumnType::Blob => 0,
         }
     }
 
     pub fn is_variable_length(&self) -> bool {
-        matches!(self, ColumnType::String | ColumnType::Binary | ColumnType::StringDict | ColumnType::FixedList | ColumnType::Float16List)
+        matches!(
+            self,
+            ColumnType::String
+                | ColumnType::Binary
+                | ColumnType::StringDict
+                | ColumnType::FixedList
+                | ColumnType::Float16List
+                | ColumnType::Blob
+        )
     }
 }
 
@@ -82,6 +99,7 @@ pub enum ColumnValue {
     Float64(f64),
     String(String),
     Binary(Vec<u8>),
+    Blob(Vec<u8>),
     /// Raw f32 bytes for a FixedList (vector) column
     FixedList(Vec<u8>),
 }
@@ -277,7 +295,7 @@ impl ColumnData {
                 offsets: vec![0],
                 data: Vec::new(),
             },
-            ColumnType::Binary => ColumnData::Binary {
+            ColumnType::Binary | ColumnType::Blob => ColumnData::Binary {
                 offsets: vec![0],
                 data: Vec::new(),
             },
@@ -711,7 +729,7 @@ impl ColumnData {
                 pos += data_len;
                 Ok((ColumnData::String { offsets, data }, pos))
             }
-            ColumnType::Binary => {
+            ColumnType::Binary | ColumnType::Blob => {
                 let count = read_u64!() as usize;
                 let offsets_len = (count + 1) * 4;
                 if pos + offsets_len > bytes.len() {
@@ -837,7 +855,7 @@ impl ColumnData {
                 let count = read_u64!() as usize;
                 pos += count * 8;
             }
-            ColumnType::String | ColumnType::Binary => {
+            ColumnType::String | ColumnType::Binary | ColumnType::Blob => {
                 let count = read_u64!() as usize;
                 let offsets_len = (count + 1) * 4;
                 pos += offsets_len;

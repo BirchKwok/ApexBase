@@ -84,6 +84,7 @@ pub fn datatype_to_column_type(dt: &DataType) -> ColumnType {
         DataType::String => ColumnType::String,
         DataType::Bool => ColumnType::Bool,
         DataType::Binary => ColumnType::Binary,
+        DataType::Blob => ColumnType::Blob,
         DataType::Timestamp => ColumnType::Timestamp,
         DataType::Date => ColumnType::Date,
         _ => ColumnType::String, // Fallback for complex types
@@ -105,6 +106,7 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::String | ColumnType::StringDict => DataType::String,
         ColumnType::Bool => DataType::Bool,
         ColumnType::Binary => DataType::Binary,
+        ColumnType::Blob => DataType::Blob,
         ColumnType::FixedList | ColumnType::Float16List => DataType::Binary,
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Date => DataType::Date,
@@ -569,6 +571,7 @@ impl TableStorageBackend {
                             Value::String(s) => ColumnValue::String(s.clone()),
                             Value::Bool(b) => ColumnValue::Bool(*b),
                             Value::Binary(b) => ColumnValue::Binary(b.clone()),
+                            Value::Blob(b) => ColumnValue::Blob(b.clone()),
                             Value::FixedList(b) => ColumnValue::FixedList(b.clone()),
                             _ => ColumnValue::Null,
                         };
@@ -852,6 +855,7 @@ impl TableStorageBackend {
                                 Value::String(s) => ColumnValue::String(s.clone()),
                                 Value::Bool(b) => ColumnValue::Bool(*b),
                                 Value::Binary(b) => ColumnValue::Binary(b.clone()),
+                                Value::Blob(b) => ColumnValue::Blob(b.clone()),
                                 Value::FixedList(b) => ColumnValue::FixedList(b.clone()),
                                 Value::Null => ColumnValue::Null,
                                 _ => ColumnValue::String(
@@ -878,6 +882,7 @@ impl TableStorageBackend {
                                 Value::String(s) => ColumnValue::String(s.clone()),
                                 Value::Bool(b) => ColumnValue::Bool(*b),
                                 Value::Binary(b) => ColumnValue::Binary(b.clone()),
+                                Value::Blob(b) => ColumnValue::Blob(b.clone()),
                                 Value::FixedList(b) => ColumnValue::FixedList(b.clone()),
                                 Value::Null => ColumnValue::Null,
                                 _ => ColumnValue::String(
@@ -1081,6 +1086,73 @@ impl TableStorageBackend {
             for name in fixedlist_columns.keys() {
                 if !schema.iter().any(|(n, _)| n == name) {
                     schema.push((name.clone(), crate::data::DataType::Binary));
+                }
+            }
+            for name in bool_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Bool));
+                }
+            }
+        }
+
+        *self.row_count.write() += ids.len() as u64;
+        self.invalidate_read_caches();
+        *self.dirty.write() = true;
+        Ok(ids)
+    }
+
+    pub fn insert_typed_with_nulls_full_with_blobs(
+        &self,
+        int_columns: HashMap<String, Vec<i64>>,
+        float_columns: HashMap<String, Vec<f64>>,
+        string_columns: HashMap<String, Vec<String>>,
+        binary_columns: HashMap<String, Vec<Vec<u8>>>,
+        fixedlist_columns: HashMap<String, Vec<Vec<u8>>>,
+        blob_columns: HashMap<String, Vec<Vec<u8>>>,
+        bool_columns: HashMap<String, Vec<bool>>,
+        null_positions: HashMap<String, Vec<bool>>,
+    ) -> io::Result<Vec<u64>> {
+        let ids = self.storage.insert_typed_with_nulls_full_with_blobs(
+            int_columns.clone(),
+            float_columns.clone(),
+            string_columns.clone(),
+            binary_columns.clone(),
+            fixedlist_columns.clone(),
+            blob_columns.clone(),
+            bool_columns.clone(),
+            null_positions,
+        )?;
+
+        {
+            let mut schema = self.schema.write();
+            for name in int_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Int64));
+                }
+            }
+            for name in float_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Float64));
+                }
+            }
+            for name in string_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::String));
+                }
+            }
+            for name in binary_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Binary));
+                }
+            }
+            for name in fixedlist_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Binary));
+                }
+            }
+            for name in blob_columns.keys() {
+                if !schema.iter().any(|(n, _)| n == name) {
+                    schema.push((name.clone(), crate::data::DataType::Blob));
                 }
             }
             for name in bool_columns.keys() {
@@ -1412,6 +1484,7 @@ impl TableStorageBackend {
                     Value::String(s) => ColumnValue::String(s.clone()),
                     Value::Bool(b) => ColumnValue::Bool(*b),
                     Value::Binary(b) => ColumnValue::Binary(b.clone()),
+                    Value::Blob(b) => ColumnValue::Blob(b.clone()),
                     Value::Null => ColumnValue::Null,
                     _ => ColumnValue::String(serde_json::to_string(v).unwrap_or_default()),
                 };
@@ -4277,6 +4350,7 @@ impl IncrementalStorageBackend {
                             Value::String(s) => OnDemandColumnValue::String(s.clone()),
                             Value::Bool(b) => OnDemandColumnValue::Bool(*b),
                             Value::Binary(b) => OnDemandColumnValue::Binary(b.clone()),
+                            Value::Blob(b) => OnDemandColumnValue::Blob(b.clone()),
                             Value::FixedList(b) => OnDemandColumnValue::FixedList(b.clone()),
                             Value::Null => OnDemandColumnValue::Null,
                             _ => OnDemandColumnValue::String(

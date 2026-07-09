@@ -989,9 +989,19 @@ impl OnDemandStorage {
                     (ArrowDataType::Boolean, Arc::new(BooleanArray::from(bools)))
                 }
                 ColumnData::Binary { offsets, data } => {
-                    use arrow::array::BinaryArray;
+                    use arrow::array::{BinaryArray, LargeBinaryArray};
                     let count = offsets.len().saturating_sub(1);
-                    if null_buf.is_some() {
+                    if schema_col_type == ColumnType::Blob {
+                        let values = self.materialize_blob_column(
+                            offsets,
+                            data,
+                            null_bitmap,
+                            active_count,
+                        )?;
+                        let refs: Vec<Option<&[u8]>> =
+                            values.iter().map(|v| v.as_deref()).collect();
+                        (ArrowDataType::LargeBinary, Arc::new(LargeBinaryArray::from(refs)))
+                    } else if null_buf.is_some() {
                         let bins: Vec<Option<&[u8]>> = (0..count.min(active_count)).map(|i| {
                             if i < null_bitmap.len() && null_bitmap[i] {
                                 None
@@ -2122,7 +2132,7 @@ impl OnDemandStorage {
                 
                 Ok(ColumnData::Bool { data: packed, len: row_count })
             }
-            ColumnType::String | ColumnType::Binary => {
+            ColumnType::String | ColumnType::Binary | ColumnType::Blob => {
                 // Variable-length type: need to read offsets first
                 self.read_variable_column_range_mmap(mmap_cache, file, index, dtype, start_row, row_count)
             }
@@ -2222,7 +2232,7 @@ impl OnDemandStorage {
         
         match dtype {
             ColumnType::String => Ok(ColumnData::String { offsets, data }),
-            ColumnType::Binary => Ok(ColumnData::Binary { offsets, data }),
+            ColumnType::Binary | ColumnType::Blob => Ok(ColumnData::Binary { offsets, data }),
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Not a variable type")),
         }
     }
@@ -2522,7 +2532,7 @@ impl OnDemandStorage {
 
         match dtype {
             ColumnType::String => Ok(ColumnData::String { offsets: result_offsets, data: result_data }),
-            ColumnType::Binary => Ok(ColumnData::Binary { offsets: result_offsets, data: result_data }),
+            ColumnType::Binary | ColumnType::Blob => Ok(ColumnData::Binary { offsets: result_offsets, data: result_data }),
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Not a variable type")),
         }
     }
@@ -2720,7 +2730,7 @@ impl OnDemandStorage {
                 Self::read_numeric_scattered_optimized::<f64>(mmap_cache, file, index, row_indices, HEADER_SIZE)
                     .map(ColumnData::Float64)
             }
-            ColumnType::String | ColumnType::Binary => {
+            ColumnType::String | ColumnType::Binary | ColumnType::Blob => {
                 // Optimized scattered read for variable-length types
                 self.read_variable_column_scattered_mmap(mmap_cache, file, index, dtype, row_indices)
             }

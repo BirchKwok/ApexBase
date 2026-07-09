@@ -5929,7 +5929,8 @@ impl SqlParser {
                     "FLOAT64" | "DOUBLE" | "REAL" => Ok(DataType::Float64),
                     "STRING" | "TEXT" | "VARCHAR" => Ok(DataType::String),
                     "BOOL" | "BOOLEAN" => Ok(DataType::Bool),
-                    "BYTES" | "BLOB" | "BINARY" | "VARBINARY" | "BYTEA" => Ok(DataType::Binary),
+                    "BLOB" | "LARGE_BINARY" | "LARGEBINARY" | "LONGBLOB" => Ok(DataType::Blob),
+                    "BYTES" | "BINARY" | "VARBINARY" | "BYTEA" => Ok(DataType::Binary),
                     "JSON" => Ok(DataType::Json),
                     "DECIMAL" | "NUMERIC" => {
                         // Skip optional (precision, scale) parameters
@@ -6505,7 +6506,7 @@ mod tests {
             assert_eq!(columns[2].data_type, DataType::UInt32);
             assert_eq!(columns[3].data_type, DataType::Float32);
             assert_eq!(columns[4].data_type, DataType::Json);
-            assert_eq!(columns[5].data_type, DataType::Binary);
+            assert_eq!(columns[5].data_type, DataType::Blob);
         } else {
             panic!("Expected CreateTable");
         }

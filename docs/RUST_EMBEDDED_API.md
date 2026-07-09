@@ -130,7 +130,8 @@ fn main() -> apexbase::Result<()> {
 | `Value::Float64(f64)` | `f64` | `FLOAT64` / `DOUBLE` |
 | `Value::String(String)` | `String` | `STRING` / `TEXT` / `VARCHAR` |
 | `Value::Bool(bool)` | `bool` | `BOOL` / `BOOLEAN` |
-| `Value::Binary(Vec<u8>)` | `Vec<u8>` | `BINARY` / `BLOB` |
+| `Value::Binary(Vec<u8>)` | `Vec<u8>` | `BINARY` / `VARBINARY` |
+| `Value::Blob(Vec<u8>)` | `Vec<u8>` | `BLOB` / `LARGE_BINARY` |
 | `Value::FixedList(Vec<u8>)` | raw LE f32 bytes | `FIXEDLIST` (vector embedding) |
 | `Value::Null` | — | `NULL` |
 
@@ -142,6 +143,7 @@ let v_float = Value::Float64(3.14);
 let v_str   = Value::String("hello".to_string());
 let v_bool  = Value::Bool(true);
 let v_bytes = Value::Binary(vec![0u8, 1, 2, 3]);
+let v_blob  = Value::Blob(vec![0u8; 128 * 1024]);
 let v_null  = Value::Null;
 ```
 
@@ -156,6 +158,7 @@ let v_null  = Value::Null;
 | `ColumnType::String` | UTF-8 string (plain or dict-encoded on disk) |
 | `ColumnType::Bool` | Boolean (bit-packed) |
 | `ColumnType::Binary` | Arbitrary byte array |
+| `ColumnType::Blob` | Large byte object stored through inline/sidecar descriptors |
 | `ColumnType::FixedList` | Fixed-size float32 vector (embedding storage) |
 
 ### DataType
@@ -169,6 +172,7 @@ let v_null  = Value::Null;
 | `DataType::String` | UTF-8 string |
 | `DataType::Bool` | Boolean |
 | `DataType::Binary` | Byte array |
+| `DataType::Blob` | Large byte object |
 
 ---
 
@@ -727,7 +731,7 @@ let val: Value = arrow_value_at(&column_ref, row_index);
 Iterates over all columns and rows, calling `arrow_value_at` for each cell.
 
 **`arrow_value_at(arr: &ArrayRef, row: usize) → Value`**  
-Handles: `Int8/16/32/64`, `UInt8/16/32/64`, `Float32/64`, `Boolean`, `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary`. Returns `Value::Null` for null entries or unrecognized types.
+Handles: `Int8/16/32/64`, `UInt8/16/32/64`, `Float32/64`, `Boolean`, `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary`. Large Arrow binary values are represented as `Value::Blob`; regular Arrow binary values are represented as `Value::Binary`. Returns `Value::Null` for null entries or unrecognized types.
 
 ---
 

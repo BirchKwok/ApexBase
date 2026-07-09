@@ -132,7 +132,7 @@ cargo test
 尤其需要反复确认：
 
 1. 是否已经有修改前 benchmark 基线。
-2. 是否使用 `maturin develop --release` 编译。
+2. 是否已经使用 `maturin develop --release` 编译。
 3. 是否运行了修改后的 benchmark。
 4. benchmark 是否没有回退。
 5. pytest 是否全部通过。
@@ -160,7 +160,7 @@ python benchmarks/bench_vs_sqlite_duckdb.py
 
 1. 修改前 benchmark 基线已记录。
 2. release 编译成功。
-3. 所有 pytest 测试通过。
+3. 实现新功能必须增加python 测试用例，并确保所有 pytest 测试通过。
 4. pytest 总耗时不超过 9 秒。
 5. 所有 `cargo test` 测试通过。
 6. `cargo test` 耗时没有明显变长。

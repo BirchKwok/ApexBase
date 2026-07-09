@@ -61,6 +61,25 @@ client.store({
 
 For large inserts, prefer columnar batches or DataFrame import.
 
+## Blob Payloads
+
+Declare large byte columns as `blob` or `large_binary` when you want descriptor-backed storage:
+
+```python
+client.create_table("files", {"name": "string", "payload": "blob"})
+large_payload = b"\0" * (5 * 1024 * 1024)
+client.store({
+    "name": ["small.bin", "video.bin"],
+    "payload": [b"small", large_payload],
+})
+
+info = client.read_blob_info("payload", 2)
+chunk = client.read_blob_range("payload", 2, offset=0, length=65536)
+payload = client.read_blob("payload", 2)
+```
+
+Blob descriptors stay in the main table. Payload bytes are loaded only when you project the blob column or call the blob read helpers.
+
 ## Querying
 
 Use `execute()` for SQL:

@@ -1330,6 +1330,7 @@ const TYPE_TIMESTAMP: u8 = 15; // Timestamp (microseconds since Unix epoch)
 const TYPE_DATE: u8 = 16; // Date (days since Unix epoch)
 const TYPE_FIXED_LIST: u8 = 17; // Fixed-size list of f32 (no offset array)
 const TYPE_FLOAT16_LIST: u8 = 18; // Fixed-size list of f16 (half-precision, dim*2 bytes/row)
+const TYPE_BLOB: u8 = 19; // Large blob descriptor column (payload may live in sidecar files)
 
 // ============================================================================
 // Data Types
@@ -1338,6 +1339,7 @@ const TYPE_FLOAT16_LIST: u8 = 18; // Fixed-size list of f16 (half-precision, dim
 // Type definitions
 include!("types.rs");
 include!("header.rs");
+include!("blob.rs");
 
 // OnDemandStorage struct and implementation
 include!("storage_core.rs");

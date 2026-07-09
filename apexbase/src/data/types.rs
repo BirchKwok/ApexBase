@@ -26,6 +26,7 @@ pub enum DataType {
     Array = 17,
     Decimal = 18,
     Float16Vector = 19,
+    Blob = 20,
 }
 
 impl DataType {
@@ -40,7 +41,11 @@ impl DataType {
             DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Timestamp => Some(8),
             DataType::Date => Some(4),
             DataType::Decimal => Some(16), // i128 for decimal storage
-            DataType::String | DataType::Binary | DataType::Json | DataType::Array => None,
+            DataType::String
+            | DataType::Binary
+            | DataType::Json
+            | DataType::Array
+            | DataType::Blob => None,
             DataType::Float16Vector => None,
         }
     }
@@ -67,7 +72,7 @@ impl DataType {
     pub fn is_variable_length(&self) -> bool {
         matches!(
             self,
-            DataType::String | DataType::Binary | DataType::Json | DataType::Array
+            DataType::String | DataType::Binary | DataType::Json | DataType::Array | DataType::Blob
         )
     }
 
@@ -92,7 +97,8 @@ impl DataType {
             "FLOAT" | "REAL" | "FLOAT4" => DataType::Float32,
             "DOUBLE" | "FLOAT8" => DataType::Float64,
             "VARCHAR" | "TEXT" | "STRING" | "CHAR" => DataType::String,
-            "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => DataType::Binary,
+            "BLOB" | "LARGEBINARY" | "LARGE_BINARY" | "LONGBLOB" => DataType::Blob,
+            "BYTEA" | "BINARY" | "VARBINARY" | "BYTES" => DataType::Binary,
             "JSON" => DataType::Json,
             "DECIMAL" | "NUMERIC" => DataType::Decimal,
             "TIMESTAMP" | "DATETIME" => DataType::Timestamp,
@@ -117,7 +123,8 @@ impl DataType {
             DataType::Float32 => "FLOAT",
             DataType::Float64 => "DOUBLE",
             DataType::String => "VARCHAR",
-            DataType::Binary => "BLOB",
+            DataType::Binary => "BINARY",
+            DataType::Blob => "BLOB",
             DataType::Json => "JSON",
             DataType::Timestamp => "TIMESTAMP",
             DataType::Date => "DATE",
