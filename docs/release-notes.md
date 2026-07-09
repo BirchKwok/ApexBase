@@ -5,11 +5,21 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 
 ## Unreleased
 
-- Add Lance-like `BLOB` / `LARGE_BINARY` column support with descriptor-backed storage for inline, packed sidecar, and dedicated sidecar blob payloads
-- Keep blob payloads lazy by storing descriptors in `.apex` column data and materializing Arrow `LargeBinary` only when blob columns are projected
-- Add single and batch Python blob helpers: `read_blob`, `read_blobs`, `read_blob_range`, `read_blob_ranges`, `read_blob_descriptor`, `read_blob_info`, and `read_blob_infos`
-- Add Rust, SQL parser, Arrow conversion, Python binding, WAL, mmap, and on-demand storage paths for `Blob` values
-- Add `benchmarks/bench_blob_lance.py` to compare ApexBase blob write/read/projection behavior against Lance Blob API
+- No unreleased changes recorded yet. New features and fixes will be listed here before the next public release.
+
+---
+
+## [v1.21.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.21.0)
+*2026-07-09*
+
+[Compare with v1.20.1](https://github.com/BirchKwok/ApexBase/compare/v1.20.1...v1.21.0)
+
+- Add Lance-like `BLOB` / `LARGE_BINARY` column support with descriptor-backed storage for inline, packed sidecar, and dedicated sidecar payloads
+- Keep blob payloads lazy by storing compact descriptors in `.apex` column data and materializing Arrow `LargeBinary` values only when blob columns are projected
+- Add Python helpers for single and batch payload access: `read_blob`, `read_blobs`, `read_blob_range`, `read_blob_ranges`, `read_blob_descriptor`, `read_blob_info`, and `read_blob_infos`
+- Extend the Rust engine, SQL parser, Arrow conversion layer, Python bindings, WAL path, mmap path, and on-demand storage pipeline to handle `Blob` values end to end
+- Add blob-focused performance coverage with `benchmarks/bench_blob_lance.py`, comparing ApexBase blob write/read/projection behavior against Lance Blob API
+- Update the Rust crate and Python package version metadata to 1.21.0
 
 ---
 
