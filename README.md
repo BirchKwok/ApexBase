@@ -1,7 +1,6 @@
 <p>
   <img align="left" src="docs/img/apexbase-wordmark.svg" width="360" alt="ApexBase">
   <br>
-  <strong>High-performance embedded HTAP database with a Rust core and a Python-first API.</strong>
 </p>
 <br clear="left">
 
