@@ -1,6 +1,8 @@
 <p>
   <img align="left" src="docs/img/apexbase-wordmark.svg" width="360" alt="ApexBase">
   <br>
+  <br>
+  <br>
 </p>
 <br clear="left">
 
