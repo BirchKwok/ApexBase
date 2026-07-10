@@ -459,13 +459,16 @@ impl ApexExecutor {
                                     true
                                 } else {
                                     let table_key = storage_path.to_string_lossy();
-                                    let cbo_strategy = QueryPlanner::plan_select_pub(
+                                    let cbo_plan = QueryPlanner::plan_select_details(
                                         &stmt,
                                         Some(&*idx_mgr),
                                         &table_key,
+                                        crate::query::planner::PlannerContext {
+                                            mmap_only: backend.is_mmap_only(),
+                                        },
                                     );
                                     matches!(
-                                        cbo_strategy,
+                                        cbo_plan.strategy,
                                         ExecutionStrategy::OlapFullScan
                                             | ExecutionStrategy::OlapAggregation
                                             | ExecutionStrategy::OlapFilteredScan
@@ -1297,13 +1300,35 @@ impl ApexExecutor {
         let idx_mgr_arc = get_index_manager(&bd, &tname);
         let mut idx_mgr = idx_mgr_arc.lock();
 
-        // Filter to predicates that have indexes
+        // Filter to predicates that have usable single-column indexes.  A
+        // composite index is handled separately below because its key must be
+        // built from all indexed equality columns.
+        let equality_values: std::collections::HashMap<String, Value> = predicates
+            .iter()
+            .filter_map(|(column, hint)| match hint {
+                PredicateHint::Eq(value) => Some((column.clone(), value.clone())),
+                _ => None,
+            })
+            .collect();
         let indexed_preds: Vec<(String, PredicateHint)> = predicates
             .into_iter()
-            .filter(|(col, _)| idx_mgr.has_index_on(col))
+            .filter(|(col, _)| idx_mgr.has_single_column_index_on(col))
             .collect();
+        let composite_columns = idx_mgr
+            .list_indexes()
+            .into_iter()
+            .filter(|meta| meta.is_composite())
+            .map(|meta| {
+                meta.effective_columns()
+                    .iter()
+                    .map(|column| column.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .find(|columns| {
+                columns.len() > 1 && columns.iter().all(|column| equality_values.contains_key(column))
+            });
 
-        if indexed_preds.is_empty() {
+        if indexed_preds.is_empty() && composite_columns.is_none() {
             return Ok(None);
         }
 
@@ -1318,8 +1343,14 @@ impl ApexExecutor {
             }
         }
 
-        // Look up each indexed predicate and intersect row ID sets
+        // Look up a complete composite key first, then intersect any
+        // independent single-column indexes.
         let mut row_ids: Option<Vec<u64>> = None;
+        if let Some(columns) = composite_columns.as_ref() {
+            if let Some(result) = idx_mgr.lookup_composite(columns, &equality_values)? {
+                row_ids = Some(result.row_ids);
+            }
+        }
         for (col_name, hint) in &indexed_preds {
             let lookup_result = idx_mgr.lookup(col_name, hint)?;
             match lookup_result {
@@ -1366,33 +1397,58 @@ impl ApexExecutor {
         // Covering index (index-only scan): if all SELECT columns are covered by
         // the index (_id + indexed columns), build result directly without reading
         // the base table — avoids expensive per-row table lookups.
-        if let Some(covered) = Self::try_index_only_scan(stmt, &indexed_preds, &row_ids)? {
-            return Ok(Some(covered));
+        let indexed_columns: std::collections::HashSet<String> = indexed_preds
+            .iter()
+            .map(|(column, _)| column.clone())
+            .chain(
+                composite_columns
+                    .iter()
+                    .flatten()
+                    .cloned(),
+            )
+            .collect();
+        let full_predicate_covered = Self::is_fully_indexable_predicate(
+            where_clause,
+            &indexed_columns,
+        );
+        if full_predicate_covered && composite_columns.is_none() {
+            if let Some(covered) = Self::try_index_only_scan(stmt, &indexed_preds, &row_ids)? {
+                return Ok(Some(covered));
+            }
         }
 
-        // Read matching rows one by one and concat
+        // Read matching rows one by one and concatenate them.  The residual
+        // filter below intentionally runs on the complete row batch.
         let mut batches: Vec<RecordBatch> = Vec::with_capacity(row_ids.len().min(1024));
         for &rid in &row_ids {
             if let Some(batch) = backend.read_row_by_id_to_arrow(rid)? {
                 batches.push(batch);
             }
         }
-
         if batches.is_empty() {
             let empty = backend.read_columns_to_arrow(None, 0, Some(0))?;
             return Ok(Some(ApexResult::Empty(empty.schema())));
         }
-
-        // Concat all batches into one
         let schema = batches[0].schema();
         let combined = arrow::compute::concat_batches(&schema, &batches)
             .map_err(|e| err_data(e.to_string()))?;
 
-        // Apply ORDER BY if present
+        // Indexes produce candidate rows.  Always apply the original WHERE so
+        // non-indexed residual predicates remain correct.
+        let filtered = Self::apply_filter_with_storage(
+            &combined,
+            where_clause,
+            storage_path,
+        )?;
+        if filtered.num_rows() == 0 {
+            return Ok(Some(ApexResult::Empty(filtered.schema())));
+        }
+
+        // Apply ORDER BY if present after residual filtering.
         let sorted = if !stmt.order_by.is_empty() {
-            Self::apply_order_by(&combined, &stmt.order_by)?
+            Self::apply_order_by(&filtered, &stmt.order_by)?
         } else {
-            combined
+            filtered
         };
 
         // Apply OFFSET + LIMIT
@@ -1424,6 +1480,54 @@ impl ApexExecutor {
             return Ok(Some(ApexResult::Empty(result.schema())));
         }
         Ok(Some(ApexResult::Data(result)))
+    }
+
+    /// Return true only when every predicate can be represented by an index
+    /// candidate.  This controls index-only scans; ordinary index scans still
+    /// accept partial coverage and apply the residual filter above.
+    fn is_fully_indexable_predicate(
+        expr: &SqlExpr,
+        indexed_columns: &std::collections::HashSet<String>,
+    ) -> bool {
+        use crate::query::sql_parser::BinaryOperator;
+        match expr {
+            SqlExpr::BinaryOp { left, op, right } => match op {
+                BinaryOperator::And => {
+                    Self::is_fully_indexable_predicate(left, indexed_columns)
+                        && Self::is_fully_indexable_predicate(right, indexed_columns)
+                }
+                BinaryOperator::Eq
+                | BinaryOperator::Gt
+                | BinaryOperator::Ge
+                | BinaryOperator::Lt
+                | BinaryOperator::Le => {
+                    (matches!(left.as_ref(), SqlExpr::Column(_))
+                        && Self::expr_to_value(right).is_some()
+                        && matches!(left.as_ref(), SqlExpr::Column(column) if indexed_columns.contains(column)))
+                        || (matches!(right.as_ref(), SqlExpr::Column(_))
+                            && Self::expr_to_value(left).is_some()
+                            && matches!(right.as_ref(), SqlExpr::Column(column) if indexed_columns.contains(column)))
+                }
+                _ => false,
+            },
+            SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => {
+                !negated
+                    && indexed_columns.contains(column)
+                    && Self::expr_to_value(low).is_some()
+                    && Self::expr_to_value(high).is_some()
+            }
+            SqlExpr::In {
+                column,
+                values,
+                negated,
+            } => !negated && indexed_columns.contains(column) && !values.is_empty(),
+            _ => false,
+        }
     }
 
     /// Extract index-usable predicates from an expression (flattens AND chains).

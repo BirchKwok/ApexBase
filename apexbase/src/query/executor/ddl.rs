@@ -326,6 +326,45 @@ impl ApexExecutor {
                         }
                     }
                 }
+
+                // Show the physical decision, not only the SQL-shaped
+                // operators above.  This makes EXPLAIN useful for verifying
+                // CBO decisions and whether statistics were available.
+                if let Some(FromItem::Table { .. }) = select.from.as_ref() {
+                    let table_path = Self::resolve_from_table_path(select, base_dir, default_table_path);
+                    if let Ok(backend) = get_cached_backend(&table_path) {
+                        let (table_base, table_name) = base_dir_and_table(&table_path);
+                        let index_manager = get_index_manager(&table_base, &table_name);
+                        let index_guard = index_manager.lock();
+                        let plan = crate::query::planner::QueryPlanner::plan_select_details(
+                            select,
+                            Some(&*index_guard),
+                            &table_path.to_string_lossy(),
+                            crate::query::planner::PlannerContext {
+                                mmap_only: backend.is_mmap_only(),
+                            },
+                        );
+                        plan_lines.push(format!(
+                            "  Chosen Plan: {:?} (estimated_cost={:.3}, estimated_rows={:.1}, stats={})",
+                            plan.strategy,
+                            plan.cost.total,
+                            plan.cost.output_rows,
+                            if plan.stats_available { "available" } else { "default" }
+                        ));
+                        if plan.feedback_applied {
+                            plan_lines.push("    Feedback: applied".to_string());
+                        }
+                        for candidate in &plan.candidates {
+                            plan_lines.push(format!(
+                                "    Candidate: {} cost={:.3} rows={:.1}{}",
+                                candidate.name,
+                                candidate.cost.total,
+                                candidate.cost.output_rows,
+                                if candidate.strategy == plan.strategy { " [chosen]" } else { "" }
+                            ));
+                        }
+                    }
+                }
                 // JOINs
                 for join in &select.joins {
                     let jt = match join.join_type {
@@ -434,11 +473,38 @@ impl ApexExecutor {
         // EXPLAIN ANALYZE: actually run the query and report timing
         if analyze {
             let start = std::time::Instant::now();
-            let result = Self::execute_parsed_multi(stmt, base_dir, default_table_path)?;
+            let result = Self::execute_parsed_multi(stmt.clone(), base_dir, default_table_path)?;
             let elapsed = start.elapsed();
             plan_lines.push(format!("  Actual Time: {:.3}ms", elapsed.as_secs_f64() * 1000.0));
             if let Ok(batch) = result.to_record_batch() {
                 plan_lines.push(format!("  Actual Rows: {}", batch.num_rows()));
+
+                if let SqlStatement::Select(select) = &stmt {
+                    let table_path = Self::resolve_from_table_path(select, base_dir, default_table_path);
+                    if table_path.exists() {
+                        if let Ok(backend) = get_cached_backend(&table_path) {
+                            let (table_base, table_name) = base_dir_and_table(&table_path);
+                            let index_manager = get_index_manager(&table_base, &table_name);
+                            let index_guard = index_manager.lock();
+                            let plan = crate::query::planner::QueryPlanner::plan_select_details(
+                                select,
+                                Some(&*index_guard),
+                                &table_path.to_string_lossy(),
+                                crate::query::planner::PlannerContext {
+                                    mmap_only: backend.is_mmap_only(),
+                                },
+                            );
+                            crate::query::planner::record_plan_feedback(
+                                &table_path.to_string_lossy(),
+                                select,
+                                &plan.strategy,
+                                plan.cost.output_rows,
+                                batch.num_rows() as f64,
+                            );
+                            plan_lines.push("  Feedback Recorded: yes".to_string());
+                        }
+                    }
+                }
             }
         }
 

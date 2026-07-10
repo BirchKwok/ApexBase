@@ -2612,21 +2612,40 @@ impl ApexExecutor {
             let nc = (0..num_rows).filter(|&i| col.is_null(i)).count() as i64;
             null_counts.push(nc);
 
-            // Collect distinct values and min/max
+            // Collect distinct values and typed numeric bounds.  Keep exact
+            // NDV for normal tables, but sample very large columns so ANALYZE
+            // does not allocate one string per row indefinitely.
             let mut distinct = std::collections::HashSet::new();
             let mut min_s = String::new();
             let mut max_s = String::new();
+            let mut numeric_min: Option<f64> = None;
+            let mut numeric_max: Option<f64> = None;
             let mut first = true;
+            let sample_limit = 100_000usize;
+            let sample_stride = (num_rows / sample_limit).max(1);
 
             for i in 0..num_rows {
                 if col.is_null(i) {
                     continue;
                 }
-                let val_str = Self::arrow_value_at_col(col, i).to_string();
-                distinct.insert(val_str.clone());
+                let value = Self::arrow_value_at_col(col, i);
+                let val_str = value.to_string();
+                if i % sample_stride == 0 {
+                    distinct.insert(val_str.clone());
+                }
+                let numeric = match value {
+                    Value::Int64(v) => Some(v as f64),
+                    Value::UInt64(v) => Some(v as f64),
+                    Value::Float64(v) => Some(v),
+                    _ => None,
+                };
+                if let Some(value) = numeric {
+                    numeric_min = Some(numeric_min.map_or(value, |min| min.min(value)));
+                    numeric_max = Some(numeric_max.map_or(value, |max| max.max(value)));
+                }
                 if first {
                     min_s = val_str.clone();
-                    max_s = val_str;
+                    max_s = val_str.clone();
                     first = false;
                 } else {
                     if val_str < min_s {
@@ -2637,18 +2656,65 @@ impl ApexExecutor {
                     }
                 }
             }
-            ndv_vals.push(distinct.len() as i64);
+            let sampled_rows = ((num_rows + sample_stride - 1) / sample_stride).max(1);
+            let estimated_ndv = if sample_stride == 1 {
+                distinct.len() as u64
+            } else {
+                ((distinct.len() as f64 * num_rows as f64 / sampled_rows as f64).round() as u64)
+                    .min(num_rows as u64)
+            };
+            ndv_vals.push(estimated_ndv as i64);
             min_vals.push(min_s.clone());
             max_vals.push(max_s.clone());
+
+            let histogram = match (numeric_min, numeric_max) {
+                (Some(min), Some(max)) if max > min => {
+                    const BUCKETS: usize = 32;
+                    let mut counts = vec![0u64; BUCKETS];
+                    let width = (max - min) / BUCKETS as f64;
+                    for i in 0..num_rows {
+                        if col.is_null(i) {
+                            continue;
+                        }
+                        let value = match Self::arrow_value_at_col(col, i) {
+                            Value::Int64(v) => Some(v as f64),
+                            Value::UInt64(v) => Some(v as f64),
+                            Value::Float64(v) => Some(v),
+                            _ => None,
+                        };
+                        if let Some(value) = value {
+                            let bucket = (((value - min) / width).floor() as usize).min(BUCKETS - 1);
+                            counts[bucket] += 1;
+                        }
+                    }
+                    counts
+                        .into_iter()
+                        .enumerate()
+                        .map(|(bucket, row_count)| crate::query::planner::HistogramBucket {
+                            lower: min + width * bucket as f64,
+                            upper: if bucket + 1 == BUCKETS {
+                                max
+                            } else {
+                                min + width * (bucket + 1) as f64
+                            },
+                            row_count,
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
 
             // Accumulate stats for CBO cache
             col_stats_map.insert(
                 field.name().clone(),
                 crate::query::planner::ColumnStats {
-                    ndv: distinct.len() as u64,
+                    ndv: estimated_ndv,
                     null_count: nc as u64,
                     min_value: min_s,
                     max_value: max_s,
+                    numeric_min,
+                    numeric_max,
+                    histogram,
                 },
             );
         }

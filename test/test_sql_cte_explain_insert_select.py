@@ -111,6 +111,19 @@ class TestExplain:
         assert 'Rows: ~' in plan
         assert 'Columns: 3' in plan
 
+    def test_explain_shows_physical_candidates(self, db_with_data):
+        db_with_data.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_age ON users (age) USING BTREE"
+        )
+        result = db_with_data.execute(
+            "EXPLAIN SELECT name FROM users WHERE age > 30"
+        )
+        plan = get_rows(result)[0][0]
+        assert "Chosen Plan:" in plan
+        assert "estimated_cost=" in plan
+        assert "Candidate:" in plan
+        assert "stats=" in plan
+
 
 # ========== INSERT...SELECT Tests ==========
 

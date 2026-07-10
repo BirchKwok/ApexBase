@@ -176,6 +176,28 @@ class TestIndexAcceleratedSelect:
         df = result.to_pandas()
         assert len(df) == 5
 
+    def test_index_candidate_keeps_residual_predicate(self, client):
+        """An indexed predicate must not discard a non-indexed AND term."""
+        rows = [
+            {
+                "city": "NYC" if i < 400 else "LA",
+                "age": 10 if i < 200 else 30,
+                "name": f"user_{i}",
+            }
+            for i in range(1000)
+        ]
+        client.store(rows)
+        client.execute("CREATE INDEX idx_city ON idx_test (city)")
+
+        result = client.execute(
+            "SELECT name FROM idx_test "
+            "WHERE city = 'NYC' AND age > 20 ORDER BY name"
+        )
+        names = result.to_pandas()["name"].tolist()
+        assert len(names) == 200
+        assert names[0] == "user_200"
+        assert names[-1] == "user_399"
+
     def test_index_correctness_vs_scan(self, client):
         """Index path results should match full-scan results."""
         self._setup_data(client, 200)

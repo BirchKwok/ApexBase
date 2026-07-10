@@ -10,7 +10,12 @@ impl ApexExecutor {
         // CBO: Reorder INNER JOINs by ascending right-table size (star join optimization).
         // Only when ALL joins are INNER and each ON condition references only the FROM table
         // and its own right table (no cross-JOIN column dependencies).
-        let joins = Self::maybe_reorder_joins(&stmt.joins, base_dir, default_table_path);
+        let joins = Self::maybe_reorder_joins(
+            &stmt.joins,
+            stmt.where_clause.as_ref(),
+            base_dir,
+            default_table_path,
+        );
 
         // Get the left (base) table - supports both Table and Subquery (VIEW)
         let mut result_batch = match &stmt.from {
@@ -79,6 +84,22 @@ impl ApexExecutor {
             }
         };
 
+        // Push predicates that reference only the base relation before the
+        // first join.  The original WHERE remains applied after joining for
+        // correctness; this early pass only reduces the join input.
+        if let (Some(where_clause), Some(source_names)) = (
+            stmt.where_clause.as_ref(),
+            Self::source_names(&stmt.from),
+        ) {
+            if Self::predicate_is_local(&result_batch, where_clause, &source_names) {
+                result_batch = Self::apply_filter_with_storage(
+                    &result_batch,
+                    where_clause,
+                    default_table_path,
+                )?;
+            }
+        }
+
         // Process each JOIN clause - supports both Table and Subquery (VIEW)
         for join_clause in &joins {
             match &join_clause.right {
@@ -120,7 +141,7 @@ impl ApexExecutor {
                 }
                 _ => {}
             }
-            let right_batch = match &join_clause.right {
+            let mut right_batch = match &join_clause.right {
                 FromItem::Table { table, .. } => {
                     let right_path = Self::resolve_table_path(table, base_dir, default_table_path);
                     if let Some(batch) = get_cached_cte_batch(&right_path) {
@@ -179,6 +200,19 @@ impl ApexExecutor {
                 | FromItem::LateralPosExplode { .. }
                 | FromItem::LateralStack { .. } => unreachable!(),
             };
+
+            if let (Some(where_clause), Some(source_names)) = (
+                stmt.where_clause.as_ref(),
+                Self::source_names(&Some(join_clause.right.clone())),
+            ) {
+                if Self::predicate_is_local(&right_batch, where_clause, &source_names) {
+                    right_batch = Self::apply_filter_with_storage(
+                        &right_batch,
+                        where_clause,
+                        default_table_path,
+                    )?;
+                }
+            }
 
             if matches!(join_clause.join_type, JoinType::Semi | JoinType::Anti) {
                 let (left_key, right_key, _, _, extra_filter) =
@@ -389,6 +423,78 @@ impl ApexExecutor {
         };
 
         Ok(ApexResult::Data(result))
+    }
+
+    fn source_names(from: &Option<FromItem>) -> Option<Vec<String>> {
+        match from.as_ref()? {
+            FromItem::Table { table, alias } => {
+                let mut names = vec![table.clone()];
+                if let Some(alias) = alias {
+                    names.push(alias.clone());
+                }
+                Some(names)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether an expression can be evaluated against one input relation.
+    /// Qualified references must name that relation and bare references must
+    /// exist in the input batch.  AND/OR are deliberately treated as a whole
+    /// expression, so an OR crossing relations is never pushed down.
+    fn predicate_is_local(
+        batch: &RecordBatch,
+        expr: &SqlExpr,
+        source_names: &[String],
+    ) -> bool {
+        fn column_is_local(batch: &RecordBatch, name: &str, source_names: &[String]) -> bool {
+            let (qualifier, bare) = match name.rsplit_once('.') {
+                Some((qualifier, bare)) => (Some(qualifier), bare),
+                None => (None, name),
+            };
+            qualifier.map_or(true, |q| source_names.iter().any(|name| name == q))
+                && batch.column_by_name(bare).is_some()
+        }
+
+        match expr {
+            SqlExpr::Column(name) => column_is_local(batch, name, source_names),
+            SqlExpr::Literal(_) | SqlExpr::Variable(_) | SqlExpr::FtsMatch { .. } => true,
+            SqlExpr::BinaryOp { left, right, .. } => {
+                Self::predicate_is_local(batch, left, source_names)
+                    && Self::predicate_is_local(batch, right, source_names)
+            }
+            SqlExpr::UnaryOp { expr, .. } | SqlExpr::Paren(expr) | SqlExpr::Cast { expr, .. } => {
+                Self::predicate_is_local(batch, expr, source_names)
+            }
+            SqlExpr::Like { column, .. }
+            | SqlExpr::Regexp { column, .. }
+            | SqlExpr::In { column, .. }
+            | SqlExpr::Between { column, .. }
+            | SqlExpr::IsNull { column, .. } => column_is_local(batch, column, source_names),
+            SqlExpr::Function { args, .. } => args
+                .iter()
+                .all(|arg| Self::predicate_is_local(batch, arg, source_names)),
+            SqlExpr::Case {
+                when_then,
+                else_expr,
+            } => {
+                when_then.iter().all(|(when_expr, then_expr)| {
+                    Self::predicate_is_local(batch, when_expr, source_names)
+                        && Self::predicate_is_local(batch, then_expr, source_names)
+                }) && else_expr.as_ref().map_or(true, |expr| {
+                    Self::predicate_is_local(batch, expr, source_names)
+                })
+            }
+            SqlExpr::ArrayIndex { array, index } => {
+                Self::predicate_is_local(batch, array, source_names)
+                    && Self::predicate_is_local(batch, index, source_names)
+            }
+            SqlExpr::ArrayLiteral(_) => true,
+            SqlExpr::TopkDistance { .. } | SqlExpr::ExplodeRename { .. } => false,
+            SqlExpr::InSubquery { .. }
+            | SqlExpr::ExistsSubquery { .. }
+            | SqlExpr::ScalarSubquery { .. } => false,
+        }
     }
 
     fn apply_lateral_explode(
@@ -732,6 +838,7 @@ impl ApexExecutor {
     /// Returns the original order unchanged if reordering is unsafe.
     fn maybe_reorder_joins(
         joins: &[JoinClause],
+        where_clause: Option<&SqlExpr>,
         base_dir: &Path,
         default_table_path: &Path,
     ) -> Vec<JoinClause> {
@@ -753,11 +860,29 @@ impl ApexExecutor {
         let mut indexed: Vec<(usize, u64)> = Vec::with_capacity(joins.len());
         for (i, j) in joins.iter().enumerate() {
             let row_count = match &j.right {
-                FromItem::Table { table, .. } => {
+                FromItem::Table { table, alias } => {
                     let path = Self::resolve_table_path(table, base_dir, default_table_path);
-                    get_cached_backend(&path)
-                        .map(|b| b.active_row_count())
-                        .unwrap_or(u64::MAX)
+                    let base_rows = get_cached_backend(&path)
+                        .map(|b| b.active_row_count() as f64)
+                        .unwrap_or(u64::MAX as f64);
+                    let source_names = {
+                        let mut names = vec![table.clone()];
+                        if let Some(alias) = alias {
+                            names.push(alias.clone());
+                        }
+                        names
+                    };
+                    let filtered_rows = where_clause
+                        .and_then(|expr| get_table_stats(&path.to_string_lossy()).map(|stats| {
+                            let selectivity = Self::estimate_local_selectivity(
+                                expr,
+                                &source_names,
+                                &stats,
+                            );
+                            base_rows * selectivity
+                        }))
+                        .unwrap_or(base_rows);
+                    filtered_rows.max(0.0).min(u64::MAX as f64) as u64
                 }
                 _ => u64::MAX, // Subqueries: unknown size, keep original position
             };
@@ -803,6 +928,62 @@ impl ApexExecutor {
         }
 
         reordered
+    }
+
+    fn estimate_local_selectivity(
+        expr: &SqlExpr,
+        source_names: &[String],
+        stats: &crate::query::planner::TableStats,
+    ) -> f64 {
+        fn column_is_local(
+            column: &str,
+            source_names: &[String],
+            stats: &crate::query::planner::TableStats,
+        ) -> bool {
+            let (qualifier, bare) = match column.rsplit_once('.') {
+                Some((qualifier, bare)) => (Some(qualifier), bare),
+                None => (None, column),
+            };
+            qualifier.map_or(true, |q| source_names.iter().any(|name| name == q))
+                && stats.columns.contains_key(bare)
+        }
+
+        match expr {
+            SqlExpr::BinaryOp {
+                left,
+                op: crate::query::sql_parser::BinaryOperator::And,
+                right,
+            } => {
+                Self::estimate_local_selectivity(left, source_names, stats)
+                    * Self::estimate_local_selectivity(right, source_names, stats)
+            }
+            SqlExpr::BinaryOp { left, right, .. } => {
+                let columns = [left.as_ref(), right.as_ref()];
+                let is_local = columns.iter().all(|child| match child {
+                    SqlExpr::Column(column) => column_is_local(column, source_names, stats),
+                    SqlExpr::Literal(_) => true,
+                    _ => false,
+                });
+                if is_local {
+                    crate::query::planner::QueryPlanner::estimate_selectivity(expr, stats)
+                } else {
+                    1.0
+                }
+            }
+            SqlExpr::Between { column, .. }
+            | SqlExpr::In { column, .. }
+            | SqlExpr::Like { column, .. }
+            | SqlExpr::Regexp { column, .. }
+            | SqlExpr::IsNull { column, .. } => {
+                if column_is_local(column, source_names, stats) {
+                    crate::query::planner::QueryPlanner::estimate_selectivity(expr, stats)
+                } else {
+                    1.0
+                }
+            }
+            _ => 1.0,
+        }
+        .clamp(0.0, 1.0)
     }
 
     /// Extract join keys preserving table qualifiers (e.g., "a.project_id" not just "project_id")

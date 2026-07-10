@@ -244,12 +244,16 @@ impl IndexManager {
             dirty: false,
         };
 
-        // Build column→index mapping
+        // Build column→index mapping.  Composite indexes are registered for
+        // every indexed column so the planner can discover a usable prefix;
+        // lookup itself still requires the complete composite key.
         for (name, meta) in &catalog {
-            mgr.column_index_map
-                .entry(meta.column_name.clone())
-                .or_insert_with(Vec::new)
-                .push(name.clone());
+            for column in meta.effective_columns() {
+                mgr.column_index_map
+                    .entry(column.to_string())
+                    .or_insert_with(Vec::new)
+                    .push(name.clone());
+            }
         }
 
         // Lazily load index instances (only when needed)
@@ -274,6 +278,48 @@ impl IndexManager {
     /// Check if a column has any index
     pub fn has_index_on(&self, column_name: &str) -> bool {
         self.column_index_map.contains_key(column_name)
+    }
+
+    /// Check if a column has a single-column index that can be probed without
+    /// values from other columns.  Composite indexes must be planned through
+    /// `lookup_composite` instead of being treated as single-column indexes.
+    pub fn has_single_column_index_on(&self, column_name: &str) -> bool {
+        self.column_index_map
+            .get(column_name)
+            .into_iter()
+            .flatten()
+            .any(|name| {
+                self.catalog
+                    .get(name)
+                    .map(|meta| !meta.is_composite())
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Check whether an index has exactly the supplied composite key order.
+    pub fn has_composite_index(&self, columns: &[String]) -> bool {
+        columns.len() > 1
+            && self.catalog.values().any(|meta| {
+                meta.is_composite()
+                    && meta
+                        .effective_columns()
+                        .iter()
+                        .map(|column| *column)
+                        .eq(columns.iter().map(|column| column.as_str()))
+            })
+    }
+
+    /// Check whether an index type can satisfy an equality or range lookup.
+    pub fn has_usable_index_for_predicate(&self, column_name: &str, is_range: bool) -> bool {
+        self.column_index_map
+            .get(column_name)
+            .into_iter()
+            .flatten()
+            .any(|name| {
+                self.catalog.get(name).map_or(false, |meta| {
+                    !meta.is_composite() && (!is_range || meta.index_type == IndexType::BTree)
+                })
+            })
     }
 
     /// Returns true when this table has no indexes at all — used as a fast CBO bypass.
@@ -367,20 +413,24 @@ impl IndexManager {
 
     /// Drop an index
     pub fn drop_index(&mut self, name: &str) -> io::Result<()> {
-        let meta = self.catalog.remove(name).ok_or_else(|| {
+        let meta = self.catalog.get(name).cloned().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Index '{}' not found", name),
             )
         })?;
 
-        // Remove from column mapping
-        if let Some(names) = self.column_index_map.get_mut(&meta.column_name) {
-            names.retain(|n| n != name);
-            if names.is_empty() {
-                self.column_index_map.remove(&meta.column_name);
+        // Remove from every column mapping.  Composite indexes are registered
+        // under all their columns, not only the leading column.
+        for column in meta.effective_columns() {
+            if let Some(names) = self.column_index_map.get_mut(column) {
+                names.retain(|n| n != name);
+                if names.is_empty() {
+                    self.column_index_map.remove(column);
+                }
             }
         }
+        self.catalog.remove(name);
 
         // Remove runtime instance
         self.instances.remove(name);
@@ -467,20 +517,38 @@ impl IndexManager {
         old_values: &HashMap<String, Value>,
         new_values: &HashMap<String, Value>,
     ) -> io::Result<()> {
-        // Remove old entries, insert new entries
-        for (col_name, old_val) in old_values {
-            if let Some(new_val) = new_values.get(col_name) {
-                if old_val != new_val {
-                    if let Some(index_names) = self.column_index_map.get(col_name).cloned() {
-                        for idx_name in &index_names {
-                            if let Some(instance) = self.instances.get_mut(idx_name) {
-                                let old_key = IndexKey::from_value(old_val);
-                                instance.remove(&old_key, row_id);
-                                let new_key = IndexKey::from_value(new_val);
-                                instance.insert(new_key, row_id)?;
-                            }
-                        }
-                    }
+        // Update each affected index as a complete key.  Building a scalar
+        // key for a composite index silently leaves stale entries behind.
+        let index_names: Vec<String> = self.catalog.keys().cloned().collect();
+        for idx_name in index_names {
+            let columns: Vec<String> = self
+                .catalog
+                .get(&idx_name)
+                .map(|meta| {
+                    meta.effective_columns()
+                        .iter()
+                        .map(|column| column.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let changed = columns.iter().any(|column| {
+                old_values
+                    .get(column)
+                    .zip(new_values.get(column))
+                    .map(|(old, new)| old != new)
+                    .unwrap_or(false)
+            });
+            if !changed {
+                continue;
+            }
+            let old_key = composite_key(&columns, old_values);
+            let new_key = composite_key(&columns, new_values);
+            if let Some(instance) = self.instances.get_mut(&idx_name) {
+                if let Some(key) = old_key.as_ref() {
+                    instance.remove(key, row_id);
+                }
+                if let Some(key) = new_key {
+                    instance.insert(key, row_id)?;
                 }
             }
         }
@@ -663,18 +731,27 @@ impl IndexManager {
         index_names: &[String],
         predicate: &PredicateHint,
     ) -> Option<String> {
+        let usable: Vec<&String> = index_names
+            .iter()
+            .filter(|name| {
+                self.catalog
+                    .get(*name)
+                    .map(|meta| !meta.is_composite())
+                    .unwrap_or(false)
+            })
+            .collect();
         match predicate {
             PredicateHint::Eq(_) | PredicateHint::In(_) => {
                 // Prefer hash index for equality, fall back to btree
-                for name in index_names {
-                    if let Some(meta) = self.catalog.get(name) {
+                for name in &usable {
+                    if let Some(meta) = self.catalog.get(*name) {
                         if meta.index_type == IndexType::Hash {
-                            return Some(name.clone());
+                            return Some((*name).clone());
                         }
                     }
                 }
                 // Fall back to any available index
-                index_names.first().cloned()
+                usable.first().map(|name| (*name).clone())
             }
             PredicateHint::Range { .. }
             | PredicateHint::Gt(_)
@@ -682,16 +759,54 @@ impl IndexManager {
             | PredicateHint::Lt(_)
             | PredicateHint::Lte(_) => {
                 // Only BTree supports range queries
-                for name in index_names {
-                    if let Some(meta) = self.catalog.get(name) {
+                for name in &usable {
+                    if let Some(meta) = self.catalog.get(*name) {
                         if meta.index_type == IndexType::BTree {
-                            return Some(name.clone());
+                            return Some((*name).clone());
                         }
                     }
                 }
                 None
             }
         }
+    }
+
+    /// Lookup a complete equality key for a composite index.
+    ///
+    /// Prefix and range scans need a typed tuple key and are intentionally not
+    /// accepted here until the on-disk key encoding supports ordered tuples.
+    pub fn lookup_composite(
+        &mut self,
+        columns: &[String],
+        values: &HashMap<String, Value>,
+    ) -> io::Result<Option<IndexLookupResult>> {
+        if columns.len() < 2 || columns.iter().any(|column| !values.contains_key(column)) {
+            return Ok(None);
+        }
+
+        let index_name = self
+            .catalog
+            .iter()
+            .find(|(_, meta)| {
+                meta.is_composite()
+                    && meta.effective_columns().iter().map(|c| *c).eq(columns.iter().map(|c| c.as_str()))
+            })
+            .map(|(name, _)| name.clone());
+        let Some(index_name) = index_name else {
+            return Ok(None);
+        };
+
+        let key = composite_key(columns, values)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "incomplete composite key"))?;
+        let instance = self.ensure_loaded(&index_name)?;
+        let row_ids = instance
+            .get(&key)
+            .map(|ids| ids.to_vec())
+            .unwrap_or_default();
+        Ok(Some(IndexLookupResult {
+            row_ids,
+            exact: true,
+        }))
     }
 }
 
@@ -798,5 +913,45 @@ mod tests {
 
         mgr.drop_index("idx_x").unwrap();
         assert!(!mgr.has_index_on("x"));
+    }
+
+    #[test]
+    fn test_composite_lookup_reload_and_drop_cleans_all_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let columns = vec!["city".to_string(), "age".to_string()];
+        {
+            let mut mgr = IndexManager::new("test_table", dir.path());
+            mgr.create_index_multi(
+                "idx_city_age",
+                &columns,
+                IndexType::Hash,
+                false,
+                DataType::String,
+            )
+            .unwrap();
+            for (id, (city, age)) in [("NYC", 20i64), ("NYC", 30), ("LA", 20)]
+                .into_iter()
+                .enumerate()
+            {
+                let mut row = HashMap::new();
+                row.insert("city".to_string(), Value::String(city.to_string()));
+                row.insert("age".to_string(), Value::Int64(age));
+                mgr.on_insert(id as u64, &row).unwrap();
+            }
+            mgr.save().unwrap();
+        }
+
+        let mut mgr = IndexManager::load("test_table", dir.path()).unwrap();
+        assert!(mgr.has_index_on("city"));
+        assert!(mgr.has_index_on("age"));
+        let mut values = HashMap::new();
+        values.insert("city".to_string(), Value::String("NYC".to_string()));
+        values.insert("age".to_string(), Value::Int64(30));
+        let result = mgr.lookup_composite(&columns, &values).unwrap().unwrap();
+        assert_eq!(result.row_ids, vec![1]);
+
+        mgr.drop_index("idx_city_age").unwrap();
+        assert!(!mgr.has_index_on("city"));
+        assert!(!mgr.has_index_on("age"));
     }
 }
