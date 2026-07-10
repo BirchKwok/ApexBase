@@ -58,6 +58,13 @@ def _ensure_polars():
         pl = _pl
     return pl
 
+
+def _ensure_lance():
+    if importlib.util.find_spec("lance") is None:
+        raise ImportError("lance not available. Install with: pip install pylance")
+    import lance
+    return lance
+
 __version__ = "1.21.0"
 
 
@@ -473,6 +480,20 @@ class ResultView:
                     return self._arrow_table.drop(['_id'])
             return self._arrow_table
         return pa_mod.Table.from_pylist(self._ensure_data())
+
+    def to_lance(self, uri, mode: str = "create", **write_options):
+        """Write results to a Lance dataset using the Arrow table path.
+
+        This keeps the Python handoff Arrow-native; Lance still writes its own
+        on-disk columnar format at the destination URI.
+        """
+        lance_mod = _ensure_lance()
+        return lance_mod.write_dataset(
+            self.to_arrow(),
+            uri,
+            mode=mode,
+            **write_options,
+        )
     
     @property
     def shape(self):

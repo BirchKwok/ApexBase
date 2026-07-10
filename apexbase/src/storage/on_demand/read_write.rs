@@ -96,6 +96,104 @@ pub fn apply_pending_deletes(path: &std::path::Path) -> io::Result<()> {
 }
 
 impl OnDemandStorage {
+    /// Append one borrowed row to an existing schema without allocating ColumnValue objects.
+    pub fn insert_one_schema_stable_borrowed(
+        &self,
+        values: &[SchemaStableValue<'_>],
+    ) -> io::Result<u64> {
+        let schema = self.schema.read();
+        let schema_len = schema.column_count();
+        if schema_len == 0 || values.len() != schema_len {
+            return Err(err_input("schema-stable insert requires exact schema values"));
+        }
+
+        for (idx, value) in values.iter().enumerate() {
+            let dtype = schema.columns[idx].1;
+            let valid = matches!(
+                (dtype, value),
+                (ColumnType::Bool, SchemaStableValue::Bool(_))
+                    | (ColumnType::Int8, SchemaStableValue::Int64(_))
+                    | (ColumnType::Int16, SchemaStableValue::Int64(_))
+                    | (ColumnType::Int32, SchemaStableValue::Int64(_))
+                    | (ColumnType::Int64, SchemaStableValue::Int64(_))
+                    | (ColumnType::UInt8, SchemaStableValue::Int64(_))
+                    | (ColumnType::UInt16, SchemaStableValue::Int64(_))
+                    | (ColumnType::UInt32, SchemaStableValue::Int64(_))
+                    | (ColumnType::UInt64, SchemaStableValue::Int64(_))
+                    | (ColumnType::Timestamp, SchemaStableValue::Int64(_))
+                    | (ColumnType::Date, SchemaStableValue::Int64(_))
+                    | (ColumnType::Float32, SchemaStableValue::Float64(_))
+                    | (ColumnType::Float64, SchemaStableValue::Float64(_))
+                    | (ColumnType::String, SchemaStableValue::Str(_))
+                    | (ColumnType::Binary, SchemaStableValue::Binary(_))
+            );
+            if !valid {
+                return Err(err_input("schema-stable insert value type mismatch"));
+            }
+        }
+
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let row_idx = {
+            let mut ids = self.ids.write();
+            let row_idx = ids.len();
+            ids.push(id);
+            row_idx
+        };
+
+        {
+            let mut columns = self.columns.write();
+            if columns.len() < schema_len {
+                return Err(err_data("column storage shorter than schema"));
+            }
+            for (idx, value) in values.iter().enumerate() {
+                match (schema.columns[idx].1, value) {
+                    (ColumnType::Bool, SchemaStableValue::Bool(v)) => columns[idx].push_bool(*v),
+                    (
+                        ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::Int64
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date,
+                        SchemaStableValue::Int64(v),
+                    ) => columns[idx].push_i64(*v),
+                    (ColumnType::Float32 | ColumnType::Float64, SchemaStableValue::Float64(v)) => {
+                        columns[idx].push_f64(*v)
+                    }
+                    (ColumnType::String, SchemaStableValue::Str(v)) => columns[idx].push_string(v),
+                    (ColumnType::Binary, SchemaStableValue::Binary(v)) => columns[idx].push_bytes(v),
+                    _ => unreachable!("validated schema-stable insert value"),
+                }
+            }
+        }
+
+        {
+            let mut header = self.header.write();
+            header.row_count += 1;
+            header.column_count = schema_len as u32;
+            header.modified_at = chrono::Utc::now().timestamp();
+        }
+
+        {
+            let mut id_to_idx = self.id_to_idx.write();
+            if let Some(map) = id_to_idx.as_mut() {
+                map.insert(id, row_idx);
+            }
+        }
+
+        {
+            let mut deleted = self.deleted.write();
+            deleted.resize((row_idx + 8) / 8, 0);
+        }
+
+        self.active_count.fetch_add(1, Ordering::Relaxed);
+        Ok(id)
+    }
+
     /// Read IDs for specific global row indices from mmap.
     /// Returns Vec<u64> of IDs corresponding to the given indices.
     pub fn get_ids_for_global_indices_mmap(&self, indices: &[usize]) -> io::Result<Vec<u64>> {
@@ -939,12 +1037,17 @@ impl OnDemandStorage {
         }
 
         let start = ids_len.saturating_sub(pending);
-        let Some(row_idx) = ids[start..]
-            .iter()
-            .position(|&row_id| row_id == id)
-            .map(|idx| start + idx)
-        else {
-            return false;
+        let row_idx = if ids[ids_len - 1] == id {
+            ids_len - 1
+        } else {
+            let Some(row_idx) = ids[start..]
+                .iter()
+                .position(|&row_id| row_id == id)
+                .map(|idx| start + idx)
+            else {
+                return false;
+            };
+            row_idx
         };
         drop(ids);
 

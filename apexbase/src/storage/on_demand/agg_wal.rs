@@ -504,18 +504,6 @@ impl OnDemandStorage {
                         return Some(part);
                     }
 
-                    if let Some(zmaps) = footer.zone_maps.get(rg_i) {
-                        if let Some(zm) = zmaps
-                            .iter()
-                            .find(|z| z.col_idx as usize == filter_idx && !z.is_float)
-                        {
-                            let tlen = target_len as i64;
-                            if tlen < zm.min_bits || tlen > zm.max_bits {
-                                return Some(part);
-                            }
-                        }
-                    }
-
                     let mmap =
                         unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len) };
                     let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
@@ -762,14 +750,6 @@ impl OnDemandStorage {
             if rg_end > mmap_ref.len() { continue; }
             let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
             if rg_bytes.len() < 32 { continue; }
-
-            // Zone map pruning: skip RG if target string length is outside [min, max]
-            if let Some(zmaps) = footer.zone_maps.get(rg_i) {
-                if let Some(zm) = zmaps.iter().find(|z| z.col_idx as usize == filter_idx && !z.is_float) {
-                    let tlen = target_bytes.len() as i64;
-                    if tlen < zm.min_bits || tlen > zm.max_bits { continue; }
-                }
-            }
 
             let compress_flag = rg_bytes[28];
             let encoding_version = rg_bytes[29];
@@ -1394,6 +1374,223 @@ impl OnDemandStorage {
             } else if ci < nc {
                 let mn = if col_mins[ci] == f64::INFINITY { 0.0 } else { col_mins[ci] };
                 let mx = if col_maxs[ci] == f64::NEG_INFINITY { 0.0 } else { col_maxs[ci] };
+                results.push((col_counts[ci], col_sums[ci], mn, mx, col_is_int[ci]));
+                ci += 1;
+            } else {
+                results.push((0, 0.0, 0.0, 0.0, false));
+            }
+        }
+        Ok(Some(results))
+    }
+
+    /// Fast filtered aggregation using a pre-built string dictionary cache.
+    /// This avoids reparsing the filter string column when earlier GROUP BY or
+    /// equality paths have already materialized row-wise group ids.
+    pub fn execute_filtered_string_agg_cached(
+        &self,
+        filter_col: &str,
+        dict_strings: &[String],
+        group_ids: &[u16],
+        target: &str,
+        agg_cols: &[&str],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        if dict_strings.is_empty() || group_ids.is_empty() || self.column_has_nulls(filter_col) {
+            return Ok(None);
+        }
+        let target_gid = match dict_strings.iter().position(|value| value == target) {
+            Some(index) => index as u16,
+            None => {
+                return Ok(Some(
+                    agg_cols
+                        .iter()
+                        .map(|_| (0, 0.0, 0.0, 0.0, false))
+                        .collect(),
+                ));
+            }
+        };
+
+        let real_cols: Vec<&str> = agg_cols
+            .iter()
+            .copied()
+            .filter(|name| *name != "*" && *name != "1")
+            .collect();
+        for col_name in &real_cols {
+            if self.column_has_nulls(col_name) {
+                return Ok(None);
+            }
+        }
+
+        let (scanned_cols, deleted): (Vec<ColumnData>, Vec<u8>) = if self.has_v4_in_memory_data() {
+            let schema = self.schema.read();
+            let columns = self.columns.read();
+            let deleted = self.deleted.read().clone();
+            let mut out = Vec::with_capacity(real_cols.len());
+            for col_name in &real_cols {
+                let Some(col_idx) = schema.get_index(col_name) else {
+                    return Ok(None);
+                };
+                let Some(col) = columns.get(col_idx) else {
+                    return Ok(None);
+                };
+                out.push(col.clone());
+            }
+            (out, deleted)
+        } else if real_cols.is_empty() {
+            let footer = match self.get_or_load_footer()? {
+                Some(f) => f,
+                None => return Ok(None),
+            };
+            if footer.row_groups.iter().any(|rg| rg.deletion_count > 0) {
+                return Ok(None);
+            }
+            let total_rows: usize = footer.row_groups.iter().map(|rg| rg.row_count as usize).sum();
+            (Vec::new(), vec![0; total_rows.div_ceil(8)])
+        } else {
+            let footer = match self.get_or_load_footer()? {
+                Some(f) => f,
+                None => return Ok(None),
+            };
+            let mut col_indices = Vec::with_capacity(real_cols.len());
+            for col_name in &real_cols {
+                let Some(col_idx) = footer.schema.get_index(col_name) else {
+                    return Ok(None);
+                };
+                col_indices.push(col_idx);
+            }
+            let (cols, del) = self.scan_columns_mmap(&col_indices, &footer)?;
+            (cols, del)
+        };
+
+        let has_deleted = deleted.iter().any(|&byte| byte != 0);
+        let scan_rows = group_ids.len();
+        let mut match_count = 0i64;
+        let mut col_counts = vec![0i64; real_cols.len()];
+        let mut col_sums = vec![0.0f64; real_cols.len()];
+        let mut col_mins = vec![f64::INFINITY; real_cols.len()];
+        let mut col_maxs = vec![f64::NEG_INFINITY; real_cols.len()];
+        let mut col_is_int = vec![false; real_cols.len()];
+
+        if real_cols.is_empty() {
+            for i in 0..scan_rows {
+                if has_deleted && i / 8 < deleted.len() && (deleted[i / 8] >> (i % 8)) & 1 != 0 {
+                    continue;
+                }
+                if unsafe { *group_ids.get_unchecked(i) } == target_gid {
+                    match_count += 1;
+                }
+            }
+        } else if real_cols.len() == 1 {
+            match &scanned_cols[0] {
+                ColumnData::Float64(values) => {
+                    let limit = scan_rows.min(values.len());
+                    for i in 0..limit {
+                        if has_deleted
+                            && i / 8 < deleted.len()
+                            && (deleted[i / 8] >> (i % 8)) & 1 != 0
+                        {
+                            continue;
+                        }
+                        if unsafe { *group_ids.get_unchecked(i) } != target_gid {
+                            continue;
+                        }
+                        match_count += 1;
+                        let v = unsafe { *values.get_unchecked(i) };
+                        col_counts[0] += 1;
+                        col_sums[0] += v;
+                        if v < col_mins[0] {
+                            col_mins[0] = v;
+                        }
+                        if v > col_maxs[0] {
+                            col_maxs[0] = v;
+                        }
+                    }
+                }
+                ColumnData::Int64(values) => {
+                    col_is_int[0] = true;
+                    let limit = scan_rows.min(values.len());
+                    for i in 0..limit {
+                        if has_deleted
+                            && i / 8 < deleted.len()
+                            && (deleted[i / 8] >> (i % 8)) & 1 != 0
+                        {
+                            continue;
+                        }
+                        if unsafe { *group_ids.get_unchecked(i) } != target_gid {
+                            continue;
+                        }
+                        match_count += 1;
+                        let vf = unsafe { *values.get_unchecked(i) } as f64;
+                        col_counts[0] += 1;
+                        col_sums[0] += vf;
+                        if vf < col_mins[0] {
+                            col_mins[0] = vf;
+                        }
+                        if vf > col_maxs[0] {
+                            col_maxs[0] = vf;
+                        }
+                    }
+                }
+                _ => return Ok(None),
+            }
+        } else {
+            let scan_limit = scanned_cols
+                .iter()
+                .fold(scan_rows, |limit, col| limit.min(col.len()));
+            for i in 0..scan_limit {
+                if has_deleted && i / 8 < deleted.len() && (deleted[i / 8] >> (i % 8)) & 1 != 0 {
+                    continue;
+                }
+                if unsafe { *group_ids.get_unchecked(i) } != target_gid {
+                    continue;
+                }
+                match_count += 1;
+                for (ci, col) in scanned_cols.iter().enumerate() {
+                    match col {
+                        ColumnData::Float64(values) => {
+                            let v = unsafe { *values.get_unchecked(i) };
+                            col_counts[ci] += 1;
+                            col_sums[ci] += v;
+                            if v < col_mins[ci] {
+                                col_mins[ci] = v;
+                            }
+                            if v > col_maxs[ci] {
+                                col_maxs[ci] = v;
+                            }
+                        }
+                        ColumnData::Int64(values) => {
+                            col_is_int[ci] = true;
+                            let vf = unsafe { *values.get_unchecked(i) } as f64;
+                            col_counts[ci] += 1;
+                            col_sums[ci] += vf;
+                            if vf < col_mins[ci] {
+                                col_mins[ci] = vf;
+                            }
+                            if vf > col_maxs[ci] {
+                                col_maxs[ci] = vf;
+                            }
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+            }
+        }
+
+        let mut results = Vec::with_capacity(agg_cols.len());
+        let mut ci = 0usize;
+        for &col_name in agg_cols {
+            if col_name == "*" || col_name == "1" {
+                results.push((match_count, 0.0, 0.0, 0.0, false));
+            } else if ci < real_cols.len() {
+                let mn = if col_mins[ci] == f64::INFINITY {
+                    0.0
+                } else {
+                    col_mins[ci]
+                };
+                let mx = if col_maxs[ci] == f64::NEG_INFINITY {
+                    0.0
+                } else {
+                    col_maxs[ci]
+                };
                 results.push((col_counts[ci], col_sums[ci], mn, mx, col_is_int[ci]));
                 ci += 1;
             } else {

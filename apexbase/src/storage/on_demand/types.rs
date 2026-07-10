@@ -104,6 +104,15 @@ pub enum ColumnValue {
     FixedList(Vec<u8>),
 }
 
+/// Borrowed values for a schema-stable single-row append hot path.
+pub enum SchemaStableValue<'a> {
+    Bool(bool),
+    Int64(i64),
+    Float64(f64),
+    Str(&'a str),
+    Binary(&'a [u8]),
+}
+
 /// Column definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnDef {

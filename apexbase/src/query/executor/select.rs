@@ -252,10 +252,35 @@ impl ApexExecutor {
                                 && !backend.has_pending_deltas()
                                 && !backend.has_delta()
                             {
-                                if let Some(result) =
-                                    Self::try_fast_filtered_string_agg(&backend, &stmt)?
-                                {
-                                    return Ok(result);
+                                let table_has_indexes =
+                                    Self::table_has_index_catalog(Some(base_dir), storage_path);
+                                if table_has_indexes {
+                                    if let Some(where_clause) = &stmt.where_clause {
+                                        if let Some((filter_col, _)) =
+                                            Self::extract_string_equality(where_clause)
+                                        {
+                                            let mut cols = Self::aggregate_input_columns(&stmt);
+                                            if !cols.iter().any(|c| c == &filter_col) {
+                                                cols.push(filter_col);
+                                            }
+                                            let col_refs: Vec<&str> =
+                                                cols.iter().map(|s| s.as_str()).collect();
+                                            let batch = backend.read_columns_to_arrow(
+                                                Some(&col_refs),
+                                                0,
+                                                None,
+                                            )?;
+                                            let filtered =
+                                                Self::apply_filter(&batch, where_clause)?;
+                                            return Self::execute_aggregation(&filtered, &stmt);
+                                        }
+                                    }
+                                } else {
+                                    if let Some(result) =
+                                        Self::try_fast_filtered_string_agg(&backend, &stmt)?
+                                    {
+                                        return Ok(result);
+                                    }
                                 }
                                 if let Some(result) =
                                     Self::try_fast_filtered_numeric_agg(&backend, &stmt)?
@@ -694,6 +719,47 @@ impl ApexExecutor {
                                                         Schema::empty(),
                                                     )));
                                                 }
+                                                if has_aggregation_check
+                                                    && stmt.group_by.is_empty()
+                                                    && stmt.joins.is_empty()
+                                                {
+                                                    let agg_cols =
+                                                        Self::aggregate_input_columns(&stmt);
+                                                    let agg_col_refs: Vec<&str> = agg_cols
+                                                        .iter()
+                                                        .map(|s| s.as_str())
+                                                        .collect();
+                                                    let batch = if indices.is_empty() {
+                                                        backend.read_columns_to_arrow(
+                                                            Some(&agg_col_refs),
+                                                            0,
+                                                            Some(0),
+                                                        )?
+                                                    } else if backend.is_mmap_only()
+                                                        && !Self::should_use_scatter_read(
+                                                            backend.row_count() as usize,
+                                                            indices.len(),
+                                                        )
+                                                    {
+                                                        let full_batch = backend
+                                                            .read_columns_to_arrow(
+                                                                Some(&agg_col_refs),
+                                                                0,
+                                                                None,
+                                                            )?;
+                                                        Self::take_rows_from_full_batch(
+                                                            &full_batch,
+                                                            &indices,
+                                                        )?
+                                                    } else {
+                                                        backend.read_columns_by_indices_to_arrow(
+                                                            &indices,
+                                                            Some(&agg_col_refs),
+                                                        )?
+                                                    };
+                                                    return Self::execute_aggregation(&batch, &stmt);
+                                                }
+
                                                 let batch = if prefer_index_materialization {
                                                     Self::read_matching_rows_by_indices(
                                                         &backend, &stmt, &indices,
@@ -754,6 +820,12 @@ impl ApexExecutor {
                                         if filtered.num_rows() == 0 {
                                             return Ok(ApexResult::Empty(filtered.schema()));
                                         }
+                                        if has_aggregation_check
+                                            && stmt.group_by.is_empty()
+                                            && stmt.joins.is_empty()
+                                        {
+                                            return Self::execute_aggregation(&filtered, &stmt);
+                                        }
                                         if !stmt.is_pure_star() {
                                             let projected = Self::apply_projection_with_storage(
                                                 &filtered,
@@ -773,6 +845,12 @@ impl ApexExecutor {
                                         )?;
                                         if filtered.num_rows() == 0 {
                                             return Ok(ApexResult::Empty(filtered.schema()));
+                                        }
+                                        if has_aggregation_check
+                                            && stmt.group_by.is_empty()
+                                            && stmt.joins.is_empty()
+                                        {
+                                            return Self::execute_aggregation(&filtered, &stmt);
                                         }
                                         if !stmt.is_pure_star() {
                                             let projected = Self::apply_projection_with_storage(
@@ -2607,6 +2685,10 @@ impl ApexExecutor {
             return Ok(None);
         }
 
+        if Self::table_has_index_catalog(None, backend.path()) {
+            return Ok(None);
+        }
+
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
@@ -2643,6 +2725,12 @@ impl ApexExecutor {
                         if !unique_cols.iter().any(|c| c == "*") {
                             unique_cols.push("*".to_string());
                         }
+                    } else if matches!(func, AggregateFunc::Count)
+                        && !backend.storage.column_has_nulls(col_name)
+                    {
+                        if !unique_cols.iter().any(|c| c == "*") {
+                            unique_cols.push("*".to_string());
+                        }
                     } else if !unique_cols.contains(col_name) {
                         unique_cols.push(col_name.clone());
                     }
@@ -2660,11 +2748,38 @@ impl ApexExecutor {
 
         // Single-pass: scan string filter + aggregate in one sequential pass
         use std::collections::HashMap;
-        let agg_results =
+        let agg_results = if let Some(dict_arc) = crate::storage::backend::get_global_dict_cache(
+            backend.path(),
+            &filter_col,
+            &backend.storage,
+        )? {
+            let target_present = dict_arc.0.iter().any(|value| value == &filter_val);
+            match backend.storage.execute_filtered_string_agg_cached(
+                &filter_col,
+                &dict_arc.0,
+                &dict_arc.1,
+                &filter_val,
+                &col_refs,
+            )? {
+                Some(r) if !(target_present && r.iter().all(|stat| stat.0 == 0)) => r,
+                Some(_) => return Ok(None),
+                None => match backend
+                    .execute_filtered_string_agg_mmap(&filter_col, &filter_val, &col_refs)?
+                {
+                    Some(r) => r,
+                    None => return Ok(None),
+                },
+            }
+        } else {
             match backend.execute_filtered_string_agg_mmap(&filter_col, &filter_val, &col_refs)? {
                 Some(r) => r,
                 None => return Ok(None),
-            };
+            }
+        };
+
+        if agg_results.iter().all(|stat| stat.0 == 0) {
+            return Ok(None);
+        }
 
         // Build stat lookup: column name -> (count, sum, min, max, is_int)
         let mut stat_map: HashMap<&str, (i64, f64, f64, f64, bool)> = HashMap::new();
@@ -2715,7 +2830,10 @@ impl ApexExecutor {
                             if is_count_star {
                                 match_count
                             } else {
-                                stat_map.get(col_name.as_str()).map(|s| s.0).unwrap_or(0)
+                                stat_map
+                                    .get(col_name.as_str())
+                                    .map(|s| s.0)
+                                    .unwrap_or(match_count)
                             }
                         } else {
                             match_count
@@ -4170,6 +4288,51 @@ impl ApexExecutor {
             .collect::<io::Result<Vec<_>>>()?;
         RecordBatch::try_new(full_batch.schema(), taken_columns)
             .map_err(|e| err_data(e.to_string()))
+    }
+
+    fn aggregate_input_columns(stmt: &SelectStatement) -> Vec<String> {
+        let mut cols = Vec::new();
+        for column in &stmt.columns {
+            if let SelectColumn::Aggregate {
+                column: Some(name),
+                ..
+            } = column
+            {
+                let is_count_star_or_const = name == "*"
+                    || name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false);
+                let input = if is_count_star_or_const { "_id" } else { name };
+                if !cols.iter().any(|existing: &String| existing == input) {
+                    cols.push(input.to_string());
+                }
+            }
+        }
+        if cols.is_empty() {
+            cols.push("_id".to_string());
+        }
+        cols
+    }
+
+    fn table_has_index_catalog(base_dir: Option<&Path>, storage_path: &Path) -> bool {
+        let stem = match storage_path.file_stem() {
+            Some(stem) => stem.to_string_lossy(),
+            None => return false,
+        };
+        let catalog_name = format!("{}.idxcat", stem);
+        if let Some(base_dir) = base_dir {
+            if base_dir.join("indexes").join(&catalog_name).exists() {
+                return true;
+            }
+        }
+        for ancestor in storage_path.ancestors().skip(1).take(8) {
+            if ancestor.join("indexes").join(&catalog_name).exists() {
+                return true;
+            }
+        }
+        false
     }
 
     fn read_matching_rows_adaptive(

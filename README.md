@@ -102,11 +102,11 @@ with ApexClient("./rag-data") as client:
 
 ## Performance At A Glance
 
-Latest local snapshot: **ApexBase 1.19.0**, 200k-row tabular dataset, 200k-vector dataset, Apple arm, Python 3.12.
+Latest local snapshot: **ApexBase 1.21.0**, 1M-row tabular dataset, 1M-vector dataset, Apple arm, Python 3.12.
 
 | Area | Snapshot |
 | --- | --- |
-| **Fair OLAP + OLTP comparison** | **38 / 38 wins** against SQLite and DuckDB in the benchmark harness |
+| **Fair OLAP + OLTP comparison** | **72 public tabular metrics** tracked; OLAP is **45 / 45 wins** in the benchmark harness |
 | **GROUP BY** | **40.0x faster** than DuckDB in the representative snapshot |
 | **FTS search** | **35.6x faster** than SQLite in the representative snapshot |
 | **Batch vector TopK cosine** | **13.9x faster** than DuckDB in the representative snapshot |
@@ -141,6 +141,21 @@ apexbase-serve --dir ./data
 apexbase-server --dir ./data --port 5432
 apexbase-flight --dir ./data --port 50051
 ```
+
+## Lance Interop
+
+```python
+from apexbase import ApexClient
+
+with ApexClient("./data") as client:
+    client.use_table("articles")
+    client.to_lance("./articles.lance")
+
+with ApexClient("./imported") as client:
+    client.from_lance("./articles.lance", table_name="articles")
+```
+
+Lance conversion uses Arrow tables as the handoff path. This keeps the in-process conversion lean and Arrow-native, while each format still writes its own on-disk layout.
 
 ## License
 

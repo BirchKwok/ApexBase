@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 from apexbase._core import ApexStorage
-from . import ResultView, _empty_result_view, _registry, DurabilityLevel
+from . import ResultView, _empty_result_view, _registry, DurabilityLevel, _ensure_lance
 
 pa = None
 pd = None
@@ -3305,6 +3305,41 @@ class ApexClient:
         self.store(records)
         return self
 
+    def from_lance(
+        self,
+        uri,
+        table_name: str = None,
+        columns: Optional[List[str]] = None,
+        filter=None,
+        limit: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        **dataset_options,
+    ) -> 'ApexClient':
+        """Import a Lance dataset into the current or named ApexBase table.
+
+        Data is read through Lance's Arrow table path, avoiding row-by-row
+        Python glue before ApexBase's existing columnar write path.
+        """
+        lance_mod = _ensure_lance()
+        dataset = uri if hasattr(uri, "to_batches") else lance_mod.dataset(uri, **dataset_options)
+
+        schema = getattr(dataset, "schema", None)
+        if table_name is not None:
+            self._select_or_create_table(table_name, self._arrow_schema_to_apex_schema(schema))
+        self._ensure_table_selected()
+
+        table = dataset.to_table(
+            columns=columns,
+            filter=filter,
+            limit=limit,
+            batch_size=batch_size,
+        )
+        if table.num_rows:
+            self.store(table)
+        elif table_name is not None:
+            self.flush()
+        return self
+
     def from_polars(self, df, table_name: str = None) -> 'ApexClient':
         if table_name is not None:
             self._select_or_create_table(table_name)
@@ -3313,12 +3348,66 @@ class ApexClient:
         self.store(records)
         return self
 
-    def _select_or_create_table(self, table_name: str):
+    def to_lance(
+        self,
+        uri,
+        sql: str = None,
+        mode: str = "create",
+        show_internal_id: bool = False,
+        **write_options,
+    ):
+        """Export the current table or a SQL result to a Lance dataset."""
+        if sql is None:
+            self._ensure_table_selected()
+            result = self.query()
+        else:
+            result = self.execute(sql, show_internal_id=show_internal_id)
+        return result.to_lance(uri, mode=mode, **write_options)
+
+    def _select_or_create_table(self, table_name: str, schema: dict = None):
         """Select an existing table or create a new one."""
         try:
             self.use_table(table_name)
         except (ValueError, RuntimeError):
-            self.create_table(table_name)
+            self.create_table(table_name, schema)
+
+    @staticmethod
+    def _arrow_schema_to_apex_schema(schema) -> Optional[dict]:
+        if schema is None:
+            return None
+        pa_mod = _ensure_pyarrow()
+        mapped = {}
+        for field in schema:
+            typ = field.type
+            if pa_mod.types.is_int8(typ):
+                mapped[field.name] = "int8"
+            elif pa_mod.types.is_int16(typ):
+                mapped[field.name] = "int16"
+            elif pa_mod.types.is_int32(typ):
+                mapped[field.name] = "int32"
+            elif pa_mod.types.is_int64(typ):
+                mapped[field.name] = "int64"
+            elif pa_mod.types.is_uint8(typ):
+                mapped[field.name] = "uint8"
+            elif pa_mod.types.is_uint16(typ):
+                mapped[field.name] = "uint16"
+            elif pa_mod.types.is_uint32(typ):
+                mapped[field.name] = "uint32"
+            elif pa_mod.types.is_uint64(typ):
+                mapped[field.name] = "uint64"
+            elif pa_mod.types.is_float32(typ):
+                mapped[field.name] = "float32"
+            elif pa_mod.types.is_float64(typ):
+                mapped[field.name] = "float64"
+            elif pa_mod.types.is_boolean(typ):
+                mapped[field.name] = "bool"
+            elif pa_mod.types.is_binary(typ):
+                mapped[field.name] = "binary"
+            elif pa_mod.types.is_large_binary(typ):
+                mapped[field.name] = "blob"
+            else:
+                mapped[field.name] = "string"
+        return mapped
 
     # ============ Utility ============
 

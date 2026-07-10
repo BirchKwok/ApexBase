@@ -7,7 +7,7 @@ use crate::data::Value;
 use crate::fts::FtsConfig;
 use crate::fts::FtsManager;
 use crate::query::{ApexExecutor, ApexResult, SqlParser};
-use crate::storage::on_demand::ColumnValue;
+use crate::storage::on_demand::{ColumnValue, SchemaStableValue};
 use crate::storage::{DurabilityLevel, StorageEngine, StorageManager, TableStorageBackend};
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
@@ -15,13 +15,22 @@ use fs2::FileExt;
 use parking_lot::RwLock;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[derive(Clone)]
+struct SchemaStableMemtableWriter {
+    database: String,
+    table_name: String,
+    table_path: PathBuf,
+    backend: Arc<TableStorageBackend>,
+    schema: Vec<(String, crate::storage::on_demand::ColumnType)>,
+}
 
 /// Convert Python dict to HashMap<String, Value>
 fn dict_to_values(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, Value>> {
@@ -509,6 +518,8 @@ pub struct ApexStorageImpl {
     auto_flush_bytes: RwLock<u64>,
     /// Temp directory for temporary tables (root_dir/.apex_tmp/)
     temp_dir: PathBuf,
+    /// Narrow single-row memtable writer cache for schema-stable OLTP inserts.
+    schema_stable_memtable_writer: RwLock<Option<SchemaStableMemtableWriter>>,
 }
 
 /// Internal Rust-only methods (not exposed to Python)
@@ -521,6 +532,117 @@ impl ApexStorageImpl {
     #[inline]
     fn insert_backend_cache_key(table_path: &std::path::Path, table_name: &str) -> String {
         format!("{}\0{}\0insert", table_path.to_string_lossy(), table_name)
+    }
+
+    fn try_insert_schema_stable_borrowed_row(
+        row: &Bound<'_, PyDict>,
+        schema: &[(String, crate::storage::on_demand::ColumnType)],
+        backend: &TableStorageBackend,
+    ) -> PyResult<Option<u64>> {
+        let has_internal_id = row.get_item("_id")?.is_some();
+        if row.len().saturating_sub(if has_internal_id { 1 } else { 0 }) != schema.len() {
+            return Ok(None);
+        }
+
+        let mut py_values = Vec::with_capacity(schema.len());
+        for (col_name, _) in schema {
+            let Some(value) = row.get_item(col_name.as_str())? else {
+                return Ok(None);
+            };
+            if value.is_none() {
+                return Ok(None);
+            }
+            py_values.push(value);
+        }
+
+        let mut ordered_values = Vec::with_capacity(schema.len());
+        for ((_, col_type), value) in schema.iter().zip(py_values.iter()) {
+            use crate::storage::on_demand::ColumnType;
+            match *col_type {
+                ColumnType::Bool => {
+                    let Ok(v) = value.extract::<bool>() else {
+                        return Ok(None);
+                    };
+                    ordered_values.push(SchemaStableValue::Bool(v));
+                }
+                ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::Int64
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Timestamp
+                | ColumnType::Date => {
+                    let Ok(v) = value.extract::<i64>() else {
+                        return Ok(None);
+                    };
+                    ordered_values.push(SchemaStableValue::Int64(v));
+                }
+                ColumnType::Float32 | ColumnType::Float64 => {
+                    let v = match value.extract::<f64>() {
+                        Ok(v) => v,
+                        Err(_) => match value.extract::<i64>() {
+                            Ok(v) => v as f64,
+                            Err(_) => return Ok(None),
+                        },
+                    };
+                    ordered_values.push(SchemaStableValue::Float64(v));
+                }
+                ColumnType::String => {
+                    let Ok(v) = value.extract::<&str>() else {
+                        return Ok(None);
+                    };
+                    ordered_values.push(SchemaStableValue::Str(v));
+                }
+                ColumnType::Binary => {
+                    let Ok(v) = value.downcast::<PyBytes>() else {
+                        return Ok(None);
+                    };
+                    ordered_values.push(SchemaStableValue::Binary(v.as_bytes()));
+                }
+                ColumnType::Blob
+                | ColumnType::StringDict
+                | ColumnType::FixedList
+                | ColumnType::Float16List
+                | ColumnType::Null => return Ok(None),
+            }
+        }
+
+        let id = backend
+            .insert_one_schema_stable_borrowed(&ordered_values)
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(Some(id))
+    }
+
+    fn try_cached_schema_stable_memtable_insert(
+        &self,
+        row: &Bound<'_, PyDict>,
+    ) -> PyResult<Option<Vec<i64>>> {
+        let current_table = self.current_table.read();
+        let current_database = self.current_database.read();
+        let guard = self.schema_stable_memtable_writer.read();
+        let writer = guard.as_ref().filter(|writer| {
+            writer.table_name == *current_table && writer.database == *current_database
+        });
+        let Some(writer) = writer else {
+            return Ok(None);
+        };
+        if writer.backend.has_pending_deltas() {
+            return Ok(None);
+        }
+
+        let Some(id) =
+            Self::try_insert_schema_stable_borrowed_row(row, &writer.schema, &writer.backend)?
+        else {
+            return Ok(None);
+        };
+
+        crate::query::executor::cache_backend_pub(&writer.table_path, Arc::clone(&writer.backend));
+        crate::query::planner::invalidate_table_stats(&writer.table_path.to_string_lossy());
+
+        Ok(Some(vec![id as i64]))
     }
 
     #[inline]
@@ -1196,6 +1318,15 @@ impl ApexStorageImpl {
         let replace_cache_marker = format!("\0{table_name}\0replace\0");
         self.replace_exact_row_cache
             .retain(|key, _| !key.contains(&replace_cache_marker));
+        let clear_writer = self
+            .schema_stable_memtable_writer
+            .read()
+            .as_ref()
+            .map(|writer| writer.table_name == table_name)
+            .unwrap_or(false);
+        if clear_writer {
+            *self.schema_stable_memtable_writer.write() = None;
+        }
     }
 
     fn mark_flush_prewarm(&self, table_path: &Path, table_name: &str) {
@@ -1304,6 +1435,7 @@ impl ApexStorageImpl {
             auto_flush_rows: RwLock::new(0),
             auto_flush_bytes: RwLock::new(0),
             temp_dir,
+            schema_stable_memtable_writer: RwLock::new(None),
         })
     }
 
@@ -1601,6 +1733,9 @@ impl ApexStorageImpl {
         if row.is_empty() {
             return Ok(Some(Vec::new()));
         }
+        if let Some(ids) = self.try_cached_schema_stable_memtable_insert(row)? {
+            return Ok(Some(ids));
+        }
 
         let (table_path, table_name) = self.get_current_table_info()?;
         if self.table_has_secondary_indexes(py, &table_path, &table_name) {
@@ -1627,8 +1762,26 @@ impl ApexStorageImpl {
         }) {
             return Ok(None);
         }
-        let schema_len = schema.len();
 
+        if let Some(id) = Self::try_insert_schema_stable_borrowed_row(row, &schema, &backend)? {
+            let cache_key = Self::backend_cache_key(&table_path, &table_name);
+            self.cached_backends.insert(cache_key, Arc::clone(&backend));
+            crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
+            crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
+
+            let database = self.current_database.read().clone();
+            *self.schema_stable_memtable_writer.write() = Some(SchemaStableMemtableWriter {
+                database,
+                table_name: table_name.clone(),
+                table_path: table_path.clone(),
+                backend: Arc::clone(&backend),
+                schema: schema.clone(),
+            });
+
+            return Ok(Some(vec![id as i64]));
+        }
+
+        let schema_len = schema.len();
         let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
         let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
         let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
@@ -2419,7 +2572,7 @@ impl ApexStorageImpl {
         {
             let backend = self.get_backend_for_overlay(py, &table_path, &table_name)?;
             if !backend.storage.has_constraints() {
-                if py.allow_threads(|| backend.delete_pending_v4_in_memory_row(id as u64)) {
+                if backend.delete_pending_v4_in_memory_row(id as u64) {
                     self.replace_exact_row_cache.remove(&replace_cache_key);
                     crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
                     crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
@@ -3451,6 +3604,11 @@ impl ApexStorageImpl {
                                 )
                             });
                             if let Ok(Some(stats)) = agg_result {
+                                if stats.iter().all(|stat| stat.0 == 0) {
+                                    // Fall through to the SQL executor. After REINDEX, this
+                                    // pre-parse shortcut can observe a stale mmap dictionary
+                                    // view even though the generic filter path is correct.
+                                } else {
                                 // Build stat lookup: column name -> (count, sum, min, max, is_int)
                                 let mut stat_map: std::collections::HashMap<
                                     &str,
@@ -3573,6 +3731,7 @@ impl ApexStorageImpl {
                                 out.set_item("columns_dict", columns_dict)?;
                                 out.set_item("rows_affected", 0i64)?;
                                 return Ok(out.into());
+                                }
                             }
                         }
                     }

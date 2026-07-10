@@ -17,7 +17,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::data::{DataType, Value};
 use crate::storage::on_demand::{
-    ColumnData, ColumnType, ColumnValue, CompressionType, OnDemandStorage,
+    ColumnData, ColumnType, ColumnValue, CompressionType, OnDemandStorage, SchemaStableValue,
 };
 use crate::table::arrow_column::ArrowStringColumn;
 use crate::table::column_table::{BitVec, TypedColumn};
@@ -69,6 +69,12 @@ pub fn get_global_dict_cache(
 /// Invalidate global dict cache for a file path
 pub fn invalidate_global_dict_cache(path: &Path) {
     let mut cache = GLOBAL_DICT_CACHE.write();
+    if cache.is_empty() {
+        return;
+    }
+    // Entries are inserted with the same absolute table path used by the
+    // backend, so exact-key invalidation is sufficient and avoids a
+    // canonicalize/retain scan on every write.
     cache.retain(|(p, _), _| p != path);
 }
 
@@ -1099,6 +1105,18 @@ impl TableStorageBackend {
         self.invalidate_read_caches();
         *self.dirty.write() = true;
         Ok(ids)
+    }
+
+    /// Insert one borrowed row whose values already match the existing storage schema.
+    pub fn insert_one_schema_stable_borrowed(
+        &self,
+        values: &[SchemaStableValue<'_>],
+    ) -> io::Result<u64> {
+        let id = self.storage.insert_one_schema_stable_borrowed(values)?;
+        *self.row_count.write() += 1;
+        self.invalidate_read_caches();
+        *self.dirty.write() = true;
+        Ok(id)
     }
 
     pub fn insert_typed_with_nulls_full_with_blobs(

@@ -5,7 +5,11 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 
 ## Unreleased
 
-- No unreleased changes recorded yet. New features and fixes will be listed here before the next public release.
+- Add Lance dataset import/export helpers: `ApexClient.from_lance`, `ApexClient.to_lance`, and `ResultView.to_lance`
+- Route Lance interoperability through Arrow tables for a lean in-process handoff while preserving ApexBase and Lance on-disk formats
+- Expand the public benchmark scoreboard with 18 common OLTP microbenchmarks covering direct row counts, point reads, missing-row lookups, small projected reads, single-row writes, update/delete-by-id paths, and read-your-write checks
+- Expand the public OLAP benchmark scoreboard with category/grouped ordering, HAVING, ascending TopK, distinct-count, JSON group-by, and filtered city aggregation metrics
+- Reuse global string dictionary caches for filtered string aggregations so predicates such as `city = 'Beijing'` can aggregate numeric columns without reparsing the filter column
 
 ---
 

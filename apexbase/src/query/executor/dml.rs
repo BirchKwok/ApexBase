@@ -2710,13 +2710,23 @@ impl ApexExecutor {
         // REINDEX must rebuild from committed values, including txn append
         // sidecars and DeltaStore cell updates.
         Self::materialize_table_sidecars(&table_path)?;
+        Self::invalidate_cache_for_path(&table_path);
+        crate::storage::backend::invalidate_global_dict_cache(&table_path);
 
         let idx_mgr_arc = get_index_manager(base_dir, table);
         let mut idx_mgr = idx_mgr_arc.lock();
         let indexes = idx_mgr
             .list_indexes()
             .iter()
-            .map(|m| (m.name.clone(), m.column_name.clone()))
+            .map(|m| {
+                (
+                    m.name.clone(),
+                    m.effective_columns()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>(),
+                )
+            })
             .collect::<Vec<_>>();
 
         if indexes.is_empty() {
@@ -2730,42 +2740,60 @@ impl ApexExecutor {
         let storage = TableStorageBackend::open(&table_path)?;
         let row_count = storage.row_count();
         if row_count > 0 {
+            const INDEX_BUILD_BATCH_ROWS: usize = 65_536;
             let mut col_names: Vec<String> = vec!["_id".to_string()];
-            for (_, col) in &indexes {
-                if !col_names.contains(col) {
-                    col_names.push(col.clone());
+            for (_, cols) in &indexes {
+                for col in cols {
+                    if !col_names.contains(col) {
+                        col_names.push(col.clone());
+                    }
                 }
             }
             let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-            let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
 
-            let id_col = batch
-                .column_by_name("_id")
-                .ok_or_else(|| err_data("_id column not found"))?;
-            let id_arr = id_col.as_any().downcast_ref::<UInt64Array>();
-            let id_arr_i64 = id_col.as_any().downcast_ref::<Int64Array>();
-
-            for row in 0..batch.num_rows() {
-                let row_id: u64 = if let Some(arr) = id_arr {
-                    arr.value(row)
-                } else if let Some(arr) = id_arr_i64 {
-                    arr.value(row) as u64
-                } else {
-                    row as u64
-                };
-
-                for (_, idx_col) in &indexes {
-                    if let Some(data_col) = batch.column_by_name(idx_col) {
-                        let value = Self::arrow_value_at_col(data_col, row);
-                        let mut col_vals = std::collections::HashMap::new();
-                        col_vals.insert(idx_col.clone(), value);
-                        let _ = idx_mgr.on_insert(row_id, &col_vals);
-                    }
+            let mut start_row = 0usize;
+            let total_rows = row_count as usize;
+            while start_row < total_rows {
+                let limit = (total_rows - start_row).min(INDEX_BUILD_BATCH_ROWS);
+                let batch =
+                    storage.read_columns_to_arrow_window(Some(&col_refs), start_row, Some(limit))?;
+                if batch.num_rows() == 0 {
+                    break;
                 }
+
+                let id_col = batch
+                    .column_by_name("_id")
+                    .ok_or_else(|| err_data("_id column not found"))?;
+                let id_arr = id_col.as_any().downcast_ref::<UInt64Array>();
+                let id_arr_i64 = id_col.as_any().downcast_ref::<Int64Array>();
+
+                for row in 0..batch.num_rows() {
+                    let row_id: u64 = if let Some(arr) = id_arr {
+                        arr.value(row)
+                    } else if let Some(arr) = id_arr_i64 {
+                        arr.value(row) as u64
+                    } else {
+                        (start_row + row) as u64
+                    };
+
+                    let mut col_vals = std::collections::HashMap::with_capacity(col_names.len());
+                    for col in col_names.iter().filter(|col| col.as_str() != "_id") {
+                        if let Some(data_col) = batch.column_by_name(col) {
+                            col_vals.insert(col.clone(), Self::arrow_value_at_col(data_col, row));
+                        }
+                    }
+                    idx_mgr.on_insert(row_id, &col_vals)?;
+                }
+
+                start_row += batch.num_rows();
             }
         }
 
         idx_mgr.save()?;
+        drop(idx_mgr);
+        invalidate_index_cache(base_dir, table);
+        Self::invalidate_cache_for_path(&table_path);
+        crate::storage::backend::invalidate_global_dict_cache(&table_path);
         Ok(ApexResult::Scalar(indexes.len() as i64))
     }
 

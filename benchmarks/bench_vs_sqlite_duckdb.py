@@ -14,6 +14,7 @@ import argparse
 import csv as csv_mod
 import gc
 import json
+import math
 import os
 import platform
 import random
@@ -620,9 +621,19 @@ class SQLiteBench:
             "SELECT city, COUNT(*) AS cnt FROM bench GROUP BY city ORDER BY cnt DESC LIMIT 5"
         )
 
+    def bench_group_by_category_order_count(self):
+        return self._query_all(
+            "SELECT category, COUNT(*) AS cnt FROM bench GROUP BY category ORDER BY cnt DESC LIMIT 5"
+        )
+
     def bench_group_by_having(self):
         return self._query_all(
             "SELECT city, COUNT(*) as cnt, AVG(score) FROM bench GROUP BY city HAVING cnt > 1000"
+        )
+
+    def bench_group_by_category_having(self):
+        return self._query_all(
+            "SELECT category, COUNT(*) as cnt, AVG(score) FROM bench GROUP BY category HAVING cnt > 1000"
         )
 
     def setup_view_bench(self):
@@ -644,6 +655,11 @@ class SQLiteBench:
             "SELECT * FROM bench ORDER BY score DESC LIMIT 100"
         )
 
+    def bench_order_limit_asc(self):
+        return self._query_all(
+            "SELECT * FROM bench ORDER BY score ASC LIMIT 100"
+        )
+
     def bench_aggregation(self):
         return self._query_all(
             "SELECT COUNT(*), AVG(age), SUM(score), MIN(age), MAX(age) FROM bench"
@@ -652,6 +668,16 @@ class SQLiteBench:
     def bench_filtered_aggregation(self):
         return self._query_all(
             "SELECT COUNT(*), AVG(score), MAX(score) FROM bench WHERE category = 'Electronics'"
+        )
+
+    def bench_filtered_aggregation_city(self):
+        return self._query_all(
+            "SELECT COUNT(*), AVG(score), MAX(score) FROM bench WHERE city = 'Beijing'"
+        )
+
+    def bench_count_where_category(self):
+        return self._scalar(
+            "SELECT COUNT(*) FROM bench WHERE category = 'Electronics'"
         )
 
     def bench_complex(self):
@@ -716,7 +742,7 @@ class SQLiteBench:
 
     def bench_oltp_city_limit_10(self):
         return self._query_all(
-            "SELECT name, age FROM bench WHERE city = 'Beijing' LIMIT 10"
+            "SELECT name, age FROM bench WHERE city = 'Beijing' LIMIT 100"
         )
 
     def bench_oltp_insert_one(self):
@@ -970,6 +996,11 @@ class SQLiteBench:
             "SELECT COUNT(DISTINCT city) FROM bench"
         )
 
+    def bench_count_distinct_category(self):
+        return self._scalar(
+            "SELECT COUNT(DISTINCT category) FROM bench"
+        )
+
     def bench_filter_in(self):
         return self._query_all(
             "SELECT * FROM bench WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"
@@ -1167,9 +1198,19 @@ class DuckDBBench:
             "SELECT city, COUNT(*) AS cnt FROM bench GROUP BY city ORDER BY cnt DESC LIMIT 5"
         )
 
+    def bench_group_by_category_order_count(self):
+        return self._query_all(
+            "SELECT category, COUNT(*) AS cnt FROM bench GROUP BY category ORDER BY cnt DESC LIMIT 5"
+        )
+
     def bench_group_by_having(self):
         return self._query_all(
             "SELECT city, COUNT(*) as cnt, AVG(score) FROM bench GROUP BY city HAVING cnt > 1000"
+        )
+
+    def bench_group_by_category_having(self):
+        return self._query_all(
+            "SELECT category, COUNT(*) as cnt, AVG(score) FROM bench GROUP BY category HAVING cnt > 1000"
         )
 
     def setup_view_bench(self):
@@ -1190,6 +1231,11 @@ class DuckDBBench:
             "SELECT * FROM bench ORDER BY score DESC LIMIT 100"
         )
 
+    def bench_order_limit_asc(self):
+        return self._query_all(
+            "SELECT * FROM bench ORDER BY score ASC LIMIT 100"
+        )
+
     def bench_aggregation(self):
         return self._query_all(
             "SELECT COUNT(*), AVG(age), SUM(score), MIN(age), MAX(age) FROM bench"
@@ -1198,6 +1244,16 @@ class DuckDBBench:
     def bench_filtered_aggregation(self):
         return self._query_all(
             "SELECT COUNT(*), AVG(score), MAX(score) FROM bench WHERE category = 'Electronics'"
+        )
+
+    def bench_filtered_aggregation_city(self):
+        return self._query_all(
+            "SELECT COUNT(*), AVG(score), MAX(score) FROM bench WHERE city = 'Beijing'"
+        )
+
+    def bench_count_where_category(self):
+        return self._scalar(
+            "SELECT COUNT(*) FROM bench WHERE category = 'Electronics'"
         )
 
     def bench_complex(self):
@@ -1271,7 +1327,7 @@ class DuckDBBench:
 
     def bench_oltp_city_limit_10(self):
         return self._query_all(
-            "SELECT name, age FROM bench WHERE city = 'Beijing' LIMIT 10"
+            "SELECT name, age FROM bench WHERE city = 'Beijing' LIMIT 100"
         )
 
     def bench_oltp_insert_one(self):
@@ -1504,6 +1560,11 @@ class DuckDBBench:
             "SELECT COUNT(DISTINCT city) FROM bench"
         )
 
+    def bench_count_distinct_category(self):
+        return self._scalar(
+            "SELECT COUNT(DISTINCT category) FROM bench"
+        )
+
     def bench_filter_in(self):
         return self._query_all(
             "SELECT * FROM bench WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"
@@ -1605,6 +1666,11 @@ class DuckDBBench:
     def bench_json_read_order_limit(self):
         return self._query_all(
             f"SELECT * FROM read_json_auto('{self.json_path}') ORDER BY score DESC LIMIT 100"
+        )
+
+    def bench_json_read_group_category(self):
+        return self._query_all(
+            f"SELECT category, COUNT(*) FROM read_json_auto('{self.json_path}') GROUP BY category"
         )
 
     def close(self):
@@ -1720,9 +1786,19 @@ class ApexBaseBench:
             "SELECT city, COUNT(*) AS cnt FROM default GROUP BY city ORDER BY cnt DESC LIMIT 5"
         )
 
+    def bench_group_by_category_order_count(self):
+        return self._query_all(
+            "SELECT category, COUNT(*) AS cnt FROM default GROUP BY category ORDER BY cnt DESC LIMIT 5"
+        )
+
     def bench_group_by_having(self):
         return self._query_all(
             "SELECT city, COUNT(*) as cnt, AVG(score) FROM default GROUP BY city HAVING cnt > 1000"
+        )
+
+    def bench_group_by_category_having(self):
+        return self._query_all(
+            "SELECT category, COUNT(*) as cnt, AVG(score) FROM default GROUP BY category HAVING cnt > 1000"
         )
 
     def setup_view_bench(self):
@@ -1746,6 +1822,11 @@ class ApexBaseBench:
             "SELECT * FROM default ORDER BY score DESC LIMIT 100"
         )
 
+    def bench_order_limit_asc(self):
+        return self._query_all(
+            "SELECT * FROM default ORDER BY score ASC LIMIT 100"
+        )
+
     def bench_aggregation(self):
         return self._query_all(
             "SELECT COUNT(*), AVG(age), SUM(score), MIN(age), MAX(age) FROM default"
@@ -1754,6 +1835,16 @@ class ApexBaseBench:
     def bench_filtered_aggregation(self):
         return self._query_all(
             "SELECT COUNT(*), AVG(score), MAX(score) FROM default WHERE category = 'Electronics'"
+        )
+
+    def bench_filtered_aggregation_city(self):
+        return self._query_all(
+            "SELECT COUNT(*), AVG(score), MAX(score) FROM default WHERE city = 'Beijing'"
+        )
+
+    def bench_count_where_category(self):
+        return self._scalar(
+            "SELECT COUNT(*) FROM default WHERE category = 'Electronics'"
         )
 
     def bench_complex(self):
@@ -1813,7 +1904,7 @@ class ApexBaseBench:
 
     def bench_oltp_city_limit_10(self):
         return self.client.execute(
-            "SELECT name, age FROM default WHERE city = 'Beijing' LIMIT 10"
+            "SELECT name, age FROM default WHERE city = 'Beijing' LIMIT 100"
         ).to_dict()
 
     def bench_oltp_insert_one(self):
@@ -2079,6 +2170,11 @@ class ApexBaseBench:
             "SELECT COUNT(DISTINCT city) FROM default"
         )
 
+    def bench_count_distinct_category(self):
+        return self._scalar(
+            "SELECT COUNT(DISTINCT category) FROM default"
+        )
+
     def bench_filter_in(self):
         return self._query_all(
             "SELECT * FROM default WHERE city IN ('Beijing', 'Shanghai', 'Guangzhou')"
@@ -2212,6 +2308,11 @@ class ApexBaseBench:
             f"SELECT * FROM read_json('{self.json_path}') ORDER BY score DESC LIMIT 100"
         )
 
+    def bench_json_read_group_category(self):
+        return self._query_all(
+            f"SELECT category, COUNT(*) FROM read_json('{self.json_path}') GROUP BY category"
+        )
+
     def close(self):
         if self.client:
             self.client.close()
@@ -2240,15 +2341,19 @@ BENCHMARKS = [
     ("GROUP BY city (10 groups)",        "bench_group_by",         False, False, False, None),
     ("GROUP BY category (10 groups)",    "bench_group_by_category", False, False, False, None),
     ("GROUP BY city ORDER BY count",     "bench_group_by_order_count", False, False, False, None),
+    ("GROUP BY category ORDER BY count", "bench_group_by_category_order_count", False, False, False, None),
     ("GROUP BY + HAVING",                "bench_group_by_having",  False, False, False, None),
+    ("GROUP BY category + HAVING",       "bench_group_by_category_having", False, False, False, None),
     ("Persistent VIEW select",           "bench_view_select",      False, False, False, "setup_view_bench"),
     ("ORDER BY score LIMIT 100",         "bench_order_limit",      False, False, False, None),
+    ("ORDER BY score ASC LIMIT 100",     "bench_order_limit_asc",  False, False, False, None),
     ("Aggregation (5 funcs)",            "bench_aggregation",      False, False, False, None),
     ("Filtered aggregation (category)",  "bench_filtered_aggregation", False, False, False, None),
+    ("Filtered aggregation (city)",      "bench_filtered_aggregation_city", False, False, False, None),
+    ("COUNT WHERE category",             "bench_count_where_category", False, False, False, None),
     ("Complex (Filter+Group+Order)",     "bench_complex",          False, False, False, None),
     ("Point Lookup (SQL by ID)",         "bench_point_lookup",     False, False, False, None),
     ("Retrieve Many (SQL, 100 IDs)",     "bench_retrieve_many",    False, False, False, None),
-    ("Insert 1K rows (default fair)",    "bench_insert_1k",        False, False, False, None),
     # --- New cases ---
     ("SELECT * -> pandas (full scan)",   "bench_full_scan_pandas", False, False, False, None),
     ("GROUP BY city,category (100 grp)","bench_group_by_2cols",   False, False, False, None),
@@ -2256,26 +2361,51 @@ BENCHMARKS = [
     ("Multi-cond (age>30 AND score>50)", "bench_filter_multi_cond",False, False, False, None),
     ("ORDER BY city,score DESC LIMIT100","bench_order_by_multi",   False, False, False, None),
     ("COUNT(DISTINCT city)",             "bench_count_distinct",   False, False, False, None),
+    ("COUNT(DISTINCT category)",         "bench_count_distinct_category", False, False, False, None),
     ("IN filter (city IN 3 cities)",     "bench_filter_in",        False, False, False, None),
     ("Numeric IN (age IN 9 values)",      "bench_filter_numeric_in",False, False, False, None),
     ("OR cross-col (age=25 OR city=BJ)",  "bench_filter_or_cross_col",False,False,False, None),
     ("Numeric OR (age=20|30|40|50)",      "bench_filter_numeric_or",False, False, False, None),
-    ("UPDATE rows (age=25; idempotent)", "bench_update_1k",        False, False, False, None),
-    # --- Delete / Window / FTS ---
-    ("Store+DELETE 1K (combined)",           "bench_delete_1k",         False, False, False, None),
-    ("DELETE 1K (pure delete; setup rows)",  "bench_delete_1k_only",    False, False, False, "bench_delete_1k_setup"),
+    # --- Window ---
     ("Window ROW_NUMBER PARTITION BY city",  "bench_window_row_number", False, False, False, None),
-    ("FTS Index Build (name,city,category)", "bench_fts_build",         True,  False, False, None),
-    ("FTS Search ('Electronics')",           "bench_fts_search",        False, False, False, None),
     # --- File reading / temp table benchmarks ---
     ("CSV Read + COUNT(*)",               "bench_csv_read_count",        False, False, False, None),
     ("CSV Read + Filter + GROUP BY",      "bench_csv_read_filter_group", False, False, False, None),
     ("CSV Read + Full Scan LIMIT 1000",   "bench_csv_read_limit_1k",     False, False, False, None),
     ("JSON Read + COUNT(*)",              "bench_json_read_count",       False, False, False, None),
     ("JSON Read + Filter",                "bench_json_read_filter",      False, False, False, None),
-    ("Temp Table (CSV) Query (filter+agg)","bench_temp_csv_create_query", False, False, False, None),
+    ("JSON Read + GROUP BY category",     "bench_json_read_group_category", False, False, False, None),
+    ("Temp Table (CSV) Query (filter+agg)","bench_temp_csv_create_query", False, False, True,  None),
     ("JSON Read + ORDER BY LIMIT 100",    "bench_json_read_order_limit", False, False, False, None),
     ("CSV Read + ORDER BY LIMIT 100",     "bench_csv_read_order_limit",  False, False, False, None),
+    # --- OLTP read microbenchmarks run after analytical/file scans but before
+    # mutation-heavy DML so latency is measured on a clean loaded table.
+    ("COUNT(*) (direct API)",            "bench_oltp_count_rows",  False, False, True,  None),
+    ("Point lookup (projected SQL)",     "bench_oltp_projected_point_lookup", False, False, True, None),
+    ("Point lookup (direct full row)",   "bench_oltp_direct_point_lookup", False, False, True, None),
+    ("Missing ID lookup",                "bench_oltp_missing_point_lookup", False, False, True, None),
+    ("Retrieve 10 IDs (projected SQL)",  "bench_oltp_projected_retrieve_10", False, False, True, None),
+    ("Retrieve 100 IDs (projected SQL)", "bench_oltp_projected_retrieve_100", False, False, True, None),
+    ("SELECT 3 cols LIMIT 100",          "bench_oltp_projected_limit_100", False, False, True, None),
+    ("String equality (projected)",      "bench_oltp_projected_string_eq", False, False, True, None),
+    ("City filter LIMIT 100",            "bench_oltp_city_limit_10", False, False, True, None),
+    # --- Bulk DML and FTS build run last so mutation-heavy paths do not
+    # perturb read-only OLAP/OLTP latency metrics.
+    ("Insert 1K rows (default fair)",    "bench_insert_1k",        False, False, False, None),
+    ("UPDATE rows (age=25; idempotent)", "bench_update_1k",        False, False, False, None),
+    ("Store+DELETE 1K (combined)",       "bench_delete_1k",        False, False, False, None),
+    ("DELETE 1K (pure delete; setup rows)", "bench_delete_1k_only", False, False, False, "bench_delete_1k_setup"),
+    ("Insert 1 row (default fair)",      "bench_oltp_insert_one", False, False, True, None),
+    ("Insert+Read own row",              "bench_oltp_insert_read_own_row", False, False, True, None),
+    ("Insert+COUNT visible",             "bench_oltp_insert_count_visible", False, False, True, None),
+    ("UPDATE by ID",                     "bench_oltp_update_by_id", False, False, True, None),
+    ("UPDATE missing ID",                "bench_oltp_update_missing_id", False, False, True, None),
+    ("UPDATE+Read by ID",                "bench_oltp_update_read_by_id", False, False, True, None),
+    ("Replace row by ID",                "bench_oltp_replace_by_id", False, False, True, None),
+    ("Insert+DELETE by ID",              "bench_oltp_insert_delete_by_id", False, False, True, None),
+    ("DELETE missing ID",                "bench_oltp_delete_missing_id", False, False, True, None),
+    ("FTS Index Build (name,city,category)", "bench_fts_build",         True,  False, False, None),
+    ("FTS Search ('Electronics')",           "bench_fts_search",        False, False, False, None),
 ]
 
 OLAP_BENCHMARK_NAMES = [
@@ -2292,11 +2422,16 @@ OLAP_BENCHMARK_NAMES = [
     "GROUP BY city (10 groups)",
     "GROUP BY category (10 groups)",
     "GROUP BY city ORDER BY count",
+    "GROUP BY category ORDER BY count",
     "GROUP BY + HAVING",
+    "GROUP BY category + HAVING",
     "Persistent VIEW select",
     "ORDER BY score LIMIT 100",
+    "ORDER BY score ASC LIMIT 100",
     "Aggregation (5 funcs)",
     "Filtered aggregation (category)",
+    "Filtered aggregation (city)",
+    "COUNT WHERE category",
     "Complex (Filter+Group+Order)",
     "SELECT * -> pandas (full scan)",
     "GROUP BY city,category (100 grp)",
@@ -2304,6 +2439,7 @@ OLAP_BENCHMARK_NAMES = [
     "Multi-cond (age>30 AND score>50)",
     "ORDER BY city,score DESC LIMIT100",
     "COUNT(DISTINCT city)",
+    "COUNT(DISTINCT category)",
     "IN filter (city IN 3 cities)",
     "Numeric IN (age IN 9 values)",
     "OR cross-col (age=25 OR city=BJ)",
@@ -2314,38 +2450,176 @@ OLAP_BENCHMARK_NAMES = [
     "CSV Read + Full Scan LIMIT 1000",
     "JSON Read + COUNT(*)",
     "JSON Read + Filter",
+    "JSON Read + GROUP BY category",
     "Temp Table (CSV) Query (filter+agg)",
     "JSON Read + ORDER BY LIMIT 100",
     "CSV Read + ORDER BY LIMIT 100",
 ]
 
-OLAP_EXTENDED_ONLY_BENCHMARK_NAMES = {
-    "SELECT * -> pandas (full scan)",
-    "CSV Read + COUNT(*)",
-    "CSV Read + Filter + GROUP BY",
-    "CSV Read + Full Scan LIMIT 1000",
-    "JSON Read + COUNT(*)",
-    "JSON Read + Filter",
-    "Temp Table (CSV) Query (filter+agg)",
-    "JSON Read + ORDER BY LIMIT 100",
-    "CSV Read + ORDER BY LIMIT 100",
-}
-
-PUBLIC_OLAP_BENCHMARK_NAMES = [
-    name for name in OLAP_BENCHMARK_NAMES
-    if name not in OLAP_EXTENDED_ONLY_BENCHMARK_NAMES
-]
+# The public scoreboard now includes every cross-engine OLAP metric that this
+# harness can run with comparable setup and materialized result semantics.
+PUBLIC_OLAP_BENCHMARK_NAMES = list(OLAP_BENCHMARK_NAMES)
 
 OLTP_FAIR_BENCHMARK_NAMES = [
     "Bulk Insert (N rows; default fair)",
     "Point Lookup (SQL by ID)",
     "Retrieve Many (SQL, 100 IDs)",
+    "COUNT(*) (direct API)",
+    "Point lookup (projected SQL)",
+    "Point lookup (direct full row)",
+    "Missing ID lookup",
+    "Retrieve 10 IDs (projected SQL)",
+    "Retrieve 100 IDs (projected SQL)",
+    "SELECT 3 cols LIMIT 100",
+    "String equality (projected)",
+    "City filter LIMIT 100",
+    "Insert 1 row (default fair)",
+    "Insert+Read own row",
+    "Insert+COUNT visible",
+    "UPDATE by ID",
+    "UPDATE missing ID",
+    "UPDATE+Read by ID",
+    "Replace row by ID",
+    "Insert+DELETE by ID",
+    "DELETE missing ID",
     "Insert 1K rows (default fair)",
     "UPDATE rows (age=25; idempotent)",
     "Store+DELETE 1K (combined)",
     "DELETE 1K (pure delete; setup rows)",
     "FTS Index Build (name,city,category)",
     "FTS Search ('Electronics')",
+]
+
+FILE_BACKED_METHODS = {
+    "bench_csv_read_count",
+    "bench_csv_read_filter_group",
+    "bench_csv_read_limit_1k",
+    "bench_json_read_count",
+    "bench_json_read_filter",
+    "bench_json_read_group_category",
+    "bench_temp_csv_create_query",
+    "bench_json_read_order_limit",
+    "bench_csv_read_order_limit",
+}
+
+FAIR_WORKLOAD_GROUPS = [
+    (
+        "Load & Index",
+        [
+            "Bulk Insert (N rows; default fair)",
+            "FTS Index Build (name,city,category)",
+        ],
+    ),
+    (
+        "Point & Limited Reads",
+        [
+            "COUNT(*)",
+            "SELECT * LIMIT 100 (cold reopen)",
+            "SELECT * LIMIT 100 (warm cache)",
+            "SELECT * LIMIT 10K (cold reopen)",
+            "SELECT * LIMIT 10K (warm cache)",
+            "Filtered LIMIT 100 (age>30)",
+            "LIMIT 100 OFFSET 10K",
+            "Point Lookup (SQL by ID)",
+            "Retrieve Many (SQL, 100 IDs)",
+            "COUNT(*) (direct API)",
+            "Point lookup (projected SQL)",
+            "Point lookup (direct full row)",
+            "Missing ID lookup",
+            "Retrieve 10 IDs (projected SQL)",
+            "Retrieve 100 IDs (projected SQL)",
+            "SELECT 3 cols LIMIT 100",
+            "City filter LIMIT 100",
+        ],
+    ),
+    (
+        "Filtering",
+        [
+            "Filter (name = 'user_5000')",
+            "Filter (age BETWEEN 25 AND 35)",
+            "LIKE filter (name LIKE user_1%)",
+            "Multi-cond (age>30 AND score>50)",
+            "IN filter (city IN 3 cities)",
+            "Numeric IN (age IN 9 values)",
+            "OR cross-col (age=25 OR city=BJ)",
+            "Numeric OR (age=20|30|40|50)",
+            "String equality (projected)",
+            "COUNT WHERE category",
+        ],
+    ),
+    (
+        "Aggregation",
+        [
+            "GROUP BY city (10 groups)",
+            "GROUP BY category (10 groups)",
+            "GROUP BY city ORDER BY count",
+            "GROUP BY category ORDER BY count",
+            "GROUP BY + HAVING",
+            "GROUP BY category + HAVING",
+            "Aggregation (5 funcs)",
+            "Filtered aggregation (category)",
+            "Filtered aggregation (city)",
+            "Complex (Filter+Group+Order)",
+            "GROUP BY city,category (100 grp)",
+            "COUNT(DISTINCT city)",
+            "COUNT(DISTINCT category)",
+        ],
+    ),
+    (
+        "Ordering, Window, View",
+        [
+            "Persistent VIEW select",
+            "ORDER BY score LIMIT 100",
+            "ORDER BY score ASC LIMIT 100",
+            "ORDER BY city,score DESC LIMIT100",
+            "Window ROW_NUMBER PARTITION BY city",
+        ],
+    ),
+    (
+        "Full Materialization",
+        [
+            "Projection full scan (3 cols)",
+            "SELECT * -> pandas (full scan)",
+        ],
+    ),
+    (
+        "File Scan",
+        [
+            "CSV Read + COUNT(*)",
+            "CSV Read + Filter + GROUP BY",
+            "CSV Read + Full Scan LIMIT 1000",
+            "JSON Read + COUNT(*)",
+            "JSON Read + Filter",
+            "JSON Read + GROUP BY category",
+            "Temp Table (CSV) Query (filter+agg)",
+            "JSON Read + ORDER BY LIMIT 100",
+            "CSV Read + ORDER BY LIMIT 100",
+        ],
+    ),
+    (
+        "DML",
+        [
+            "Insert 1K rows (default fair)",
+            "Insert 1 row (default fair)",
+            "Insert+Read own row",
+            "Insert+COUNT visible",
+            "UPDATE by ID",
+            "UPDATE missing ID",
+            "UPDATE+Read by ID",
+            "Replace row by ID",
+            "Insert+DELETE by ID",
+            "DELETE missing ID",
+            "UPDATE rows (age=25; idempotent)",
+            "Store+DELETE 1K (combined)",
+            "DELETE 1K (pure delete; setup rows)",
+        ],
+    ),
+    (
+        "Search",
+        [
+            "FTS Search ('Electronics')",
+        ],
+    ),
 ]
 
 _BENCHMARK_BY_NAME = {spec[0]: spec for spec in BENCHMARKS}
@@ -2391,6 +2665,10 @@ def benchmark_specs_for_profile(profile: str):
     return [spec for spec in BENCHMARKS if spec[0] in selected]
 
 
+def selected_benchmarks_need_files(benchmark_specs):
+    return any(spec[1] in FILE_BACKED_METHODS for spec in benchmark_specs)
+
+
 def profile_runs_extended_sections(profile: str) -> bool:
     return normalize_profile(profile) == PROFILE_EXTENDED
 
@@ -2404,7 +2682,7 @@ OLTP_DEFAULT_BENCHMARKS = [
     ("Retrieve 100 IDs (projected SQL)", "bench_oltp_projected_retrieve_100"),
     ("SELECT 3 cols LIMIT 100", "bench_oltp_projected_limit_100"),
     ("String equality (projected)", "bench_oltp_projected_string_eq"),
-    ("City filter LIMIT 10", "bench_oltp_city_limit_10"),
+    ("City filter LIMIT 100", "bench_oltp_city_limit_10"),
     ("Insert 1 row (default fair)", "bench_oltp_insert_one"),
     ("Insert+Read own row", "bench_oltp_insert_read_own_row"),
     ("Insert+COUNT visible", "bench_oltp_insert_count_visible"),
@@ -2415,6 +2693,11 @@ OLTP_DEFAULT_BENCHMARKS = [
     ("Insert+DELETE by ID", "bench_oltp_insert_delete_by_id"),
     ("DELETE missing ID", "bench_oltp_delete_missing_id"),
 ]
+
+MICRO_MEDIAN_BENCHMARK_METHODS = {
+    method_name for _, method_name in OLTP_DEFAULT_BENCHMARKS
+}
+MICRO_MEDIAN_BENCHMARK_METHODS.add("bench_temp_csv_create_query")
 
 OLTP_APEX_DIAGNOSTIC_BENCHMARKS = [
     ("Insert 10 rows (small-batch API diagnostic)", "bench_oltp_insert_10_rows"),
@@ -2538,6 +2821,137 @@ def summarize_apex_section(benchmark_specs, results):
     }
 
 
+def geometric_mean_ms(values):
+    positives = [v for v in values if v is not None and v > 0]
+    if not positives:
+        return None
+    return math.exp(sum(math.log(v) for v in positives) / len(positives))
+
+
+def summarize_workload_group(group_name, metric_names, results, eng_names):
+    rows = []
+    for metric_name in metric_names:
+        metric_values = results.get(metric_name, {})
+        apex_ms = metric_values.get("ApexBase")
+        other_values = [
+            metric_values.get(eng_name)
+            for eng_name in eng_names
+            if eng_name != "ApexBase"
+        ]
+        if apex_ms is not None and any(value is not None for value in other_values):
+            rows.append((metric_name, {
+                eng_name: metric_values.get(eng_name)
+                for eng_name in eng_names
+            }))
+
+    totals = {}
+    geomeans = {}
+    for eng_name in eng_names:
+        values = [values.get(eng_name) for _, values in rows]
+        available = [value for value in values if value is not None]
+        totals[eng_name] = sum(available) if available and len(available) == len(rows) else None
+        geomeans[eng_name] = geometric_mean_ms(values)
+
+    apex_total = totals.get("ApexBase")
+    other_totals = [v for k, v in totals.items() if k != "ApexBase" and v is not None]
+    ratio_label = apex_ratio_label(apex_total, other_totals) if apex_total is not None else None
+
+    wins = ties = 0
+    for _, values in rows:
+        apex_ms = values.get("ApexBase")
+        others = [v for k, v in values.items() if k != "ApexBase" and v is not None]
+        if apex_ms is None or not others:
+            continue
+        best_other = min(others)
+        ratio = apex_ms / best_other if best_other > 0 else float("inf")
+        if abs(ratio - 1.0) < 1e-9:
+            ties += 1
+        elif ratio < 1:
+            wins += 1
+
+    return {
+        "workload": group_name,
+        "metric_count": len(rows),
+        "metrics": [metric_name for metric_name, _ in rows],
+        "total_ms": totals,
+        "geomean_ms": geomeans,
+        "apex_vs_best_total": ratio_label,
+        "apex_wins": wins,
+        "apex_ties": ties,
+        "apex_slower": len(rows) - wins - ties,
+    }
+
+
+def build_fair_workload_scoreboard(results, eng_names, selected_benchmarks):
+    selected_names = {spec[0] for spec in selected_benchmarks}
+    grouped_names = set()
+    scoreboard = []
+    for group_name, metric_names in FAIR_WORKLOAD_GROUPS:
+        names = [name for name in metric_names if name in selected_names]
+        if not names:
+            continue
+        grouped_names.update(names)
+        summary = summarize_workload_group(group_name, names, results, eng_names)
+        if summary["metric_count"] > 0:
+            scoreboard.append(summary)
+
+    uncategorized = [
+        spec[0] for spec in selected_benchmarks
+        if spec[0] not in grouped_names
+    ]
+    if uncategorized:
+        summary = summarize_workload_group("Other", uncategorized, results, eng_names)
+        if summary["metric_count"] > 0:
+            scoreboard.append(summary)
+    return scoreboard
+
+
+def print_fair_workload_scoreboard(results, eng_names, selected_benchmarks, col_width):
+    scoreboard = build_fair_workload_scoreboard(results, eng_names, selected_benchmarks)
+    if not scoreboard:
+        return []
+
+    print("\n--- Fair Workload Scoreboard (Aggregated) ---")
+    print("  Lower total is better. A row can compare ApexBase with any available peer; missing peers show N/A.")
+    name_width = max(24, *(len(row["workload"]) for row in scoreboard))
+    header = f"{'Workload':<{name_width}} | {'Metrics':>7}"
+    for eng_name in eng_names:
+        header += f" | {eng_name + ' total':>{col_width}}"
+    if "ApexBase" in eng_names and len(eng_names) >= 2:
+        header += f" | {'Apex/Best':>{col_width}} | {'Apex wins':>{10}}"
+    print(header)
+    print("-" * len(header))
+
+    json_rows = []
+    for summary in scoreboard:
+        row = f"{summary['workload']:<{name_width}} | {summary['metric_count']:>7}"
+        for eng_name in eng_names:
+            total_ms = summary["total_ms"].get(eng_name)
+            row += f" | {fmt_ms(total_ms) if total_ms is not None else 'N/A':>{col_width}}"
+        if "ApexBase" in eng_names and len(eng_names) >= 2:
+            ratio = summary.get("apex_vs_best_total") or "N/A"
+            row += f" | {ratio:>{col_width}} | {summary['apex_wins']:>3}/{summary['metric_count']:<6}"
+        print(row)
+        json_rows.append({
+            "workload": summary["workload"],
+            "metric_count": summary["metric_count"],
+            "metrics": summary["metrics"],
+            "total_ms": {
+                k: round(v, 3) if v is not None else None
+                for k, v in summary["total_ms"].items()
+            },
+            "geomean_ms": {
+                k: round(v, 6) if v is not None else None
+                for k, v in summary["geomean_ms"].items()
+            },
+            "apex_vs_best_total": summary["apex_vs_best_total"],
+            "apex_wins": summary["apex_wins"],
+            "apex_ties": summary["apex_ties"],
+            "apex_slower": summary["apex_slower"],
+        })
+    return json_rows
+
+
 def print_benchmark_section(title, description, benchmark_specs, results, eng_names, col_width):
     print(f"\n--- {title} ---")
     print(f"  {description}")
@@ -2592,8 +3006,7 @@ def module_metric_counts(profile: str = PROFILE_PUBLIC):
     if profile_runs_extended_sections(profile):
         olap_count += len(apex_materialization_queries({"point_lookup_id": 1})) + 2
         oltp_count += (
-            len(OLTP_DEFAULT_BENCHMARKS)
-            + len(OLTP_APEX_DIAGNOSTIC_BENCHMARKS)
+            len(OLTP_APEX_DIAGNOSTIC_BENCHMARKS)
             + len(OLTP_DURABLE_WRITE_BENCHMARKS)
             + len(TXN_FAIR_BENCHMARKS)
             + len(TXN_APEX_DIAGNOSTIC_BENCHMARKS)
@@ -3470,8 +3883,8 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
     olap_metric_count, oltp_metric_count, vector_metric_total = module_metric_counts(profile)
     print(f"\nDataset: {N:,} rows × 5 columns (name, age, score, city, category)")
     print(f"Warmup: {WARMUP} iterations, Timed: {ITERS} iterations (average)")
-    print(f"Profile: {profile} ({'README public scoreboard' if profile == PROFILE_PUBLIC else 'full diagnostics'})")
-    print("Fairness mode: default rankings use normal engine APIs and comparable result materialization.")
+    print(f"Profile: {profile} ({'fair workload scoreboard' if profile == PROFILE_PUBLIC else 'full diagnostics'})")
+    print("Fairness mode: default rankings use normal engine APIs, shared input data, and comparable materialized results.")
     print(
         f"Layout: OLAP, OLTP, and Vector Similarity modules; "
         f"{olap_metric_count + oltp_metric_count + vector_metric_total} named metrics configured "
@@ -3487,7 +3900,7 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
         )
         print(
             "Vector results are reported separately and do not change the "
-            f"{len(selected_benchmarks)}-metric default fair scoreboard."
+            f"{len(selected_benchmarks)}-metric tabular fair scoreboard."
         )
     if args.low_memory:
         print("Mode: LOW-MEMORY (ApexBase-only cache stress mode; not a cross-engine apples-to-apples setting)")
@@ -3501,12 +3914,12 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
     tmpdir = tempfile.mkdtemp(prefix="apexbase_bench_")
 
     csv_path = parquet_path = json_path = None
-    if profile_runs_extended_sections(profile):
+    if selected_benchmarks_need_files(selected_benchmarks) or profile_runs_extended_sections(profile):
         print("Generating benchmark files (CSV/Parquet/JSON)...", end=" ", flush=True)
         csv_path, parquet_path, json_path = generate_benchmark_files(tmpdir, data)
         print("done.")
     else:
-        print("Benchmark files: skipped for public profile.")
+        print("Benchmark files: skipped; no selected fair metric needs external files.")
     results = {}
     shared_inputs = build_shared_inputs(N)
 
@@ -3563,7 +3976,10 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
             elif is_warm_nogc:
                 # Warm cached backend, no gc
                 rss_before = measure_rss_mb()
-                ms = run_bench_nogc(fn, warmup=WARMUP, iterations=ITERS)
+                if method_name in MICRO_MEDIAN_BENCHMARK_METHODS:
+                    ms = run_bench_nogc_median(fn, warmup=WARMUP, iterations=ITERS)
+                else:
+                    ms = run_bench_nogc(fn, warmup=WARMUP, iterations=ITERS)
                 rss_after = measure_rss_mb()
                 results[bench_name][eng_name] = ms
                 if rss_before and rss_after:
@@ -3887,10 +4303,17 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
                         row += f" | {'N/A':>{col_width}}"
                 print(row)
 
+    fair_workload_scoreboard = print_fair_workload_scoreboard(
+        results,
+        eng_names,
+        selected_benchmarks,
+        col_width,
+    )
+
     if "ApexBase" in [n for n, _ in engines]:
         stats = summarize_apex_section(selected_benchmarks, results)
         print(
-            f"\nDefault Fair Summary: ApexBase wins {stats['wins']}/{stats['total']}, "
+            f"\nTabular Fair Detail Summary: ApexBase wins {stats['wins']}/{stats['total']}, "
             f"ties {stats['ties']}/{stats['total']}, slower {stats['slower']}/{stats['total']}"
         )
 
@@ -3990,6 +4413,7 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
                 "skip_vector": args.skip_vector,
             },
             "results": json_results,
+            "fair_workload_scoreboard": fair_workload_scoreboard,
             "vector_similarity": vector_results,
             "apexbase_materialization": materialization_results,
             "qps": qps_results,

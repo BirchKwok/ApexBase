@@ -18,6 +18,7 @@ import shutil
 from pathlib import Path
 import sys
 import os
+import importlib.util
 import numpy as np
 
 # Add the apexbase python module to path
@@ -46,6 +47,8 @@ try:
     PYARROW_AVAILABLE = True
 except ImportError:
     PYARROW_AVAILABLE = False
+
+LANCE_AVAILABLE = importlib.util.find_spec("lance") is not None
 
 
 @pytest.mark.skipif(not PANDAS_AVAILABLE, reason="Pandas not available")
@@ -433,7 +436,7 @@ class TestPyArrowConversions:
             assert "Charlie" in names
             
             client.close()
-    
+
     def test_to_arrow_basic(self):
         """Test basic to_arrow conversion"""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -540,6 +543,74 @@ class TestPyArrowConversions:
             assert isinstance(table_result, pa.Table)
             assert len(table_result) == 0
             
+            client.close()
+
+
+@pytest.mark.skipif(
+    not (PYARROW_AVAILABLE and LANCE_AVAILABLE),
+    reason="PyArrow and Lance are required",
+)
+class TestLanceConversions:
+    """Test Lance dataset conversions through Arrow."""
+
+    def test_to_lance_and_from_lance_roundtrip(self):
+        import lance
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=os.path.join(temp_dir, "apex"))
+            client.create_table(
+                "files",
+                {"name": "string", "age": "int64", "payload": "blob"},
+            )
+            payloads = [b"small", b"x" * 70000, None]
+            client.store(
+                {
+                    "name": ["Alice", "Bob", "Charlie"],
+                    "age": [25, 30, 35],
+                    "payload": payloads,
+                }
+            )
+
+            lance_path = os.path.join(temp_dir, "files.lance")
+            ds = client.to_lance(lance_path)
+            assert ds.count_rows() == 3
+
+            table = lance.dataset(lance_path).to_table()
+            assert table.column("name").to_pylist() == ["Alice", "Bob", "Charlie"]
+            assert table.column("payload").to_pylist() == payloads
+
+            imported = ApexClient(dirpath=os.path.join(temp_dir, "imported"))
+            imported.from_lance(lance_path, table_name="files", batch_size=2)
+            rows = imported.execute(
+                "SELECT name, age, payload FROM files ORDER BY age"
+            ).to_dict()
+            assert [row["name"] for row in rows] == ["Alice", "Bob", "Charlie"]
+            assert [row["payload"] for row in rows] == payloads
+
+            client.close()
+            imported.close()
+
+    def test_sql_result_to_lance_respects_projection(self):
+        import lance
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.store(
+                [
+                    {"name": "Alice", "age": 25, "city": "NYC"},
+                    {"name": "Bob", "age": 30, "city": "LA"},
+                ]
+            )
+
+            lance_path = os.path.join(temp_dir, "adults.lance")
+            result = client.execute("SELECT name, age FROM default WHERE age >= 30")
+            result.to_lance(lance_path)
+
+            table = lance.dataset(lance_path).to_table()
+            assert table.column_names == ["name", "age"]
+            assert table.to_pylist() == [{"name": "Bob", "age": 30}]
+
             client.close()
 
 

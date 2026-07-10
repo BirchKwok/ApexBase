@@ -444,10 +444,11 @@ where
 
 /// Evict least recently used entries from cache if over limit
 fn evict_lru_cache_entries() {
-    if STORAGE_CACHE.len() <= MAX_CACHE_ENTRIES {
+    let cache_len = STORAGE_CACHE.len();
+    if cache_len <= MAX_CACHE_ENTRIES {
         return;
     }
-    let entries_to_remove = STORAGE_CACHE.len() - MAX_CACHE_ENTRIES + 1;
+    let entries_to_remove = cache_len.saturating_sub(MAX_CACHE_ENTRIES) + 1;
     let mut access_times: Vec<(PathBuf, u64)> = STORAGE_CACHE
         .iter()
         .map(|entry| {
@@ -743,6 +744,11 @@ impl ZoneMap {
 /// CRITICAL: Must be called before any write operation to release mmap on Windows
 #[inline]
 pub fn invalidate_storage_cache(path: &Path) {
+    // Cache keys are the absolute table paths created by the Python binding.
+    // Keep invalidation O(1): this runs on every small write.  Scanning the
+    // whole cache and canonicalizing every entry turns ordinary inserts into
+    // filesystem-heavy operations, and matching by filename can evict an
+    // unrelated table with the same basename.
     STORAGE_CACHE.remove(path);
 }
 
