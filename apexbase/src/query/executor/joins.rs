@@ -7,10 +7,9 @@ impl ApexExecutor {
         base_dir: &Path,
         default_table_path: &Path,
     ) -> io::Result<ApexResult> {
-        // CBO: Reorder INNER JOINs by ascending right-table size (star join optimization).
-        // Only when ALL joins are INNER and each ON condition references only the FROM table
-        // and its own right table (no cross-JOIN column dependencies).
+        // CBO: choose a dependency-safe order for small INNER JOIN graphs.
         let joins = Self::maybe_reorder_joins(
+            &stmt.from,
             &stmt.joins,
             stmt.where_clause.as_ref(),
             base_dir,
@@ -833,17 +832,20 @@ impl ApexExecutor {
     }
 
     /// CBO: Reorder INNER JOIN clauses by ascending right-table row count.
-    /// Only applies when ALL joins are INNER and each ON condition is a simple
-    /// equality (star join pattern — no cross-JOIN column dependencies).
-    /// Returns the original order unchanged if reordering is unsafe.
+    /// For up to eight relations this uses a bounded subset-DP memo.  Larger
+    /// graphs intentionally keep their original order to avoid making planning
+    /// itself more expensive than execution.
     fn maybe_reorder_joins(
+        from: &Option<FromItem>,
         joins: &[JoinClause],
         where_clause: Option<&SqlExpr>,
         base_dir: &Path,
         default_table_path: &Path,
     ) -> Vec<JoinClause> {
-        // Need 2+ joins to benefit from reordering
-        if joins.len() < 2 {
+        // Two joins have only two possible orders; keep the original light
+        // path and reserve memo planning for graphs where it can pay back its
+        // own planning cost.
+        if joins.len() < 3 || where_clause.is_none() {
             return joins.to_vec();
         }
         // Only reorder if ALL joins are INNER (LEFT/RIGHT/FULL/CROSS are order-dependent)
@@ -856,78 +858,180 @@ impl ApexExecutor {
                 return joins.to_vec();
             }
         }
-        // Collect right-table row counts
-        let mut indexed: Vec<(usize, u64)> = Vec::with_capacity(joins.len());
-        for (i, j) in joins.iter().enumerate() {
-            let row_count = match &j.right {
-                FromItem::Table { table, alias } => {
-                    let path = Self::resolve_table_path(table, base_dir, default_table_path);
-                    let base_rows = get_cached_backend(&path)
-                        .map(|b| b.active_row_count() as f64)
-                        .unwrap_or(u64::MAX as f64);
-                    let source_names = {
-                        let mut names = vec![table.clone()];
-                        if let Some(alias) = alias {
-                            names.push(alias.clone());
-                        }
-                        names
-                    };
-                    let filtered_rows = where_clause
-                        .and_then(|expr| get_table_stats(&path.to_string_lossy()).map(|stats| {
-                            let selectivity = Self::estimate_local_selectivity(
-                                expr,
-                                &source_names,
-                                &stats,
-                            );
-                            base_rows * selectivity
-                        }))
-                        .unwrap_or(base_rows);
-                    filtered_rows.max(0.0).min(u64::MAX as f64) as u64
+        let Some(base_names) = Self::source_names(from) else {
+            return joins.to_vec();
+        };
+        if joins
+            .iter()
+            .any(|join| !matches!(&join.right, FromItem::Table { .. }))
+        {
+            return joins.to_vec();
+        }
+        if joins.len() > 8 {
+            return joins.to_vec();
+        }
+
+        #[derive(Clone)]
+        struct JoinEstimate {
+            names: Vec<String>,
+            rows: f64,
+            selectivity: f64,
+        }
+
+        let estimates: Vec<JoinEstimate> = joins
+            .iter()
+            .map(|join| {
+                let FromItem::Table { table, alias } = &join.right else {
+                    unreachable!()
+                };
+                let path = Self::resolve_table_path(table, base_dir, default_table_path);
+                let base_rows = get_cached_backend(&path)
+                    .map(|backend| backend.active_row_count() as f64)
+                    .unwrap_or(f64::MAX / 4.0);
+                let mut names = vec![table.clone()];
+                if let Some(alias) = alias {
+                    names.push(alias.clone());
                 }
-                _ => u64::MAX, // Subqueries: unknown size, keep original position
+                let rows = where_clause
+                    .and_then(|expr| get_table_stats(&path.to_string_lossy()).map(|stats| {
+                        base_rows * Self::estimate_local_selectivity(expr, &names, &stats)
+                    }))
+                    .unwrap_or(base_rows)
+                    .clamp(1.0, f64::MAX / 4.0);
+                let selectivity = Self::estimate_join_selectivity(join, &names, &path);
+                JoinEstimate {
+                    names,
+                    rows,
+                    selectivity,
+                }
+            })
+            .collect();
+
+        #[derive(Clone)]
+        struct JoinState {
+            cost: f64,
+            output_rows: f64,
+            order: Vec<usize>,
+            available: Vec<String>,
+        }
+
+        let state_count = 1usize << joins.len();
+        let full_mask = state_count - 1;
+        let base_rows = match from {
+            Some(FromItem::Table { table, .. }) => {
+                let path = Self::resolve_table_path(table, base_dir, default_table_path);
+                get_cached_backend(&path)
+                    .map(|backend| backend.active_row_count() as f64)
+                    .unwrap_or(1.0)
+            }
+            _ => 1.0,
+        };
+        let mut memo: Vec<Option<JoinState>> = vec![None; state_count];
+        memo[0] = Some(JoinState {
+            cost: 0.0,
+            output_rows: base_rows.max(1.0),
+            order: Vec::new(),
+            available: base_names,
+        });
+
+        for mask in 0..state_count {
+            let Some(state) = memo[mask].clone() else {
+                continue;
             };
-            indexed.push((i, row_count));
-        }
-        // Sort by ascending row count (smallest tables joined first)
-        indexed.sort_by_key(|&(_, rows)| rows);
-        let reordered: Vec<JoinClause> = indexed.iter().map(|&(i, _)| joins[i].clone()).collect();
-
-        // Validate column dependencies: each JOIN's ON clause left key must reference
-        // a column available from the FROM table or a previously-joined right table.
-        // If reordering breaks this (e.g., ON a.col = p.col where 'a' hasn't been joined yet),
-        // fall back to the original order.
-        let mut available_tables: Vec<String> = Vec::new();
-        // Add FROM table alias/name
-        // (We don't have the FROM here, but we can detect cross-table references in ON clauses)
-        for (idx, j) in reordered.iter().enumerate() {
-            if let Ok((left_key_full, _)) = Self::extract_join_keys_qualified(&j.on) {
-                // Check if the left key has a table qualifier that matches a right table
-                // that hasn't been joined yet in the reordered sequence
-                if let Some(dot_pos) = left_key_full.rfind('.') {
-                    let table_prefix = &left_key_full[..dot_pos];
-                    // Check if this table prefix matches any RIGHT table that comes AFTER this join
-                    let is_forward_ref =
-                        reordered[idx + 1..]
-                            .iter()
-                            .any(|future_j| match &future_j.right {
-                                FromItem::Table { table, alias, .. } => {
-                                    alias.as_deref().unwrap_or(table) == table_prefix
-                                }
-                                _ => false,
-                            });
-                    if is_forward_ref {
-                        // Reordering broke column dependency — fall back to original order
-                        return joins.to_vec();
-                    }
+            for index in 0..joins.len() {
+                let bit = 1usize << index;
+                if mask & bit != 0
+                    || !Self::join_can_follow(
+                        &joins[index].on,
+                        &state.available,
+                        &estimates[index].names,
+                    )
+                {
+                    continue;
+                }
+                let estimate = &estimates[index];
+                let output_rows = (state.output_rows * estimate.rows * estimate.selectivity)
+                    .clamp(1.0, f64::MAX / 4.0);
+                let next = JoinState {
+                    // Hash join work is dominated by the current probe side
+                    // and the new build side.  The output estimate makes the
+                    // memo prefer selective joins early.
+                    cost: state.cost + state.output_rows + estimate.rows + output_rows * 0.01,
+                    output_rows,
+                    order: {
+                        let mut order = state.order.clone();
+                        order.push(index);
+                        order
+                    },
+                    available: {
+                        let mut available = state.available.clone();
+                        available.extend(estimate.names.iter().cloned());
+                        available
+                    },
+                };
+                let replace = memo[mask | bit]
+                    .as_ref()
+                    .map(|current| next.cost < current.cost)
+                    .unwrap_or(true);
+                if replace {
+                    memo[mask | bit] = Some(next);
                 }
             }
-            // Track joined tables
-            if let FromItem::Table { table, alias, .. } = &j.right {
-                available_tables.push(alias.clone().unwrap_or_else(|| table.clone()));
-            }
         }
 
-        reordered
+        let Some(best) = memo[full_mask].as_ref() else {
+            return joins.to_vec();
+        };
+        best.order.iter().map(|&index| joins[index].clone()).collect()
+    }
+
+    fn join_can_follow(on: &SqlExpr, available: &[String], right: &[String]) -> bool {
+        let Ok((left_key, right_key)) = Self::extract_join_keys_qualified(on) else {
+            return false;
+        };
+        let mut has_right = false;
+        let mut has_available = false;
+        for key in [left_key, right_key] {
+            let Some((qualifier, _)) = key.rsplit_once('.') else {
+                has_right = true;
+                has_available = true;
+                continue;
+            };
+            if right.iter().any(|name| name == qualifier) {
+                has_right = true;
+            } else if available.iter().any(|name| name == qualifier) {
+                has_available = true;
+            } else {
+                return false;
+            }
+        }
+        has_right && has_available
+    }
+
+    fn estimate_join_selectivity(join: &JoinClause, right: &[String], path: &Path) -> f64 {
+        let Ok((left_key, right_key)) = Self::extract_join_keys_qualified(&join.on) else {
+            return 0.1;
+        };
+        let fallback_key = right_key.clone();
+        let right_column = [left_key, right_key]
+            .into_iter()
+            .find(|key| {
+                key.rsplit_once('.')
+                    .map(|(qualifier, _)| right.iter().any(|name| name == qualifier))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(fallback_key);
+        let column = right_column.rsplit('.').next().unwrap_or(&right_column);
+        get_table_stats(&path.to_string_lossy())
+            .and_then(|stats| stats.columns.get(column).map(|column| column.ndv))
+            .map(|ndv| {
+                if ndv > 0 {
+                    (1.0 / ndv as f64).clamp(0.000_001, 1.0)
+                } else {
+                    0.1
+                }
+            })
+            .unwrap_or(0.1)
     }
 
     fn estimate_local_selectivity(
@@ -2210,5 +2314,29 @@ impl ApexExecutor {
 
         // Fallback: create null array
         Ok(arrow::array::new_null_array(array.data_type(), len))
+    }
+}
+
+#[cfg(test)]
+mod join_optimizer_tests {
+    use super::*;
+
+    #[test]
+    fn join_order_requires_one_available_relation() {
+        let on = SqlExpr::BinaryOp {
+            left: Box::new(SqlExpr::Column("fact.customer_id".to_string())),
+            op: crate::query::sql_parser::BinaryOperator::Eq,
+            right: Box::new(SqlExpr::Column("customer.id".to_string())),
+        };
+        assert!(ApexExecutor::join_can_follow(
+            &on,
+            &["fact".to_string()],
+            &["customer".to_string()]
+        ));
+        assert!(!ApexExecutor::join_can_follow(
+            &on,
+            &["product".to_string()],
+            &["customer".to_string()]
+        ));
     }
 }

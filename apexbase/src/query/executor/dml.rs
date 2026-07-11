@@ -2727,6 +2727,9 @@ impl ApexExecutor {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
+            source_size: crate::query::planner::table_data_size(
+                &storage_path.to_string_lossy(),
+            ),
         };
         crate::query::planner::store_table_stats(&storage_path.to_string_lossy(), table_stats);
 

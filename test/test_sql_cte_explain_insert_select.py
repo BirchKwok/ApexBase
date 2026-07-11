@@ -124,6 +124,40 @@ class TestExplain:
         assert "Candidate:" in plan
         assert "stats=" in plan
 
+    def test_explain_cbo_candidate_invariants(self, db_with_data):
+        db_with_data.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_city_age ON users (city, age)"
+        )
+        result = db_with_data.execute(
+            "EXPLAIN SELECT name FROM users WHERE age = 30 AND city = 'NYC'"
+        )
+        plan = get_rows(result)[0][0]
+        assert "composite-index-scan(city,age)" in plan
+
+        db_with_data.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_age ON users (age) USING BTREE"
+        )
+        result = db_with_data.execute(
+            "EXPLAIN SELECT name FROM users WHERE age = 25 OR age = 30"
+        )
+        plan = get_rows(result)[0][0]
+        assert "index-scan(age)" not in plan
+        assert "index-range-scan(age)" not in plan
+
+        db_with_data.execute("ANALYZE users")
+        before = get_rows(
+            db_with_data.execute("EXPLAIN SELECT name FROM users WHERE age > 30")
+        )[0][0]
+        assert "stats=available" in before
+
+        db_with_data.execute(
+            "INSERT INTO users (name, age, city) VALUES ('Frank', 40, 'SF')"
+        )
+        after = get_rows(
+            db_with_data.execute("EXPLAIN SELECT name FROM users WHERE age > 30")
+        )[0][0]
+        assert "stats=default" in after
+
 
 # ========== INSERT...SELECT Tests ==========
 

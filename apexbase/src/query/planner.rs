@@ -80,6 +80,9 @@ pub struct TableStats {
     pub columns: HashMap<String, ColumnStats>,
     /// Timestamp when stats were collected (epoch millis)
     pub collected_at: u64,
+    /// Source table size when the statistics were collected.
+    #[serde(default)]
+    pub source_size: u64,
 }
 
 /// Global stats cache: table_path → TableStats
@@ -164,15 +167,39 @@ fn stats_sidecar_path(table_key: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.cbo_stats", table_key))
 }
 
+fn table_data_paths(table_key: &str) -> [std::path::PathBuf; 3] {
+    let base = std::path::PathBuf::from(table_key);
+    let name = base.file_name().unwrap_or_default().to_string_lossy();
+    let mut delta = base.clone();
+    delta.set_file_name(format!("{}.delta", name));
+    let mut delta_store = base.clone();
+    delta_store.set_file_name(format!("{}.deltastore", name));
+    [base, delta, delta_store]
+}
+
+pub fn table_data_size(table_key: &str) -> u64 {
+    table_data_paths(table_key)
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .fold(0u64, |size, metadata| size.saturating_add(metadata.len()))
+}
+
 fn stats_are_fresh(table_key: &str, stats: &TableStats) -> bool {
-    let Ok(modified) = std::fs::metadata(table_key).and_then(|meta| meta.modified()) else {
-        return true;
-    };
-    let modified_ms = modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    modified_ms <= stats.collected_at
+    let paths = table_data_paths(table_key);
+    if stats.source_size != 0 && table_data_size(table_key) != stats.source_size {
+        return false;
+    }
+    paths
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .filter_map(|metadata| metadata.modified().ok())
+        .all(|modified| {
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+                <= stats.collected_at
+        })
 }
 
 // ============================================================================
@@ -513,6 +540,8 @@ pub struct QueryCharacteristics {
     pub has_join: bool,
     /// Whether the query has subqueries
     pub has_subquery: bool,
+    /// Whether the predicate contains OR, which requires an index union plan.
+    pub has_disjunction: bool,
     /// Whether the query has LIMIT
     pub has_limit: bool,
     /// Whether the query filters on _id (primary key)
@@ -537,6 +566,7 @@ impl Default for QueryCharacteristics {
             has_order_by: false,
             has_join: false,
             has_subquery: false,
+            has_disjunction: false,
             has_limit: false,
             filters_on_pk: false,
             equality_filter_columns: Vec::new(),
@@ -731,7 +761,7 @@ impl QueryPlanner {
             cost: scan_cost,
         }];
 
-        if !context.mmap_only {
+        if !chars.has_disjunction {
             if let (Some(idx_mgr), Some(_where_expr)) = (index_manager, &select.where_clause) {
                 for col in &chars.equality_filter_columns {
                     if !idx_mgr.has_usable_index_for_predicate(col, false) {
@@ -776,14 +806,25 @@ impl QueryPlanner {
                     });
                 }
 
-                let equality_columns: Vec<String> = chars
-                    .equality_filter_columns
-                    .iter()
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>()
+                let composite_columns = idx_mgr
+                    .list_indexes()
                     .into_iter()
-                    .collect();
-                if idx_mgr.has_composite_index(&equality_columns) {
+                    .filter(|meta| meta.is_composite())
+                    .map(|meta| {
+                        meta.effective_columns()
+                            .iter()
+                            .map(|column| column.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .find(|columns| {
+                        columns.iter().all(|column| {
+                            chars
+                                .equality_filter_columns
+                                .iter()
+                                .any(|candidate| candidate == column)
+                        })
+                    });
+                if let Some(equality_columns) = composite_columns {
                     let mut cost = PlanCost::index_scan(row_count, selectivity);
                     cost.output_rows = output_rows;
                     candidates.push(PlanCandidate {
@@ -880,7 +921,8 @@ impl QueryPlanner {
                 match op {
                     BinaryOperator::Eq => {
                         let column = match (left.as_ref(), right.as_ref()) {
-                            (SqlExpr::Column(column), _) | (_, SqlExpr::Column(column)) => {
+                            (SqlExpr::Column(column), SqlExpr::Literal(_))
+                            | (SqlExpr::Literal(_), SqlExpr::Column(column)) => {
                                 Some(column)
                             }
                             _ => None,
@@ -898,7 +940,8 @@ impl QueryPlanner {
                     | BinaryOperator::Lt
                     | BinaryOperator::Le => {
                         let column = match (left.as_ref(), right.as_ref()) {
-                            (SqlExpr::Column(column), _) | (_, SqlExpr::Column(column)) => {
+                            (SqlExpr::Column(column), SqlExpr::Literal(_))
+                            | (SqlExpr::Literal(_), SqlExpr::Column(column)) => {
                                 Some(column)
                             }
                             _ => None,
@@ -915,6 +958,7 @@ impl QueryPlanner {
                     BinaryOperator::Or => {
                         Self::analyze_where(left, chars);
                         Self::analyze_where(right, chars);
+                        chars.has_disjunction = true;
                         chars.estimated_selectivity = (chars.estimated_selectivity * 2.0).min(1.0);
                     }
                     _ => {}
@@ -961,6 +1005,18 @@ impl QueryPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    use crate::data::DataType;
+    use crate::query::sql_parser::SqlParser;
+    use crate::storage::index::IndexType;
+
+    fn select_statement(sql: &str) -> SelectStatement {
+        match SqlParser::parse(sql).unwrap() {
+            SqlStatement::Select(select) => select,
+            _ => panic!("expected SELECT"),
+        }
+    }
 
     #[test]
     fn test_strategy_display() {
@@ -973,6 +1029,78 @@ mod tests {
         let chars = QueryCharacteristics::default();
         assert!(!chars.has_aggregation);
         assert!(!chars.has_group_by);
+        assert!(!chars.has_disjunction);
         assert_eq!(chars.estimated_selectivity, 1.0);
+    }
+
+    #[test]
+    fn stats_source_size_change_is_stale() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"before").unwrap();
+        let stats = TableStats {
+            row_count: 1,
+            columns: HashMap::new(),
+            collected_at: u64::MAX,
+            source_size: table_data_size(file.path().to_str().unwrap()),
+        };
+        assert!(stats_are_fresh(file.path().to_str().unwrap(), &stats));
+
+        file.write_all(b"-after").unwrap();
+        file.flush().unwrap();
+        assert!(!stats_are_fresh(file.path().to_str().unwrap(), &stats));
+    }
+
+    #[test]
+    fn composite_candidate_uses_declared_index_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut indexes = IndexManager::new("t", dir.path());
+        indexes
+            .create_index_multi(
+                "idx_city_age",
+                &["city".to_string(), "age".to_string()],
+                IndexType::Hash,
+                false,
+                DataType::String,
+            )
+            .unwrap();
+        let select = select_statement(
+            "SELECT name FROM t WHERE age = 30 AND city = 'NYC' AND name = 'alice'",
+        );
+
+        let plan = QueryPlanner::plan_select_with_stats(
+            &select,
+            Some(&indexes),
+            None,
+            PlannerContext { mmap_only: true },
+        );
+        assert!(plan
+            .candidates
+            .iter()
+            .any(|candidate| candidate.name == "composite-index-scan(city,age)"));
+    }
+
+    #[test]
+    fn or_does_not_offer_partial_index_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut indexes = IndexManager::new("t", dir.path());
+        indexes
+            .create_index(
+                "idx_age",
+                "age",
+                IndexType::BTree,
+                false,
+                DataType::Int64,
+            )
+            .unwrap();
+        let select = select_statement("SELECT name FROM t WHERE age = 25 OR age = 30");
+
+        let plan = QueryPlanner::plan_select_with_stats(
+            &select,
+            Some(&indexes),
+            None,
+            PlannerContext::default(),
+        );
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].name, "sequential-filtered-scan");
     }
 }
