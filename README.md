@@ -102,14 +102,14 @@ with ApexClient("./rag-data") as client:
 
 ## Performance At A Glance
 
-Latest local snapshot: **ApexBase 1.21.0**, 1M-row tabular dataset, 1M-vector dataset, Apple arm, Python 3.12.
+Latest local snapshot: **ApexBase 1.22.0**, 1M-row tabular dataset, 1M-vector dataset, Apple arm, Python 3.12.
 
 | Area | Snapshot |
 | --- | --- |
-| **Fair OLAP + OLTP comparison** | **72 public tabular metrics** tracked; OLAP is **45 / 45 wins** in the benchmark harness |
-| **GROUP BY** | **40.0x faster** than DuckDB in the representative snapshot |
-| **FTS search** | **35.6x faster** than SQLite in the representative snapshot |
-| **Batch vector TopK cosine** | **13.9x faster** than DuckDB in the representative snapshot |
+| **Fair OLAP + OLTP comparison** | **72 public tabular metrics** tracked; ApexBase wins **71 / 72** in the benchmark harness |
+| **GROUP BY city** | **2.3x faster** than DuckDB in the representative snapshot |
+| **FTS search** | **170.2x faster** than SQLite in the representative snapshot |
+| **Batch vector TopK cosine** | **10.7x faster** than DuckDB in the representative snapshot |
 
 Benchmarks are workload-sensitive. The default benchmark command tracks this public scoreboard; extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`. See the full reproducible setup in the [Performance documentation](https://birchkwok.github.io/ApexBase/latest/performance/).
 

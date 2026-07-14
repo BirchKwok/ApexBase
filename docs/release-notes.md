@@ -5,11 +5,27 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 
 ## Unreleased
 
+- No unreleased changes recorded yet. New features and fixes will be listed here before the next public release.
+
+---
+
+## [v1.22.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.22.0)
+*2026-07-14*
+
+[Compare with v1.21.0](https://github.com/BirchKwok/ApexBase/compare/v1.21.0...v1.22.0)
+
 - Add Lance dataset import/export helpers: `ApexClient.from_lance`, `ApexClient.to_lance`, and `ResultView.to_lance`
 - Route Lance interoperability through Arrow tables for a lean in-process handoff while preserving ApexBase and Lance on-disk formats
+- Add cost-based SELECT planning with executable candidate details, cardinality feedback, residual-predicate preservation, bounded join planning, and richer `EXPLAIN` timing and cost visibility
+- Strengthen index and statistics correctness with generation-aware sidecars, typed composite keys, composite-prefix and range access, AND intersection, OR union, covering-index costs, Zone Map costs, and controlled row-id materialization
+- Expand Hive-style user behavior benchmark coverage with 360-degree, complex, most-complex, and syntax-torture workloads plus DuckDB and SQLite equivalents
+- Improve aggregation, DML, expression, join, window, mmap, and embedded execution paths for complex SQL and indexed workloads, with broader regression coverage for edge cases
+- Refine memory-efficient public APIs and add Python and Rust memory benchmarks for internal and embedded access paths
 - Expand the public benchmark scoreboard with 18 common OLTP microbenchmarks covering direct row counts, point reads, missing-row lookups, small projected reads, single-row writes, update/delete-by-id paths, and read-your-write checks
 - Expand the public OLAP benchmark scoreboard with category/grouped ordering, HAVING, ascending TopK, distinct-count, JSON group-by, and filtered city aggregation metrics
 - Reuse global string dictionary caches for filtered string aggregations so predicates such as `city = 'Beijing'` can aggregate numeric columns without reparsing the filter column
+- Refresh README branding and performance snapshot documentation
+- Update the Rust crate and Python package version metadata to 1.22.0
 
 ---
 
