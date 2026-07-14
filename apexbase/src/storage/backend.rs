@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -28,9 +29,53 @@ use crate::table::column_table::{BitVec, TypedColumn};
 
 /// Global string dictionary cache keyed by (file_path, column_name).
 /// Invalidated by file modification time.
+const GLOBAL_DICT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const GLOBAL_DICT_CACHE_MAX_ENTRIES: usize = 64;
+
+struct GlobalDictCacheEntry {
+    modified_time: SystemTime,
+    data: Arc<(Vec<String>, Vec<u16>)>,
+    bytes: usize,
+    last_access: AtomicU64,
+}
+
 static GLOBAL_DICT_CACHE: once_cell::sync::Lazy<
-    RwLock<HashMap<(PathBuf, String), (SystemTime, Arc<(Vec<String>, Vec<u16>)>)>>,
+    RwLock<HashMap<(PathBuf, String), GlobalDictCacheEntry>>,
 > = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
+static GLOBAL_DICT_CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_DICT_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
+
+fn global_dict_entry_bytes(key: &(PathBuf, String), data: &(Vec<String>, Vec<u16>)) -> usize {
+    key.0.as_os_str().len()
+        + key.1.capacity()
+        + data.0.capacity() * std::mem::size_of::<String>()
+        + data.0.iter().map(|value| value.capacity()).sum::<usize>()
+        + data.1.capacity() * std::mem::size_of::<u16>()
+}
+
+fn evict_global_dict_cache(
+    cache: &mut HashMap<(PathBuf, String), GlobalDictCacheEntry>,
+    current_bytes: &mut usize,
+    incoming_bytes: usize,
+    max_bytes: usize,
+    max_entries: usize,
+) {
+    while !cache.is_empty()
+        && (current_bytes.saturating_add(incoming_bytes) > max_bytes
+            || cache.len() >= max_entries)
+    {
+        let Some(key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access.load(Ordering::Relaxed))
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        if let Some(entry) = cache.remove(&key) {
+            *current_bytes = current_bytes.saturating_sub(entry.bytes);
+        }
+    }
+}
 
 type FirstStringRowIdCache = ahash::AHashMap<Box<str>, u64>;
 
@@ -48,9 +93,13 @@ pub fn get_global_dict_cache(
     // Check cache
     {
         let cache = GLOBAL_DICT_CACHE.read();
-        if let Some((cached_mtime, data)) = cache.get(&key) {
-            if *cached_mtime >= mtime {
-                return Ok(Some(Arc::clone(data)));
+        if let Some(entry) = cache.get(&key) {
+            if entry.modified_time >= mtime {
+                entry.last_access.store(
+                    GLOBAL_DICT_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                return Ok(Some(Arc::clone(&entry.data)));
             }
         }
     }
@@ -59,7 +108,31 @@ pub fn get_global_dict_cache(
     if let Some((dict_strings, group_ids)) = storage.build_string_dict_cache(col_name)? {
         let data = Arc::new((dict_strings, group_ids));
         let mut cache = GLOBAL_DICT_CACHE.write();
-        cache.insert(key, (mtime, Arc::clone(&data)));
+        let mut current_bytes = GLOBAL_DICT_CACHE_BYTES.load(Ordering::Relaxed);
+        if let Some(replaced) = cache.remove(&key) {
+            current_bytes = current_bytes.saturating_sub(replaced.bytes);
+        }
+        let bytes = global_dict_entry_bytes(&key, &data);
+        evict_global_dict_cache(
+            &mut cache,
+            &mut current_bytes,
+            bytes,
+            GLOBAL_DICT_CACHE_MAX_BYTES,
+            GLOBAL_DICT_CACHE_MAX_ENTRIES,
+        );
+        current_bytes = current_bytes.saturating_add(bytes);
+        cache.insert(
+            key,
+            GlobalDictCacheEntry {
+                modified_time: mtime,
+                data: Arc::clone(&data),
+                bytes,
+                last_access: AtomicU64::new(
+                    GLOBAL_DICT_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed),
+                ),
+            },
+        );
+        GLOBAL_DICT_CACHE_BYTES.store(current_bytes, Ordering::Relaxed);
         Ok(Some(data))
     } else {
         Ok(None)
@@ -75,7 +148,15 @@ pub fn invalidate_global_dict_cache(path: &Path) {
     // Entries are inserted with the same absolute table path used by the
     // backend, so exact-key invalidation is sufficient and avoids a
     // canonicalize/retain scan on every write.
-    cache.retain(|(p, _), _| p != path);
+    let mut current_bytes = GLOBAL_DICT_CACHE_BYTES.load(Ordering::Relaxed);
+    cache.retain(|(p, _), entry| {
+        let keep = p != path;
+        if !keep {
+            current_bytes = current_bytes.saturating_sub(entry.bytes);
+        }
+        keep
+    });
+    GLOBAL_DICT_CACHE_BYTES.store(current_bytes, Ordering::Relaxed);
 }
 
 // ============================================================================
@@ -564,30 +645,10 @@ impl TableStorageBackend {
     /// Insert rows to delta file (memory efficient - doesn't load existing column data)
     /// Auto-compacts when delta exceeds threshold
     pub fn insert_rows_to_delta(&self, rows: &[HashMap<String, Value>]) -> io::Result<Vec<u64>> {
-        let converted: Vec<HashMap<String, ColumnValue>> = rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|(k, v)| {
-                        let cv = match v {
-                            Value::Int64(i) => ColumnValue::Int64(*i),
-                            Value::Timestamp(t) => ColumnValue::Int64(*t),
-                            Value::Date(d) => ColumnValue::Int64(*d as i64),
-                            Value::Float64(f) => ColumnValue::Float64(*f),
-                            Value::String(s) => ColumnValue::String(s.clone()),
-                            Value::Bool(b) => ColumnValue::Bool(*b),
-                            Value::Binary(b) => ColumnValue::Binary(b.clone()),
-                            Value::Blob(b) => ColumnValue::Blob(b.clone()),
-                            Value::FixedList(b) => ColumnValue::FixedList(b.clone()),
-                            _ => ColumnValue::Null,
-                        };
-                        (k.clone(), cv)
-                    })
-                    .collect()
-            })
-            .collect();
+        let ids = self.storage.insert_value_rows_to_delta(rows)?;
 
-        self.insert_column_rows_to_delta(&converted)
+        self.update_delta_compaction_state(&ids);
+        Ok(ids)
     }
 
     pub fn insert_column_rows_to_delta(
@@ -596,13 +657,18 @@ impl TableStorageBackend {
     ) -> io::Result<Vec<u64>> {
         let ids = self.storage.insert_rows_to_delta(rows)?;
 
+        self.update_delta_compaction_state(&ids);
+        Ok(ids)
+    }
+
+    fn update_delta_compaction_state(&self, ids: &[u64]) {
         // Auto-compact if delta file is too large (> 10MB or > 100K rows)
         const DELTA_SIZE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
         const DELTA_ROWS_THRESHOLD: usize = 100_000;
 
         if ids.len() >= DELTA_ROWS_THRESHOLD {
             *self.dirty.write() = true;
-            return Ok(ids);
+            return;
         }
 
         if ids.len() > 1 {
@@ -612,8 +678,6 @@ impl TableStorageBackend {
                 *self.dirty.write() = true;
             }
         }
-
-        Ok(ids)
     }
 
     /// Get delta file path
@@ -835,75 +899,15 @@ impl TableStorageBackend {
     // Write APIs
     // ========================================================================
 
-    /// Insert rows (updates cache and marks dirty)
-    /// Optimized with parallel conversion for large batches
+    /// Insert rows (updates cache and marks dirty).
+    /// Values are borrowed until they are copied once into typed columns.
     pub fn insert_rows(&self, rows: &[HashMap<String, Value>]) -> io::Result<Vec<u64>> {
-        use crate::storage::on_demand::ColumnValue;
-        use rayon::prelude::*;
-
         if rows.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Convert to ColumnValue format - use parallel for large batches
-        let converted: Vec<HashMap<String, ColumnValue>> = if rows.len() > 1000 {
-            rows.par_iter()
-                .map(|row| {
-                    row.iter()
-                        .map(|(k, v)| {
-                            let cv = match v {
-                                Value::Int64(i) => ColumnValue::Int64(*i),
-                                Value::Int32(i) => ColumnValue::Int64(*i as i64),
-                                Value::Timestamp(t) => ColumnValue::Int64(*t),
-                                Value::Date(d) => ColumnValue::Int64(*d as i64),
-                                Value::Float64(f) => ColumnValue::Float64(*f),
-                                Value::Float32(f) => ColumnValue::Float64(*f as f64),
-                                Value::String(s) => ColumnValue::String(s.clone()),
-                                Value::Bool(b) => ColumnValue::Bool(*b),
-                                Value::Binary(b) => ColumnValue::Binary(b.clone()),
-                                Value::Blob(b) => ColumnValue::Blob(b.clone()),
-                                Value::FixedList(b) => ColumnValue::FixedList(b.clone()),
-                                Value::Null => ColumnValue::Null,
-                                _ => ColumnValue::String(
-                                    serde_json::to_string(v).unwrap_or_default(),
-                                ),
-                            };
-                            (k.clone(), cv)
-                        })
-                        .collect()
-                })
-                .collect()
-        } else {
-            rows.iter()
-                .map(|row| {
-                    row.iter()
-                        .map(|(k, v)| {
-                            let cv = match v {
-                                Value::Int64(i) => ColumnValue::Int64(*i),
-                                Value::Int32(i) => ColumnValue::Int64(*i as i64),
-                                Value::Timestamp(t) => ColumnValue::Int64(*t),
-                                Value::Date(d) => ColumnValue::Int64(*d as i64),
-                                Value::Float64(f) => ColumnValue::Float64(*f),
-                                Value::Float32(f) => ColumnValue::Float64(*f as f64),
-                                Value::String(s) => ColumnValue::String(s.clone()),
-                                Value::Bool(b) => ColumnValue::Bool(*b),
-                                Value::Binary(b) => ColumnValue::Binary(b.clone()),
-                                Value::Blob(b) => ColumnValue::Blob(b.clone()),
-                                Value::FixedList(b) => ColumnValue::FixedList(b.clone()),
-                                Value::Null => ColumnValue::Null,
-                                _ => ColumnValue::String(
-                                    serde_json::to_string(v).unwrap_or_default(),
-                                ),
-                            };
-                            (k.clone(), cv)
-                        })
-                        .collect()
-                })
-                .collect()
-        };
-
         // Insert into storage
-        let ids = self.storage.insert_rows(&converted)?;
+        let ids = self.storage.insert_value_rows(rows)?;
 
         // Update schema if new columns (only check first row for perf)
         {
@@ -1130,52 +1134,70 @@ impl TableStorageBackend {
         bool_columns: HashMap<String, Vec<bool>>,
         null_positions: HashMap<String, Vec<bool>>,
     ) -> io::Result<Vec<u64>> {
+        // Preserve only the small schema metadata before moving the potentially
+        // large column buffers into storage. Cloning every input map here used
+        // to double the live payload for all typed/Arrow bulk inserts.
+        let mut inserted_schema = Vec::with_capacity(
+            int_columns.len()
+                + float_columns.len()
+                + string_columns.len()
+                + binary_columns.len()
+                + fixedlist_columns.len()
+                + blob_columns.len()
+                + bool_columns.len(),
+        );
+        inserted_schema.extend(
+            int_columns
+                .keys()
+                .map(|name| (name.clone(), crate::data::DataType::Int64)),
+        );
+        inserted_schema.extend(
+            float_columns
+                .keys()
+                .map(|name| (name.clone(), crate::data::DataType::Float64)),
+        );
+        inserted_schema.extend(
+            string_columns
+                .keys()
+                .map(|name| (name.clone(), crate::data::DataType::String)),
+        );
+        inserted_schema.extend(
+            binary_columns
+                .keys()
+                .map(|name| (name.clone(), crate::data::DataType::Binary)),
+        );
+        inserted_schema.extend(
+            fixedlist_columns
+                .keys()
+                .map(|name| (name.clone(), crate::data::DataType::Binary)),
+        );
+        inserted_schema.extend(
+            blob_columns
+                .keys()
+                .map(|name| (name.clone(), crate::data::DataType::Blob)),
+        );
+        inserted_schema.extend(
+            bool_columns
+                .keys()
+                .map(|name| (name.clone(), crate::data::DataType::Bool)),
+        );
+
         let ids = self.storage.insert_typed_with_nulls_full_with_blobs(
-            int_columns.clone(),
-            float_columns.clone(),
-            string_columns.clone(),
-            binary_columns.clone(),
-            fixedlist_columns.clone(),
-            blob_columns.clone(),
-            bool_columns.clone(),
+            int_columns,
+            float_columns,
+            string_columns,
+            binary_columns,
+            fixedlist_columns,
+            blob_columns,
+            bool_columns,
             null_positions,
         )?;
 
         {
             let mut schema = self.schema.write();
-            for name in int_columns.keys() {
-                if !schema.iter().any(|(n, _)| n == name) {
-                    schema.push((name.clone(), crate::data::DataType::Int64));
-                }
-            }
-            for name in float_columns.keys() {
-                if !schema.iter().any(|(n, _)| n == name) {
-                    schema.push((name.clone(), crate::data::DataType::Float64));
-                }
-            }
-            for name in string_columns.keys() {
-                if !schema.iter().any(|(n, _)| n == name) {
-                    schema.push((name.clone(), crate::data::DataType::String));
-                }
-            }
-            for name in binary_columns.keys() {
-                if !schema.iter().any(|(n, _)| n == name) {
-                    schema.push((name.clone(), crate::data::DataType::Binary));
-                }
-            }
-            for name in fixedlist_columns.keys() {
-                if !schema.iter().any(|(n, _)| n == name) {
-                    schema.push((name.clone(), crate::data::DataType::Binary));
-                }
-            }
-            for name in blob_columns.keys() {
-                if !schema.iter().any(|(n, _)| n == name) {
-                    schema.push((name.clone(), crate::data::DataType::Blob));
-                }
-            }
-            for name in bool_columns.keys() {
-                if !schema.iter().any(|(n, _)| n == name) {
-                    schema.push((name.clone(), crate::data::DataType::Bool));
+            for (name, data_type) in inserted_schema {
+                if !schema.iter().any(|(existing, _)| existing == &name) {
+                    schema.push((name, data_type));
                 }
             }
         }
@@ -4581,6 +4603,36 @@ impl StorageManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn test_dict_entry(bytes: usize, access: u64) -> GlobalDictCacheEntry {
+        GlobalDictCacheEntry {
+            modified_time: SystemTime::UNIX_EPOCH,
+            data: Arc::new((Vec::new(), Vec::new())),
+            bytes,
+            last_access: AtomicU64::new(access),
+        }
+    }
+
+    #[test]
+    fn test_global_dict_cache_evicts_lru_by_byte_budget() {
+        let mut cache = HashMap::from([
+            (
+                (PathBuf::from("old.apex"), "value".to_string()),
+                test_dict_entry(4, 1),
+            ),
+            (
+                (PathBuf::from("hot.apex"), "value".to_string()),
+                test_dict_entry(4, 2),
+            ),
+        ]);
+        let mut bytes = 8;
+
+        evict_global_dict_cache(&mut cache, &mut bytes, 4, 8, 8);
+
+        assert_eq!(bytes, 4);
+        assert!(!cache.contains_key(&(PathBuf::from("old.apex"), "value".to_string())));
+        assert!(cache.contains_key(&(PathBuf::from("hot.apex"), "value".to_string())));
+    }
 
     #[test]
     fn test_backend_bool_null() {

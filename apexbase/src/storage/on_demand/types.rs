@@ -104,6 +104,110 @@ pub enum ColumnValue {
     FixedList(Vec<u8>),
 }
 
+/// Allocation-free view used while columnarizing row-oriented inputs.
+///
+/// `TableStorageBackend` accepts `crate::data::Value`, while the storage layer
+/// also exposes the compatibility `ColumnValue` API. Keeping both inputs as a
+/// borrowed view avoids materializing an intermediate owned row batch before
+/// the values are copied once into their final column buffers.
+pub(crate) enum ColumnValueRef<'a> {
+    Null,
+    Bool(bool),
+    Int64(i64),
+    Float64(f64),
+    String(std::borrow::Cow<'a, str>),
+    Binary(&'a [u8]),
+    Blob(&'a [u8]),
+    FixedList(&'a [u8]),
+}
+
+pub(crate) trait AsColumnValueRef {
+    fn as_column_value_ref(&self) -> ColumnValueRef<'_>;
+
+    #[inline]
+    fn as_delta_column_value_ref(&self) -> ColumnValueRef<'_> {
+        self.as_column_value_ref()
+    }
+
+    fn to_owned_column_value(&self) -> ColumnValue {
+        match self.as_column_value_ref() {
+            ColumnValueRef::Null => ColumnValue::Null,
+            ColumnValueRef::Bool(value) => ColumnValue::Bool(value),
+            ColumnValueRef::Int64(value) => ColumnValue::Int64(value),
+            ColumnValueRef::Float64(value) => ColumnValue::Float64(value),
+            ColumnValueRef::String(value) => ColumnValue::String(value.into_owned()),
+            ColumnValueRef::Binary(value) => ColumnValue::Binary(value.to_vec()),
+            ColumnValueRef::Blob(value) => ColumnValue::Blob(value.to_vec()),
+            ColumnValueRef::FixedList(value) => ColumnValue::FixedList(value.to_vec()),
+        }
+    }
+}
+
+impl AsColumnValueRef for ColumnValue {
+    #[inline]
+    fn as_column_value_ref(&self) -> ColumnValueRef<'_> {
+        match self {
+            ColumnValue::Null => ColumnValueRef::Null,
+            ColumnValue::Bool(value) => ColumnValueRef::Bool(*value),
+            ColumnValue::Int64(value) => ColumnValueRef::Int64(*value),
+            ColumnValue::Float64(value) => ColumnValueRef::Float64(*value),
+            ColumnValue::String(value) => {
+                ColumnValueRef::String(std::borrow::Cow::Borrowed(value))
+            }
+            ColumnValue::Binary(value) => ColumnValueRef::Binary(value),
+            ColumnValue::Blob(value) => ColumnValueRef::Blob(value),
+            ColumnValue::FixedList(value) => ColumnValueRef::FixedList(value),
+        }
+    }
+}
+
+impl AsColumnValueRef for crate::data::Value {
+    #[inline]
+    fn as_column_value_ref(&self) -> ColumnValueRef<'_> {
+        use crate::data::Value;
+
+        match self {
+            Value::Null => ColumnValueRef::Null,
+            Value::Bool(value) => ColumnValueRef::Bool(*value),
+            Value::Int64(value) | Value::Timestamp(value) => ColumnValueRef::Int64(*value),
+            Value::Int32(value) | Value::Date(value) => ColumnValueRef::Int64(*value as i64),
+            Value::Float64(value) => ColumnValueRef::Float64(*value),
+            Value::Float32(value) => ColumnValueRef::Float64(*value as f64),
+            Value::String(value) => {
+                ColumnValueRef::String(std::borrow::Cow::Borrowed(value))
+            }
+            Value::Binary(value) => ColumnValueRef::Binary(value),
+            Value::Blob(value) => ColumnValueRef::Blob(value),
+            Value::FixedList(value) => ColumnValueRef::FixedList(value),
+            // Preserve the existing compatibility behavior for uncommon
+            // scalar/JSON/array values by storing their serialized form.
+            value => ColumnValueRef::String(std::borrow::Cow::Owned(
+                serde_json::to_string(value).unwrap_or_default(),
+            )),
+        }
+    }
+
+    #[inline]
+    fn as_delta_column_value_ref(&self) -> ColumnValueRef<'_> {
+        use crate::data::Value;
+
+        match self {
+            Value::Null => ColumnValueRef::Null,
+            Value::Bool(value) => ColumnValueRef::Bool(*value),
+            Value::Int64(value) | Value::Timestamp(value) => ColumnValueRef::Int64(*value),
+            Value::Date(value) => ColumnValueRef::Int64(*value as i64),
+            Value::Float64(value) => ColumnValueRef::Float64(*value),
+            Value::String(value) => {
+                ColumnValueRef::String(std::borrow::Cow::Borrowed(value))
+            }
+            Value::Binary(value) => ColumnValueRef::Binary(value),
+            Value::Blob(value) => ColumnValueRef::Blob(value),
+            Value::FixedList(value) => ColumnValueRef::FixedList(value),
+            _ => ColumnValueRef::Null,
+        }
+    }
+}
+
 /// Borrowed values for a schema-stable single-row append hot path.
 pub enum SchemaStableValue<'a> {
     Bool(bool),

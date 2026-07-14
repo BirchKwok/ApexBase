@@ -51,11 +51,14 @@ pub enum DurabilityLevel {
 impl DurabilityLevel {
     /// Parse from string (case-insensitive)
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "fast" => Some(DurabilityLevel::Fast),
-            "safe" => Some(DurabilityLevel::Safe),
-            "max" => Some(DurabilityLevel::Max),
-            _ => None,
+        if s.eq_ignore_ascii_case("fast") {
+            Some(DurabilityLevel::Fast)
+        } else if s.eq_ignore_ascii_case("safe") {
+            Some(DurabilityLevel::Safe)
+        } else if s.eq_ignore_ascii_case("max") {
+            Some(DurabilityLevel::Max)
+        } else {
+            None
         }
     }
 

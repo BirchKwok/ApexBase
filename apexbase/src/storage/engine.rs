@@ -508,9 +508,8 @@ impl StorageEngine {
                     // Non-V4 with data: check schema match for delta
                     if cached.row_count > 0 {
                         let use_delta = rows.iter().all(|row| {
-                            let data_cols: std::collections::HashSet<_> =
-                                row.keys().cloned().collect();
-                            cached.columns == data_cols
+                            row.len() == cached.columns.len()
+                                && row.keys().all(|name| cached.columns.contains(name))
                         });
                         return (use_delta, false);
                     }
@@ -570,8 +569,7 @@ impl StorageEngine {
         }
 
         let use_delta = rows.iter().all(|row| {
-            let data_cols: std::collections::HashSet<_> = row.keys().cloned().collect();
-            schema_cols == data_cols
+            row.len() == schema_cols.len() && row.keys().all(|name| schema_cols.contains(name))
         });
         (use_delta, false)
     }
@@ -847,8 +845,8 @@ impl StorageEngine {
     pub fn write_typed(
         &self,
         table_path: &Path,
-        int_columns: HashMap<String, Vec<i64>>,
-        float_columns: HashMap<String, Vec<f64>>,
+        mut int_columns: HashMap<String, Vec<i64>>,
+        mut float_columns: HashMap<String, Vec<f64>>,
         string_columns: HashMap<String, Vec<String>>,
         mut binary_columns: HashMap<String, Vec<Vec<u8>>>,
         fixedlist_columns: HashMap<String, Vec<Vec<u8>>>,
@@ -912,13 +910,15 @@ impl StorageEngine {
                                 let mut new_columns: Vec<ColumnData> =
                                     Vec::with_capacity(schema.len());
                                 let mut new_nulls: Vec<Vec<u8>> = Vec::with_capacity(schema.len());
+                                let mut moved_int_columns = Vec::new();
+                                let mut moved_float_columns = Vec::new();
 
                                 // Allocate IDs
                                 let start_id = storage.next_id_value();
                                 let ids: Vec<u64> =
                                     (start_id..start_id + row_count as u64).collect();
 
-                                for (col_name, col_type) in &schema {
+                                for (schema_idx, (col_name, col_type)) in schema.iter().enumerate() {
                                     // Build null bitmap
                                     let null_bitmap =
                                         if let Some(null_vec) = null_positions.get(col_name) {
@@ -949,17 +949,24 @@ impl StorageEngine {
                                         | ColumnType::UInt64
                                         | ColumnType::Timestamp
                                         | ColumnType::Date => {
-                                            let vals = int_columns
-                                                .get(col_name)
-                                                .cloned()
-                                                .unwrap_or_else(|| vec![0; row_count]);
+                                            let vals = if let Some(vals) = int_columns.remove(col_name)
+                                            {
+                                                moved_int_columns.push(schema_idx);
+                                                vals
+                                            } else {
+                                                vec![0; row_count]
+                                            };
                                             new_columns.push(ColumnData::Int64(vals));
                                         }
                                         ColumnType::Float64 | ColumnType::Float32 => {
-                                            let vals = float_columns
-                                                .get(col_name)
-                                                .cloned()
-                                                .unwrap_or_else(|| vec![0.0; row_count]);
+                                            let vals = if let Some(vals) =
+                                                float_columns.remove(col_name)
+                                            {
+                                                moved_float_columns.push(schema_idx);
+                                                vals
+                                            } else {
+                                                vec![0.0; row_count]
+                                            };
                                             new_columns.push(ColumnData::Float64(vals));
                                         }
                                         ColumnType::String
@@ -1097,7 +1104,29 @@ impl StorageEngine {
                                         return Ok(ids);
                                     }
                                     Err(_) => {
-                                        // Fall through to full write
+                                        // Recover moved inputs before falling through to the
+                                        // full-write path. Append failures are rare, so keep
+                                        // recovery off the successful hot path.
+                                        for schema_idx in moved_int_columns {
+                                            if let ColumnData::Int64(values) =
+                                                &mut new_columns[schema_idx]
+                                            {
+                                                int_columns.insert(
+                                                    schema[schema_idx].0.clone(),
+                                                    std::mem::take(values),
+                                                );
+                                            }
+                                        }
+                                        for schema_idx in moved_float_columns {
+                                            if let ColumnData::Float64(values) =
+                                                &mut new_columns[schema_idx]
+                                            {
+                                                float_columns.insert(
+                                                    schema[schema_idx].0.clone(),
+                                                    std::mem::take(values),
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }

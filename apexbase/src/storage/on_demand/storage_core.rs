@@ -1650,6 +1650,22 @@ impl OnDemandStorage {
         &self,
         rows: &[HashMap<String, ColumnValue>],
     ) -> io::Result<Vec<u64>> {
+        self.insert_rows_to_delta_impl(rows)
+    }
+
+    /// Delta counterpart to `insert_value_rows`: borrow facade values until
+    /// they are copied into the final column buffers written to disk.
+    pub(crate) fn insert_value_rows_to_delta(
+        &self,
+        rows: &[HashMap<String, crate::data::Value>],
+    ) -> io::Result<Vec<u64>> {
+        self.insert_rows_to_delta_impl(rows)
+    }
+
+    fn insert_rows_to_delta_impl<V: AsColumnValueRef>(
+        &self,
+        rows: &[HashMap<String, V>],
+    ) -> io::Result<Vec<u64>> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -1728,8 +1744,8 @@ impl OnDemandStorage {
                     | ColumnType::Date => {
                         let v = val
                             .and_then(|v| {
-                                if let ColumnValue::Int64(n) = v {
-                                    Some(*n)
+                                if let ColumnValueRef::Int64(n) = v.as_delta_column_value_ref() {
+                                    Some(n)
                                 } else {
                                     None
                                 }
@@ -1740,8 +1756,8 @@ impl OnDemandStorage {
                     ColumnType::Float64 | ColumnType::Float32 => {
                         let v = val
                             .and_then(|v| {
-                                if let ColumnValue::Float64(n) = v {
-                                    Some(*n)
+                                if let ColumnValueRef::Float64(n) = v.as_delta_column_value_ref() {
+                                    Some(n)
                                 } else {
                                     None
                                 }
@@ -1752,8 +1768,8 @@ impl OnDemandStorage {
                     ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
                         let v = val
                             .and_then(|v| {
-                                if let ColumnValue::String(s) = v {
-                                    Some(s.clone())
+                                if let ColumnValueRef::String(s) = v.as_delta_column_value_ref() {
+                                    Some(s.into_owned())
                                 } else {
                                     None
                                 }
@@ -1763,21 +1779,20 @@ impl OnDemandStorage {
                     }
                     ColumnType::Binary | ColumnType::Blob => {
                         let v = val
-                            .and_then(|v| {
-                                if let ColumnValue::Binary(b) | ColumnValue::Blob(b) = v {
-                                    Some(b.clone())
-                                } else {
-                                    None
+                            .and_then(|v| match v.as_delta_column_value_ref() {
+                                ColumnValueRef::Binary(b) | ColumnValueRef::Blob(b) => {
+                                    Some(b.to_vec())
                                 }
+                                _ => None,
                             })
                             .unwrap_or_default();
                         binary_columns.get_mut(col_name).unwrap().push(v);
                     }
                     ColumnType::FixedList | ColumnType::Float16List => {
                         let v = val
-                            .and_then(|v| match v {
-                                ColumnValue::FixedList(b) | ColumnValue::Binary(b) => {
-                                    Some(b.clone())
+                            .and_then(|v| match v.as_delta_column_value_ref() {
+                                ColumnValueRef::FixedList(b) | ColumnValueRef::Binary(b) => {
+                                    Some(b.to_vec())
                                 }
                                 _ => None,
                             })
@@ -1787,8 +1802,8 @@ impl OnDemandStorage {
                     ColumnType::Bool => {
                         let v = val
                             .and_then(|v| {
-                                if let ColumnValue::Bool(b) = v {
-                                    Some(*b)
+                                if let ColumnValueRef::Bool(b) = v.as_delta_column_value_ref() {
+                                    Some(b)
                                 } else {
                                     None
                                 }

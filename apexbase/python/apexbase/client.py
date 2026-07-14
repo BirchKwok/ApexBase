@@ -109,7 +109,7 @@ def encode_vector(vec) -> bytes:
         client.store([{"name": "item1", "vec": encode_vector([1.0, 2.0, 3.0])}])
     """
     if hasattr(vec, 'astype'):  # numpy array
-        return vec.astype('<f4').tobytes()
+        return vec.astype('<f4', copy=False).tobytes()
     return struct.pack(f'<{len(vec)}f', *[float(v) for v in vec])
 
 
@@ -121,8 +121,7 @@ def decode_vector(b: bytes) -> list:
         row = client.retrieve(1)
         floats = decode_vector(row["vec"])
     """
-    n = len(b) // 4
-    return list(struct.unpack(f'<{n}f', b[:n * 4]))
+    return np.frombuffer(b, dtype='<f4', count=len(b) // 4).tolist()
 
 
 def _is_vector_column(values) -> bool:
@@ -1144,22 +1143,7 @@ class ApexClient:
                 if not isinstance(data, pa_mod.Table):
                     pa_mod = None
                 else:
-                    # Convert Arrow Table to columnar dict for zero-copy path
-                    columns = {}
-                    for name in data.column_names:
-                        col = data[name]
-                        # Convert to list for storage
-                        if pa_mod.types.is_string(col.type) or pa_mod.types.is_large_string(col.type):
-                            columns[name] = col.to_pylist()
-                        elif pa_mod.types.is_integer(col.type):
-                            columns[name] = col.to_pylist()
-                        elif pa_mod.types.is_floating(col.type):
-                            columns[name] = col.to_pylist()
-                        elif pa_mod.types.is_boolean(col.type):
-                            columns[name] = col.to_pylist()
-                        else:
-                            columns[name] = col.to_pylist()
-                    self._store_columnar(columns)
+                    self._store_columnar(data.to_pydict())
                     return
 
             # 3. Pandas DataFrame - Convert to columnar dict for optimized storage
@@ -1167,24 +1151,14 @@ class ApexClient:
                 pd_mod = _ensure_pandas()
                 if isinstance(data, pd_mod.DataFrame):
                     # Convert DataFrame to columnar dict
-                    columns = {}
-                    for name in data.columns:
-                        col = data[name]
-                        if col.dtype == 'object':
-                            columns[name] = col.fillna('').tolist()
-                        else:
-                            columns[name] = col.tolist()
+                    columns = {name: data[name].tolist() for name in data.columns}
                     self._store_columnar(columns)
                     return
 
             # 4. Polars DataFrame - Convert to columnar dict for optimized storage
-            if POLARS_AVAILABLE and data_module.startswith("polars") and hasattr(data, 'to_arrow'):
+            if POLARS_AVAILABLE and data_module.startswith("polars") and hasattr(data, 'to_dict'):
                 _ensure_polars()
-                # Convert to Arrow then to columnar dict
-                arrow_table = data.to_arrow()
-                columns = {}
-                for name in arrow_table.column_names:
-                    columns[name] = arrow_table[name].to_pylist()
+                columns = data.to_dict(as_series=False)
                 self._store_columnar(columns)
                 return
 
@@ -3177,14 +3151,7 @@ class ApexClient:
     def retrieve_all(self) -> 'ResultView':
         self._check_connection()
         self._ensure_table_selected()
-        with self._lock:
-            results = self._storage.retrieve_all()
-        if not results:
-            return _empty_result_view()
-        
-        pa_mod = _ensure_pyarrow()
-        table = pa_mod.Table.from_pylist(results)
-        return ResultView(arrow_table=table)
+        return self.execute(f"SELECT * FROM {self._current_table}")
 
     def list_fields(self) -> List[str]:
         self._check_connection()
@@ -3293,16 +3260,14 @@ class ApexClient:
         if table_name is not None:
             self._select_or_create_table(table_name)
         self._ensure_table_selected()
-        records = df.to_dict('records')
-        self.store(records)
+        self.store(df)
         return self
 
     def from_pyarrow(self, table, table_name: str = None) -> 'ApexClient':
         if table_name is not None:
             self._select_or_create_table(table_name)
         self._ensure_table_selected()
-        records = table.to_pylist()
-        self.store(records)
+        self.store(table)
         return self
 
     def from_lance(
@@ -3344,8 +3309,7 @@ class ApexClient:
         if table_name is not None:
             self._select_or_create_table(table_name)
         self._ensure_table_selected()
-        records = df.to_dicts()
-        self.store(records)
+        self.store(df)
         return self
 
     def to_lance(

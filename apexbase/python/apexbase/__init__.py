@@ -338,10 +338,12 @@ class ResultView:
             if self._arrow_table is not None:
                 show_id = bool(getattr(self, "_show_internal_id", False))
                 if show_id:
-                    self._data = [dict(row) for row in self._arrow_table.to_pylist()]
+                    self._data = self._arrow_table.to_pylist()
                 else:
-                    self._data = [{k: v for k, v in row.items() if k != '_id'} 
-                                  for row in self._arrow_table.to_pylist()]
+                    table = self._arrow_table
+                    if '_id' in table.column_names:
+                        table = table.drop(['_id'])
+                    self._data = table.to_pylist()
         return self._data if self._data is not None else []
     
     def to_dict(self) -> List[dict]:
@@ -584,12 +586,36 @@ class ResultView:
                 return first_row.get(first_key)
         return None
 
+    def _row_at(self, idx: int) -> dict:
+        """Materialize one row without expanding the entire result."""
+        if idx < 0:
+            idx += self._num_rows
+        if idx < 0 or idx >= self._num_rows:
+            raise IndexError("ResultView index out of range")
+        if self._data is not None:
+            return self._data[idx]
+
+        show_id = bool(getattr(self, "_show_internal_id", False))
+        if self._lazy_pydict is not None:
+            return {
+                key: values[idx]
+                for key, values in self._lazy_pydict.items()
+                if show_id or key != '_id'
+            }
+
+        self._ensure_arrow()
+        if self._arrow_table is not None:
+            table = self._arrow_table.slice(idx, 1)
+            if not show_id and '_id' in table.column_names:
+                table = table.drop(['_id'])
+            rows = table.to_pylist()
+            if rows:
+                return rows[0]
+        raise IndexError("ResultView index out of range")
+
     def first(self) -> Optional[dict]:
         """Get first row as dictionary (hide _id)"""
-        data = self._ensure_data()
-        if data:
-            return data[0]
-        return None
+        return self._row_at(0) if self._num_rows else None
     
     def __len__(self):
         return self._num_rows
@@ -598,6 +624,8 @@ class ResultView:
         return iter(self._ensure_data())
     
     def __getitem__(self, idx):
+        if isinstance(idx, int):
+            return self._row_at(idx)
         return self._ensure_data()[idx]
     
     def __repr__(self):

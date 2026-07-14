@@ -332,9 +332,9 @@ impl ApexDB {
 
     /// List all tables in the current database directory (sorted).
     pub fn list_tables(&self) -> Vec<String> {
-        let base_dir = self.inner.current_base_dir();
+        let base_dir = self.inner.base_dir.read();
         let mut tables = Vec::new();
-        if let Ok(entries) = fs::read_dir(&base_dir) {
+        if let Ok(entries) = fs::read_dir(&*base_dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.extension().and_then(|e| e.to_str()) == Some("apex") {
@@ -536,6 +536,22 @@ impl Table {
         if batch.num_rows() == 0 {
             return Ok(Vec::new());
         }
+        if let Some(columns) = typed_columns_from_record_batch(batch) {
+            let engine = crate::storage::engine::engine();
+            return Ok(engine.write_typed(
+                &self.path,
+                columns.ints,
+                columns.floats,
+                columns.strings,
+                columns.binaries,
+                HashMap::new(),
+                columns.bools,
+                columns.nulls,
+                self.inner.durability,
+            )?);
+        }
+
+        // Preserve support for Arrow types outside the native typed writer.
         let rows = record_batch_to_rows(batch)?;
         self.insert_batch(&rows)
     }
@@ -826,6 +842,178 @@ fn to_absolute(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     }
+}
+
+struct TypedArrowColumns {
+    ints: HashMap<String, Vec<i64>>,
+    floats: HashMap<String, Vec<f64>>,
+    strings: HashMap<String, Vec<String>>,
+    binaries: HashMap<String, Vec<Vec<u8>>>,
+    bools: HashMap<String, Vec<bool>>,
+    nulls: HashMap<String, Vec<bool>>,
+}
+
+/// Convert the Arrow types supported by `arrow_value_at` directly to the
+/// storage engine's columnar input. Returning `None` keeps the compatibility
+/// fallback for uncommon/extension Arrow types.
+fn typed_columns_from_record_batch(batch: &RecordBatch) -> Option<TypedArrowColumns> {
+    let mut out = TypedArrowColumns {
+        ints: HashMap::new(),
+        floats: HashMap::new(),
+        strings: HashMap::new(),
+        binaries: HashMap::new(),
+        bools: HashMap::new(),
+        nulls: HashMap::new(),
+    };
+    let schema = batch.schema();
+
+    macro_rules! integer_column {
+        ($array:ty, $col:expr, $convert:expr) => {{
+            let array = $col.as_any().downcast_ref::<$array>()?;
+            (0..array.len())
+                .map(|row| $convert(array.value(row)))
+                .collect()
+        }};
+    }
+
+    for (index, field) in schema.fields().iter().enumerate() {
+        let name = field.name();
+        if name == "_id" {
+            continue;
+        }
+        let column = batch.column(index);
+        if column.null_count() > 0 {
+            out.nulls.insert(
+                name.clone(),
+                (0..column.len()).map(|row| column.is_null(row)).collect(),
+            );
+        }
+
+        match column.data_type() {
+            ArrowDataType::Int64 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(Int64Array, column, |value| value),
+                );
+            }
+            ArrowDataType::Int32 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(Int32Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::Int16 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(Int16Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::Int8 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(Int8Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::UInt64 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(UInt64Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::UInt32 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(UInt32Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::UInt16 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(UInt16Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::UInt8 => {
+                out.ints.insert(
+                    name.clone(),
+                    integer_column!(UInt8Array, column, |value| value as i64),
+                );
+            }
+            ArrowDataType::Float64 => {
+                let array = column.as_any().downcast_ref::<Float64Array>()?;
+                out.floats.insert(name.clone(), array.values().to_vec());
+            }
+            ArrowDataType::Float32 => {
+                let array = column.as_any().downcast_ref::<Float32Array>()?;
+                out.floats.insert(
+                    name.clone(),
+                    array.values().iter().map(|value| *value as f64).collect(),
+                );
+            }
+            ArrowDataType::Boolean => {
+                let array = column.as_any().downcast_ref::<BooleanArray>()?;
+                out.bools.insert(
+                    name.clone(),
+                    (0..array.len()).map(|row| array.value(row)).collect(),
+                );
+            }
+            ArrowDataType::Utf8 => {
+                let array = column.as_any().downcast_ref::<StringArray>()?;
+                out.strings.insert(
+                    name.clone(),
+                    (0..array.len())
+                        .map(|row| {
+                            if array.is_null(row) {
+                                String::new()
+                            } else {
+                                array.value(row).to_owned()
+                            }
+                        })
+                        .collect(),
+                );
+            }
+            ArrowDataType::LargeUtf8 => {
+                let array = column.as_any().downcast_ref::<LargeStringArray>()?;
+                out.strings.insert(
+                    name.clone(),
+                    (0..array.len())
+                        .map(|row| {
+                            if array.is_null(row) {
+                                String::new()
+                            } else {
+                                array.value(row).to_owned()
+                            }
+                        })
+                        .collect(),
+                );
+            }
+            ArrowDataType::Binary => {
+                let array = column.as_any().downcast_ref::<BinaryArray>()?;
+                out.binaries.insert(
+                    name.clone(),
+                    (0..array.len())
+                        .map(|row| {
+                            if array.is_null(row) {
+                                Vec::new()
+                            } else {
+                                array.value(row).to_vec()
+                            }
+                        })
+                        .collect(),
+                );
+            }
+            // LargeBinary maps to Blob in the row API, while write_typed uses
+            // the existing schema to distinguish Blob from Binary. Retain the
+            // old conversion path so schema inference remains identical.
+            _ => return None,
+        }
+    }
+
+    let has_user_columns = !out.ints.is_empty()
+        || !out.floats.is_empty()
+        || !out.strings.is_empty()
+        || !out.binaries.is_empty()
+        || !out.bools.is_empty();
+    has_user_columns.then_some(out)
 }
 
 /// Convert an Arrow [`RecordBatch`] to `Vec<Row>`.
@@ -1744,6 +1932,46 @@ mod tests {
         let ids = table.insert_arrow(&batch).unwrap();
         assert!(ids.is_empty());
         assert_eq!(table.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_insert_arrow_typed_path_preserves_nulls_and_assigns_ids() {
+        use arrow::array::{BooleanArray, Float32Array, Int64Array, StringArray, UInt64Array};
+        use arrow::datatypes::{DataType as ArrowDT, Field, Schema as ArrowSchema};
+
+        let (_dir, db) = temp_db();
+        let table = db.create_table("arrow_typed_t").unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("_id", ArrowDT::UInt64, false),
+            Field::new("value", ArrowDT::Int64, true),
+            Field::new("score", ArrowDT::Float32, false),
+            Field::new("name", ArrowDT::Utf8, true),
+            Field::new("active", ArrowDT::Boolean, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![999, 1_000, 1_001])),
+                Arc::new(Int64Array::from(vec![Some(10), None, Some(30)])),
+                Arc::new(Float32Array::from(vec![1.5, 2.5, 3.5])),
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+                Arc::new(BooleanArray::from(vec![true, false, true])),
+            ],
+        )
+        .unwrap();
+
+        let ids = table.insert_arrow(&batch).unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_ne!(ids[0], 999, "incoming _id must not replace assigned IDs");
+        let rows = table
+            .execute("SELECT * FROM arrow_typed_t ORDER BY _id")
+            .unwrap()
+            .to_rows()
+            .unwrap();
+        assert_eq!(rows[1].get("value"), Some(&Value::Null));
+        assert_eq!(rows[1].get("name"), Some(&Value::Null));
+        assert_eq!(rows[0].get("score"), Some(&Value::Float64(1.5)));
+        assert_eq!(rows[2].get("active"), Some(&Value::Bool(true)));
     }
 
     // ── Group 8: helper functions ────────────────────────────────────────────

@@ -5164,6 +5164,22 @@ impl OnDemandStorage {
     /// - Safe mode: WAL is flushed but fsync is deferred to flush() call
     /// - Max mode: WAL is fsync'd immediately after each insert for strongest guarantee
     pub fn insert_rows(&self, rows: &[HashMap<String, ColumnValue>]) -> io::Result<Vec<u64>> {
+        self.insert_rows_impl(rows)
+    }
+
+    /// Insert row-oriented facade values without first cloning them into an
+    /// owned `ColumnValue` batch.
+    pub(crate) fn insert_value_rows(
+        &self,
+        rows: &[HashMap<String, crate::data::Value>],
+    ) -> io::Result<Vec<u64>> {
+        self.insert_rows_impl(rows)
+    }
+
+    fn insert_rows_impl<V: AsColumnValueRef>(
+        &self,
+        rows: &[HashMap<String, V>],
+    ) -> io::Result<Vec<u64>> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -5179,9 +5195,19 @@ impl OnDemandStorage {
             let mut wal_writer = self.wal_writer.write();
             
             if let Some(writer) = wal_writer.as_mut() {
-                let record = super::incremental::WalRecord::BatchInsert { 
+                let wal_rows = rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|(name, value)| {
+                                (name.clone(), value.to_owned_column_value())
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let record = super::incremental::WalRecord::BatchInsert {
                     start_id, 
-                    rows: rows.to_vec(),
+                    rows: wal_rows,
                     txn_id: 0,
                 };
                 writer.append(&record)?;
@@ -5296,15 +5322,15 @@ impl OnDemandStorage {
                     || bool_columns.contains_key(key) {
                     continue;
                 }
-                match val {
-                    ColumnValue::Int64(_) => { int_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                    ColumnValue::Float64(_) => { float_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                    ColumnValue::String(_) => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                    ColumnValue::Binary(_) => { binary_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                    ColumnValue::Blob(_) => { blob_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                    ColumnValue::FixedList(_) => { fixedlist_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                    ColumnValue::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                    ColumnValue::Null => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                match val.as_column_value_ref() {
+                    ColumnValueRef::Int64(_) => { int_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValueRef::Float64(_) => { float_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValueRef::String(_) => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValueRef::Binary(_) => { binary_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValueRef::Blob(_) => { blob_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValueRef::FixedList(_) => { fixedlist_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValueRef::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    ColumnValueRef::Null => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                 }
                 null_positions.insert(key.clone(), Vec::with_capacity(num_rows));
             }
@@ -5322,15 +5348,15 @@ impl OnDemandStorage {
                     && !string_columns.contains_key(key) && !binary_columns.contains_key(key)
                     && !blob_columns.contains_key(key)
                     && !fixedlist_columns.contains_key(key) && !bool_columns.contains_key(key) {
-                    match val {
-                        ColumnValue::Int64(_) => { int_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                        ColumnValue::Float64(_) => { float_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                        ColumnValue::String(_) => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                        ColumnValue::Binary(_) => { binary_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                        ColumnValue::Blob(_) => { blob_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                        ColumnValue::FixedList(_) => { fixedlist_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                        ColumnValue::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
-                        ColumnValue::Null => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                    match val.as_column_value_ref() {
+                        ColumnValueRef::Int64(_) => { int_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValueRef::Float64(_) => { float_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValueRef::String(_) => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValueRef::Binary(_) => { binary_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValueRef::Blob(_) => { blob_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValueRef::FixedList(_) => { fixedlist_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValueRef::Bool(_) => { bool_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
+                        ColumnValueRef::Null => { string_columns.insert(key.clone(), Vec::with_capacity(num_rows)); }
                     }
                     null_positions.insert(key.clone(), Vec::with_capacity(num_rows));
                 }
@@ -5338,70 +5364,70 @@ impl OnDemandStorage {
             
             // Collect values for all columns and track NULL positions
             for (key, col) in int_columns.iter_mut() {
-                let (val, is_null) = match row.get(key) {
-                    Some(ColumnValue::Int64(v)) => (*v, false),
-                    Some(ColumnValue::Null) | None => (0, true),
+                let (val, is_null) = match row.get(key).map(|v| v.as_column_value_ref()) {
+                    Some(ColumnValueRef::Int64(v)) => (v, false),
+                    Some(ColumnValueRef::Null) | None => (0, true),
                     _ => (0, true),
                 };
                 col.push(val);
-                null_positions.entry(key.clone()).or_default().push(is_null);
+                null_positions.get_mut(key).unwrap().push(is_null);
             }
             for (key, col) in float_columns.iter_mut() {
-                let (val, is_null) = match row.get(key) {
-                    Some(ColumnValue::Float64(v)) => (*v, false),
-                    Some(ColumnValue::Null) | None => (0.0, true),
+                let (val, is_null) = match row.get(key).map(|v| v.as_column_value_ref()) {
+                    Some(ColumnValueRef::Float64(v)) => (v, false),
+                    Some(ColumnValueRef::Null) | None => (0.0, true),
                     _ => (0.0, true),
                 };
                 col.push(val);
-                null_positions.entry(key.clone()).or_default().push(is_null);
+                null_positions.get_mut(key).unwrap().push(is_null);
             }
             for (key, col) in string_columns.iter_mut() {
-                let (val, is_null) = match row.get(key) {
-                    Some(ColumnValue::String(v)) => (v.clone(), false),
-                    Some(ColumnValue::Null) => (NULL_MARKER.to_string(), true),
+                let (val, is_null) = match row.get(key).map(|v| v.as_column_value_ref()) {
+                    Some(ColumnValueRef::String(v)) => (v.into_owned(), false),
+                    Some(ColumnValueRef::Null) => (NULL_MARKER.to_string(), true),
                     None => (String::new(), true),
                     _ => (String::new(), true),
                 };
                 col.push(val);
-                null_positions.entry(key.clone()).or_default().push(is_null);
+                null_positions.get_mut(key).unwrap().push(is_null);
             }
             for (key, col) in binary_columns.iter_mut() {
-                let (val, is_null) = match row.get(key) {
-                    Some(ColumnValue::Binary(v)) => (v.clone(), false),
-                    Some(ColumnValue::Null) | None => (Vec::new(), true),
+                let (val, is_null) = match row.get(key).map(|v| v.as_column_value_ref()) {
+                    Some(ColumnValueRef::Binary(v)) => (v.to_vec(), false),
+                    Some(ColumnValueRef::Null) | None => (Vec::new(), true),
                     _ => (Vec::new(), true),
                 };
                 col.push(val);
-                null_positions.entry(key.clone()).or_default().push(is_null);
+                null_positions.get_mut(key).unwrap().push(is_null);
             }
             for (key, col) in blob_columns.iter_mut() {
-                let (val, is_null) = match row.get(key) {
-                    Some(ColumnValue::Blob(v)) | Some(ColumnValue::Binary(v)) => {
+                let (val, is_null) = match row.get(key).map(|v| v.as_column_value_ref()) {
+                    Some(ColumnValueRef::Blob(v)) | Some(ColumnValueRef::Binary(v)) => {
                         (self.write_blob_value(v)?, false)
                     }
-                    Some(ColumnValue::Null) | None => (Vec::new(), true),
+                    Some(ColumnValueRef::Null) | None => (Vec::new(), true),
                     _ => (Vec::new(), true),
                 };
                 col.push(val);
-                null_positions.entry(key.clone()).or_default().push(is_null);
+                null_positions.get_mut(key).unwrap().push(is_null);
             }
             for (key, col) in fixedlist_columns.iter_mut() {
-                let (val, is_null) = match row.get(key) {
-                    Some(ColumnValue::FixedList(v)) => (v.clone(), false),
-                    Some(ColumnValue::Null) | None => (Vec::new(), true),
+                let (val, is_null) = match row.get(key).map(|v| v.as_column_value_ref()) {
+                    Some(ColumnValueRef::FixedList(v)) => (v.to_vec(), false),
+                    Some(ColumnValueRef::Null) | None => (Vec::new(), true),
                     _ => (Vec::new(), true),
                 };
                 col.push(val);
-                null_positions.entry(key.clone()).or_default().push(is_null);
+                null_positions.get_mut(key).unwrap().push(is_null);
             }
             for (key, col) in bool_columns.iter_mut() {
-                let (val, is_null) = match row.get(key) {
-                    Some(ColumnValue::Bool(v)) => (*v, false),
-                    Some(ColumnValue::Null) | None => (false, true),
+                let (val, is_null) = match row.get(key).map(|v| v.as_column_value_ref()) {
+                    Some(ColumnValueRef::Bool(v)) => (v, false),
+                    Some(ColumnValueRef::Null) | None => (false, true),
                     _ => (false, true),
                 };
                 col.push(val);
-                null_positions.entry(key.clone()).or_default().push(is_null);
+                null_positions.get_mut(key).unwrap().push(is_null);
             }
         }
 
