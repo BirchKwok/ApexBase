@@ -232,7 +232,13 @@ impl ApexExecutor {
                         }
 
                         let right_mask = Self::evaluate_predicate(batch, right)?;
-                        compute::and(&left_mask, &right_mask).map_err(|e| err_data(e.to_string()))
+                        if left_mask.null_count() == 0 && right_mask.null_count() == 0 {
+                            compute::and(&left_mask, &right_mask)
+                                .map_err(|e| err_data(e.to_string()))
+                        } else {
+                            compute::kernels::boolean::and_kleene(&left_mask, &right_mask)
+                                .map_err(|e| err_data(e.to_string()))
+                        }
                     }
                     BinaryOperator::Or => {
                         // Short-circuit evaluation: if left is all true, don't evaluate right
@@ -262,7 +268,13 @@ impl ApexExecutor {
                         }
 
                         let right_mask = Self::evaluate_predicate(batch, right)?;
-                        compute::or(&left_mask, &right_mask).map_err(|e| err_data(e.to_string()))
+                        if left_mask.null_count() == 0 && right_mask.null_count() == 0 {
+                            compute::or(&left_mask, &right_mask)
+                                .map_err(|e| err_data(e.to_string()))
+                        } else {
+                            compute::kernels::boolean::or_kleene(&left_mask, &right_mask)
+                                .map_err(|e| err_data(e.to_string()))
+                        }
                     }
                     // Comparison operators
                     _ => Self::evaluate_comparison(batch, left, op, right),
@@ -373,14 +385,26 @@ impl ApexExecutor {
                         Self::evaluate_predicate_with_storage(batch, left, storage_path)?;
                     let right_mask =
                         Self::evaluate_predicate_with_storage(batch, right, storage_path)?;
-                    compute::and(&left_mask, &right_mask).map_err(|e| err_data(e.to_string()))
+                    if left_mask.null_count() == 0 && right_mask.null_count() == 0 {
+                        compute::and(&left_mask, &right_mask)
+                            .map_err(|e| err_data(e.to_string()))
+                    } else {
+                        compute::kernels::boolean::and_kleene(&left_mask, &right_mask)
+                            .map_err(|e| err_data(e.to_string()))
+                    }
                 }
                 BinaryOperator::Or => {
                     let left_mask =
                         Self::evaluate_predicate_with_storage(batch, left, storage_path)?;
                     let right_mask =
                         Self::evaluate_predicate_with_storage(batch, right, storage_path)?;
-                    compute::or(&left_mask, &right_mask).map_err(|e| err_data(e.to_string()))
+                    if left_mask.null_count() == 0 && right_mask.null_count() == 0 {
+                        compute::or(&left_mask, &right_mask)
+                            .map_err(|e| err_data(e.to_string()))
+                    } else {
+                        compute::kernels::boolean::or_kleene(&left_mask, &right_mask)
+                            .map_err(|e| err_data(e.to_string()))
+                    }
                 }
                 _ => Self::evaluate_comparison_with_storage(batch, left, op, right, storage_path),
             },
@@ -2309,96 +2333,100 @@ impl ApexExecutor {
         else_expr: Option<&SqlExpr>,
     ) -> io::Result<ArrayRef> {
         let num_rows = batch.num_rows();
-
-        // Determine result type from first THEN expression
-        let first_then = Self::evaluate_expr_to_array(batch, &when_then[0].1)?;
-        let is_string = first_then.as_any().downcast_ref::<StringArray>().is_some();
+        let then_arrays = when_then
+            .iter()
+            .map(|(_, expr)| Self::evaluate_expr_to_array(batch, expr))
+            .collect::<io::Result<Vec<_>>>()?;
+        let else_array = else_expr
+            .map(|expr| Self::evaluate_expr_to_array(batch, expr))
+            .transpose()?;
+        let arrays = then_arrays.iter().chain(else_array.iter());
+        let is_string = arrays.clone().any(|array| array.as_any().is::<StringArray>());
+        let is_float = arrays.clone().any(|array| array.as_any().is::<Float64Array>());
+        let conditions = when_then
+            .iter()
+            .map(|(condition, _)| Self::evaluate_predicate(batch, condition))
+            .collect::<io::Result<Vec<_>>>()?;
 
         if is_string {
-            // Handle string CASE results
-            let mut result: Vec<Option<String>> = if let Some(else_e) = else_expr {
-                let else_array = Self::evaluate_expr_to_array(batch, else_e)?;
-                if let Some(arr) = else_array.as_any().downcast_ref::<StringArray>() {
-                    (0..num_rows)
-                        .map(|i| {
-                            if arr.is_null(i) {
-                                None
-                            } else {
-                                Some(arr.value(i).to_string())
-                            }
-                        })
-                        .collect()
-                } else {
-                    vec![None; num_rows]
-                }
-            } else {
-                vec![None; num_rows]
-            };
-
-            let mut assigned = vec![false; num_rows];
-
-            for (cond_expr, then_expr) in when_then {
-                let cond = Self::evaluate_predicate(batch, cond_expr)?;
-                let then_array = Self::evaluate_expr_to_array(batch, then_expr)?;
-
-                if let Some(then_str) = then_array.as_any().downcast_ref::<StringArray>() {
-                    for i in 0..num_rows {
-                        if !assigned[i] && cond.value(i) {
-                            result[i] = if then_str.is_null(i) {
-                                None
-                            } else {
-                                Some(then_str.value(i).to_string())
-                            };
-                            assigned[i] = true;
-                        }
+            let mut result = vec![None; num_rows];
+            if let Some(array) = else_array
+                .as_ref()
+                .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            {
+                for row in 0..num_rows {
+                    if !array.is_null(row) {
+                        result[row] = Some(array.value(row).to_string());
                     }
                 }
             }
-
-            Ok(Arc::new(StringArray::from(result)))
-        } else {
-            // Handle numeric CASE results (Int64)
-            let mut result: Vec<Option<i64>> = if let Some(else_e) = else_expr {
-                let else_array = Self::evaluate_expr_to_array(batch, else_e)?;
-                if let Some(arr) = else_array.as_any().downcast_ref::<Int64Array>() {
-                    (0..num_rows)
-                        .map(|i| {
-                            if arr.is_null(i) {
-                                None
-                            } else {
-                                Some(arr.value(i))
-                            }
-                        })
-                        .collect()
-                } else {
-                    vec![None; num_rows]
-                }
-            } else {
-                vec![None; num_rows]
-            };
-
             let mut assigned = vec![false; num_rows];
-
-            for (cond_expr, then_expr) in when_then {
-                let cond = Self::evaluate_predicate(batch, cond_expr)?;
-                let then_array = Self::evaluate_expr_to_array(batch, then_expr)?;
-
-                if let Some(then_int) = then_array.as_any().downcast_ref::<Int64Array>() {
-                    for i in 0..num_rows {
-                        if !assigned[i] && cond.value(i) {
-                            result[i] = if then_int.is_null(i) {
-                                None
-                            } else {
-                                Some(then_int.value(i))
-                            };
-                            assigned[i] = true;
-                        }
+            for (condition, array) in conditions.iter().zip(&then_arrays) {
+                let Some(array) = array.as_any().downcast_ref::<StringArray>() else {
+                    continue;
+                };
+                for row in 0..num_rows {
+                    if !assigned[row] && !condition.is_null(row) && condition.value(row) {
+                        result[row] = (!array.is_null(row))
+                            .then(|| array.value(row).to_string());
+                        assigned[row] = true;
                     }
                 }
             }
-
-            Ok(Arc::new(Int64Array::from(result)))
+            return Ok(Arc::new(StringArray::from(result)));
         }
+
+        if is_float {
+            let numeric_value = |array: &ArrayRef, row: usize| -> Option<f64> {
+                if array.is_null(row) {
+                    None
+                } else if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+                    Some(values.value(row))
+                } else {
+                    array
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .map(|values| values.value(row) as f64)
+                }
+            };
+            let mut result = else_array
+                .as_ref()
+                .map(|array| (0..num_rows).map(|row| numeric_value(array, row)).collect())
+                .unwrap_or_else(|| vec![None; num_rows]);
+            let mut assigned = vec![false; num_rows];
+            for (condition, array) in conditions.iter().zip(&then_arrays) {
+                for row in 0..num_rows {
+                    if !assigned[row] && !condition.is_null(row) && condition.value(row) {
+                        result[row] = numeric_value(array, row);
+                        assigned[row] = true;
+                    }
+                }
+            }
+            return Ok(Arc::new(Float64Array::from(result)));
+        }
+
+        let mut result = else_array
+            .as_ref()
+            .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+            .map(|array| {
+                (0..num_rows)
+                    .map(|row| (!array.is_null(row)).then(|| array.value(row)))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![None; num_rows]);
+        let mut assigned = vec![false; num_rows];
+        for (condition, array) in conditions.iter().zip(&then_arrays) {
+            let Some(array) = array.as_any().downcast_ref::<Int64Array>() else {
+                continue;
+            };
+            for row in 0..num_rows {
+                if !assigned[row] && !condition.is_null(row) && condition.value(row) {
+                    result[row] = (!array.is_null(row)).then(|| array.value(row));
+                    assigned[row] = true;
+                }
+            }
+        }
+        Ok(Arc::new(Int64Array::from(result)))
     }
 
     /// Evaluate function expression (COALESCE, etc.)

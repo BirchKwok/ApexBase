@@ -449,26 +449,56 @@ impl ApexExecutor {
         }
 
         let num_rows = batch.num_rows();
-        let num_specs = window_specs.len();
+        let use_float: Vec<bool> = window_specs
+            .iter()
+            .map(|(func_name, func_args, _, _, _)| {
+                let source_is_float = func_args
+                    .first()
+                    .and_then(|name| Self::get_column_by_name(batch, name.trim_matches('"')))
+                    .is_some_and(|column| column.as_any().is::<Float64Array>());
+                source_is_float
+                    || matches!(func_name.as_str(), "AVG" | "PERCENT_RANK" | "CUME_DIST")
+            })
+            .collect();
         // Per-spec nullable output: int (rank/row_number) or float (sum/avg/lag)
-        let mut per_int: Vec<Vec<Option<i64>>> = vec![vec![None; num_rows]; num_specs];
-        let mut per_flt: Vec<Vec<Option<f64>>> = vec![vec![None; num_rows]; num_specs];
-        let mut use_float: Vec<bool> = vec![false; num_specs];
+        let mut per_int: Vec<Vec<Option<i64>>> = use_float
+            .iter()
+            .map(|float| if *float { Vec::new() } else { vec![None; num_rows] })
+            .collect();
+        let mut per_flt: Vec<Vec<Option<f64>>> = use_float
+            .iter()
+            .map(|float| if *float { vec![None; num_rows] } else { Vec::new() })
+            .collect();
         // Multiple window functions in analytics SQL usually share an identical
         // PARTITION BY / ORDER BY clause.  Hashing and sorting the million-row
         // input independently for every ROW_NUMBER/LAG/LEAD is pure duplicate
         // work, so retain the ordered row groups for the duration of this SELECT.
-        let mut ordered_group_cache: AHashMap<String, Vec<Vec<usize>>> = AHashMap::new();
+        let mut ordered_group_cache: AHashMap<String, Arc<Vec<Vec<usize>>>> = AHashMap::new();
 
         for (spec_idx, (func_name, func_args, partition_by, order_by, _)) in window_specs.iter().enumerate() {
-            let src_col_name = func_args.get(0).map(|s| s.trim_matches('"').to_string());
-            let is_float_src = src_col_name.as_deref().and_then(|cn| Self::get_column_by_name(batch, cn))
-                .map_or(false, |c| c.as_any().downcast_ref::<Float64Array>().is_some());
-            use_float[spec_idx] = is_float_src || matches!(func_name.as_str(), "AVG" | "PERCENT_RANK" | "CUME_DIST");
-
             let cache_key = format!("{:?}|{:?}", partition_by, order_by);
+            let order_cols: Vec<(ArrayRef, bool)> = order_by
+                .iter()
+                .filter_map(|order| {
+                    Self::get_column_by_name(batch, order.column.trim_matches('"'))
+                        .cloned()
+                        .map(|column| (column, order.descending))
+                })
+                .collect();
+            let compare_order = |a: usize, b: usize| {
+                for (column, descending) in &order_cols {
+                    let mut ordering = Self::compare_array_values(column, a, b);
+                    if *descending {
+                        ordering = ordering.reverse();
+                    }
+                    if ordering != std::cmp::Ordering::Equal {
+                        return ordering;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            };
             let groups = if let Some(cached) = ordered_group_cache.get(&cache_key) {
-                cached.clone()
+                Arc::clone(cached)
             } else {
                 let mut grouped: AHashMap<u64, Vec<usize>> =
                     AHashMap::with_capacity(num_rows / 10 + 1);
@@ -486,27 +516,17 @@ impl ApexExecutor {
                     grouped.entry(key).or_insert_with(|| Vec::with_capacity(16)).push(row_idx);
                 }
                 let mut ordered = grouped.into_values().collect::<Vec<_>>();
-                if let Some(order) = order_by.first() {
-                    if let Some(column) =
-                        Self::get_column_by_name(batch, order.column.trim_matches('"'))
-                    {
-                        for indices in &mut ordered {
-                            indices.sort_by(|&a, &b| {
-                                let cmp = Self::compare_array_values(column, a, b);
-                                if order.descending { cmp.reverse() } else { cmp }
-                            });
-                        }
+                if !order_cols.is_empty() {
+                    for indices in &mut ordered {
+                        indices.sort_by(|&a, &b| compare_order(a, b));
                     }
                 }
-                ordered_group_cache.insert(cache_key, ordered.clone());
+                let ordered = Arc::new(ordered);
+                ordered_group_cache.insert(cache_key, Arc::clone(&ordered));
                 ordered
             };
 
-            let order_col: Option<ArrayRef> = order_by.first().and_then(|order| {
-                Self::get_column_by_name(batch, order.column.trim_matches('"')).cloned()
-            });
-
-            for indices in groups {
+            for indices in groups.iter() {
                 match func_name.as_str() {
                     "ROW_NUMBER" => {
                         for (pos, &row_idx) in indices.iter().enumerate() {
@@ -517,8 +537,8 @@ impl ApexExecutor {
                         let mut rank = 1i64;
                         let mut prev: Option<usize> = None;
                         for (pos, &row_idx) in indices.iter().enumerate() {
-                            if let (Some(p), Some(ref col)) = (prev, &order_col) {
-                                if Self::compare_array_values(col, p, row_idx) != std::cmp::Ordering::Equal {
+                            if let Some(p) = prev {
+                                if compare_order(p, row_idx) != std::cmp::Ordering::Equal {
                                     rank = (pos + 1) as i64;
                                 }
                             }
@@ -529,9 +549,9 @@ impl ApexExecutor {
                     "DENSE_RANK" => {
                         let mut rank = 1i64;
                         let mut prev: Option<usize> = None;
-                        for &row_idx in &indices {
-                            if let (Some(p), Some(ref col)) = (prev, &order_col) {
-                                if Self::compare_array_values(col, p, row_idx) != std::cmp::Ordering::Equal {
+                        for &row_idx in indices {
+                            if let Some(p) = prev {
+                                if compare_order(p, row_idx) != std::cmp::Ordering::Equal {
                                     rank += 1;
                                 }
                             }
@@ -540,7 +560,15 @@ impl ApexExecutor {
                         }
                     }
                     "NTILE" => {
-                        let n = func_args.get(0).and_then(|s| s.parse::<i64>().ok()).unwrap_or(4);
+                        let n = func_args
+                            .get(0)
+                            .and_then(|s| {
+                                s.trim_start_matches("Int64(")
+                                    .trim_end_matches(')')
+                                    .parse::<i64>()
+                                    .ok()
+                            })
+                            .unwrap_or(4);
                         let count = indices.len() as i64;
                         for (pos, &row_idx) in indices.iter().enumerate() {
                             per_int[spec_idx][row_idx] = Some(((pos as i64 * n / count) + 1).min(n));
@@ -551,8 +579,8 @@ impl ApexExecutor {
                         let mut rank = 1i64;
                         let mut prev: Option<usize> = None;
                         for (pos, &row_idx) in indices.iter().enumerate() {
-                            if let (Some(p), Some(ref col)) = (prev, &order_col) {
-                                if Self::compare_array_values(col, p, row_idx) != std::cmp::Ordering::Equal {
+                            if let Some(p) = prev {
+                                if compare_order(p, row_idx) != std::cmp::Ordering::Equal {
                                     rank = (pos + 1) as i64;
                                 }
                             }
@@ -563,17 +591,20 @@ impl ApexExecutor {
                     }
                     "CUME_DIST" => {
                         let count = indices.len();
-                        let mut rank = 0usize;
-                        let mut same = 1usize;
-                        let mut prev: Option<usize> = None;
-                        for (pos, &row_idx) in indices.iter().enumerate() {
-                            if let (Some(p), Some(ref col)) = (prev, &order_col) {
-                                if Self::compare_array_values(col, p, row_idx) == std::cmp::Ordering::Equal {
-                                    same += 1;
-                                } else { rank = pos; same = 1; }
+                        let mut peer_start = 0usize;
+                        while peer_start < count {
+                            let mut peer_end = peer_start + 1;
+                            while peer_end < count
+                                && compare_order(indices[peer_start], indices[peer_end])
+                                    == std::cmp::Ordering::Equal
+                            {
+                                peer_end += 1;
                             }
-                            per_flt[spec_idx][row_idx] = Some((rank + same) as f64 / count as f64);
-                            prev = Some(row_idx);
+                            let value = peer_end as f64 / count as f64;
+                            for &row_idx in &indices[peer_start..peer_end] {
+                                per_flt[spec_idx][row_idx] = Some(value);
+                            }
+                            peer_start = peer_end;
                         }
                     }
                     "LAG" => {
@@ -625,10 +656,10 @@ impl ApexExecutor {
                             let fr = indices[0];
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let v = if fa.is_null(fr) { None } else { Some(fa.value(fr)) };
-                                for &ri in &indices { per_flt[spec_idx][ri] = v; }
+                                for &ri in indices { per_flt[spec_idx][ri] = v; }
                             } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
                                 let v = if ia.is_null(fr) { None } else { Some(ia.value(fr)) };
-                                for &ri in &indices { per_int[spec_idx][ri] = v; }
+                                for &ri in indices { per_int[spec_idx][ri] = v; }
                             }
                         }
                     }
@@ -638,10 +669,10 @@ impl ApexExecutor {
                             let lr = indices[indices.len() - 1];
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let v = if fa.is_null(lr) { None } else { Some(fa.value(lr)) };
-                                for &ri in &indices { per_flt[spec_idx][ri] = v; }
+                                for &ri in indices { per_flt[spec_idx][ri] = v; }
                             } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
                                 let v = if ia.is_null(lr) { None } else { Some(ia.value(lr)) };
-                                for &ri in &indices { per_int[spec_idx][ri] = v; }
+                                for &ri in indices { per_int[spec_idx][ri] = v; }
                             }
                         }
                     }
@@ -652,13 +683,13 @@ impl ApexExecutor {
                                 // Running (cumulative) sum when ORDER BY is present
                                 if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                     let mut running = 0.0f64;
-                                    for &ri in &indices {
+                                    for &ri in indices {
                                         if !fa.is_null(ri) { running += fa.value(ri); }
                                         per_flt[spec_idx][ri] = Some(running);
                                     }
                                 } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
                                     let mut running = 0i64;
-                                    for &ri in &indices {
+                                    for &ri in indices {
                                         if !ia.is_null(ri) { running += ia.value(ri); }
                                         per_int[spec_idx][ri] = Some(running);
                                     }
@@ -667,10 +698,10 @@ impl ApexExecutor {
                                 // Total partition sum when no ORDER BY
                                 if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                     let total: f64 = indices.iter().filter_map(|&i| if fa.is_null(i) { None } else { Some(fa.value(i)) }).sum();
-                                    for &ri in &indices { per_flt[spec_idx][ri] = Some(total); }
+                                    for &ri in indices { per_flt[spec_idx][ri] = Some(total); }
                                 } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
                                     let total: i64 = indices.iter().filter_map(|&i| if ia.is_null(i) { None } else { Some(ia.value(i)) }).sum();
-                                    for &ri in &indices { per_int[spec_idx][ri] = Some(total); }
+                                    for &ri in indices { per_int[spec_idx][ri] = Some(total); }
                                 }
                             }
                         }
@@ -680,10 +711,10 @@ impl ApexExecutor {
                         if let Some(src_col) = Self::get_column_by_name(batch, col_name) {
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let mut running = 0.0f64;
-                                for &ri in &indices { if !fa.is_null(ri) { running += fa.value(ri); } per_flt[spec_idx][ri] = Some(running); }
+                                for &ri in indices { if !fa.is_null(ri) { running += fa.value(ri); } per_flt[spec_idx][ri] = Some(running); }
                             } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
                                 let mut running = 0i64;
-                                for &ri in &indices { if !ia.is_null(ri) { running += ia.value(ri); } per_int[spec_idx][ri] = Some(running); }
+                                for &ri in indices { if !ia.is_null(ri) { running += ia.value(ri); } per_int[spec_idx][ri] = Some(running); }
                             }
                         }
                     }
@@ -693,17 +724,17 @@ impl ApexExecutor {
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let vals: Vec<f64> = indices.iter().filter_map(|&i| if fa.is_null(i) { None } else { Some(fa.value(i)) }).collect();
                                 let avg = if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 };
-                                for &ri in &indices { per_flt[spec_idx][ri] = Some(avg); }
+                                for &ri in indices { per_flt[spec_idx][ri] = Some(avg); }
                             } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
                                 let vals: Vec<i64> = indices.iter().filter_map(|&i| if ia.is_null(i) { None } else { Some(ia.value(i)) }).collect();
                                 let avg = if vals.is_empty() { 0.0 } else { vals.iter().sum::<i64>() as f64 / vals.len() as f64 };
-                                for &ri in &indices { per_flt[spec_idx][ri] = Some(avg); }
+                                for &ri in indices { per_flt[spec_idx][ri] = Some(avg); }
                             }
                         }
                     }
                     "COUNT" => {
                         let cnt = indices.len() as i64;
-                        for &ri in &indices { per_int[spec_idx][ri] = Some(cnt); }
+                        for &ri in indices { per_int[spec_idx][ri] = Some(cnt); }
                     }
                     "MIN" => {
                         let col_name = func_args.get(0).map(|s| s.trim_matches('"')).unwrap_or("");
@@ -711,10 +742,10 @@ impl ApexExecutor {
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let mv = indices.iter().filter_map(|&i| if fa.is_null(i) { None } else { Some(fa.value(i)) }).fold(f64::INFINITY, f64::min);
                                 let mv = if mv == f64::INFINITY { None } else { Some(mv) };
-                                for &ri in &indices { per_flt[spec_idx][ri] = mv; }
+                                for &ri in indices { per_flt[spec_idx][ri] = mv; }
                             } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
                                 let mv = indices.iter().filter_map(|&i| if ia.is_null(i) { None } else { Some(ia.value(i)) }).min();
-                                for &ri in &indices { per_int[spec_idx][ri] = mv; }
+                                for &ri in indices { per_int[spec_idx][ri] = mv; }
                             }
                         }
                     }
@@ -724,10 +755,10 @@ impl ApexExecutor {
                             if let Some(fa) = src_col.as_any().downcast_ref::<Float64Array>() {
                                 let mv = indices.iter().filter_map(|&i| if fa.is_null(i) { None } else { Some(fa.value(i)) }).fold(f64::NEG_INFINITY, f64::max);
                                 let mv = if mv == f64::NEG_INFINITY { None } else { Some(mv) };
-                                for &ri in &indices { per_flt[spec_idx][ri] = mv; }
+                                for &ri in indices { per_flt[spec_idx][ri] = mv; }
                             } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
                                 let mv = indices.iter().filter_map(|&i| if ia.is_null(i) { None } else { Some(ia.value(i)) }).max();
-                                for &ri in &indices { per_int[spec_idx][ri] = mv; }
+                                for &ri in indices { per_int[spec_idx][ri] = mv; }
                             }
                         }
                     }
@@ -739,12 +770,12 @@ impl ApexExecutor {
                                 let v = if n > 0 && n <= indices.len() {
                                     let nr = indices[n-1]; if fa.is_null(nr) { None } else { Some(fa.value(nr)) }
                                 } else { None };
-                                for &ri in &indices { per_flt[spec_idx][ri] = v; }
+                                for &ri in indices { per_flt[spec_idx][ri] = v; }
                             } else if let Some(ia) = src_col.as_any().downcast_ref::<Int64Array>() {
                                 let v = if n > 0 && n <= indices.len() {
                                     let nr = indices[n-1]; if ia.is_null(nr) { None } else { Some(ia.value(nr)) }
                                 } else { None };
-                                for &ri in &indices { per_int[spec_idx][ri] = v; }
+                                for &ri in indices { per_int[spec_idx][ri] = v; }
                             }
                         }
                     }

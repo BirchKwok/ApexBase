@@ -60,6 +60,22 @@ pub struct IndexMeta {
     /// Empty means single-column (backward compat with old serialized catalogs).
     #[serde(default)]
     pub columns: Vec<String>,
+    /// Composite key encoding. Zero denotes the legacy NUL-joined format;
+    /// version one is the typed tuple representation.
+    #[serde(default)]
+    pub key_format_version: u8,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacyIndexMeta {
+    name: String,
+    column_name: String,
+    index_type: IndexType,
+    unique: bool,
+    data_type: DataType,
+    created_at: i64,
+    #[serde(default)]
+    columns: Vec<String>,
 }
 
 impl IndexMeta {
@@ -78,21 +94,24 @@ impl IndexMeta {
     }
 }
 
-/// Build a composite IndexKey from multiple column values.
-/// For single-column, returns the value's key directly.
-/// For multi-column, concatenates as "val1\0val2\0val3" string key.
+const TYPED_TUPLE_VERSION: u8 = 1;
+
+/// Build a versioned typed tuple without string conversion or separators.
 fn composite_key(columns: &[String], values: &HashMap<String, Value>) -> Option<IndexKey> {
     if columns.len() == 1 {
         values.get(&columns[0]).map(|v| IndexKey::from_value(v))
     } else {
-        let mut parts: Vec<String> = Vec::with_capacity(columns.len());
+        let mut parts: Vec<IndexKey> = Vec::with_capacity(columns.len());
         for col in columns {
             match values.get(col) {
-                Some(v) => parts.push(v.to_string()),
+                Some(v) => parts.push(IndexKey::from_value(v)),
                 None => return None, // Missing column value
             }
         }
-        Some(IndexKey::from_value(&Value::String(parts.join("\0"))))
+        Some(IndexKey::Tuple {
+            version: TYPED_TUPLE_VERSION,
+            values: parts,
+        })
     }
 }
 
@@ -125,6 +144,13 @@ impl IndexInstance {
         match self {
             IndexInstance::BTree(idx) => idx.get(key),
             IndexInstance::Hash(idx) => idx.get(key),
+        }
+    }
+
+    fn tuple_prefix(&self, prefix: &[IndexKey]) -> Vec<u64> {
+        match self {
+            IndexInstance::BTree(index) => index.tuple_prefix(prefix, None),
+            IndexInstance::Hash(index) => index.tuple_prefix(prefix),
         }
     }
 
@@ -232,8 +258,33 @@ impl IndexManager {
         }
 
         let data = std::fs::read(&catalog_path)?;
-        let catalog: HashMap<String, IndexMeta> = bincode::deserialize(&data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let catalog: HashMap<String, IndexMeta> = match bincode::deserialize(&data) {
+            Ok(catalog) => catalog,
+            Err(current_error) => {
+                let legacy: HashMap<String, LegacyIndexMeta> = bincode::deserialize(&data)
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, current_error.to_string())
+                    })?;
+                legacy
+                    .into_iter()
+                    .map(|(name, meta)| {
+                        (
+                            name,
+                            IndexMeta {
+                                name: meta.name,
+                                column_name: meta.column_name,
+                                index_type: meta.index_type,
+                                unique: meta.unique,
+                                data_type: meta.data_type,
+                                created_at: meta.created_at,
+                                columns: meta.columns,
+                                key_format_version: 0,
+                            },
+                        )
+                    })
+                    .collect()
+            }
+        };
 
         let mut mgr = Self {
             table_name: table_name.to_string(),
@@ -293,6 +344,18 @@ impl IndexManager {
                     .get(name)
                     .map(|meta| !meta.is_composite())
                     .unwrap_or(false)
+            })
+    }
+
+    pub fn has_single_column_btree_on(&self, column_name: &str) -> bool {
+        self.column_index_map
+            .get(column_name)
+            .into_iter()
+            .flatten()
+            .any(|name| {
+                self.catalog.get(name).map_or(false, |meta| {
+                    !meta.is_composite() && meta.index_type == IndexType::BTree
+                })
             })
     }
 
@@ -384,6 +447,11 @@ impl IndexManager {
             data_type,
             created_at: chrono::Utc::now().timestamp(),
             columns: columns.to_vec(),
+            key_format_version: if columns.len() > 1 {
+                TYPED_TUPLE_VERSION
+            } else {
+                0
+            },
         };
 
         // Create the runtime instance
@@ -789,20 +857,102 @@ impl IndexManager {
             .iter()
             .find(|(_, meta)| {
                 meta.is_composite()
-                    && meta.effective_columns().iter().map(|c| *c).eq(columns.iter().map(|c| c.as_str()))
+                    && meta
+                        .effective_columns()
+                        .iter()
+                        .map(|c| *c)
+                        .eq(columns.iter().map(|c| c.as_str()))
             })
             .map(|(name, _)| name.clone());
         let Some(index_name) = index_name else {
             return Ok(None);
         };
 
-        let key = composite_key(columns, values)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "incomplete composite key"))?;
+        if self.catalog[&index_name].key_format_version != TYPED_TUPLE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "composite index '{}' uses a legacy key format; rebuild the index",
+                    index_name
+                ),
+            ));
+        }
+
+        let key = composite_key(columns, values).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "incomplete composite key")
+        })?;
         let instance = self.ensure_loaded(&index_name)?;
         let row_ids = instance
             .get(&key)
             .map(|ids| ids.to_vec())
-            .unwrap_or_default();
+            .unwrap_or_else(|| match &key {
+                IndexKey::Tuple { version: 1, values } => instance.tuple_prefix(values),
+                _ => Vec::new(),
+            });
+        Ok(Some(IndexLookupResult {
+            row_ids,
+            exact: true,
+        }))
+    }
+
+    /// Probe the longest leading equality prefix of a composite index. A
+    /// BTree can additionally constrain the next key element to an inclusive
+    /// range. Legacy composite indexes are rejected with a rebuild message.
+    pub fn lookup_composite_prefix(
+        &mut self,
+        columns: &[String],
+        equality_values: &HashMap<String, Value>,
+        range: Option<(&String, &Value, &Value)>,
+    ) -> io::Result<Option<IndexLookupResult>> {
+        let index_name = self
+            .catalog
+            .iter()
+            .find(|(_, meta)| {
+                meta.is_composite()
+                    && meta
+                        .effective_columns()
+                        .iter()
+                        .map(|c| *c)
+                        .eq(columns.iter().map(String::as_str))
+            })
+            .map(|(name, _)| name.clone());
+        let Some(index_name) = index_name else {
+            return Ok(None);
+        };
+        let meta = &self.catalog[&index_name];
+        if meta.key_format_version != TYPED_TUPLE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "composite index '{}' uses a legacy key format; rebuild the index",
+                    index_name
+                ),
+            ));
+        }
+        let mut prefix = Vec::new();
+        for column in columns {
+            match equality_values.get(column) {
+                Some(value) => prefix.push(IndexKey::from_value(value)),
+                None => break,
+            }
+        }
+        if prefix.is_empty() || prefix.len() == columns.len() {
+            return Ok(None);
+        }
+        let range_keys = match range {
+            Some((column, low, high)) if columns.get(prefix.len()) == Some(column) => {
+                Some((IndexKey::from_value(low), IndexKey::from_value(high)))
+            }
+            _ => None,
+        };
+        let instance = self.ensure_loaded(&index_name)?;
+        let row_ids = match instance {
+            IndexInstance::BTree(index) => {
+                index.tuple_prefix(&prefix, range_keys.as_ref().map(|(low, high)| (low, high)))
+            }
+            IndexInstance::Hash(index) if range_keys.is_none() => index.tuple_prefix(&prefix),
+            IndexInstance::Hash(_) => return Ok(None),
+        };
         Ok(Some(IndexLookupResult {
             row_ids,
             exact: true,
@@ -953,5 +1103,124 @@ mod tests {
         mgr.drop_index("idx_city_age").unwrap();
         assert!(!mgr.has_index_on("city"));
         assert!(!mgr.has_index_on("age"));
+    }
+
+    #[test]
+    fn typed_composite_keys_do_not_collide_on_embedded_nul() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = IndexManager::new("test_table", dir.path());
+        let columns = vec!["left".to_string(), "right".to_string()];
+        mgr.create_index_multi(
+            "idx_pair",
+            &columns,
+            IndexType::Hash,
+            false,
+            DataType::String,
+        )
+        .unwrap();
+        let first = HashMap::from([
+            ("left".to_string(), Value::String("a\0b".to_string())),
+            ("right".to_string(), Value::String("c".to_string())),
+        ]);
+        let second = HashMap::from([
+            ("left".to_string(), Value::String("a".to_string())),
+            ("right".to_string(), Value::String("b\0c".to_string())),
+        ]);
+        mgr.on_insert(10, &first).unwrap();
+        mgr.on_insert(20, &second).unwrap();
+        assert_eq!(
+            mgr.lookup_composite(&columns, &first)
+                .unwrap()
+                .unwrap()
+                .row_ids,
+            vec![10]
+        );
+        assert_eq!(
+            mgr.lookup_composite(&columns, &second)
+                .unwrap()
+                .unwrap()
+                .row_ids,
+            vec![20]
+        );
+    }
+
+    #[test]
+    fn composite_btree_supports_prefix_and_next_column_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = IndexManager::new("test_table", dir.path());
+        let columns = vec!["city".to_string(), "age".to_string()];
+        mgr.create_index_multi(
+            "idx_city_age",
+            &columns,
+            IndexType::BTree,
+            false,
+            DataType::String,
+        )
+        .unwrap();
+        for (row_id, city, age) in [
+            (1, "NYC", 20),
+            (2, "NYC", 30),
+            (3, "NYC", 40),
+            (4, "SF", 30),
+        ] {
+            mgr.on_insert(
+                row_id,
+                &HashMap::from([
+                    ("city".to_string(), Value::String(city.to_string())),
+                    ("age".to_string(), Value::Int64(age)),
+                ]),
+            )
+            .unwrap();
+        }
+        let equality = HashMap::from([("city".to_string(), Value::String("NYC".to_string()))]);
+        let prefix = mgr
+            .lookup_composite_prefix(&columns, &equality, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.row_ids, vec![1, 2, 3]);
+        let range_column = "age".to_string();
+        let low = Value::Int64(25);
+        let high = Value::Int64(35);
+        let ranged = mgr
+            .lookup_composite_prefix(&columns, &equality, Some((&range_column, &low, &high)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(ranged.row_ids, vec![2]);
+    }
+
+    #[test]
+    fn legacy_composite_catalog_requests_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path().join("indexes");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let legacy = HashMap::from([(
+            "idx_pair".to_string(),
+            LegacyIndexMeta {
+                name: "idx_pair".to_string(),
+                column_name: "left".to_string(),
+                index_type: IndexType::Hash,
+                unique: false,
+                data_type: DataType::String,
+                created_at: 0,
+                columns: vec!["left".to_string(), "right".to_string()],
+            },
+        )]);
+        std::fs::write(
+            index_dir.join("test_table.idxcat"),
+            bincode::serialize(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let mut mgr = IndexManager::load("test_table", dir.path()).unwrap();
+        let error = mgr
+            .lookup_composite(
+                &["left".to_string(), "right".to_string()],
+                &HashMap::from([
+                    ("left".to_string(), Value::String("a".to_string())),
+                    ("right".to_string(), Value::String("b".to_string())),
+                ]),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("rebuild the index"));
     }
 }

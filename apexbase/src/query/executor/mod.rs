@@ -29,7 +29,8 @@ use crate::query::jit::{
     simd_max_i64, simd_min_i64, simd_sum_f64, simd_sum_i64, ExprJIT, FilterFnI64,
 };
 use crate::query::planner::{
-    get_table_stats, invalidate_table_stats, ExecutionStrategy, QueryPlanner,
+    get_table_stats, invalidate_table_schema_stats, invalidate_table_stats, ExecutionStrategy,
+    QueryPlanner,
 };
 use crate::query::sql_parser::BinaryOperator;
 use crate::query::sql_parser::FromItem;

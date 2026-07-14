@@ -227,6 +227,57 @@ class TestIndexAcceleratedSelect:
         df = result.to_pandas()
         assert len(df) == 10
 
+    def test_composite_btree_prefix_equality_and_range(self, client):
+        rows = [
+            {"city": city, "age": age, "name": f"{city}_{age}"}
+            for city in ("NYC", "SF")
+            for age in (20, 30, 40)
+        ]
+        client.store(rows)
+        client.execute(
+            "CREATE INDEX idx_city_age ON idx_test (city, age) USING BTREE"
+        )
+
+        prefix = client.execute(
+            "SELECT name FROM idx_test WHERE city = 'NYC' ORDER BY name"
+        ).to_pandas()
+        assert prefix["name"].tolist() == ["NYC_20", "NYC_30", "NYC_40"]
+
+        ranged = client.execute(
+            "SELECT name FROM idx_test "
+            "WHERE city = 'NYC' AND age BETWEEN 20 AND 40 ORDER BY age"
+        ).to_pandas()
+        assert ranged["name"].tolist() == ["NYC_20", "NYC_30", "NYC_40"]
+
+    def test_and_intersection_and_or_union_are_exact(self, client):
+        rows = [
+            {
+                "city": "NYC" if i % 2 == 0 else "SF",
+                "age": 20 + i % 3,
+                "name": f"user_{i}",
+            }
+            for i in range(60)
+        ]
+        client.store(rows)
+        client.execute("CREATE INDEX idx_city ON idx_test (city)")
+        client.execute("CREATE INDEX idx_age ON idx_test (age)")
+
+        intersection = client.execute(
+            "SELECT name FROM idx_test "
+            "WHERE city = 'NYC' AND age = 21 ORDER BY name"
+        ).to_pandas()
+        assert intersection["name"].tolist() == sorted(
+            f"user_{i}" for i in range(60) if i % 2 == 0 and 20 + i % 3 == 21
+        )
+
+        union = client.execute(
+            "SELECT name FROM idx_test "
+            "WHERE city = 'NYC' OR age = 21 ORDER BY name"
+        ).to_pandas()
+        assert union["name"].tolist() == sorted(
+            f"user_{i}" for i in range(60) if i % 2 == 0 or 20 + i % 3 == 21
+        )
+
 
 class TestIndexWithDML:
     """Test that index stays in sync with INSERT/UPDATE/DELETE via SQL."""

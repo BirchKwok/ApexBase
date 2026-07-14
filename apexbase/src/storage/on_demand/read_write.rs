@@ -1330,6 +1330,12 @@ impl OnDemandStorage {
         id: u64,
     ) -> io::Result<Option<Vec<(String, crate::data::Value)>>> {
         use crate::data::Value;
+        // Freshly opened mmap backends load the footer lazily. Reading the
+        // cache directly before initialization makes every valid ID look
+        // absent, so ensure it is populated before the lock-only fast path.
+        if self.v4_footer.read().is_none() {
+            let _ = self.get_or_load_footer()?;
+        }
         // Extract only the fields we need — avoids cloning the full footer
         // (zone_maps, all row_groups, all col_offsets for every RG, schema strings).
         let (rg_offset, rg_rows, rg_min_id, col_offsets_rg, col_schema) = {

@@ -169,6 +169,24 @@ impl HashIndex {
         self.map.get(key).map(|v| v.as_slice())
     }
 
+    pub fn tuple_prefix(&self, prefix: &[IndexKey]) -> Vec<u64> {
+        let mut result = Vec::new();
+        for (key, ids) in &self.map {
+            if let IndexKey::Tuple { version: 1, values } = key {
+                if values.len() >= prefix.len()
+                    && values
+                        .iter()
+                        .zip(prefix)
+                        .all(|(value, expected)| value.semantically_eq(expected))
+                {
+                    result.extend_from_slice(ids);
+                }
+            }
+        }
+        result.sort_unstable();
+        result
+    }
+
     /// Check if a key exists
     pub fn contains_key(&self, key: &IndexKey) -> bool {
         self.map.contains_key(key)

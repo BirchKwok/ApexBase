@@ -1038,26 +1038,13 @@ impl ApexExecutor {
         if row_count > 0 {
             const INDEX_BUILD_BATCH_ROWS: usize = 65_536;
 
-            // Read _id column and all indexed columns
-            let mut col_refs_owned: Vec<String> = vec!["_id".to_string()];
-            for c in columns {
-                if !col_refs_owned.contains(c) {
-                    col_refs_owned.push(c.clone());
-                }
-            }
-            let col_refs: Vec<&str> = col_refs_owned.iter().map(|s| s.as_str()).collect();
-
             let build_result = (|| -> io::Result<()> {
                 let mut start_row = 0usize;
                 let total_rows = row_count as usize;
 
                 while start_row < total_rows {
                     let limit = (total_rows - start_row).min(INDEX_BUILD_BATCH_ROWS);
-                    let batch = storage.read_columns_to_arrow_window(
-                        Some(&col_refs),
-                        start_row,
-                        Some(limit),
-                    )?;
+                    let batch = storage.read_columns_to_arrow(None, start_row, Some(limit))?;
 
                     if batch.num_rows() == 0 {
                         break;
@@ -1238,12 +1225,53 @@ impl ApexExecutor {
 
     /// Extract a Value from an Arrow ArrayRef at a given row index (for index building)
     fn arrow_value_at_col(col: &ArrayRef, row: usize) -> Value {
-        use arrow::array::{BooleanArray, Float32Array};
+        use arrow::array::{
+            BooleanArray, DictionaryArray, Float32Array, Int16Array, Int32Array, Int8Array,
+            LargeStringArray, UInt16Array, UInt32Array, UInt8Array,
+        };
+        use arrow::datatypes::{
+            Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type,
+            UInt8Type,
+        };
         if col.is_null(row) {
             return Value::Null;
         }
-        if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+        macro_rules! dictionary_string {
+            ($key_type:ty) => {
+                if let Some(arr) = col.as_any().downcast_ref::<DictionaryArray<$key_type>>() {
+                    let key = arr.keys().value(row) as usize;
+                    return arr
+                        .values()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .filter(|values| key < values.len())
+                        .map(|values| Value::String(values.value(key).to_string()))
+                        .unwrap_or(Value::Null);
+                }
+            };
+        }
+        dictionary_string!(Int8Type);
+        dictionary_string!(Int16Type);
+        dictionary_string!(Int32Type);
+        dictionary_string!(Int64Type);
+        dictionary_string!(UInt8Type);
+        dictionary_string!(UInt16Type);
+        dictionary_string!(UInt32Type);
+        dictionary_string!(UInt64Type);
+        if let Some(arr) = col.as_any().downcast_ref::<Int8Array>() {
+            Value::Int8(arr.value(row))
+        } else if let Some(arr) = col.as_any().downcast_ref::<Int16Array>() {
+            Value::Int16(arr.value(row))
+        } else if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+            Value::Int32(arr.value(row))
+        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
             Value::Int64(arr.value(row))
+        } else if let Some(arr) = col.as_any().downcast_ref::<UInt8Array>() {
+            Value::UInt8(arr.value(row))
+        } else if let Some(arr) = col.as_any().downcast_ref::<UInt16Array>() {
+            Value::UInt16(arr.value(row))
+        } else if let Some(arr) = col.as_any().downcast_ref::<UInt32Array>() {
+            Value::UInt32(arr.value(row))
         } else if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
             Value::UInt64(arr.value(row))
         } else if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
@@ -1252,10 +1280,25 @@ impl ApexExecutor {
             Value::Float32(arr.value(row))
         } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
             Value::String(arr.value(row).to_string())
+        } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+            Value::String(arr.value(row).to_string())
         } else if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
             Value::Bool(arr.value(row))
         } else {
-            Value::Null
+            // Projection/window readers may expose encoded Arrow types that
+            // differ from the full-scan representation. Preserve index
+            // correctness by decoding the scalar display form as a final,
+            // cold-path fallback during index maintenance and ANALYZE.
+            arrow::util::display::array_value_to_string(col.as_ref(), row)
+                .ok()
+                .map(|value| {
+                    value
+                        .parse::<i64>()
+                        .map(Value::Int64)
+                        .or_else(|_| value.parse::<f64>().map(Value::Float64))
+                        .unwrap_or_else(|_| Value::String(value))
+                })
+                .unwrap_or(Value::Null)
         }
     }
 
@@ -1296,7 +1339,11 @@ impl ApexExecutor {
         let indexed_cols: Vec<String> = idx_mgr
             .list_indexes()
             .iter()
-            .map(|m| m.column_name.clone())
+            .flat_map(|meta| {
+                meta.effective_columns()
+                    .into_iter()
+                    .map(str::to_owned)
+            })
             .collect();
         let mut col_names: Vec<String> = vec!["_id".to_string()];
         col_names.extend(indexed_cols.iter().cloned());
@@ -1380,7 +1427,11 @@ impl ApexExecutor {
         let indexed_cols: Vec<String> = idx_mgr
             .list_indexes()
             .iter()
-            .map(|m| m.column_name.clone())
+            .flat_map(|meta| {
+                meta.effective_columns()
+                    .into_iter()
+                    .map(str::to_owned)
+            })
             .collect();
         let mut col_names: Vec<String> = vec!["_id".to_string()];
         col_names.extend(indexed_cols.iter().cloned());
@@ -2616,6 +2667,7 @@ impl ApexExecutor {
             // NDV for normal tables, but sample very large columns so ANALYZE
             // does not allocate one string per row indefinitely.
             let mut distinct = std::collections::HashSet::new();
+            let mut frequencies = std::collections::HashMap::<String, u64>::new();
             let mut min_s = String::new();
             let mut max_s = String::new();
             let mut numeric_min: Option<f64> = None;
@@ -2632,6 +2684,7 @@ impl ApexExecutor {
                 let val_str = value.to_string();
                 if i % sample_stride == 0 {
                     distinct.insert(val_str.clone());
+                    *frequencies.entry(val_str.clone()).or_default() += 1;
                 }
                 let numeric = match value {
                     Value::Int64(v) => Some(v as f64),
@@ -2663,6 +2716,12 @@ impl ApexExecutor {
                 ((distinct.len() as f64 * num_rows as f64 / sampled_rows as f64).round() as u64)
                     .min(num_rows as u64)
             };
+            let mut most_common_values: Vec<(String, u64)> = frequencies
+                .into_iter()
+                .map(|(value, count)| (value, count.saturating_mul(sample_stride as u64)))
+                .collect();
+            most_common_values.sort_unstable_by(|left, right| right.1.cmp(&left.1));
+            most_common_values.truncate(16);
             ndv_vals.push(estimated_ndv as i64);
             min_vals.push(min_s.clone());
             max_vals.push(max_s.clone());
@@ -2715,12 +2774,16 @@ impl ApexExecutor {
                     numeric_min,
                     numeric_max,
                     histogram,
+                    most_common_values,
                 },
             );
         }
 
         // Store stats in CBO cache for cost-based optimization
         let table_stats = crate::query::planner::TableStats {
+            schema_version: 0,
+            schema_generation: 0,
+            data_generation: 0,
             row_count: num_rows as u64,
             columns: col_stats_map,
             collected_at: std::time::SystemTime::now()
@@ -2810,22 +2873,11 @@ impl ApexExecutor {
         let row_count = storage.row_count();
         if row_count > 0 {
             const INDEX_BUILD_BATCH_ROWS: usize = 65_536;
-            let mut col_names: Vec<String> = vec!["_id".to_string()];
-            for (_, cols) in &indexes {
-                for col in cols {
-                    if !col_names.contains(col) {
-                        col_names.push(col.clone());
-                    }
-                }
-            }
-            let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-
             let mut start_row = 0usize;
             let total_rows = row_count as usize;
             while start_row < total_rows {
                 let limit = (total_rows - start_row).min(INDEX_BUILD_BATCH_ROWS);
-                let batch =
-                    storage.read_columns_to_arrow_window(Some(&col_refs), start_row, Some(limit))?;
+                let batch = storage.read_columns_to_arrow(None, start_row, Some(limit))?;
                 if batch.num_rows() == 0 {
                     break;
                 }
@@ -2845,10 +2897,14 @@ impl ApexExecutor {
                         (start_row + row) as u64
                     };
 
-                    let mut col_vals = std::collections::HashMap::with_capacity(col_names.len());
-                    for col in col_names.iter().filter(|col| col.as_str() != "_id") {
-                        if let Some(data_col) = batch.column_by_name(col) {
-                            col_vals.insert(col.clone(), Self::arrow_value_at_col(data_col, row));
+                    let mut col_vals =
+                        std::collections::HashMap::with_capacity(batch.num_columns());
+                    for (column_index, field) in batch.schema().fields().iter().enumerate() {
+                        if field.name() != "_id" {
+                            col_vals.insert(
+                                field.name().clone(),
+                                Self::arrow_value_at_col(batch.column(column_index), row),
+                            );
                         }
                     }
                     idx_mgr.on_insert(row_id, &col_vals)?;

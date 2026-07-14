@@ -5493,6 +5493,57 @@ impl OnDemandStorage {
         Ok(Some(result))
     }
 
+    /// Estimate rows and row groups that survive numeric zone-map pruning.
+    /// Returns `(matching_rows, total_rows, matching_groups, total_groups)`.
+    pub fn estimate_zone_map_range(
+        &self,
+        col_name: &str,
+        low: f64,
+        high: f64,
+    ) -> io::Result<Option<(u64, u64, u32, u32)>> {
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(None);
+        };
+        let Some(col_idx) = footer.schema.get_index(col_name) else {
+            return Ok(None);
+        };
+        let low_i = low.ceil() as i64;
+        let high_i = high.floor() as i64;
+        let mut matching_rows = 0u64;
+        let mut total_rows = 0u64;
+        let mut matching_groups = 0u32;
+        let mut saw_zone_map = false;
+        for (rg_idx, row_group) in footer.row_groups.iter().enumerate() {
+            let active = row_group.active_rows() as u64;
+            total_rows = total_rows.saturating_add(active);
+            let zone_map = footer
+                .zone_maps
+                .get(rg_idx)
+                .and_then(|maps| maps.iter().find(|map| map.col_idx as usize == col_idx));
+            let may_match = match zone_map {
+                Some(map) => {
+                    saw_zone_map = true;
+                    if map.is_float {
+                        map.may_overlap_float_range(low, high)
+                    } else {
+                        map.may_overlap_int_range(low_i, high_i)
+                    }
+                }
+                None => true,
+            };
+            if may_match && active > 0 {
+                matching_rows = matching_rows.saturating_add(active);
+                matching_groups = matching_groups.saturating_add(1);
+            }
+        }
+        Ok(saw_zone_map.then_some((
+            matching_rows,
+            total_rows,
+            matching_groups,
+            footer.row_groups.len() as u32,
+        )))
+    }
+
     /// Direct mmap top-K scan: finds top-k row indices by a numeric column without materializing
     /// the full Arrow array. Uses RCIX + zone maps for O(N_rows) with O(k) heap in L1 cache.
     /// Returns Vec<(global_row_idx, value)> sorted in the requested order.

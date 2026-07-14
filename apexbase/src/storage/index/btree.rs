@@ -27,6 +27,12 @@ pub enum IndexKey {
     Float(u64),
     Str(String),
     Bytes(Vec<u8>),
+    /// Versioned, typed composite key. Each element retains its scalar type,
+    /// so values such as ("a\0b", "c") and ("a", "b\0c") cannot collide.
+    Tuple {
+        version: u8,
+        values: Vec<IndexKey>,
+    },
 }
 
 impl IndexKey {
@@ -53,6 +59,22 @@ impl IndexKey {
             Value::Json(j) => IndexKey::Str(j.to_string()),
             Value::Array(_) => IndexKey::Null,
             Value::FixedList(_) => IndexKey::Null,
+        }
+    }
+
+    pub(crate) fn semantically_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (IndexKey::Int(left), IndexKey::UInt(right)) => *left >= 0 && *left as u64 == *right,
+            (IndexKey::UInt(left), IndexKey::Int(right)) => *right >= 0 && *left == *right as u64,
+            (IndexKey::Float(left), IndexKey::Int(right))
+            | (IndexKey::Int(right), IndexKey::Float(left)) => {
+                f64::from_bits(*left) == *right as f64
+            }
+            (IndexKey::Float(left), IndexKey::UInt(right))
+            | (IndexKey::UInt(right), IndexKey::Float(left)) => {
+                f64::from_bits(*left) == *right as f64
+            }
+            _ => self == other,
         }
     }
 }
@@ -94,6 +116,16 @@ impl Ord for IndexKey {
             }
             (IndexKey::Str(a), IndexKey::Str(b)) => a.cmp(b),
             (IndexKey::Bytes(a), IndexKey::Bytes(b)) => a.cmp(b),
+            (
+                IndexKey::Tuple {
+                    version: av,
+                    values: a,
+                },
+                IndexKey::Tuple {
+                    version: bv,
+                    values: b,
+                },
+            ) => av.cmp(bv).then_with(|| a.cmp(b)),
             // Cross-type: use discriminant index for ordering
             _ => {
                 fn disc_index(k: &IndexKey) -> u8 {
@@ -105,6 +137,7 @@ impl Ord for IndexKey {
                         IndexKey::Float(_) => 4,
                         IndexKey::Str(_) => 5,
                         IndexKey::Bytes(_) => 6,
+                        IndexKey::Tuple { .. } => 7,
                     }
                 }
                 disc_index(self).cmp(&disc_index(other))
@@ -125,6 +158,10 @@ impl std::hash::Hash for IndexKey {
             IndexKey::Float(v) => v.hash(state),
             IndexKey::Str(s) => s.hash(state),
             IndexKey::Bytes(b) => b.hash(state),
+            IndexKey::Tuple { version, values } => {
+                version.hash(state);
+                values.hash(state);
+            }
         }
     }
 }
@@ -293,6 +330,39 @@ impl BTreeIndex {
     pub fn range_inclusive(&self, start: &IndexKey, end: &IndexKey) -> Vec<u64> {
         let mut result = Vec::new();
         for (_, ids) in self.tree.range(start.clone()..=end.clone()) {
+            result.extend_from_slice(ids);
+        }
+        result
+    }
+
+    /// Return rows whose typed tuple begins with `prefix`, optionally applying
+    /// a range predicate to the immediately following tuple element.
+    pub fn tuple_prefix(
+        &self,
+        prefix: &[IndexKey],
+        range: Option<(&IndexKey, &IndexKey)>,
+    ) -> Vec<u64> {
+        let mut result = Vec::new();
+        for (key, ids) in &self.tree {
+            let IndexKey::Tuple { version: 1, values } = key else {
+                continue;
+            };
+            if values.len() < prefix.len()
+                || !values
+                    .iter()
+                    .zip(prefix)
+                    .all(|(value, expected)| value.semantically_eq(expected))
+            {
+                continue;
+            }
+            if let Some((low, high)) = range {
+                let Some(value) = values.get(prefix.len()) else {
+                    continue;
+                };
+                if value < low || value > high {
+                    continue;
+                }
+            }
             result.extend_from_slice(ids);
         }
         result

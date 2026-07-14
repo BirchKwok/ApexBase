@@ -171,6 +171,7 @@ impl ApexExecutor {
         }
         
         std::fs::remove_file(table_path)?;
+        invalidate_table_schema_stats(&table_path.to_string_lossy());
         
         // Clean up associated files (WAL, delta, deltastore) in same directory as table
         let parent_dir = table_path.parent().unwrap_or(table_path);
@@ -234,6 +235,7 @@ impl ApexExecutor {
         
         // Invalidate all caches after write to ensure subsequent reads get fresh data
         invalidate_storage_cache(&table_path);
+        invalidate_table_schema_stats(&table_path.to_string_lossy());
         crate::storage::engine::engine().invalidate(&table_path);
         
         Ok(ApexResult::Scalar(0))
@@ -340,9 +342,7 @@ impl ApexExecutor {
                             select,
                             Some(&*index_guard),
                             &table_path.to_string_lossy(),
-                            crate::query::planner::PlannerContext {
-                                mmap_only: backend.is_mmap_only(),
-                            },
+                            Self::planner_context(&backend, select.where_clause.as_ref()),
                         );
                         plan_lines.push(format!(
                             "  Chosen Plan: {:?} (estimated_cost={:.3}, estimated_rows={:.1}, stats={})",
@@ -350,6 +350,10 @@ impl ApexExecutor {
                             plan.cost.total,
                             plan.cost.output_rows,
                             if plan.stats_available { "available" } else { "default" }
+                        ));
+                        plan_lines.push(format!(
+                            "    Planning Time: {:.3}ms",
+                            plan.planning_time_micros as f64 / 1000.0
                         ));
                         if plan.feedback_applied {
                             plan_lines.push("    Feedback: applied".to_string());
@@ -475,7 +479,14 @@ impl ApexExecutor {
             let start = std::time::Instant::now();
             let result = Self::execute_parsed_multi(stmt.clone(), base_dir, default_table_path)?;
             let elapsed = start.elapsed();
-            plan_lines.push(format!("  Actual Time: {:.3}ms", elapsed.as_secs_f64() * 1000.0));
+            plan_lines.push(format!(
+                "  Execution Time: {:.3}ms",
+                elapsed.as_secs_f64() * 1000.0
+            ));
+            plan_lines.push(format!(
+                "  Actual Time: {:.3}ms",
+                elapsed.as_secs_f64() * 1000.0
+            ));
             if let Ok(batch) = result.to_record_batch() {
                 plan_lines.push(format!("  Actual Rows: {}", batch.num_rows()));
 
@@ -490,9 +501,7 @@ impl ApexExecutor {
                                 select,
                                 Some(&*index_guard),
                                 &table_path.to_string_lossy(),
-                                crate::query::planner::PlannerContext {
-                                    mmap_only: backend.is_mmap_only(),
-                                },
+                                Self::planner_context(&backend, select.where_clause.as_ref()),
                             );
                             crate::query::planner::record_plan_feedback(
                                 &table_path.to_string_lossy(),
@@ -1903,6 +1912,8 @@ impl ApexExecutor {
         let binaries: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut bools: HashMap<String, Vec<bool>> = HashMap::new();
         let mut nulls: HashMap<String, Vec<bool>> = HashMap::new();
+        let backend = TableStorageBackend::open_for_write(target_path)?;
+        let target_types: HashMap<String, DataType> = backend.get_schema().into_iter().collect();
 
         for (index, field) in batch.schema().fields().iter().enumerate() {
             if field.name() == "_id" { continue; }
@@ -1913,17 +1924,35 @@ impl ApexExecutor {
                 ArrowDataType::Int64 => {
                     let values = array.as_any().downcast_ref::<Int64Array>()
                         .ok_or_else(|| err_data(format!("Invalid Int64 column {}", name)))?;
-                    ints.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { 0 } else { values.value(row) }).collect());
+                    if matches!(target_types.get(&name), Some(DataType::Float32 | DataType::Float64)) {
+                        floats.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { 0.0 } else { values.value(row) as f64 }).collect());
+                    } else {
+                        ints.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { 0 } else { values.value(row) }).collect());
+                    }
                 }
                 ArrowDataType::UInt64 => {
                     let values = array.as_any().downcast_ref::<UInt64Array>()
                         .ok_or_else(|| err_data(format!("Invalid UInt64 column {}", name)))?;
-                    ints.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { 0 } else { values.value(row) as i64 }).collect());
+                    if matches!(target_types.get(&name), Some(DataType::Float32 | DataType::Float64)) {
+                        floats.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { 0.0 } else { values.value(row) as f64 }).collect());
+                    } else {
+                        ints.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { 0 } else { values.value(row) as i64 }).collect());
+                    }
                 }
                 ArrowDataType::Float64 => {
                     let values = array.as_any().downcast_ref::<Float64Array>()
                         .ok_or_else(|| err_data(format!("Invalid Float64 column {}", name)))?;
-                    floats.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { 0.0 } else { values.value(row) }).collect());
+                    if matches!(
+                        target_types.get(&name),
+                        Some(
+                            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                                | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+                        )
+                    ) {
+                        ints.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { 0 } else { values.value(row) as i64 }).collect());
+                    } else {
+                        floats.insert(name.clone(), (0..rows).map(|row| if values.is_null(row) { 0.0 } else { values.value(row) }).collect());
+                    }
                 }
                 ArrowDataType::Boolean => {
                     let values = array.as_any().downcast_ref::<BooleanArray>()
@@ -1963,7 +1992,6 @@ impl ApexExecutor {
             nulls.insert(name.clone(), null_bitmap);
         }
 
-        let backend = TableStorageBackend::open_for_write(target_path)?;
         let inserted = backend.insert_typed_with_nulls(
             ints, floats, strings, binaries, bools, nulls,
         )?.len();

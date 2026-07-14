@@ -98,6 +98,8 @@ class TestExplain:
         plan = get_rows(result)[0][0]
         assert 'Actual Time' in plan
         assert 'Actual Rows' in plan
+        assert 'Planning Time' in plan
+        assert 'Execution Time' in plan
 
     def test_explain_insert(self, db_with_data):
         result = db_with_data.execute("EXPLAIN INSERT INTO users (name, age, city) VALUES ('Frank', 40, 'SF')")
@@ -124,6 +126,13 @@ class TestExplain:
         assert "Candidate:" in plan
         assert "stats=" in plan
 
+        zone_plan = get_rows(
+            db_with_data.execute(
+                "EXPLAIN SELECT name FROM users WHERE age BETWEEN 25 AND 35"
+            )
+        )[0][0]
+        assert "zone-map-scan(" in zone_plan
+
     def test_explain_cbo_candidate_invariants(self, db_with_data):
         db_with_data.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_city_age ON users (city, age)"
@@ -143,6 +152,7 @@ class TestExplain:
         plan = get_rows(result)[0][0]
         assert "index-scan(age)" not in plan
         assert "index-range-scan(age)" not in plan
+        assert "index-union(deduplicated)" in plan
 
         db_with_data.execute("ANALYZE users")
         before = get_rows(

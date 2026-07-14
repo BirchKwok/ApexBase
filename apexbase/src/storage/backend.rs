@@ -2886,7 +2886,9 @@ impl TableStorageBackend {
         ids: &[u64],
     ) -> io::Result<arrow::record_batch::RecordBatch> {
         use crate::data::Value;
-        use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+        use arrow::array::{
+            ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array,
+        };
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use std::sync::Arc;
@@ -2900,7 +2902,7 @@ impl TableStorageBackend {
         if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
             if let Ok(Some(batch)) = self.storage.retrieve_many_mmap(ids) {
                 let batch = self.apply_delta_overlay_to_batch(batch)?;
-                if !self.has_delta() || batch.num_rows() == ids.len() {
+                if batch.num_rows() > 0 && (!self.has_delta() || batch.num_rows() == ids.len()) {
                     return Ok(batch);
                 }
 
@@ -2930,6 +2932,44 @@ impl TableStorageBackend {
                 return arrow::compute::concat_batches(&schema, refs)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
             }
+        }
+
+        // RCIX is optional for older V4 row groups. Reuse the single-row
+        // generic fallback while preserving a stable schema for concatenation.
+        let mut point_batches = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(batch) = self.read_row_by_id_to_arrow(id)? {
+                point_batches.push(batch);
+            }
+        }
+        if point_batches.len() == ids.len() {
+            let schema = point_batches[0].schema();
+            return arrow::compute::concat_batches(&schema, &point_batches)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+        }
+
+        // Last-resort compatibility path for V4 row groups without RCIX.
+        // A regular scan already applies deletion and delta overlays; select
+        // only the requested IDs in caller order to preserve lookup semantics.
+        let full_batch = self.read_columns_to_arrow(None, 0, None)?;
+        if let Some(id_col) = full_batch.column_by_name("_id") {
+            let mut positions = std::collections::HashMap::with_capacity(full_batch.num_rows());
+            if let Some(array) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                for row in 0..array.len() {
+                    positions.insert(array.value(row), row as u32);
+                }
+            } else if let Some(array) = id_col.as_any().downcast_ref::<Int64Array>() {
+                for row in 0..array.len() {
+                    positions.insert(array.value(row) as u64, row as u32);
+                }
+            }
+            let indices = arrow::array::UInt32Array::from(
+                ids.iter()
+                    .filter_map(|id| positions.get(id).copied())
+                    .collect::<Vec<_>>(),
+            );
+            return arrow::compute::take_record_batch(&full_batch, &indices)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
         }
 
         // Fallback: per-ID retrieve_rcix loop (non-RCIX RGs)
@@ -3775,6 +3815,15 @@ impl TableStorageBackend {
     ) -> io::Result<Option<Vec<u64>>> {
         self.storage
             .scan_numeric_range_mmap_with_ids(col_name, low, high)
+    }
+
+    pub fn estimate_zone_map_range(
+        &self,
+        col_name: &str,
+        low: f64,
+        high: f64,
+    ) -> io::Result<Option<(u64, u64, u32, u32)>> {
+        self.storage.estimate_zone_map_range(col_name, low, high)
     }
 
     /// Single-pass scan + mark deleted + save for numeric predicates.

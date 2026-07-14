@@ -463,9 +463,7 @@ impl ApexExecutor {
                                         &stmt,
                                         Some(&*idx_mgr),
                                         &table_key,
-                                        crate::query::planner::PlannerContext {
-                                            mmap_only: backend.is_mmap_only(),
-                                        },
+                                        Self::planner_context(&backend, stmt.where_clause.as_ref()),
                                     );
                                     matches!(
                                         cbo_plan.strategy,
@@ -1269,11 +1267,6 @@ impl ApexExecutor {
         use crate::query::sql_parser::BinaryOperator;
         use crate::storage::index::index_manager::PredicateHint;
 
-        // Skip index path for mmap-only: per-row reads would each do a full mmap scan
-        if backend.is_mmap_only() {
-            return Ok(None);
-        }
-
         // Only use index for simple queries: no GROUP BY, no aggregation, no JOIN
         if !stmt.group_by.is_empty() || !stmt.joins.is_empty() {
             return Ok(None);
@@ -1300,6 +1293,14 @@ impl ApexExecutor {
         let idx_mgr_arc = get_index_manager(&bd, &tname);
         let mut idx_mgr = idx_mgr_arc.lock();
 
+        // OR is only legal when every branch can be satisfied by indexes. The
+        // complete predicate is still reapplied after union and deduplication.
+        let disjunctive_row_ids = if Self::contains_disjunction(where_clause) {
+            Self::lookup_index_expression(&mut idx_mgr, where_clause)?
+        } else {
+            None
+        };
+
         // Filter to predicates that have usable single-column indexes.  A
         // composite index is handled separately below because its key must be
         // built from all indexed equality columns.
@@ -1310,6 +1311,10 @@ impl ApexExecutor {
                 _ => None,
             })
             .collect();
+        let range_values = predicates.iter().find_map(|(column, hint)| match hint {
+            PredicateHint::Range { low, high } => Some((column.clone(), low.clone(), high.clone())),
+            _ => None,
+        });
         let indexed_preds: Vec<(String, PredicateHint)> = predicates
             .into_iter()
             .filter(|(col, _)| idx_mgr.has_single_column_index_on(col))
@@ -1324,13 +1329,38 @@ impl ApexExecutor {
                     .map(|column| column.to_string())
                     .collect::<Vec<_>>()
             })
-            .find(|columns| {
-                columns.len() > 1 && columns.iter().all(|column| equality_values.contains_key(column))
-            });
+            .filter_map(|columns| {
+                let prefix_len = columns
+                    .iter()
+                    .take_while(|column| equality_values.contains_key(*column))
+                    .count();
+                (prefix_len > 0).then_some((columns, prefix_len))
+            })
+            .max_by_key(|(_, prefix_len)| *prefix_len);
 
-        if indexed_preds.is_empty() && composite_columns.is_none() {
+        if indexed_preds.is_empty() && composite_columns.is_none() && disjunctive_row_ids.is_none() {
             return Ok(None);
         }
+
+        let ordered_index_column = composite_columns
+            .as_ref()
+            .and_then(|(columns, prefix_len)| columns.get(*prefix_len).cloned())
+            .or_else(|| {
+                if composite_columns.is_some() || indexed_preds.len() != 1 {
+                    return None;
+                }
+                indexed_preds.iter().find_map(|(column, hint)| {
+                    matches!(
+                        hint,
+                        PredicateHint::Range { .. }
+                            | PredicateHint::Gt(_)
+                            | PredicateHint::Gte(_)
+                            | PredicateHint::Lt(_)
+                            | PredicateHint::Lte(_)
+                    )
+                    .then(|| column.clone())
+                })
+            });
 
         // CBO: Pre-estimate selectivity using ANALYZE stats before expensive index lookup
         let table_key = storage_path.to_string_lossy();
@@ -1345,10 +1375,22 @@ impl ApexExecutor {
 
         // Look up a complete composite key first, then intersect any
         // independent single-column indexes.
-        let mut row_ids: Option<Vec<u64>> = None;
-        if let Some(columns) = composite_columns.as_ref() {
-            if let Some(result) = idx_mgr.lookup_composite(columns, &equality_values)? {
-                row_ids = Some(result.row_ids);
+        let mut row_ids: Option<Vec<u64>> = disjunctive_row_ids;
+        if let Some((columns, prefix_len)) = composite_columns.as_ref() {
+            let lookup = if *prefix_len == columns.len() {
+                idx_mgr.lookup_composite(columns, &equality_values)?
+            } else {
+                idx_mgr.lookup_composite_prefix(
+                    columns,
+                    &equality_values,
+                    range_values.as_ref().map(|(column, low, high)| (column, low, high)),
+                )?
+            };
+            if let Some(result) = lookup {
+                row_ids = Some(match row_ids {
+                    Some(existing) => Self::intersect_row_ids(existing, result.row_ids),
+                    None => result.row_ids,
+                });
             }
         }
         for (col_name, hint) in &indexed_preds {
@@ -1357,12 +1399,7 @@ impl ApexExecutor {
                 Some(r) => {
                     row_ids = Some(match row_ids {
                         None => r.row_ids,
-                        Some(existing) => {
-                            // Intersect: keep only IDs in both sets
-                            let set: std::collections::HashSet<u64> =
-                                r.row_ids.into_iter().collect();
-                            existing.into_iter().filter(|id| set.contains(id)).collect()
-                        }
+                        Some(existing) => Self::intersect_row_ids(existing, r.row_ids),
                     });
                 }
                 None => {
@@ -1403,49 +1440,75 @@ impl ApexExecutor {
             .chain(
                 composite_columns
                     .iter()
-                    .flatten()
-                    .cloned(),
+                    .flat_map(|(columns, _)| columns.iter().cloned()),
             )
             .collect();
         let full_predicate_covered = Self::is_fully_indexable_predicate(
             where_clause,
             &indexed_columns,
         );
-        if full_predicate_covered && composite_columns.is_none() {
-            if let Some(covered) = Self::try_index_only_scan(stmt, &indexed_preds, &row_ids)? {
+        let composite_is_full_equality = composite_columns
+            .as_ref()
+            .map(|(columns, prefix_len)| *prefix_len == columns.len())
+            .unwrap_or(false);
+        if full_predicate_covered
+            && (composite_columns.is_none() || composite_is_full_equality)
+        {
+            let mut covering_preds = indexed_preds.clone();
+            for (column, value) in &equality_values {
+                if !covering_preds
+                    .iter()
+                    .any(|(candidate, _)| candidate == column)
+                {
+                    covering_preds.push((column.clone(), PredicateHint::Eq(value.clone())));
+                }
+            }
+            if let Some(covered) = Self::try_index_only_scan(stmt, &covering_preds, &row_ids)? {
                 return Ok(Some(covered));
             }
         }
 
-        // Read matching rows one by one and concatenate them.  The residual
-        // filter below intentionally runs on the complete row batch.
-        let mut batches: Vec<RecordBatch> = Vec::with_capacity(row_ids.len().min(1024));
-        for &rid in &row_ids {
-            if let Some(batch) = backend.read_row_by_id_to_arrow(rid)? {
-                batches.push(batch);
+        // Batch materialization amortizes mmap/footer work. Tiny probes retain
+        // the lower-latency point path; the crossover is benchmarked.
+        const BATCH_ROW_ID_THRESHOLD: usize = 8;
+        let combined = if row_ids.len() >= BATCH_ROW_ID_THRESHOLD {
+            backend.read_rows_by_ids_to_arrow(&row_ids)?
+        } else {
+            let mut batches: Vec<RecordBatch> = Vec::with_capacity(row_ids.len());
+            for &rid in &row_ids {
+                if let Some(batch) = backend.read_row_by_id_to_arrow(rid)? {
+                    batches.push(batch);
+                }
             }
-        }
-        if batches.is_empty() {
+            if batches.len() != row_ids.len() {
+                backend.read_rows_by_ids_to_arrow(&row_ids)?
+            } else {
+                let schema = batches[0].schema();
+                arrow::compute::concat_batches(&schema, &batches)
+                    .map_err(|e| err_data(e.to_string()))?
+            }
+        };
+        if combined.num_rows() == 0 {
             let empty = backend.read_columns_to_arrow(None, 0, Some(0))?;
             return Ok(Some(ApexResult::Empty(empty.schema())));
         }
-        let schema = batches[0].schema();
-        let combined = arrow::compute::concat_batches(&schema, &batches)
-            .map_err(|e| err_data(e.to_string()))?;
 
         // Indexes produce candidate rows.  Always apply the original WHERE so
         // non-indexed residual predicates remain correct.
-        let filtered = Self::apply_filter_with_storage(
-            &combined,
-            where_clause,
-            storage_path,
-        )?;
+        let filtered = if full_predicate_covered && composite_is_full_equality {
+            combined
+        } else {
+            Self::apply_filter_with_storage(&combined, where_clause, storage_path)?
+        };
         if filtered.num_rows() == 0 {
             return Ok(Some(ApexResult::Empty(filtered.schema())));
         }
 
         // Apply ORDER BY if present after residual filtering.
-        let sorted = if !stmt.order_by.is_empty() {
+        let index_order_satisfies = stmt.order_by.len() == 1
+            && !stmt.order_by[0].descending
+            && ordered_index_column.as_deref() == Some(stmt.order_by[0].column.as_str());
+        let sorted = if !stmt.order_by.is_empty() && !index_order_satisfies {
             Self::apply_order_by(&filtered, &stmt.order_by)?
         } else {
             filtered
@@ -1480,6 +1543,105 @@ impl ApexExecutor {
             return Ok(Some(ApexResult::Empty(result.schema())));
         }
         Ok(Some(ApexResult::Data(result)))
+    }
+
+    fn contains_disjunction(expr: &SqlExpr) -> bool {
+        matches!(expr, SqlExpr::BinaryOp { op: BinaryOperator::Or, .. })
+            || match expr {
+                SqlExpr::BinaryOp { left, right, .. } => {
+                    Self::contains_disjunction(left) || Self::contains_disjunction(right)
+                }
+                SqlExpr::Paren(inner) => Self::contains_disjunction(inner),
+                _ => false,
+            }
+    }
+
+    fn planner_context(
+        backend: &TableStorageBackend,
+        where_clause: Option<&SqlExpr>,
+    ) -> crate::query::planner::PlannerContext {
+        let zone_map = match where_clause {
+            Some(SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated: false,
+            }) => Self::expr_to_value(low)
+                .and_then(|value| value.as_f64())
+                .zip(Self::expr_to_value(high).and_then(|value| value.as_f64()))
+                .and_then(|(low, high)| {
+                    backend
+                        .estimate_zone_map_range(column, low, high)
+                        .ok()
+                        .flatten()
+                }),
+            _ => None,
+        };
+        crate::query::planner::PlannerContext {
+            mmap_only: backend.is_mmap_only(),
+            zone_map,
+        }
+    }
+
+    fn intersect_row_ids(mut left: Vec<u64>, mut right: Vec<u64>) -> Vec<u64> {
+        left.sort_unstable();
+        right.sort_unstable();
+        let mut out = Vec::with_capacity(left.len().min(right.len()));
+        let (mut i, mut j) = (0, 0);
+        while i < left.len() && j < right.len() {
+            match left[i].cmp(&right[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    if out.last() != Some(&left[i]) { out.push(left[i]); }
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        out
+    }
+
+    fn union_row_ids(mut left: Vec<u64>, right: Vec<u64>) -> Vec<u64> {
+        left.extend(right);
+        left.sort_unstable();
+        left.dedup();
+        left
+    }
+
+    fn lookup_index_expression(
+        indexes: &mut crate::storage::index::IndexManager,
+        expr: &SqlExpr,
+    ) -> io::Result<Option<Vec<u64>>> {
+        match expr {
+            SqlExpr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+                let left = Self::lookup_index_expression(indexes, left)?;
+                let right = Self::lookup_index_expression(indexes, right)?;
+                Ok(left.zip(right).map(|(left, right)| Self::union_row_ids(left, right)))
+            }
+            SqlExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                let left = Self::lookup_index_expression(indexes, left)?;
+                let right = Self::lookup_index_expression(indexes, right)?;
+                Ok(match (left, right) {
+                    (Some(left), Some(right)) => Some(Self::intersect_row_ids(left, right)),
+                    (Some(ids), None) | (None, Some(ids)) => Some(ids),
+                    (None, None) => None,
+                })
+            }
+            SqlExpr::Paren(inner) => Self::lookup_index_expression(indexes, inner),
+            _ => {
+                let mut predicates = Vec::with_capacity(1);
+                Self::extract_index_predicates(expr, &mut predicates);
+                if predicates.len() != 1 {
+                    return Ok(None);
+                }
+                let (column, hint) = predicates.pop().unwrap();
+                if !indexes.has_single_column_index_on(&column) {
+                    return Ok(None);
+                }
+                Ok(indexes.lookup(&column, &hint)?.map(|result| result.row_ids))
+            }
+        }
     }
 
     /// Return true only when every predicate can be represented by an index

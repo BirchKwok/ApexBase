@@ -34,9 +34,9 @@ use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use crate::data::Value;
 use crate::query::sql_parser::BinaryOperator;
 use crate::query::{SelectColumn, SelectStatement, SqlExpr, SqlStatement};
-use crate::data::Value;
 use crate::storage::index::IndexManager;
 
 // ============================================================================
@@ -62,6 +62,10 @@ pub struct ColumnStats {
     /// Optional equi-width histogram for numeric predicates.
     #[serde(default)]
     pub histogram: Vec<HistogramBucket>,
+    /// Most common values and their estimated frequencies. Values use the
+    /// same canonical string representation as ANALYZE min/max.
+    #[serde(default)]
+    pub most_common_values: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +78,15 @@ pub struct HistogramBucket {
 /// Per-table statistics collected by ANALYZE
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableStats {
+    /// Serialized statistics schema version.
+    #[serde(default)]
+    pub schema_version: u32,
+    /// Table schema generation observed by ANALYZE.
+    #[serde(default)]
+    pub schema_generation: u64,
+    /// Table data generation observed by ANALYZE.
+    #[serde(default)]
+    pub data_generation: u64,
     /// Total row count
     pub row_count: u64,
     /// Per-column statistics: column_name → stats
@@ -89,6 +102,17 @@ pub struct TableStats {
 static STATS_CACHE: Lazy<RwLock<HashMap<String, TableStats>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
+const STATS_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct TableGeneration {
+    schema: u64,
+    data: u64,
+}
+
+static TABLE_GENERATIONS: Lazy<RwLock<HashMap<String, TableGeneration>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
 #[derive(Debug, Clone)]
 struct PlanFeedback {
     strategy: ExecutionStrategy,
@@ -101,9 +125,16 @@ static PLAN_FEEDBACK: Lazy<RwLock<HashMap<u64, PlanFeedback>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// Store ANALYZE results into the stats cache
-pub fn store_table_stats(table_key: &str, stats: TableStats) {
+pub fn store_table_stats(table_key: &str, mut stats: TableStats) {
+    let generation = current_generation(table_key);
+    stats.schema_version = STATS_SCHEMA_VERSION;
+    stats.schema_generation = generation.schema;
+    stats.data_generation = generation.data;
     if let Ok(data) = bincode::serialize(&stats) {
         let _ = std::fs::write(stats_sidecar_path(table_key), data);
+    }
+    if let Ok(data) = bincode::serialize(&generation) {
+        let _ = std::fs::write(generation_sidecar_path(table_key), data);
     }
     STATS_CACHE.write().insert(table_key.to_string(), stats);
 }
@@ -111,7 +142,7 @@ pub fn store_table_stats(table_key: &str, stats: TableStats) {
 /// Retrieve cached stats for a table
 pub fn get_table_stats(table_key: &str) -> Option<TableStats> {
     if let Some(stats) = STATS_CACHE.read().get(table_key).cloned() {
-        return Some(stats);
+        return stats_are_fresh(table_key, &stats).then_some(stats);
     }
 
     let sidecar = stats_sidecar_path(table_key);
@@ -129,6 +160,22 @@ pub fn get_table_stats(table_key: &str) -> Option<TableStats> {
 /// Invalidate stats for a table (e.g., after DML)
 pub fn invalidate_table_stats(table_key: &str) {
     STATS_CACHE.write().remove(table_key);
+    let mut generations = TABLE_GENERATIONS.write();
+    let generation = generations
+        .entry(table_key.to_string())
+        .or_insert_with(|| load_generation(table_key));
+    generation.data = generation.data.saturating_add(1);
+}
+
+/// Invalidate statistics after a schema-changing DDL operation.
+pub fn invalidate_table_schema_stats(table_key: &str) {
+    STATS_CACHE.write().remove(table_key);
+    let mut generations = TABLE_GENERATIONS.write();
+    let generation = generations
+        .entry(table_key.to_string())
+        .or_insert_with(|| load_generation(table_key));
+    generation.schema = generation.schema.saturating_add(1);
+    generation.data = generation.data.saturating_add(1);
 }
 
 fn feedback_key(table_key: &str, select: &SelectStatement) -> u64 {
@@ -158,13 +205,35 @@ pub fn record_plan_feedback(
     entry.strategy = strategy.clone();
     entry.estimated_rows = (entry.estimated_rows * entry.samples as f64 + estimated_rows)
         / (entry.samples as f64 + 1.0);
-    entry.actual_rows = (entry.actual_rows * entry.samples as f64 + actual_rows)
-        / (entry.samples as f64 + 1.0);
+    entry.actual_rows =
+        (entry.actual_rows * entry.samples as f64 + actual_rows) / (entry.samples as f64 + 1.0);
     entry.samples = entry.samples.saturating_add(1);
 }
 
 fn stats_sidecar_path(table_key: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.cbo_stats", table_key))
+}
+
+fn generation_sidecar_path(table_key: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.cbo_generation", table_key))
+}
+
+fn load_generation(table_key: &str) -> TableGeneration {
+    std::fs::read(generation_sidecar_path(table_key))
+        .ok()
+        .and_then(|data| bincode::deserialize(&data).ok())
+        .unwrap_or_default()
+}
+
+fn current_generation(table_key: &str) -> TableGeneration {
+    if let Some(generation) = TABLE_GENERATIONS.read().get(table_key).copied() {
+        return generation;
+    }
+    let loaded = load_generation(table_key);
+    TABLE_GENERATIONS
+        .write()
+        .insert(table_key.to_string(), loaded);
+    loaded
 }
 
 fn table_data_paths(table_key: &str) -> [std::path::PathBuf; 3] {
@@ -185,6 +254,13 @@ pub fn table_data_size(table_key: &str) -> u64 {
 }
 
 fn stats_are_fresh(table_key: &str, stats: &TableStats) -> bool {
+    if stats.schema_version != STATS_SCHEMA_VERSION {
+        return false;
+    }
+    let generation = current_generation(table_key);
+    if stats.schema_generation != generation.schema || stats.data_generation != generation.data {
+        return false;
+    }
     let paths = table_data_paths(table_key);
     if stats.source_size != 0 && table_data_size(table_key) != stats.source_size {
         return false;
@@ -274,12 +350,16 @@ pub struct QueryPlan {
     pub candidates: Vec<PlanCandidate>,
     pub stats_available: bool,
     pub feedback_applied: bool,
+    /// Time spent constructing and costing candidates.
+    pub planning_time_micros: u64,
 }
 
 /// Storage facts that affect physical plan legality and cost.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlannerContext {
     pub mmap_only: bool,
+    /// Rows and row groups surviving storage zone-map pruning.
+    pub zone_map: Option<(u64, u64, u32, u32)>,
 }
 
 // ============================================================================
@@ -293,12 +373,27 @@ impl QueryPlanner {
             SqlExpr::BinaryOp { left, op, right } => {
                 match op {
                     BinaryOperator::Eq => {
-                        let col = match (left.as_ref(), right.as_ref()) {
-                            (SqlExpr::Column(col), _) => Some(col),
-                            (_, SqlExpr::Column(col)) => Some(col),
-                            _ => None,
+                        let (col, literal) = match (left.as_ref(), right.as_ref()) {
+                            (SqlExpr::Column(col), SqlExpr::Literal(value)) => {
+                                (Some(col), Some(value))
+                            }
+                            (SqlExpr::Literal(value), SqlExpr::Column(col)) => {
+                                (Some(col), Some(value))
+                            }
+                            _ => (None, None),
                         };
                         if let Some(cs) = col.and_then(|column| stats.columns.get(column)) {
+                            if let Some(value) = literal {
+                                let rendered = value.to_string();
+                                if let Some((_, count)) = cs
+                                    .most_common_values
+                                    .iter()
+                                    .find(|(candidate, _)| candidate == &rendered)
+                                {
+                                    return (*count as f64 / stats.row_count.max(1) as f64)
+                                        .clamp(0.0, 1.0);
+                                }
+                            }
                             if cs.ndv > 0 {
                                 return (1.0 / cs.ndv as f64).min(1.0);
                             }
@@ -349,18 +444,13 @@ impl QueryPlanner {
                 }
             }
             SqlExpr::Between {
-                column,
-                low,
-                high,
-                ..
+                column, low, high, ..
             } => {
                 let Some(cs) = stats.columns.get(column) else {
                     return 0.15;
                 };
-                let (Some(low), Some(high)) = (
-                    Self::literal_f64(low),
-                    Self::literal_f64(high),
-                ) else {
+                let (Some(low), Some(high)) = (Self::literal_f64(low), Self::literal_f64(high))
+                else {
                     return 0.15;
                 };
                 match (cs.numeric_min, cs.numeric_max) {
@@ -396,7 +486,11 @@ impl QueryPlanner {
                         };
                     }
                 }
-                if *negated { 0.95 } else { 0.05 }
+                if *negated {
+                    0.95
+                } else {
+                    0.05
+                }
             }
             SqlExpr::UnaryOp {
                 op: crate::query::sql_parser::UnaryOperator::Not,
@@ -415,11 +509,7 @@ impl QueryPlanner {
         }
     }
 
-    fn estimate_range_selectivity(
-        stats: &ColumnStats,
-        op: &BinaryOperator,
-        value: f64,
-    ) -> f64 {
+    fn estimate_range_selectivity(stats: &ColumnStats, op: &BinaryOperator, value: f64) -> f64 {
         let Some(min) = stats.numeric_min else {
             return 0.33;
         };
@@ -450,8 +540,7 @@ impl QueryPlanner {
                 if x <= bucket.lower || bucket.upper <= bucket.lower {
                     break;
                 }
-                let fraction = ((x - bucket.lower) / (bucket.upper - bucket.lower))
-                    .clamp(0.0, 1.0);
+                let fraction = ((x - bucket.lower) / (bucket.upper - bucket.lower)).clamp(0.0, 1.0);
                 return (before as f64 + fraction * bucket.row_count as f64) / total as f64;
             }
             before as f64 / total as f64
@@ -521,6 +610,14 @@ pub enum IndexLookupType {
     Range,
     /// IN list: col IN (v1, v2, ...)
     InList,
+    /// Intersect independently indexed AND predicates.
+    Intersection,
+    /// Union and deduplicate fully indexed OR branches.
+    Union,
+    /// Equality prefix of a composite BTree index.
+    CompositePrefix,
+    /// Equality prefix followed by a range on the next composite key.
+    CompositeRange,
 }
 
 // ============================================================================
@@ -606,13 +703,8 @@ impl QueryPlanner {
         select: &SelectStatement,
         index_manager: Option<&IndexManager>,
     ) -> ExecutionStrategy {
-        Self::plan_select_with_stats(
-            select,
-            index_manager,
-            None,
-            PlannerContext::default(),
-        )
-        .strategy
+        Self::plan_select_with_stats(select, index_manager, None, PlannerContext::default())
+            .strategy
     }
 
     /// Plan with CBO: use table stats for cost-based index/scan decisions
@@ -661,13 +753,14 @@ impl QueryPlanner {
         table_key: &str,
         context: PlannerContext,
     ) -> QueryPlan {
+        let planning_started = std::time::Instant::now();
         let stats = get_table_stats(table_key);
         let mut plan = Self::plan_select_with_stats(select, index_manager, stats.as_ref(), context);
         if !plan.candidates.is_empty() {
             if let Some(feedback) = PLAN_FEEDBACK.read().get(&feedback_key(table_key, select)) {
                 if feedback.samples > 0 && feedback.estimated_rows > 0.0 {
-                    let correction = (feedback.actual_rows / feedback.estimated_rows)
-                        .clamp(0.25, 4.0);
+                    let correction =
+                        (feedback.actual_rows / feedback.estimated_rows).clamp(0.25, 4.0);
                     for candidate in &mut plan.candidates {
                         if candidate.strategy == feedback.strategy {
                             candidate.cost.total *= correction;
@@ -686,6 +779,7 @@ impl QueryPlanner {
                 }
             }
         }
+        plan.planning_time_micros = planning_started.elapsed().as_micros() as u64;
         plan
     }
 
@@ -708,6 +802,7 @@ impl QueryPlanner {
             candidates: Vec::new(),
             stats_available: stats.is_some(),
             feedback_applied: false,
+            planning_time_micros: 0,
         };
 
         if chars.is_write {
@@ -749,10 +844,17 @@ impl QueryPlanner {
         } else {
             ExecutionStrategy::OlapFullScan
         };
-        let mut scan_cost = PlanCost::seq_scan(row_count);
+        let scan_rows = context
+            .zone_map
+            .map(|(matching, _, _, _)| matching as f64)
+            .unwrap_or(row_count)
+            .min(row_count);
+        let mut scan_cost = PlanCost::seq_scan(scan_rows);
         scan_cost.output_rows = output_rows;
         let mut candidates = vec![PlanCandidate {
-            name: if select.where_clause.is_some() {
+            name: if let Some((_, _, matching_groups, total_groups)) = context.zone_map {
+                format!("zone-map-scan({}/{})", matching_groups, total_groups)
+            } else if select.where_clause.is_some() {
                 "sequential-filtered-scan".to_string()
             } else {
                 "sequential-scan".to_string()
@@ -761,8 +863,37 @@ impl QueryPlanner {
             cost: scan_cost,
         }];
 
-        if !chars.has_disjunction {
-            if let (Some(idx_mgr), Some(_where_expr)) = (index_manager, &select.where_clause) {
+        if let (Some(idx_mgr), Some(_where_expr)) = (index_manager, &select.where_clause) {
+            if chars.has_disjunction {
+                let all_indexed = chars
+                    .equality_filter_columns
+                    .iter()
+                    .all(|column| idx_mgr.has_usable_index_for_predicate(column, false))
+                    && chars
+                        .range_filter_columns
+                        .iter()
+                        .all(|column| idx_mgr.has_usable_index_for_predicate(column, true));
+                if all_indexed
+                    && (!chars.equality_filter_columns.is_empty()
+                        || !chars.range_filter_columns.is_empty())
+                {
+                    let mut cost = PlanCost::index_scan(row_count, selectivity);
+                    cost.total += cost.output_rows * 0.15;
+                    candidates.push(PlanCandidate {
+                        name: "index-union(deduplicated)".to_string(),
+                        strategy: ExecutionStrategy::OltpIndexLookup {
+                            column: chars
+                                .equality_filter_columns
+                                .first()
+                                .or(chars.range_filter_columns.first())
+                                .cloned()
+                                .unwrap_or_default(),
+                            lookup_type: IndexLookupType::Union,
+                        },
+                        cost,
+                    });
+                }
+            } else {
                 for col in &chars.equality_filter_columns {
                     if !idx_mgr.has_usable_index_for_predicate(col, false) {
                         continue;
@@ -806,32 +937,80 @@ impl QueryPlanner {
                     });
                 }
 
-                let composite_columns = idx_mgr
+                let independently_indexed = chars
+                    .equality_filter_columns
+                    .iter()
+                    .filter(|column| idx_mgr.has_usable_index_for_predicate(column, false))
+                    .count()
+                    + chars
+                        .range_filter_columns
+                        .iter()
+                        .filter(|column| idx_mgr.has_usable_index_for_predicate(column, true))
+                        .count();
+                if independently_indexed > 1 {
+                    let mut cost = PlanCost::index_scan(row_count, selectivity);
+                    cost.total += output_rows * 0.05;
+                    candidates.push(PlanCandidate {
+                        name: "index-intersection".to_string(),
+                        strategy: ExecutionStrategy::OltpIndexLookup {
+                            column: chars
+                                .equality_filter_columns
+                                .first()
+                                .cloned()
+                                .unwrap_or_default(),
+                            lookup_type: IndexLookupType::Intersection,
+                        },
+                        cost,
+                    });
+                }
+
+                let composite = idx_mgr
                     .list_indexes()
                     .into_iter()
                     .filter(|meta| meta.is_composite())
-                    .map(|meta| {
-                        meta.effective_columns()
+                    .filter_map(|meta| {
+                        let columns = meta
+                            .effective_columns()
                             .iter()
                             .map(|column| column.to_string())
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>();
+                        let prefix_len = columns
+                            .iter()
+                            .take_while(|column| chars.equality_filter_columns.contains(column))
+                            .count();
+                        let next_is_range = columns
+                            .get(prefix_len)
+                            .map(|column| chars.range_filter_columns.contains(column))
+                            .unwrap_or(false);
+                        let legal = prefix_len == columns.len()
+                            || (meta.index_type == crate::storage::index::IndexType::BTree
+                                && prefix_len > 0);
+                        legal.then_some((columns, prefix_len, next_is_range))
                     })
-                    .find(|columns| {
-                        columns.iter().all(|column| {
-                            chars
-                                .equality_filter_columns
-                                .iter()
-                                .any(|candidate| candidate == column)
-                        })
-                    });
-                if let Some(equality_columns) = composite_columns {
+                    .max_by_key(|(_, prefix_len, next_is_range)| (*prefix_len, *next_is_range));
+                if let Some((columns, prefix_len, next_is_range)) = composite {
                     let mut cost = PlanCost::index_scan(row_count, selectivity);
                     cost.output_rows = output_rows;
                     candidates.push(PlanCandidate {
-                        name: format!("composite-index-scan({})", equality_columns.join(",")),
+                        name: if prefix_len == columns.len() {
+                            format!("composite-index-scan({})", columns.join(","))
+                        } else if next_is_range {
+                            format!(
+                                "composite-prefix-range({})",
+                                columns[..=prefix_len].join(",")
+                            )
+                        } else {
+                            format!("composite-prefix-scan({})", columns[..prefix_len].join(","))
+                        },
                         strategy: ExecutionStrategy::OltpIndexLookup {
-                            column: equality_columns[0].clone(),
-                            lookup_type: IndexLookupType::Equality,
+                            column: columns.get(prefix_len).unwrap_or(&columns[0]).clone(),
+                            lookup_type: if prefix_len == columns.len() {
+                                IndexLookupType::Equality
+                            } else if next_is_range {
+                                IndexLookupType::CompositeRange
+                            } else {
+                                IndexLookupType::CompositePrefix
+                            },
                         },
                         cost,
                     });
@@ -842,12 +1021,58 @@ impl QueryPlanner {
         candidates = candidates
             .into_iter()
             .map(|mut candidate| {
-                if !select.order_by.is_empty() {
+                let projection_width = if select.is_select_star() {
+                    8.0
+                } else {
+                    select.columns.len().max(1) as f64
+                };
+                if candidate.name.starts_with("sequential")
+                    || candidate.name.starts_with("zone-map")
+                {
+                    candidate.cost.total *=
+                        (0.30 + projection_width.min(8.0) * 0.0875).clamp(0.30, 1.0);
+                } else if candidate.name.contains("index") {
+                    let covered = !select.is_select_star()
+                        && select.columns.iter().all(|column| match column {
+                            SelectColumn::Column(name) => {
+                                name == "_id" || chars.equality_filter_columns.contains(name)
+                            }
+                            SelectColumn::ColumnAlias { column, .. } => {
+                                column == "_id" || chars.equality_filter_columns.contains(column)
+                            }
+                            _ => false,
+                        });
+                    let width_factor = if covered {
+                        0.55
+                    } else {
+                        (0.75 + projection_width.min(8.0) * 0.0625).min(1.25)
+                    };
+                    candidate.cost.total = COST_INDEX_LOOKUP
+                        + (candidate.cost.total - COST_INDEX_LOOKUP).max(0.0) * width_factor;
+                }
+                let preserves_order = select.order_by.len() == 1
+                    && !select.order_by[0].descending
+                    && match &candidate.strategy {
+                        ExecutionStrategy::OltpIndexLookup {
+                            column,
+                            lookup_type:
+                                IndexLookupType::Range
+                                | IndexLookupType::CompositePrefix
+                                | IndexLookupType::CompositeRange,
+                        } => select.order_by[0].column == *column,
+                        _ => false,
+                    };
+                if !select.order_by.is_empty() && !preserves_order {
                     let rows = candidate.cost.output_rows.max(1.0);
                     candidate.cost.total += COST_SORT_PER_ROW_LOG * rows * rows.ln();
                 }
                 if let Some(limit) = select.limit {
                     let wanted = (limit + select.offset.unwrap_or(0)) as f64;
+                    if candidate.name.contains("index") && candidate.cost.output_rows > wanted {
+                        let ratio = wanted / candidate.cost.output_rows.max(1.0);
+                        candidate.cost.total =
+                            COST_INDEX_LOOKUP + (candidate.cost.total - COST_INDEX_LOOKUP) * ratio;
+                    }
                     candidate.cost.output_rows = candidate.cost.output_rows.min(wanted);
                 }
                 candidate
@@ -869,6 +1094,7 @@ impl QueryPlanner {
             candidates,
             stats_available: stats.is_some(),
             feedback_applied: false,
+            planning_time_micros: 0,
         }
     }
 
@@ -922,9 +1148,7 @@ impl QueryPlanner {
                     BinaryOperator::Eq => {
                         let column = match (left.as_ref(), right.as_ref()) {
                             (SqlExpr::Column(column), SqlExpr::Literal(_))
-                            | (SqlExpr::Literal(_), SqlExpr::Column(column)) => {
-                                Some(column)
-                            }
+                            | (SqlExpr::Literal(_), SqlExpr::Column(column)) => Some(column),
                             _ => None,
                         };
                         if let Some(col) = column {
@@ -941,9 +1165,7 @@ impl QueryPlanner {
                     | BinaryOperator::Le => {
                         let column = match (left.as_ref(), right.as_ref()) {
                             (SqlExpr::Column(column), SqlExpr::Literal(_))
-                            | (SqlExpr::Literal(_), SqlExpr::Column(column)) => {
-                                Some(column)
-                            }
+                            | (SqlExpr::Literal(_), SqlExpr::Column(column)) => Some(column),
                             _ => None,
                         };
                         if let Some(col) = column {
@@ -1038,6 +1260,9 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(b"before").unwrap();
         let stats = TableStats {
+            schema_version: STATS_SCHEMA_VERSION,
+            schema_generation: 0,
+            data_generation: 0,
             row_count: 1,
             columns: HashMap::new(),
             collected_at: u64::MAX,
@@ -1071,7 +1296,10 @@ mod tests {
             &select,
             Some(&indexes),
             None,
-            PlannerContext { mmap_only: true },
+            PlannerContext {
+                mmap_only: true,
+                zone_map: None,
+            },
         );
         assert!(plan
             .candidates
@@ -1084,13 +1312,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut indexes = IndexManager::new("t", dir.path());
         indexes
-            .create_index(
-                "idx_age",
-                "age",
-                IndexType::BTree,
-                false,
-                DataType::Int64,
-            )
+            .create_index("idx_age", "age", IndexType::BTree, false, DataType::Int64)
             .unwrap();
         let select = select_statement("SELECT name FROM t WHERE age = 25 OR age = 30");
 
@@ -1100,7 +1322,46 @@ mod tests {
             None,
             PlannerContext::default(),
         );
-        assert_eq!(plan.candidates.len(), 1);
-        assert_eq!(plan.candidates[0].name, "sequential-filtered-scan");
+        assert!(plan
+            .candidates
+            .iter()
+            .any(|candidate| candidate.name == "index-union(deduplicated)"));
+        assert!(!plan
+            .candidates
+            .iter()
+            .any(|candidate| candidate.name == "index-scan(age)"));
+    }
+
+    #[test]
+    fn mcv_corrects_skewed_equality_selectivity() {
+        let stats = TableStats {
+            schema_version: STATS_SCHEMA_VERSION,
+            schema_generation: 0,
+            data_generation: 0,
+            row_count: 1000,
+            columns: HashMap::from([(
+                "category".to_string(),
+                ColumnStats {
+                    ndv: 100,
+                    null_count: 0,
+                    min_value: "common".to_string(),
+                    max_value: "rare".to_string(),
+                    numeric_min: None,
+                    numeric_max: None,
+                    histogram: Vec::new(),
+                    most_common_values: vec![("common".to_string(), 600)],
+                },
+            )]),
+            collected_at: 0,
+            source_size: 0,
+        };
+        let common = select_statement("SELECT * FROM t WHERE category = 'common'")
+            .where_clause
+            .unwrap();
+        let rare = select_statement("SELECT * FROM t WHERE category = 'rare'")
+            .where_clause
+            .unwrap();
+        assert_eq!(QueryPlanner::estimate_selectivity(&common, &stats), 0.6);
+        assert_eq!(QueryPlanner::estimate_selectivity(&rare, &stats), 0.01);
     }
 }

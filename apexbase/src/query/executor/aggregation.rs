@@ -3253,6 +3253,150 @@ impl ApexExecutor {
 
         let num_rows = batch.num_rows();
 
+        // FAST PATH: two string keys with COUNT(*). Encode both dictionaries and
+        // aggregate in one pass. The packed pair of u32 IDs is collision-free and
+        // avoids two row-sized index buffers plus partition-map merging.
+        let is_two_string_count = group_cols.len() == 2
+            && stmt.columns.iter().any(|column| {
+                matches!(
+                    column,
+                    SelectColumn::Aggregate {
+                        func: AggregateFunc::Count,
+                        column: None,
+                        distinct: false,
+                        ..
+                    }
+                )
+            })
+            && stmt.columns.iter().all(|column| match column {
+                SelectColumn::Column(name) | SelectColumn::ColumnAlias { column: name, .. } => {
+                    let name = name.trim_matches('"');
+                    let name = name.rsplit('.').next().unwrap_or(name);
+                    group_cols.iter().any(|group| group == name)
+                }
+                SelectColumn::Aggregate {
+                    func: AggregateFunc::Count,
+                    column: None,
+                    distinct: false,
+                    ..
+                } => true,
+                _ => false,
+            });
+
+        if is_two_string_count {
+            if let (Some(col1), Some(col2)) = (
+                batch.column_by_name(&group_cols[0]),
+                batch.column_by_name(&group_cols[1]),
+            ) {
+                if let (Some(arr1), Some(arr2)) = (
+                    col1.as_any().downcast_ref::<StringArray>(),
+                    col2.as_any().downcast_ref::<StringArray>(),
+                ) {
+                    let estimated = (num_rows / 10).clamp(16, 65_536);
+                    let mut dict1: AHashMap<&str, u32> = AHashMap::with_capacity(estimated);
+                    let mut dict2: AHashMap<&str, u32> = AHashMap::with_capacity(estimated);
+                    let mut values1: Vec<Option<&str>> = Vec::with_capacity(estimated + 1);
+                    let mut values2: Vec<Option<&str>> = Vec::with_capacity(estimated + 1);
+                    values1.push(None);
+                    values2.push(None);
+                    let mut groups: AHashMap<u64, i64> = AHashMap::with_capacity(estimated);
+
+                    for row_idx in 0..num_rows {
+                        let id1 = if arr1.is_null(row_idx) {
+                            0
+                        } else {
+                            let value = arr1.value(row_idx);
+                            if value == "\x00__NULL__\x00" {
+                                0
+                            } else {
+                                *dict1.entry(value).or_insert_with(|| {
+                                    let id = values1.len() as u32;
+                                    values1.push(Some(value));
+                                    id
+                                })
+                            }
+                        };
+                        let id2 = if arr2.is_null(row_idx) {
+                            0
+                        } else {
+                            let value = arr2.value(row_idx);
+                            if value == "\x00__NULL__\x00" {
+                                0
+                            } else {
+                                *dict2.entry(value).or_insert_with(|| {
+                                    let id = values2.len() as u32;
+                                    values2.push(Some(value));
+                                    id
+                                })
+                            }
+                        };
+                        let key = ((id1 as u64) << 32) | id2 as u64;
+                        *groups.entry(key).or_insert(0) += 1;
+                    }
+
+                    let grouped: Vec<(u64, i64)> = groups.into_iter().collect();
+                    let counts: Vec<i64> = grouped.iter().map(|(_, count)| *count).collect();
+                    let result1: ArrayRef = Arc::new(StringArray::from(
+                        grouped
+                            .iter()
+                            .map(|(key, _)| values1[(key >> 32) as usize])
+                            .collect::<Vec<_>>(),
+                    ));
+                    let result2: ArrayRef = Arc::new(StringArray::from(
+                        grouped
+                            .iter()
+                            .map(|(key, _)| values2[(*key as u32) as usize])
+                            .collect::<Vec<_>>(),
+                    ));
+
+                    let mut result_fields = Vec::with_capacity(stmt.columns.len());
+                    let mut result_arrays = Vec::with_capacity(stmt.columns.len());
+                    for column in &stmt.columns {
+                        match column {
+                            SelectColumn::Column(name)
+                            | SelectColumn::ColumnAlias { column: name, .. } => {
+                                let actual = name.trim_matches('"');
+                                let actual = actual.rsplit('.').next().unwrap_or(actual);
+                                let output = match column {
+                                    SelectColumn::ColumnAlias { alias, .. } => alias.as_str(),
+                                    _ => actual,
+                                };
+                                let array = if actual == group_cols[0] {
+                                    result1.clone()
+                                } else {
+                                    result2.clone()
+                                };
+                                result_fields.push(Field::new(output, ArrowDataType::Utf8, true));
+                                result_arrays.push(array);
+                            }
+                            SelectColumn::Aggregate { alias, .. } => {
+                                let output = alias.as_deref().unwrap_or("COUNT(*)");
+                                result_fields.push(Field::new(output, ArrowDataType::Int64, false));
+                                result_arrays.push(Arc::new(Int64Array::from(counts.clone())));
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+
+                    let schema = Arc::new(Schema::new(result_fields));
+                    let mut result = RecordBatch::try_new(schema, result_arrays)
+                        .map_err(|e| err_data(e.to_string()))?;
+                    if let Some(having_expr) = &stmt.having {
+                        let mask = Self::evaluate_predicate(&result, having_expr)?;
+                        result = compute::filter_record_batch(&result, &mask)
+                            .map_err(|e| err_data(e.to_string()))?;
+                    }
+                    if !stmt.order_by.is_empty() {
+                        let resolved = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+                        let k = stmt.limit.map(|limit| limit + stmt.offset.unwrap_or(0));
+                        result = Self::apply_order_by_topk(&result, &resolved, k)?;
+                    }
+                    result = Self::apply_limit_offset(&result, stmt.limit, stmt.offset)?;
+                    return Ok(ApexResult::Data(result));
+                }
+            }
+        }
+
         // FAST PATH: Single column GROUP BY on small integer range (e.g., category_id 0-999)
         // Uses direct array indexing instead of hash map - much faster
         if group_cols.len() == 1 {

@@ -1,9 +1,9 @@
 """Reproducible benchmark for all three Hive user-profile workloads.
 
 The three source queries are kept verbatim in ``benchmarks/sql``. Only
-``${biz_date}`` is bound at runtime. DuckDB receives automatically rewritten,
-semantically equivalent SQL because it does not parse Hive's LATERAL VIEW or
-INSERT OVERWRITE ... PARTITION syntax.
+``${biz_date}`` is bound at runtime for ApexBase. DuckDB executes the checked-in
+native SQL generated under ``benchmarks/sql/duckdb``; the benchmark refuses a
+stale generated file so the comparison remains auditable.
 
 Usage:
     python benchmarks/bench_hive_complex_vs_duckdb.py
@@ -32,11 +32,26 @@ from apexbase import ApexClient
 
 
 ROOT = Path(__file__).resolve().parent
+DUCKDB_SQL_ROOT = ROOT / "sql" / "duckdb"
 SQL_FILES = (
     ROOT / "sql" / "hive_user_360.sql",
     ROOT / "sql" / "hive_user_complex.sql",
     ROOT / "sql" / "hive_user_most_complex.sql",
+    ROOT / "sql" / "hive_user_syntax_torture.sql",
 )
+
+
+def checked_duckdb_sql(sql_file: Path, hive_sql: str, biz_date: str) -> str:
+    """Load the generated DuckDB SQL and reject stale generated artifacts."""
+    native_path = DUCKDB_SQL_ROOT / sql_file.name
+    native = native_path.read_text(encoding="utf-8")
+    expected = duckdb_sql(hive_sql, "${biz_date}")
+    if native != expected:
+        raise RuntimeError(
+            f"stale DuckDB SQL: {native_path}; run "
+            "python benchmarks/generate_hive_native_sql.py"
+        )
+    return native.replace("${biz_date}", biz_date)
 TARGETS = {
     "hive_user_360.sql": ("ads_user_360_profile_wide_df",),
     "hive_user_complex.sql": ("ads_user_super_operation_profile_df",),
@@ -44,6 +59,10 @@ TARGETS = {
         "ads_user_extreme_operation_profile_df",
         "ads_high_value_user_pool_df",
         "ads_user_recall_pool_df",
+    ),
+    "hive_user_syntax_torture.sql": (
+        "ads_user_syntax_torture_profile_df",
+        "ads_user_syntax_torture_alert_df",
     ),
 }
 DATABASE_TABLES = (
@@ -648,7 +667,7 @@ def main() -> None:
     results = []
     for sql_file in sql_files:
         hive = sql_file.read_text(encoding="utf-8")
-        duck_sql = duckdb_sql(hive, args.biz_date)
+        duck_sql = checked_duckdb_sql(sql_file, hive, args.biz_date)
         duck_times = timed(lambda: con.execute(duck_sql).fetchall(), args.iterations)
         targets = TARGETS[sql_file.name]
         create_apex_targets(con, root / "apex", targets)
@@ -705,6 +724,7 @@ def main() -> None:
         f"Rows: behavior={args.rows:,}; threads={BENCH_THREADS}; "
         f"shared setup/load excluded={setup_seconds:.3f}s"
     )
+    print("ApexBase SQL path: verbatim Hive source; only ${biz_date} is bound")
     for sql_file, hive, apex_times, duck_times, counts in results:
         apex_mean, duck_mean = statistics.mean(apex_times), statistics.mean(duck_times)
         print(f"\nSQL: {sql_file} ({len(hive.splitlines())} lines)")

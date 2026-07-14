@@ -247,3 +247,85 @@ def test_hive_advanced_row_generators_joins_and_multi_insert():
             "SELECT u.user_id FROM hive_users_adv u LEFT ANTI JOIN events e ON u.user_id=e.user_id"
         )) == [("u3",)]
         db.close()
+
+
+def test_window_peer_semantics_and_multiple_order_columns():
+    with tempfile.TemporaryDirectory(prefix="apex_window_peers_") as path:
+        db = ApexStorage(path)
+        db.execute("CREATE TABLE IF NOT EXISTS window_peers (label TEXT, score BIGINT)")
+        db.execute("TRUNCATE TABLE window_peers")
+        db.execute(
+            "INSERT INTO window_peers VALUES "
+            "('b',10),('a',10),('d',20),('c',20)"
+        )
+        result = db.execute(
+            "SELECT label, "
+            "ROW_NUMBER() OVER (ORDER BY score, label) AS row_num, "
+            "NTILE(2) OVER (ORDER BY score, label) AS bucket, "
+            "CUME_DIST() OVER (ORDER BY score) AS cumulative_distribution "
+            "FROM window_peers ORDER BY label"
+        )
+        assert sorted(_rows(result)) == [
+            ("a", 1, 1, 0.5),
+            ("b", 2, 1, 0.5),
+            ("c", 3, 2, 1.0),
+            ("d", 4, 2, 1.0),
+        ]
+        db.close()
+
+
+def test_wide_insert_overwrite_coerces_to_target_schema():
+    with tempfile.TemporaryDirectory(prefix="apex_wide_overwrite_types_") as path:
+        db = ApexStorage(path)
+        columns = [f"c{i}" for i in range(65)]
+        schema = ",".join(f"{column} BIGINT" for column in columns)
+        projection = ",".join(f"{i}.0 AS {column}" for i, column in enumerate(columns))
+        db.execute(f"CREATE TABLE IF NOT EXISTS wide_target ({schema})")
+        db.execute("TRUNCATE TABLE wide_target")
+        db.execute(f"INSERT OVERWRITE TABLE wide_target SELECT {projection}")
+        result = db.execute(f"SELECT {','.join(columns)} FROM wide_target")
+        assert _rows(result) == [tuple(range(65))]
+        db.close()
+
+
+def test_sql_three_valued_boolean_short_circuit_semantics():
+    with tempfile.TemporaryDirectory(prefix="apex_sql_three_valued_logic_") as path:
+        db = ApexStorage(path)
+        db.execute("CREATE TABLE IF NOT EXISTS truth_values (id BIGINT, a BIGINT, b BIGINT)")
+        db.execute("TRUNCATE TABLE truth_values")
+        db.execute("INSERT INTO truth_values VALUES (1,1,NULL),(2,0,NULL)")
+        assert _rows(db.execute(
+            "SELECT id FROM truth_values WHERE a=1 OR (a=0 AND b=1) ORDER BY id"
+        )) == [(1,)]
+        assert _rows(db.execute(
+            "SELECT id FROM truth_values WHERE NOT (a=1 AND b=1) ORDER BY id"
+        )) == [(2,)]
+        assert _rows(db.execute(
+            "SELECT id, CASE WHEN a=1 THEN 0 WHEN a=2 THEN 100 ELSE 2.5 END AS score "
+            "FROM truth_values ORDER BY id"
+        )) == [(1, 0.0), (2, 2.5)]
+        db.close()
+
+
+def test_two_string_group_count_preserves_aliases_and_null_groups():
+    with tempfile.TemporaryDirectory(prefix="apex_two_string_group_") as path:
+        db = ApexStorage(path)
+        db.execute("CREATE TABLE IF NOT EXISTS sessions (user_id TEXT, session_id TEXT)")
+        db.execute("TRUNCATE TABLE sessions")
+        db.execute(
+            "INSERT INTO sessions VALUES "
+            "('u1','s1'),('u1','s1'),('u1','s2'),"
+            "('u2',NULL),('u2',NULL),(NULL,'orphan')"
+        )
+        rows = _rows(db.execute(
+            "WITH source AS (SELECT user_id, session_id FROM sessions) "
+            "SELECT user_id AS uid, session_id AS sid, COUNT(*) AS session_depth "
+            "FROM source GROUP BY user_id, session_id"
+        ))
+        assert sorted(rows, key=lambda row: (str(row[0]), str(row[1]))) == [
+            (None, "orphan", 1),
+            ("u1", "s1", 2),
+            ("u1", "s2", 1),
+            ("u2", None, 2),
+        ]
+        db.close()

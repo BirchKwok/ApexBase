@@ -867,7 +867,10 @@ impl ApexExecutor {
         {
             return joins.to_vec();
         }
-        if joins.len() > 8 {
+        const MAX_JOIN_RELATIONS: usize = 8;
+        const MAX_MEMO_STATES: usize = 512;
+        const PLANNING_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
+        if joins.len() > MAX_JOIN_RELATIONS {
             return joins.to_vec();
         }
 
@@ -916,6 +919,10 @@ impl ApexExecutor {
         }
 
         let state_count = 1usize << joins.len();
+        if state_count > MAX_MEMO_STATES {
+            return joins.to_vec();
+        }
+        let planning_started = std::time::Instant::now();
         let full_mask = state_count - 1;
         let base_rows = match from {
             Some(FromItem::Table { table, .. }) => {
@@ -935,6 +942,9 @@ impl ApexExecutor {
         });
 
         for mask in 0..state_count {
+            if planning_started.elapsed() > PLANNING_BUDGET {
+                return joins.to_vec();
+            }
             let Some(state) = memo[mask].clone() else {
                 continue;
             };
@@ -2036,31 +2046,29 @@ impl ApexExecutor {
             .column_by_name(right_key)
             .ok_or_else(|| err_data(format!("Right join key '{}' not found", right_key)))?;
 
-        // Build hash set of left keys
-        let mut left_key_hashes: ahash::AHashSet<u64> =
-            ahash::AHashSet::with_capacity(left.num_rows());
+        // Keep the rows for each hash bucket so collision verification only
+        // examines candidates with the same hash. Scanning the entire left
+        // side after every hash hit makes a fully matched join quadratic.
+        let mut left_key_rows: AHashMap<u64, Vec<usize>> =
+            AHashMap::with_capacity(left.num_rows());
         for i in 0..left.num_rows() {
-            left_key_hashes.insert(Self::hash_array_value_fast(left_key_col, i));
+            left_key_rows
+                .entry(Self::hash_array_value_fast(left_key_col, i))
+                .or_insert_with(|| Vec::with_capacity(1))
+                .push(i);
         }
 
         // Find right rows whose keys don't exist in left
         let mut unmatched_right_indices: Vec<u32> = Vec::new();
         for i in 0..right.num_rows() {
             let hash = Self::hash_array_value_fast(right_key_col, i);
-            if !left_key_hashes.contains(&hash) {
+            let matched = left_key_rows.get(&hash).is_some_and(|candidates| {
+                candidates
+                    .iter()
+                    .any(|&j| Self::arrays_equal_at(right_key_col, i, left_key_col, j))
+            });
+            if !matched {
                 unmatched_right_indices.push(i as u32);
-            } else {
-                // Hash match doesn't guarantee value match — verify
-                let mut found = false;
-                for j in 0..left.num_rows() {
-                    if Self::arrays_equal_at(right_key_col, i, left_key_col, j) {
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    unmatched_right_indices.push(i as u32);
-                }
             }
         }
 
