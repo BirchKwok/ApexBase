@@ -1,5 +1,6 @@
 """Keep every supported public Python API represented in the perf/memory suite."""
 
+import builtins
 import importlib.util
 from pathlib import Path
 import re
@@ -31,6 +32,26 @@ def test_every_public_python_api_has_a_perf_and_memory_case():
 def test_public_api_case_names_are_unique():
     benchmark = _load_benchmark_module()
     assert len(benchmark.PUBLIC_API_CASES) == len(set(benchmark.PUBLIC_API_CASES))
+
+
+def test_benchmark_imports_without_posix_resource(monkeypatch):
+    real_import = builtins.__import__
+
+    def import_without_resource(name, *args, **kwargs):
+        if name == "resource":
+            raise ModuleNotFoundError("No module named 'resource'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_resource)
+    benchmark = _load_benchmark_module()
+    assert benchmark.resource is None
+
+
+def test_benchmark_rss_is_available_on_current_platform():
+    benchmark = _load_benchmark_module()
+    current_mb, peak_mb = benchmark._rss_mb()
+    assert current_mb > 0
+    assert peak_mb >= current_mb
 
 
 def _rust_manifest():

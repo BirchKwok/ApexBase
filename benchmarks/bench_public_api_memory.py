@@ -16,7 +16,6 @@ import inspect
 import json
 import os
 from pathlib import Path
-import resource
 import statistics
 import subprocess
 import sys
@@ -24,6 +23,39 @@ import tempfile
 import threading
 import time
 import tracemalloc
+
+try:
+    import resource
+except ImportError:  # Not available on Windows.
+    resource = None
+
+
+if os.name == "nt":
+    import ctypes
+
+    class _ProcessMemoryCounters(ctypes.Structure):
+        _fields_ = (
+            ("cb", ctypes.c_ulong),
+            ("page_fault_count", ctypes.c_ulong),
+            ("peak_working_set_size", ctypes.c_size_t),
+            ("working_set_size", ctypes.c_size_t),
+            ("quota_peak_paged_pool_usage", ctypes.c_size_t),
+            ("quota_paged_pool_usage", ctypes.c_size_t),
+            ("quota_peak_non_paged_pool_usage", ctypes.c_size_t),
+            ("quota_non_paged_pool_usage", ctypes.c_size_t),
+            ("pagefile_usage", ctypes.c_size_t),
+            ("peak_pagefile_usage", ctypes.c_size_t),
+        )
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    _kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    _psapi.GetProcessMemoryInfo.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_ProcessMemoryCounters),
+        ctypes.c_ulong,
+    )
+    _psapi.GetProcessMemoryInfo.restype = ctypes.c_int
 
 
 ROWS = 2_000
@@ -155,6 +187,15 @@ def discover_public_api_names():
 
 
 def _rss_mb():
+    if os.name == "nt":
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        if not _psapi.GetProcessMemoryInfo(
+            _kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        mb = 1024.0 * 1024.0
+        return counters.working_set_size / mb, counters.peak_working_set_size / mb
     if sys.platform == "darwin":
         value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         # ru_maxrss is peak bytes on macOS, so use ps for current RSS.
