@@ -1151,7 +1151,13 @@ class ApexClient:
                 pd_mod = _ensure_pandas()
                 if isinstance(data, pd_mod.DataFrame):
                     # Convert DataFrame to columnar dict
-                    columns = {name: data[name].tolist() for name in data.columns}
+                    columns = {}
+                    for name in data.columns:
+                        column = data[name]
+                        if column.dtype.kind == 'O':
+                            columns[name] = column.fillna('').tolist()
+                        else:
+                            columns[name] = column.tolist()
                     self._store_columnar(columns)
                     return
 
