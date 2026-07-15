@@ -102,7 +102,7 @@ with ApexClient("./rag-data") as client:
 
 ## Performance At A Glance
 
-Latest local snapshot: **ApexBase 1.22.0**, 1M-row tabular dataset, 1M-vector dataset, Apple arm, Python 3.12.
+Latest local snapshot: **ApexBase 1.23.0**, 1M-row tabular dataset, 1M-vector dataset, Apple arm, Python 3.12.
 
 | Area | Snapshot |
 | --- | --- |

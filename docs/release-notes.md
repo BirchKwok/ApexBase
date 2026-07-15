@@ -9,6 +9,20 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 
 ---
 
+## [v1.23.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.23.0)
+*2026-07-15*
+
+[Compare with v1.22.0](https://github.com/BirchKwok/ApexBase/compare/v1.22.0...v1.23.0)
+
+- Replace the external `nanofts` crate with ApexFTS, an in-repo Rust full-text engine using `.afts` snapshots and checksummed `.afts.wal`
+- Split ApexFTS into analyzer, engine, index, query, and storage modules while preserving Arrow zero-copy indexing paths such as `add_documents_arrow_str`
+- Own the process allocator via `mimalloc` instead of inheriting one from the former FTS dependency
+- Rebuild FTS from `.apex` table data when only legacy `.nfts` files remain; quarantine corrupt ApexFTS snapshots instead of opening them as valid data
+- Improve query DDL/DML/select execution, SQL parsing, Python bindings, and FTS documentation and regression coverage
+- Update the Rust crate and Python package version metadata to 1.23.0
+
+---
+
 ## [v1.22.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.22.0)
 *2026-07-14*
 
